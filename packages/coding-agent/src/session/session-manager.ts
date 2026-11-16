@@ -1977,6 +1977,19 @@ export type SharedAppendOutcome =
 	| { readonly kind: "rejected"; readonly error: unknown };
 
 /**
+ * What reconciliation proved about an `unknown` shared append.
+ *
+ * `committed` means the attempted entry is durably in the transcript. `absent` means
+ * neither the transcript nor the resident graph holds it, so a retry cannot duplicate it.
+ * `unresolved` means the entry may already be durable and the transcript could not be
+ * read to decide; such an entry must not be resubmitted blindly.
+ */
+export type SharedAppendReconciliation =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unresolved"; readonly id: string; readonly error: unknown };
+
+/**
  * What a writable open did about pending migration.
  *
  * `stale` means the transcript changed after this process read it, so publishing now
@@ -20945,6 +20958,51 @@ export class SessionManager {
 		if (!file || !this.#storage.existsSync(file))
 			return { kind: "unknown", id, error: new Error("durability_unproven") };
 		return { kind: "committed", id };
+	}
+
+	/**
+	 * Decide an `unknown` shared append before anyone retries or reports it.
+	 *
+	 * `unknown` is not "not persisted": the entry can be committed before the failure that
+	 * produced the outcome (post-write snapshot verification, transaction release, a
+	 * superseded publication), and it can still be resident here unpublished. A blind retry
+	 * can therefore duplicate it, and a failure report can be wrong.
+	 *
+	 * `absent` is only returned once both the committed transcript and this manager's
+	 * resident graph are known not to hold the entry. Any read or publish failure after that
+	 * point is `unresolved`, which callers must hold rather than resubmit.
+	 */
+	async reconcileUnknownSharedAppend(id: string, error: unknown): Promise<SharedAppendReconciliation> {
+		const durable = (candidate: CommittedTranscriptRead): boolean =>
+			candidate.kind === "snapshot" &&
+			candidate.snapshot.sessionId === this.#sessionId &&
+			candidate.snapshot.entryIds.includes(id);
+		let read: CommittedTranscriptRead;
+		try {
+			read = await this.captureCommittedSnapshot();
+		} catch (cause) {
+			return { kind: "unresolved", id, error: cause };
+		}
+		if (durable(read)) return { kind: "committed", id };
+		if (this.#byId.has(id)) {
+			// The entry was staged in this process but its publication was not proven.
+			// Publish the pending bytes and re-verify; never append it a second time.
+			try {
+				await this.flush();
+			} catch (cause) {
+				return { kind: "unresolved", id, error: cause };
+			}
+			let after: CommittedTranscriptRead;
+			try {
+				after = await this.captureCommittedSnapshot();
+			} catch (cause) {
+				return { kind: "unresolved", id, error: cause };
+			}
+			return durable(after) ? { kind: "committed", id } : { kind: "unresolved", id, error };
+		}
+		if (read.kind === "absent") return { kind: "absent" };
+		if (read.kind === "snapshot" && read.snapshot.sessionId === this.#sessionId) return { kind: "absent" };
+		return { kind: "unresolved", id, error };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */

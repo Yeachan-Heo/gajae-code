@@ -3,16 +3,21 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai/models";
+import { Container } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { TreeSelectorComponent } from "../src/modes/components/tree-selector";
+import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { TodoCommandController } from "../src/modes/controllers/todo-command-controller";
+import { initTheme } from "../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import {
+	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SessionManager,
 	SessionNearLimitAppendError,
 	SharedSessionMutationUnsupportedError,
@@ -196,7 +201,8 @@ describe("shared publication admission split", () => {
 		expect(() => f.manager.appendMessage(user("between titles"))).toThrow(SharedSessionMutationUnsupportedError);
 		expect(await second).toEqual({ kind: "committed", title: "Second title" });
 		expect(publications).toBe(2);
-		expect(() => f.manager.appendMessage(user("after both titles"))).not.toThrow();
+		const appended = f.manager.appendMessage(user("after both titles"));
+		expect(f.manager.getEntries().some(entry => entry.id === appended)).toBe(true);
 	});
 
 	it("releases scoped admission when publication setup throws before the transaction", async () => {
@@ -213,6 +219,8 @@ describe("shared publication admission split", () => {
 		).rejects.toThrow();
 		// A leaked admission count would keep the session barred after the setup failure.
 		expect(() => f.manager.appendMessage(user("after failed publication"))).not.toThrow();
+		const appended = f.manager.appendMessage(user("retry after failed publication"));
+		expect(f.manager.getEntries().some(entry => entry.id === appended)).toBe(true);
 		await fs.rm(locks);
 		expect(
 			(await f.manager.appendTemporaryModelChangeSharingSession("test/temporary", { level: "high" }, () => true))
@@ -231,7 +239,8 @@ describe("shared publication admission split", () => {
 			() => true,
 		);
 		expect(outcome.kind).toBe("committed");
-		expect(() => f.manager.appendMessage(user("after temporary model"))).not.toThrow();
+		const appended = f.manager.appendMessage(user("after temporary model"));
+		expect(f.manager.getEntries().some(entry => entry.id === appended)).toBe(true);
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
@@ -247,6 +256,8 @@ describe("shared publication admission split", () => {
 			});
 		});
 		expect(() => f.manager.appendMessage(user("after thinking"))).not.toThrow();
+		const appended = f.manager.appendMessage(user("retry after thinking"));
+		expect(f.manager.getEntries().some(entry => entry.id === appended)).toBe(true);
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
 
@@ -257,7 +268,8 @@ describe("shared publication admission split", () => {
 		await f.manager.flush();
 		const outcome = await f.manager.appendToolSelectionsSharingSession(["mcp__probe"], undefined, () => true);
 		expect(outcome.kind).toBe("committed");
-		expect(() => f.manager.appendMessage(user("after tool selection"))).not.toThrow();
+		const appended = f.manager.appendMessage(user("after tool selection"));
+		expect(f.manager.getEntries().some(entry => entry.id === appended)).toBe(true);
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
@@ -397,12 +409,193 @@ describe("shared publication admission split", () => {
 		const reopened = await SessionManager.open(f.file, f.destination);
 		managers.push(reopened);
 		const reloaded = reopened.getEntries();
+		expect(reloaded.some(entry => entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE)).toBe(
+			true,
+		);
+		expect(reloaded.some(entry => entry.type === "message" && entry.message.role === "developer")).toBe(true);
+	});
+
+	it("keeps a background mode change ahead of a newer canonical append", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const original = f.manager.appendModeChangeSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendModeChangeSharingSession").mockImplementation(async (mode, data) => {
+			entered.resolve();
+			await gate.promise;
+			return original(mode, data);
+		});
+		const publication = f.session.appendModeChangeInBackground("plan");
+		await entered.promise;
+
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("newer canonical") });
+		// The canonical append must queue behind the older background publication instead
+		// of overtaking it through a free lease. Without the lane reservation it commits
+		// here and the older mode change lands after newer state.
+		await Bun.sleep(10);
 		expect(
-			reloaded.some(entry => entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE),
-		).toBe(true);
-		expect(
-			reloaded.some(entry => entry.type === "message" && entry.message.role === "developer"),
-		).toBe(true);
+			f.manager
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						entry.message.content === "newer canonical",
+				),
+		).toBe(false);
+
+		gate.resolve();
+		expect(await publication).toEqual({ committed: true });
+		await f.session.awaitSessionSettlement();
+		await f.manager.flush();
+		const persisted = await Bun.file(f.file).text();
+		const modeIndex = persisted.indexOf('"type":"mode_change"');
+		const messageIndex = persisted.indexOf("newer canonical");
+		expect(modeIndex).toBeGreaterThanOrEqual(0);
+		expect(messageIndex).toBeGreaterThan(modeIndex);
+	});
+
+	it("joins a paused recovery drain instead of publishing a deferred result twice", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		// Queue one deferred command result without starting a turn.
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo deferred-once", shellResult("deferred once"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let publications = 0;
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution") {
+				publications++;
+				entered.resolve();
+				await gate.promise;
+			}
+			return original(message);
+		});
+
+		// Force recovery starts the drain detached; make it pause inside the lease.
+		vi.spyOn(f.session.agent, "waitForIdle").mockImplementation(() => new Promise<void>(() => {}));
+		vi.spyOn(f.session.agent, "prompt").mockRejectedValue(new Error("successor run blocked by test"));
+		await f.session.abort({ timeoutMs: 1 });
+		await entered.promise;
+
+		// A successor prompt joins the retained drain owner rather than starting a second
+		// traversal of the same pending entry.
+		const successor = f.session.prompt("successor").catch((error: unknown) => error);
+		await Bun.sleep(10);
+		expect(publications).toBe(1);
+
+		gate.resolve();
+		await successor;
+		await f.session.awaitSessionSettlement();
+		expect(publications).toBe(1);
+		expect(persisted).toHaveBeenCalledTimes(1);
+		await f.manager.flush();
+		const durable = await Bun.file(f.file).text();
+		expect(durable.split("deferred once").length - 1).toBe(1);
+	});
+
+	it("reports a Python result as persisted only after the shared append commits", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "pythonExecution") {
+				entered.resolve();
+				await gate.promise;
+			}
+			return original(message);
+		});
+		const persisted = vi.fn();
+		f.session.recordPythonResult("print('shared')", shellResult("python shared output"), { onPersisted: persisted });
+		await entered.promise;
+		expect(persisted).not.toHaveBeenCalled();
+
+		gate.resolve();
+		await f.session.awaitSessionSettlement();
+		expect(persisted).toHaveBeenCalledTimes(1);
+		await f.manager.flush();
+		expect(await Bun.file(f.file).text()).toContain("python shared output");
+	});
+
+	it("withholds Python onPersisted when the shared append is refused", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockResolvedValue({
+			kind: "rejected",
+			error: new Error("lease refused"),
+		});
+		const notice = vi.spyOn(f.session, "emitNotice");
+		const persisted = vi.fn();
+		f.session.recordPythonResult("print('refused')", shellResult("python refused output"), {
+			onPersisted: persisted,
+		});
+		await f.session.awaitSessionSettlement();
+		expect(persisted).not.toHaveBeenCalled();
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Could not save the python result to this session: lease refused",
+			"session-publication",
+		);
+	});
+
+	it("keeps the structured near-limit outcome on a canonical shared tool result", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const nearLimit = new SessionNearLimitAppendError({
+			entryBytes: 900,
+			liveBytes: 1000,
+			capBytes: 1000,
+			entryRetained: true,
+		});
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockResolvedValue({
+			kind: "unknown",
+			id: "near-limit-entry",
+			error: nearLimit,
+		});
+		const result = {
+			role: "toolResult" as const,
+			toolCallId: "call-1",
+			toolName: "edit",
+			content: [{ type: "text" as const, text: "applied" }],
+			isError: false,
+			timestamp: 3,
+		};
+		f.session.agent.emitExternalEvent({ type: "message_end", message: result as never });
+		await f.session.awaitSessionSettlement().catch(() => {});
+
+		// The shared wrapper must not swallow the typed outcome: the tool result carries
+		// the structured failure and the recovery guidance the operator needs.
+		expect(result.isError).toBe(true);
+		const text = result.content[0]?.text ?? "";
+		expect(text).toContain("managed per-file limit");
+		expect(text).toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
+		expect("details" in result ? result.details : undefined).toMatchObject({
+			failureKind: "persistence",
+			nearLimitAppend: {
+				code: "near_limit_append",
+				entryBytes: 900,
+				liveBytes: 1000,
+				capBytes: 1000,
+				entryRetained: true,
+			},
+		});
 	});
 
 	it("refuses every additive legacy append of a shared logical session before mutating", async () => {
@@ -483,21 +676,57 @@ describe("shared publication admission split", () => {
 		await f.manager.flush();
 		const outcome = await f.manager.appendModeChangeSharingSession("plan", { planFilePath: "/tmp/plan.md" });
 		expect(outcome.kind).toBe("committed");
-		expect(() => f.manager.appendMessage(user("after mode change"))).not.toThrow();
+		const appended = f.manager.appendMessage(user("after mode change"));
+		expect(f.manager.getEntries().some(entry => entry.id === appended)).toBe(true);
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
 
-	it("persists a tree-navigator label after shared admission", async () => {
+	it("publishes a tree-navigator label through the real controller after shared admission", async () => {
 		const f = await fixture();
+		await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+		await Settings.init({ inMemory: true });
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 		const leaf = f.manager.getLeafId();
 		if (!leaf) throw new Error("missing leaf");
-		// modes/controllers/selector-controller.ts routes the tree navigator's label submit here.
-		expect(await f.session.appendLabelChangeInBackground(leaf, "tree-label")).toEqual({ committed: true });
+
+		const editor = new Container();
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const ctx = {
+			session: f.session,
+			sessionManager: f.manager,
+			settings: Settings.isolated(),
+			editor,
+			editorContainer,
+			ui: { terminal: { rows: 40 }, setFocus: vi.fn(), requestRender: vi.fn() },
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+			showWarning: vi.fn(),
+			isStopped: () => false,
+			statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
+			resetIrcSidebarSession: vi.fn(),
+			resetObserverRegistry: vi.fn(),
+			updateEditorTopBorder: vi.fn(),
+			updateEditorBorderColor: vi.fn(),
+			rebuildInitialMessages: vi.fn(),
+			reloadTodos: vi.fn(async () => {}),
+			goalModeController: { scheduleContinuation: vi.fn() },
+		} as unknown as InteractiveModeContext;
+		// The real producer: SelectorController owns the tree navigator's label callback.
+		new SelectorController(ctx).showTreeSelector();
+		const selector = editorContainer.children.find(child => child instanceof TreeSelectorComponent);
+		if (!(selector instanceof TreeSelectorComponent)) throw new Error("tree selector was not shown");
+
+		// Same submit path the navigator uses: Shift+L opens the label input, Enter submits it.
+		selector.getTreeList().onLabelEdit?.(leaf, undefined);
+		selector.handleInput("tree-label");
+		selector.handleInput("\n");
 		await f.session.awaitSessionSettlement();
 		await f.manager.flush();
+
+		expect(ctx.showError).not.toHaveBeenCalled();
 		expect(await Bun.file(f.file).text()).toContain('"label":"tree-label"');
 	});
 

@@ -634,6 +634,26 @@ import { TerminalIdleAdmissionError, YieldQueue } from "./yield-queue";
  */
 type SessionPersistedMessage = Message | CustomMessage | BashExecutionMessage | PythonExecutionMessage | FileMentionMessage;
 
+/** A deferred command result whose shared publication could not be proven durable or absent. */
+interface UnresolvedExecutionPublication {
+	readonly entryId: string;
+	readonly reason: string;
+}
+
+/**
+ * One command result waiting for a publication slot.
+ *
+ * `unresolved` is set after reconciliation could neither find the attempted entry in the
+ * transcript nor prove it absent. Such an entry is never retried: a blind resubmission
+ * would allocate a second entry for a message that may already be durable.
+ */
+type PendingExecutionMessage<T extends BashExecutionMessage | PythonExecutionMessage> = {
+	message: T;
+	onPersisted?: () => void;
+	appendedToAgent: boolean;
+	unresolved?: UnresolvedExecutionPublication;
+};
+
 /**
  * #4560: structured workflow recovery projection from canonical durable
  * Ralplan/Ultragoal state, consumed by the compaction summary context and
@@ -4387,11 +4407,7 @@ export class AgentSession {
 
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
-	#pendingBashMessages: Array<{
-		message: BashExecutionMessage;
-		onPersisted?: () => void;
-		appendedToAgent: boolean;
-	}> = [];
+	#pendingBashMessages: Array<PendingExecutionMessage<BashExecutionMessage>> = [];
 	/**
 	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
 	 * own turn without pausing any later turn.
@@ -4547,11 +4563,12 @@ export class AgentSession {
 	/** MCP tool names skipped because a non-MCP tool already holds them. */
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
-	#pendingPythonMessages: Array<{
-		message: PythonExecutionMessage;
-		onPersisted?: () => void;
-		appendedToAgent: boolean;
-	}> = [];
+	#pendingPythonMessages: Array<PendingExecutionMessage<PythonExecutionMessage>> = [];
+	/**
+	 * Retained owner of the pending-message drain. Concurrent callers join this promise
+	 * instead of traversing the shared queues themselves.
+	 */
+	#pendingPromptDrain: Promise<void> | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -6121,7 +6138,37 @@ export class AgentSession {
 		return false;
 	}
 
+	/**
+	 * Join the retained drain owner, starting one when none is in flight.
+	 *
+	 * The pending queues are shared mutable state and their per-entry publications
+	 * await. A second drain traversing them concurrently would publish the same entry
+	 * twice or splice successors out of order, so there is exactly one owner and every
+	 * caller — prompt preflight, prompt finalization, and forced recovery — joins it.
+	 * The owner is cleared only after it settles, so a caller that arrives during
+	 * settlement starts the next drain instead of observing a stale promise.
+	 */
 	async #flushPendingPromptMessages(): Promise<void> {
+		for (;;) {
+			const drain = this.#pendingPromptDrain ?? this.#startPendingPromptDrain();
+			await drain;
+			// Another caller may have started a successor drain while this one settled;
+			// it owns entries queued after this batch, so join that one too.
+			if (this.#pendingPromptDrain && this.#pendingPromptDrain !== drain) continue;
+			return;
+		}
+	}
+
+	#startPendingPromptDrain(): Promise<void> {
+		let drain: Promise<void>;
+		drain = this.#drainPendingPromptMessages().finally(() => {
+			if (this.#pendingPromptDrain === drain) this.#pendingPromptDrain = undefined;
+		});
+		this.#pendingPromptDrain = drain;
+		return drain;
+	}
+
+	async #drainPendingPromptMessages(): Promise<void> {
 		const errors: unknown[] = [];
 		try {
 			await this.#flushPendingBashMessages();
@@ -8306,6 +8353,28 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Run a durable publication inside the canonical scheduling lane.
+	 *
+	 * The reservation is synchronous, so the publication keeps the order of the call that
+	 * produced it rather than the order in which the cross-process lease happens to become
+	 * free. The managed lease is exclusion only: it cannot stop a newer publication from
+	 * acquiring it first and appending newer state ahead of an older queued entry. Joining
+	 * the lane's predecessor before the lease is acquired is what preserves call order;
+	 * the slot is released after the publication settles.
+	 */
+	#withCanonicalSchedulingLane<T>(body: () => Promise<T>): Promise<T> {
+		const { predecessor, release } = this.#reserveCanonicalSchedulingSlot();
+		return (async () => {
+			try {
+				if (!predecessor.released) await predecessor.promise;
+				return await body();
+			} finally {
+				release();
+			}
+		})();
+	}
+
 	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
 		const group = (this.#thinkingControlAdmissionGroup ??= {
 			...this.#reserveCanonicalSchedulingSlot(),
@@ -9117,7 +9186,7 @@ export class AgentSession {
 						const outcome = await this.sessionManager.appendMessageSharingSession(event.message);
 						if (outcome.kind !== "committed") {
 							throw new Error(
-								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 								{ cause: outcome },
 							);
 						}
@@ -9128,8 +9197,6 @@ export class AgentSession {
 					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
 					canonicalAdmission?.fail(error);
-					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
-					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -9137,11 +9204,16 @@ export class AgentSession {
 					// continuation path instead of a generic fatal abort. The typed
 					// error already performed deterministic recovery, so the session is
 					// not poisoned and the turn ends with actionable state.
-					if (error instanceof SessionNearLimitAppendError) {
+					// A shared append reports this as an `unknown` outcome and wraps it in a
+					// generic publication error, so it must be recognised before the shared
+					// abort. It must not enter the legacy todo recovery path or authorise a
+					// rewrite: the shared rewrite bar is what refused the recovery.
+					const nearLimit = sharedAppendNearLimitError(error);
+					if (nearLimit) {
 						this.agent.abort();
 						if (event.message.role === "toolResult") {
 							event.message.isError = true;
-							const committed = error.entryRetained
+							const committed = nearLimit.entryRetained
 								? "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
 								: "The edit committed on disk but its receipt could not be retained in the live session.";
 							event.message.content = [
@@ -9160,17 +9232,19 @@ export class AgentSession {
 									: {}),
 								failureKind: "persistence",
 								nearLimitAppend: {
-									code: error.code,
-									entryBytes: error.entryBytes,
-									liveBytes: error.liveBytes,
-									capBytes: error.capBytes,
-									entryRetained: error.entryRetained,
+									code: nearLimit.code,
+									entryBytes: nearLimit.entryBytes,
+									liveBytes: nearLimit.liveBytes,
+									capBytes: nearLimit.capBytes,
+									entryRetained: nearLimit.entryRetained,
 								},
 							};
 							this.agent.touchContext();
 						}
 						return;
 					}
+					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
+					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					if (
 						event.message.role !== "toolResult" ||
 						event.message.toolName !== "todo_write" ||
@@ -16768,7 +16842,7 @@ export class AgentSession {
 		);
 		if (outcome.kind !== "committed") {
 			throw new Error(
-				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 				{ cause: outcome },
 			);
 		}
@@ -16794,8 +16868,9 @@ export class AgentSession {
 	 * Publish a custom entry from a synchronous call site.
 	 *
 	 * A shared-append session publishes through its admitted path in the background and
-	 * logs a refusal, because such a caller cannot await a transaction and a refusal must
-	 * not abort its turn. The legacy form throws inline exactly as before.
+	 * reports a refusal or an unconfirmed outcome to the operator, because such a caller
+	 * cannot await a transaction and a refusal must not abort its turn. The legacy form
+	 * throws inline exactly as before.
 	 */
 	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
 		if (!this.#usesSharedWorkflowIntentAppend()) {
@@ -16865,29 +16940,48 @@ export class AgentSession {
 	/**
 	 * Run one background publication.
 	 *
-	 * Returns the real outcome: `false` means nothing was committed, and the caller must
-	 * treat the entry as not persisted. A refusal never throws into the turn (a synchronous
-	 * producer cannot await a transaction and must not abort the run), so the cause is
-	 * logged here with the operation and the promise is registered for settlement joining.
+	 * The publication reserves the canonical scheduling lane synchronously, waits for its
+	 * predecessor, and only then acquires the cross-process lease, so an older queued entry
+	 * cannot be overtaken by a newer canonical append. A refusal never throws into the turn
+	 * (a synchronous producer cannot await a transaction and must not abort the run), so the
+	 * cause is reported here and the promise is registered for settlement joining.
+	 *
+	 * `unknown` is not a refusal: the entry may have been committed before the failure that
+	 * produced the outcome. It is reconciled against the transcript first and reported as
+	 * unconfirmed when reconciliation cannot decide.
 	 */
 	#publishInBackground(
 		operation: string,
 		publish: () => Promise<SharedAppendOutcome>,
 	): Promise<BackgroundPublicationResult> {
-		const task = publish()
-			.then((outcome): BackgroundPublicationResult => {
+		const task = this.#withCanonicalSchedulingLane(async (): Promise<BackgroundPublicationResult> => {
+			try {
+				const outcome = await publish();
 				if (outcome.kind === "committed") return { committed: true };
 				const cause = describeSharedAppendFailure(outcome);
+				if (outcome.kind === "unknown") {
+					const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
+					if (reconciled.kind === "committed") return { committed: true };
+					if (reconciled.kind === "unresolved") {
+						const reason = `${cause.reason ?? cause.outcome}; durability could not be confirmed or disproved`;
+						logger.warn(
+							"Shared session append has an unknown outcome; the entry may already be in the transcript",
+							{ operation, entryId: outcome.id, cause: reason },
+						);
+						this.#reportBackgroundUncertainty(operation, reason);
+						return { committed: false, durability: "unknown", entryId: outcome.id, cause: reason };
+					}
+				}
 				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
 				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
 				return { committed: false, cause: cause.reason };
-			})
-			.catch((error: unknown): BackgroundPublicationResult => {
+			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);
 				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
 				this.#reportBackgroundRefusal(operation, reason);
 				return { committed: false, cause: reason };
-			});
+			}
+		});
 		return this.#trackBackgroundPublication(task);
 	}
 
@@ -16901,6 +16995,22 @@ export class AgentSession {
 	#reportBackgroundRefusal(operation: string, reason: string): void {
 		if (this.#isDisposed) return;
 		this.emitNotice("warning", `Could not save the ${operation} to this session: ${reason}`, "session-publication");
+	}
+
+	/**
+	 * Surface an unconfirmed background publication to the operator.
+	 *
+	 * Reporting a refusal here would be a lie: the entry may already be durable. Say so
+	 * explicitly instead, so the operator re-reads the transcript rather than re-creating
+	 * an entry that might already exist.
+	 */
+	#reportBackgroundUncertainty(operation: string, reason: string): void {
+		if (this.#isDisposed) return;
+		this.emitNotice(
+			"warning",
+			`Could not confirm that the ${operation} was saved to this session: ${reason}. It may already be in the transcript.`,
+			"session-publication",
+		);
 	}
 
 	/** Join a background publication at settlement time; never leaves a rejection unobserved. */
@@ -16944,23 +17054,35 @@ export class AgentSession {
 	}
 
 	/**
-	 * Persist one deferred command result and throw when it was not committed.
+	 * Persist one deferred command result and throw when it was not confirmed durable.
 	 *
-	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
-	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
-	 * cannot express that, so this path awaits the lease and converts every non-committed
-	 * outcome into a throw carrying the cause.
+	 * The deferred flush must be able to tell "durably persisted" apart from "not
+	 * persisted" so it can keep the entry queued for retry and withhold `onPersisted`. A
+	 * background publish cannot express that, so this path awaits the lease in the
+	 * canonical lane and converts every non-committed outcome into a throw carrying the
+	 * cause. An `unknown` outcome is reconciled first: the entry may already be durable,
+	 * and resubmitting it would duplicate it rather than retry it.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
 		if (!this.#usesSharedWorkflowIntentAppend()) {
 			this.sessionManager.appendMessage(message);
 			return;
 		}
-		const outcome = await this.#trackBackgroundPublication(this.sessionManager.appendMessageSharingSession(message));
-		if (outcome.kind !== "committed") {
-			const cause = describeSharedAppendFailure(outcome);
-			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
+		const outcome = await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(() => this.sessionManager.appendMessageSharingSession(message)),
+		);
+		if (outcome.kind === "committed") return;
+		const cause = describeSharedAppendFailure(outcome);
+		if (outcome.kind === "unknown") {
+			const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
+			if (reconciled.kind === "committed") return;
+			const reason = cause.reason ?? cause.outcome;
+			if (reconciled.kind === "unresolved") {
+				this.#reportBackgroundUncertainty(label, `${reason}; durability could not be confirmed or disproved`);
+				throw new UnresolvedExecutionPublicationError(outcome.id, reason);
+			}
 		}
+		this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
 		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
 	}
 
@@ -20404,8 +20526,9 @@ export class AgentSession {
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
 		if (hadLivePrompt) this.#releasePowerAssertion();
-		// Recovery must not block on a shared publication; the flush keeps uncommitted
-		// entries queued for a later retry and logs its own failure here instead.
+		// Recovery must not block on a shared publication; the flush keeps failed entries
+		// queued for a later retry, holds entries whose durability is unconfirmed without
+		// resubmitting them, and logs its own failure here instead.
 		void this.#flushPendingPromptMessages().catch(error => {
 			logger.warn("Failed to flush deferred prompt messages during forced recovery", { error: String(error) });
 		});
@@ -31867,7 +31990,10 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			void this.#publishMessageInBackground("python result", pythonMessage);
+			// `onPersisted` is the durability signal: a shared append may be refused or end
+			// with an unknown outcome, and reporting success before the entry is committed
+			// would promise a reload survival that never happened (#7815).
+			void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -31875,7 +32001,6 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
-			options?.onPersisted?.();
 		}
 	}
 
@@ -31938,19 +32063,33 @@ export class AgentSession {
 	}
 
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<PendingExecutionMessage<T>>,
 		kind: "bash" | "python",
 	): Promise<void> {
-		if (pendingMessages.length === 0) return;
+		// Take exactly the entries queued now. Anything appended while this drain awaits
+		// belongs to a later batch and must stay behind the entries retained here; a
+		// length-indexed splice at the end would drop those successors.
+		const batch = pendingMessages.splice(0);
+		if (batch.length === 0) return;
 
-		const total = pendingMessages.length;
-		const remaining: typeof pendingMessages = [];
+		const total = batch.length;
+		const remaining: typeof batch = [];
 		const errors: unknown[] = [];
 		const persisted: string[] = [];
 		let callbackFailureCount = 0;
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
-		for (const pending of pendingMessages) {
+		let unresolvedCount = 0;
+		for (const pending of batch) {
+			if (pending.unresolved) {
+				// Reconciliation could not prove this entry durable or absent. Resubmitting it
+				// could duplicate a message that already reached the transcript, so it stays
+				// queued and blocks its successors exactly like an earlier failed append.
+				persistenceBlocked = true;
+				unresolvedCount++;
+				remaining.push(pending);
+				continue;
+			}
 			if (!pending.appendedToAgent) {
 				if (agentAppendBlocked) {
 					remaining.push(pending);
@@ -31976,10 +32115,14 @@ export class AgentSession {
 			try {
 				await this.#persistExecutionMessage("deferred command result", pending.message);
 			} catch (error) {
-				// Session entries form a leaf-linked transcript. Once one append fails,
-				// later entries must remain queued behind it or a retry would append the
-				// failed entry after messages that originally followed it.
+				// Session entries form a leaf-linked transcript. Once one append fails or its
+				// durability is unconfirmed, later entries must remain queued behind it or a
+				// retry would append the failed entry after messages that originally followed it.
 				persistenceBlocked = true;
+				if (error instanceof UnresolvedExecutionPublicationError) {
+					pending.unresolved = { entryId: error.entryId, reason: error.message };
+					unresolvedCount++;
+				}
 				remaining.push(pending);
 				errors.push(error);
 				continue;
@@ -31994,22 +32137,30 @@ export class AgentSession {
 			}
 		}
 
-		pendingMessages.splice(0, pendingMessages.length, ...remaining);
-		if (errors.length === 0) return;
+		if (remaining.length > 0) pendingMessages.unshift(...remaining);
+		if (errors.length === 0 && unresolvedCount === 0) return;
 
 		const persistedCount = total - remaining.length;
-		const persistenceFailureCount = remaining.length;
+		const failedCount = remaining.length - unresolvedCount;
 		const persistenceSummary =
-			persistenceFailureCount > 0
-				? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
-				: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
+			unresolvedCount > 0
+				? `Could not confirm persistence of ${unresolvedCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, ${failedCount} failed, and unconfirmed messages stay queued without retry to avoid duplicates`
+				: remaining.length > 0
+					? `Failed to persist ${remaining.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
 				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
 				: "";
 		const pending = remaining.map(item => ("command" in item.message ? item.message.command : item.message.code));
+		const reported =
+			errors.length > 0
+				? errors
+				: remaining.flatMap(item =>
+						item.unresolved ? [new UnresolvedExecutionPublicationError(item.unresolved.entryId, item.unresolved.reason)] : [],
+					);
 		throw new AggregateError(
-			errors,
+			reported,
 			`${persistenceSummary}${callbackSummary}; persisted: ${JSON.stringify(persisted)}; pending: ${JSON.stringify(pending)}`,
 		);
 	}
@@ -34912,10 +35063,46 @@ export class AgentSession {
 	}
 }
 
-/** Outcome of a background publication: `false` means nothing reached the transcript. */
+/**
+ * Outcome of a background publication.
+ *
+ * `committed` is the only outcome that may be reported as persisted. `durability:
+ * "unknown"` means the append may have reached the transcript but reconciliation could
+ * neither find nor disprove it; it must be reported as unconfirmed, never as a refusal.
+ */
 interface BackgroundPublicationResult {
 	readonly committed: boolean;
+	/** Set when the entry may already be durable even though `committed` is false. */
+	readonly durability?: "unknown";
+	/** Attempted entry id when `durability` is `unknown`. */
+	readonly entryId?: string;
 	readonly cause?: string;
+}
+
+/** A deferred command result whose publication outcome could not be proven either way. */
+class UnresolvedExecutionPublicationError extends Error {
+	constructor(
+		readonly entryId: string,
+		reason: string,
+	) {
+		super(`Durability of the deferred command result (attempted id ${entryId}) is unknown: ${reason}`);
+		this.name = "UnresolvedExecutionPublicationError";
+	}
+}
+
+/**
+ * The typed near-limit failure a shared append may have wrapped as its `unknown` cause.
+ *
+ * The canonical shared path throws a generic publication error whose `cause` is the
+ * `SharedAppendOutcome`, whose `error` is the typed failure. The operator mapping has to
+ * see through both layers or a near-limit transcript degrades into a generic run abort.
+ */
+function sharedAppendNearLimitError(error: unknown): SessionNearLimitAppendError | undefined {
+	if (error instanceof SessionNearLimitAppendError) return error;
+	const cause = error instanceof Error ? error.cause : undefined;
+	if (cause === null || typeof cause !== "object" || !("error" in cause)) return undefined;
+	const outcomeError = cause.error;
+	return outcomeError instanceof SessionNearLimitAppendError ? outcomeError : undefined;
 }
 
 /** Flatten a non-committed shared outcome into log/report fields. */
@@ -34926,7 +35113,11 @@ function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: s
 			outcome: outcome.kind,
 			reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
 		};
-	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
+	if (outcome.kind === "unknown")
+		return {
+			outcome: outcome.kind,
+			reason: `attempted id ${outcome.id}: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`,
+		};
 	return { outcome: outcome.kind };
 }
 
@@ -34942,7 +35133,7 @@ function assertSharedAppendCommitted(
 ): asserts outcome is Extract<SharedAppendOutcome, { kind: "committed" }> {
 	if (outcome.kind === "committed") return;
 	throw new Error(
-		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 		{ cause: outcome },
 	);
 }
