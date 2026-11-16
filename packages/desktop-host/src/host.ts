@@ -367,7 +367,16 @@ interface SessionCandidate {
 	registry: ModelRegistry;
 	notices: DesktopMessage[];
 }
+interface ExclusiveViewHandoff {
+	/** No more SDK mutations remain in the exclusive operation. Receipt writes may still be pending. */
+	ready: Promise<void>;
+	settle: () => void;
+	/** Retiring persistence remains the request's before-ACK barrier, including failure. */
+	transferred?: Promise<void>;
+	persistence?: Promise<void>;
+}
 interface LiveSession extends SessionCandidate {
+	viewOwnerToken: symbol;
 	completion?: DesktopComposerCompletion;
 	observation?: SdkComposerObservation;
 	serviceGeneration: number;
@@ -378,6 +387,8 @@ interface LiveSession extends SessionCandidate {
 	/** A settled continuation arrived while the current catalog write still held admission. */
 	viewPending?: boolean;
 	viewPersistence?: Promise<void>;
+	/** Retirement may take final-view persistence without claiming delivery completion. */
+	exclusiveViewHandoff?: ExclusiveViewHandoff;
 	error?: string;
 	errorOwner?: string;
 	queuedAdmissionOrder?: number;
@@ -457,6 +468,8 @@ export class DesktopHost {
 	/** Process-local only: receipts and snapshots never recreate completion intent. */
 	#completedTasks = new Set<string>();
 	#live = new Map<string, LiveSession>();
+	/** Publication tokens survive live-map removal without retaining disposed SDK owners. */
+	#viewOwners = new WeakMap<SavedSession, symbol>();
 	#managed = new Map<string, ManagedSession>();
 	#managedControlEpoch = 0;
 	#managedOpening = new Map<string, Promise<ManagedSession>>();
@@ -1222,6 +1235,7 @@ export class DesktopHost {
 			throw new Error("Workspace is closed. Open the folder again to use this conversation.");
 		const live: LiveSession = {
 			...candidate,
+			viewOwnerToken: Symbol("desktop view owner"),
 			serviceGeneration: candidate.sdk.sessionLifecycle.generation,
 			unsubscribeActivity: () => {},
 			unsubscribeIdentity: () => {},
@@ -1242,6 +1256,7 @@ export class DesktopHost {
 			scopeOwners: new Map(),
 		};
 		this.#live.set(live.metadata.id, live);
+		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
 		this.#attachGatePresenter(live);
 		this.#attachOperatorController(live);
 		this.#attachBtwController(live);
@@ -1409,7 +1424,7 @@ export class DesktopHost {
 			if (entry?.type !== "message" || entry.message.role !== "user")
 				throw new Error("Invalid entry ID for branching");
 		}
-		await this.#flushSession(live);
+		await this.#flushSession(live, live);
 		assertSource();
 		if (!sourceFile) throw new Error("Session has no persisted transcript");
 		const project = this.#catalog.projects.find(item => item.id === live.metadata.projectId)!;
@@ -1632,6 +1647,7 @@ export class DesktopHost {
 	async #disposeLive(live: LiveSession): Promise<void> {
 		live.titleAbort?.abort();
 		this.#retiredLive.add(live);
+		const handoff = live.exclusiveViewHandoff;
 		this.#cancelQuestions(live.metadata.id);
 		const failures: unknown[] = [];
 		const attempt = async (operation: () => unknown | Promise<unknown>) => {
@@ -1641,19 +1657,11 @@ export class DesktopHost {
 				failures.push(error);
 			}
 		};
-		// A background settled-view save owns admission until its asynchronous flush
-		// finishes. Join it before disposing the manager it is still observing.
-		await attempt(async () => live.viewPersistence);
-		await attempt(async () => {
-			// Failed publication callers own compensation, even on retained cleanup retries.
-			// Workspace teardown still owns its catalog row after removing the live map entry.
-			if (live.busy || this.#rolledBackPublications.has(live)) return;
-			const view = this.#captureView(live);
-			if (!view) return;
-			await live.sdk.sessionManager.flush();
-			this.#recordView(live, view);
-			await this.#save();
-		});
+		// Transfer the final view, not terminal delivery. The retiring request still
+		// joins this exact promise before ACK; teardown may not dispose its manager first.
+		const persistence = this.#persistRetiringView(live, handoff);
+		if (handoff) handoff.transferred = persistence;
+		await attempt(() => persistence);
 		const persistenceFailures = failures.length;
 		await attempt(() => live.unsubscribe());
 		await attempt(() => live.unsubscribeActivity());
@@ -1679,12 +1687,44 @@ export class DesktopHost {
 		}
 		if (failures.length) throw new AggregateError(failures, "Session failed to release all owned resources");
 	}
+	async #persistRetiringView(live: LiveSession, handoff?: ExclusiveViewHandoff): Promise<void> {
+		const failures: unknown[] = [];
+		const attempt = async (operation: () => unknown | Promise<unknown>) => {
+			try {
+				await operation();
+			} catch (error) {
+				failures.push(error);
+			}
+		};
+		// The workspace caller bounds these joins with its original deadline. Actual
+		// cleanup retains the manager until the SDK-settled handoff and flush finish.
+		await attempt(async () => handoff?.ready);
+		await attempt(async () => handoff?.persistence);
+		await attempt(async () => live.viewPersistence);
+		await attempt(async () => {
+			// A ready exclusive handoff permits capture while its receipt still holds busy.
+			// Failed publications never regain authority, including on cleanup retry.
+			if ((live.busy && !handoff) || !this.#ownsView(live)) return;
+			const view = this.#captureView(live);
+			if (!view) return;
+			await live.sdk.sessionManager.flush();
+			if (!this.#ownsView(live)) return;
+			this.#recordView(live, view);
+			await this.#save();
+		});
+		if (failures.length) throw new AggregateError(failures, "Session final view persistence failed");
+	}
+	#ownsView(live: LiveSession): boolean {
+		return this.#viewOwners.get(live.metadata) === live.viewOwnerToken && !this.#rolledBackPublications.has(live);
+	}
 	async #persistLive(live: LiveSession): Promise<void> {
 		do {
 			live.viewPending = false;
-			if (this.#live.get(live.metadata.id) === live) await this.#flushSession(live);
+			if (!this.#ownsView(live)) return;
+			await this.#flushSession(live, live);
+			if (!this.#ownsView(live)) return;
 			await this.#save();
-		} while (live.viewPending && this.#live.get(live.metadata.id) === live);
+		} while (live.viewPending && this.#ownsView(live));
 	}
 	#captureView(candidate: SessionCandidate): SdkSessionView | undefined {
 		if (candidate.sdk.sessionLifecycle.disposed) return;
@@ -1707,7 +1747,8 @@ export class DesktopHost {
 		if (current?.sessionId === flushed.sessionId && current.leafEntryId === flushed.leafEntryId)
 			candidate.metadata.view = current;
 	}
-	async #flushSession(live: SessionCandidate): Promise<void> {
+	async #flushSession(live: SessionCandidate, owner?: LiveSession): Promise<void> {
+		if (owner && !this.#ownsView(owner)) return;
 		const manager = live.sdk.sessionManager;
 		const sessionId = live.sdk.sessionId;
 		const generation = live.sdk.sessionLifecycle.generation;
@@ -1734,6 +1775,8 @@ export class DesktopHost {
 		const root = await fs.realpath(this.#storageRoot(scope)).catch(() => this.#storageRoot(scope));
 		const parent = await fs.realpath(path.dirname(file)).catch(() => path.dirname(file));
 		const relative = path.relative(root, path.join(parent, path.basename(file)));
+		if (owner && !this.#ownsView(owner)) return;
+		assertCurrent();
 		this.#sessionPath(relative, scope);
 		// Record the transcript before the remaining fallible steps so a later failure
 		// can still discard the file this host just created.
@@ -1743,10 +1786,13 @@ export class DesktopHost {
 		// A committed empty successor reserves its path before creating the file.
 		// Materialize through the SDK, never publish a merely reserved catalog path.
 		await manager.ensureOnDisk();
+		if (owner && !this.#ownsView(owner)) return;
 		assertCurrent();
 		await manager.flush();
+		if (owner && !this.#ownsView(owner)) return;
 		assertCurrent();
 		const stat = await fs.stat(file);
+		if (owner && !this.#ownsView(owner)) return;
 		assertCurrent();
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
 		this.#recordView(live, view);
@@ -2062,6 +2108,9 @@ export class DesktopHost {
 		} finally {
 			unsubscribe();
 		}
+		// SDK idle is distinct from durable terminal delivery. Retirement may now take
+		// the final view while this request continues to own its pending journal write.
+		live.exclusiveViewHandoff?.settle();
 		const owned = run.started ? terminals.get(scopeKey(run.started.scope)) : undefined;
 		if (owned?.assistant === "error" || owned?.assistant === "aborted" || owned?.reason === "cancelled") {
 			await this.#delivery(id, {
@@ -2113,6 +2162,13 @@ export class DesktopHost {
 		live.scopeOwners.clear();
 		live.errorEpoch = (live.errorEpoch ?? 0) + 1;
 		this.#publish(live);
+		// Delete disposes inside its own operation; fork owns a separate publication.
+		// Only requests that owe source persistence participate in this handoff.
+		const ready = persistSource ? Promise.withResolvers<void>() : undefined;
+		const viewHandoff: ExclusiveViewHandoff | undefined = ready
+			? { ready: ready.promise, settle: () => ready.resolve() }
+			: undefined;
+		live.exclusiveViewHandoff = viewHandoff;
 		try {
 			if (retireGates) await live.gatePresenter?.withdrawAll();
 			return await operation();
@@ -2128,13 +2184,20 @@ export class DesktopHost {
 			throw error;
 		} finally {
 			live.streamingMessage = undefined;
-			this.#cancelQuestions(live.metadata.id);
+			viewHandoff?.settle();
 			try {
-				if (persistSource) await this.#persistLive(live);
+				this.#cancelQuestions(live.metadata.id);
+				if (viewHandoff?.transferred) await viewHandoff.transferred;
+				else if (persistSource) {
+					const persistence = this.#persistLive(live);
+					if (viewHandoff) viewHandoff.persistence = persistence;
+					await persistence;
+				}
 			} finally {
 				live.gateMutation = false;
 				live.busy = false;
-				if (this.#live.has(live.metadata.id)) this.#publish(live);
+				live.exclusiveViewHandoff = undefined;
+				if (this.#live.get(live.metadata.id) === live) this.#publish(live);
 			}
 		}
 	}

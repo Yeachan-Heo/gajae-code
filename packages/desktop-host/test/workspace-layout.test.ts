@@ -138,6 +138,54 @@ async function launch(
 	};
 }
 
+async function launchFinalView({ explicitResumeProviderScope = false } = {}) {
+	process.env.GJC_NO_TITLE = "1";
+	const api = `desktop-workspace-final-view-${crypto.randomUUID()}`;
+	const model = createMockModel({
+		provider: "desktop-workspace-final-view-fixture",
+		handler: () => ({ content: ["controlled answer"] }),
+	});
+	Object.defineProperty(model, "api", { value: api });
+	registerCustomApi(api, model.stream, api);
+	cleanups.push(async () => unregisterCustomApis(api));
+	const created: CreateAgentSessionResult[] = [];
+	const fixture = await launch({
+		createSession: async options => {
+			const result = await createAgentSession({
+				...options,
+				// Resume may explicitly retain the existing provider/logical identity.
+				// The public SDK then scopes jobs to provider+file rather than the initial
+				// default endpoint; neither job ownership nor exact-view identity is bypassed.
+				...(explicitResumeProviderScope && created.length > 0
+					? { providerSessionId: options.sessionManager?.getSessionId() }
+					: {}),
+				model,
+				extensions: [],
+				systemPrompt: ["Test"],
+				toolNames: [],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMcpAutoload: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				deferOptionalModelRefresh: true,
+			});
+			result.session.modelRegistry.authStorage.setRuntimeApiKey(model.provider, "fixture-only");
+			result.session.settings.set("compaction.enabled", false);
+			result.session.settings.set("retry.enabled", false);
+			result.session.settings.set("async.enabled", false);
+			created.push(result);
+			return result;
+		},
+	});
+	const readCatalog = (): Promise<{ sessions: Array<{ id: string; view?: SdkSessionView }> }> =>
+		Bun.file(path.join(fixture.dataDir, "catalog.json")).json();
+	return { ...fixture, created, model, readCatalog };
+}
+
 describe("desktop workspace layout", () => {
 	test("closing a workspace hides it and every conversation, and keeps their files", async () => {
 		const { call, snapshot, open, directory } = await launch();
@@ -516,50 +564,12 @@ describe("desktop workspace layout", () => {
 		"continued",
 		"root",
 	] as const)("workspace close persists the final settled %s view after removing its live owner", async selection => {
-		process.env.GJC_NO_TITLE = "1";
-		const api = `desktop-workspace-final-view-${crypto.randomUUID()}`;
-		const model = createMockModel({
-			provider: "desktop-workspace-final-view-fixture",
-			handler: () => ({ content: ["controlled answer"] }),
-		});
-		Object.defineProperty(model, "api", { value: api });
-		registerCustomApi(api, model.stream, api);
-		cleanups.push(async () => unregisterCustomApis(api));
-		const created: CreateAgentSessionResult[] = [];
-		const { call, open, snapshot, dataDir } = await launch({
-			createSession: async options => {
-				const result = await createAgentSession({
-					...options,
-					model,
-					extensions: [],
-					systemPrompt: ["Test"],
-					toolNames: [],
-					skills: [],
-					rules: [],
-					contextFiles: [],
-					promptTemplates: [],
-					slashCommands: [],
-					enableMcpAutoload: false,
-					enableLsp: false,
-					skipPythonPreflight: true,
-					deferOptionalModelRefresh: true,
-				});
-				result.session.modelRegistry.authStorage.setRuntimeApiKey(model.provider, "fixture-only");
-				result.session.settings.set("compaction.enabled", false);
-				result.session.settings.set("retry.enabled", false);
-				result.session.settings.set("async.enabled", false);
-				created.push(result);
-				return result;
-			},
-		});
+		const { call, open, snapshot, created, model, readCatalog } = await launchFinalView();
 		const project = await open("first");
 		const session = await call<DesktopSession>("session.create", { projectId: project.id });
 		await call("prompt", { sessionId: session.id, text: "initial saved view" });
 		const sdk = created[0]!.session;
 		const initial = captureSessionView(sdk);
-		const catalogPath = path.join(dataDir, "catalog.json");
-		const readCatalog = (): Promise<{ sessions: Array<{ id: string; view?: SdkSessionView }> }> =>
-			Bun.file(catalogPath).json();
 		expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(initial);
 		const abort = sdk.abort.bind(sdk);
 		let final: SdkSessionView | undefined;
@@ -580,6 +590,7 @@ describe("desktop workspace layout", () => {
 		}
 		if (!final) throw new Error("Workspace close did not capture its final settled view");
 		expect(final).not.toEqual(initial);
+		if (selection === "root") expect(final.leafEntryId).toBeNull();
 		expect(model.calls).toHaveLength(2);
 		expect(sdk.sessionLifecycle.disposed).toBe(true);
 		expect(snapshot().sessions).toEqual([]);
@@ -588,8 +599,203 @@ describe("desktop workspace layout", () => {
 		await call("session.select", { sessionId: session.id });
 		expect(created).toHaveLength(2);
 		expect(captureSessionView(created[1]!.session)).toEqual(final);
+		if (selection === "root") expect(captureSessionView(created[1]!.session).leafEntryId).toBeNull();
 		expect(model.calls).toHaveLength(2);
 	});
+
+	test("a final flush beyond the close budget cannot overwrite a successor's exact root view", async () => {
+		// Default logical-id endpoints correctly refuse a second live job manager.
+		// Explicit resume scopes retain the SAME provider/view identity with a distinct
+		// supported provider+file job endpoint. Never disable or replace that registry.
+		const { call, open, created, model, readCatalog } = await launchFinalView({ explicitResumeProviderScope: true });
+		const project = await open("first");
+		const session = await call<DesktopSession>("session.create", { projectId: project.id });
+		await call("prompt", { sessionId: session.id, text: "initial saved view" });
+		const sdk = created[0]!.session;
+		const initial = captureSessionView(sdk);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const disposed = Promise.withResolvers<void>();
+		let holdFinalFlush = false;
+		let final: SdkSessionView | undefined;
+		const abort = sdk.abort.bind(sdk);
+		const closingAbort = vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			await abort(options);
+			await sdk.prompt("retiring owner's final append");
+			await sdk.waitForIdle();
+			final = captureSessionView(sdk);
+			holdFinalFlush = true;
+		});
+		const flush = sdk.sessionManager.flush.bind(sdk.sessionManager);
+		const finalFlush = vi.spyOn(sdk.sessionManager, "flush").mockImplementation(async () => {
+			await flush();
+			if (!holdFinalFlush) return;
+			holdFinalFlush = false;
+			entered.resolve();
+			await release.promise;
+		});
+		const dispose = sdk.dispose.bind(sdk);
+		const disposal = vi.spyOn(sdk, "dispose").mockImplementation(async options => {
+			await dispose(options);
+			disposed.resolve();
+		});
+		const closing = call("project.close", { projectId: project.id });
+		try {
+			await entered.promise;
+			// Use the real close budget: A still owns its manager when the folder queue releases.
+			await closing;
+			expect(sdk.sessionLifecycle.disposed).toBe(false);
+			if (!final) throw new Error("Missing retiring owner's final view");
+			expect(final).not.toEqual(initial);
+			expect(final.leafEntryId).not.toBeNull();
+			await open("first");
+			await call("session.select", { sessionId: session.id });
+			const successor = created[1]!.session;
+			expect(successor.sessionManager.getSessionFile()).toBe(sdk.sessionManager.getSessionFile());
+			expect(successor.sessionManager.getSessionId()).toBe(sdk.sessionManager.getSessionId());
+			expect(captureSessionView(successor)).toEqual(initial);
+			await restoreSessionView(successor, { sessionId: successor.sessionId, leafEntryId: null });
+			await call("session.star", { sessionId: session.id, starred: true });
+			const selected = captureSessionView(successor);
+			expect(selected.leafEntryId).toBeNull();
+			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(selected);
+
+			release.resolve();
+			await disposed.promise;
+			expect(sdk.sessionLifecycle.disposed).toBe(true);
+			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(selected);
+			// A fresh SDK owner must restore B's exact root, not A's late append or the file tail.
+			await call("project.close", { projectId: project.id });
+			await open("first");
+			await call("session.select", { sessionId: session.id });
+			expect(created).toHaveLength(3);
+			expect(captureSessionView(created[2]!.session)).toEqual(selected);
+			expect(captureSessionView(created[2]!.session).leafEntryId).toBeNull();
+			expect(model.calls).toHaveLength(2);
+		} finally {
+			release.resolve();
+			await closing;
+			await disposed.promise;
+			closingAbort.mockRestore();
+			finalFlush.mockRestore();
+			disposal.mockRestore();
+		}
+	}, 30000);
+
+	test.each([
+		"continued",
+		"root",
+		"superseded",
+	] as const)("workspace close drains an exclusive %s view behind its pending terminal receipt", async selection => {
+		const { call, open, created, model, readCatalog, dataDir } = await launchFinalView();
+		const project = await open("first");
+		const session = await call<DesktopSession>("session.create", { projectId: project.id });
+		await call("prompt", { sessionId: session.id, text: "initial saved view" });
+		const sdk = created[0]!.session;
+		const initial = captureSessionView(sdk);
+		expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(initial);
+		let ownedJournal: DeliveryJournal | undefined;
+		const list = DeliveryJournal.prototype.list;
+		const probe = vi.spyOn(DeliveryJournal.prototype, "list").mockImplementation(function (this: DeliveryJournal) {
+			const receipts = list.call(this);
+			if (receipts.some(receipt => receipt.sessionId === session.id)) ownedJournal = this;
+			return receipts;
+		});
+		try {
+			await call("bootstrap");
+		} finally {
+			probe.mockRestore();
+		}
+		if (!ownedJournal) throw new Error("Missing fixture-owned delivery journal");
+		const journalOwner = ownedJournal;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const disposed = Promise.withResolvers<void>();
+		const requestId = "close-final-prompt";
+		let final: SdkSessionView | undefined;
+		const update = journalOwner.update.bind(journalOwner);
+		const terminalWrite = vi.spyOn(journalOwner, "update").mockImplementation(async (id, changes) => {
+			if (id === requestId && changes.disposition === "completed") {
+				if (selection === "root") await restoreSessionView(sdk, { sessionId: sdk.sessionId, leafEntryId: null });
+				final = captureSessionView(sdk);
+				entered.resolve();
+				await release.promise;
+			}
+			await update(id, changes);
+		});
+		const dispose = sdk.dispose.bind(sdk);
+		const disposal = vi.spyOn(sdk, "dispose").mockImplementation(async options => {
+			await dispose(options);
+			disposed.resolve();
+		});
+		let responded = false;
+		const prompting = call("prompt", { sessionId: session.id, text: "final exclusive append" }, requestId).then(
+			() => {
+				responded = true;
+			},
+		);
+		let closing: Promise<unknown> | undefined;
+		try {
+			await entered.promise;
+			if (!final) throw new Error("Missing exclusive operation's final view");
+			expect(final).not.toEqual(initial);
+			if (selection === "root") expect(final.leafEntryId).toBeNull();
+			expect(sdk.isStreaming).toBe(false);
+			closing = call("project.close", { projectId: project.id });
+			await closing;
+			// Actual teardown takes the settled view without claiming the held receipt completed.
+			await disposed.promise;
+			expect(responded).toBe(false);
+			expect(disposal).toHaveBeenCalledTimes(1);
+			expect(sdk.sessionLifecycle.disposed).toBe(true);
+			const pending = { id: requestId, sessionId: session.id, disposition: "accepted" };
+			expect((await call<DesktopSnapshot>("bootstrap")).deliveries).toContainEqual(expect.objectContaining(pending));
+			const journal: { receipts: Array<{ id: string; disposition: string }> } = await Bun.file(
+				path.join(dataDir, "deliveries.json"),
+			).json();
+			expect(journal.receipts).toContainEqual(expect.objectContaining(pending));
+			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(final);
+			await open("first");
+			await call("session.select", { sessionId: session.id });
+			expect(created).toHaveLength(2);
+			const successor = created[1]!.session;
+			expect(captureSessionView(successor)).toEqual(final);
+			if (selection === "root") expect(captureSessionView(successor).leafEntryId).toBeNull();
+			let expected = final;
+			if (selection === "superseded") {
+				await restoreSessionView(successor, { sessionId: successor.sessionId, leafEntryId: null });
+				await call("session.star", { sessionId: session.id, starred: true });
+				expected = captureSessionView(successor);
+				expect(expected.leafEntryId).toBeNull();
+				await call("project.close", { projectId: project.id });
+				await open("first");
+				await call("session.select", { sessionId: session.id });
+			}
+			expect(responded).toBe(false);
+			expect((await call<DesktopSnapshot>("bootstrap")).deliveries).toContainEqual(expect.objectContaining(pending));
+			release.resolve();
+			await prompting;
+			await disposed.promise;
+			expect(responded).toBe(true);
+			expect(sdk.sessionLifecycle.disposed).toBe(true);
+			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(expected);
+			expect((await call<DesktopSnapshot>("bootstrap")).deliveries).toContainEqual(
+				expect.objectContaining({ id: requestId, disposition: "completed" }),
+			);
+			expect(created).toHaveLength(selection === "superseded" ? 3 : 2);
+			const reopened = captureSessionView(created.at(-1)!.session);
+			expect(reopened).toEqual(expected);
+			if (selection === "root" || selection === "superseded") expect(reopened.leafEntryId).toBeNull();
+			expect(model.calls).toHaveLength(2);
+		} finally {
+			release.resolve();
+			await prompting;
+			await closing;
+			if (closing) await disposed.promise;
+			terminalWrite.mockRestore();
+			disposal.mockRestore();
+		}
+	}, 30000);
 
 	test("a closed workspace stays closed across a restart, and open ones still reorder", async () => {
 		const { call, snapshot, open, dataDir, directory, createHost } = await launch();
