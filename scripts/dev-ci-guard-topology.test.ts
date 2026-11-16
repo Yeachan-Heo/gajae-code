@@ -436,9 +436,48 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 	});
 	test("dispatch workflow admission cannot deadlock its virtual integration job", async () => {
 		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
-		const workflowConcurrency = source.match(/group:\s*>-\s*\n\s*\$\{\{[\s\S]*?cancel-in-progress:/)?.[0] ?? "";
+		const workflowConcurrency = source.match(/group:\s*>\-\s*\n\s*\$\{\{[\s\S]*?cancel-in-progress:/)?.[0] ?? "";
 		expect(workflowConcurrency).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
 		expect(workflowConcurrency).not.toContain("'dev-ci-virtual-integration'");
+	});
+
+	// The affected planner selects its own `ci-selftest`/`affected-selftest` task for
+	// CI-harness changes, so a planner regression that stops emitting that task also
+	// stops the tests that would catch it. This fixed job is the independent rail:
+	// it has no planner dependency, so neither relevance nor task emission can hide
+	// these tests, and the required affected aggregate fails closed on its result.
+	test("runs the CI meta-script unit tests independently of the affected plan", async () => {
+		const d = await workflow();
+		const meta = requiredJob(d, "ci-meta-tests");
+		// No `needs` on purpose: the tests must not be gated by the plan they validate.
+		expect(meta.needs ?? []).toEqual([]);
+		expect(meta["runs-on"]).toBe("ubuntu-22.04");
+		// Non-code events validate nothing in any other job, so this rail shares the
+		// planner's metadata-edit / head-only-dispatch skip predicate exactly.
+		expect(meta.if).toBe(requiredJob(d, "affected-plan").if);
+		expect(checkoutRef(meta.steps)).toBe("${{ github.event.pull_request.head.sha || github.sha }}");
+		// A fixed workflow step is only meaningful if it runs installed tests; the
+		// tarball order also keeps the invocation unambiguous on every platform.
+		const installIndex = meta.steps.findIndex(step => step.run?.trim() === "bun install --frozen-lockfile");
+		const testIndex = meta.steps.findIndex(step => step.name === "Run CI meta-script unit tests");
+		expect(installIndex).toBeGreaterThan(-1);
+		expect(testIndex).toBeGreaterThan(installIndex);
+		const invocation = namedStep(meta, "Run CI meta-script unit tests").run ?? "";
+		expect(invocation.trim().split(/\s+/)).toEqual([
+			"bun",
+			"test",
+			"./scripts/ci-dev-affected.test.ts",
+			"./scripts/run-bun-test-files.test.ts",
+			"./scripts/dev-ci-guard-topology.test.ts",
+			"./scripts/ci-risk-canary-manifest.test.ts",
+			"./scripts/ci-virtual-integration.test.ts",
+			"./scripts/ci-gjc-state-gates.test.ts",
+		]);
+		const affected = requiredJob(d, "affected");
+		expect(affected.needs).toContain("ci-meta-tests");
+		expect(namedStep(affected, "Fail closed on producer and live dependency results").run).toContain(
+			"${{ needs.ci-meta-tests.result }}",
+		);
 	});
 
 });
