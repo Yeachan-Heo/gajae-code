@@ -275,6 +275,15 @@ const STAGED_WRITER_COPY_CHUNK_BYTES = 64 * 1024;
  * be used for the mutable `.spill.commit` marker (checked create/replace helpers
  * exist for that path).
  */
+export type SessionNoReplacePublicationReceipt = {
+	readonly publicationId: string;
+	readonly stat: SessionStorageStat;
+	readonly sha256: string;
+} & (
+	| { readonly kind: "fsync"; readonly namespaceSynced: true }
+	| { readonly kind: "backend_ack"; readonly namespaceSynced: false }
+);
+
 export interface StagedStreamingWriter {
 	/** Append one complete line; the writer adds the trailing newline. */
 	writeLine(bytes: Uint8Array): void;
@@ -292,17 +301,22 @@ export interface StagedStreamingWriter {
 	fsync(): void;
 	/** Close the staged descriptor; required before {@link publishNoReplace}. */
 	closeSync(): void;
-	/** Atomically publish the staged file at the destination only while it is absent. */
-	publishNoReplace(): void;
+	/** Publish only while absent; memory acknowledgments never attest filesystem durability. */
+	publishNoReplace(): SessionNoReplacePublicationReceipt;
 }
 
 export interface SessionStorageExclusiveLock {
+	/** File-backend acquisition evidence, captured from the installed descriptor, never recaptured by pathname. */
+	readonly acquiredFile?: {
+		readonly generation: string;
+		readonly identity: Readonly<native.NativeExactFileIdentity>;
+	};
 	releaseSync(): void;
 }
 
 export interface SessionStorageLockOptions {
 	securityContext?: SessionStorageSecurityContext;
-	/** Required by transcript-adjacent authority; a foreign host is never probed locally. */
+	/** Nonempty matching caller and recorded host IDs are required for stale-lock recovery. */
 	ownerHostId?: string;
 }
 
@@ -1404,6 +1418,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
  */
 class FileStagedStreamingWriter implements StagedStreamingWriter {
 	#fd: number;
+	#createdIdentity: { dev: bigint; ino: bigint };
+	#closedIdentity: SessionStorageStat | undefined;
 	#stagingPath: string;
 	#destinationPath: string;
 	#securityContext: SessionStorageSecurityContext;
@@ -1434,6 +1450,8 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			throw error;
 		}
 		this.#fd = fd;
+		const created = fs.fstatSync(fd, { bigint: true });
+		this.#createdIdentity = { dev: created.dev, ino: created.ino };
 		writerRegistry.register(this, this.#fd, this);
 	}
 
@@ -1557,6 +1575,10 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		if (this.#error) throw this.#error;
 		try {
 			secureOwnerOnlyFileDescriptor(this.#stagingPath, this.#fd, "verify", this.#securityContext);
+			const closed = statFromNode(fs.fstatSync(this.#fd, { bigint: true }));
+			if (!closed.isFile || closed.dev !== this.#createdIdentity.dev || closed.ino !== this.#createdIdentity.ino)
+				throw new Error("staged_source_identity_changed");
+			this.#closedIdentity = closed;
 			fs.closeSync(this.#fd);
 		} catch (err) {
 			throw this.#recordError(err);
@@ -1565,30 +1587,61 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		writerRegistry.unregister(this);
 	}
 
-	publishNoReplace(): void {
+	publishNoReplace(): SessionNoReplacePublicationReceipt {
 		if (this.#published) throw new Error("Staged writer already published");
 		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
 		if (this.#error) throw this.#error;
+		if (!shouldFsyncManagedDirectory()) throw new Error("staged_publication_durability_unavailable");
 		const dir = path.dirname(this.#destinationPath);
-		const originalStaging = fs.lstatSync(this.#stagingPath, { bigint: true });
-		const originalStagingIdentity = { dev: originalStaging.dev, ino: originalStaging.ino };
+		const originalStagingIdentity = this.#closedIdentity;
+		if (!originalStagingIdentity) throw new Error("staged_source_identity_unavailable");
+		this.#verifyStagedPath(this.#stagingPath, originalStagingIdentity);
 		let publishSource = this.#stagingPath;
 		let materialized: string | undefined;
 		let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
 		let outcome: NativePublishOutcome | undefined;
+		let publicationAttempted = false;
 		let linkPublished = false;
 		let failure: unknown;
+		let selectedFd: number | undefined;
+		let receipt: SessionNoReplacePublicationReceipt | undefined;
 		try {
+			let expected = originalStagingIdentity;
 			if (this.#pendingPatches.size > 0) {
-				materialized = this.#materializePatchedCopy();
-				publishSource = materialized;
+				const copy = this.#materializePatchedCopy();
+				materialized = copy.path;
+				publishSource = copy.path;
+				expected = copy.stat;
 			}
-			const staged = fs.lstatSync(publishSource, { bigint: true });
-			stagedIdentity = { dev: staged.dev, ino: staged.ino };
+			stagedIdentity = expected;
+			selectedFd = fs.openSync(
+				publishSource,
+				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+			);
+			const staged = statFromNode(fs.fstatSync(selectedFd, { bigint: true }));
+			if (!staged.isFile || staged.nlink !== 1n || !sameDescriptorIdentity(staged, expected))
+				throw new Error("staged_source_identity_changed");
+			const hash = createHash("sha256");
+			const chunk = Buffer.allocUnsafe(STAGED_WRITER_COPY_CHUNK_BYTES);
+			let offset = 0;
+			while (offset < staged.size) {
+				const count = fs.readSync(selectedFd, chunk, 0, Math.min(chunk.byteLength, staged.size - offset), offset);
+				if (count === 0) throw new Error("staged_source_changed");
+				hash.update(chunk.subarray(0, count));
+				offset += count;
+			}
+			fs.fsyncSync(selectedFd);
+			secureOwnerOnlyFileDescriptor(publishSource, selectedFd, "verify", this.#securityContext);
+			if (!sameDescriptorIdentity(statFromNode(fs.fstatSync(selectedFd, { bigint: true })), staged))
+				throw new Error("staged_source_changed");
+			this.#verifyStagedPath(publishSource, staged);
+			const sha256 = hash.digest("hex");
+			publicationAttempted = true;
 			outcome = classifyNativePublishOutcome(
 				nativeSessionStorage().renameNoReplacePath(publishSource, this.#destinationPath),
 			);
 			if (renameFlagsUnsupported(outcome)) {
+				this.#verifyStagedPath(publishSource, staged);
 				outcome = classifyNativePublishOutcome(
 					nativeSessionStorage().linkNoReplacePath(publishSource, this.#destinationPath),
 				);
@@ -1603,32 +1656,71 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 				named.ino !== stagedIdentity.ino
 			)
 				throw new Error("destination_identity_changed");
+			if (linkPublished) unlinkOwnedStagedSync(publishSource, stagedIdentity);
+			if (materialized) unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
 			fsyncDirectorySync(dir);
-			this.#published = true;
+			const stat = statFromNode(fs.fstatSync(selectedFd, { bigint: true }));
+			const publishedName = statFromNode(fs.lstatSync(this.#destinationPath, { bigint: true }));
+			if (
+				!stat.isFile ||
+				stat.dev !== staged.dev ||
+				stat.ino !== staged.ino ||
+				stat.size !== staged.size ||
+				stat.mtimeNs !== staged.mtimeNs ||
+				stat.nlink !== 1n ||
+				!publishedName.isFile ||
+				!sameDescriptorIdentity(publishedName, stat)
+			)
+				throw new Error("destination_identity_changed");
+			receipt = { publicationId: randomUUID(), stat, sha256, kind: "fsync", namespaceSynced: true };
 		} catch (error) {
-			failure = error;
+			failure = this.#recordError(error);
 		} finally {
-			// Only a validated pre-mutation outcome authorizes removing our own staged
-			// name: a committed outcome may have made publishSource the destination.
+			// Before dispatch, or after a validated pre-mutation outcome, our exact
+			// staged name is disposable. Unknown native mutations never authorize cleanup.
 			if (materialized) {
-				if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome))))
+				if (
+					stagedIdentity &&
+					(!publicationAttempted || linkPublished || (outcome && mayCleanCurrentStaging(outcome)))
+				)
 					unlinkOwnedStagedSync(materialized, stagedIdentity);
 				unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
-			} else if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome)))) {
+			} else if (
+				stagedIdentity &&
+				(!publicationAttempted || linkPublished || (outcome && mayCleanCurrentStaging(outcome)))
+			) {
 				unlinkOwnedStagedSync(this.#stagingPath, stagedIdentity);
 			}
+			if (selectedFd !== undefined) fs.closeSync(selectedFd);
 		}
 		if (failure !== undefined) throw failure;
+		if (!receipt) throw new Error("staged_publication_receipt_unavailable");
+		this.#published = true;
+		return receipt;
 	}
 
-	/** Second bounded streaming pass: materialize staged lines with pending patches applied. */
-	#materializePatchedCopy(): string {
+	#verifyStagedPath(stagingPath: string, expected: SessionStorageStat): void {
+		const named = fs.lstatSync(stagingPath, { bigint: true });
+		if (named.isSymbolicLink() || !named.isFile() || !sameDescriptorIdentity(statFromNode(named), expected))
+			throw new Error("staged_source_identity_changed");
+	}
+
+	/** Second bounded streaming pass: retain the identity of the descriptor we actually created. */
+	#materializePatchedCopy(): { path: string; stat: SessionStorageStat } {
 		const dir = path.dirname(this.#stagingPath);
 		const copyPath = path.join(dir, `.${path.basename(this.#destinationPath)}.${randomUUID()}.staged-final`);
 		let copyFd: number | undefined;
 		let sourceFd: number | undefined;
 		let copyIdentity: { dev: bigint; ino: bigint } | undefined;
 		try {
+			sourceFd = fs.openSync(
+				this.#stagingPath,
+				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+			);
+			const source = statFromNode(fs.fstatSync(sourceFd, { bigint: true }));
+			if (!source.isFile || !this.#closedIdentity || !sameDescriptorIdentity(source, this.#closedIdentity))
+				throw new Error("staged_source_identity_changed");
+			this.#verifyStagedPath(this.#stagingPath, source);
 			copyFd = fs.openSync(
 				copyPath,
 				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
@@ -1637,7 +1729,6 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			secureOwnerOnlyFileDescriptor(copyPath, copyFd, "apply", this.#securityContext);
 			const created = fs.fstatSync(copyFd, { bigint: true });
 			copyIdentity = { dev: created.dev, ino: created.ino };
-			sourceFd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 			let ordinal = 0;
 			let carry = Buffer.alloc(0);
 			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
@@ -1656,10 +1747,14 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 					lineStart = newline + 1;
 				}
 				carry = Buffer.from(combined.subarray(lineStart));
+				if (carry.byteLength > STAGED_WRITER_LINE_MAX_BYTES) throw new Error("staged_file_malformed_line");
 			}
-			if (carry.byteLength > 0) throw new Error("staged_file_malformed_tail");
-			fs.fsyncSync(copyFd);
-			return copyPath;
+			if (carry.byteLength > 0 || ordinal !== this.#lineCount) throw new Error("staged_file_malformed_tail");
+			if (!sameDescriptorIdentity(statFromNode(fs.fstatSync(sourceFd, { bigint: true })), source))
+				throw new Error("staged_source_changed");
+			this.#verifyStagedPath(this.#stagingPath, source);
+			secureOwnerOnlyFileDescriptor(copyPath, copyFd, "verify", this.#securityContext);
+			return { path: copyPath, stat: statFromNode(fs.fstatSync(copyFd, { bigint: true })) };
 		} catch (error) {
 			if (copyIdentity) unlinkOwnedStagedSync(copyPath, copyIdentity);
 			throw this.#recordError(error);
@@ -1847,7 +1942,7 @@ function reclaimStaleSessionStorageLockSync(lockPath: string, ownerHostId: strin
 	}
 	if (!owner || !expected || !sha256) return false;
 	// PID/incarnation observations only carry authority on the lock's recorded host.
-	// An unqualified or foreign generation cannot be reclaimed by a qualified caller.
+	// Missing identities never establish locality, including two unqualified identities.
 	if (
 		typeof ownerHostId !== "string" ||
 		ownerHostId.length === 0 ||
@@ -2091,8 +2186,25 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 					fs.closeSync(publishedFd);
 				}
 				fsyncDirectorySync(dir);
+				const acquiredParent = fs.lstatSync(dir, { bigint: true });
+				if (!acquiredParent.isDirectory() || acquiredParent.isSymbolicLink())
+					throw new Error("exclusive_lock_parent_identity_changed");
+				const acquiredFile = Object.freeze({
+					generation: token,
+					identity: Object.freeze({
+						dev: expected.dev,
+						ino: expected.ino,
+						nlink: expected.nlink,
+						parentDev: acquiredParent.dev,
+						parentIno: acquiredParent.ino,
+						size: expected.size,
+						mtimeNs: expected.mtimeNs,
+						sha256: ownerDigest,
+					}),
+				});
 				let released = false;
 				return {
+					acquiredFile,
 					releaseSync: () => {
 						if (released) return;
 						const removal = exactRemoveSessionStorageLockPathResult(lockPath, expected, ownerDigest!);
@@ -3352,7 +3464,7 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		this.#closed = true;
 	}
 
-	publishNoReplace(): void {
+	publishNoReplace(): SessionNoReplacePublicationReceipt {
 		if (this.#published) throw new Error("Staged writer already published");
 		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
 		if (this.#error) throw this.#error;
@@ -3371,7 +3483,15 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		this.#lines.length = 0;
 		this.#pendingPatches.clear();
 		this.#storage.writeBytesOwnedSync(this.#path, content);
+		const snapshot = this.#storage.readSnapshotSync(this.#path);
 		this.#published = true;
+		return {
+			publicationId: randomUUID(),
+			stat: snapshot.stat,
+			sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+			kind: "backend_ack",
+			namespaceSynced: false,
+		};
 	}
 }
 
