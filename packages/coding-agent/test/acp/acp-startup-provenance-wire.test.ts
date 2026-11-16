@@ -104,7 +104,6 @@ afterEach(async () => {
 	await cleanupFixtureRoots(cleanupRoots);
 });
 
-/** Explicit child environment allowlist; all stateful locations are test-owned. */
 interface Oracle {
 	proc: AcpProc;
 	connection: ClientSideConnection;

@@ -115,14 +115,6 @@ afterEach(async () => {
 	await cleanupFixtureRoots(cleanupRoots);
 });
 
-/**
- * Explicit minimal environment allowlist. NEVER spreads `process.env`: only
- * `PATH` and the locale/timezone vars (`LANG`/`LC_ALL`/`TZ`) are forwarded, and
- * the locale/timezone vars only "as available" (present and non-empty). `HOME`,
- * `TMPDIR`, every XDG dir, and the agent dirs are owned by the test and rooted
- * under the isolated temp root. This function performs no process-global env
- * mutation — it only constructs and returns a fresh object handed to the child.
- */
 interface Oracle {
 	proc: AcpProc;
 	connection: ClientSideConnection;

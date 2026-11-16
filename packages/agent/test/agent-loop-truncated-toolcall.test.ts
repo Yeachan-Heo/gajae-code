@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AgentContext, AgentLoopConfig, AgentTool, StreamFn } from "@gajae-code/agent-core/types";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
@@ -130,10 +130,6 @@ describe("agentLoop: truncated tool-call guard", () => {
 });
 
 describe("agentLoop: reason-specific incompleteArguments guidance", () => {
-	function identityConverter(messages: AgentMessage[]): Message[] {
-		return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-	}
-
 	async function runWithReason(
 		reason: "truncated" | "malformed" | "conflicting" | "ambiguous" | undefined,
 		stopReason: "length" | "toolUse" = "length",

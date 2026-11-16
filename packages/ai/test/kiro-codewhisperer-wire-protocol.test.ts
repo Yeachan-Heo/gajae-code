@@ -3,7 +3,6 @@ import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
 import type { AssistantMessageEvent, Context, Model } from "../src/types";
 import { encodeFrame } from "./helpers";
 
-// Frame encoder (copied from aws-eventstream.test.ts for use in fixtures)
 // Mock fetch to capture request and serve responses
 let capturedRequest: { headers: Record<string, string>; body: string } | null = null;
 

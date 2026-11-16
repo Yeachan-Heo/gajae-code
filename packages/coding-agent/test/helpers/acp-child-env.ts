@@ -1,6 +1,13 @@
 import * as path from "node:path";
 
-/** Hermetic child-process environment rooted at an isolated fixture HOME. */
+/**
+ * Hermetic child-process environment rooted at an isolated fixture HOME.
+ *
+ * NEVER spreads `process.env`: only `PATH` and the locale/timezone vars
+ * (`LANG`/`LC_ALL`/`TZ`) are forwarded, and those only when present and
+ * non-empty. `HOME`, `TMPDIR`, every XDG dir, and the agent dirs stay owned by
+ * the test and rooted under the isolated temp root.
+ */
 export function buildChildEnv(root: string): Record<string, string> {
 	const env: Record<string, string> = {
 		PATH: process.env.PATH ?? "/usr/bin:/bin",
