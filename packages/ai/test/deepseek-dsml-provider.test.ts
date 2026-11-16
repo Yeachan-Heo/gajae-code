@@ -150,4 +150,40 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(tools(result).map(call => call.arguments)).toContainEqual({ path: "other.ts" });
 		expect(tools(result).map(call => call.arguments)).toContainEqual({ path: "src/index.ts" });
 	});
+
+	// Finding 4: Retain unmatched recovered calls in mixed deltas
+	it("keeps distinct recovered DSML calls when structured calls are present in same delta", async () => {
+		const result = await response([
+			{
+				content:
+					'<｜DSML｜invoke name="write"><｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter></｜DSML｜invoke>',
+				tool_calls: structured('{"path":"in.txt"}'),
+			},
+		]);
+		// Should have both the recovered write call and the structured read call
+		expect(tools(result)).toHaveLength(2);
+		const callsByName = Object.fromEntries(tools(result).map(c => [c.name, c]));
+		expect(callsByName.write).toBeDefined();
+		expect(callsByName.read).toBeDefined();
+	});
+
+	// Finding 5: Match structured and recovered calls one-to-one
+	it("matches structured calls one-to-one with recovered calls", async () => {
+		// Two identical recovered calls followed by one structured call
+		// The structured call should suppress exactly one recovered call
+		const result = await response([
+			{
+				content:
+					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">file.txt</｜DSML｜parameter></｜DSML｜invoke>' +
+					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">file.txt</｜DSML｜parameter></｜DSML｜invoke>',
+			},
+			{ tool_calls: structured('{"path":"file.txt"}') },
+		]);
+		// Should have 2 calls: one structured (suppressing one recovered) and one unmatched recovered
+		expect(tools(result)).toHaveLength(2);
+	});
+
+	// Finding 6: Preserve Kimi streaming order (if we had Kimi tests)
+	// This is harder to test without actual Kimi model, but the provider test
+	// for immediate emission during streaming would verify the fix
 });

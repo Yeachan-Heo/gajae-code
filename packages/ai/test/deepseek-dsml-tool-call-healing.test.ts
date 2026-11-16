@@ -135,7 +135,7 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(healer.drainCompleted()).toEqual([]);
 	});
 
-	it("falls back to raw strings for invalid JSON and numbers calls per instance", () => {
+	it("marks calls with invalid JSON-typed parameters as incomplete", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
 			'<｜DSML｜invoke name="first"><｜DSML｜parameter name="value" string="false">not-json</｜DSML｜parameter></｜DSML｜invoke>' +
@@ -145,7 +145,11 @@ describe("DeepSeek DSML tool-call healing", () => {
 		const calls = healer.drainCompleted();
 		expect(calls.map(call => call.id)).toEqual(["dsml_1", "dsml_2"]);
 		expect(calls.map(call => call.name)).toEqual(["first", "second"]);
-		expect(JSON.parse(calls[0].arguments)).toEqual({ value: "not-json" });
+		// First call has invalid JSON, so marked incomplete with empty args
+		expect(calls[0].incomplete).toBe(true);
+		expect(JSON.parse(calls[0].arguments)).toEqual({});
+		// Second call is valid string parameter
+		expect(calls[1].incomplete).toBeUndefined();
 		expect(JSON.parse(calls[1].arguments)).toEqual({ value: "text" });
 	});
 
@@ -216,5 +220,36 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(healer.drainCompleted()).toEqual([]);
 		healer.feed('<｜DSML｜invoke name="second"></｜DSML｜invoke>');
 		expect(healer.drainCompleted().map(call => call.name)).toEqual(["second"]);
+	});
+
+	// Finding 2: Reject invalid JSON-typed DSML arguments
+	it("marks an invocation with invalid JSON-typed parameter as incomplete instead of falling back", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed(
+			'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="code" string="false">{not valid json}</｜DSML｜parameter>' +
+				"</｜DSML｜invoke>",
+		);
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		// Should be marked incomplete, not fallen back to string
+		expect(calls[0].incomplete).toBe(true);
+	});
+
+	// Finding 3: Preserve parameter structure errors
+	it("marks an invocation incomplete when a parameter opens before the previous closes", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed(
+			'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="first">value1' +
+				'<｜DSML｜parameter name="second">value2</｜DSML｜parameter>' + // opens before first closes
+				"</｜DSML｜invoke>",
+		);
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		// Should be marked incomplete due to structural error
+		expect(calls[0].incomplete).toBe(true);
+		// Should have lost the malformed parameters
+		expect(JSON.parse(calls[0].arguments)).toEqual({});
 	});
 });

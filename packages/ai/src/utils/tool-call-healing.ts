@@ -316,6 +316,7 @@ export class DsmlToolCallHealer {
 	#inParameter = false;
 	#suppressCall = false;
 	#incomplete = false;
+	#hasStructuralError = false;
 	#pendingName = "";
 	#pendingInvokeString: boolean | undefined;
 	#pendingParameterName = "";
@@ -346,6 +347,7 @@ export class DsmlToolCallHealer {
 		this.#inParameter = false;
 		this.#suppressCall = false;
 		this.#incomplete = false;
+		this.#hasStructuralError = false;
 		this.#pendingName = "";
 		this.#pendingInvokeString = undefined;
 		this.#pendingParameterName = "";
@@ -472,7 +474,8 @@ export class DsmlToolCallHealer {
 						this.#abandonCall();
 						return;
 					}
-					this.#incomplete = this.#inParameter;
+					// Preserve incomplete flag set by parsing errors or structural issues
+					this.#incomplete = this.#incomplete || this.#inParameter;
 					this.#finalizeCall();
 				}
 				this.#suppressCall = false;
@@ -494,6 +497,13 @@ export class DsmlToolCallHealer {
 
 		if (tag.kind !== "parameter" || !this.#inCall) return;
 		if (!tag.closing) {
+			// Finding 3: If a parameter is already open, this is a structural error.
+			// Mark incomplete and discard this call's arguments to prevent malformed execution.
+			if (this.#inParameter) {
+				this.#incomplete = true;
+				this.#hasStructuralError = true;
+				this.#pendingArguments = [];
+			}
 			this.#inParameter = true;
 			this.#pendingParameterName = tag.name ?? "";
 			this.#pendingParameterString = tag.string !== false;
@@ -515,6 +525,9 @@ export class DsmlToolCallHealer {
 	}
 
 	#addArgument(name: string, value: string, isString: boolean): void {
+		// Skip adding arguments if we've detected structural errors
+		if (this.#hasStructuralError) return;
+
 		let rawJson: string;
 		if (isString) {
 			rawJson = JSON.stringify(value);
@@ -524,7 +537,10 @@ export class DsmlToolCallHealer {
 				parseJsonWithRepair<unknown>(candidate);
 				rawJson = candidate;
 			} catch {
-				rawJson = JSON.stringify(value);
+				// Finding 2: Mark the call as incomplete when JSON-typed argument fails to parse,
+				// instead of falling back to a string which would allow execution despite malformed data
+				this.#incomplete = true;
+				return;
 			}
 		}
 		this.#pendingArguments.push(`${JSON.stringify(name)}:${rawJson}`);

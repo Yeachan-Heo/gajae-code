@@ -1103,7 +1103,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				healedToolCallEmitted = true;
 			};
 			const collectHealedToolCalls = (): void => {
-				recoveredCalls.push(...(kimiHealer?.drainCompleted() ?? []), ...(dsmlHealer?.drainCompleted() ?? []));
+				// Finding 6: Kimi calls are now emitted immediately during streaming (pre-PR behavior),
+				// so only collect DSML calls for end-of-stream reconciliation
+				recoveredCalls.push(...(dsmlHealer?.drainCompleted() ?? []));
 			};
 			let providerSafetyStop = false;
 			let hasExplicitUsageReport = false;
@@ -1198,34 +1200,33 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									deepseekStripBuffer += normalizedDeltaText;
 									flushDeepseekStripBuffer(false);
 								} else if (dsmlHealer) {
-									const suppressRecoveredCallsInThisDelta =
-										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
-									if (suppressRecoveredCallsInThisDelta) {
-										// Same chunk leaks markers AND carries structured tool_calls.
-										// Strip the marker text from visible output, but drop any
-										// synthesized calls so the structured payload stays the
-										// single source of truth (avoids double-dispatch).
-										const clean = dsmlHealer.consumeWithoutCalls(normalizedDeltaText);
-										if (clean.length > 0) appendTextDelta(clean);
-									} else {
-										const clean = dsmlHealer.feed(normalizedDeltaText);
-										if (clean.length > 0) appendTextDelta(clean);
-										collectHealedToolCalls();
-									}
+									// Finding 4: Feed the text and collect any recovered calls, but let reconciliation
+									// handle matching each recovered call individually against structured calls.
+									const clean = dsmlHealer.feed(normalizedDeltaText);
+									if (clean.length > 0) appendTextDelta(clean);
+									collectHealedToolCalls();
 								} else if (kimiHealer) {
-									const suppressRecoveredCallsInThisDelta =
+									// Finding 4: Feed the text and collect any recovered calls, but let reconciliation
+									// handle matching each recovered call individually against structured calls.
+									const clean = kimiHealer.feed(normalizedDeltaText);
+									if (clean.length > 0) appendTextDelta(clean);
+									// Finding 6: Emit Kimi recovered calls immediately during streaming (pre-PR behavior),
+									// not buffered until end-of-stream like DSML.
+									// But still suppress Kimi calls when structured calls are present in the same delta.
+									const hasStructuredCallsInDelta =
 										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
-									if (suppressRecoveredCallsInThisDelta) {
-										// Same chunk leaks markers AND carries structured tool_calls.
-										// Strip the marker text from visible output, but drop any
-										// synthesized calls so the structured payload stays the
-										// single source of truth (avoids double-dispatch).
-										const clean = kimiHealer.consumeWithoutCalls(normalizedDeltaText);
-										if (clean.length > 0) appendTextDelta(clean);
+
+									if (!hasStructuredCallsInDelta) {
+										const kimiCalls = kimiHealer.drainCompleted();
+										for (const call of kimiCalls) {
+											if (!call.incomplete) {
+												emitHealedToolCall(call);
+											}
+										}
 									} else {
-										const clean = kimiHealer.feed(normalizedDeltaText);
-										if (clean.length > 0) appendTextDelta(clean);
-										collectHealedToolCalls();
+										// Suppress Kimi calls when structured calls are in the same delta
+										// Discard them to avoid double-dispatch
+										kimiHealer?.drainCompleted();
 									}
 								} else {
 									appendTextDelta(normalizedDeltaText);
@@ -1379,33 +1380,74 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				}
 			}
 
-			if (kimiHealer || dsmlHealer) {
-				const trailing = (kimiHealer?.flushPending() ?? "") + (dsmlHealer?.flushPending() ?? "");
+			if (dsmlHealer) {
+				const trailing = dsmlHealer.flushPending();
 				if (trailing.length > 0) appendTextDelta(trailing);
 				collectHealedToolCalls();
+
+				// Finding 1: Filter recovered calls by effective tool choice
+				const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
+				const effectiveToolChoice = resolvedToolChoice.resolvedChoice ?? "auto";
+
+				const allowedRecoveredCalls = recoveredCalls.filter(call => {
+					if (effectiveToolChoice === "none") {
+						// No tools allowed; reject all recovered calls
+						return false;
+					}
+					if (
+						typeof effectiveToolChoice === "object" &&
+						"name" in effectiveToolChoice &&
+						effectiveToolChoice.name !== call.name
+					) {
+						// Only a specific tool is allowed; reject others
+						return false;
+					}
+					// "auto" or matching named tool
+					return true;
+				});
+
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
-				for (const call of recoveredCalls) {
+
+				// Finding 5: Match structured and recovered calls one-to-one
+				const matchedStructuredCallIndices = new Set<number>();
+
+				for (const call of allowedRecoveredCalls) {
 					const recoveredArguments = parseStreamingJson(call.arguments);
-					const matchingCall = structuredCalls.find(
-						block => block.name === call.name && areJsonValuesEqual(block.arguments, recoveredArguments),
-					);
-					if (matchingCall) {
+
+					// Find first unmatched structured call that matches this recovered call
+					let foundMatchIndex = -1;
+					for (let i = 0; i < structuredCalls.length; i++) {
+						if (
+							!matchedStructuredCallIndices.has(i) &&
+							structuredCalls[i].name === call.name &&
+							areJsonValuesEqual(structuredCalls[i].arguments, recoveredArguments)
+						) {
+							foundMatchIndex = i;
+							break;
+						}
+					}
+
+					if (foundMatchIndex >= 0) {
+						matchedStructuredCallIndices.add(foundMatchIndex);
 						logger.debug("openai-completions: suppressed recovered tool call matching structured call", {
 							model: model.id,
 							recoveredCallId: call.id,
-							structuredCallId: matchingCall.id,
+							structuredCallId: structuredCalls[foundMatchIndex].id,
 						});
 						continue;
 					}
+
 					emitHealedToolCall(call);
 				}
-				if (healedToolCallEmitted && output.stopReason === "stop") {
-					// Hosts that leak Kimi or DSML tool-call markup often still report
-					// `finish_reason: stop` for the surrounding turn. Promote
-					// only that natural-completion finish — leave `error`,
-					// `length`, `aborted`, etc. untouched.
-					output.stopReason = "toolUse";
-				}
+			}
+
+			// Promote stop reason for both Kimi (emitted during streaming) and DSML (emitted during reconciliation)
+			if (healedToolCallEmitted && output.stopReason === "stop") {
+				// Hosts that leak Kimi or DSML tool-call markup often still report
+				// `finish_reason: stop` for the surrounding turn. Promote
+				// only that natural-completion finish — leave `error`,
+				// `length`, `aborted`, etc. untouched.
+				output.stopReason = "toolUse";
 			}
 
 			finishCurrentBlock(currentBlock);
