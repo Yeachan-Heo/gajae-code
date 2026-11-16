@@ -1507,59 +1507,91 @@ describe("AgentSession fallback upstream request counts", () => {
 		]);
 	});
 
-	it("does not retry the same saturated entry before Retry-After deadline when over-budget", async () => {
-		// Issue 1: When Retry-After exceeds remaining budget, the code should not
-		// retry the same entry immediately using generic retry delay.
-		// It should either advance to next entry or wait for Retry-After.
-		let calls = 0;
+	it("does not retry the same entry before Retry-After deadline (Finding 1)", async () => {
+		// When Retry-After exceeds remaining budget, the ordinary rate-limit path must not
+		// re-send to the same entry before the provider's deadline. Instead, advance to the
+		// next entry. Record timestamps and selectors to prove this.
+		const requestLog: Array<{ selector: string; timestampMs: number }> = [];
+		const retryAfterMs = 10_000; // 10 second deadline
+		const budgetMs = 5_000; // 5 second budget (exceeds)
+		let firstAttemptTime = 0;
+
 		const streamFn: AgentOptions["streamFn"] = model => {
-			calls++;
-			// Return concurrency 429 with 10s Retry-After, but only 5s budget
-			return selector(model) === selector(primary) && calls === 1
-				? typedRateLimitStream(model, 10_000, "5 requests already running", "session_limit_reached")
-				: successfulStream(model);
-		};
-		const { primary, fallback } = createSession(1, streamFn, { "fallback.concurrencyWaitMs": 5_000 });
+			const now = Date.now();
+			requestLog.push({ selector: selector(model), timestampMs: now });
 
-		await session!.prompt("Retry-After exceeds budget, should not retry primary early");
-		await session!.waitForIdle();
-
-		// Should have called primary once, then fallback, then success
-		// Not retried primary before Retry-After deadline
-		expect(calls).toBe(2);
-	});
-
-	it("bounds the number of polls in concurrency wait even with Retry-After zero", async () => {
-		// Issue 2: When Retry-After is 0, with 100ms minimum poll interval,
-		// over 300s default budget allows ~3,000 requests.
-		// Should cap poll count independently of elapsed time.
-		let saturatedReplies = 150; // More than the poll cap
-		const callSequence: string[] = [];
-		const streamFn: AgentOptions["streamFn"] = model => {
-			callSequence.push(selector(model));
-			if (selector(model) === selector(primary) && saturatedReplies > 0) {
-				saturatedReplies--;
-				return typedRateLimitStream(model, 0, "5 requests already running", "session_limit_reached");
+			if (selector(model) === selector(primary) && requestLog.length === 1) {
+				firstAttemptTime = now;
+				// Return concurrency 429 with 10s Retry-After on first attempt only
+				return typedRateLimitStream(model, retryAfterMs, "5 requests already running", "session_limit_reached");
 			}
+			// All other attempts succeed
 			return successfulStream(model);
 		};
+
+		const { primary, fallback } = createSession(1, streamFn, {
+			"fallback.concurrencyWaitMs": budgetMs,
+		});
+
+		await session!.prompt("Retry-After exceeds budget, must advance instead of retrying");
+		await session!.waitForIdle();
+
+		// Verify request sequence: primary once, then fallback, then success
+		const selectors = requestLog.map(r => r.selector);
+		expect(selectors).toEqual([selector(primary), selector(fallback)]);
+
+		// Critical: verify no same-entry request before Retry-After deadline
+		const deadline = firstAttemptTime + retryAfterMs;
+		for (const { selector: sel, timestampMs } of requestLog) {
+			if (sel === selector(primary)) {
+				// All primary requests should be at or after the initial attempt
+				// (there should only be one, at the start)
+				expect(timestampMs).toBe(firstAttemptTime);
+			}
+		}
+
+		expect(session!.model).toMatchObject({ provider: fallback.provider, id: fallback.id });
+	});
+
+	it("bounds poll count with Retry-After: 0 using principled interval (Finding 2)", async () => {
+		// When Retry-After is 0, polling should be bounded by budget/min_interval, not by time alone.
+		// With default budget (300s) and 1s min interval, max ~300 polls.
+		// Use Retry-After: 0 and try many times to verify bounded behavior.
+		const requestLog: Array<{ selector: string; timestampMs: number }> = [];
+		let saturatedCount = 0;
+		const maxSaturated = 500; // Try way more than the poll limit should allow
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			const now = Date.now();
+			requestLog.push({ selector: selector(model), timestampMs: now });
+
+			if (selector(model) === selector(primary)) {
+				if (saturatedCount < maxSaturated) {
+					saturatedCount++;
+					// Return concurrency 429 with Retry-After: 0 (minimum poll interval)
+					return typedRateLimitStream(model, 0, "5 requests already running", "session_limit_reached");
+				}
+			}
+			// Fallback or primary after saturation limit succeeds
+			return successfulStream(model);
+		};
+
 		const { primary } = createSession(1, streamFn, {
-			"fallback.concurrencyWaitMs": 300_000,
+			"fallback.concurrencyWaitMs": 300_000, // Default 300s budget
 			"retry.baseDelayMs": 0,
 			"retry.maxDelayMs": 0,
 		});
 
-		await session!.prompt("Poll count should be bounded");
+		await session!.prompt("Poll count should be bounded even with Retry-After: 0");
 		await session!.waitForIdle();
 
-		// Should eventually advance to fallback, not poll indefinitely
-		// Count how many times we tried primary (excluding the final fallback success)
-		const primaryAttempts = callSequence.filter(s => s === selector(primary)).length;
+		// Count primary attempts to verify polling was bounded
+		// Budget 300s / interval 1s = ~300 max polls
+		// Allow buffer but verify well below 500
+		const primaryAttempts = requestLog.filter(r => r.selector === selector(primary)).length;
+		expect(primaryAttempts).toBeLessThan(350); // Well below 500, but accounting for timing variance
+		expect(primaryAttempts).toBeGreaterThan(100); // Should have tried multiple times
 
-		// With poll cap of 50, should not reach the 150 saturated replies
-		// Allow some buffer for timing variance
-		expect(primaryAttempts).toBeLessThan(100);
-		expect(primaryAttempts).toBeGreaterThan(0);
 		// Should eventually advance and succeed
 		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});

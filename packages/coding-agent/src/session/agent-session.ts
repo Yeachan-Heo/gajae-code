@@ -1550,6 +1550,12 @@ type RetryErrorClassification =
 
 /** Longest single pause while waiting for a provider's parallel-request slot. */
 const CONCURRENCY_WAIT_MAX_POLL_MS = 15_000;
+/**
+ * Minimum poll interval when Retry-After is 0, used to bound request volume.
+ * With a budget of 300,000ms (default), this 1000ms interval bounds requests to ~300,
+ * preventing unbounded polling when a provider returns Retry-After: 0.
+ */
+const CONCURRENCY_POLL_MIN_INTERVAL_MS = 1000;
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
@@ -29779,11 +29785,12 @@ export class AgentSession {
 			return undefined;
 		}
 		// Bound poll count independently of elapsed time to prevent unbounded retries
-		// when Retry-After is zero or very small. With 100ms min interval and 300s budget,
-		// an unbounded poll could allow ~3000 requests. Cap at a reasonable ceiling.
-		const MAX_CONCURRENCY_POLLS = 50;
+		// when Retry-After is zero or very small. The maximum poll attempts is determined
+		// by the budget divided by the minimum reasonable poll interval (1000ms).
+		// This prevents ~3000+ requests with 100ms polls on a 300s budget.
+		const maxPolls = Math.ceil(budgetMs / CONCURRENCY_POLL_MIN_INTERVAL_MS);
 		this.#concurrencyWaitPollCount++;
-		if (this.#concurrencyWaitPollCount > MAX_CONCURRENCY_POLLS) {
+		if (this.#concurrencyWaitPollCount > maxPolls) {
 			return undefined;
 		}
 		// A slot frees when any running request ends; poll with capped jitter so
@@ -30621,11 +30628,7 @@ export class AgentSession {
 		if (
 			!concurrencyWait &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			// When Retry-After exceeds the remaining budget, skip credential marking
-			// to prevent same-entry retries before the provider's deadline. Instead,
-			// advance to the next entry in the fallback chain.
-			!this.#concurrencyWaitRetryAfterExceededBudget
+			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
 			quotaCredentialMark = await this.#markFailedCredential({
 				...trigger,
@@ -30711,7 +30714,14 @@ export class AgentSession {
 			controller.discardStartedAttempt();
 			outcome = "retry";
 		} else if (managedFallback) {
-			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			// When Retry-After exceeds the remaining budget, force advance to the next entry
+			// instead of retrying the same entry. This prevents re-sending before the provider's
+			// deadline via the ordinary rate-limit path.
+			if (this.#concurrencyWaitRetryAfterExceededBudget) {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			}
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
