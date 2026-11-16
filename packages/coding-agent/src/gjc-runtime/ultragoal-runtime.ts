@@ -637,18 +637,22 @@ async function appendHumanBlockedAskEvent<T>(
  * the question opens. Returns `false` when the admission is already spent. The
  * reservation survives a restart, so an answer that could not be recorded still
  * cannot be asked again. `stillAdmissible` re-derives the receipt under the
- * ledger lock, which blocker classifications and critic verdicts also take, so
- * a receipt superseded after the guard ran is refused. Rows carry no `goalId`, which keeps them out of every
+ * plan and ledger locks, which plan writes, blocker classifications and critic
+ * verdicts also take, so a receipt superseded after the guard ran is refused. Rows carry no `goalId`, which keeps them out of every
  * completion-receipt freshness base.
  */
 export function recordUltragoalHumanBlockedAskReserved(
 	input: HumanBlockedAskReceipt,
 	stillAdmissible: () => Promise<boolean>,
 ): Promise<boolean> {
-	return appendHumanBlockedAskEvent(input, async ledger =>
-		!isUltragoalHumanBlockedAskSpent(ledger, input.classificationEventId) && (await stillAdmissible())
-			? { event: HUMAN_BLOCKED_ASK_RESERVED_EVENT, result: true }
-			: { result: false },
+	// The receipt is also stale after a required-goal change, so the recheck holds
+	// the plan lock too, taken before the ledger lock (the established order).
+	return withUltragoalPlanOwnership(input.cwd, input.sessionId, () =>
+		appendHumanBlockedAskEvent(input, async ledger =>
+			!isUltragoalHumanBlockedAskSpent(ledger, input.classificationEventId) && (await stillAdmissible())
+				? { event: HUMAN_BLOCKED_ASK_RESERVED_EVENT, result: true }
+				: { result: false },
+		),
 	);
 }
 

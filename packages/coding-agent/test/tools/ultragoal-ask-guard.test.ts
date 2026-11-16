@@ -10,6 +10,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { isUltragoalAskBlocked, isUltragoalPauseBlocked } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
+	addUltragoalSubgoal,
 	computeUltragoalPlanGeneration,
 	createUltragoalPlan,
 	getUltragoalPaths,
@@ -104,7 +105,7 @@ async function writeActiveDeepInterviewState(cwd: string, sessionId: string): Pr
 }
 
 function stubAskTool(execute: () => Promise<void>): AgentTool {
-	return {
+	const tool: AgentTool & { [BUILTIN_ASK_TOOL]: true } = {
 		name: "ask",
 		label: "Ask",
 		summary: "Ask",
@@ -117,6 +118,7 @@ function stubAskTool(execute: () => Promise<void>): AgentTool {
 			return { content: [{ type: "text", text: "asked" }], details: {} };
 		},
 	};
+	return tool;
 }
 
 // Mirrors ExtensionToolWrapper: a prototype `execute` that reads instance state via
@@ -826,6 +828,52 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		return { sessionId: TEST_SESSION_ID, classificationEventId: pause.classificationEventId! };
 	}
 
+	it("holds plan writes behind the reservation recheck", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const receipt = await currentReceipt(cwd);
+		let planWritten = false;
+		let planWrittenDuringRecheck: boolean | undefined;
+		let steer: Promise<unknown> | undefined;
+
+		const reserved = await recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, async () => {
+			steer = addUltragoalSubgoal({
+				cwd,
+				title: "New required goal",
+				objective: "Covers a requirement found late",
+				evidence: "review found a missing requirement",
+				rationale: "scope grew",
+			}).then(() => {
+				planWritten = true;
+			});
+			await Bun.sleep(300);
+			planWrittenDuringRecheck = planWritten;
+			return isHumanBlockedAskReceiptCurrent(cwd, receipt);
+		});
+		await steer;
+
+		expect(planWrittenDuringRecheck).toBe(false);
+		expect(reserved).toBe(true);
+		expect(planWritten).toBe(true);
+	});
+
+	it("refuses a human-blocked ask without an interactive UI", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const headless = { hasUI: false, abort: () => {} } as unknown as AgentToolContext;
+
+		await expect(askTool(cwd).execute("call-1", QUESTION, undefined, undefined, headless)).rejects.toThrow(
+			/only in an interactive session/,
+		);
+		expect(await answeredAskRows(cwd)).toBe(0);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.some(event => event.event === "human_blocked_ask_reserved")).toBe(false);
+	});
+
 	it("refuses to reserve a receipt superseded by a newer classification after the guard ran", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
@@ -989,13 +1037,12 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	// Issue 2: Enforce one-question settlement for custom ask tools
 	// Only the built-in AskTool should be admitted for human-blocked asks.
 	// Custom tools named "ask" should be rejected.
-	it("[Issue 2] refuses admission for custom ask tools to prevent bypass of settlement accounting", async () => {
+	it("refuses admission for custom ask tools to prevent bypass of settlement accounting", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		await recordVerifiedHumanBlock(cwd);
 
-		// A custom tool that looks like ask but isn't the built-in AskTool
 		const customAskTool = {
 			name: "ask",
 			label: "Ask",
@@ -1009,40 +1056,17 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 					details: {},
 				};
 			},
-		};
+		} as unknown as AgentTool;
 
-		// Wrapping a custom ask tool should either identify it's not the built-in,
-		// or the guard should reject it at execution time
 		const guarded = guardToolForUltragoalAsk(
 			customAskTool,
 			() => cwd,
 			() => ({ sessionId: TEST_SESSION_ID }),
 		);
 
-		// The guarded tool should refuse to execute the custom tool for human-blocked asks
-		// because only AskTool writes proper settlement events
 		const select = vi.fn(async () => "Vault");
-		await expect(guarded.execute("call-1", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow();
-	});
-
-	// Issue 3: Require independent critic provenance for headless asks
-	// A headless session must not use a verdict recorded by the same session.
-	// The critic must be independent for security.
-	// This test verifies that ask admission in a headless context properly validates
-	// that any required critic verdict came from an independent session, not the
-	// same session that is trying to ask the question.
-	it("[Issue 3] validates that ask-guard checks for independent critic provenance", async () => {
-		const cwd = await tempDir();
-		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
-		await createUltragoalPlan({ cwd, brief: "Implement the story" });
-
-		// The basic pause check should validate that the session requesting the ask
-		// is authorized by an independent verdict, not one it recorded itself
-		const pauseBlocked = await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID });
-
-		// Verify that pause blocking works correctly
-		expect(pauseBlocked).toBeDefined();
-		expect(pauseBlocked.blocked).toBe(true);
-		// Without a human_blocked classification, ask is blocked
+		await expect(guarded.execute("call-1", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow(
+			/custom ask tools are not permitted/,
+		);
 	});
 });
