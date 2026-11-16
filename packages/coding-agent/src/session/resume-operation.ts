@@ -59,6 +59,8 @@ export interface ResumeInitialPublication extends ResumeInitialPublicationIntent
 	readonly successor: {
 		readonly fileIdentity: ResumeFileIdentity;
 		readonly snapshotDigest: string;
+		/** Immutable issued snapshot length; later same-inode bytes must retain this exact prefix. */
+		readonly snapshotByteLength: number;
 	};
 }
 
@@ -76,6 +78,8 @@ export interface PendingResumeOp extends ResumeMemberBinding {
 		readonly initialPublication?: ResumeInitialPublicationIntent;
 		/** Original captured bytes, bound by the adapter before any checked replacement. */
 		readonly snapshotDigest?: string;
+		/** Required alongside the digest for replacement anchors, and zero for absent-path intent. */
+		readonly snapshotByteLength?: number;
 		readonly lastError?: string;
 		readonly attempts: number;
 	};
@@ -93,16 +97,19 @@ export interface ResumeByteRange {
 /**
  * Adapter-issued checked replacement receipt, captured under authority and lease.
  * Like D, this is trusted evidence, not authority minted by readable byte equality or caller input.
+ * Snapshot digests and lengths are immutable, even after appends on the successor inode.
  */
 export interface ResumePublicationSuccession {
 	readonly publicationId: string;
 	readonly predecessor: {
 		readonly fileIdentity: ResumeFileIdentity;
 		readonly snapshotDigest: string;
+		readonly snapshotByteLength: number;
 	};
 	readonly successor: {
 		readonly fileIdentity: ResumeFileIdentity;
 		readonly snapshotDigest: string;
+		readonly snapshotByteLength: number;
 	};
 }
 
@@ -538,6 +545,7 @@ function validRange(range: ResumeHashedRange, capture: ResumeFreshCapture): bool
 }
 
 function validPrefix(capture: ResumeFreshCapture, byteLength: number, sha256: string): boolean {
+	if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > captureByteLength(capture)) return false;
 	if (capture.byteEvidence === undefined) return digest(capture.bytes.subarray(0, byteLength)) === sha256;
 	if (byteLength === capture.byteEvidence.byteLength) return sha256 === capture.byteEvidence.fullDigest;
 	return capture.byteEvidence.prefixes.some(prefix => prefix.byteLength === byteLength && prefix.sha256 === sha256);
@@ -554,7 +562,8 @@ function sameInitialPublication(a: ResumeInitialPublication, b: ResumeInitialPub
 		a.epoch === b.epoch &&
 		a.memberToken === b.memberToken &&
 		sameIdentity(a.successor.fileIdentity, b.successor.fileIdentity) &&
-		a.successor.snapshotDigest === b.successor.snapshotDigest
+		a.successor.snapshotDigest === b.successor.snapshotDigest &&
+		a.successor.snapshotByteLength === b.successor.snapshotByteLength
 	);
 }
 
@@ -563,6 +572,7 @@ function validInitialPublication(pending: PendingResumeOp, receipt: ResumeInitia
 	return (
 		pending.durabilityDebt.fileIdentity === null &&
 		pending.durabilityDebt.snapshotDigest === digest(new Uint8Array()) &&
+		pending.durabilityDebt.snapshotByteLength === 0 &&
 		intent !== undefined &&
 		receipt.kind === "no_replace" &&
 		receipt.predecessor === "absent" &&
@@ -582,7 +592,9 @@ function validInitialPublication(pending: PendingResumeOp, receipt: ResumeInitia
 		intent.memberToken === pending.memberToken &&
 		receipt.successor.fileIdentity.dev.length > 0 &&
 		receipt.successor.fileIdentity.ino.length > 0 &&
-		/^[a-f0-9]{64}$/.test(receipt.successor.snapshotDigest)
+		/^[a-f0-9]{64}$/.test(receipt.successor.snapshotDigest) &&
+		Number.isSafeInteger(receipt.successor.snapshotByteLength) &&
+		receipt.successor.snapshotByteLength > 0
 	);
 }
 
@@ -596,15 +608,38 @@ export function validatePublicationSuccessions(
 	if (!capture.fresh || !validateResumeCaptureBytes(capture)) return false;
 	const absent = pending.durabilityDebt.fileIdentity === null;
 	if (absent) {
-		if (!initialPublication || !validInitialPublication(pending, initialPublication)) return false;
+		if (
+			!initialPublication ||
+			!validInitialPublication(pending, initialPublication) ||
+			initialPublication.headerId !== capture.reducerView.headerId
+		)
+			return false;
 	} else if (initialPublication || pending.durabilityDebt.initialPublication) return false;
 	const fileIdentity = initialPublication?.successor.fileIdentity ?? pending.durabilityDebt.fileIdentity;
 	const snapshotDigest = initialPublication?.successor.snapshotDigest ?? pending.durabilityDebt.snapshotDigest;
+	const snapshotByteLength =
+		initialPublication?.successor.snapshotByteLength ?? pending.durabilityDebt.snapshotByteLength;
 	if (!fileIdentity) return false;
 	if (publicationSuccessions.length === 0)
-		return sameIdentity(fileIdentity, capture.fileIdentity) && (!absent || snapshotDigest === capture.snapshotDigest);
-	if (publicationSuccessions.length > 256 || !snapshotDigest) return false;
-	let predecessor = { fileIdentity, snapshotDigest };
+		return (
+			sameIdentity(fileIdentity, capture.fileIdentity) &&
+			(!initialPublication ||
+				validPrefix(
+					capture,
+					initialPublication.successor.snapshotByteLength,
+					initialPublication.successor.snapshotDigest,
+				))
+		);
+	if (
+		publicationSuccessions.length > 256 ||
+		!snapshotDigest ||
+		!/^[a-f0-9]{64}$/.test(snapshotDigest) ||
+		snapshotByteLength === undefined ||
+		!Number.isSafeInteger(snapshotByteLength) ||
+		snapshotByteLength < 0
+	)
+		return false;
+	let predecessor = { fileIdentity, snapshotDigest, snapshotByteLength };
 	const publicationIds = new Set<string>(initialPublication ? [initialPublication.publicationId] : []);
 	const identities = new Set([JSON.stringify([predecessor.fileIdentity.dev, predecessor.fileIdentity.ino])]);
 	for (const succession of publicationSuccessions) {
@@ -616,8 +651,20 @@ export function validatePublicationSuccessions(
 			!succession.publicationId ||
 			publicationIds.has(succession.publicationId) ||
 			!sameIdentity(predecessor.fileIdentity, succession.predecessor.fileIdentity) ||
-			predecessor.snapshotDigest !== succession.predecessor.snapshotDigest ||
-			!succession.successor.snapshotDigest ||
+			!Number.isSafeInteger(succession.predecessor.snapshotByteLength) ||
+			succession.predecessor.snapshotByteLength < predecessor.snapshotByteLength ||
+			!/^[a-f0-9]{64}$/.test(succession.predecessor.snapshotDigest) ||
+			((predecessor.snapshotDigest !== succession.predecessor.snapshotDigest ||
+				predecessor.snapshotByteLength !== succession.predecessor.snapshotByteLength) &&
+				(!validPrefix(capture, predecessor.snapshotByteLength, predecessor.snapshotDigest) ||
+					!validPrefix(
+						capture,
+						succession.predecessor.snapshotByteLength,
+						succession.predecessor.snapshotDigest,
+					))) ||
+			!Number.isSafeInteger(succession.successor.snapshotByteLength) ||
+			succession.successor.snapshotByteLength < 0 ||
+			!/^[a-f0-9]{64}$/.test(succession.successor.snapshotDigest) ||
 			identities.has(successorIdentity)
 		)
 			return false;
@@ -627,7 +674,7 @@ export function validatePublicationSuccessions(
 	}
 	return (
 		sameIdentity(predecessor.fileIdentity, capture.fileIdentity) &&
-		predecessor.snapshotDigest === capture.snapshotDigest
+		validPrefix(capture, predecessor.snapshotByteLength, predecessor.snapshotDigest)
 	);
 }
 
@@ -649,15 +696,17 @@ export function validateDurabilityProof(
 	if (!validatePublicationSuccessions(pending, capture, publicationSuccessions, initial)) return [];
 	const originalIdentity = initial?.successor.fileIdentity ?? pending.durabilityDebt.fileIdentity;
 	const originalDigest = initial?.successor.snapshotDigest ?? pending.durabilityDebt.snapshotDigest;
+	const originalByteLength = initial?.successor.snapshotByteLength ?? pending.durabilityDebt.snapshotByteLength;
 	if (!originalIdentity) return [];
 	if (publicationSuccessions.length > 0 || initial) {
 		const terminal = publicationSuccessions[publicationSuccessions.length - 1] ?? initial;
 		if (!terminal) return [];
 		if (sameIdentity(proof.fileIdentity, capture.fileIdentity)) {
+			// Issued publication authority remains fixed; later sync receipts independently
+			// authenticate their own exact prefix and ranges on this same successor inode.
 			if (
 				proof.publicationId !== terminal.publicationId ||
-				proof.snapshotDigest !== capture.snapshotDigest ||
-				proof.snapshotByteLength !== captureByteLength(capture)
+				proof.snapshotByteLength < terminal.successor.snapshotByteLength
 			)
 				return [];
 		} else {
@@ -669,12 +718,14 @@ export function validateDurabilityProof(
 			if (publication) {
 				if (
 					proof.publicationId !== publication.publicationId ||
-					proof.snapshotDigest !== publication.successor.snapshotDigest
+					proof.snapshotDigest !== publication.successor.snapshotDigest ||
+					proof.snapshotByteLength !== publication.successor.snapshotByteLength
 				)
 					return [];
 			} else if (
 				!sameIdentity(proof.fileIdentity, originalIdentity) ||
 				proof.snapshotDigest !== originalDigest ||
+				proof.snapshotByteLength !== originalByteLength ||
 				(initial !== undefined && proof.publicationId !== initial.publicationId) ||
 				publicationSuccessions.some(succession => succession.publicationId === proof.publicationId)
 			)
