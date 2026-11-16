@@ -888,6 +888,24 @@ export class SharedControlPublicationError extends Error {
 	}
 }
 
+/**
+ * Durable session intent a model-selection rollback restores along with the live model:
+ * the configured DEFAULT chain and the resume default. Absent fields are left alone.
+ */
+export interface ModelSelectionRollbackDurableState {
+	readonly defaultChain?: {
+		readonly state:
+			| {
+					readonly entries: readonly string[];
+					readonly origin: string;
+					readonly identity?: string;
+					readonly explicitHead?: boolean;
+			  }
+			| undefined;
+	};
+	readonly resumeDefault?: { readonly selector: string | undefined };
+}
+
 function sharedControlPublicationMessage(operation: string, outcome: SharedEntriesAppendOutcome): string {
 	switch (outcome.kind) {
 		case "stale":
@@ -24769,11 +24787,23 @@ export class AgentSession {
 	async restoreModelSelectionForRollback(
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
+		durable?: ModelSelectionRollbackDurableState,
 	): Promise<void> {
-		// Compensation writes through legacy appends. Once the session is shared, the
-		// forward write was an admitted publication; never restore the live model
-		// blindly over it (#7824).
+		// A shared session compensates through its own admitted publication (#7824).
+		if (this.#usesSharedSessionPublication())
+			return this.#restoreSharedModelSelectionForRollback(model, thinkingLevel, durable);
 		this.sessionManager.assertLegacyAppendAllowed("restore model selection");
+		if (durable?.defaultChain) {
+			const chain = durable.defaultChain.state;
+			this.setConfiguredModelChain(
+				"default",
+				chain?.entries ?? [],
+				chain?.origin ?? "rollback",
+				chain?.identity,
+				chain?.explicitHead ?? true,
+			);
+		}
+		if (durable?.resumeDefault) this.recordResumeDefaultModel(durable.resumeDefault.selector);
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (model) {
 			// Restoring a captured live model is compensation, not a new selection:
@@ -24786,6 +24816,124 @@ export class AgentSession {
 			this.#syncAppendOnlyContext(undefined);
 		}
 		this.setThinkingLevel(thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/**
+	 * Shared-session compensation for a failed selector transaction. It compares the
+	 * captured state with the current live and durable state and publishes only the
+	 * entries that actually differ, through the common admitted control publication,
+	 * before any live change. Nothing that differs means nothing is written or changed.
+	 * A refused publication changes nothing; an unknown one closes the session.
+	 */
+	async #restoreSharedModelSelectionForRollback(
+		model: Model | undefined,
+		thinkingLevel: ThinkingLevel | undefined,
+		durable: ModelSelectionRollbackDurableState | undefined,
+	): Promise<void> {
+		const operation = "restore model selection";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const liveModel = this.model;
+		const liveThinking = this.#thinkingLevel;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const entries: SharedControlEntry[] = [];
+		const targetChain = durable?.defaultChain?.state;
+		const chainChanges =
+			durable?.defaultChain !== undefined &&
+			!util.isDeepStrictEqual(
+				targetChain === undefined
+					? undefined
+					: {
+							entries: [...targetChain.entries],
+							origin: targetChain.origin,
+							identity: targetChain.identity,
+							explicitHead: targetChain.explicitHead ?? true,
+						},
+				this.getConfiguredModelChainState("default"),
+			);
+		if (chainChanges) {
+			const chainEntries = [...(targetChain?.entries ?? [])];
+			entries.push({
+				type: "configured_model_chain",
+				chain: {
+					role: "default",
+					entries: chainEntries,
+					origin: targetChain?.origin ?? "rollback",
+					identity: targetChain?.identity,
+					explicitHead: targetChain?.explicitHead ?? true,
+					cleared: chainEntries.length === 0,
+				},
+			});
+		}
+		const resumeDefault = durable?.resumeDefault;
+		if (resumeDefault && this.getSessionDefaultModelSelector() !== resumeDefault.selector) {
+			entries.push(
+				resumeDefault.selector === undefined
+					? { type: "model_role_clear", role: "default" }
+					: { type: "model_change", model: resumeDefault.selector, role: "default" },
+			);
+		}
+		const modelChanges = model !== liveModel;
+		if (model && modelChanges)
+			entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "temporary" });
+		const effectiveThinking = resolveThinkingLevelForModel(model, thinkingLevel);
+		if (effectiveThinking !== liveThinking)
+			entries.push({ type: "thinking_level_change", level: effectiveThinking, operatorIntent: false });
+		if (entries.length === 0 && !modelChanges) return;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === liveModel &&
+				this.#thinkingLevel === liveThinking &&
+				this.#thinkingLevelMutationRevision === thinkingRevision
+			);
+		};
+		let committed: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
+		if (entries.length > 0) {
+			const outcome = await this.#withStartedSharedControlPublication(
+				() => {
+					if (!current())
+						throw new SharedControlPublicationError(operation, {
+							kind: "rejected",
+							error: new Error("superseded"),
+						});
+				},
+				() => manager.appendControlEntriesSharingSession(entries, current),
+			);
+			if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+			if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+			if (!current()) return this.#failClosedSharedControl(operation, outcome);
+			committed = outcome;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		try {
+			if (chainChanges) {
+				this.#defaultFallbackController = undefined;
+				this.#defaultFallbackExhaustedLastTurn = false;
+			}
+			if (model) {
+				if (modelChanges) this.#setModelAuthoritatively(model, "rollback");
+			} else if (modelChanges) {
+				this.#clearActiveRetryFallback();
+				this.#setModelWithProviderSessionReset(undefined);
+				this.#syncAppendOnlyContext(undefined);
+			}
+			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
+		} catch (error) {
+			if (committed) return this.#failClosedSharedControl(operation, committed, error);
+			throw error;
+		}
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 

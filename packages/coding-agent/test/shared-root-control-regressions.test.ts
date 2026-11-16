@@ -422,18 +422,6 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect(reopened.getSessionName()).toBe("Shared title");
 	});
 
-	it("refuses selector compensation before restoring the live model over an admitted write", async () => {
-		const f = await fixture();
-		await canonicalMessage(f);
-		const before = f.session.model;
-		const bytes = await Bun.file(f.file).text();
-		await expect(
-			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.Low),
-		).rejects.toThrow("Shared session mutation requires transaction admission: restore model selection");
-		expect(f.session.model).toBe(before);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
@@ -690,6 +678,107 @@ describe("#7824 /clear in a shared root TUI session", () => {
 			code: "unknown",
 		});
 		expect(f.session.agent.state.messages).toEqual(messages);
+		expect(f.session.sessionLifecycle.disposed).toBe(true);
+	});
+});
+
+describe("#7824 selector compensation in a shared root TUI session", () => {
+	it("publishes only the differing model and thinking before restoring them live", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		const fallback = f.registry.find(provider, "fallback")!;
+		await f.session.restoreModelSelectionForRollback(fallback, ThinkingLevel.High, {
+			resumeDefault: { selector: initialSelector },
+		});
+		// The resume default already matches the snapshot, so only model and thinking publish.
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.calls[0]![0]).toEqual([
+			{ type: "model_change", model: fallbackSelector, role: "temporary" },
+			{ type: "thinking_level_change", level: ThinkingLevel.High, operatorIntent: false },
+		]);
+		expect(f.session.model).toBe(fallback);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.manager.getBranch().find(entry => entry.parentId === leaf)).toMatchObject({ type: "model_change" });
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models).toMatchObject({ default: initialSelector, temporary: fallbackSelector });
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("restores a changed chain and resume default in the same publication", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const selected = f.registry.find(provider, "selected")!;
+		const initial = f.session.model;
+		const chain = f.session.getConfiguredModelChainState("default");
+		await f.session.setDefaultModelSelection(selected, ThinkingLevel.High);
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.restoreModelSelectionForRollback(initial, ThinkingLevel.Low, {
+			defaultChain: { state: chain },
+			resumeDefault: { selector: initialSelector },
+		});
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.calls[0]![0].map(entry => entry.type)).toEqual([
+			"configured_model_chain",
+			"model_change",
+			"model_change",
+			"thinking_level_change",
+		]);
+		expect(f.session.model).toBe(initial);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models).toMatchObject({ default: initialSelector, temporary: initialSelector });
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(reopened.configuredModelChains.default?.entries ?? []).toEqual(chain?.entries ?? []);
+	});
+
+	it("writes nothing when the captured state already matches", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.restoreModelSelectionForRollback(f.session.model, ThinkingLevel.Low, {
+			defaultChain: { state: f.session.getConfiguredModelChainState("default") },
+			resumeDefault: { selector: initialSelector },
+		});
+		expect(publish).not.toHaveBeenCalled();
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("leaves the live model untouched when the compensation publication is refused", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = f.session.model;
+		const bytes = await Bun.file(f.file).text();
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		await expect(
+			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.High),
+		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(f.session.model).toBe(before);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("closes the session instead of restoring when the compensation outcome is unknown", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = f.session.model;
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "unknown",
+			ids: ["compensation"],
+			error: new Error("durability_unproven"),
+		});
+		await expect(
+			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.High),
+		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "unknown" });
+		expect(f.session.model).toBe(before);
 		expect(f.session.sessionLifecycle.disposed).toBe(true);
 	});
 });
