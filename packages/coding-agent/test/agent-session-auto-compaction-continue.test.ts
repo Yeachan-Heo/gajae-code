@@ -1136,4 +1136,48 @@ describe("AgentSession auto-compaction continuation", () => {
 
 		expect(promptError, "prompt should succeed after overflow compaction").toBeUndefined();
 	});
+
+	it("issue #7826: prompting after threshold compaction does not re-trigger with stale usage", async () => {
+		// After a threshold auto-compaction completes, the user prompts again.
+		// Before the fix, the stale assistant message (from before compaction) would have
+		// pre-compaction usage stats, causing re-entry into runAutoCompaction("threshold")
+		// and an AgentBusyError for the user prompt. This kept the session busy for 30s
+		// waiting for the second compaction (which was a no-op) to complete.
+		// With the fix, the errorIsFromBeforeCompaction guard prevents the re-trigger.
+
+		// Use default settings and messages to trigger threshold compaction naturally
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const compactionEvents: { type: string; reason?: string }[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start") {
+				compactionEvents.push({ type: event.type, reason: event.reason });
+			}
+		});
+
+		// First compaction with default message (191K tokens)
+		await driveCompaction();
+		await advancePostPrompt(50);
+		await session.waitForIdle();
+
+		// Verify at least one compaction was triggered
+		expect(compactionEvents.length, "at least one compaction should have been triggered").toBeGreaterThan(0);
+
+		// Now prompt again with a timeout to detect hanging
+		let promptError: Error | undefined;
+		const mockPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		try {
+			await Promise.race([
+				session.prompt("continue working"),
+				new Promise<void>((_, reject) =>
+					setTimeout(() => reject(new Error("Timed out waiting for prompt - session may be wedged")), 3000),
+				),
+			]);
+		} catch (error) {
+			promptError = error instanceof Error ? error : new Error(String(error));
+		}
+
+		// The prompt should succeed without timing out
+		expect(promptError, "prompt should succeed after compaction without 30s hang").toBeUndefined();
+		expect(mockPrompt).toHaveBeenCalled();
+	});
 });
