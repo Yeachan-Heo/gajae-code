@@ -34,6 +34,8 @@ function manifestEntry(entry: SessionEntry, order: number, kind: ResumeManifestE
 }
 
 interface FixtureOptions {
+	emptyBase?: boolean;
+	foreignRoot?: boolean;
 	cursors?: number;
 	dependents?: number;
 	enroll?: boolean;
@@ -49,7 +51,13 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 	const dependents = options.dependents ?? 1;
 	const enroll = options.enroll ?? true;
 	const suffix = options.suffix ?? "none";
-	const base = cursors === 0 ? [message("a", null)] : [message("a", null), message("b", null), message("c", null)];
+	const base = options.emptyBase
+		? []
+		: cursors === 0
+			? [message("a", null)]
+			: [message("a", null), message("b", null), message("c", null)];
+	const target = base[0]?.id ?? null;
+	if (options.foreignRoot) base.push(message("foreign", null));
 	const planned: SessionEntry[] = [];
 	const manifest: ResumeManifestEntry[] = [];
 	function add(entry: SessionEntry, kind: ResumeManifestEntry["kind"]): void {
@@ -61,7 +69,7 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 			{
 				type: "custom",
 				id: "M",
-				parentId: "a",
+				parentId: target,
 				timestamp,
 				customType: "gjc.owner_enroll",
 				data: {
@@ -82,7 +90,7 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 			{
 				type: "custom",
 				id: `C${index + 1}`,
-				parentId: index === 0 ? "a" : `C${index}`,
+				parentId: index === 0 ? target : `C${index}`,
 				timestamp,
 				customType: "gjc.resume_cursor",
 				data: {
@@ -98,10 +106,10 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 			"cursor",
 		);
 	for (let index = 0; index < dependents; index++)
-		add(message(`D${index + 1}`, index ? `D${index}` : cursors ? `C${cursors}` : "a"), "dependent");
+		add(message(`D${index + 1}`, index ? `D${index}` : cursors ? `C${cursors}` : target), "dependent");
 	const presentCount = options.present ?? planned.length;
 	const present = planned.slice(0, presentCount);
-	const local = message("L", present.at(-1)?.id ?? "a");
+	const local = message("L", present.at(-1)?.id ?? target);
 	const files: FileEntry[] = [
 		{ type: "session", id: "header", version: 3, timestamp, cwd: "/project" },
 		...base,
@@ -150,10 +158,10 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 			selectionRequested: true,
 			cursorIds: Array.from({ length: cursors }, (_, index) => `C${index + 1}`),
 			dependentIds: Array.from({ length: dependents }, (_, index) => `D${index + 1}`),
-			target: "a",
+			target,
 		},
 		manifest,
-		CB: cursors ? `C${cursors}` : "a",
+		CB: cursors ? `C${cursors}` : target,
 		g0: { fileEntriesIndex0: base.length, entryRevision0: base.length },
 		memberToken: "token",
 		authorityKey: "authority",
@@ -207,7 +215,7 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 				? { kind: "terminal", closeOutcome: "closed", residentAttempt: "discarded", closure }
 				: { kind: "live", strictClosePending: false, residentAttempt: "discarded" },
 		residentSuffix,
-		residentTip: suffix === "none" ? (planned.at(-1)?.id ?? "a") : "L",
+		residentTip: suffix === "none" ? (planned.at(-1)?.id ?? target) : "L",
 		preOpCommittedTail: base.at(-1)?.id ?? null,
 		preOpEntries: base.map((entry, index) => manifestEntry(entry, index, "dependent")),
 		remainingConflict: options.remainingConflict ?? [],
@@ -308,16 +316,63 @@ describe("C5 manifest x suffix x durability truth table", () => {
 		expect(markerPrefix.outcome.kind).toBe("enrolled_only");
 		expect(markerPrefix.receipt.commitment.selectionEffect).toBe("marker_only");
 		expect(markerPrefix.receipt.commitment.selectionCommitted).toBe(false);
+		expect(markerPrefix.receipt.presence).toEqual({ present: ["M"], missing: ["C1", "C2", "D1"] });
+		expect(markerPrefix.receipt.frontier.CF).toBe("c");
+		expect(markerPrefix.receipt.finalPublishedTip).toBe("c");
 		const k0PendingDependent = classifyResumeOperation(fixture({ cursors: 0, dependents: 1, present: 1 }));
 		expect(k0PendingDependent.outcome.kind).toBe("dependents_absent");
 		expect(k0PendingDependent.receipt.commitment.selectionCommitted).toBe(true);
 		expect(k0PendingDependent.receipt.commitment.operationComplete).toBe(false);
+		expect(k0PendingDependent.receipt.frontier.CF).toBe("a");
+		expect(k0PendingDependent.receipt.finalPublishedTip).toBe("a");
 		const k0 = classifyResumeOperation(fixture({ cursors: 0, dependents: 0 }));
 		expect(k0.outcome.kind).toBe("committed");
 		expect(k0.receipt.commitment.selectionCommitted).toBe(true);
+		expect(k0.receipt.frontier.CF).toBe("a");
+		expect(k0.receipt.finalPublishedTip).toBe("a");
 		expect(classifyResumeOperation(fixture({ cursors: 0, dependents: 0, manifestD: false })).outcome.kind).toBe(
 			"unknown",
 		);
+	});
+
+	it("published enrollment suffix preserves the executable tip without dropping marker durability obligations", () => {
+		for (const emptyBase of [false, true]) {
+			for (const manifestD of [true, false]) {
+				const e = fixture({ emptyBase, cursors: 0, dependents: 0, manifestD });
+				const markerSuffix: ResumeOperationEvidence = {
+					...e,
+					residentSuffix: e.pending.manifest.map(entry => ({ ...entry, residentKind: "planned" })),
+				};
+				const result = classifyResumeOperation(markerSuffix);
+				const tip = emptyBase ? null : "a";
+				expect(result.receipt.commitment.reducerView?.candidates).toEqual(emptyBase ? [] : ["a"]);
+				expect(result.receipt.presence).toEqual({ present: ["M"], missing: [] });
+				expect(result.receipt.frontier.CF).toBe(tip);
+				expect(result.receipt.finalPublishedTip).toBe(tip);
+				expect(result.receipt.finalClassification.finalPublishedTip).toBe(tip);
+				expect(result.receipt.residentSuffix).toMatchObject([
+					{ id: "M", kind: "planned", state: manifestD ? "published_with_D" : "published_no_D" },
+				]);
+				expect(result.outcome.kind).toBe(manifestD ? "committed" : "unknown");
+				expect(result.receipt.commitment.operationComplete).toBe(manifestD);
+				expect(P_latch(markerSuffix)).toBe(manifestD);
+				expect(P_continue(markerSuffix)).toBe(manifestD);
+			}
+		}
+	});
+
+	it("a durable enrollment-only resident suffix cannot replace a later executable manifest tip", () => {
+		const e = fixture();
+		const result = classifyResumeOperation({
+			...e,
+			residentSuffix: e.pending.manifest
+				.filter(entry => entry.kind === "enroll")
+				.map(entry => ({ ...entry, residentKind: "planned" })),
+		});
+		expect(result.outcome.kind).toBe("committed");
+		expect(result.receipt.frontier.CF).toBe("D1");
+		expect(result.receipt.finalPublishedTip).toBe("D1");
+		expect(result.receipt.residentSuffix).toMatchObject([{ id: "M", state: "published_with_D" }]);
 	});
 
 	it("missing dependents do not undo an actually committed selection", () => {
@@ -343,6 +398,118 @@ describe("C5 manifest x suffix x durability truth table", () => {
 		};
 		expect(P_latch(latched)).toBe(false);
 		expect(P_continue(latched)).toBe(false);
+	});
+});
+
+describe("null-base owned lineage", () => {
+	it("recognizes the durable own dependent as a continuation of an empty transcript", () => {
+		const e = fixture({ emptyBase: true, cursors: 0 });
+		const result = classifyResumeOperation(e);
+		expect(e.pending.CB).toBeNull();
+		expect(e.pending.plan.target).toBeNull();
+		expect(e.pending.manifest.map(entry => [entry.id, entry.parentId])).toEqual([
+			["M", null],
+			["D1", null],
+		]);
+		expect(result.receipt.commitment.reducerView).toEqual({
+			kind: "tail_unambiguous",
+			candidates: ["D1"],
+			leaf: "D1",
+		});
+		expect(result.receipt.remainingConflict).toEqual([]);
+		expect(result.outcome.kind).toBe("committed");
+		expect(result.receipt.frontier).toEqual({ CB: null, CF: "D1", RT: "D1" });
+		expect(result.receipt.finalPublishedTip).toBe("D1");
+		expect(P_latch(e)).toBe(true);
+		expect(P_continue(e)).toBe(true);
+	});
+
+	it("recognizes only matched own local suffix lineage through a dependent or enrollment marker", () => {
+		for (const dependents of [0, 1]) {
+			const e = fixture({ emptyBase: true, cursors: 0, dependents, suffix: "published" });
+			const result = classifyResumeOperation(e);
+			expect(result.receipt.commitment.reducerView).toEqual({
+				kind: "tail_unambiguous",
+				candidates: ["L"],
+				leaf: "L",
+			});
+			expect(result.receipt.remainingConflict).toEqual([]);
+			expect(result.outcome.kind).toBe("committed");
+			expect(result.receipt.frontier.CF).toBe(dependents ? "D1" : null);
+			expect(result.receipt.finalPublishedTip).toBe("L");
+			expect(result.receipt.residentSuffix).toMatchObject([
+				{ id: "L", kind: "retainedLocal", state: "published_with_D" },
+			]);
+			expect(P_latch(e)).toBe(true);
+			expect(P_continue(e)).toBe(true);
+		}
+	});
+
+	it("keeps an unrelated null-root candidate conflicting despite empty caller conflict evidence", () => {
+		const e = fixture({ emptyBase: true, foreignRoot: true, cursors: 0 });
+		const result = classifyResumeOperation(e);
+		expect(result.receipt.commitment.reducerView?.candidates).toEqual(["foreign", "D1"]);
+		expect(result.receipt.remainingConflict).toEqual(["foreign"]);
+		expect(result.outcome.kind).toBe("committed_with_remaining_conflict");
+		expect(P_latch(e)).toBe(true);
+		expect(P_continue(e)).toBe(false);
+	});
+
+	it("rejects mismatched manifest or suffix payloads and parents along the own null-root path", () => {
+		for (const suffix of ["none", "published"] as const) {
+			const original = fixture({ emptyBase: true, cursors: 0, suffix });
+			for (const change of [{ payloadDigest: "different" }, { parentId: "missing" }]) {
+				const pending: PendingResumeOp = {
+					...original.pending,
+					manifest: original.pending.manifest.map(entry => (entry.id === "D1" ? { ...entry, ...change } : entry)),
+				};
+				const malformedManifest = { ...original, pending };
+				const result = classifyResumeOperation(malformedManifest);
+				expect(result.receipt.commitment.reducerView?.candidates).toEqual([suffix === "none" ? "D1" : "L"]);
+				expect(result.receipt.remainingConflict).toEqual([suffix === "none" ? "D1" : "L"]);
+				expect(result.outcome).toMatchObject({ kind: "unknown", reason: "gap" });
+				expect(P_latch(malformedManifest)).toBe(false);
+				expect(P_continue(malformedManifest)).toBe(false);
+				if (suffix === "published") {
+					const malformedSuffix: ResumeOperationEvidence = {
+						...original,
+						residentSuffix: original.residentSuffix.map(entry => ({ ...entry, ...change })),
+					};
+					const suffixResult = classifyResumeOperation(malformedSuffix);
+					expect(suffixResult.receipt.remainingConflict).toEqual(["L"]);
+					expect(suffixResult.outcome).toMatchObject({ kind: "unknown", reason: "unexplained_resident_branch" });
+					expect(P_latch(malformedSuffix)).toBe(false);
+					expect(P_continue(malformedSuffix)).toBe(false);
+				}
+			}
+		}
+	});
+
+	it("does not explain an unowned suffix or a malformed captured range by its null root", () => {
+		const original = fixture({ emptyBase: true, cursors: 0, suffix: "published" });
+		const capture = captured(original);
+		const unexplained: ResumeOperationEvidence = {
+			...original,
+			residentSuffix: original.residentSuffix.map(entry => ({ ...entry, residentKind: "unexplained" })),
+		};
+		const unowned: ResumeOperationEvidence = { ...original, residentSuffix: [] };
+		const malformedRange: ResumeOperationEvidence = {
+			...original,
+			capture: {
+				...capture,
+				entries: capture.entries.map(entry =>
+					entry.id === "D1" ? { ...entry, range: { ...entry.range, hash: "different" } } : entry,
+				),
+			},
+		};
+		for (const e of [unexplained, unowned, malformedRange]) {
+			const result = classifyResumeOperation(e);
+			expect(result.receipt.commitment.reducerView?.candidates).toEqual(["L"]);
+			expect(result.receipt.remainingConflict).toEqual(["L"]);
+			expect(result.outcome.kind).toBe("unknown");
+			expect(P_latch(e)).toBe(false);
+			expect(P_continue(e)).toBe(false);
+		}
 	});
 });
 

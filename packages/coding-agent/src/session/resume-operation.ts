@@ -482,15 +482,32 @@ function remainingConflicts(e: ResumeOperationEvidence): readonly string[] {
 		let id: string | null = candidate;
 		const visited = new Set<string>();
 		let selectedLineage = false;
+		// Null is not a shared graph vertex: every hop must belong to this operation.
+		let ownedNullLineage = selected === null && e.pending.CB === null && e.pending.plan.cursorIds.length === 0;
 		while (id !== null && !visited.has(id)) {
 			if (id === selected) {
 				selectedLineage = true;
 				break;
 			}
 			visited.add(id);
-			id = entries.get(id)?.parentId ?? null;
+			const actual = entries.get(id);
+			if (ownedNullLineage) {
+				const planned = e.pending.manifest.find(entry => entry.id === id);
+				const resident = e.residentSuffix.find(entry => entry.id === id);
+				const expected = planned ?? (resident?.residentKind === "retainedLocal" ? resident : undefined);
+				ownedNullLineage =
+					actual !== undefined &&
+					expected !== undefined &&
+					sameEntry(expected, actual) &&
+					validRange(actual.range, capture.bytes) &&
+					(!resident ||
+						(resident.residentKind !== "unexplained" &&
+							sameEntry(resident, actual) &&
+							(!planned || planned.order === resident.order)));
+			}
+			id = actual?.parentId ?? null;
 		}
-		if (!selectedLineage) remaining.add(candidate);
+		if (!selectedLineage && !(id === null && ownedNullLineage)) remaining.add(candidate);
 	}
 	return [...remaining];
 }
@@ -740,13 +757,13 @@ function analyze(e: ResumeOperationEvidence): Analysis {
 	if (structureValid)
 		for (const entry of p.manifest) {
 			if (!durable.has(entry.id)) break;
-			CF = entry.id;
+			if (entry.kind !== "enroll") CF = entry.id;
 		}
 	let finalPublishedTip = CF;
 	if (structureValid)
 		for (const entry of suffix) {
 			if (entry.state !== "published_with_D") break;
-			finalPublishedTip = entry.id;
+			if (entry.id !== p.plan.enroll) finalPublishedTip = entry.id;
 		}
 	return {
 		shape,
