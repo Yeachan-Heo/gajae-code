@@ -189,7 +189,7 @@ async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<Sla
 			return usage("Could not generate a session title — pass one: /rename <title>", runtime);
 		}
 
-		const stored = await runtime.sessionManager.setSessionName(generated, "user");
+		const stored = await runtime.session.setSessionName(generated, "user");
 		if (!stored) {
 			await runtime.output("Session name not changed (a user-set name takes precedence).");
 			return commandConsumed();
@@ -772,7 +772,7 @@ async function handleEffortCommand(
 
 	const levelToApply =
 		requestedLevel === ThinkingLevel.Inherit ? runtime.settings.get("defaultThinkingLevel") : requestedLevel;
-	runtime.session.setThinkingLevel(levelToApply, false);
+	await runtime.session.setThinkingLevelForControl(levelToApply, false);
 	const effectiveLevel = runtime.session.thinkingLevel ?? ThinkingLevel.Off;
 	const requestedLabel =
 		requestedLevel === ThinkingLevel.Inherit ? `${requestedLevel} (${levelToApply})` : requestedLevel;
@@ -1281,7 +1281,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							cause: "user-selection",
 						});
 						if (existingDefaultThinkingLevel) {
-							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+							await runtime.session.setThinkingLevelForSession(existingDefaultThinkingLevel);
 						}
 					}
 					if (!includesDefault) {
@@ -1376,17 +1376,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			const arg = command.args.toLowerCase();
 			if (!arg || arg === "toggle") {
-				const enabled = runtime.session.toggleFastMode();
+				const enabled = await runtime.session.toggleFastMode();
 				await runtime.output(`Fast mode ${enabled ? "enabled" : "disabled"}.`);
 				return commandConsumed();
 			}
 			if (arg === "on") {
-				runtime.session.setFastMode(true);
+				await runtime.session.setFastMode(true);
 				await runtime.output("Fast mode enabled.");
 				return commandConsumed();
 			}
 			if (arg === "off") {
-				runtime.session.setFastMode(false);
+				await runtime.session.setFastMode(false);
 				await runtime.output("Fast mode disabled.");
 				return commandConsumed();
 			}
@@ -1402,24 +1402,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			return usage("Usage: /fast [on|off|status]", runtime);
 		},
-		handleTui: (command, runtime) => {
+		handleTui: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (!arg || arg === "toggle") {
-				const enabled = runtime.ctx.session.toggleFastMode();
+				const enabled = await runtime.ctx.session.toggleFastMode();
 				refreshStatusLine(runtime.ctx);
 				runtime.ctx.showStatus(`Fast mode ${enabled ? "enabled" : "disabled"}.`);
 				runtime.ctx.editor.setText("");
 				return;
 			}
 			if (arg === "on") {
-				runtime.ctx.session.setFastMode(true);
+				await runtime.ctx.session.setFastMode(true);
 				refreshStatusLine(runtime.ctx);
 				runtime.ctx.showStatus("Fast mode enabled.");
 				runtime.ctx.editor.setText("");
 				return;
 			}
 			if (arg === "off") {
-				runtime.ctx.session.setFastMode(false);
+				await runtime.ctx.session.setFastMode(false);
 				refreshStatusLine(runtime.ctx);
 				runtime.ctx.showStatus("Fast mode disabled.");
 				runtime.ctx.editor.setText("");
@@ -2595,7 +2595,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			if (!command.args) return regenerateSessionTitle(runtime);
 			invalidateSessionTitleGeneration(runtime.sessionManager);
-			const ok = await runtime.sessionManager.setSessionName(command.args, "user");
+			const ok = await runtime.session.setSessionName(command.args, "user");
 			if (!ok) {
 				await runtime.output("Session name not changed (a user-set name takes precedence).");
 				return commandConsumed();

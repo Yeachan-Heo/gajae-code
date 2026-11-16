@@ -2377,10 +2377,12 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 							return send;
 						},
 						appendEntry: (customType, data) => {
-							session.sessionManager.appendCustomEntry(customType, data);
+							// A shared-append session refuses the legacy append after its first
+							// canonical publication; publish through the session's admitted path.
+							void session.appendCustomEntryInBackground(customType, data);
 						},
 						setLabel: (targetId, label) => {
-							session.sessionManager.appendLabelChange(targetId, label);
+							void session.appendLabelChangeInBackground(targetId, label);
 						},
 						getActiveTools: () => session.getActiveToolNames(),
 						getAllTools: () => session.getAllToolNames(),

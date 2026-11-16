@@ -1682,7 +1682,7 @@ export class InputController {
 		)
 			.then(async title => {
 				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
-				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+				const applied = await this.ctx.session.setSessionName(title, "auto");
 				if (applied) {
 					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
 					this.ctx.updateEditorBorderColor();

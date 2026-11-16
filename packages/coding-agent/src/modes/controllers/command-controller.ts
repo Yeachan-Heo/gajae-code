@@ -1408,7 +1408,7 @@ export class CommandController {
 					return;
 				}
 
-				const stored = await this.ctx.sessionManager.setSessionName(generated, "user");
+				const stored = await this.ctx.session.setSessionName(generated, "user");
 				if (!stored) {
 					this.ctx.showError("Session name cannot be empty.");
 					return;
@@ -1418,7 +1418,7 @@ export class CommandController {
 			}
 
 			invalidateSessionTitleGeneration(this.ctx.sessionManager);
-			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
+			const stored = await this.ctx.session.setSessionName(title, "user");
 			if (!stored) {
 				this.ctx.showError("Session name cannot be empty.");
 				return;

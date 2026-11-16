@@ -93,6 +93,8 @@ interface FakeAcpBuiltinSession {
 	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
 	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
+	setThinkingLevelForControl(thinkingLevel: ThinkingLevel, persist: boolean): Promise<void>;
+	setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined): Promise<void>;
 }
 
 function createRuntime() {
@@ -227,6 +229,14 @@ function createRuntime() {
 			this.thinkingLevel = thinkingLevel;
 			this.thinkingLevelCalls.push({ thinkingLevel, persist });
 		},
+		// The real controls publish before applying; the fake applies through the
+		// overridable setter so tests can observe the requested level.
+		async setThinkingLevelForControl(thinkingLevel: ThinkingLevel, persist: boolean) {
+			this.setThinkingLevel(thinkingLevel, persist);
+		},
+		async setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined) {
+			this.setThinkingLevel(thinkingLevel);
+		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const fakeSessionManager = {
@@ -293,6 +303,7 @@ function createRuntime() {
 	};
 	const typedSession = Object.assign(session, {
 		sessionManager: fakeSessionManager as unknown as SessionManager,
+		setSessionName: (name: string, source: "auto" | "user") => fakeSessionManager.setSessionName(name, source),
 	}) as unknown as AgentSession & FakeAcpBuiltinSession;
 	return {
 		output,
