@@ -317,14 +317,21 @@ for (const isolated of [true, false]) {
 			await expect(
 				host.request("question.answer", { sessionId: session.id, questionId: crypto.randomUUID(), value: true }),
 			).rejects.toThrow();
+			const historyBeforeSeed = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
 			await host.request("shutdown");
 			expect(await host.child.exited).toBe(0);
 			await host.reader;
 			// Seed only after shutdown has released the genuine writer. No provider is needed.
-			const seedCatalog: { sessions: { id: string; file: string; scope?: string }[] } = await Bun.file(
-				path.join(dataAlias, "catalog.json"),
-			).json();
+			const seedCatalog: {
+				sessions: {
+					id: string;
+					file: string;
+					scope?: string;
+					view?: { sessionId: string; leafEntryId: string | null };
+				}[];
+			} = await Bun.file(path.join(dataAlias, "catalog.json")).json();
 			const sourceRow = seedCatalog.sessions.find(item => item.id === session.id)!;
+			if (!sourceRow.view) throw new Error("Expected the app's saved exact cursor before external seeding");
 			// App conversations now live in the SDK store the terminal reads; older rows
 			// stay in the app's private root, so both roots resolve by recorded scope.
 			const appSessions = path.join(await fs.realpath(dataAlias), "sessions");
@@ -356,7 +363,10 @@ for (const isolated of [true, false]) {
 						const entryId = manager.appendMessage({ role: "user", content: process.argv[2], timestamp: 2 });
 						manager.appendMessage({ role: "user", content: "제외할 뒤 메시지", timestamp: 3 });
 						await manager.flush();
-						process.stdout.write(entryId);
+						process.stdout.write(JSON.stringify({
+							selectedEntryId: entryId,
+							view: { sessionId: manager.getSessionId(), leafEntryId: manager.getLeafId() },
+						}));
 					} finally {
 						const outcome = await manager.closeStrict();
 						if (outcome.kind !== "closed") throw outcome.error;
@@ -370,14 +380,41 @@ for (const isolated of [true, false]) {
 				],
 				{ cwd: path.resolve(import.meta.dir, "../../desktop-host"), stdout: "pipe", stderr: "pipe" },
 			);
-			const [selectedEntryId, seedError, seedExit] = await Promise.all([
+			const [seedOutput, seedError, seedExit] = await Promise.all([
 				new Response(seed.stdout).text(),
 				new Response(seed.stderr).text(),
 				seed.exited,
 			]);
 			expect(seedError).toBe("");
 			expect(seedExit).toBe(0);
+			const {
+				selectedEntryId,
+				view,
+			}: {
+				selectedEntryId: string;
+				view: { sessionId: string; leafEntryId: string | null };
+			} = JSON.parse(seedOutput);
 			expect(selectedEntryId).not.toBe("");
+			// Appending to a transcript must not advance the app's saved exact view.
+			// First prove ordinary resume still selects the original branch, even at root.
+			host = launch();
+			await host.request("session.select", { sessionId: session.id });
+			const exactHistory = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
+			expect(exactHistory.messages.map(message => [message.role, message.text])).toEqual(
+				historyBeforeSeed.messages.map(message => [message.role, message.text]),
+			);
+			expect(exactHistory.messages.some(message => message.entryId === selectedEntryId)).toBe(false);
+			await host.request("shutdown");
+			expect(await host.child.exited).toBe(0);
+			await host.reader;
+			// Explicitly select the synthetic seed cursor in this stopped fixture's
+			// presentation catalog; production restore must never infer the latest leaf.
+			const selectedCatalog: typeof seedCatalog = await Bun.file(path.join(dataAlias, "catalog.json")).json();
+			const selectedRow = selectedCatalog.sessions.find(item => item.id === session.id);
+			if (!selectedRow) throw new Error("Seeded session missing from catalog");
+			expect(selectedRow.view).toEqual(sourceRow.view);
+			selectedRow.view = view;
+			await Bun.write(path.join(dataAlias, "catalog.json"), JSON.stringify(selectedCatalog));
 			host = launch();
 			const restored = await host.request<DesktopSnapshot>("bootstrap");
 			expect(restored.sessions[0]?.title).toBe("명령으로 바꾼 제목");
