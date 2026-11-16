@@ -600,8 +600,9 @@ function collapseMixedTypeCombinerVariants(schema: JsonObject, combiner: "anyOf"
 
 	// Only apply fields valid for the chosen type. Each variant was validated above
 	// to have only keys allowed for its own type, but merged fields may include keys
-	// from different variants. We must filter to only keys allowed for chosenType
-	// (prefer array when any variant is array per existing test semantics).
+	// from different variants. We must filter to only keys allowed for chosenType.
+	// Keep first non-null type semantics (not preferring array) for backward compatibility
+	// with existing test [array,string,null] → array behavior.
 	const allowedKeysForChosenType = CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS[chosenType];
 	if (!allowedKeysForChosenType) {
 		return schema;
