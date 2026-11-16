@@ -97,7 +97,7 @@ import {
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
-import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
+import { DsmlToolCallHealer, type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
 import {
 	isForcedToolChoiceUnsupportedError,
@@ -1047,6 +1047,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
+			const dsmlHealer =
+				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens ? new DsmlToolCallHealer() : undefined;
 			let healedToolCallEmitted = false;
 			const emitHealedToolCall = (call: HealedToolCall): void => {
 				finishCurrentBlock(currentBlock);
@@ -1080,8 +1082,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				healedToolCallEmitted = true;
 			};
 			const flushHealedToolCalls = (): void => {
-				if (!kimiHealer) return;
-				const calls = kimiHealer.drainCompleted();
+				if (!kimiHealer && !dsmlHealer) return;
+				const calls = [...(kimiHealer?.drainCompleted() ?? []), ...(dsmlHealer?.drainCompleted() ?? [])];
 				for (const call of calls) emitHealedToolCall(call);
 			};
 			let providerSafetyStop = false;
@@ -1176,6 +1178,21 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 								} else if (stripDeepseekChatTemplateTokens) {
 									deepseekStripBuffer += normalizedDeltaText;
 									flushDeepseekStripBuffer(false);
+								} else if (dsmlHealer) {
+									const hasStructuredToolCalls =
+										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
+									if (hasStructuredToolCalls) {
+										// Same chunk leaks markers AND carries structured tool_calls.
+										// Strip the marker text from visible output, but drop any
+										// synthesized calls so the structured payload stays the
+										// single source of truth (avoids double-dispatch).
+										const clean = dsmlHealer.consumeWithoutCalls(normalizedDeltaText);
+										if (clean.length > 0) appendTextDelta(clean);
+									} else {
+										const clean = dsmlHealer.feed(normalizedDeltaText);
+										if (clean.length > 0) appendTextDelta(clean);
+										flushHealedToolCalls();
+									}
 								} else if (kimiHealer) {
 									const hasStructuredToolCalls =
 										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
@@ -1333,12 +1350,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				noteRepetitionTrip(guard, channel);
 			}
 
-			if (kimiHealer) {
-				const trailing = kimiHealer.flushPending();
+			if (kimiHealer || dsmlHealer) {
+				const trailing = (kimiHealer?.flushPending() ?? "") + (dsmlHealer?.flushPending() ?? "");
 				if (trailing.length > 0) appendTextDelta(trailing);
 				flushHealedToolCalls();
 				if (healedToolCallEmitted && output.stopReason === "stop") {
-					// Hosts that leak Kimi tool tokens often still report
+					// Hosts that leak Kimi or DSML tool-call markup often still report
 					// `finish_reason: stop` for the surrounding turn. Promote
 					// only that natural-completion finish — leave `error`,
 					// `length`, `aborted`, etc. untouched.

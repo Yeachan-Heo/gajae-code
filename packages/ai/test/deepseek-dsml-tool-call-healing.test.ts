@@ -1,0 +1,151 @@
+import { describe, expect, it } from "bun:test";
+import { DsmlToolCallHealer } from "../src/utils/tool-call-healing";
+
+describe("DeepSeek DSML tool-call healing", () => {
+	it("parses string and JSON-typed parameters and strips all markup", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed(
+			"Before" +
+				"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>' +
+				'<｜DSML｜parameter name="timeout" string="false">60</｜DSML｜parameter>' +
+				"</｜DSML｜invoke>" +
+				"</｜DSML｜tool_calls>" +
+				"After",
+		);
+
+		expect(clean).toBe("BeforeAfter");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].id).toBe("dsml_1");
+		expect(calls[0].name).toBe("bash");
+		expect(JSON.parse(calls[0].arguments)).toEqual({ command: "pwd", timeout: 60 });
+		expect(clean).not.toContain("DSML");
+	});
+
+	it("accepts whitespace after the DSML delimiter", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed(
+			'<｜DSML｜ invoke name="read">' +
+				'<｜DSML｜ parameter name="path" string="true">src/index.ts</｜DSML｜ parameter>' +
+				"</｜DSML｜ invoke>",
+		);
+
+		expect(clean).toBe("");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("read");
+		expect(JSON.parse(calls[0].arguments)).toEqual({ path: "src/index.ts" });
+	});
+
+	it("accepts ASCII pipe delimiters", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed(
+			"<|DSML|tool_calls>" +
+				'<|DSML|invoke name="read">' +
+				'<|DSML|parameter name="path" string="true">src/index.ts</|DSML|parameter>' +
+				"</|DSML|invoke>" +
+				"</|DSML|tool_calls>",
+		);
+
+		expect(clean).toBe("");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("read");
+		expect(JSON.parse(calls[0].arguments)).toEqual({ path: "src/index.ts" });
+	});
+
+	it("recovers the real Venice leak including its direct _i parameter", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed(
+			'<｜DSML｜ invoke name="_i" string="true">정규식 매칭 검증</｜DSML｜ parameter>\n' +
+				'<｜DSML｜ parameter name="command" string="true">cd ~/.gjc/agent/rules && node -e "..."</｜DSML｜ parameter>\n' +
+				'<｜DSML｜ parameter name="timeout" string="false">60</｜DSML｜ parameter>\n' +
+				"</｜DSML｜ invoke>\n" +
+				"</｜DSML｜ calls>",
+		);
+
+		expect(clean.trim()).toBe("");
+		expect(clean).not.toContain("DSML");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("_i");
+		expect(JSON.parse(calls[0].arguments)).toEqual({
+			_i: "정규식 매칭 검증",
+			command: 'cd ~/.gjc/agent/rules && node -e "..."',
+			timeout: 60,
+		});
+	});
+
+	it("holds markup across small chunks, including inside the delimiter", () => {
+		const healer = new DsmlToolCallHealer();
+		const leaked =
+			"Visible " +
+			"<｜DSML｜calls>" +
+			'<｜DSML｜invoke name="write">' +
+			'<｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter>' +
+			'<｜DSML｜parameter name="content" string="true">hello</｜DSML｜parameter>' +
+			"</｜DSML｜invoke>" +
+			"</｜DSML｜calls>" +
+			" done";
+
+		let clean = "";
+		for (const ch of leaked) clean += healer.feed(ch);
+		clean += healer.flushPending();
+
+		expect(clean).toBe("Visible  done");
+		expect(clean).not.toContain("DSML");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("write");
+		expect(JSON.parse(calls[0].arguments)).toEqual({ path: "out.txt", content: "hello" });
+	});
+
+	it("passes prose through and releases a trailing lone less-than sign at flush", () => {
+		const healer = new DsmlToolCallHealer();
+		expect(healer.feed("Plain < text ")).toBe("Plain < text ");
+		expect(healer.feed("<")).toBe("");
+		expect(healer.drainCompleted()).toEqual([]);
+		expect(healer.flushPending()).toBe("<");
+	});
+
+	it("drops an unterminated invocation without emitting a call or markup", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed(
+			'Visible <｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">echo hi',
+		);
+
+		expect(clean).toBe("Visible ");
+		expect(healer.flushPending()).toBe("");
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("consumeWithoutCalls strips markup and discards completed calls", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.consumeWithoutCalls(
+			"Before" +
+				'<｜DSML｜invoke name="read">' +
+				'<｜DSML｜parameter name="path">src/index.ts</｜DSML｜parameter>' +
+				"</｜DSML｜invoke>" +
+				"After",
+		);
+
+		expect(clean).toBe("BeforeAfter");
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("falls back to raw strings for invalid JSON and numbers calls per instance", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed(
+			'<｜DSML｜invoke name="first"><｜DSML｜parameter name="value" string="false">not-json</｜DSML｜parameter></｜DSML｜invoke>' +
+				'<｜DSML｜invoke name="second"><｜DSML｜parameter name="value">text</｜DSML｜parameter></｜DSML｜invoke>',
+		);
+
+		const calls = healer.drainCompleted();
+		expect(calls.map(call => call.id)).toEqual(["dsml_1", "dsml_2"]);
+		expect(calls.map(call => call.name)).toEqual(["first", "second"]);
+		expect(JSON.parse(calls[0].arguments)).toEqual({ value: "not-json" });
+		expect(JSON.parse(calls[1].arguments)).toEqual({ value: "text" });
+	});
+});

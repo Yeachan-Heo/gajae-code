@@ -281,6 +281,240 @@ export class ToolCallHealer {
 	}
 }
 
+const DSML_TAG_PREFIXES = [
+	{ prefix: "</｜DSML｜", closing: true },
+	{ prefix: "</|DSML|", closing: true },
+	{ prefix: "<｜DSML｜", closing: false },
+	{ prefix: "<|DSML|", closing: false },
+] as const;
+
+type DsmlTagKind = "invoke" | "parameter" | "wrapper" | "unknown";
+
+interface DsmlTag {
+	readonly length: number;
+	readonly kind: DsmlTagKind;
+	readonly closing: boolean;
+	readonly name?: string;
+	readonly string?: boolean;
+}
+
+/**
+ * Streaming-safe recovery for DeepSeek DSML tool-call markup leaked into
+ * `delta.content` by hosts whose server-side parser did not recognize it.
+ * One instance per stream; completed calls use deterministic per-stream IDs.
+ */
+export class DsmlToolCallHealer {
+	#buffer = "";
+	#offset = 0;
+	#inCall = false;
+	#inParameter = false;
+	#pendingName = "";
+	#pendingInvokeString: boolean | undefined;
+	#pendingParameterName = "";
+	#pendingParameterString = true;
+	#pendingValue = "";
+	#pendingArguments: string[] = [];
+	#nextId = 1;
+	readonly #completed: HealedToolCall[] = [];
+
+	feed(text: string): string {
+		if (text.length === 0) return "";
+		this.#compact();
+		this.#buffer += text;
+		return this.#consume();
+	}
+
+	consumeWithoutCalls(text: string): string {
+		const clean = this.feed(text);
+		if (this.#completed.length > 0) this.#completed.length = 0;
+		return clean;
+	}
+
+	drainCompleted(): HealedToolCall[] {
+		if (this.#completed.length === 0) return [];
+		return this.#completed.splice(0, this.#completed.length);
+	}
+
+	flushPending(): string {
+		const tail = this.#remaining();
+		this.#buffer = "";
+		this.#offset = 0;
+		if (this.#inCall) return "";
+		return tail;
+	}
+
+	#remaining(): string {
+		return this.#offset === 0 ? this.#buffer : this.#buffer.slice(this.#offset);
+	}
+
+	#compact(): void {
+		if (this.#offset === 0) return;
+		this.#buffer = this.#buffer.slice(this.#offset);
+		this.#offset = 0;
+	}
+
+	#consume(): string {
+		let clean = "";
+
+		while (this.#offset < this.#buffer.length) {
+			if (this.#buffer[this.#offset] === "<") {
+				const tag = this.#parseTag();
+				if (tag === "partial") break;
+				if (tag !== undefined) {
+					this.#offset += tag.length;
+					this.#handleTag(tag);
+					continue;
+				}
+			}
+
+			const ch = this.#buffer[this.#offset]!;
+			this.#offset += 1;
+			if (this.#inCall) {
+				this.#pendingValue += ch;
+			} else {
+				clean += ch;
+			}
+		}
+
+		return clean;
+	}
+
+	/** Returns "partial" when the remaining bytes could still become a DSML tag. */
+	#parseTag(): DsmlTag | "partial" | undefined {
+		const remaining = this.#remaining();
+		let matched: (typeof DSML_TAG_PREFIXES)[number] | undefined;
+		for (const candidate of DSML_TAG_PREFIXES) {
+			if (remaining.startsWith(candidate.prefix)) {
+				matched = candidate;
+				break;
+			}
+		}
+		if (!matched) {
+			for (const candidate of DSML_TAG_PREFIXES) {
+				if (candidate.prefix.startsWith(remaining)) return "partial";
+			}
+			return undefined;
+		}
+
+		const end = remaining.indexOf(">", matched.prefix.length);
+		if (end < 0) return "partial";
+
+		const body = remaining.slice(matched.prefix.length, end).trim();
+		const length = end + 1;
+		const match = /^([A-Za-z_][\w-]*)(?:\s+([\s\S]*))?$/.exec(body);
+		if (!match) return { length, kind: "unknown", closing: matched.closing };
+
+		const tagName = match[1];
+		if (tagName === "calls" || tagName === "tool_calls") {
+			return { length, kind: "wrapper", closing: matched.closing };
+		}
+		if (tagName !== "invoke" && tagName !== "parameter") {
+			return { length, kind: "unknown", closing: matched.closing };
+		}
+		if (matched.closing) return { length, kind: tagName, closing: true };
+
+		const attributes = match[2] ?? "";
+		const stringAttribute = readDsmlAttribute(attributes, "string");
+		return {
+			length,
+			kind: tagName,
+			closing: false,
+			name: readDsmlAttribute(attributes, "name"),
+			string: stringAttribute === undefined ? undefined : stringAttribute !== "false",
+		};
+	}
+
+	#handleTag(tag: DsmlTag): void {
+		if (tag.kind === "invoke") {
+			if (tag.closing) {
+				if (this.#inCall) this.#finalizeCall();
+				return;
+			}
+			this.#inCall = true;
+			this.#inParameter = false;
+			this.#pendingName = tag.name?.trim() ?? "";
+			this.#pendingInvokeString = tag.string;
+			this.#pendingParameterName = "";
+			this.#pendingParameterString = true;
+			this.#pendingValue = "";
+			this.#pendingArguments = [];
+			return;
+		}
+
+		if (tag.kind !== "parameter" || !this.#inCall) return;
+		if (!tag.closing) {
+			this.#inParameter = true;
+			this.#pendingParameterName = tag.name ?? "";
+			this.#pendingParameterString = tag.string !== false;
+			this.#pendingValue = "";
+			return;
+		}
+
+		if (this.#inParameter) {
+			this.#addArgument(this.#pendingParameterName, this.#pendingValue, this.#pendingParameterString);
+		} else if (this.#pendingInvokeString !== undefined) {
+			// An observed Venice deviation closes the invoke's direct value as a
+			// parameter. Its invoke attributes describe that first parameter too.
+			this.#addArgument(this.#pendingName, this.#pendingValue, this.#pendingInvokeString);
+		}
+		this.#inParameter = false;
+		this.#pendingParameterName = "";
+		this.#pendingParameterString = true;
+		this.#pendingValue = "";
+	}
+
+	#addArgument(name: string, value: string, isString: boolean): void {
+		let rawJson: string;
+		if (isString) {
+			rawJson = JSON.stringify(value);
+		} else {
+			const candidate = value.trim();
+			try {
+				parseJsonWithRepair<unknown>(candidate);
+				rawJson = candidate;
+			} catch {
+				rawJson = JSON.stringify(value);
+			}
+		}
+		this.#pendingArguments.push(`${JSON.stringify(name)}:${rawJson}`);
+	}
+
+	#finalizeCall(): void {
+		const rawArgs = this.#pendingArguments.length === 0 ? "{}" : `{${this.#pendingArguments.join(",")}}`;
+		const escapedUnicodeArgumentEvidence = collectUnsafeUnicodeEscapeEvidence(rawArgs);
+		const escapedNonAsciiArguments = escapedUnicodeArgumentEvidence !== undefined;
+
+		let argsJson = rawArgs;
+		try {
+			argsJson = JSON.stringify(parseJsonWithRepair<unknown>(rawArgs));
+		} catch {
+			// Leave raw; downstream parseStreamingJson absorbs the failure.
+		}
+
+		const completed: HealedToolCall = {
+			id: `dsml_${this.#nextId++}`,
+			name: this.#pendingName,
+			arguments: argsJson,
+			escapedNonAsciiArguments,
+		};
+		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
+		this.#completed.push(completed);
+		this.#inCall = false;
+		this.#inParameter = false;
+		this.#pendingName = "";
+		this.#pendingInvokeString = undefined;
+		this.#pendingParameterName = "";
+		this.#pendingParameterString = true;
+		this.#pendingValue = "";
+		this.#pendingArguments = [];
+	}
+}
+
+function readDsmlAttribute(attributes: string, name: "name" | "string"): string | undefined {
+	const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(attributes);
+	return match?.[1] ?? match?.[2];
+}
+
 /**
  * Cheap test for whether a given model is known to leak Kimi-K2 chat-template
  * tool-call tokens into visible text. Used to gate the per-stream healer so
