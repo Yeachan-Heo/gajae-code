@@ -643,6 +643,18 @@ interface UnresolvedExecutionPublication {
 }
 
 /**
+ * The transcript a queued publication was scheduled against.
+ *
+ * The manager instance alone is not enough: session switches rotate the same manager, and
+ * `setSessionFile` can adopt another file that carries the same logical session id.
+ */
+interface PublicationOrigin {
+	readonly manager: SessionManager;
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+}
+
+/**
  * One command result waiting for a publication slot.
  *
  * `unresolved` is set after reconciliation could neither find the attempted entry in the
@@ -17091,12 +17103,23 @@ export class AgentSession {
 	}
 
 	/** The transcript a publication was scheduled against; compared after the lane wait. */
-	#capturePublicationOrigin(): { manager: SessionManager; sessionId: string } {
-		return { manager: this.sessionManager, sessionId: this.sessionManager.getSessionId() };
+	#capturePublicationOrigin(): PublicationOrigin {
+		return {
+			manager: this.sessionManager,
+			sessionId: this.sessionManager.getSessionId(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
 	}
 
-	#isPublicationOriginCurrent(origin: { manager: SessionManager; sessionId: string }): boolean {
-		return this.sessionManager === origin.manager && this.sessionManager.getSessionId() === origin.sessionId;
+	#isPublicationOriginCurrent(origin: PublicationOrigin): boolean {
+		// The session id alone is not the transcript identity: `setSessionFile` can adopt a
+		// different file that carries the same logical id, and a queued publication that
+		// survives that switch would append predecessor state to the adopted transcript.
+		return (
+			this.sessionManager === origin.manager &&
+			this.sessionManager.getSessionId() === origin.sessionId &&
+			this.sessionManager.getSessionFile() === origin.sessionFile
+		);
 	}
 
 	/**
@@ -32123,7 +32146,7 @@ export class AgentSession {
 		// The batch belongs to the transcript that was active when it was taken. A session
 		// switch rotates the same manager and clears these queues, so a batch survivor that
 		// outlived it must be dropped rather than published into the successor.
-		const batchSessionId = this.sessionManager.getSessionId();
+		const batchOrigin = this.#capturePublicationOrigin();
 		// Take exactly the entries queued now. Anything appended while this drain awaits
 		// belongs to a later batch and must stay behind the entries retained here; a
 		// length-indexed splice at the end would drop those successors.
@@ -32140,7 +32163,7 @@ export class AgentSession {
 		let unresolvedCount = 0;
 		let superseded = false;
 		for (const pending of batch) {
-			if (this.sessionManager.getSessionId() !== batchSessionId) {
+			if (!this.#isPublicationOriginCurrent(batchOrigin)) {
 				// The switch already discarded the predecessor queue; nothing here may be
 				// re-queued or reported against the successor.
 				superseded = true;
