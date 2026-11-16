@@ -4,16 +4,23 @@ import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager, type SubagentRecord, type SubagentRunOutcome } from "../src/async/job-manager";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { offBackend } from "../src/memory-backend/off-backend";
+import type { MemoryBackendStartOptions } from "../src/memory-backend/types";
 import { AgentRegistry } from "../src/registry/agent-registry";
+import { createLazyService } from "../src/runtime/lazy-service";
 import {
 	JobObservation,
 	type JobObservationError,
 	type JobObservationTarget,
 	type TaskObservationTarget,
 } from "../src/sdk/job-observation";
-import { createAgentSession } from "../src/sdk/session";
+import { type CreateAgentSessionOptions, createAgentSession } from "../src/sdk/session";
+import { CURRENT_SESSION_VERSION } from "../src/sdk/session-readonly/format";
+import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { type OwnerMembership, revalidateOwnerMembershipSync } from "../src/session/owner-group";
+import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
+import { type FileEntry, SessionManager } from "../src/session/session-manager";
 import { CronTool, resetCronRegistryForTests } from "../src/tools/cron";
 import type { ToolSession } from "../src/tools/index";
 
@@ -90,7 +97,10 @@ async function observationFactory(persisted = false, parentTaskPrefix?: string) 
 	const auth = await AuthStorage.create(path.join(temp.path(), "auth.db"));
 	const ownerId = `factory-owner-${crypto.randomUUID()}`;
 	const sessionManager = persisted
-		? SessionManager.create(temp.path(), SessionManager.explicitDestination(path.join(temp.path(), "sessions")))
+		? SessionManager.create(
+				temp.path(),
+				SessionManager.explicitDestination(path.join(temp.path(), "sessions"), temp.path()),
+			)
 		: SessionManager.inMemory(temp.path());
 	if (persisted) {
 		sessionManager.appendMessage({ role: "user", content: "persisted seed", timestamp: Date.now() });
@@ -147,12 +157,13 @@ function expectCode(action: () => unknown, code: JobObservationError["code"]): v
 	expect(action).toThrow(expect.objectContaining({ name: "JobObservationError", code }));
 }
 
-async function createCron(ownerId = OWNER): Promise<{ id: string; createdAt: number }> {
+async function createCron(value: AsyncJobManager, ownerId = OWNER): Promise<{ id: string; createdAt: number }> {
 	const session = {
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionId: () => "isolated-test-session",
 		getAgentId: () => ownerId,
+		getAsyncJobManager: () => value,
 		sendCustomMessage: async () => {},
 		allocateOutputArtifact: async () => ({}),
 	} as unknown as ToolSession;
@@ -164,7 +175,7 @@ async function createCron(ownerId = OWNER): Promise<{ id: string; createdAt: num
 	});
 	const id = result.details!.id!;
 	// Query through the same public facade a client uses, not the schedule store.
-	const observation = observe(managers[0]!, ownerId);
+	const observation = observe(value, ownerId);
 	return observation.getSnapshot().crons.find(cron => cron.id === id)!;
 }
 
@@ -176,6 +187,226 @@ afterEach(async () => {
 });
 
 describe("owner-scoped SDK job observation", () => {
+	test("generic folded-job cancel joins the actual abort-ignoring runner, not acceptance", async () => {
+		const value = manager();
+		const observation = observe(value);
+		const release = Promise.withResolvers<string>();
+		const id = value.register("bash", "folded local runner", () => release.promise, { ownerId: OWNER });
+		const target = { id, generation: value.getJob(id)!.generation };
+		value.markBackgrounded(id, target.generation, "sdk_control");
+		try {
+			const pending = await observation.cancelJobAndWait(target, 0);
+			expect(pending).toMatchObject({ accepted: true, status: "pending", runner: "pending" });
+			expect(value.getJob(id)?.status).toBe("cancelled");
+			expect(observation.getSnapshot().unsettledJobs).toContainEqual(target);
+			release.resolve("actual unwind");
+			await value.getJobPromise(id, target.generation);
+			expect(await observation.cancelJobAndWait(target, 100)).toMatchObject({
+				accepted: false,
+				status: "settled",
+				runner: "settled",
+			});
+		} finally {
+			release.resolve("cleanup");
+		}
+	});
+
+	test("generic joins retain pending delivery after the execution has really settled", async () => {
+		const delivery = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const value = new AsyncJobManager({
+			onJobComplete: async () => {
+				started.resolve();
+				await delivery.promise;
+			},
+		});
+		managers.push(value);
+		const observation = observe(value);
+		const id = value.register("bash", "local completion", async () => "done", { ownerId: OWNER });
+		const target = { id, generation: value.getJob(id)!.generation };
+		observation.getSnapshot();
+		try {
+			await value.getJobPromise(id, target.generation);
+			await started.promise;
+			expect(await observation.cancelJobAndWait(target, 0)).toMatchObject({
+				status: "pending",
+				runner: "settled",
+				delivery: "pending",
+			});
+			delivery.resolve();
+			expect(await observation.cancelJobAndWait(target, 100)).toMatchObject({
+				status: "settled",
+				delivery: "settled",
+			});
+		} finally {
+			delivery.resolve();
+		}
+	});
+
+	test("an admitted join retains physical delivery across manager and observer disposal", async () => {
+		const delivery = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const value = new AsyncJobManager({
+			onJobComplete: async () => {
+				started.resolve();
+				await delivery.promise;
+			},
+		});
+		managers.push(value);
+		const observation = observe(value);
+		const id = value.register("bash", "delivery outlives disposal", async () => "done", { ownerId: OWNER });
+		const target = { id, generation: value.getJob(id)!.generation };
+		observation.getSnapshot();
+		try {
+			await value.getJobPromise(id, target.generation);
+			await started.promise;
+			const joining = observation.cancelJobAndWait(target, 20);
+			expect(await value.dispose({ timeoutMs: 0 })).toBe(false);
+			observation.dispose();
+			expect(value.getJob(id)).toBeUndefined();
+			expect(await joining).toMatchObject({
+				accepted: false,
+				status: "pending",
+				runner: "settled",
+				delivery: "pending",
+			});
+		} finally {
+			delivery.resolve();
+			await value.awaitRetainedDisposalCompletion();
+		}
+	});
+
+	test("generic cancel refuses foreign generations and cannot abort an ID-reused successor", async () => {
+		const value = manager(0);
+		const observation = observe(value);
+		const foreign = monitor(value, "another-owner");
+		await expect(observation.cancelJobAndWait(foreign, 0)).rejects.toMatchObject({ code: "not_found" });
+		const first = monitor(value, OWNER, "generic-reused");
+		expect((await observation.cancelJobAndWait(first, 100)).status).toBe("settled");
+		const successor = monitor(value, OWNER, first.id);
+		await expect(observation.cancelJobAndWait(first, 0)).rejects.toMatchObject({ code: "stale_generation" });
+		expect(value.getJob(successor.id)?.status).toBe("running");
+		expect(value.getJob(foreign.id)?.status).toBe("running");
+	});
+
+	test("task cancel-and-join removes paused and queued admissions without launching them", async () => {
+		const value = manager(undefined, 1);
+		const observation = observe(value);
+		const busy = runningTask(value, "join-capacity");
+		taskRecord(value, "join-paused");
+		expect(await observation.cancelTaskAndWait(taskTarget(observation, "join-paused"), 0)).toMatchObject({
+			accepted: true,
+			status: "settled",
+		});
+		taskRecord(value, "join-queued");
+		let launches = 0;
+		value.registerResumeDescriptor({ subagentId: "join-queued", ownerId: OWNER, data: {} }, () => {
+			launches++;
+			return undefined;
+		});
+		observation.resumeTask(taskTarget(observation, "join-queued"));
+		expect(await observation.cancelTaskAndWait(taskTarget(observation, "join-queued"), 0)).toMatchObject({
+			accepted: true,
+			status: "settled",
+		});
+		busy.gate.resolve({ kind: "completed", text: "release capacity" });
+		await busy.job.promise;
+		expect(launches).toBe(0);
+		expect(value.getSubagentRecord("join-queued")?.status).toBe("cancelled");
+	});
+
+	test("task cancel-and-join does not mistake a canonical terminal transition for physical unwind", async () => {
+		const value = manager();
+		const observation = observe(value);
+		const release = Promise.withResolvers<SubagentRunOutcome>();
+		const id = value.register("task", "ignores abort", () => release.promise, { ownerId: OWNER });
+		const record = taskRecord(value, "join-ignoring");
+		record.status = "running";
+		record.currentJobId = id;
+		value.registerSubagentRecord(record);
+		try {
+			expect(await observation.cancelTaskAndWait(taskTarget(observation, record.subagentId), 0)).toMatchObject({
+				status: "pending",
+				runner: "pending",
+			});
+			expect(value.getSubagentRecord(record.subagentId)?.status).toBe("cancelled");
+			expect(observation.getSnapshot().unsettledJobs.some(job => job.id === id)).toBe(true);
+		} finally {
+			release.resolve({ kind: "completed", text: "unwound" });
+			await value.getJob(id)!.promise;
+		}
+	});
+
+	test("unavailable execution proof returns unknown while retaining exact pending delivery", async () => {
+		const delivery = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const value = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async () => {
+				started.resolve();
+				await delivery.promise;
+			},
+		});
+		managers.push(value);
+		const id = value.register("bash", "evicted runner", async () => "done", { ownerId: OWNER });
+		const target = { id, generation: value.getJob(id)!.generation };
+		const completion = value.getJobPromise(id, target.generation)!;
+		try {
+			await completion;
+			await started.promise;
+			const observation = observe(value);
+			expect(value.getJob(id)).toBeUndefined();
+			expect(await observation.cancelJobAndWait(target, 0)).toMatchObject({
+				accepted: false,
+				status: "unknown",
+				runner: "unknown",
+				delivery: "pending",
+			});
+			expect(observation.getSnapshot().unsettledJobs).toContainEqual(target);
+		} finally {
+			delivery.resolve();
+		}
+	});
+
+	test("invalid join deadlines and target getter disposal cannot trigger cancellation", async () => {
+		const value = manager();
+		const observation = observe(value);
+		const target = monitor(value);
+		for (const timeout of [-1, Number.NaN, Number.POSITIVE_INFINITY])
+			await expect(observation.cancelJobAndWait(target, timeout)).rejects.toBeInstanceOf(RangeError);
+		await expect(
+			observation.cancelJobAndWait(
+				{
+					get id() {
+						observation.dispose();
+						return target.id;
+					},
+					generation: target.generation,
+				},
+				0,
+			),
+		).rejects.toMatchObject({ code: "disposed" });
+		expect(value.getJob(target.id)?.status).toBe("running");
+	});
+
+	test("named schedule join checks createdAt and deletes only the selected owner schedule", async () => {
+		const value = manager();
+		const observation = observe(value);
+		const first = await createCron(value);
+		const second = await createCron(value);
+		const foreign = await createCron(value, "foreign-owner");
+		await expect(observation.deleteCronAndWait(foreign, 0)).rejects.toMatchObject({ code: "not_found" });
+		await expect(
+			observation.deleteCronAndWait({ id: first.id, createdAt: first.createdAt - 1 }, 0),
+		).rejects.toMatchObject({ code: "stale_generation" });
+		expect(await observation.deleteCronAndWait(first, 0)).toMatchObject({ accepted: true, status: "settled" });
+		expect(observation.getSnapshot().crons.map(cron => cron.id)).toEqual([second.id]);
+		expect(
+			observe(value, "foreign-owner")
+				.getSnapshot()
+				.crons.map(cron => cron.id),
+		).toEqual([foreign.id]);
+	});
 	test("rejects absent/blank owners rather than falling back to unscoped queries", () => {
 		const value = manager();
 		for (const owner of ["", " ", " owner", "owner ", "__legacy__"]) {
@@ -328,10 +559,9 @@ describe("owner-scoped SDK job observation", () => {
 
 	test("cron deletion checks owner and schedule identity; repeated deletion is not-found", async () => {
 		const value = manager();
-		AsyncJobManager.setInstance(value);
 		const observation = observe(value);
-		const owned = await createCron();
-		const foreign = await createCron("foreign-owner");
+		const owned = await createCron(value);
+		const foreign = await createCron(value, "foreign-owner");
 		expect(observation.getSnapshot().crons.map(cron => cron.id)).toEqual([owned.id]);
 		expectCode(() => observation.deleteCron(foreign), "not_found");
 		expectCode(() => observation.deleteCron({ ...owned, createdAt: owned.createdAt - 1 }), "stale_generation");
@@ -915,6 +1145,342 @@ describe("owner-scoped SDK job observation", () => {
 		});
 	}
 
+	for (const admission of ["factory-minted", "preexisting", "before-manager"] as const) {
+		test(`interactive factory constructor cleanup preserves ${admission} ownership`, async () => {
+			const temp = TempDir.createSync("@sdk-factory-constructor-admission-");
+			const priorManager = AsyncJobManager.instance();
+			const auth = await AuthStorage.create(path.join(temp.path(), "auth.db"));
+			const modelRegistry = new ModelRegistry(auth, path.join(temp.path(), "models.yml"));
+			modelRegistry.registerProvider("admission-fixture", {
+				baseUrl: "http://127.0.0.1:9/v1",
+				apiKey: "ADMISSION_FIXTURE_KEY",
+				api: "openai-completions",
+				models: [
+					{
+						id: "initial-model",
+						name: "Admission Fixture Model",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 8_192,
+					},
+				],
+			});
+			const sessionManager = SessionManager.create(
+				temp.path(),
+				SessionManager.explicitDestination(path.join(temp.path(), "sessions"), temp.path()),
+			);
+			if (admission === "preexisting") await sessionManager.flush();
+			const initialMembership = sessionManager.getOwnerMembership();
+			const failure = new Error(`constructor failure with ${admission} admission`);
+			let constructorMembership: OwnerMembership | undefined;
+			const memoryMode = spyOn(sessionManager, "setSessionMemoryMode").mockImplementationOnce(() => {
+				constructorMembership = sessionManager.getOwnerMembership();
+				expect(constructorMembership).toBeDefined();
+				expect(sessionManager.getSessionOwnerEvidence()?.policy.kind).toBe("cooperative");
+				expect(() => revalidateOwnerMembershipSync(constructorMembership!)).not.toThrow();
+				expect(sessionManager.getBranch()).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({ type: "model_change", model: "admission-fixture/initial-model" }),
+						expect.objectContaining({ type: "thinking_level_change" }),
+					]),
+				);
+				throw failure;
+			});
+			const beforeManager = spyOn(modelRegistry, "applyConfiguredModelBindings");
+			if (admission === "before-manager")
+				beforeManager.mockImplementationOnce(() => {
+					throw failure;
+				});
+			const flush = spyOn(sessionManager, "flush");
+			const ensureOnDisk = spyOn(sessionManager, "ensureOnDisk");
+			const close = spyOn(sessionManager, "closeStrict");
+			const retire = spyOn(sessionManager, "retireFactoryCooperativeOwnerAfterClose");
+			const settings = Settings.isolated({
+				"bash.autoBackground.enabled": false,
+				"memory.backend": "off",
+				"notifications.enabled": false,
+				modelRoles: { default: "admission-fixture/initial-model" },
+			});
+			const options: CreateAgentSessionOptions = {
+				cwd: temp.path(),
+				agentDir: temp.path(),
+				authStorage: auth,
+				modelRegistry,
+				settings,
+				agentRegistry: new AgentRegistry(),
+				sessionManager,
+				hasUI: true,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				toolNames: [],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				workspaceTree: {
+					rootPath: temp.path(),
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				},
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				deferOptionalModelRefresh: true,
+			};
+			setPrimaryControlSurface(options, "cli");
+			try {
+				await expect(createAgentSession(options)).rejects.toBe(failure);
+				expect(memoryMode).toHaveBeenCalledTimes(admission === "before-manager" ? 0 : 1);
+				if (admission === "factory-minted") {
+					expect(initialMembership).toBeUndefined();
+					expect(ensureOnDisk).toHaveBeenCalledTimes(1);
+					expect(flush).toHaveBeenCalledTimes(1);
+					expect(close).toHaveBeenCalledTimes(1);
+					expect(sessionManager.getStrictCloseState()).toEqual({ kind: "closed" });
+					expect(retire).toHaveBeenCalledTimes(1);
+					expect(retire).toHaveBeenCalledWith(constructorMembership);
+					expect(retire.mock.results[0]!.value).toBe(true);
+					expect(sessionManager.getOwnerMembership()).toBeUndefined();
+					expect(() => revalidateOwnerMembershipSync(constructorMembership!)).toThrow("participation_lost");
+					const entries = (await Bun.file(sessionManager.getSessionFile()!).text())
+						.trimEnd()
+						.split("\n")
+						.map(line => JSON.parse(line) as FileEntry);
+					expect(entries).toContainEqual(
+						expect.objectContaining({ type: "model_change", model: "admission-fixture/initial-model" }),
+					);
+				} else {
+					expect(ensureOnDisk).not.toHaveBeenCalled();
+					expect(flush).not.toHaveBeenCalled();
+					expect(close).not.toHaveBeenCalled();
+					expect(retire).not.toHaveBeenCalled();
+					expect(sessionManager.getStrictCloseState()).toEqual({ kind: "none_started" });
+					expect(sessionManager.getOwnerMembership()).toBe(initialMembership);
+					if (admission === "preexisting") {
+						expect(constructorMembership).toBe(initialMembership);
+						expect(() => revalidateOwnerMembershipSync(initialMembership!)).not.toThrow();
+					}
+				}
+				expect(AsyncJobManager.forEndpoint(sessionManager.getSessionId())).toBeUndefined();
+				expect(AsyncJobManager.instance()).toBe(priorManager);
+				const endpointFile = path.join(
+					temp.path(),
+					".gjc",
+					"state",
+					"sdk",
+					`${sessionManager.getSessionId()}.json`,
+				);
+				expect(await Bun.file(endpointFile).exists()).toBe(false);
+			} finally {
+				memoryMode.mockRestore();
+				beforeManager.mockRestore();
+				flush.mockRestore();
+				ensureOnDisk.mockRestore();
+				close.mockRestore();
+				retire.mockRestore();
+				if (sessionManager.getStrictCloseState().kind === "none_started") {
+					await sessionManager.ensureOnDisk();
+					await sessionManager.flushAndCloseStrict();
+				}
+				const membership = sessionManager.getOwnerMembership();
+				if (membership) sessionManager.retireFactoryCooperativeOwnerAfterClose(membership);
+				AsyncJobManager.setInstance(priorManager);
+				await modelRegistry.dispose();
+				await settings.close();
+				auth.close();
+				await temp.remove();
+			}
+		});
+	}
+
+	for (const notifications of [false, true]) {
+		for (const failurePhase of ["factory", "session", "supplied-session"] as const) {
+			test(`interactive factory ${failurePhase} failure ${notifications ? "with notifications" : "with default SDK hosting"} never strands cooperative admission`, async () => {
+				const temp = TempDir.createSync("@sdk-factory-admission-");
+				const priorManager = AsyncJobManager.instance();
+				const auth = await AuthStorage.create(path.join(temp.path(), "auth.db"));
+				const file = path.join(temp.path(), "sessions", "seed.jsonl");
+				const timestamp = new Date().toISOString();
+				await Bun.write(
+					file,
+					[
+						{
+							type: "session",
+							version: CURRENT_SESSION_VERSION,
+							id: crypto.randomUUID(),
+							timestamp,
+							cwd: temp.path(),
+						},
+						{
+							type: "message",
+							id: "seed-message",
+							parentId: null,
+							timestamp,
+							message: { role: "user", content: "persisted seed", timestamp: Date.now() },
+						},
+					]
+						.map(entry => JSON.stringify(entry))
+						.join("\n") + "\n",
+				);
+				const sessionManager = await SessionManager.open(
+					file,
+					SessionManager.explicitDestination(path.dirname(file), temp.path()),
+				);
+				if (failurePhase === "supplied-session") await sessionManager.flush();
+				const initialMembership = sessionManager.getOwnerMembership();
+				const flush = spyOn(sessionManager, "flush");
+				const close = spyOn(sessionManager, "closeStrict");
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const failure = new Error(`held ${failurePhase} startup failure`);
+				let capturedSession: AgentSession | undefined;
+				let disposeCalls = (): number => 0;
+				let restoreDispose: (() => void) | undefined;
+				const options: CreateAgentSessionOptions = {
+					cwd: temp.path(),
+					agentDir: temp.path(),
+					authStorage: auth,
+					modelRegistry: new ModelRegistry(auth, path.join(temp.path(), "models.yml")),
+					settings: Settings.isolated({
+						"bash.autoBackground.enabled": false,
+						"memory.backend": "off",
+						"notifications.enabled": notifications,
+						"notifications.telegram.enabled": notifications,
+						"notifications.telegram.botToken": "123456:admission-test-token",
+						"notifications.telegram.chatId": "42",
+					}),
+					agentRegistry: new AgentRegistry(),
+					sessionManager,
+					hasUI: true,
+					disableExtensionDiscovery: true,
+					extensions: [
+						async () => {
+							expect(flush).not.toHaveBeenCalled();
+							expect(sessionManager.getOwnerMembership()).toBe(initialMembership);
+							if (failurePhase === "factory") {
+								entered.resolve();
+								await release.promise;
+								throw failure;
+							}
+						},
+					],
+					runtimeServices: {
+						memoryBackend: createLazyService({
+							id: "memory.backend",
+							initialize: async () => ({
+								value: {
+									...offBackend,
+									async start({ session }: MemoryBackendStartOptions) {
+										capturedSession = session;
+										const dispose = spyOn(session, "dispose");
+										disposeCalls = () => dispose.mock.calls.length;
+										restoreDispose = () => dispose.mockRestore();
+										expect(flush).toHaveBeenCalledTimes(1);
+										const membership = sessionManager.getOwnerMembership()!;
+										expect(membership).toBeDefined();
+										expect(sessionManager.retireFactoryCooperativeOwnerAfterClose(membership)).toBe(false);
+										expect(sessionManager.getOwnerMembership()).toBe(membership);
+										expect(() => revalidateOwnerMembershipSync(membership)).not.toThrow();
+										// Default endpoint hooks remain registered, but no host starts
+										// until the caller initializes session_start after factory return.
+										expect(session.extensionRunner?.hasHandlers("session_start")).toBe(true);
+										expect(session.extensionRunner?.getCommand("notify")).toBeDefined();
+										const appended = sessionManager.appendCustomEntry("startup-writer", {});
+										await sessionManager.flush();
+										const records = (await Bun.file(file).text()).trimEnd().split("\n");
+										expect(records.map(line => JSON.parse(line) as FileEntry)).toContainEqual(
+											expect.objectContaining({
+												type: "custom",
+												id: appended,
+												customType: "startup-writer",
+											}),
+										);
+										entered.resolve();
+										await release.promise;
+										throw failure;
+									},
+								},
+							}),
+						}),
+					},
+					toolNames: [],
+					skills: [],
+					rules: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					workspaceTree: {
+						rootPath: temp.path(),
+						rendered: "",
+						truncated: false,
+						totalLines: 0,
+						agentsMdFiles: [],
+					},
+					enableMCP: false,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					deferOptionalModelRefresh: true,
+				};
+				setPrimaryControlSurface(options, "cli");
+				const creation = createAgentSession(options);
+				void creation.catch(() => {});
+				try {
+					await Promise.race([
+						entered.promise,
+						creation.then(() => {
+							throw new Error("Factory returned before the held startup boundary");
+						}),
+					]);
+					const membership = sessionManager.getOwnerMembership();
+					expect(close).not.toHaveBeenCalled();
+					const endpointFile = path.join(
+						temp.path(),
+						".gjc",
+						"state",
+						"sdk",
+						`${sessionManager.getSessionId()}.json`,
+					);
+					expect(await Bun.file(endpointFile).exists()).toBe(false);
+					release.resolve();
+					await expect(creation).rejects.toBe(failure);
+					if (failurePhase === "factory") {
+						expect(flush).not.toHaveBeenCalled();
+						expect(close).not.toHaveBeenCalled();
+						expect(sessionManager.getOwnerMembership()).toBeUndefined();
+					} else {
+						expect(disposeCalls()).toBe(1);
+						expect(capturedSession?.isDisposed).toBe(true);
+						expect(close).toHaveBeenCalledTimes(1);
+						await expect(close.mock.results[0]!.value).resolves.toMatchObject({ kind: "closed" });
+						if (failurePhase === "supplied-session") {
+							expect(membership).toBe(initialMembership);
+							expect(() => revalidateOwnerMembershipSync(membership!)).not.toThrow();
+						} else {
+							expect(() => revalidateOwnerMembershipSync(membership!)).toThrow("participation_lost");
+						}
+					}
+				} finally {
+					release.resolve();
+					await creation.catch(() => {});
+					await capturedSession?.dispose();
+					restoreDispose?.();
+					flush.mockRestore();
+					close.mockRestore();
+					await sessionManager.closeStrict();
+					if (initialMembership) sessionManager.retireFactoryCooperativeOwnerAfterClose(initialMembership);
+					AsyncJobManager.setInstance(priorManager);
+					auth.close();
+					await temp.remove();
+				}
+			});
+		}
+	}
+
 	test("real SDK factory renews only after completed committed transitions and retires predecessor cleanup", async () => {
 		const fixture = await observationFactory(true);
 		const { result, ownerId } = fixture;
@@ -926,6 +1492,8 @@ describe("owner-scoped SDK job observation", () => {
 			const originalFile = session.sessionManager.getSessionFile();
 			if (!originalFile) throw new Error("Expected persisted factory session");
 			const originalGeneration = session.sessionLifecycle.generation;
+			const originalMembership = session.sessionManager.getOwnerMembership();
+			expect(originalMembership).toBeDefined();
 			const capturedManager = AsyncJobManager.forEndpoint(originalId)!;
 			expect(capturedManager).toBeDefined();
 			const predecessor = result.jobObservation!;
@@ -951,6 +1519,11 @@ describe("owner-scoped SDK job observation", () => {
 				release.resolve();
 				expect(await transition).toBe(true);
 				expect(session.sessionLifecycle.transitioning).toBe(false);
+				expect(() => revalidateOwnerMembershipSync(originalMembership!)).toThrow("participation_lost");
+				const intermediateMembership = session.sessionManager.getOwnerMembership();
+				expect(intermediateMembership).toBeDefined();
+				const intermediateId = session.sessionId;
+				const intermediateFile = session.sessionManager.getSessionFile()!;
 				const intermediate = result.jobObservation!;
 				expect(intermediate).not.toBe(predecessor);
 				expect(result.jobObservation).toBe(intermediate);
@@ -964,6 +1537,41 @@ describe("owner-scoped SDK job observation", () => {
 				try {
 					expect(await session.switchSession(originalFile)).toBe(true);
 					expect(session.sessionId).toBe(originalId);
+					expect(session.sessionManager.getSessionFile()).toBe(originalFile);
+					expect(() => revalidateOwnerMembershipSync(intermediateMembership!)).toThrow("participation_lost");
+					const appended = session.sessionManager.appendCustomEntry("switched-owner", {});
+					await session.sessionManager.flush();
+					const switchedOwner = session.sessionManager.getSessionOwnerEvidence()!;
+					expect(switchedOwner).toBeDefined();
+					expect(session.sessionManager.getOwnerMembership()).not.toBe(originalMembership);
+					expect(session.sessionManager.getOwnerMembership()).not.toBe(intermediateMembership);
+					const records = (await Bun.file(originalFile).text())
+						.trimEnd()
+						.split("\n")
+						.map(line => JSON.parse(line) as FileEntry);
+					expect(records[0]).toMatchObject({ type: "session", id: originalId });
+					expect(records.filter(entry => entry.id === appended)).toHaveLength(1);
+					expect(
+						records.filter(entry => entry.type === "custom" && entry.customType === "gjc.owner_enroll"),
+					).toContainEqual(
+						expect.objectContaining({
+							data: expect.objectContaining({ bind: originalId, member: switchedOwner.memberId }),
+						}),
+					);
+					expect(
+						records.filter(
+							entry =>
+								entry.type === "custom" &&
+								entry.customType === "gjc.owner_enroll" &&
+								(entry.data as { bind: string }).bind === intermediateId,
+						),
+					).toEqual([]);
+					const intermediateRecords = (await Bun.file(intermediateFile).text())
+						.trimEnd()
+						.split("\n")
+						.map(line => JSON.parse(line) as FileEntry);
+					expect(intermediateRecords[0]).toMatchObject({ type: "session", id: intermediateId });
+					expect(intermediateRecords.some(entry => entry.id === appended)).toBe(false);
 					const successor = result.jobObservation!;
 					expect(successor).not.toBe(predecessor);
 					expect(successor).not.toBe(intermediate);

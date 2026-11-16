@@ -32,19 +32,35 @@ export type {
 	SessionAgentModelRole,
 	TrackedSendUserMessageOptions,
 } from "../session/agent-session";
+export type { LegacyTakeoverAttestation, OwnerProbe, SessionOwnerPolicy } from "../session/owner-group";
 export * from "../session/resume-cursor";
 export * from "../session/resume-operation";
 export { getSessionMessageEntryId } from "../session/session-manager";
 export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";
 export * from "./activity-controls";
-
 export * from "./authorization-controls";
 export * as btw from "./btw";
 export * as bus from "./bus";
 export * from "./composer-observation";
 export * from "./diagnostics/observe-broker";
 export * from "./diff-observation";
+export * from "./embedded-work";
+export {
+	createEmbeddedAgentSession,
+	deleteEmbeddedSession,
+	type EmbeddedAgentSessionOptions,
+	type EmbeddedAgentSessionResult,
+	type EmbeddedPromptRevision,
+	type EmbeddedRevisionInput,
+	type EmbeddedRevisionOptions,
+	forkEmbeddedSession,
+	getEmbeddedAvailableModels,
+	getEmbeddedPromptRevision,
+	listEmbeddedProjectSessions,
+	registerEmbeddedProcessCleanup,
+	validateEmbeddedConfigPatch,
+} from "./embedding";
 export * from "./extension-interaction";
 export * as host from "./host";
 export type {
@@ -64,6 +80,31 @@ export type {
 	Q10ThinkingEffort,
 	Q10ThinkingMode,
 } from "./models";
+export {
+	attestEmbeddedLegacyTakeover,
+	consentEmbeddedDisconnect,
+	createNativeEmbeddedAgentSession,
+	type EmbeddedResumeResolution,
+	type NativeEmbeddedAgentSessionOptions,
+	type NativeEmbeddedOpenResult,
+	type NativeEmbeddedOptions,
+	type NativeFreshEmbeddedOptions,
+	prepareEmbeddedDisconnect,
+	probeEmbeddedSessionOwnership,
+	reconcileEmbeddedResumeCheckpoint,
+	recordEmbeddedResumeCheckpoint,
+	resolveEmbeddedResumeCheckpoint,
+	resumeEmbeddedAgentSession,
+	selectEmbeddedExecutionBranch,
+	terminateEmbeddedAgentSession,
+} from "./native-embedding";
+export type {
+	NativeDisconnectConsent,
+	NativeDisconnectPreparation,
+	NativeLifecycleHandle,
+	NativeReconcileMode,
+	NativeTerminationConsent,
+} from "./native-lifecycle";
 export * from "./notification-setup";
 export * from "./notification-setup-contract";
 export * from "./operator-controls";

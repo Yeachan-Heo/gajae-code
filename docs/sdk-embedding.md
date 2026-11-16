@@ -102,7 +102,12 @@ history without opening/recovering an index, acquiring a lock, creating a direct
 quarantining corrupt data, or probing an endpoint. Corrupt or incomplete lifecycle
 history is a legacy ambiguity; unhealthy/ambiguous selected-target index roots are
 unresolved authority; unreadable or changed observations are unknown ownership.
-Neither is an available-writer result.
+Neither is an available-writer result. Lifecycle compaction preserves original
+binding/effect witnesses rather than letting a later unrelated terminal erase them.
+Active unkeyed identities retain at most eight distinct intermediate binding tuples;
+exhaustion refuses compaction before writes. Read-only namespace checks probe one
+prefix at a time, stop at the first missing or rejected prefix, and bound each
+observation to 256 prefixes and 1,048,576 cumulative pathname code units.
 
 Only the supplied App agent directory's index is read. Its detached identities
 preserve exact recorded process incarnation, endpoint generation and provenance;
@@ -110,6 +115,23 @@ they are not live endpoint verification or process-death evidence. Missing index
 data, a terminal projection and stale heartbeats never authorize takeover. Actual
 admission must separately enforce the adjacent owner group and verified endpoint
 veto, then revalidate observations under the owner lock and after hydration.
+
+Ordinary cooperative TUI publication distinguishes its already-authoritative group's
+endpoint from another owner: recognition requires an existing live cooperative
+member with the exact freshly observed process incarnation and local host. PID
+identity alone is insufficient. Every indexed claimant is retained and checked;
+replacement between distinct members requires one exact live-group snapshot for
+both processes, while a same-process file/mtime contradiction still refuses. A
+withdrawn transport does not retire its positively identified live member, and a
+kernel-proven absent indexed process does not hide any remaining live claim.
+Every other candidate is inspected. This never relaxes native admission's endpoint
+veto, creates membership, or authorizes App cooperative joins.
+
+Ordinary cooperative loading also retains the previous linear-format migration
+boundary: a descriptor-verified pre-graph transcript with no reserved owner metadata
+may register cooperatively without inventing graph IDs or native checkpoint
+authority. Modern invalid graphs, reserved metadata and changed snapshots still
+refuse. Native recovery never uses this legacy path.
 
 ## Operation and durability evidence
 
@@ -123,8 +145,12 @@ published tip are separate values.
 Readable bytes alone do not establish durability. `validateDurabilityProof`
 checks exact file identity, publication, operation, snapshot bytes, namespace sync,
 indices and hashed byte ranges. A changed identity or mismatched range cannot be
-covered by a previous proof. An unchanged proven prefix may remain covered after
-an append, but newly published final-drain bytes need their own positive evidence.
+covered by a previous proof without authenticated checked-publication lineage.
+Historical proofs keep their own immutable snapshot and ranges: on a replaced
+inode, their length must lie between that inode's issuance and departure snapshots,
+and the fresh capture must authenticate their prefix. This preserves independently
+durable same-inode appends through a checked replacement, without inventing a new
+proof. Newly published final-drain bytes still need their own positive evidence.
 
 `P_latch` describes local writer readiness and is independent of global candidate
 conflict; `P_continue` additionally requires a resolved checkpoint with no conflict.
@@ -157,6 +183,113 @@ recovery to that exact host identity. Foreign-host and unqualified generations r
 protected even when their PID is absent locally. Lock release also checks its exact
 record generation and cannot remove a successor. A lock token alone is not session
 membership or permission to retire a transcript owner.
+
+## Native embedded ownership and lifecycle
+
+`createEmbeddedAgentSession` accepts an explicit `cwd`, `agentDir`, configuration
+and storage scope. Its native overload also requires `native.expected` (the exact
+`{ snapshotDigest, resolved }` from `resolveEmbeddedResumeCheckpoint(file)`) and
+`native.ownerPolicy: { kind: "exclusive_native", expected }`. New sessions use
+`native: { create: true, ownerPolicy: { kind: "exclusive_native" } }` with a storage
+destination and no existing file. Interpretation and independent ownership vetoes
+precede hydration, writer admission, sanitation and runtime factory effects.
+
+The result is a discriminated union: `opened`, `selector`, `refused`,
+`uncertain_cursor`, `selection_incomplete`, or `startup_failed`. Only `opened`
+contains a published runtime and its registered `interaction` service/connection.
+Use `opened.interaction.service.ui` with `opened.result.initializeUI`; replacing it
+with an unrelated UI context is rejected. This same service supplies the registry's
+actual pending-request inventory, rather than treating a missing service as settled.
+Retained-operation results carry their actual opaque
+`handle`, immutable `op`, and `selection` receipt. Keep these objects in the trusted
+host; reconstructing them from JSON does not restore authority. A selector is not
+permission to open a writer. Explicit selection supplies its original snapshot
+digest and a target entry or `null` (the empty root), plus a stable operation ID.
+
+`probeEmbeddedSessionOwnership` is read-only. An explicit, acknowledged
+`attestEmbeddedLegacyTakeover` receipt applies only to the bounded legacy takeover
+row; it cannot override enrolled owners, ambiguous history, unresolved authority
+roots or verified endpoints. Authority lives beside the transcript in
+`.gjc-owners/<headerId>.json`, independent of the App profile directory. Membership
+requires its exact physical root, policy revision, epoch and opaque member token;
+missing files and local PID observations do not grant takeover.
+
+`selectEmbeddedExecutionBranch(handle, target, { op })` and
+`recordEmbeddedResumeCheckpoint(handle, { op })` return retained fixed-ID
+operations. `reconcileEmbeddedResumeCheckpoint(handle, { op, mode })` accepts
+`verify`, `verifyReadOnly`, `repairDurability`, or `complete`. It is always RECON:
+verification or completion never closes, cancels, disposes or retires a live
+manager. Held/unproven suffixes remain `suffix_incomplete` until positively
+accounted for; a complete selection is not necessarily a complete operation.
+Native Continue requires `selection.receipt.commitment.continueEligible`.
+
+The dispatcher first checks actual terminal close state, then invocation and
+registry authorization, then OPEN-only classification. OPEN is limited to its
+unforgeable pre-runtime coordinator; the token is revoked at runtime publication.
+Runtime requests cannot replay OPEN. Refused requests preserve prior readiness.
+A retained live handle still owns its actual manager and pending evidence.
+
+Disconnect is separate from RECON. Call `prepareEmbeddedDisconnect(handle, op)` to
+capture a read-only preparation; default termination without recorded consent is
+refused without effects. `consentEmbeddedDisconnect(handle, preparation, consent)`
+records an opaque, epoch-bound consent, then
+`terminateEmbeddedAgentSession(handle, { op, consent })` validates every current
+work and suffix target before effects. `stopAndJoin`, exact
+`discardUnpublished: { ids }`, and per-work consent are distinct decisions. Never
+call raw `result.session.dispose()` for a native runtime: native disposal requires
+the registry's actual authorized termination context, not a retry option.
+
+`getEmbeddedQueuedWork` lists user drafts, not hidden reminders.
+`getEmbeddedOwnedWork` captures exact run, job generation, schedule, workflow and
+interaction ownership; unavailable evidence blocks settlement. Work cancellation
+joins physical runners and in-flight delivery promises. Cancel acceptance, removed
+projections, and borrowed UI detach are not settlement proofs. Foreign/stale
+interaction addresses and work targets are rejected before effects.
+
+Actual `closed` plus a fresh final capture is required for closure evidence. If
+that evidence is unavailable, membership remains retained. Retirement additionally
+requires the classifier's current permission and a positive exact owner-record
+mutation receipt; permission alone is not a completed retirement. `close_unknown`
+is terminal and read-only, including when a rewrite was pending. A retryable close
+is retried only under the existing authorized termination intent.
+
+`listEmbeddedProjectSessions` preserves display arrays and separately reports
+strict complete/incomplete inventory. `forkEmbeddedSession` copies captured history
+to independent destination membership and durably pins the selected execution
+checkpoint, rather than inferring it from a physical metadata tail. Deletion checks
+all owner vetoes before cleanup and requires a verified positive deletion outcome.
+A `cleanup_pending` error retains an opaque same-process `retry` handle and exact
+native cleanup evidence; missing transcript bytes never authorize another delete
+or replacement cleanup. Ordinary artifact cleanup may retain its receipt-bound
+`.removing` namespace only after fresh exact root-identity, empty-payload, alias,
+side-path and canonical-reappearance checks, plus a durable artifact-phase
+checkpoint before transcript deletion. A native `payloadDurable` flag alone is
+not completion. Task-artifact-owner retirement is a separate strict class:
+`payload_retired` with a retained namespace remains `cleanup_pending`, and retry
+re-enters its actual retained coordinator rather than fabricating success. The
+transcript-adjacent `.gjc-owners` record and tombstone are independent authority
+cleanup obligations, not the task-artifact-owner directory.
+
+### Transcript consumer and rollback boundaries
+
+- Context, execution selection and tree navigation use the contracted resume graph;
+  enrollment is evidence, not an executable leaf. Presentation restoration does
+  not append a selection or move the future append base.
+- Fork/export/rewrite retain physical IDs, order, content and parents. Fork changes
+  the header binding, so copied owner/cursor metadata grants no destination
+  authority; its destination gets its own membership and checkpoint.
+- Session listings select transcript candidates, not adjacent `.gjc-owners` JSON
+  records. Native byte readers and exact filesystem operations remain byte/identity
+  primitives, not execution-graph interpreters. They do not manufacture ownership
+  or checkpoint authority from metadata they do not interpret.
+- Prompt revision uses conversational entries, prepares tree hooks first and
+  commits the execution selection only at accepted prompt preflight. A refused
+  preflight may restore only its exact unchanged manager/view state; uncertain
+  publication retains the actual pending operation for reconciliation.
+- Rollback is not deletion of unfamiliar metadata, resetting a sticky persistence
+  error, promoting a cooperative manager or reopening after `close_unknown`.
+  Keep the same opaque operation/handle and use its authorized reconciliation or
+  termination path. Source rollback cannot safely erase already durable records.
 
 ## What `createAgentSession()` discovers by default
 

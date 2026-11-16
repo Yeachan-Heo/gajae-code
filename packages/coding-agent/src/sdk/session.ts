@@ -194,6 +194,7 @@ import {
 } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
+import { getOwnerMembershipEvidence, type OwnerMembership } from "../session/owner-group";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
 import {
@@ -1856,6 +1857,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let sessionAgent: Agent | undefined;
 	let session!: AgentSession;
 	let sessionManager!: SessionManager;
+	let initialOwnerMembership: OwnerMembership | undefined;
 	let hasSession = false;
 	let processCwdClaimed = false;
 	let hasRegistered = false;
@@ -2088,6 +2090,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
 		liveSessionManager = sessionManager;
+		initialOwnerMembership = sessionManager.getOwnerMembership();
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
@@ -6054,6 +6057,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		if (
+			primaryControlSurface === "cli" &&
+			options.hasUI === true &&
+			!isCanonicalSubSession &&
+			(notificationsExtensionEligible || sdkHostEligible)
+		) {
+			// Host factories only register hooks; session_start publishes the endpoint
+			// after this factory returns. Admit before that publication, but only once
+			// startup failure cleanup owns a session that can close/retire the manager.
+			await sessionManager.flush();
+		}
 		if (taskFacade) {
 			const unregisterTaskMoveListener = sessionManager.registerAfterMoveListener(move =>
 				taskFacade.invalidateForSessionMove(move.newCwd),
@@ -6751,6 +6765,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		bindSessionClientControlResources(creationResult);
 		return creationResult;
 	} catch (error) {
+		// Initial model/thinking publication can admit even before construction succeeds.
+		// Capture the exact factory manager and token before teardown can yield.
+		const failedSessionManager = sessionManager;
+		const failedOwnerMembership = failedSessionManager?.getOwnerMembership();
+		let factoryOwnerMembership: OwnerMembership | undefined;
 		// Capture pending owner work before asynchronous startup teardown can yield.
 		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);
 		void startupPythonCleanup.catch(() => {});
@@ -6763,6 +6782,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					? cleanupError
 					: new AggregateError([cleanupDiagnostic, cleanupError], "Multiple startup cleanup operations failed.");
 		};
+		try {
+			if (
+				failedOwnerMembership &&
+				failedOwnerMembership !== initialOwnerMembership &&
+				getOwnerMembershipEvidence(failedOwnerMembership).policy.kind === "cooperative"
+			)
+				factoryOwnerMembership = failedOwnerMembership;
+		} catch (cleanupError) {
+			recordCleanupFailure(cleanupError);
+		}
 		const attemptCleanup = async (
 			cleanup: () => void | Promise<void>,
 			onFailure?: (cleanupError: unknown) => void,
@@ -6791,6 +6820,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await session.awaitDisposeCompletion();
 				}
 			});
+			if (factoryOwnerMembership) {
+				const membership = factoryOwnerMembership;
+				await attemptCleanup(() => {
+					// Only the factory's new cooperative admission may be retired here.
+					// The manager retains it unless exact closure and settled debt are proven.
+					failedSessionManager.retireFactoryCooperativeOwnerAfterClose(membership);
+				});
+			}
 			await attemptCleanup(() => startupPythonCleanup);
 		} else {
 			if (hasRegistered)
@@ -6827,6 +6864,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		await attemptCleanup(releaseLocalProtocolOverride);
 		await attemptCleanup(closeOwnedAuthStorage);
+		if (!hasSession && factoryOwnerMembership) {
+			const membership = factoryOwnerMembership;
+			await attemptCleanup(async () => {
+				// No AgentSession owns disposal after a constructor failure. Commit cold
+				// synchronous publication debt before closing, but never retry an already
+				// failed/unknown close or flush after terminal admission.
+				if (failedSessionManager.getOwnerMembership() !== membership) throw new Error("authority_changed");
+				let state = failedSessionManager.getStrictCloseState();
+				if (state.kind === "none_started") {
+					await attemptCleanup(() => failedSessionManager.ensureOnDisk());
+					state = failedSessionManager.getStrictCloseState();
+				}
+				const outcome =
+					state.kind === "none_started"
+						? await failedSessionManager.flushAndCloseStrict()
+						: state.kind === "in_flight"
+							? await failedSessionManager.closeStrict()
+							: state;
+				if (outcome.kind !== "closed") throw outcome.error;
+				failedSessionManager.retireFactoryCooperativeOwnerAfterClose(membership);
+			});
+		}
 		if (cleanupDiagnostic !== undefined) {
 			logger.warn("Failed to clean up createAgentSession resources after startup error", {
 				error: safeErrorForLog(error),

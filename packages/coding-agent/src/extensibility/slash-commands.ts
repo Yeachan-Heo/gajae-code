@@ -2,6 +2,7 @@ import type { AutocompleteItem } from "@gajae-code/tui";
 import { parseFrontmatter, prompt, sanitizeDisplayLine } from "@gajae-code/utils";
 import { slashCommandCapability } from "../capability/slash-command";
 import { appendInlineArgsFallback, templateUsesInlineArgPlaceholders } from "../config/prompt-templates";
+import type { Settings } from "../config/settings";
 import type { SlashCommand } from "../discovery";
 import { loadCapability } from "../discovery";
 import type { AgentSession } from "../session/agent-session";
@@ -230,6 +231,9 @@ function parseCommandTemplate(
 export interface LoadSlashCommandsOptions {
 	/** Working directory for project-local commands. Default: getProjectDir() */
 	cwd?: string;
+	/** Supplied embedding profile; never substitute the process-global profile. */
+	agentDir?: string;
+	settings?: Settings;
 }
 
 /**
@@ -237,7 +241,11 @@ export interface LoadSlashCommandsOptions {
  * Loads from all registered providers (builtin, user, project).
  */
 export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}): Promise<FileSlashCommand[]> {
-	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: options.cwd });
+	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, {
+		cwd: options.cwd,
+		agentDir: options.agentDir,
+		settings: options.settings,
+	});
 
 	const fileCommands: FileSlashCommand[] = [];
 	for (const cmd of result.items) {

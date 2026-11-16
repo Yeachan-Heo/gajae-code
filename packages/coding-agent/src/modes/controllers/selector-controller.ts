@@ -2213,8 +2213,12 @@ export class SelectorController {
 	}
 
 	showTreeSelector(): void {
-		const tree = getTreeForInternalRead(this.ctx.sessionManager);
-		const realLeafId = this.ctx.sessionManager.getLeafId();
+		const manager = this.ctx.sessionManager;
+		const openedSessionId = manager.getSessionId();
+		const openedSessionFile = manager.getSessionFile();
+		const openedIdentity = manager.getSessionIdentityGeneration();
+		const tree = getTreeForInternalRead(manager);
+		const realLeafId = manager.getLeafId();
 
 		if (tree.length === 0) {
 			this.ctx.showStatus("No entries in session");
@@ -2293,7 +2297,13 @@ export class SelectorController {
 					}
 
 					try {
-						this.ctx.promptSuggestion?.clear();
+						if (
+							this.ctx.sessionManager !== manager ||
+							manager.getSessionId() !== openedSessionId ||
+							manager.getSessionFile() !== openedSessionFile ||
+							manager.getSessionIdentityGeneration() !== openedIdentity
+						)
+							throw new Error("Navigation cancelled because the active session changed");
 						const result = await this.ctx.session.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
@@ -2311,6 +2321,13 @@ export class SelectorController {
 							return;
 						}
 
+						if (
+							result.executionSelection &&
+							(!result.executionSelection.result.receipt.commitment.operationComplete ||
+								!result.executionSelection.result.receipt.commitment.continueEligible)
+						)
+							throw new Error("Execution selection is not durably ready");
+						this.ctx.promptSuggestion?.clear();
 						// Update UI — pass the context built by navigateTree to skip a second O(N) walk.
 						this.ctx.rebuildInitialMessages("reconcile-same-transcript", result.sessionContext);
 						await this.ctx.reloadTodos();

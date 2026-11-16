@@ -84,7 +84,6 @@ import {
 	type SummaryOptions,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
-
 import {
 	commitToolOutputPrune,
 	createPrunedNotice,
@@ -126,11 +125,11 @@ import {
 	getSupportedEfforts,
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
+	isImageOnlyModel,
 	isUsageLimitError,
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
-	isImageOnlyModel,
 	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
@@ -149,6 +148,7 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
+import { assertNativeDisposalAuthorized } from "../sdk/native-lifecycle";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -163,6 +163,7 @@ import {
 } from "./btw-contract";
 import { type BtwMainObservation, type BtwPrefixCandidate, BtwPrefixLedger } from "./btw-prefix-ledger";
 import { createBtwStatusSanitizer, projectBtwVisibleText } from "./btw-projection";
+import type { PendingResumeOp, ReconcileResult } from "./resume-operation";
 import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 import {
@@ -496,12 +497,12 @@ import {
 	notifyWorkflowGateEmitterChanged,
 } from "../tools/ask-answer-registry";
 import { assertEditableFile } from "../tools/auto-generated-guard";
-import { closePendingAsks } from "../tools/pending-asks";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
+import { closePendingAsks } from "../tools/pending-asks";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -925,6 +926,20 @@ export type AgentSessionEvent =
 export type QueuedInputDelivery = "steer" | "followUp";
 export type QueuedInputQueuePolicy = "respect-mode" | "sequential";
 export type QueuedInputRemovalReason = "cancelled" | "removed" | "refused";
+
+export interface ExternalAdmissionTarget {
+	readonly sessionId: string;
+	readonly generation: number;
+	readonly identityGeneration: number;
+}
+
+export interface ExternalStopAdmissionLease {
+	readonly target: ExternalAdmissionTarget;
+	/** Releases only this holder. Repeated release has no effect. */
+	release(): void;
+}
+
+export type QueuedInputCancelResult = "removed" | "already_executing" | "unknown";
 
 export interface QueuedInputAdmission {
 	submissionId: string;
@@ -2556,6 +2571,8 @@ export type QueuedMessageEditMode = "steer" | "followUp";
 
 export interface QueuedMessageEditEntry {
 	id: string;
+	/** Exact tracked submission identity, when this row was admitted with tracking. */
+	submissionId?: string;
 	text: string;
 	mode: QueuedMessageEditMode;
 	label: string;
@@ -3300,6 +3317,32 @@ interface SessionRecapSnapshot extends SessionRecapTurn {
 	language: string;
 }
 
+export interface TreeNavigationResult {
+	executionSelection?: ExecutionSelectionPublication;
+	editorText?: string;
+	cancelled: boolean;
+	aborted?: boolean;
+	summaryEntry?: BranchSummaryEntry;
+	sessionContext?: SessionContext;
+}
+
+export interface ExecutionSelectionPublication {
+	readonly pending: PendingResumeOp;
+	readonly result: ReconcileResult;
+}
+
+export class ExecutionSelectionError extends Error {
+	constructor(
+		readonly pending: PendingResumeOp,
+		readonly code: string,
+		readonly receipt?: ReconcileResult["receipt"],
+		options?: ErrorOptions,
+	) {
+		super("Execution selection is not durably ready.", options);
+		this.name = "ExecutionSelectionError";
+	}
+}
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -3365,6 +3408,13 @@ export class AgentSession {
 	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
+	#executionAcceptance = new AsyncLocalStorage<{
+		entry: SessionAdmissionEntry;
+		manager: SessionManager;
+		identity: number;
+		generation: number;
+		active: boolean;
+	}>();
 	#successorSessionAdmissionContext = new AsyncLocalStorage<SuccessorSessionAdmission>();
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
@@ -4992,6 +5042,48 @@ export class AgentSession {
 		});
 	}
 
+	readonly #externalStopAdmissionHolders = new Map<
+		symbol,
+		{ target: ExternalAdmissionTarget; manager: SessionManager }
+	>();
+
+	/** Read-only exact identity used by external stop-admission holders. */
+	get externalAdmissionTarget(): ExternalAdmissionTarget {
+		return Object.freeze({
+			sessionId: this.sessionId,
+			generation: this.#sessionTransitionGeneration,
+			identityGeneration: this.sessionManager.getSessionIdentityGeneration(),
+		});
+	}
+
+	/** Actual live logical resource run, never a guessed session/turn identifier. */
+	get activeLogicalRunId(): string | undefined {
+		return this.agent.activeResourceRunId;
+	}
+
+	/** Reversible external-only fence. Does not close admission or mutate existing work. */
+	acquireExternalStopAdmission(expected: ExternalAdmissionTarget): ExternalStopAdmissionLease {
+		const { sessionId, generation, identityGeneration } = expected;
+		const current = this.externalAdmissionTarget;
+		this.#assertSessionAdmissionOpen();
+		if (
+			this.#sessionTransitionKind !== undefined ||
+			this.#handoffTransitionActive ||
+			sessionId !== current.sessionId ||
+			generation !== current.generation ||
+			identityGeneration !== current.identityGeneration
+		)
+			throw this.#sessionAdmissionBusyError();
+		const token = Symbol("external-stop-admission");
+		this.#externalStopAdmissionHolders.set(token, { target: current, manager: this.sessionManager });
+		return Object.freeze({
+			target: current,
+			release: () => {
+				this.#externalStopAdmissionHolders.delete(token);
+			},
+		});
+	}
+
 	#assertSessionAdmissionOpen(): void {
 		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
 			throw this.#sessionAdmissionBusyError();
@@ -5036,8 +5128,24 @@ export class AgentSession {
 	 * is checked by the caller and is intentionally narrower than the general
 	 * successor-hook context.
 	 */
-	#assertExternalSessionIngress(options?: { allowTrackedSuccessor?: boolean; allowCancelAndSubmit?: boolean }): void {
+	#assertExternalSessionIngress(options?: {
+		allowTrackedSuccessor?: boolean;
+		allowCancelAndSubmit?: boolean;
+		internal?: boolean;
+	}): void {
 		this.#assertSessionAdmissionOpen();
+		if (!options?.internal && this.#externalStopAdmissionHolders.size > 0) {
+			const current = this.externalAdmissionTarget;
+			for (const holder of this.#externalStopAdmissionHolders.values()) {
+				if (
+					holder.manager === this.sessionManager &&
+					holder.target.sessionId === current.sessionId &&
+					holder.target.generation === current.generation &&
+					holder.target.identityGeneration === current.identityGeneration
+				)
+					throw this.#sessionAdmissionBusyError();
+			}
+		}
 		if (this.#cancelAndSubmitInProgress && options?.allowCancelAndSubmit !== true) {
 			throw Object.assign(new AgentBusyError("Cannot submit work while cancel-and-submit is in progress."), {
 				code: "busy",
@@ -8270,13 +8378,15 @@ export class AgentSession {
 	}
 
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
-	#thinkingControlAdmissionGroup: {
-		predecessor: CanonicalMessageAdmissionSlot;
-		workflowPredecessors: Promise<void>[];
-		completion: CanonicalMessageAdmissionSlot;
-		release: () => void;
-		members: number;
-	} | undefined;
+	#thinkingControlAdmissionGroup:
+		| {
+				predecessor: CanonicalMessageAdmissionSlot;
+				workflowPredecessors: Promise<void>[];
+				completion: CanonicalMessageAdmissionSlot;
+				release: () => void;
+				members: number;
+		  }
+		| undefined;
 	#startedSharedControlPublications = new Set<Promise<void>>();
 
 	#reserveCanonicalSchedulingSlot() {
@@ -8296,11 +8406,12 @@ export class AgentSession {
 	}
 
 	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
-		const group = (this.#thinkingControlAdmissionGroup ??= {
+		this.#thinkingControlAdmissionGroup ??= {
 			...this.#reserveCanonicalSchedulingSlot(),
 			workflowPredecessors: [...this.#startedSharedControlPublications],
 			members: 0,
-		});
+		};
+		const group = this.#thinkingControlAdmissionGroup;
 		group.members++;
 		try {
 			if (!group.predecessor.released || group.workflowPredecessors.length)
@@ -12326,16 +12437,27 @@ export class AgentSession {
 	 * Remove all listeners, flush pending writes, and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
+	#disposeStrictCloseAttempts: 1 | undefined;
+	#disposeResourceState: "not_started" | "in_flight" | "settled" | "unknown" = "not_started";
+
+	/** Non-writer cleanup evidence; never establishes transcript closure or durability. */
+	getDisposeResourceState(): "not_started" | "in_flight" | "settled" | "unknown" {
+		return this.#disposeResourceState;
+	}
+
+	dispose(options: { sessionShutdownReason?: "detached_idle"; strictCloseAttempts?: 1 } = {}): Promise<void> {
+		assertNativeDisposalAuthorized(this.sessionManager);
+		if (this.#disposeCompleted) return Promise.resolve();
+		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
+		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
 		closePendingAsks(this.sessionId);
 		this.#btwPrefixLedger.clear();
 		this.#btwPrefixScopes = new WeakMap();
 		this.#evalExecutionDisposing = true;
 		this.#permissionEpoch.abort();
-		if (this.#disposeCompleted) return Promise.resolve();
-		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
-		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
 		if (!this.#disposeRunPromise) {
+			this.#disposeResourceState = "in_flight";
+			this.#disposeStrictCloseAttempts = options.strictCloseAttempts;
 			this.#sessionShutdownReason = options.sessionShutdownReason;
 			this.#disposeDeadline = Date.now() + this.#disposeTimeoutMs;
 			this.#disposeDeadlineExpired = Promise.withResolvers<void>();
@@ -12692,6 +12814,7 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+		this.#disposeResourceState = disposeFailures.length === 0 ? "settled" : "unknown";
 		if (criticalDisposeError !== undefined) {
 			disposeFailures.push({ label: "session manager close", error: criticalDisposeError, critical: true });
 		}
@@ -12705,7 +12828,9 @@ export class AgentSession {
 
 	async #closeSessionManagerForDispose(): Promise<void> {
 		let retryDelayMs = 50;
+		let attempts = 0;
 		for (;;) {
+			attempts++;
 			const outcome = await this.sessionManager.closeStrict();
 			if (outcome.kind === "closed") {
 				SessionManager.releaseProcessCwdOwnership(this.sessionManager);
@@ -12715,6 +12840,8 @@ export class AgentSession {
 				SessionManager.releaseProcessCwdOwnership(this.sessionManager);
 				throw outcome.error;
 			}
+			if (this.#disposeStrictCloseAttempts !== undefined && attempts >= this.#disposeStrictCloseAttempts)
+				throw outcome.error;
 			logger.warn("Session manager close remains retryable during dispose", { error: outcome.error.message });
 			await Bun.sleep(retryDelayMs);
 			retryDelayMs = Math.min(retryDelayMs * 2, 1_000);
@@ -14669,6 +14796,7 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
+			isCurrent?: () => boolean;
 		},
 	): Promise<number | undefined> {
 		const sharedDiscovery = options?.sharedDiscoveredActivation === true && this.#usesSharedWorkflowIntentAppend();
@@ -14680,6 +14808,7 @@ export class AgentSession {
 		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
+			(options?.isCurrent?.() ?? true) &&
 			(options?.expectedActiveToolSelectionRevision === undefined ||
 				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
 					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
@@ -15034,10 +15163,14 @@ export class AgentSession {
 		}
 	}
 
-	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
+	async #restoreMCPSelectionsForSessionContext(
+		sessionContext: SessionContext,
+		isCurrent?: () => boolean,
+	): Promise<void> {
+		if (isCurrent && !isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
-			await this.#attachAskToolIfWorkflowActive();
+			await this.#attachAskToolIfWorkflowActive(isCurrent);
 			return;
 		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
@@ -15059,11 +15192,13 @@ export class AgentSession {
 				? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
 				: (constructorDiscoveredBuiltinToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
-		await this.#applyActiveToolsByName(
+		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false },
+			{ persistMCPSelection: false, isCurrent },
 		);
-		await this.#attachAskToolIfWorkflowActive();
+		if (isCurrent && (applied === undefined || !isCurrent()))
+			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		await this.#attachAskToolIfWorkflowActive(isCurrent);
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -16132,8 +16267,8 @@ export class AgentSession {
 		}
 	}
 
-	async #attachAskToolIfWorkflowActive(): Promise<void> {
-		if (this.#isDisposed || this.#sessionAdmissionClosing) return;
+	async #attachAskToolIfWorkflowActive(isCurrent?: () => boolean): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || (isCurrent && !isCurrent())) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -16168,6 +16303,7 @@ export class AgentSession {
 				});
 				retryHydration = true;
 			}
+			if (isCurrent && !isCurrent()) return;
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
@@ -16190,7 +16326,23 @@ export class AgentSession {
 		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			this.#attachAskTool();
+			if (isCurrent) {
+				// Exact view restoration must join prompt rebuilding and fence its publication.
+				if (
+					!this.#explicitEmptyToolSelection &&
+					this.#toolRegistry.has("ask") &&
+					!this.getActiveToolNames().includes("ask")
+				) {
+					const applied = await this.#applyActiveToolsByName([...this.getActiveToolNames(), "ask"], {
+						persistMCPSelection: false,
+						isCurrent,
+					});
+					if (applied === undefined || !isCurrent())
+						throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+				}
+			} else {
+				this.#attachAskTool();
+			}
 		} else if (this.#durableWorkflowSkillState?.sessionId === sessionId) {
 			this.#durableWorkflowSkillState = undefined;
 		}
@@ -16976,8 +17128,10 @@ export class AgentSession {
 			// generation change is not cancellation: the queue helpers admit a follow-up
 			// against the current state rather than pretending the old run remains live.
 			const assertCurrent = () => {
-				if (options?.preflightSignal?.aborted ||
-					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
+				if (
+					options?.preflightSignal?.aborted ||
+					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration
+				)
 					throw promptPreflightCancelledError();
 			};
 			assertCurrent();
@@ -17003,7 +17157,7 @@ export class AgentSession {
 		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
 		// This ensures steers are injected immediately even when config hot reload is pending.
 		// However, steers still wait behind explicit model-selection fences to preserve selection ordering.
-		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+		if (options?.streamingBehavior === "steer" && this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 			// However, do not bypass for steers with an already-aborted preflight signal.
 			// The signal abort indicates user cancellation and must be respected.
 			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -17022,7 +17176,7 @@ export class AgentSession {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
-			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			if (options?.onPreflightAcceptCommit) await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 			else options?.onPreflightAccepted?.();
 			this.#assertExternalSessionIngress();
 			return;
@@ -17064,7 +17218,7 @@ export class AgentSession {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
-			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			if (options?.onPreflightAcceptCommit) await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 			else options?.onPreflightAccepted?.();
 			this.#assertExternalSessionIngress();
 			return;
@@ -17100,7 +17254,8 @@ export class AgentSession {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 					}
 					this.#assertExternalSessionIngress();
-					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					if (options?.onPreflightAcceptCommit)
+						await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 					else options?.onPreflightAccepted?.();
 					this.#assertExternalSessionIngress();
 					return;
@@ -17363,7 +17518,8 @@ export class AgentSession {
 						throw promptPreflightCancelledError();
 					}
 					this.#assertExternalSessionIngress();
-					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					if (options?.onPreflightAcceptCommit)
+						await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 					else options?.onPreflightAccepted?.();
 					durableAcceptanceCompleted = true;
 					this.#assertExternalSessionIngress();
@@ -17831,7 +17987,8 @@ export class AgentSession {
 				onPreflightAccepted: async () => {
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
-					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					if (options?.onPreflightAcceptCommit)
+						await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 					else options?.onPreflightAccepted?.();
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 				},
@@ -17841,7 +17998,8 @@ export class AgentSession {
 					if (options?.workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) {
 						return (async () => {
 							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!, () =>
-								this.#throwIfPromptPreflightCancelled(generation, preflightSignal));
+								this.#throwIfPromptPreflightCancelled(generation, preflightSignal),
+							);
 							this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 							if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
 						})();
@@ -18196,6 +18354,7 @@ export class AgentSession {
 		this.#assertExternalSessionIngress({
 			allowTrackedSuccessor: options?.allowDuringSessionTransition,
 			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+			internal: options?.claimsGenuineUserIntent !== true,
 		});
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
@@ -18345,6 +18504,7 @@ export class AgentSession {
 		this.#assertExternalSessionIngress({
 			allowTrackedSuccessor: options?.allowDuringSessionTransition,
 			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+			internal: options?.claimsGenuineUserIntent !== true,
 		});
 		assertImagePlaceholdersHavePayload(text, images);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -18361,6 +18521,7 @@ export class AgentSession {
 		this.#assertExternalSessionIngress({
 			allowTrackedSuccessor: options?.allowDuringSessionTransition,
 			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+			internal: options?.claimsGenuineUserIntent !== true,
 		});
 		assertImagePlaceholdersHavePayload(text, images);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -18500,6 +18661,7 @@ export class AgentSession {
 			this.#assertExternalSessionIngress({
 				allowTrackedSuccessor: options?.allowDuringSessionTransition,
 				allowCancelAndSubmit: options?.allowCancelAndSubmit,
+				internal: options?.claimsGenuineUserIntent !== true,
 			});
 			return this.#queueFollowUpMessage(message, displayText, options);
 		} finally {
@@ -18643,7 +18805,7 @@ export class AgentSession {
 		// A hidden next-turn message queued during a handoff transition would be
 		// dropped when the successor clears predecessor queues; reject it as busy so
 		// the caller can retry against the settled session.
-		this.#assertExternalSessionIngress({ allowCancelAndSubmit });
+		this.#assertExternalSessionIngress({ allowCancelAndSubmit, internal: origin === "turn" });
 		this.#pendingNextTurnMessages.push({ message, origin });
 		if (!triggerTurn) return;
 		const generation = this.#promptGeneration;
@@ -18924,7 +19086,7 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
-		this.#assertExternalSessionIngress();
+		this.#assertExternalSessionIngress({ internal: options?.origin === "turn" });
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,
@@ -19359,7 +19521,7 @@ export class AgentSession {
 					);
 				}
 				assertPreflightStillOpen();
-				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				if (options?.onPreflightAcceptCommit) await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 				assertPreflightStillOpen();
 				if (options?.trackSubmission === true) {
 					trackedQueuedInput = this.#createTrackedQueuedInput(deliverAs, options.queuePolicy ?? "respect-mode");
@@ -19389,7 +19551,7 @@ export class AgentSession {
 				return trackedQueuedInput?.submission;
 			}
 			if (deliverAs === "steer") {
-				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				if (options?.onPreflightAcceptCommit) await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 				assertPreflightStillOpen();
 				if (options?.trackSubmission === true) {
 					trackedQueuedInput = this.#createTrackedQueuedInput(deliverAs, options.queuePolicy ?? "respect-mode");
@@ -19433,7 +19595,7 @@ export class AgentSession {
 			// Abort unwind is awaited before classification so a successor is not
 			// parked in the dying turn's steer queue.
 			if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
-				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				if (options?.onPreflightAcceptCommit) await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 				assertPreflightStillOpen();
 				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
@@ -19482,7 +19644,8 @@ export class AgentSession {
 				onPreflightAcceptCommit:
 					options?.onPreflightAcceptCommit || freshAtReservation || promoteAfterAbortUnwind
 						? async () => {
-								if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+								if (options?.onPreflightAcceptCommit)
+									await this.#commitPromptAcceptance(options.onPreflightAcceptCommit);
 								else options?.onPreflightAccepted?.();
 								assertPreflightStillOpen();
 								fireQueuedPromotion();
@@ -19578,11 +19741,47 @@ export class AgentSession {
 		};
 	}
 
+	/** Remove only a still-executable display identity; stale chips are not cancellation receipts. */
+	cancelQueuedMessage(id: string): QueuedInputCancelResult {
+		const row = this.getQueuedMessageEntries().find(entry => entry.id === id);
+		if (!row) return "unknown";
+		if (row.submissionId) return this.cancelQueuedInputSubmission(row.submissionId);
+		const entry = [...this.#steeringMessages, ...this.#followUpMessages].find(
+			candidate => this.#queuedMessageEditId(row.mode, candidate.sequence) === id,
+		);
+		const message = entry?.message;
+		if (!message) return "unknown";
+		const queued =
+			this.#deferredSdkFollowUps.includes(message) ||
+			this.agent.snapshotSteering().includes(message) ||
+			this.agent.snapshotFollowUp().includes(message);
+		if (!queued) return "unknown";
+		return this.removeQueuedMessageForEditing(id) !== undefined ? "removed" : "unknown";
+	}
+
+	/** Exact tracked cancellation; a delivered submission never authorizes aborting its run. */
+	cancelQueuedInputSubmission(submissionId: string): QueuedInputCancelResult {
+		const state = this.#trackedQueuedInputs.get(submissionId);
+		if (!state) return "unknown";
+		if (state.executionSettled || this.#trackedQueuedInputsAwaitingOwnRun.has(state)) return "already_executing";
+		if (state.submission.cancel()) return "removed";
+		const current = this.#trackedQueuedInputs.get(submissionId);
+		return current && (current.executionSettled || this.#trackedQueuedInputsAwaitingOwnRun.has(current))
+			? "already_executing"
+			: "unknown";
+	}
+
 	getQueuedMessageEntries(): QueuedMessageEditEntry[] {
 		const entries: QueuedMessageEditEntry[] = [];
+		const submissions = new Map<AgentMessage, string>();
+		for (const state of this.#trackedQueuedInputs.values()) {
+			if (state.message && !state.executionSettled && !state.terminalSettled)
+				submissions.set(state.message, state.submission.submissionId);
+		}
 		for (const entry of this.#steeringMessages) {
 			entries.push({
 				id: this.#queuedMessageEditId("steer", entry.sequence),
+				submissionId: entry.message ? submissions.get(entry.message) : undefined,
 				text: entry.text,
 				mode: "steer",
 				label: "Steer",
@@ -19591,6 +19790,7 @@ export class AgentSession {
 		for (const entry of this.#followUpMessages) {
 			entries.push({
 				id: this.#queuedMessageEditId("followUp", entry.sequence),
+				submissionId: entry.message ? submissions.get(entry.message) : undefined,
 				text: entry.text,
 				mode: "followUp",
 				label: "Queued",
@@ -20454,6 +20654,8 @@ export class AgentSession {
 		handle: string,
 		options: {
 			graceMs: number;
+			/** External exact-run consent; ordinary retained-ledger joins remain unchanged. */
+			abortRunId?: string;
 			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
 		},
 	): Promise<
@@ -20461,8 +20663,21 @@ export class AgentSession {
 			terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
 		}
 	> {
+		// Materialize caller accessors before the final exact-run check.
+		const { abortRunId, graceMs, terminal: requestedTerminal } = options;
+		const terminal = requestedTerminal
+			? {
+					scope: requestedTerminal.scope,
+					expectedEpoch: requestedTerminal.expectedEpoch,
+					steeringSnapshotToken: requestedTerminal.steeringSnapshotToken,
+				}
+			: undefined;
+		// Terminal bookkeeping can purge queues/fence continuations. Validate the exact
+		// live run before any such effect, not only before agent.abort() below.
+		if (abortRunId !== undefined && (abortRunId !== handle || abortRunId !== this.agent.activeResourceRunId))
+			return { status: "unfenced", reason: "unknown_run", pending: [] };
 		let registeredScope: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string } | undefined;
-		if (options.terminal) {
+		if (terminal) {
 			// The terminal scope must be registered for the ABORTED turn's
 			// lineage, never a successor's. A new root turn advances the attempt
 			// epoch at admission, so when the caller captured the epoch before a
@@ -20471,13 +20686,10 @@ export class AgentSession {
 			// unrelated successor's queues (review thread P1). Callers that do
 			// not pass an expected epoch (direct seam users) retain the prior
 			// register-regardless behavior.
-			if (
-				options.terminal.expectedEpoch !== undefined &&
-				options.terminal.expectedEpoch !== this.#promptGeneration
-			) {
+			if (terminal.expectedEpoch !== undefined && terminal.expectedEpoch !== this.#promptGeneration) {
 				return { status: "unfenced", reason: "unknown_run", pending: [] };
 			}
-			const requestedSnapshotToken = options.terminal.steeringSnapshotToken;
+			const requestedSnapshotToken = terminal.steeringSnapshotToken;
 			const currentSnapshotKey =
 				this.#turnLineageIdHash === undefined ? undefined : `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
 			if (requestedSnapshotToken !== undefined) {
@@ -20504,7 +20716,7 @@ export class AgentSession {
 				const scope = registerTerminalTurnScope({
 					lineageIdHash,
 					promptAttemptEpoch: this.#promptGeneration,
-					ownedCompletionPolicy: options.terminal.scope === "owned" ? "disabled" : "enabled",
+					ownedCompletionPolicy: terminal.scope === "owned" ? "disabled" : "enabled",
 				});
 				// Admission can fail closed (registry saturation): the abort
 				// proceeds without a scope, so nothing is attributed.
@@ -20639,7 +20851,7 @@ export class AgentSession {
 			};
 		}
 		if (handle === this.agent.activeResourceRunId) this.agent.abort();
-		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
+		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: graceMs });
 		if (proof.status === "unfenced" && proof.reason !== "resources_pending") {
 			this.agent.resourceLedger.quarantine(handle);
 		}
@@ -20657,7 +20869,7 @@ export class AgentSession {
 		// so preserving the envelopes alone leaves them stranded until an
 		// unrelated prompt. Schedule a continue so they are consumed as a
 		// fresh turn (review thread P1).
-		if (options.terminal && registeredScope) {
+		if (terminal && registeredScope) {
 			// Rearm ONLY envelopes the classifier marks fresh. A drop-classified
 			// envelope (a denied owned completion under scope:"owned") must never
 			// reach the model: purge it from the follow-up queue BEFORE the
@@ -20897,7 +21109,9 @@ export class AgentSession {
 					}
 					// Follow-ups bound to the aborted run were discarded at its agent_end; keep
 					// the snapshots from handing them back to the replacement run or a rollback.
-					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(entry => !this.#isPromptRunLive(entry.target));
+					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(
+						entry => !this.#isPromptRunLive(entry.target),
+					);
 					if (endedFollowUps.length > 0) {
 						const ended = new Set(endedFollowUps.map(entry => entry.message));
 						queueSnapshot.followUp.splice(
@@ -21514,7 +21728,11 @@ export class AgentSession {
 					() => {
 						if (stale()) throw new SessionTitlePersistenceStaleError();
 					},
-					() => manager.setSessionNameSharingSession(title, "auto", { isCurrent: () => !stale(), onlyIfUnnamed: true }),
+					() =>
+						manager.setSessionNameSharingSession(title, "auto", {
+							isCurrent: () => !stale(),
+							onlyIfUnnamed: true,
+						}),
 				);
 				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
 				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
@@ -23531,6 +23749,12 @@ export class AgentSession {
 			)
 				throw new Error("Session changed while selecting temporary model");
 		};
+		if (this.#usesSharedWorkflowIntentAppend() && options?.cause === "startup-override") {
+			// Startup metadata uses synchronous append helpers. Establish the
+			// cooperative lease through the awaited drain before those helpers run.
+			await this.sessionManager.flush();
+			assertCurrent();
+		}
 		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		options?.onMutationStarted?.();
 		let materialized = false;
@@ -24424,8 +24648,10 @@ export class AgentSession {
 		onApplied?: (mutationRevision: number) => void,
 		entryAlreadyCommitted = false,
 	): void {
-		if (!entryAlreadyCommitted &&
-			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)) {
+		if (
+			!entryAlreadyCommitted &&
+			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)
+		) {
 			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		}
 		this.#btwPrefixLedger.clear();
@@ -24475,16 +24701,18 @@ export class AgentSession {
 		const sessionId = this.sessionManager.getSessionId();
 		const model = this.model;
 		const contextGeneration = this.#reasoningControlContextGeneration;
-		const current = () => revision === this.#thinkingLevelMutationRevision &&
+		const current = () =>
+			revision === this.#thinkingLevelMutationRevision &&
 			liveRevision === this.#thinkingLevelLiveMutationRevision &&
-			sessionId === this.sessionManager.getSessionId() && model === this.model &&
+			sessionId === this.sessionManager.getSessionId() &&
+			model === this.model &&
 			contextGeneration === this.#reasoningControlContextGeneration;
 		return async () => {
 			if (!current()) return;
 			return this.sessionManager.withSharedThinkingControl(async () => {
 				const selected = level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level;
 				const effective = resolveThinkingLevelForModel(model, selected);
-				let outcome;
+				let outcome: SharedAppendOutcome;
 				try {
 					outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
 						level === ThinkingLevel.Inherit ? level : effective,
@@ -24498,7 +24726,8 @@ export class AgentSession {
 					outcome.kind === "rejected" &&
 					outcome.error instanceof Error &&
 					outcome.error.message === "shared_thinking_control_superseded"
-				) return;
+				)
+					return;
 				if (outcome.kind !== "committed") {
 					throw new Error(
 						`Session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
@@ -24517,26 +24746,39 @@ export class AgentSession {
 		const sessionId = this.sessionManager.getSessionId();
 		const model = this.model;
 		const contextGeneration = this.#reasoningControlContextGeneration;
-		const sameContext = () => contextGeneration === this.#reasoningControlContextGeneration &&
-			sessionId === this.sessionManager.getSessionId() && model === this.model;
-		const current = () => revision === this.#thinkingLevelMutationRevision &&
-			liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext();
+		const sameContext = () =>
+			contextGeneration === this.#reasoningControlContextGeneration &&
+			sessionId === this.sessionManager.getSessionId() &&
+			model === this.model;
+		const current = () =>
+			revision === this.#thinkingLevelMutationRevision &&
+			liveRevision === this.#thinkingLevelLiveMutationRevision &&
+			sameContext();
 		return async () => {
 			if (!current()) return;
 			return this.sessionManager.withSharedThinkingControl(async () => {
-				const effective = resolveThinkingLevelForModel(model,
-					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+				const effective = resolveThinkingLevelForModel(
+					model,
+					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+				);
 				const persisted = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effective;
 				const publish = async (isCurrent: () => boolean) => {
-					let outcome;
+					let outcome: SharedAppendOutcome;
 					try {
 						outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
-							ThinkingLevel.Inherit, false, isCurrent);
+							ThinkingLevel.Inherit,
+							false,
+							isCurrent,
+						);
 					} catch (error) {
 						throw new Error("Reasoning settings saved; session thinking publication failed", { cause: error });
 					}
-					if (outcome.kind === "rejected" && outcome.error instanceof Error &&
-						outcome.error.message === "shared_thinking_control_superseded") return false;
+					if (
+						outcome.kind === "rejected" &&
+						outcome.error instanceof Error &&
+						outcome.error.message === "shared_thinking_control_superseded"
+					)
+						return false;
 					if (outcome.kind !== "committed") {
 						throw new Error(
 							`Reasoning settings saved; session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
@@ -24553,11 +24795,20 @@ export class AgentSession {
 					if (revision === this.#thinkingLevelMutationRevision && sameContext()) {
 						const pending = this.#pendingThinkingLevelControlSuccess;
 						this.#pendingThinkingLevelControlSuccess = undefined;
-						if (pending && pending.contextGeneration === contextGeneration &&
-							pending.sessionId === sessionId && pending.model === model && current()) {
+						if (
+							pending &&
+							pending.contextGeneration === contextGeneration &&
+							pending.sessionId === sessionId &&
+							pending.model === model &&
+							current()
+						) {
 							try {
-								if (await publish(current) && current())
-									apply(pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level);
+								if ((await publish(current)) && current())
+									apply(
+										pending.level === ThinkingLevel.Inherit
+											? this.#getInheritedThinkingLevel()
+											: pending.level,
+									);
 							} catch (recoveryError) {
 								const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
 								throw new AggregateError(
@@ -24568,34 +24819,47 @@ export class AgentSession {
 							}
 						} else {
 							this.#pendingThinkingLevelControlFailure = {
-								mutationRevision: revision, liveMutationRevision: liveRevision,
-								sessionId, model, contextGeneration,
+								mutationRevision: revision,
+								liveMutationRevision: liveRevision,
+								sessionId,
+								model,
+								contextGeneration,
 							};
 						}
 					}
 					throw new Error("Unable to persist reasoning settings.", { cause: settingsError });
 				}
 				if (!current()) {
-					if (liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext() &&
-						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision) {
-						this.#pendingThinkingLevelControlSuccess = { level, mutationRevision: revision,
-							sessionId, model, contextGeneration };
+					if (
+						liveRevision === this.#thinkingLevelLiveMutationRevision &&
+						sameContext() &&
+						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision
+					) {
+						this.#pendingThinkingLevelControlSuccess = {
+							level,
+							mutationRevision: revision,
+							sessionId,
+							model,
+							contextGeneration,
+						};
 						const failure = this.#pendingThinkingLevelControlFailure;
-						const recoverable = () => failure !== undefined &&
+						const recoverable = () =>
+							failure !== undefined &&
 							failure.mutationRevision === this.#thinkingLevelMutationRevision &&
 							failure.liveMutationRevision === this.#thinkingLevelLiveMutationRevision &&
-							failure.sessionId === this.sessionManager.getSessionId() && failure.model === this.model &&
+							failure.sessionId === this.sessionManager.getSessionId() &&
+							failure.model === this.model &&
 							failure.contextGeneration === this.#reasoningControlContextGeneration;
 						if (recoverable()) {
 							this.#pendingThinkingLevelControlSuccess = undefined;
 							this.#pendingThinkingLevelControlFailure = undefined;
-							if (await publish(recoverable) && recoverable())
+							if ((await publish(recoverable)) && recoverable())
 								apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 						}
 					}
 					return;
 				}
-				if (await publish(current) && current())
+				if ((await publish(current)) && current())
 					apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 			});
 		};
@@ -28041,7 +28305,8 @@ export class AgentSession {
 				continue;
 			}
 
-			if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+			if (!this.#usesSharedWorkflowIntentAppend())
+				this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -31063,7 +31328,7 @@ export class AgentSession {
 
 	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
 		await this.#withStartedSharedControlPublication(assertCurrent, async () => {
-			let outcome;
+			let outcome: SharedAppendOutcome;
 			try {
 				outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
 			} catch (error) {
@@ -32151,7 +32416,10 @@ export class AgentSession {
 		const rosterClaim = callerOwnsRosterClaim ? turnArgs.ircRosterClaim : this.#claimIrcRosterCandidate();
 		const execution = this.#runBackgroundTurn(turnArgs, rosterClaim ?? null, callerOwnsRosterClaim);
 		// Retain ownership of actual credential and iterator work, not its abort race.
-		void execution.then(() => lease.release(), () => lease.release());
+		void execution.then(
+			() => lease.release(),
+			() => lease.release(),
+		);
 		try {
 			return await awaitEphemeralAbort(execution, signal);
 		} finally {
@@ -32296,8 +32564,11 @@ export class AgentSession {
 	async #runOwnedBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 		this.#assertExternalSessionIngress();
 		const manager = this.sessionManager;
-		if (this.#btwCleanupFailures.some(failure =>
-			failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration())) {
+		if (
+			this.#btwCleanupFailures.some(
+				failure => failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration(),
+			)
+		) {
 			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.");
 		}
 		if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
@@ -33682,6 +33953,155 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
+	 * Restore an exact runtime cursor, including the empty root. Unlike user tree
+	 * navigation this never runs hooks, summarizes, aborts work, or appends entries.
+	 * The caller must persist the cursor separately; flush does not persist it.
+	 */
+	async restoreTreeLeaf(targetId: string | null, options: { messages?: readonly AgentMessage[] } = {}): Promise<void> {
+		const gone = () => Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (this.#isDisposed) throw gone();
+		this.#assertExternalSessionIngress();
+		const busy = () =>
+			this.isRevisionControlBusy ||
+			this.isCompacting ||
+			this.hasPendingBashMessages ||
+			this.hasPendingPythonMessages ||
+			this.queuedMessageCount > 0 ||
+			this.agent.hasQueuedMessages();
+		if (busy()) throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
+		if (targetId !== null && (typeof targetId !== "string" || targetId.length === 0))
+			throw Object.assign(new Error("Invalid session leaf."), { code: "invalid_input" });
+		const manager = this.sessionManager;
+		if (targetId !== null && !manager.getEntryForFidelity(targetId)) throw gone();
+		const previousLeaf = manager.getLeafId();
+		if (targetId === previousLeaf && !options.messages) return;
+		const restoredMessages = options.messages ? [...options.messages] : undefined;
+		const agent = this.agent;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identity = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
+		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
+		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
+		const previousHasExplicitActiveToolSelectionForContext = this.#committedHasExplicitActiveToolSelectionForContext;
+		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
+			? [...this.#committedExplicitMCPToolSelectionForContext]
+			: undefined;
+		const previousExplicitMCPToolSelectionPersistsForContext =
+			this.#committedExplicitMCPToolSelectionPersistsForContext;
+		const previousTools = [...agent.state.tools];
+		const previousBaseSystemPrompt = this.#baseSystemPrompt;
+		const previousSystemPrompt = agent.state.systemPrompt;
+		const previousLastAppliedToolSignature = this.#lastAppliedToolSignature;
+		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
+		const previousMessages = agent.state.messages.slice();
+		let ownedMessages = previousMessages;
+		let ownedLeaf = previousLeaf;
+		let revisions = manager.revisionSnapshot();
+		let moved = false;
+		const current = () => {
+			const now = manager.revisionSnapshot();
+			const messages = agent.state.messages;
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.agent === agent &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionFile() === file &&
+				manager.getSessionIdentityGeneration() === identity &&
+				this.#sessionTransitionKind === "navigate-tree" &&
+				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
+				this.#mcpCatalogGeneration === mcpCatalogGeneration &&
+				this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration &&
+				manager.getLeafId() === ownedLeaf &&
+				now.entry === revisions.entry &&
+				now.leaf === revisions.leaf &&
+				now.headerExport === revisions.headerExport &&
+				now.label === revisions.label &&
+				now.replayMetadata === revisions.replayMetadata &&
+				messages.length === ownedMessages.length &&
+				messages.every((message, index) => message === ownedMessages[index]) &&
+				!busy()
+			);
+		};
+		this.#beginSessionTransition("navigate-tree");
+		try {
+			if (!current()) throw gone();
+			if (targetId === null) manager.resetLeaf();
+			else manager.branch(targetId);
+			ownedLeaf = targetId;
+			revisions = { ...revisions, leaf: revisions.leaf + 1 };
+			moved = true;
+			this.#commitSessionTransition();
+			if (!current()) throw gone();
+			const context = this.buildDisplaySessionContext();
+			await this.#restoreMCPSelectionsForSessionContext(context, current);
+			if (!current()) throw gone();
+			agent.replaceMessages(restoredMessages ?? context.messages, {
+				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
+			});
+			ownedMessages = agent.state.messages.slice();
+			this.#resetInjectedContextSignatures();
+			this.#syncTodoPhasesFromBranch();
+			this.#closeCodexProviderSessionsForHistoryRewrite();
+			this.#resetActiveSdkRunOwnership();
+			if (!current()) throw gone();
+		} catch (error) {
+			// Revision counters catch even a competing selection away and back. Never
+			// overwrite appended work, a successor, disposal, or foreign agent history.
+			if (moved && current()) {
+				try {
+					if (previousLeaf === null) manager.resetLeaf();
+					else manager.branch(previousLeaf);
+					ownedLeaf = previousLeaf;
+					revisions = { ...revisions, leaf: revisions.leaf + 1 };
+					if (!current()) throw gone();
+					// The transcript may intentionally differ from the live selection. Restore
+					// prepared tools and both prompts without rebuilding or persisting it.
+					this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+					this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+					this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
+					this.#commitExplicitMCPToolSelectionAuthority();
+					this.#selectedMCPToolNames = previousSelectedMCPToolNames;
+					this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+					this.#activeToolSelectionRevision++;
+					agent.setTools(previousTools);
+					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+					if (!current()) throw gone();
+					this.#baseSystemPrompt = previousBaseSystemPrompt;
+					agent.setSystemPrompt(previousSystemPrompt);
+					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+					this.#invalidateDiscoveryCaches();
+					if (!current()) throw gone();
+					agent.replaceMessages(previousMessages, {
+						historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
+					});
+					ownedMessages = agent.state.messages.slice();
+					this.#resetInjectedContextSignatures();
+					this.#syncTodoPhasesFromBranch();
+					this.#closeCodexProviderSessionsForHistoryRewrite();
+					if (!current()) throw gone();
+				} catch {
+					throw Object.assign(new Error("Session view rollback failed."), {
+						code: "revision_failed",
+						rollbackFailed: true,
+					});
+				}
+			} else if (moved) {
+				throw gone();
+			}
+			throw error;
+		} finally {
+			this.#endSessionTransition();
+		}
+	}
+
+	/**
 	 * Navigate to a different node in the session tree.
 	 * Unlike branch() which creates a new session file, this stays in the same file.
 	 *
@@ -33690,17 +34110,136 @@ export class AgentSession {
 	 * @param options.customInstructions Custom instructions for summarizer
 	 * @returns Result with editorText (if user message) and cancelled status
 	 */
+	async #commitPromptAcceptance(callback: () => void | Promise<void>): Promise<void> {
+		const entry = this.#sessionAdmissionContext.getStore();
+		if (!entry || entry.kind !== "prompt" || entry.released || this.#activeSessionAdmission !== entry)
+			return callback();
+		const scope = {
+			entry,
+			manager: this.sessionManager,
+			identity: this.sessionManager.getSessionIdentityGeneration(),
+			generation: this.#sessionTransitionGeneration,
+			active: true,
+		};
+		try {
+			await this.#executionAcceptance.run(scope, callback);
+		} finally {
+			scope.active = false;
+		}
+	}
+
+	/** Durable execution selection; exact presentation restoration uses restoreTreeLeaf instead. */
+	async selectExecutionBranchDurably(
+		targetLeafId: string | null,
+		op: string = crypto.randomUUID(),
+		beforeCommit?: () => void,
+	): Promise<ExecutionSelectionPublication | undefined> {
+		if (this.#isDisposed) throw new Error("resource_gone");
+		this.#assertExternalSessionIngress();
+		const acceptance = this.#executionAcceptance.getStore();
+		const ownsPreflight =
+			acceptance?.active === true &&
+			!acceptance.entry.released &&
+			this.#activeSessionAdmission === acceptance.entry &&
+			this.#sessionAdmissionContext.getStore() === acceptance.entry &&
+			acceptance.manager === this.sessionManager &&
+			acceptance.identity === this.sessionManager.getSessionIdentityGeneration() &&
+			acceptance.generation === this.#sessionTransitionGeneration &&
+			!this.agent.state.isStreaming;
+		if (this.#sessionTransitionKind !== undefined || (this.isStreaming && !ownsPreflight))
+			throw new AgentBusyError("Cannot change execution selection while work is active.");
+		return this.#persistExecutionSelection(targetLeafId, op, beforeCommit);
+	}
+
+	async #persistExecutionSelection(
+		targetLeafId: string | null,
+		op: string,
+		beforeCommit?: () => void,
+	): Promise<ExecutionSelectionPublication | undefined> {
+		const manager = this.sessionManager;
+		if (!manager.getSessionFile()) return undefined;
+		const priorPresentationLeaf = manager.getLeafId();
+		const identity = manager.getSessionIdentityGeneration();
+		const priorRevisions = manager.revisionSnapshot();
+		const pending = await manager.selectExecutionBranch(targetLeafId, { op, beforeCommit });
+		const restoreOwnPresentation = (): void => {
+			const current = manager.revisionSnapshot();
+			if (
+				this.sessionManager !== manager ||
+				manager.getSessionIdentityGeneration() !== identity ||
+				manager.getStrictCloseState().kind !== "none_started" ||
+				manager.getLeafId() !== pending.CB ||
+				current.leaf !== priorRevisions.leaf + 1 ||
+				pending.g0.entryRevision0 !== priorRevisions.entry ||
+				current.entry !== priorRevisions.entry + pending.manifest.length ||
+				current.headerExport !== priorRevisions.headerExport ||
+				current.label !== priorRevisions.label ||
+				current.replayMetadata !== priorRevisions.replayMetadata ||
+				pending.manifest.some(record => {
+					const entry = manager.getEntryForFidelity(record.id);
+					return (
+						!entry ||
+						entry.parentId !== record.parentId ||
+						crypto.createHash("sha256").update(JSON.stringify(entry)).digest("hex") !== record.payloadDigest
+					);
+				})
+			)
+				return;
+			manager.restorePresentationLeaf(priorPresentationLeaf);
+		};
+		let result: ReconcileResult;
+		try {
+			result = await manager.reconcileResumeOperation(pending, "complete", {
+				contextFamily: "live",
+				context: "runtime",
+				closeOutcome: manager.getStrictCloseState().kind,
+				invocation: "RECON",
+				action: "RETAIN_LIVE",
+				completionResult: "n/a",
+				authorization: { tokenValid: false, terminationIntent: "none", intentValid: false },
+				readiness: { prior: "ready", current: "ready" },
+			});
+		} catch (error) {
+			restoreOwnPresentation();
+			throw new ExecutionSelectionError(pending, "uncertain_cursor", undefined, { cause: error });
+		}
+		if (!result.receipt.commitment.continueEligible) {
+			restoreOwnPresentation();
+			throw new ExecutionSelectionError(pending, result.refusal ?? "uncertain_cursor", result.receipt);
+		}
+		return { pending, result };
+	}
+
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string; includeTarget?: boolean } = {},
-	): Promise<{
-		editorText?: string;
-		cancelled: boolean;
-		aborted?: boolean;
-		summaryEntry?: BranchSummaryEntry;
-		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
-		sessionContext?: SessionContext;
-	}> {
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			includeTarget?: boolean;
+			beforeExecutionCommit?: () => void;
+		} = {},
+	): Promise<TreeNavigationResult> {
+		return this.#navigateTree(targetId, options, true);
+	}
+
+	/** Edit preparation retains tree admission hooks, but cannot publish an execution selection. */
+	async prepareTreeEdit(
+		targetId: string,
+		options: { beforeExecutionCommit?: () => void } = {},
+	): Promise<TreeNavigationResult> {
+		return this.#navigateTree(targetId, options, false);
+	}
+
+	async #navigateTree(
+		targetId: string,
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			includeTarget?: boolean;
+			beforeExecutionCommit?: () => void;
+		},
+		persistSelection: boolean,
+	): Promise<TreeNavigationResult> {
 		// Serialize with every other session-identity transition via the shared
 		// lease (handoff/compact/new/switch/branch/clear/fork). navigateTree rewrites
 		// live history in place, so a concurrent transition would race the same state.
@@ -33712,7 +34251,12 @@ export class AgentSession {
 		try {
 			const oldLeafId = currentLeafId;
 			const leafTarget = targetId === oldLeafId ? this.sessionManager.getEntryForFidelity(targetId) : undefined;
-			if (targetId === oldLeafId && (options.includeTarget || options.summarize || !(leafTarget?.type === "message" && leafTarget.message.role === "user")))
+			if (
+				targetId === oldLeafId &&
+				(options.includeTarget ||
+					options.summarize ||
+					!(leafTarget?.type === "message" && leafTarget.message.role === "user"))
+			)
 				return { cancelled: false };
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
@@ -33761,12 +34305,14 @@ export class AgentSession {
 				}
 			}
 
-			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0)
+				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
 
-			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0)
+				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
@@ -33837,6 +34383,14 @@ export class AgentSession {
 
 			await this.#settleBtwForSessionTransition();
 
+			// Guard again after awaited hooks/preparation, and within the manager's frozen commit.
+			options.beforeExecutionCommit?.();
+			// A cancelled preparation never writes a cursor; refusal never publishes a new runtime view.
+			let durableSelection =
+				persistSelection && !summaryText
+					? await this.#persistExecutionSelection(newLeafId, crypto.randomUUID(), options.beforeExecutionCommit)
+					: undefined;
+
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
@@ -33849,12 +34403,16 @@ export class AgentSession {
 					fromExtension,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
-			} else if (newLeafId === null) {
-				// No summary, navigating to root - reset leaf
-				this.sessionManager.resetLeaf();
-			} else {
-				// No summary, navigating to non-root
-				this.sessionManager.branch(newLeafId);
+				if (persistSelection)
+					durableSelection = await this.#persistExecutionSelection(
+						summaryId,
+						crypto.randomUUID(),
+						options.beforeExecutionCommit,
+					);
+			} else if (!durableSelection) {
+				// Persistent selection retains its immutable cursor CB as the next append base.
+				if (newLeafId === null) this.sessionManager.resetLeaf();
+				else this.sessionManager.branch(newLeafId);
 			}
 			this.#commitSessionTransition();
 
@@ -33897,9 +34455,21 @@ export class AgentSession {
 					}),
 				);
 				const refreshedContext = this.buildDisplaySessionContext();
-				return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
+				return {
+					editorText,
+					cancelled: false,
+					summaryEntry,
+					sessionContext: refreshedContext,
+					...(durableSelection ? { executionSelection: durableSelection } : {}),
+				};
 			}
-			return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
+			return {
+				editorText,
+				cancelled: false,
+				summaryEntry,
+				sessionContext: displayContext,
+				...(durableSelection ? { executionSelection: durableSelection } : {}),
+			};
 		} finally {
 			this.#reconnectToAgent();
 			this.#endSessionTransition();
