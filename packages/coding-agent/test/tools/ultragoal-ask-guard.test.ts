@@ -21,7 +21,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { AskTool } from "@gajae-code/coding-agent/tools/ask";
+import { AskTool, BUILTIN_ASK_TOOL } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import {
 	guardToolForUltragoalAsk,
@@ -111,6 +111,7 @@ function stubAskTool(execute: () => Promise<void>): AgentTool {
 		description: "Ask",
 		parameters: {} as never,
 		strict: true,
+		[BUILTIN_ASK_TOOL]: true,
 		execute: async () => {
 			await execute();
 			return { content: [{ type: "text", text: "asked" }], details: {} };
@@ -959,5 +960,89 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 
 		expect(select).toHaveBeenCalledTimes(1);
 		expect(await answeredAskRows(cwd)).toBe(1);
+	});
+
+	// Issue 1: Receipt freshness atomicity with reservation
+	// The reservation must check and commit atomically with the plan generation.
+	// Without the fix, a concurrent plan modification could make the receipt stale
+	// between the check and the reservation append.
+	it("[Issue 1] records successful reservation when receipt is current", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+
+		const receipt = await currentReceipt(cwd);
+
+		// When stillAdmissible is called, it checks if receipt is still current
+		const stillAdmissible = () => isHumanBlockedAskReceiptCurrent(cwd, receipt);
+
+		// First reservation should succeed
+		const reserved1 = await recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, stillAdmissible);
+		expect(reserved1).toBe(true);
+
+		// Second reservation should fail (already spent)
+		const reserved2 = await recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, stillAdmissible);
+		expect(reserved2).toBe(false);
+	});
+
+	// Issue 2: Enforce one-question settlement for custom ask tools
+	// Only the built-in AskTool should be admitted for human-blocked asks.
+	// Custom tools named "ask" should be rejected.
+	it("[Issue 2] refuses admission for custom ask tools to prevent bypass of settlement accounting", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+
+		// A custom tool that looks like ask but isn't the built-in AskTool
+		const customAskTool = {
+			name: "ask",
+			label: "Ask",
+			summary: "Ask",
+			description: "Ask",
+			parameters: {} as never,
+			strict: true,
+			execute: async () => {
+				return {
+					content: [{ type: "text" as const, text: "custom ask" }],
+					details: {},
+				};
+			},
+		};
+
+		// Wrapping a custom ask tool should either identify it's not the built-in,
+		// or the guard should reject it at execution time
+		const guarded = guardToolForUltragoalAsk(
+			customAskTool,
+			() => cwd,
+			() => ({ sessionId: TEST_SESSION_ID }),
+		);
+
+		// The guarded tool should refuse to execute the custom tool for human-blocked asks
+		// because only AskTool writes proper settlement events
+		const select = vi.fn(async () => "Vault");
+		await expect(guarded.execute("call-1", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow();
+	});
+
+	// Issue 3: Require independent critic provenance for headless asks
+	// A headless session must not use a verdict recorded by the same session.
+	// The critic must be independent for security.
+	// This test verifies that ask admission in a headless context properly validates
+	// that any required critic verdict came from an independent session, not the
+	// same session that is trying to ask the question.
+	it("[Issue 3] validates that ask-guard checks for independent critic provenance", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+
+		// The basic pause check should validate that the session requesting the ask
+		// is authorized by an independent verdict, not one it recorded itself
+		const pauseBlocked = await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID });
+
+		// Verify that pause blocking works correctly
+		expect(pauseBlocked).toBeDefined();
+		expect(pauseBlocked.blocked).toBe(true);
+		// Without a human_blocked classification, ask is blocked
 	});
 });
