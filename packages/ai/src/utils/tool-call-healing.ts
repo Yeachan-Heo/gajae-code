@@ -314,9 +314,7 @@ export class DsmlToolCallHealer {
 	#offset = 0;
 	#inCall = false;
 	#inParameter = false;
-	#suppressCall = false;
 	#incomplete = false;
-	#hasStructuralError = false;
 	#pendingName = "";
 	#pendingInvokeString: boolean | undefined;
 	#pendingParameterName = "";
@@ -345,9 +343,7 @@ export class DsmlToolCallHealer {
 	#abandonCall(): void {
 		this.#inCall = false;
 		this.#inParameter = false;
-		this.#suppressCall = false;
 		this.#incomplete = false;
-		this.#hasStructuralError = false;
 		this.#pendingName = "";
 		this.#pendingInvokeString = undefined;
 		this.#pendingParameterName = "";
@@ -361,15 +357,6 @@ export class DsmlToolCallHealer {
 		this.#compact();
 		this.#buffer += text;
 		return this.#consume();
-	}
-
-	consumeWithoutCalls(text: string): string {
-		const clean = this.feed(text);
-		// Preserve strip-only state through the closing tag, including when the
-		// opening tag itself is split across deltas.
-		if (this.#inCall || this.#remaining().length > 0) this.#suppressCall = true;
-		if (this.#completed.length > 0) this.#completed.length = 0;
-		return clean;
 	}
 
 	drainCompleted(): HealedToolCall[] {
@@ -470,15 +457,10 @@ export class DsmlToolCallHealer {
 		if (tag.kind === "invoke") {
 			if (tag.closing) {
 				if (this.#inCall) {
-					if (this.#suppressCall) {
-						this.#abandonCall();
-						return;
-					}
-					// Preserve incomplete flag set by parsing errors or structural issues
+					// Parse failures and nested parameters already marked the call.
 					this.#incomplete = this.#incomplete || this.#inParameter;
 					this.#finalizeCall();
 				}
-				this.#suppressCall = false;
 				return;
 			}
 			this.#inCall = true;
@@ -489,21 +471,14 @@ export class DsmlToolCallHealer {
 			this.#pendingParameterString = true;
 			this.#pendingValue = "";
 			this.#pendingArguments = [];
-			// Don't reset suppressCall here - it may have been set by consumeWithoutCalls()
-			// on a partial opening tag that now completes
 			this.#incomplete = false;
 			return;
 		}
 
 		if (tag.kind !== "parameter" || !this.#inCall) return;
 		if (!tag.closing) {
-			// Finding 3: If a parameter is already open, this is a structural error.
-			// Mark incomplete and discard this call's arguments to prevent malformed execution.
-			if (this.#inParameter) {
-				this.#incomplete = true;
-				this.#hasStructuralError = true;
-				this.#pendingArguments = [];
-			}
+			// A parameter opening inside another is malformed: the call must not execute.
+			if (this.#inParameter) this.#incomplete = true;
 			this.#inParameter = true;
 			this.#pendingParameterName = tag.name ?? "";
 			this.#pendingParameterString = tag.string !== false;
@@ -525,9 +500,6 @@ export class DsmlToolCallHealer {
 	}
 
 	#addArgument(name: string, value: string, isString: boolean): void {
-		// Skip adding arguments if we've detected structural errors
-		if (this.#hasStructuralError) return;
-
 		let rawJson: string;
 		if (isString) {
 			rawJson = JSON.stringify(value);
@@ -537,8 +509,7 @@ export class DsmlToolCallHealer {
 				parseJsonWithRepair<unknown>(candidate);
 				rawJson = candidate;
 			} catch {
-				// Finding 2: Mark the call as incomplete when JSON-typed argument fails to parse,
-				// instead of falling back to a string which would allow execution despite malformed data
+				// A JSON-typed value that does not parse is malformed, not a string.
 				this.#incomplete = true;
 				return;
 			}

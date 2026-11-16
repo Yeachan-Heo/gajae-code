@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
+import { type OpenAICompletionsOptions, streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai/types";
 
 const originalFetch = global.fetch;
@@ -43,7 +43,10 @@ function structured(argumentsText: string, start = true): NonNullable<Delta["too
 	];
 }
 
-async function response(deltas: Delta[]): Promise<AssistantMessage> {
+async function response(
+	deltas: Delta[],
+	options: Omit<OpenAICompletionsOptions, "apiKey"> = {},
+): Promise<AssistantMessage> {
 	const events = [...deltas, {}].map((delta, index) => ({
 		id: "chatcmpl-dsml",
 		object: "chat.completion.chunk",
@@ -59,7 +62,7 @@ async function response(deltas: Delta[]): Promise<AssistantMessage> {
 	const result = await streamOpenAICompletions(
 		model,
 		{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }] },
-		{ apiKey: "test" },
+		{ apiKey: "test", ...options },
 	).result();
 	expect(result.stopReason).not.toBe("error");
 	return result;
@@ -151,7 +154,6 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(tools(result).map(call => call.arguments)).toContainEqual({ path: "src/index.ts" });
 	});
 
-	// Finding 4: Retain unmatched recovered calls in mixed deltas
 	it("keeps distinct recovered DSML calls when structured calls are present in same delta", async () => {
 		const result = await response([
 			{
@@ -167,7 +169,6 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(callsByName.read).toBeDefined();
 	});
 
-	// Finding 5: Match structured and recovered calls one-to-one
 	it("matches structured calls one-to-one with recovered calls", async () => {
 		// Two identical recovered calls followed by one structured call
 		// The structured call should suppress exactly one recovered call
@@ -183,7 +184,10 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(tools(result)).toHaveLength(2);
 	});
 
-	// Finding 6: Preserve Kimi streaming order (if we had Kimi tests)
-	// This is harder to test without actual Kimi model, but the provider test
-	// for immediate emission during streaming would verify the fix
+	it("drops recovered calls the request's tool choice forbids", async () => {
+		const deltas: Delta[] = [{ content: `${invocationStart}src/index.ts${invocationEnd}` }];
+		expect(tools(await response(deltas, { toolChoice: "none" }))).toHaveLength(0);
+		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "write" } }))).toHaveLength(0);
+		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "read" } }))).toHaveLength(1);
+	});
 });

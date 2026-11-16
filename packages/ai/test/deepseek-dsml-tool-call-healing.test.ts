@@ -121,20 +121,6 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(healer.drainCompleted()).toEqual([]);
 	});
 
-	it("consumeWithoutCalls strips markup and discards completed calls", () => {
-		const healer = new DsmlToolCallHealer();
-		const clean = healer.consumeWithoutCalls(
-			"Before" +
-				'<｜DSML｜invoke name="read">' +
-				'<｜DSML｜parameter name="path">src/index.ts</｜DSML｜parameter>' +
-				"</｜DSML｜invoke>" +
-				"After",
-		);
-
-		expect(clean).toBe("BeforeAfter");
-		expect(healer.drainCompleted()).toEqual([]);
-	});
-
 	it("marks calls with invalid JSON-typed parameters as incomplete", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
@@ -167,31 +153,6 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(second.drainCompleted().map(call => call.id)).toEqual(["dsml_bbbbbbbb_1"]);
 	});
 
-	it("does not re-emit a call when structured calls suppress an open invocation", () => {
-		const healer = new DsmlToolCallHealer();
-		healer.feed('<｜DSML｜invoke name="read"><｜DSML｜ parameter name="path" string="true">a</parameter>');
-		expect(healer.consumeWithoutCalls("")).toBe("");
-		expect(healer.drainCompleted()).toEqual([]);
-
-		// The closing tag arrives in a later content-only delta; the structured
-		// payload already covered this call, so nothing may be synthesized again.
-		healer.feed("</｜DSML｜ invoke>");
-		expect(healer.drainCompleted()).toEqual([]);
-	});
-
-	it("still recovers the next invocation after a suppressed one", () => {
-		const healer = new DsmlToolCallHealer();
-		healer.feed('<｜DSML｜invoke name="first">');
-		healer.consumeWithoutCalls("");
-		healer.feed(
-			"</｜DSML｜ invoke>" +
-				'<｜DSML｜invoke name="second"><｜DSML｜ parameter name="x" string="true">1</parameter></｜DSML｜ invoke>',
-		);
-
-		const calls = healer.drainCompleted();
-		expect(calls.map(call => call.name)).toEqual(["second"]);
-	});
-
 	it("marks an invocation closed with an open parameter as incomplete", () => {
 		const healer = new DsmlToolCallHealer();
 		expect(healer.feed('<｜DSML｜invoke name="read"><｜DSML｜parameter name="path">secret')).toBe("");
@@ -205,24 +166,6 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(healer.drainCompleted()[0].incomplete).toBeUndefined();
 	});
 
-	it("keeps suppressed parameter bytes hidden until the invocation closes", () => {
-		const healer = new DsmlToolCallHealer();
-		expect(healer.consumeWithoutCalls('<｜DSML｜invoke name="read"><｜DSML｜parameter name="path">sec')).toBe("");
-		expect(healer.feed("ret.txt</｜DSML｜parameter>")).toBe("");
-		expect(healer.feed("</｜DSML｜invoke>Visible")).toBe("Visible");
-		expect(healer.drainCompleted()).toEqual([]);
-	});
-
-	it("preserves suppression when the opening invocation tag is split", () => {
-		const healer = new DsmlToolCallHealer();
-		expect(healer.consumeWithoutCalls("<｜DSML｜inv")).toBe("");
-		expect(healer.feed('oke name="first"></｜DSML｜invoke>')).toBe("");
-		expect(healer.drainCompleted()).toEqual([]);
-		healer.feed('<｜DSML｜invoke name="second"></｜DSML｜invoke>');
-		expect(healer.drainCompleted().map(call => call.name)).toEqual(["second"]);
-	});
-
-	// Finding 2: Reject invalid JSON-typed DSML arguments
 	it("marks an invocation with invalid JSON-typed parameter as incomplete instead of falling back", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
@@ -236,7 +179,6 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(calls[0].incomplete).toBe(true);
 	});
 
-	// Finding 3: Preserve parameter structure errors
 	it("marks an invocation incomplete when a parameter opens before the previous closes", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
@@ -247,9 +189,6 @@ describe("DeepSeek DSML tool-call healing", () => {
 		);
 		const calls = healer.drainCompleted();
 		expect(calls).toHaveLength(1);
-		// Should be marked incomplete due to structural error
 		expect(calls[0].incomplete).toBe(true);
-		// Should have lost the malformed parameters
-		expect(JSON.parse(calls[0].arguments)).toEqual({});
 	});
 });
