@@ -148,6 +148,20 @@ Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packa
   - scalars become text
 - The VM exposes a restricted `process` subset plus `Buffer`, `fetch`, `Blob`, `File`, `Headers`, `Request`, `Response`, `fs`, `require`, and browser-style globals
 - Per-session VM runs are serialized with `runQueued()`
+- The engine is chosen by the `eval.jsRuntime` setting: `bun` (default, described above) or `quickjs` (below). A context created by one engine is reset when the setting switches to the other.
+
+### JavaScript QuickJS sandbox (`eval.jsRuntime: quickjs`)
+
+Implemented in `packages/coding-agent/src/eval/js/quickjs/runtime.ts` and `packages/coding-agent/src/eval/js/quickjs/prelude.txt`, on `quickjs-emscripten-core` with the `@jitl/quickjs-wasmfile-release-sync` variant.
+
+- Cells run in a QuickJS (wasm) context inside the same JS eval worker. The context has only QuickJS intrinsics (JSON, Math, Date, Promise, typed arrays, ...) plus the prelude globals: `tool`, `output`, `display`, `print`, `console`, `sort`, `uniq`, `counter`, `sleep`.
+- There is no `fetch`, `Bun`, `process`, `require`, `Buffer`, filesystem, environment, timer API, or module loader. Static imports and `import()` throw/reject.
+- `tool.<name>(args)` is the only way out. Calls take the same worker → host `tool-call` frame as the Bun runtime and run through `callSessionTool()` with the session's permission, approval, and redaction guards, so they appear as normal tool calls and denials surface as catchable errors in the cell.
+- Values cross the boundary as JSON text, parsed on each side by intrinsics captured before user code runs. The raw host bridge is only reachable from the prelude closure, and `__gjc_set_final_expr__` / `__gjc_import__` are non-writable, non-configurable globals. Guest prototype or `JSON` tampering cannot redirect tool calls or reach host objects, and host error stacks are not copied into the guest.
+- `read`, `write`, `append`, `tree`, `diff`, and `env` are defined but throw an error that names the `tool.*` replacement. `output()` reads through `tool.read`. `sort`, `uniq`, and `counter` run the same host helpers as the Bun prelude on plain data.
+- Limits: a 256 MiB guest heap (`out of memory` is a cell error) and a 512 KiB guest stack (`stack overflow` is a cell error). The cell timeout is enforced in the worker by an interrupt handler (synchronous loops, microtask loops) and a wait timer (pending tool calls, `sleep`). A timed-out cell reports `Command timed out` with `cancelled: true`, and the context and its bindings survive. The host timeout only kills the worker 2s after the cell deadline, as a backstop.
+- A cell that awaits a promise with no tool call or `sleep` in flight fails right away instead of waiting for the timeout.
+- The worker's `close` frame disposes the QuickJS context and runtime; worker termination (reset, abort, owner disposal) frees them with the thread.
 
 ### Python runtime
 
