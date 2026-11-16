@@ -1463,6 +1463,16 @@ function isPromptPreflightCancelledError(error: unknown): boolean {
 	return error instanceof Error && error.name === "PromptPreflightCancelledError";
 }
 
+/**
+ * Preflight identity a shared drain re-reads before claiming a successor batch.
+ * Cancellation flips either half: an abort advances the turn generation and fires
+ * the captured admission signal.
+ */
+interface PromptPreflightIdentity {
+	readonly generation: number;
+	readonly signal: AbortSignal;
+}
+
 /** Result from a handoff operation. */
 export interface HandoffResult {
 	document: string;
@@ -6177,9 +6187,21 @@ export class AgentSession {
 	 * caller — prompt preflight, prompt finalization, and forced recovery — joins it.
 	 * The owner is cleared only after it settles, so a caller that arrives during
 	 * settlement starts the next drain instead of observing a stale promise.
+	 *
+	 * `preflight` is the caller's own cancellation identity, and only that caller
+	 * abandons its claims when it fires; joiners and finalization still drain to
+	 * quiescence so a preserved successor is published exactly once.
 	 */
-	async #flushPendingPromptMessages(): Promise<void> {
+	async #flushPendingPromptMessages(preflight?: PromptPreflightIdentity): Promise<void> {
 		for (;;) {
+			// Re-read cancellation before EVERY claim, not once before the loop. The drain
+			// is unbounded by design (it keeps claiming successor batches until quiescence),
+			// so a cancelled preflight that entered it would keep publishing rows the abort
+			// already disowned, and the abort itself waits on this turn's terminal with no
+			// timeout bound. Throwing here leaves the queued rows untouched for turn
+			// finalization and later drains, exactly like the unresolved rows the failed
+			// path retains: nothing is drained, nothing is discarded.
+			if (preflight) this.#throwIfPromptPreflightCancelled(preflight.generation, preflight.signal);
 			const drain = this.#pendingPromptDrain ?? this.#startPendingPromptDrain();
 			await drain;
 			// Another caller may have started a successor drain while this one settled;
@@ -18086,7 +18108,7 @@ export class AgentSession {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
 			// Retry anything whose previous post-turn persistence failed before the new prompt.
-			await this.#flushPendingPromptMessages();
+			await this.#flushPendingPromptMessages({ generation, signal: preflightSignal });
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
