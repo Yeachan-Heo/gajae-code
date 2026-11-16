@@ -88,7 +88,11 @@ import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
-import { recordUltragoalHumanBlockedAskAnswered } from "../gjc-runtime/ultragoal-runtime";
+import {
+	recordUltragoalHumanBlockedAskAnswered,
+	recordUltragoalHumanBlockedAskReleased,
+	recordUltragoalHumanBlockedAskReserved,
+} from "../gjc-runtime/ultragoal-runtime";
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
@@ -975,13 +979,38 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		humanBlockedAsksInFlight.add(reservation);
 		let release = true;
 		try {
-			const result = await this.#ask(_toolCallId, params, signal, _onUpdate, context);
+			let reserved: boolean;
+			try {
+				reserved = await recordUltragoalHumanBlockedAskReserved({ cwd: this.session.cwd, ...receipt });
+			} catch (error) {
+				throw new ToolError(
+					`Ultragoal ask guard: the single ask for this human-only blocker could not be reserved, so it was not opened: ${errorMessage(error)}`,
+				);
+			}
+			if (!reserved) {
+				throw new ToolError(
+					"Ultragoal ask guard: the single ask for this human-only blocker is already open or was already answered.",
+				);
+			}
+			let result: AgentToolResult<AskToolDetails>;
+			try {
+				result = await this.#ask(_toolCallId, params, signal, _onUpdate, context);
+			} catch (error) {
+				// No answer came back, so hand the admission back. If the release cannot
+				// be recorded the durable reservation keeps the admission closed.
+				try {
+					await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
+				} catch (releaseError) {
+					release = false;
+					logger.warn(`ask: releasing the human-blocked ask reservation failed: ${errorMessage(releaseError)}`);
+				}
+				throw error;
+			}
 			try {
 				await recordUltragoalHumanBlockedAskAnswered({ cwd: this.session.cwd, ...receipt });
 			} catch (error) {
-				// The user already answered, so the answer is returned. The admission
-				// stays closed: without a durable spend row the reservation is kept for
-				// the life of this process instead of letting the same receipt ask again.
+				// The user already answered, so the answer is returned. The durable
+				// reservation keeps the admission closed, including across restarts.
 				release = false;
 				logger.warn(`ask: recording the human-blocked ask answer failed: ${errorMessage(error)}`);
 			}

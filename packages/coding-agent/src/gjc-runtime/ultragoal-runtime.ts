@@ -571,40 +571,93 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 	);
 }
 
+export const HUMAN_BLOCKED_ASK_RESERVED_EVENT = "human_blocked_ask_reserved";
+export const HUMAN_BLOCKED_ASK_RELEASED_EVENT = "human_blocked_ask_released";
 export const HUMAN_BLOCKED_ASK_ANSWERED_EVENT = "human_blocked_ask_answered";
 
-/** Pure: whether the single ask of one `human_blocked` classification is already spent. */
-export function isUltragoalHumanBlockedAskAnswered(
+interface HumanBlockedAskReceipt {
+	cwd: string;
+	sessionId: string;
+	classificationEventId: string;
+}
+
+function latestHumanBlockedAskEvent(
+	ledger: readonly UltragoalLedgerEvent[],
+	classificationEventId: string,
+): string | undefined {
+	for (let index = ledger.length - 1; index >= 0; index--) {
+		const event = ledger[index];
+		if (event.classificationEventId !== classificationEventId) continue;
+		if (
+			event.event === HUMAN_BLOCKED_ASK_RESERVED_EVENT ||
+			event.event === HUMAN_BLOCKED_ASK_RELEASED_EVENT ||
+			event.event === HUMAN_BLOCKED_ASK_ANSWERED_EVENT
+		) {
+			return event.event;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Pure: whether the single ask of one `human_blocked` classification is spent.
+ * A reservation spends it from the moment the question opens; only a release
+ * (the question ended without an answer) hands it back.
+ */
+export function isUltragoalHumanBlockedAskSpent(
 	ledger: readonly UltragoalLedgerEvent[],
 	classificationEventId: string,
 ): boolean {
-	return ledger.some(
-		event =>
-			event.event === HUMAN_BLOCKED_ASK_ANSWERED_EVENT && event.classificationEventId === classificationEventId,
+	const latest = latestHumanBlockedAskEvent(ledger, classificationEventId);
+	return latest !== undefined && latest !== HUMAN_BLOCKED_ASK_RELEASED_EVENT;
+}
+
+async function appendHumanBlockedAskEvent<T>(
+	input: HumanBlockedAskReceipt,
+	decide: (ledger: readonly UltragoalLedgerEvent[]) => { event: string; result: T } | { result: T },
+): Promise<T> {
+	const { cwd, sessionId, classificationEventId } = input;
+	return withWorkflowStateLock(
+		getUltragoalPaths(cwd, sessionId).ledgerPath,
+		async () => {
+			const decision = decide(await readUltragoalLedger(cwd, sessionId));
+			if ("event" in decision) await appendLedger(cwd, { event: decision.event, classificationEventId }, sessionId);
+			return decision.result;
+		},
+		{ cwd },
 	);
 }
 
 /**
- * Spend the single `ask` a verified human-only blocker admits. Recorded once the
- * question returned an answer, bound to the `human_blocked` classification it
- * was admitted for, so neither that classification nor a re-recorded verdict on
- * it can open `ask` again. The row carries no `goalId`, which keeps it out of
- * every completion-receipt freshness base.
+ * Durably reserve the single `ask` a verified human-only blocker admits, before
+ * the question opens. Returns `false` when the admission is already spent. The
+ * reservation survives a restart, so an answer that could not be recorded still
+ * cannot be asked again. Rows carry no `goalId`, which keeps them out of every
+ * completion-receipt freshness base.
  */
-export async function recordUltragoalHumanBlockedAskAnswered(input: {
-	cwd: string;
-	sessionId: string;
-	classificationEventId: string;
-}): Promise<void> {
-	const { cwd, sessionId, classificationEventId } = input;
-	await withWorkflowStateLock(
-		getUltragoalPaths(cwd, sessionId).ledgerPath,
-		async () => {
-			const ledger = await readUltragoalLedger(cwd, sessionId);
-			if (isUltragoalHumanBlockedAskAnswered(ledger, classificationEventId)) return;
-			await appendLedger(cwd, { event: HUMAN_BLOCKED_ASK_ANSWERED_EVENT, classificationEventId }, sessionId);
-		},
-		{ cwd },
+export function recordUltragoalHumanBlockedAskReserved(input: HumanBlockedAskReceipt): Promise<boolean> {
+	return appendHumanBlockedAskEvent(input, ledger =>
+		isUltragoalHumanBlockedAskSpent(ledger, input.classificationEventId)
+			? { result: false }
+			: { event: HUMAN_BLOCKED_ASK_RESERVED_EVENT, result: true },
+	);
+}
+
+/** Hand a reservation back after its question ended without an answer. */
+export function recordUltragoalHumanBlockedAskReleased(input: HumanBlockedAskReceipt): Promise<void> {
+	return appendHumanBlockedAskEvent(input, ledger =>
+		latestHumanBlockedAskEvent(ledger, input.classificationEventId) === HUMAN_BLOCKED_ASK_RESERVED_EVENT
+			? { event: HUMAN_BLOCKED_ASK_RELEASED_EVENT, result: undefined }
+			: { result: undefined },
+	);
+}
+
+/** Record that the reserved question returned an answer. */
+export function recordUltragoalHumanBlockedAskAnswered(input: HumanBlockedAskReceipt): Promise<void> {
+	return appendHumanBlockedAskEvent(input, ledger =>
+		latestHumanBlockedAskEvent(ledger, input.classificationEventId) === HUMAN_BLOCKED_ASK_ANSWERED_EVENT
+			? { result: undefined }
+			: { event: HUMAN_BLOCKED_ASK_ANSWERED_EVENT, result: undefined },
 	);
 }
 

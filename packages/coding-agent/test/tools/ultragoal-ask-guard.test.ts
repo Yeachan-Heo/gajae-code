@@ -764,6 +764,58 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(select).toHaveBeenCalledTimes(1);
 	});
 
+	it("keeps the admission spent on disk when the answer cannot be recorded", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const ledgerPath = getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath;
+		let ledgerWhileOpen = "";
+		// Snapshot the ledger as it stands while the question is open, then break it
+		// so the answer row cannot be written.
+		const select = vi.fn(async () => {
+			ledgerWhileOpen = await Bun.file(ledgerPath).text();
+			await fs.rm(ledgerPath);
+			await fs.mkdir(ledgerPath);
+			return "Vault";
+		});
+
+		await askTool(cwd).execute("call-1", QUESTION, undefined, undefined, createContext(select));
+		await fs.rm(ledgerPath, { recursive: true });
+		await Bun.write(ledgerPath, ledgerWhileOpen);
+
+		// What a restarted process sees: no answer row, but the admission is spent.
+		expect(await answeredAskRows(cwd)).toBe(0);
+		const pause = await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID });
+		expect(pause.askSpent).toBe(true);
+	});
+
+	it("refuses to open the question when the reservation cannot be recorded", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const ledgerPath = getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath;
+		const select = vi.fn(async () => "Vault");
+		const tool = askTool(cwd);
+		// The guard reads the ledger first; break only the write that follows it.
+		const ledgerText = await Bun.file(ledgerPath).text();
+		const chmod = await fs.stat(ledgerPath);
+		await fs.chmod(ledgerPath, 0o444);
+		try {
+			await expect(tool.execute("call-1", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow(
+				/could not be reserved/,
+			);
+		} finally {
+			await fs.chmod(ledgerPath, chmod.mode);
+		}
+		expect(select).not.toHaveBeenCalled();
+		expect(await Bun.file(ledgerPath).text()).toBe(ledgerText);
+
+		await tool.execute("call-2", QUESTION, undefined, undefined, createContext(select));
+		expect(select).toHaveBeenCalledTimes(1);
+	});
+
 	it("spends the receipt through the session tool wrapper as well", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
