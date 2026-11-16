@@ -174,6 +174,43 @@ async function startAndConnect(harness: ReturnType<typeof createHarness>): Promi
 	return connectFrames(harness.endpoint());
 }
 
+test("loss of a real writer's admitted ownership prevents SDK transport publication", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-owner-refusal-"));
+	tempDirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	const id = manager.getSessionId();
+	await manager.flush();
+	const membership = manager.getOwnerMembership();
+	const evidence = manager.getSessionOwnerEvidence();
+	if (!membership || !evidence) throw new Error("Expected the real writer's admitted membership");
+	const ownerFile = evidence.authorityKey;
+	const foreign = "foreign owner authority must not be repaired";
+	await Bun.write(ownerFile, foreign);
+	const handlers = new Map<string, Handler>();
+	createNotificationsExtension({
+		on: (event: string, handler: Handler) => handlers.set(event, handler),
+		registerCommand: () => {},
+	} as never);
+	const ctx = { cwd, sessionManager: manager } as never;
+	const start = vi.spyOn(SessionSdkHost.prototype, "start");
+	const admission = vi.spyOn(manager, "flush");
+	try {
+		await Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx)).catch(() => {});
+		expect(admission).not.toHaveBeenCalled();
+		expect(start).not.toHaveBeenCalled();
+		expect(manager.getOwnerMembership()).toBe(membership);
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${id}.json`))).toBe(false);
+		expect(await Bun.file(ownerFile).text()).toBe(foreign);
+	} finally {
+		admission.mockRestore();
+		start.mockRestore();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		await expect(manager.close()).rejects.toMatchObject({ code: "participation_lost" });
+		expect(manager.getOwnerMembership()).toBe(membership);
+		expect(await Bun.file(ownerFile).text()).toBe(foreign);
+	}
+});
+
 test("session_switch publishes successor SDK authority only after AgentSession restore commits", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-post-commit-switch-"));
 	const agentDir = path.join(cwd, ".gjc", "agent");
@@ -187,6 +224,8 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 	await targetSessionManager.ensureOnDisk();
 	const targetSessionFile = targetSessionManager.getSessionFile();
 	const targetSessionId = targetSessionManager.getSessionId();
+	const targetAuthorityKey = targetSessionManager.getSessionOwnerEvidence()?.authorityKey;
+	if (!targetAuthorityKey) throw new Error("Expected admitted target session");
 	await targetSessionManager.close();
 	if (!targetSessionFile) throw new Error("Expected persisted target session");
 
@@ -209,6 +248,11 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 			if (event.type !== "session_switch") return;
 			postCommitObserved = true;
 			expect(currentSessionManager.getSessionId()).toBe(targetSessionId);
+			expect(currentSessionManager.getSessionOwnerEvidence()).toMatchObject({
+				policy: { kind: "cooperative" },
+				memberKind: "cooperative",
+				authorityKey: targetAuthorityKey,
+			});
 			expect(session?.agent.state.messages).toEqual(
 				expect.arrayContaining([expect.objectContaining({ role: "user", content: "restored target message" })]),
 			);

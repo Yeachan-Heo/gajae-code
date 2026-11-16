@@ -75,6 +75,8 @@ import {
 import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
 import type { BtwTextExchange } from "../../session/btw-contract";
 import type { ClientBridge } from "../../session/client-bridge";
+import { revalidateOwnerMembership } from "../../session/owner-group";
+import { SessionManager } from "../../session/session-manager";
 import {
 	createSessionWorkLease,
 	type SessionWorkLease,
@@ -9211,6 +9213,17 @@ export function createNotificationsExtension(
 			} catch {}
 		};
 		try {
+			// Real writers must hold independently admitted ownership before this
+			// transport advertises them. Register the startup promise first so a
+			// concurrent start joins this admission instead of publishing a rival.
+			// Read-only structural extension contexts do not own a transcript writer.
+			if (ctx.sessionManager instanceof SessionManager && ctx.sessionManager.isPersisted()) {
+				if (!ctx.sessionManager.getOwnerMembership()) await ctx.sessionManager.flush();
+				const membership = ctx.sessionManager.getOwnerMembership();
+				if (!membership) throw new Error("SDK transport requires admitted transcript ownership.");
+				await revalidateOwnerMembership(membership);
+				throwIfLifecycleStopped();
+			}
 			server.onSdkFrame((err, inbound) => {
 				if (err) {
 					if (inbound?.connectionId) sendMalformed(inbound.connectionId, err.message);
