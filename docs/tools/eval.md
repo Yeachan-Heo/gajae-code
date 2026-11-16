@@ -13,8 +13,9 @@
   - `packages/coding-agent/src/eval/backend.ts` — backend execution contract
   - `packages/coding-agent/src/eval/js/index.ts` — JS backend adapter
   - `packages/coding-agent/src/eval/js/executor.ts` — JS execution + output sink
-  - `packages/coding-agent/src/eval/js/context-manager.ts` — persistent VM contexts, prelude, tool bridge
-  - `packages/coding-agent/src/eval/js/shared/prelude.txt` — JS global helpers
+  - `packages/coding-agent/src/eval/js/context-manager.ts` — persistent JS worker contexts, tool bridge
+  - `packages/coding-agent/src/eval/js/quickjs/runtime.ts` — QuickJS sandbox: limits, host bridge, final-value capture
+  - `packages/coding-agent/src/eval/js/quickjs/prelude.txt` — JS global helpers inside the sandbox
   - `packages/coding-agent/src/eval/py/index.ts` — Python backend adapter
   - `packages/coding-agent/src/eval/py/executor.ts` — kernel session retention, reset, cleanup
   - `packages/coding-agent/src/eval/py/kernel.ts` — runner subprocess lifecycle, NDJSON framing, interrupt/shutdown
@@ -42,11 +43,11 @@ Each `EvalCellInput` (from `evalCellSchema` in `packages/coding-agent/src/tools/
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `language` | `"py" \| "js"` | Yes | Backend selector. `"py"` maps to the persistent Python subprocess runner (`python` backend); `"js"` maps to the persistent JavaScript VM. |
+| `language` | `"py" \| "js"` | Yes | Backend selector. `"py"` maps to the persistent Python subprocess runner (`python` backend); `"js"` maps to the persistent JavaScript (QuickJS) sandbox. |
 | `code` | `string` | Yes | Cell body, verbatim. JSON-encoded — embed newlines, quotes, and indentation directly; no fences, no headers. |
 | `title` | `string` | No | Short label rendered in the transcript (e.g. `"imports"`, `"load config"`). |
 | `timeout` | `integer` | No | Per-cell timeout in seconds, clamped to `1..600`. Defaults to 30 when omitted. |
-| `reset` | `boolean` | No | Wipe this cell's language kernel before running. Reset is per-language: a `py` cell's reset does not touch the JS VM and vice versa. Defaults to `false`. |
+| `reset` | `boolean` | No | Wipe this cell's language kernel before running. Reset is per-language: a `py` cell's reset does not touch the JS sandbox and vice versa. Defaults to `false`. |
 
 Minimal example matching the live schema:
 
@@ -124,43 +125,34 @@ Side-channel artifacts:
 Backend choice is **explicit per cell** — there is no auto-detection.
 
 - `language: "py"` → Python (subprocess runner) backend
-- `language: "js"` → JavaScript VM backend
+- `language: "js"` → JavaScript QuickJS sandbox backend
 
 If the requested backend is disabled or unavailable, the tool throws `ToolError` for that cell. The caller chooses; the tool does not silently substitute.
 
-### JavaScript runtime
+### JavaScript runtime (QuickJS sandbox)
 
-Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packages/coding-agent/src/eval/js/shared/prelude.txt`.
+JavaScript cells have exactly one runtime: a QuickJS (wasm) sandbox, implemented in `packages/coding-agent/src/eval/js/quickjs/runtime.ts` and `packages/coding-agent/src/eval/js/quickjs/prelude.txt` on `quickjs-emscripten-core` with the `@jitl/quickjs-wasmfile-release-sync` variant. There is no Bun/Node execution path and no setting that selects one; `eval.js` only turns the backend on or off.
 
-- Persistent `vm.Context` instances keyed by `js:${sessionId}` in the `sessions` map of `context-manager.ts`
-- `reset: true` calls `resetVmContext(sessionKey)` before the cell executes
-- Top-level `await` and bare `return` are supported by wrapping code in an async IIFE when `wrapCode()` sees `await` or `return`
-- Top-level static `import ... from ...` and dynamic `import(...)` calls are routed through `rewriteImports()`, which sends them via `__gjc_import__` so the specifier resolves against the session cwd
-- Module cache is busted for **local** imports between cells so edits to source files are picked up without restarting the runtime. `__gjc_import__` deletes `require.cache[absPath]` before re-importing whenever the original specifier is a filesystem path: relative (`./x`, `../x`, `.`, `..`), POSIX-absolute (`/...`), home-prefixed (`~/...`), or Windows drive-letter (`C:\...` / `C:/...`). Bare specifiers (`react`, `lodash/x`) and URL/scheme specifiers (`node:fs`, `file://...`, `https://...`) are left in cache so package identity stays stable across cells. The cache-bust only fires when the resolved target is an absolute path — unresolved bare-package fallbacks (`resolveImportSpecifier()` returning the original specifier) skip it.
-- The prelude installs globals:
-  - `display`, `print`
-  - `read`, `write`, `append`, `sort`, `uniq`, `counter`, `diff`, `tree`, `env`, `output`
-  - `tool.<name>(args)` proxy for arbitrary session tool calls
-- JS helpers are async because they cross the VM/tool boundary
+- One QuickJS context per session, keyed by `js:${sessionId}` in the `sessions` map of `context-manager.ts`. It lives inside a dedicated Bun Worker (`worker-entry.ts` → `worker-core.ts`) so a wedged cell can still be killed by terminating the thread.
+- `reset: true` calls `resetVmContext(sessionKey)` before the cell executes; per-session runs are serialized with `runQueued()`.
+- `wrapCode()` (`shared/rewrite-imports.ts`) strips TypeScript syntax, wraps cells that use top-level `await`/`return` in an async IIFE, and rewrites the final expression (or top-level `return`) into a `__gjc_set_final_expr__` call. The final value is adopted like `await` (thenables are followed once) and then displayed.
+- Static `import ... from ...` and `import()` are rewritten to `__gjc_import__`, which throws `import of "<specifier>" is not available in the QuickJS sandbox`. Native `import()` built at runtime (through `eval`/`Function`) rejects because QuickJS has no module loader.
+- The context has only QuickJS intrinsics (JSON, Math, Date, Promise, Map/Set, typed arrays, regex, ...) plus the prelude globals. There is no `fetch`, `Bun`, `process`, `require`, `Buffer`, `fs`, environment, `setInterval`, or module loader.
+- Prelude globals:
+  - `display`, `print`, `console.{log,info,warn,error,debug}` (a pure subset of `util.inspect` formatting)
+  - `tool.<name>(args)` and `output(...ids)`; `output()` reads `agent://<id>` through `tool.read`
+  - `read(path, { offset, limit })` and `write(path, content)`, thin wrappers over `tool.read({ path: "<path>:raw" })` (line windows cut in the sandbox) and `tool.write`; `write` accepts string content only
+  - `sort`, `uniq`, `counter`: the shared host text helpers (`shared/helpers.ts`), called with plain data only
+  - `sleep(ms)`, `setTimeout(fn, ms, ...args)`, `clearTimeout(id)`: timers ride on the host sleep and end with the cell, so a timer that has not fired when the cell finishes never runs
+  - `append`, `tree`, `diff`, `env` are defined but throw an error that names the `tool.*` replacement
+- `tool.<name>(args)` is the only way out. Calls take the worker → host `tool-call` frame and run through `callSessionTool()` with the session's permission, approval, and redaction guards, so they appear as normal tool calls and denials surface as catchable errors in the cell. A tool error the cell rethrows unchanged fails the cell with the original host error, so designed-error provenance survives.
+- Values cross the boundary as JSON text, parsed on each side by intrinsics captured before user code runs. The raw host bridge is only reachable from the prelude closure, and `__gjc_set_final_expr__` / `__gjc_import__` are non-writable, non-configurable globals. Guest prototype or `JSON` tampering cannot redirect tool calls or reach host objects, and host error stacks are not copied into the guest.
 - `display(value)` behavior:
   - plain objects/arrays become JSON outputs
-  - `{ type: "image", data, mimeType }` becomes an image output
-  - scalars become text
-- The VM exposes a restricted `process` subset plus `Buffer`, `fetch`, `Blob`, `File`, `Headers`, `Request`, `Response`, `fs`, `require`, and browser-style globals
-- Per-session VM runs are serialized with `runQueued()`
-- The engine is chosen by the `eval.jsRuntime` setting: `bun` (default, described above) or `quickjs` (below). A context created by one engine is reset when the setting switches to the other.
-
-### JavaScript QuickJS sandbox (`eval.jsRuntime: quickjs`)
-
-Implemented in `packages/coding-agent/src/eval/js/quickjs/runtime.ts` and `packages/coding-agent/src/eval/js/quickjs/prelude.txt`, on `quickjs-emscripten-core` with the `@jitl/quickjs-wasmfile-release-sync` variant.
-
-- Cells run in a QuickJS (wasm) context inside the same JS eval worker. The context has only QuickJS intrinsics (JSON, Math, Date, Promise, typed arrays, ...) plus the prelude globals: `tool`, `output`, `display`, `print`, `console`, `sort`, `uniq`, `counter`, `sleep`.
-- There is no `fetch`, `Bun`, `process`, `require`, `Buffer`, filesystem, environment, timer API, or module loader. Static imports and `import()` throw/reject.
-- `tool.<name>(args)` is the only way out. Calls take the same worker → host `tool-call` frame as the Bun runtime and run through `callSessionTool()` with the session's permission, approval, and redaction guards, so they appear as normal tool calls and denials surface as catchable errors in the cell.
-- Values cross the boundary as JSON text, parsed on each side by intrinsics captured before user code runs. The raw host bridge is only reachable from the prelude closure, and `__gjc_set_final_expr__` / `__gjc_import__` are non-writable, non-configurable globals. Guest prototype or `JSON` tampering cannot redirect tool calls or reach host objects, and host error stacks are not copied into the guest.
-- `read`, `write`, `append`, `tree`, `diff`, and `env` are defined but throw an error that names the `tool.*` replacement. `output()` reads through `tool.read`. `sort`, `uniq`, and `counter` run the same host helpers as the Bun prelude on plain data.
+  - `{ type: "image", data, mimeType }` becomes an image output (`data`: base64 string, `Uint8Array`/typed array, or `ArrayBuffer`)
+  - scalars, and values that cannot be serialized (cycles), become text
 - Limits: a 256 MiB guest heap (`out of memory` is a cell error) and a 512 KiB guest stack (`stack overflow` is a cell error). The cell timeout is enforced in the worker by an interrupt handler (synchronous loops, microtask loops) and a wait timer (pending tool calls, `sleep`). A timed-out cell reports `Command timed out` with `cancelled: true`, and the context and its bindings survive. The host timeout only kills the worker 2s after the cell deadline, as a backstop.
-- A cell that awaits a promise with no tool call or `sleep` in flight fails right away instead of waiting for the timeout.
+- A cell that awaits a promise with no tool call or timer in flight fails right away instead of waiting for the timeout.
 - The worker's `close` frame disposes the QuickJS context and runtime; worker termination (reset, abort, owner disposal) frees them with the thread.
 
 ### Python runtime
@@ -196,11 +188,12 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 ## Side Effects
 
 - Filesystem
-  - JS/Python prelude helpers can read, write, append, diff, and traverse files under the session cwd or absolute paths.
+  - Python prelude helpers can read, write, append, diff, and traverse files under the session cwd or absolute paths.
+  - JS cells have no filesystem access of their own; `read`/`write` and every other file effect go through `tool.*` calls.
   - Output may spill to an artifact file via `OutputSink`.
 - Network
   - Python backend speaks NDJSON to a local `python3` subprocess over stdin/stdout (no network).
-  - JS runtime exposes `fetch` and `tool.<name>()`; those tools may perform additional network I/O.
+  - JS cells have no `fetch`; network I/O happens only inside the tools they call through `tool.<name>()`.
 - Subprocesses / native bindings
   - Python availability check runs `<python> -c ...`.
   - Python backend spawns one `python -u runner.py` subprocess per kernel; cancellation sends `SIGINT`. Details in `docs/python-repl.md`.
@@ -208,7 +201,7 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
   - `session.assertEvalExecutionAllowed?.()` can block execution.
   - `session.trackEvalExecution?.(...)` can register cancellable eval work.
   - `session.getSessionFile?.()` and `session.getEvalKernelOwnerId?.()` influence kernel reuse and artifact lookup.
-  - JS VM contexts persist in the `sessions` map of `context-manager.ts` across eval calls until reset/disposal.
+  - JS QuickJS contexts persist in the `sessions` map of `context-manager.ts` across eval calls until reset/disposal.
   - Python retained kernels persist in the executor's `sessions` map until reset, owner cleanup (`disposeKernelSessionsByOwner()`), or process shutdown (`disposeAllKernelSessions()`). There is no idle eviction or session cap.
 - User-visible prompts / interactive UI
   - none; stdin requests are rejected programmatically
@@ -250,9 +243,9 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 - Backend selection is now strictly explicit per cell: `language` must be `"py"` or `"js"`. The previous `*** Cell` header parser, the `eval.lark` constrained grammar, and the sniffer-based fallback have all been removed.
 - `EvalTool.customFormat` no longer exists. Tool calls flow through the standard JSON schema; there is no Lark-constrained sampling path.
 - `tool.<name>()` exists in JS, and in Python when the host tool bridge starts. Python `output(...)` also goes through the bridge; the other Python prelude helpers work on the filesystem directly.
-- JS helper paths reject protocol URIs (`://`) in `resolvePath()`; the JS prelude is filesystem-only unless the code calls `tool.read(...)` or another tool explicitly.
+- JS `read(path)` goes through `tool.read`, so internal URIs and URLs follow the read tool's own rules and permissions.
 - Python helper `output(...)` reads each id through the tool bridge, as the JS helper does, with `tool.read({"path": "agent://<id>:raw"})`, so it no longer depends on `PI_ARTIFACTS_DIR` / `PI_SESSION_FILE`. `offset`/`limit`, `query`, and `format` (`raw`, `stripped`, `json`) are applied in Python to the full raw output. It raises `RuntimeError` when the tool bridge is unavailable.
 - `display()` can produce text and structured outputs from the same value; the renderer prefers markdown over `text/plain` when both exist.
-- JS static imports are rewritten only at top level. Nested imports stay invalid and surface normal JS syntax/runtime errors.
+- JS static imports are rewritten only at top level, and the rewritten import throws in the sandbox. Nested imports stay invalid and surface normal JS syntax/runtime errors.
 - `EvalTool` is `concurrency = "exclusive"`, so eval calls do not overlap within a session.
 - The tool description shown to the model is templated by backend availability (`getEvalToolDescription()`); if Python is unavailable, the prompt omits Python-specific instructions.
