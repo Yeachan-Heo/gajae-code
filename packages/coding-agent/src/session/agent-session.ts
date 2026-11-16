@@ -1473,6 +1473,18 @@ interface PromptPreflightIdentity {
 	readonly signal: AbortSignal;
 }
 
+/**
+ * Retained owner of the pending-message drain. Concurrent callers join `promise` instead
+ * of traversing the shared queues themselves. `preflights` collects the cancellation
+ * identity of every prompt preflight publishing through this owner: the owner re-reads
+ * all of them before each claimed batch, so one cancelled preflight cannot take
+ * ownership of rows the abort already disowned.
+ */
+interface PendingPromptDrain {
+	promise: Promise<void>;
+	preflights: PromptPreflightIdentity[];
+}
+
 /** Result from a handoff operation. */
 export interface HandoffResult {
 	document: string;
@@ -4605,10 +4617,10 @@ export class AgentSession {
 	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<PendingExecutionMessage<PythonExecutionMessage>> = [];
 	/**
-	 * Retained owner of the pending-message drain. Concurrent callers join this promise
+	 * Retained owner of the pending-message drain. Concurrent callers join this owner
 	 * instead of traversing the shared queues themselves.
 	 */
-	#pendingPromptDrain: Promise<void> | undefined;
+	#pendingPromptDrain: PendingPromptDrain | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -5753,6 +5765,12 @@ export class AgentSession {
 		}
 	}
 
+	#throwIfPromptPreflightDrainCancelled(preflights: readonly PromptPreflightIdentity[]): void {
+		for (const preflight of preflights) {
+			this.#throwIfPromptPreflightCancelled(preflight.generation, preflight.signal);
+		}
+	}
+
 	async #awaitPromptPreflight<T>(generation: number, signal: AbortSignal, pending: Promise<T>): Promise<T> {
 		this.#throwIfPromptPreflightCancelled(generation, signal);
 		const cancellation = Promise.withResolvers<never>();
@@ -6194,9 +6212,13 @@ export class AgentSession {
 	 * The owner is cleared only after it settles, so a caller that arrives during
 	 * settlement starts the next drain instead of observing a stale promise.
 	 *
-	 * `preflight` is the caller's own cancellation identity, and only that caller
-	 * abandons its claims when it fires; joiners and finalization still drain to
-	 * quiescence so a preserved successor is published exactly once.
+	 * `preflight` is the caller's own cancellation identity. Every preflight publishing
+	 * through the owner attaches it, and the owner re-reads all attached identities
+	 * before each claimed batch, so a cancellation that lands while the drain awaits a
+	 * publication stops the very next claim — including a claim of a different kind in
+	 * the same drain. A cancelled preflight unwinds as a cancellation; joiners and
+	 * finalization still drain to quiescence so a preserved successor is published
+	 * exactly once.
 	 */
 	async #flushPendingPromptMessages(preflight?: PromptPreflightIdentity): Promise<void> {
 		for (;;) {
@@ -6208,11 +6230,22 @@ export class AgentSession {
 			// finalization and later drains, exactly like the unresolved rows the failed
 			// path retains: nothing is drained, nothing is discarded.
 			if (preflight) this.#throwIfPromptPreflightCancelled(preflight.generation, preflight.signal);
-			const drain = this.#pendingPromptDrain ?? this.#startPendingPromptDrain();
-			await drain;
+			const owner = this.#pendingPromptDrain;
+			const drain = owner?.promise ?? this.#startPendingPromptDrain(preflight);
+			if (owner && preflight && !owner.preflights.includes(preflight)) owner.preflights.push(preflight);
+			try {
+				await drain;
+			} catch (error) {
+				if (!isPromptPreflightCancelledError(error)) throw error;
+				// The shared owner stopped claiming because a preflight attached to it was
+				// cancelled. Only that preflight unwinds as a cancellation; every other caller
+				// still owes the successor batches behind it a publication, so it joins the next
+				// drain below instead of inheriting someone else's disowned claim.
+				if (preflight && this.#isPromptPreflightCancelled(preflight.generation, preflight.signal)) throw error;
+			}
 			// Another caller may have started a successor drain while this one settled;
 			// it owns entries queued after this batch, so join that one too.
-			if (this.#pendingPromptDrain && this.#pendingPromptDrain !== drain) continue;
+			if (this.#pendingPromptDrain && this.#pendingPromptDrain.promise !== drain) continue;
 			// The owner's settlement clears #pendingPromptDrain before joiners resume, so a
 			// row queued while it awaited would otherwise be left for the next prompt and the
 			// successor invocation would start without it. A successful drain consumed its
@@ -6224,25 +6257,32 @@ export class AgentSession {
 		}
 	}
 
-	#startPendingPromptDrain(): Promise<void> {
-		let drain: Promise<void>;
-		drain = this.#drainPendingPromptMessages().finally(() => {
-			if (this.#pendingPromptDrain === drain) this.#pendingPromptDrain = undefined;
+	#startPendingPromptDrain(preflight?: PromptPreflightIdentity): Promise<void> {
+		// A fresh array per owner identifies the owner too, so the settlement callback needs
+		// no reference to the object it is clearing.
+		const preflights: PromptPreflightIdentity[] = preflight ? [preflight] : [];
+		const promise = this.#drainPendingPromptMessages(preflights).finally(() => {
+			if (this.#pendingPromptDrain?.preflights === preflights) this.#pendingPromptDrain = undefined;
 		});
-		this.#pendingPromptDrain = drain;
-		return drain;
+		this.#pendingPromptDrain = { promise, preflights };
+		return promise;
 	}
 
-	async #drainPendingPromptMessages(): Promise<void> {
+	async #drainPendingPromptMessages(preflights: readonly PromptPreflightIdentity[]): Promise<void> {
 		const errors: unknown[] = [];
 		try {
-			await this.#flushPendingBashMessages();
+			await this.#flushPendingBashMessages(preflights);
 		} catch (error) {
+			// A cancellation is the owner's whole reason to stop, not a failed batch: it must
+			// not be merged into the aggregate below, which other callers treat as a real
+			// publication failure, and no later kind may be claimed for the cancelled preflight.
+			if (isPromptPreflightCancelledError(error)) throw error;
 			errors.push(error);
 		}
 		try {
-			await this.#flushPendingPythonMessages();
+			await this.#flushPendingPythonMessages(preflights);
 		} catch (error) {
+			if (isPromptPreflightCancelledError(error)) throw error;
 			errors.push(error);
 		}
 		try {
@@ -32061,8 +32101,8 @@ export class AgentSession {
 	 * Flush pending bash messages to agent state and session.
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
-	async #flushPendingBashMessages(): Promise<void> {
-		await this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
+	async #flushPendingBashMessages(preflights: readonly PromptPreflightIdentity[]): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash", preflights);
 	}
 
 	// =========================================================================
@@ -32297,18 +32337,25 @@ export class AgentSession {
 	/**
 	 * Flush pending Python messages to agent state and session.
 	 */
-	async #flushPendingPythonMessages(): Promise<void> {
-		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
+	async #flushPendingPythonMessages(preflights: readonly PromptPreflightIdentity[]): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python", preflights);
 	}
 
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
 		pendingMessages: Array<PendingExecutionMessage<T>>,
 		kind: "bash" | "python",
+		preflights: readonly PromptPreflightIdentity[],
 	): Promise<void> {
 		// The batch belongs to the transcript that was active when it was taken. A session
 		// switch rotates the same manager and clears these queues, so a batch survivor that
 		// outlived it must be dropped rather than published into the successor.
 		const batchOrigin = this.#capturePublicationOrigin();
+		if (pendingMessages.length === 0) return;
+		// Re-read cancellation at the claim itself, not only once per drain invocation: one
+		// drain claims the next kind after awaiting the previous kind's publication, so a
+		// preflight cancelled during that await would otherwise take ownership of rows the
+		// abort already disowned and hold its live token while publishing them.
+		this.#throwIfPromptPreflightDrainCancelled(preflights);
 		// Take exactly the entries queued now. Anything appended while this drain awaits
 		// belongs to a later batch and must stay behind the entries retained here; a
 		// length-indexed splice at the end would drop those successors.
