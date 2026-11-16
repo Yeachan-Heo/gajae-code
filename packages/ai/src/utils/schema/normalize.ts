@@ -595,10 +595,27 @@ function collapseMixedTypeCombinerVariants(schema: JsonObject, combiner: "anyOf"
 
 	const nextSchema = copySchemaWithout(schema, combiner);
 	const nonNullTypes = variantTypes.filter(t => t !== "null");
-	nextSchema.type = nonNullTypes[0] ?? variantTypes[0];
+	const chosenType = nonNullTypes[0] ?? variantTypes[0];
+	nextSchema.type = chosenType;
+
+	// Only apply fields valid for the chosen type. Each variant was validated above
+	// to have only keys allowed for its own type, but merged fields may include keys
+	// from different variants. We must filter to only keys allowed for chosenType
+	// (prefer array when any variant is array per existing test semantics).
+	const allowedKeysForChosenType = CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS[chosenType];
+	if (!allowedKeysForChosenType) {
+		return schema;
+	}
+
 	for (const key in mergedVariantFields) {
 		if (!Object.hasOwn(mergedVariantFields, key)) continue;
 		const value = mergedVariantFields[key];
+
+		// Only apply fields valid for the chosen type or shared across all types
+		if (!Object.hasOwn(allowedKeysForChosenType, key) && !Object.hasOwn(CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS, key)) {
+			continue;
+		}
+
 		const existingValue = Object.hasOwn(nextSchema, key) ? nextSchema[key] : undefined;
 		if (existingValue !== undefined && !areJsonValuesEqual(existingValue, value)) {
 			return schema;
