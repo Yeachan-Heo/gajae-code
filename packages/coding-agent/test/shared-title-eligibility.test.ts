@@ -1215,10 +1215,16 @@ describe("shared publication admission split", () => {
 		// Captured synchronously when the successor run is entered. A result that arrived
 		// while the joined drain was awaiting must already be in agent state, in order.
 		let enteredCommands: string[] | undefined;
+		let durableAtEntry: string | undefined;
 		const promptSpy = vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {
 			enteredCommands = f.session.agent.state.messages.flatMap(message =>
 				message.role === "bashExecution" ? [message.command] : [],
 			);
+			// The ordering claim is about the moment the successor run starts, not about the
+			// settled transcript: read the durable order here, while the drain that fed it has
+			// already settled and the successor prompt has not appended anything of its own.
+			await f.manager.flush();
+			durableAtEntry = await Bun.file(f.file).text();
 		});
 
 		const successor = f.session.prompt("successor").catch((error: unknown) => error);
@@ -1235,10 +1241,86 @@ describe("shared publication admission split", () => {
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		// The successor invocation must not start while its result is still queued.
 		expect(enteredCommands).toEqual(["echo first-batch", "echo second-batch"]);
+		if (durableAtEntry === undefined) throw new Error("durable transcript was not captured at prompt entry");
+		expect(durableAtEntry.indexOf("first batch output")).toBeGreaterThanOrEqual(0);
+		expect(durableAtEntry.indexOf("second batch output")).toBeGreaterThan(
+			durableAtEntry.indexOf("first batch output"),
+		);
 		await f.session.awaitSessionSettlement();
 		await f.manager.flush();
 		const durable = await Bun.file(f.file).text();
 		expect(durable.indexOf("first batch output")).toBeLessThan(durable.indexOf("second batch output"));
+	});
+
+	it("stops a cancelled preflight from claiming successor batches and preserves them for finalization", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo first-batch", shellResult("first batch output"));
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const firstEntered = Promise.withResolvers<void>();
+		const firstGate = Promise.withResolvers<void>();
+		const successorEntered = Promise.withResolvers<void>();
+		const successorGate = Promise.withResolvers<void>();
+		const publications: string[] = [];
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution") {
+				publications.push(message.command);
+				if (message.command === "echo first-batch") {
+					firstEntered.resolve();
+					await firstGate.promise;
+				} else {
+					successorEntered.resolve();
+					await successorGate.promise;
+				}
+			}
+			return original(message);
+		});
+		const promptSpy = vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
+
+		const preflight = f.session.prompt("successor prompt").catch((error: unknown) => error);
+		await firstEntered.promise;
+		try {
+			// The successor arrives while the preflight is still publishing the first batch.
+			Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+			f.session.recordBashResult("echo second-batch", shellResult("second batch output"));
+			delete (f.session as { isStreaming?: unknown }).isStreaming;
+			// Cancel BEFORE the first batch settles, so the claim that follows its publication is
+			// exactly the successor claim a cancelled preflight must refuse.
+			f.session.cancelPendingPreflightForTerminalAbort();
+			firstGate.resolve();
+
+			await successorEntered.promise;
+			// The successor is published here by turn finalization, not by the preflight: the
+			// cancelled preflight has already unwound, so it no longer counts as live work.
+			expect(f.session.isStreaming).toBe(false);
+			successorGate.resolve();
+
+			// Cancellation unwinds as a cancellation, not as a publication failure.
+			expect(await preflight).toBeUndefined();
+			expect(promptSpy).not.toHaveBeenCalled();
+			expect(publications).toEqual(["echo first-batch", "echo second-batch"]);
+			expect(f.session.hasPendingBashMessages).toBe(false);
+			const agentCommands = f.session.agent.state.messages.flatMap(message =>
+				message.role === "bashExecution" ? [message.command] : [],
+			);
+			expect(agentCommands).toEqual(["echo first-batch", "echo second-batch"]);
+			await f.session.awaitSessionSettlement();
+			await f.manager.flush();
+			const durable = await Bun.file(f.file).text();
+			expect(durable.split("first batch output").length - 1).toBe(1);
+			expect(durable.split("second batch output").length - 1).toBe(1);
+			expect(durable.indexOf("first batch output")).toBeLessThan(durable.indexOf("second batch output"));
+		} finally {
+			// Release both publications even when an assertion above fails, so a regression
+			// cannot wedge session teardown behind a gate nothing opens.
+			firstGate.resolve();
+			successorGate.resolve();
+		}
 	});
 
 	it("orders an awaited publication behind older queued background publications", async () => {
