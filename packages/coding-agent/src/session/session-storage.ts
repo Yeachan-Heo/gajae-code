@@ -73,6 +73,20 @@ export interface SessionStorageExactReplacementExpectation {
 	readonly stat: SessionStorageStat;
 	readonly sha256: string;
 }
+
+/** Exact recorded bytes to re-dirty in place; never an append or a replacement entry. */
+export interface SessionDurabilityRepairRange {
+	readonly offset: number;
+	readonly length: number;
+	readonly sha256: string;
+}
+
+export interface SessionDurabilityRepairReceipt {
+	readonly stat: SessionStorageStat;
+	readonly sha256: string;
+	readonly namespaceSynced: true;
+	readonly ranges: readonly SessionDurabilityRepairRange[];
+}
 function normalizeBufferedWriterCapacity(value: number | undefined): number {
 	const capacity = value ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES;
 	if (
@@ -318,6 +332,13 @@ export interface SessionStorage extends SessionStorageReader {
 	 */
 	deleteSessionVerified?(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult>;
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter;
+	/** Fresh-handle same-offset byte-identical re-dirty and real file + namespace sync. */
+	repairDurabilitySync?(
+		path: string,
+		expected: SessionStorageExactReplacementExpectation,
+		ranges: readonly SessionDurabilityRepairRange[],
+		options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionDurabilityRepairReceipt;
 	/** Open a bounded synchronous byte-oriented writer for disposable sidecars. */
 	openBufferedWriter?(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter;
 	/** Open a staged streaming writer for one immutable one-shot destination (additive). */
@@ -1850,6 +1871,103 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 }
 
 export class FileSessionStorage extends FileSessionReader implements SessionStorage {
+	repairDurabilitySync(
+		file: string,
+		expected: SessionStorageExactReplacementExpectation,
+		ranges: readonly SessionDurabilityRepairRange[],
+		options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionDurabilityRepairReceipt {
+		// This operation never borrows the failed append writer, O_APPEND, or its error state.
+		// Platforms without a proven directory-sync primitive must not issue a positive receipt.
+		if (!shouldFsyncManagedDirectory()) throw new Error("durability_repair_unavailable");
+		let previousEnd = 0;
+		for (const range of ranges) {
+			validateRangeReadBounds(range.offset, range.length);
+			if (range.offset < previousEnd || range.length === 0 || range.offset + range.length > expected.stat.size)
+				throw new Error("durability_repair_invalid_range");
+			if (!/^[a-f0-9]{64}$/.test(range.sha256)) throw new Error("durability_repair_invalid_hash");
+			previousEnd = range.offset + range.length;
+		}
+		const parent = path.dirname(file);
+		const parentBefore = fs.lstatSync(parent, { bigint: true });
+		if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink()) throw new Error("source_changed");
+		const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+		try {
+			const assertIdentity = (): SessionStorageStat => {
+				secureOwnerOnlyFileDescriptor(file, fd, "verify", options?.securityContext);
+				const stat = statFromNode(fs.fstatSync(fd, { bigint: true }));
+				const named = fs.lstatSync(file, { bigint: true });
+				const namedParent = fs.lstatSync(parent, { bigint: true });
+				if (
+					!stat.isFile ||
+					stat.nlink !== 1n ||
+					stat.dev !== expected.stat.dev ||
+					stat.ino !== expected.stat.ino ||
+					stat.size !== expected.stat.size ||
+					!named.isFile() ||
+					named.isSymbolicLink() ||
+					named.nlink !== 1n ||
+					named.dev !== stat.dev ||
+					named.ino !== stat.ino ||
+					named.size !== BigInt(stat.size) ||
+					!namedParent.isDirectory() ||
+					namedParent.isSymbolicLink() ||
+					namedParent.dev !== parentBefore.dev ||
+					namedParent.ino !== parentBefore.ino
+				)
+					throw new Error("source_changed");
+				return stat;
+			};
+			const buffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, expected.stat.size)));
+			const hashRange = (offset: number, length: number): string => {
+				const hash = createHash("sha256");
+				for (let consumed = 0; consumed < length; ) {
+					const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, length - consumed), offset + consumed);
+					if (count === 0) throw new Error("range_not_present");
+					hash.update(buffer.subarray(0, count));
+					consumed += count;
+				}
+				return hash.digest("hex");
+			};
+			assertIdentity();
+			if (hashRange(0, expected.stat.size) !== expected.sha256) throw new Error("source_changed");
+			for (const range of ranges) {
+				if (hashRange(range.offset, range.length) !== range.sha256) throw new Error("source_changed");
+			}
+			// Verify the entire plan before the first write, then re-dirty only already-present bytes.
+			assertIdentity();
+			for (const range of ranges) {
+				for (let consumed = 0; consumed < range.length; ) {
+					const count = fs.readSync(
+						fd,
+						buffer,
+						0,
+						Math.min(buffer.length, range.length - consumed),
+						range.offset + consumed,
+					);
+					if (count === 0) throw new Error("range_not_present");
+					for (let written = 0; written < count; ) {
+						const n = fs.writeSync(fd, buffer, written, count - written, range.offset + consumed + written);
+						if (n === 0) throw new Error("Short write");
+						written += n;
+					}
+					consumed += count;
+				}
+			}
+			fs.fsyncSync(fd);
+			fsyncDirectorySync(parent);
+			const stat = assertIdentity();
+			if (hashRange(0, stat.size) !== expected.sha256) throw new Error("source_changed");
+			for (const range of ranges) {
+				if (hashRange(range.offset, range.length) !== range.sha256) throw new Error("source_changed");
+			}
+			assertIdentity();
+			return { stat, sha256: expected.sha256, namespaceSynced: true, ranges: ranges.map(range => ({ ...range })) };
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
 	acquireExclusiveLockSync(
 		lockPath: string,
 		options?: { securityContext?: SessionStorageSecurityContext },

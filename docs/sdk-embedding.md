@@ -64,6 +64,14 @@ only `close_failed_retryable` permits another close attempt. A terminal unknown
 result is retained, not converted to `closed` because a descriptor was released.
 Closure alone does not prove transcript durability or authorize ownership retirement.
 
+`FileSessionStorage.repairDurabilitySync(path, expected, ranges)` is a low-level
+repair primitive, not ownership admission. Its caller must hold publication and
+ownership fences. It verifies the exact inode, full snapshot hash and all recorded
+byte ranges before re-dirtying identical bytes at the same offsets through a fresh
+non-append handle. A receipt requires file sync, parent-directory sync and unchanged
+read-back; readable bytes after a sync failure are not durability evidence. Backends
+without this primitive or a proven namespace sync must report repair unavailable.
+
 ## What `createAgentSession()` discovers by default
 
 `createAgentSession()` follows “provide to override, omit to discover”.
