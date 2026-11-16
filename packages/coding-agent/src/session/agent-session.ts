@@ -32229,6 +32229,12 @@ export class AgentSession {
 			}
 		}
 
+		if (!superseded && !this.#isPublicationOriginCurrent(batchOrigin)) {
+			// The switch can also land inside the manager awaits above, where the append
+			// returns stale/transcript_moved instead of raising the pre-lane sentinel. A row
+			// retained from that attempt still belongs to the predecessor transcript.
+			superseded = true;
+		}
 		if (superseded) {
 			// The predecessor transcript is gone, so its retained rows are dropped exactly
 			// like the switch's own queue clear; `onPersisted` never fires for them.

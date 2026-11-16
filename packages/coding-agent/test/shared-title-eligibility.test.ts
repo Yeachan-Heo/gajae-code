@@ -1080,6 +1080,50 @@ describe("shared publication admission split", () => {
 		expect(await Bun.file(f.file).text()).toContain("deferred output");
 	});
 
+	it("drops a deferred result that outlived the transcript it was queued for", async () => {
+		const f = await fixture();
+		// A sole deferred row: the restored-row path is only taken when the batch retains
+		// something, and a successor row would hide the leak behind an earlier failure.
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo orphaned", shellResult("orphaned output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") throw new Error("unexpected publication");
+			publications++;
+			entered.resolve();
+			await gate.promise;
+			// The manager noticed the rotation while its lease was pending.
+			return { kind: "stale", reason: "transcript_moved" };
+		});
+		vi.spyOn(f.session.agent, "prompt").mockRejectedValue(new Error("stop after the flush"));
+		const flushing = f.session.prompt("flush deferred").catch((error: unknown) => error);
+		await entered.promise;
+
+		const successor = SessionManager.create(f.manager.getCwd(), f.destination);
+		managers.push(successor);
+		successor.appendMessage(user("successor root"));
+		await successor.ensureOnDisk();
+		await successor.flush();
+		const successorFile = successor.getSessionFile();
+		if (!successorFile) throw new Error("missing successor file");
+		await f.manager.setSessionFile(successorFile);
+
+		gate.resolve();
+		await flushing;
+		// The retired row must not be re-queued against the successor transcript.
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		expect(persisted).not.toHaveBeenCalled();
+		await f.session.prompt("after the switch").catch(() => {});
+		expect(publications).toBe(1);
+		await f.manager.flush();
+		expect(await Bun.file(successorFile).text()).not.toContain("orphaned output");
+	});
+
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
