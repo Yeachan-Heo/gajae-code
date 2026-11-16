@@ -1,14 +1,12 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { HookSelectorComponent } from "@gajae-code/coding-agent/modes/components/hook-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { CURSOR_MARKER, type TUI } from "@gajae-code/tui";
 import type { AutocompleteItem, AutocompleteProvider } from "@gajae-code/tui/autocomplete";
+import { loadTestTheme } from "./helpers/test-theme";
 
 beforeAll(async () => {
-	const themeInstance = await getThemeByName("red-claw");
-	if (!themeInstance) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const themeInstance = await loadTestTheme();
 	setThemeInstance(themeInstance);
 });
 

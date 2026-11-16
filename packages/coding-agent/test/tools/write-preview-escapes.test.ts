@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { getThemeByName, initTheme, type Theme } from "../../src/modes/theme/theme";
+import { initTheme, type Theme } from "../../src/modes/theme/theme";
 import { writeToolRenderer } from "../../src/tools/write";
+import { loadTestTheme } from "../helpers/test-theme";
 
 const ESC = "\u001b";
 const BEL = "\u0007";
@@ -38,7 +39,7 @@ async function highlightingOff(): Promise<void> {
 }
 
 async function theme(): Promise<Theme> {
-	const uiTheme = await getThemeByName("red-claw");
+	const uiTheme = await loadTestTheme();
 	expect(uiTheme).toBeDefined();
 	return uiTheme!;
 }

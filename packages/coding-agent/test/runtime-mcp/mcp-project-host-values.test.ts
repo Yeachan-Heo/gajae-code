@@ -10,12 +10,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getMCPConfigPath, getProjectDir, setAgentDir, setProjectDir } from "@gajae-code/utils";
 import { safeRmSync } from "../../../../scripts/safe-cleanup";
+import { waitForCheck } from "../../../utils/test/helpers/wait-for";
 import { clearConfigValueCache } from "../../src/config/resolve-config-value";
 import { MCPCommandController } from "../../src/modes/controllers/runtime-mcp-command-controller";
-import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import { setThemeInstance } from "../../src/modes/theme/theme";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import type { MCPServerConfig } from "../../src/runtime-mcp/types";
+import { loadTestTheme } from "../helpers/test-theme";
 
 const SECRET_NAME = "GJC_CANARY_SECRET";
 const PUBLIC_NAME = "GJC_CANARY_PUBLIC";
@@ -38,14 +40,8 @@ async function exists(filePath: string): Promise<boolean> {
 	}
 }
 
-async function waitUntil(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await check()) return true;
-		await Bun.sleep(20);
-	}
-	return check();
-}
+const waitUntil = (check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> =>
+	waitForCheck(check, timeoutMs, { intervalMs: 20 });
 
 function httpHeaders(config: MCPServerConfig | undefined): Record<string, string> {
 	if (!config || (config.type !== "http" && config.type !== "sse")) {
@@ -63,8 +59,7 @@ function stdioEnv(config: MCPServerConfig | undefined): Record<string, string> {
 
 describe("project MCP host values", () => {
 	beforeAll(async () => {
-		const loaded = await getThemeByName("red-claw");
-		if (!loaded) throw new Error("red-claw theme missing");
+		const loaded = await loadTestTheme();
 		setThemeInstance(loaded);
 	});
 

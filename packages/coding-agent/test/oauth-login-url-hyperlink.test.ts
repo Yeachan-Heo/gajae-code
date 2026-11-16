@@ -2,11 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "@gajae-code/coding-agent/modes/shared/oauth-url-copy";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { type Component, Text } from "@gajae-code/tui";
 import { MCPAddWizard } from "../src/modes/components/runtime-mcp-add-wizard";
 import { MCPCommandController } from "../src/modes/controllers/runtime-mcp-command-controller";
+import { loadTestTheme } from "./helpers/test-theme";
 
 // A login URL is a single unbreakable token, so any pane narrower than the URL
 // splits it across rows. The wrap layer re-opens the identical OSC 8 link on
@@ -139,8 +140,7 @@ describe("OAuth login row emission", () => {
 		resetSettingsForTest();
 		await Settings.init({ inMemory: true });
 		settings.override("tui.hyperlinks", "always");
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Failed to load test theme");
+		const theme = await loadTestTheme();
 		setThemeInstance(theme);
 	});
 

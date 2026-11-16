@@ -25,6 +25,7 @@ import { describeFoldReceipt } from "@gajae-code/coding-agent/session/fold-coord
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 
 function fakeJob(id: string, generation: string): AsyncJob {
 	return {
@@ -52,14 +53,8 @@ function textOf(message: unknown): string {
 	return "";
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 describe("fold red-team: live session duplicate notice/wake", () => {
 	let session: AgentSession | undefined;
