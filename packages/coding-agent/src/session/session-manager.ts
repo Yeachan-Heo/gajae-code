@@ -21622,7 +21622,8 @@ export class SessionManager {
 					: this.#appendDiscoveredBuiltinToolSelectionWithId(builtin!, correlationId, id),
 			undefined,
 			isCurrent,
-			false,
+			// A control operation: verification and release failures latch persistence.
+			true,
 			true,
 		);
 	}

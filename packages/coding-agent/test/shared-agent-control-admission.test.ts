@@ -10,7 +10,7 @@ import { Settings } from "../src/config/settings";
 import { getDefault } from "../src/config/settings-schema";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { type CreateAgentSessionOptions, createAgentSession } from "../src/sdk/session";
-import { AgentSession } from "../src/session/agent-session";
+import { AgentSession, SharedControlPublicationError } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
@@ -324,14 +324,58 @@ describe("shared AgentSession control admission", () => {
 			if (++reads === 2) throw new Error("publication verification unavailable");
 			return result;
 		});
-		await expect(f.session.activateDiscoveredTools(["scheduled_fixture"])).rejects.toMatchObject({
-			message: "Shared tool selection unknown",
-			cause: { kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) },
-		});
+		let thrown: unknown;
+		try {
+			await f.session.activateDiscoveredTools(["scheduled_fixture"]);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(SharedControlPublicationError);
+		const error = thrown as SharedControlPublicationError;
+		expect(error).toMatchObject({ code: "unknown", operation: "select active tools" });
+		expect(error.outcome).toMatchObject({ kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) });
 		expect(reads).toBe(2);
 		expect(f.session.getActiveToolNames()).toEqual(before);
 		expect(f.agent.state.systemPrompt).toEqual(prompt);
 		expect((await Bun.file(f.file).text()).startsWith(original)).toBe(true);
+		// The unproven selection keeps its receipt, closes ingress, and latches persistence
+		// so no later publication continues from a transcript this session cannot vouch for.
+		expect(f.session.isDisposed).toBe(true);
+		expect(await f.manager.appendToolSelectionsSharingSession(undefined, ["scheduled_fixture"], () => true)).toEqual({
+			kind: "stale",
+			reason: "persistence_latched",
+		});
+		sessions.splice(sessions.indexOf(f.session), 1);
+		managers.splice(managers.indexOf(f.manager), 1);
+		expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: error.outcome } });
+		await f.session.dispose().catch(() => {});
+	});
+
+	it("fails closed with the committed receipt when discovered-tool promotion throws", async () => {
+		const f = await fixture(false, true, undefined, true);
+		const before = f.session.getActiveToolNames();
+		const promotion = new Error("live promotion failed");
+		vi.spyOn(f.agent, "setSystemPrompt").mockImplementation(() => {
+			throw promotion;
+		});
+		let thrown: unknown;
+		try {
+			await f.session.activateDiscoveredTools(["scheduled_fixture"]);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(SharedControlPublicationError);
+		const error = thrown as SharedControlPublicationError;
+		expect(error).toMatchObject({ code: "committed_not_applied", operation: "select active tools" });
+		expect(error.cause).toBe(promotion);
+		if (error.outcome.kind !== "committed") throw new Error(error.outcome.kind);
+		const [receipt] = error.outcome.ids;
+		// The selection is durable under its receipt while the live tools never changed,
+		// so the session closes instead of running on tools its transcript no longer names.
+		expect(await Bun.file(f.file).text()).toContain(`"id":"${receipt}"`);
+		expect(f.session.getActiveToolNames()).toEqual(before);
+		expect(f.session.isDisposed).toBe(true);
+		await f.session.dispose().catch(() => {});
 	});
 	it("renames an opted-in root after shared append without moving its branch cursor", async () => {
 		const f = await fixture(false, true);

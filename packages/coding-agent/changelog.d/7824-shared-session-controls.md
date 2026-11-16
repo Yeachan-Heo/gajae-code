@@ -7,3 +7,4 @@
 - `/rename`, automatic titles, plan-mode titles and the extension `setSessionName` now save the title through admitted shared title publication. Previously they called the session manager's legacy writer, which is refused once the session is shared (#7824).
 - Per-tool TTSR reminder records are now saved through admitted shared publication instead of being silently dropped. Model-selector compensation now refuses before it would put the live model back over an admitted shared write (#7824).
 - An uncertain or committed-but-unapplied shared control write now closes the session with a message that says what happened, instead of retrying or rolling back (#7824).
+- Shared tool selection now follows the same rule: an uncertain write, or a saved selection the session could not apply, closes the session and keeps the saved entry IDs, and an uncertain write blocks further writes from that session (#7824).

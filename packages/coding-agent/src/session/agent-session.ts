@@ -14905,7 +14905,9 @@ export class AgentSession {
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
 				promote();
 			} else {
+				const operation = "select active tools";
 				let promoted = false;
+				let promotionError: unknown;
 				const outcome = await this.#withStartedSharedControlPublication(
 					() => {
 						if (!current()) throw new Error("Shared tool selection superseded");
@@ -14916,22 +14918,28 @@ export class AgentSession {
 							builtinChanged ? selectedBuiltinNames : undefined,
 							current,
 						);
+						// No await between the committed receipt and live promotion.
 						if (result.kind === "committed" && current()) {
 							try {
 								promote();
 								promoted = true;
 							} catch (error) {
-								throw new AggregateError([error], "Shared tool selection committed but promotion failed", {
-									cause: result,
-								});
+								promotionError = error;
 							}
 						}
 						return result;
 					},
 				);
-				if (outcome.kind !== "committed")
-					throw new Error(`Shared tool selection ${outcome.kind}`, { cause: outcome });
-				if (!promoted) throw new Error("Shared tool selection committed but superseded", { cause: outcome });
+				// A possibly durable selection this session did not apply keeps its receipt and
+				// closes the session instead of running on tools its transcript no longer names.
+				if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+				if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+				if (!promoted)
+					return this.#failClosedSharedControl(
+						operation,
+						outcome,
+						promotionError ?? new Error("Committed shared tool selection superseded"),
+					);
 			}
 			return this.#activeToolSelectionRevision;
 		}
