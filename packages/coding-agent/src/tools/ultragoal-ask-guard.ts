@@ -6,7 +6,7 @@ import {
 	isUltragoalPauseBlocked,
 	type UltragoalAskBlockDiagnostic,
 } from "../gjc-runtime/ultragoal-guard";
-import { BUILTIN_ASK_TOOL } from "./ask";
+import { isBuiltinAskTool } from "./ask";
 import { ToolError } from "./tool-errors";
 
 const ULTRAGOAL_ASK_GUARD = Symbol.for("gajae-code.ultragoalAskGuard");
@@ -140,7 +140,7 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 				// Issue 2: Enforce one-question settlement for custom ask tools.
 				// Only the built-in AskTool writes proper reservation/answer/release events
 				// for human-blocked asks. Custom extensions must not bypass this accounting.
-				if (admission?.humanBlockedReceipt && !(target as Record<string | symbol, unknown>)[BUILTIN_ASK_TOOL]) {
+				if (admission?.humanBlockedReceipt && !isBuiltinAskTool(target)) {
 					throw new ToolError(
 						"Ultragoal ask guard: custom ask tools are not permitted for human-blocked admits. Only the built-in AskTool supports durable one-question settlement.",
 					);
