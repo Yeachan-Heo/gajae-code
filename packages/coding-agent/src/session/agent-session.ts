@@ -9225,8 +9225,11 @@ export class AgentSession {
 									? "The edit committed and its receipt is retained only in this live session; it is not durable and is lost if the session ends before a later write succeeds."
 									: "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
 								: "The edit committed on disk but its receipt could not be retained in the live session.";
+							// A shared session is past its per-file cap and refuses the only rewrite that
+							// could reclaim room, so naming compaction or `/clear` here would be dead
+							// guidance: both need an append or rewrite this session refuses.
 							const guidance = sharedAppend
-								? `To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}. This shared session refuses \`/clear\`, so compaction is the available path here; re-verify the edited file before relying on it.`
+								? "No in-session recovery is available: the transcript cannot grow, and both compaction and `/clear` need the shared publication this session refuses. Re-verify the edited file before relying on it."
 								: `To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`;
 							event.message.content = [
 								{
@@ -9252,6 +9255,11 @@ export class AgentSession {
 								},
 							};
 							this.agent.touchContext();
+							// The canonical block above is the only place this result is persisted, and
+							// the transcript refused it, so this emission is the operator's only view of
+							// the structured outcome. Returning without it delivers the guidance to the
+							// agent state and the model but never to session subscribers.
+							await this.#emitSessionEvent(event, eventLease);
 						}
 						return;
 					}

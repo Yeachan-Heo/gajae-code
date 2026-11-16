@@ -577,6 +577,12 @@ describe("shared publication admission split", () => {
 			isError: false,
 			timestamp: 3,
 		};
+		const delivered: string[] = [];
+		f.session.subscribe(event => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
+			const first = event.message.content[0];
+			if (first?.type === "text") delivered.push(first.text);
+		});
 		f.session.agent.emitExternalEvent({ type: "message_end", message: result as never });
 		await f.session.awaitSessionSettlement().catch(() => {});
 
@@ -585,13 +591,16 @@ describe("shared publication admission split", () => {
 		expect(result.isError).toBe(true);
 		const text = result.content[0]?.text ?? "";
 		expect(text).toContain("managed per-file limit");
-		expect(text).toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
 		// The shared rewrite bar refused the live-entry recovery, so the receipt is not
 		// durable and the guidance must not promise a later write will land.
 		expect(text).toContain("not durable");
 		expect(text).not.toContain("will persist on the next successful write");
-		expect(text).toContain("This shared session refuses `/clear`");
-		expect(text).toContain("/compact");
+		// Nor may it offer compaction or `/clear`: both need the shared publication this
+		// session refuses, so naming them would be dead guidance.
+		expect(text).toContain("No in-session recovery is available");
+		expect(text).toContain("this session refuses");
+		expect(text).not.toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
+		expect(text).not.toContain("To continue");
 		expect("details" in result ? result.details : undefined).toMatchObject({
 			failureKind: "persistence",
 			nearLimitAppend: {
@@ -602,6 +611,10 @@ describe("shared publication admission split", () => {
 				entryRetained: true,
 			},
 		});
+		// Delivery, not just mutation: a subscriber must receive the mapped error result.
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.isError).toBe(true);
+		expect(delivered[0]?.text).toContain("No in-session recovery is available");
 	});
 
 	it("keeps the legacy near-limit recovery promise for a non-shared tool result", async () => {
@@ -625,6 +638,14 @@ describe("shared publication admission split", () => {
 			isError: false,
 			timestamp: 3,
 		};
+		// The transcript refused this entry, so session subscribers are the operator's only
+		// view of the structured outcome: the mapped result must actually be delivered.
+		const delivered: Array<{ isError: boolean; text: string }> = [];
+		f.session.subscribe(event => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
+			const first = event.message.content[0];
+			delivered.push({ isError: event.message.isError === true, text: first?.type === "text" ? first.text : "" });
+		});
 		f.session.agent.emitExternalEvent({ type: "message_end", message: result as never });
 		await f.session.awaitSessionSettlement().catch(() => {});
 
@@ -632,12 +653,16 @@ describe("shared publication admission split", () => {
 		const text = result.content[0]?.text ?? "";
 		expect(text).toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
 		expect(text).toContain("will persist on the next successful write");
-		// The shared-only `/clear` refusal must not leak into a legacy session's guidance.
-		expect(text).not.toContain("This shared session refuses");
+		// The shared-only uncertainty must not leak into a legacy session's guidance.
+		expect(text).not.toContain("not durable");
+		expect(text).not.toContain("No in-session recovery is available");
 		expect("details" in result ? result.details : undefined).toMatchObject({
 			failureKind: "persistence",
 			nearLimitAppend: { code: "near_limit_append", entryRetained: true },
 		});
+		// The legacy mapping must be delivered to subscribers too, not only mutated in place.
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]).toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
 	});
 
 	it("refuses every additive legacy append of a shared logical session before mutating", async () => {
