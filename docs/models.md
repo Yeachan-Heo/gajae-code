@@ -37,9 +37,12 @@ reload is disabled on those platforms. Restart the session after editing either 
 
 Changes apply between requests, not during a streamed response. The active
 preset's new mappings apply to subsequent requests and delegated work; explicit
-session model or role overrides remain authoritative. Editing `modelProfile.default`
-affects the next startup, not the current active preset. The status line and open model selector
-refresh after the runtime accepts the change.
+session model or role overrides remain authoritative. Choose a durable default through
+`/model` → default or `gjc --mpreset <name> --default`. These operations commit
+`modelProfile.default` and its versioned `modelProfile.ownership` record together;
+do not edit the default projection independently once an ownership record exists.
+A conflicting projection is rejected rather than silently choosing either profile.
+The status line and open model selector refresh after the runtime accepts the change.
 
 Invalid YAML, invalid settings, or removal of an active preset or required model
 rejects the change with a visible diagnostic. The accepted runtime configuration
@@ -148,6 +151,8 @@ modelBindings:
 - `google-gemini-cli`
 - `ollama-chat`
 - `cursor-agent`
+- `devin-acp`
+- `kiro-codewhisperer-stream`
 
 
 ### First-class DeepInfra, Azure OpenAI, and Amazon Bedrock examples
@@ -230,6 +235,12 @@ gjc setup provider --preset alibaba-token-plan
 gjc setup provider --preset cline-pass
 gjc setup provider --preset commandcode-goat
 gjc setup provider --preset ionet
+gjc setup provider --preset runcrate
+gjc setup provider --preset cloudgpu
+gjc setup provider --preset cheaper-inference
+gjc setup provider --preset standardcompute
+gjc setup provider --preset uberllm
+gjc setup provider --preset requesty
 ```
 
 The same presets are available inside the TUI:
@@ -242,9 +253,15 @@ The same presets are available inside the TUI:
 /provider add --preset cline-pass
 /provider add --preset commandcode-goat
 /provider add --preset ionet
+/provider add --preset runcrate
+/provider add --preset cloudgpu
+/provider add --preset cheaper-inference
+/provider add --preset standardcompute
+/provider add --preset uberllm
+/provider add --preset requesty
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, `CMD_API_KEY`, or `IONET_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. The IO Intelligence preset (aliases: `io-net`, `io-intelligence`) writes an OpenAI-compatible custom provider named `ionet` for [IO Intelligence](https://io.net) by io.net; model ids are `org/name` pairs discovered live from the endpoint's `/models` route, so no models are hardcoded. Create the corresponding API key in the provider dashboard before inference.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, `CMD_API_KEY`, `IONET_API_KEY`, `RUNCRATE_API_KEY`, `CLOUDGPU_API_KEY`, `CHEAPER_INFERENCE_API_KEY`, `STANDARDCOMPUTE_API_KEY`, `UBERLLM_API_KEY`, or `REQUESTY_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. The IO Intelligence preset (aliases: `io-net`, `io-intelligence`) writes an OpenAI-compatible custom provider named `ionet` for [IO Intelligence](https://io.net) by io.net; model ids are `org/name` pairs discovered live from the endpoint's `/models` route, so no models are hardcoded. The Runcrate preset (alias: `runcrate-ai`) writes an OpenAI-compatible custom provider named `runcrate` for [Runcrate](https://www.runcrate.ai); model ids are `vendor/model` pairs discovered live from the public `/v1/models` route (only rows whose `output_modalities` is text, so image, audio, video and embedding models are not offered for chat), and streamed reasoning arrives in `reasoning_content`. The CloudGPU preset (alias: `cloudgpu-app`) writes an OpenAI-compatible custom provider named `cloudgpu` for [CloudGPU](https://cloudgpu.app); model ids are plain slugs such as `deepseek-v4.1-flash` or `kimi-k3` discovered live from the public `/v1/models` route, so no models are hardcoded. Discovery sets `discovery.outputModalities` and `discovery.inputModalities` to `[text]`, so a row is admitted only when both advertised modality lists are text. Text output alone would still admit transcription rows, whose input is audio, and text input alone would still admit image and audio-output rows. The preset disables the `developer` role (some models behind the gateway reject it and accept `system`), and streamed reasoning arrives in `reasoning_content`. The Cheaper Inference preset (alias: `cheaperinference`) writes an OpenAI-compatible custom provider named `cheaper-inference` for [Cheaper Inference](https://cheaperinference.com), an OpenAI-compatible LLM gateway; model ids are plain slugs such as `gpt-5.4-mini` or `deepseek-v4-flash` discovered live from the authenticated `/v1/models` route, so no models are hardcoded. The Standard Compute preset (alias: `standard-compute`) writes an OpenAI-compatible custom provider named `standardcompute` for [Standard Compute](https://standardcompute.com), an OpenAI-compatible gateway that routes each request to the cheapest capable model; model ids are discovered live from the public `/v1/models` route, including the routed `StandardCompute` id and `vendor/model` ids for pinning one model, so no models are hardcoded. The UberLLM preset (alias: `uberllm-dev`) writes an OpenAI-compatible custom provider named `uberllm` for [UberLLM](https://uberllm.dev), an OpenAI-compatible gateway; model ids are `vendor/model` pairs such as `deepseek/deepseek-v4-flash` or `anthropic/claude-sonnet-5` discovered live from the public `/v1/models` route (only rows whose `output_modalities` is text), so no models are hardcoded. The Requesty preset (alias: `requesty-ai`) writes an OpenAI-compatible custom provider named `requesty` for [Requesty](https://www.requesty.ai), an OpenAI-compatible LLM gateway that routes to first-party providers; the preset seeds a short list of `vendor/model` ids (`openai/gpt-5.4`, `openai/gpt-5.4-mini`, `anthropic/claude-sonnet-5-5`, `anthropic/claude-opus-5-5`, `google/gemini-3.6-flash`) instead of live discovery, because Requesty's `/v1/models` catalog is larger than the 1 MB models-list limit. Any other id from https://www.requesty.ai/models can be added with `--model`. Create the corresponding API key in the provider dashboard before inference.
 
 ## Signed remote preset registry
 
@@ -334,6 +351,8 @@ Built-in profiles are grouped by provider mix and tier:
 GLM-5.3 always enables thinking and accepts only `low`, `high`, and `max`; `max` is the provider default and is recommended for coding. The GLM tiers preserve the former role ordering by collapsing `minimal`/`low` to `low`, `medium`/`high` to `high`, and `xhigh` to `max`. GLM-5.3-Flash keeps the same text contract (per z.ai docs, its text parameters are consistent with GLM-5.3 with a 1M-token context window) and now backs the high-volume lanes of the GLM tiers: `glm-eco` runs default, executor, and planner on `glm-5.3-flash:low` while critic and architect stay on `glm-5.3:high`; `glm-medium` and `glm-pro` keep every role on `glm-5.3` except the executor, which uses `glm-5.3-flash:low` (Medium) and `glm-5.3-flash:high` (Pro).
 
 Gemini 3.7 Flash is bundled wherever Gemini 3.6 Flash already was (`google/gemini-3.7-flash`, `google-gemini-cli/gemini-3.7-flash`, Copilot, Antigravity effort variants, OpenCode Zen, OpenRouter, Vercel AI Gateway, Cursor, and the other 3.6 Flash gateways). First-class Google transports use `google-level` thinking and accept only `low`, `medium`, and `high`; `minimal` is rejected because the official Gemini API returns an error. Provider defaults stay on the existing Pro-class models.
+
+Gemini 4 Carbon (`gemini-4-carbon`) is bundled in the `google`, `google-gemini-cli`, and `google-vertex` providers with a 1,048,576-token context window. Maximum output is 32,768 tokens on `google` and 65,536 on `google-gemini-cli` and `google-vertex`, following models.dev. It accepts text and image input and uses `google-level` thinking with `low`, `medium`, and `high` levels. It is not bundled for Antigravity until that transport is confirmed to serve it.
 
 
 The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Luna low/Luna low/Luna high/Luna xhigh/Luna high to default/executor/planner/critic/architect, which is Medium with Sol lowered to Luna at the same effort; Medium assigns Sol low/Sol low/Sol high/Sol xhigh/Sol high; Pro assigns Sol medium/Sol medium/Sol high/Sol max/Sol xhigh; Sol is `openai-codex/gpt-6.1-sol` and Luna is `openai-codex/gpt-6-luna`; and LunaMaxxing assigns Luna medium/Luna xhigh/Luna max/Luna max/Luna max. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5-5:medium` for planner.
@@ -443,6 +462,8 @@ translation protocol that GJC does not implement, so they are deliberately not b
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `vllm`, `sglang`, `openai-models-list`, or `models-dev`; `models-dev` may select a different catalog entry with `modelsDevProvider`
+- `discovery.outputModalities` (`openai-models-list` only): admit only `/models` rows whose advertised `output_modalities` all appear in this list, for example `[text]` to keep image, audio, video and embedding rows out of a chat catalog; rows without `output_modalities` are skipped. Unset admits every row.
+- `discovery.inputModalities` (`openai-models-list` only): admit only `/models` rows whose advertised `input_modalities` all appear in this list, for example `[text]` to keep audio-input transcription rows out of a chat catalog; rows without `input_modalities` are skipped. Unset admits every row. Pair it with `outputModalities` when text output alone still includes non-chat rows.
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models use top-level automatic caching and emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints default to explicit block markers because compatible proxies commonly inject, rewrite, or reject top-level cache controls; they omit `ttl` unless `compat.supportsLongCacheRetention: true` opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration

@@ -213,6 +213,42 @@ describe("theme auto-detection", () => {
 		expect(detectSpy).not.toHaveBeenCalled();
 	});
 
+	it("requests OSC 11 polling only while terminal appearance can change the theme", async () => {
+		using _globals = withThemeTestGlobals();
+		const demand: boolean[] = [];
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "red-claw");
+		const unsubscribe = themeModule.onTerminalAppearanceDemandChange(needed => demand.push(needed));
+		try {
+			expect(demand).toEqual([false]);
+
+			themeModule.setAutoThemeMapping("light", "blue-crab");
+			expect(demand).toEqual([false, true]);
+
+			const explicit = await themeModule.getThemeByName("red-claw");
+			if (!explicit) throw new Error("Failed to load red-claw theme");
+			themeModule.setThemeInstance(explicit);
+			expect(demand).toEqual([false, true, false]);
+
+			themeModule.enableAutoTheme();
+			expect(demand).toEqual([false, true, false, true]);
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("does not request OSC 11 polling under the macOS Zellij fallback", async () => {
+		using _globals = withThemeTestGlobals({ zellij: "1" });
+		vi.spyOn(nativesModule, "detectMacOSAppearance").mockReturnValue(MacOSAppearance.Dark);
+		const demand: boolean[] = [];
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+		const unsubscribe = themeModule.onTerminalAppearanceDemandChange(needed => demand.push(needed));
+		try {
+			expect(demand).toEqual([false]);
+		} finally {
+			unsubscribe();
+		}
+	});
+
 	it("does not apply a theme after the owning UI stops", async () => {
 		using _globals = withThemeTestGlobals();
 		const previousTheme = themeModule.getCurrentThemeName();

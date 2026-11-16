@@ -36,9 +36,6 @@ export function telegramDaemonOwnerMarkerPath(agentDir: string, acquisitionId: s
 	return path.join(daemonPaths(agentDir).ownerRegistry, `${safe}.json`);
 }
 
-export const daemonOwnerMarkerPath = telegramDaemonOwnerMarkerPath;
-export const telegramDaemonProcessMarkerPath = telegramDaemonOwnerMarkerPath;
-
 export function daemonPaths(agentDir: string): DaemonPaths {
 	const dir = path.join(agentDir, "notifications");
 	return {

@@ -1,0 +1,1871 @@
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai/models";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import * as z from "zod/v4";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
+import { getDefault } from "../src/config/settings-schema";
+import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
+import { type CreateAgentSessionOptions, createAgentSession } from "../src/sdk/session";
+import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
+import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
+import * as titleGenerator from "../src/utils/title-generator";
+
+const roots: string[] = [];
+const sessions: AgentSession[] = [];
+const managers: SessionManager[] = [];
+const registries: ModelRegistry[] = [];
+const stores: AuthStorage[] = [];
+const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	for (const session of sessions.splice(0)) await session.dispose();
+	for (const registry of registries.splice(0)) await registry.dispose();
+	for (const manager of managers.splice(0)) await manager.closeStrict();
+	for (const store of stores.splice(0)) store.close();
+	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+});
+
+async function fixture(
+	durableSettings = false,
+	rootInteractiveSharedAppend = false,
+	streamFn?: Agent["streamFn"],
+	withDiscoverableTool = false,
+	factory?: {
+		cli: boolean;
+		options: Pick<CreateAgentSessionOptions, "hasUI" | "taskDepth" | "parentTaskPrefix" | "currentAgentType">;
+	},
+) {
+	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-controls-"));
+	roots.push(root);
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	await fs.mkdir(cwd, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	const destination = SessionManager.managedDestination(cwd, agentDir);
+	const manager = SessionManager.create(cwd, destination);
+	managers.push(manager);
+	const first = manager.appendMessage(user("first"));
+	manager.appendMessage(user("second"));
+	await manager.ensureOnDisk();
+	await manager.flush();
+	const file = manager.getSessionFile()!;
+	const auth = await AuthStorage.create(path.join(root, "auth.db"));
+	stores.push(auth);
+	auth.setRuntimeApiKey("anthropic", "test-key");
+	const registry = new ModelRegistry(auth);
+	registries.push(registry);
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Missing bundled model");
+	const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }] }));
+	const tool: AgentTool = {
+		name: "control_fixture",
+		label: "Control fixture",
+		description: "Control admission fixture",
+		parameters: z.object({}),
+		execute,
+	};
+	const discoveredTool: AgentTool = {
+		name: "scheduled_fixture",
+		label: "Schedule fixture",
+		description: "Recurring schedule fixture",
+		loadMode: "discoverable",
+		parameters: z.object({}),
+		execute,
+	};
+	const settings = durableSettings
+		? await Settings.loadForScope({ cwd, agentDir })
+		: Settings.isolated({
+				"compaction.enabled": false,
+				"todo.reminders": false,
+				"startup.networkPrewarm": false,
+				...(withDiscoverableTool ? { "tools.discoveryMode": "all" as const } : {}),
+			});
+	const agent = new Agent({
+		initialState: { model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+		...(streamFn ? { streamFn, getApiKey: () => "test-key" } : {}),
+	});
+	const rebuild = vi.fn(async () => ({ systemPrompt: ["Rebuilt"] }));
+	let session: AgentSession;
+	if (factory) {
+		const options: CreateAgentSessionOptions = {
+			...factory.options,
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings,
+			model,
+			authStorage: auth,
+			modelRegistry: registry,
+			toolNames: [],
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		};
+		Object.assign(options, { primaryControlSurface: "cli", rootInteractiveSharedAppend: true });
+		if (factory.cli) setPrimaryControlSurface(options, "cli");
+		session = (await createAgentSession(options)).session;
+	} else
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings,
+			modelRegistry: registry,
+			toolRegistry: new Map([
+				[tool.name, tool],
+				...(withDiscoverableTool ? [[discoveredTool.name, discoveredTool] as const] : []),
+			]),
+			rebuildSystemPrompt: rebuild,
+			rootInteractiveSharedAppend,
+		});
+	sessions.push(session);
+	await manager.flush();
+	const admit = async () => {
+		const sibling = await SessionManager.open(file, destination);
+		managers.push(sibling);
+		const peerResult = await sibling.appendMessageSharingSession(user("peer"));
+		if (peerResult.kind !== "committed") throw new Error(peerResult.kind);
+		const result = await manager.appendMessageSharingSession(user("local"));
+		if (result.kind !== "committed") throw new Error(result.kind);
+	};
+	return {
+		session,
+		manager,
+		agent: session.agent,
+		settings,
+		registry,
+		model,
+		first,
+		file,
+		admit,
+		execute,
+		rebuild,
+		cwd,
+		agentDir,
+		destination,
+	};
+}
+
+function holdSnapshot(manager: SessionManager, onRead = 1) {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const capture = manager.captureCommittedSnapshot.bind(manager);
+	let reads = 0;
+	vi.spyOn(manager, "captureCommittedSnapshot").mockImplementation(async () => {
+		if (++reads === onRead) {
+			entered.resolve();
+			await release.promise;
+		}
+		return capture();
+	});
+	return { entered: entered.promise, release: () => release.resolve() };
+}
+
+function holdSettingsCommit(settings: Settings) {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const commit = settings.commitAtomicBatch.bind(settings);
+	vi.spyOn(settings, "commitAtomicBatch").mockImplementation(async patches => {
+		entered.resolve();
+		await release.promise;
+		return commit(patches);
+	});
+	return { entered: entered.promise, release: () => release.resolve() };
+}
+
+async function withHeldCleanup(
+	body: () => Promise<void>,
+	release: () => void,
+	pending: () => Array<Promise<unknown> | undefined>,
+	phase: string,
+): Promise<void> {
+	let cleanupFailure: unknown;
+	try {
+		await body();
+	} finally {
+		release();
+		try {
+			await withinBarrier(Promise.allSettled(pending().filter(Boolean)), phase);
+		} catch (error) {
+			cleanupFailure = error;
+		}
+	}
+	if (cleanupFailure !== undefined) throw cleanupFailure;
+}
+
+async function withinBarrier<T>(pending: Promise<T>, phase: string): Promise<T> {
+	const deadline = Promise.withResolvers<never>();
+	const timer = setTimeout(() => deadline.reject(new Error(`Timed out waiting for ${phase}`)), 1500);
+	try {
+		return await Promise.race([pending, deadline.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function observeControl(pending: Promise<void>) {
+	return pending.then(
+		() => ({ kind: "fulfilled" as const }),
+		error => ({ kind: "rejected" as const, error }),
+	);
+}
+
+function snapshot(session: AgentSession) {
+	return structuredClone({
+		model: session.model,
+		thinking: session.thinkingLevel,
+		agentThinking: session.agent.state.thinkingLevel,
+		tier: session.serviceTier,
+		tools: session.getActiveToolNames(),
+		prompt: session.agent.state.systemPrompt,
+		messages: session.agent.state.messages,
+		profile: session.getActiveModelProfile(),
+		selectionRevision: session.getUserModelSelectionRevision(),
+		modelRoles: session.settings.get("modelRoles"),
+		defaultThinking: session.settings.get("defaultThinkingLevel"),
+		manager: {
+			revisions: session.sessionManager.revisionSnapshot(),
+			entries: session.sessionManager.getEntries(),
+			leaf: session.sessionManager.getLeafId(),
+		},
+	});
+}
+
+describe("shared AgentSession control admission", () => {
+	for (const [label, cli, options, admitted] of [
+		["root CLI", true, { hasUI: true }, true],
+		["SDK with forged fields", false, { hasUI: true }, false],
+		["noninteractive CLI", true, { hasUI: false }, false],
+		["task-depth child", true, { hasUI: true, taskDepth: 1 }, false],
+		["parent-prefix child", true, { hasUI: true, parentTaskPrefix: "parent" }, false],
+		["agent-type child", true, { hasUI: true, currentAgentType: "executor" }, false],
+	] as const) {
+		it(`factory shared authority follows trusted provenance: ${label}`, async () => {
+			const f = await fixture(false, false, undefined, false, { cli, options });
+			await f.admit();
+			const before = await Bun.file(f.file).text();
+			const rename = async () => f.session.setSessionName("trusted root title");
+			if (admitted) {
+				await rename();
+				expect(f.manager.getSessionName()).toBe("trusted root title");
+			} else {
+				await expect(rename()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+				expect(await Bun.file(f.file).text()).toBe(before);
+			}
+		});
+	}
+
+	it("publishes discovered built-in activation on its own branch without changing peer bytes", async () => {
+		const f = await fixture(false, true, undefined, true);
+		const peer = await SessionManager.open(f.file, f.destination);
+		managers.push(peer);
+		const peerAppend = await peer.appendMessageSharingSession(user("peer before discovery"));
+		if (peerAppend.kind !== "committed") throw new Error(`Peer publication ${peerAppend.kind}`);
+		const peerBytes = await Bun.file(f.file).text();
+		const parentId = f.manager.getLeafId();
+		if (parentId === null) throw new Error("Missing root branch parent");
+		expect(await f.session.activateDiscoveredTools(["scheduled_fixture"])).toEqual(["scheduled_fixture"]);
+		expect(f.session.getActiveToolNames()).toContain("scheduled_fixture");
+		expect(f.agent.state.systemPrompt).toEqual(["Rebuilt"]);
+		const bytes = await Bun.file(f.file).text();
+		expect(bytes.startsWith(peerBytes)).toBe(true);
+		const appended = bytes
+			.slice(peerBytes.length)
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type: string;
+						parentId: string;
+						id: string;
+						timestamp: string;
+						selectedToolNames?: string[];
+					},
+			);
+		expect(appended).toEqual([
+			{
+				type: "discovered_builtin_tool_selection",
+				parentId,
+				selectedToolNames: ["scheduled_fixture"],
+				id: expect.any(String),
+				timestamp: expect.any(String),
+			},
+		]);
+		expect(f.manager.getLeafId()).toBe(appended[0]!.id);
+		expect(peer.getLeafId()).toBe(peerAppend.id);
+	});
+
+	it("withholds discovered-tool promotion when shared publication cannot prove durability", async () => {
+		const f = await fixture(false, true, undefined, true);
+		const before = f.session.getActiveToolNames();
+		const prompt = [...f.agent.state.systemPrompt];
+		const original = await Bun.file(f.file).text();
+		const capture = f.manager.captureCommittedSnapshot.bind(f.manager);
+		let reads = 0;
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
+			const result = await capture();
+			if (++reads === 2) throw new Error("publication verification unavailable");
+			return result;
+		});
+		await expect(f.session.activateDiscoveredTools(["scheduled_fixture"])).rejects.toMatchObject({
+			message: "Shared discovered-tool activation unknown",
+			cause: { kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) },
+		});
+		expect(reads).toBe(2);
+		expect(f.session.getActiveToolNames()).toEqual(before);
+		expect(f.agent.state.systemPrompt).toEqual(prompt);
+		expect((await Bun.file(f.file).text()).startsWith(original)).toBe(true);
+	});
+	it("renames an opted-in root after shared append without moving its branch cursor", async () => {
+		const f = await fixture(false, true);
+		const published = await f.manager.appendMessageSharingSession(user("published before rename"));
+		expect(published.kind).toBe("committed");
+		const original = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const entries = f.manager.getEntries();
+		expect(await f.session.setSessionName("User chosen title", "user")).toBe(true);
+		expect(f.session.sessionName).toBe("User chosen title");
+		expect(f.manager.getLeafId()).toBe(leaf);
+		expect(f.manager.getEntries()).toEqual(entries);
+		const updated = await Bun.file(f.file).text();
+		expect(updated.startsWith(original)).toBe(true);
+		const appended = updated
+			.slice(original.length)
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type: string;
+						patch?: { title?: string; titleSource?: string };
+					},
+			);
+		expect(appended.filter(record => record.patch?.title !== undefined)).toEqual([
+			{
+				type: "header_patch",
+				patch: {
+					title: "User chosen title",
+					titleSource: "user",
+				},
+			},
+		]);
+		expect(appended.every(record => record.type === "header_patch")).toBe(true);
+	});
+
+	it("applies a deferred automatic title after the root's first shared message", async () => {
+		const f = await fixture(false, true);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(titleGenerator, "generateSessionTitle").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return "Generated shared title";
+		});
+		const generation = f.session.generateAutoSessionTitle("first input");
+		void generation.catch(() => {});
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(entered.promise, "deferred title generation");
+				const published = await f.manager.appendMessageSharingSession(user("first input"));
+				expect(published.kind).toBe("committed");
+				const original = await Bun.file(f.file).text();
+				const leaf = f.manager.getLeafId();
+				release.resolve();
+				expect(await withinBarrier(generation, "automatic title publication")).toEqual({
+					kind: "applied",
+					title: "Generated shared title",
+				});
+				expect(f.session.sessionName).toBe("Generated shared title");
+				expect(f.manager.getLeafId()).toBe(leaf);
+				const updated = await Bun.file(f.file).text();
+				expect(updated.startsWith(original)).toBe(true);
+				const patches = updated
+					.slice(original.length)
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as { type: string; patch: { title?: string; titleSource?: string } });
+				expect(patches.filter(record => record.patch.title !== undefined)).toEqual([
+					{
+						type: "header_patch",
+						patch: {
+							title: "Generated shared title",
+							titleSource: "auto",
+						},
+					},
+				]);
+				expect(patches.every(record => record.type === "header_patch")).toBe(true);
+			},
+			() => release.resolve(),
+			() => [generation],
+			"deferred title cleanup",
+		);
+	});
+
+	it("lets a peer manual title defeat stale auto without replaying starred metadata", async () => {
+		const f = await fixture(false, true);
+		const sibling = await SessionManager.open(f.file, f.destination);
+		managers.push(sibling);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(titleGenerator, "generateSessionTitle").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return "Old automatic title";
+		});
+		const generation = f.session.generateAutoSessionTitle("first input");
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(entered.promise, "peer manual title generation");
+				expect((await sibling.setSessionNameSharingSession("Peer manual", "user")).kind).toBe("committed");
+				const before = await Bun.file(f.file).text();
+				release.resolve();
+				expect(await withinBarrier(generation, "peer title precedence")).toEqual({
+					kind: "skipped",
+					reason: "named",
+				});
+				expect(await Bun.file(f.file).text()).toBe(before);
+				const manual = await f.session.setSessionName("Local manual", "user");
+				expect(manual).toBe(true);
+				const patches = (await Bun.file(f.file).text())
+					.slice(before.length)
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as { type: string; patch: Record<string, unknown> });
+				expect(patches).toEqual([{ type: "header_patch", patch: { title: "Local manual", titleSource: "user" } }]);
+			},
+			() => release.resolve(),
+			() => [generation],
+			"peer title cleanup",
+		);
+	});
+
+	it("publishes an unpublished title with its pending entries and retains its cursor", async () => {
+		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-bootstrap-"));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		managers.push(manager);
+		const first = manager.appendMessage(user("pending one"));
+		const second = manager.appendMessage(user("pending two"));
+		const leaf = manager.getLeafId();
+		const result = await manager.setSessionNameSharingSession("First title", "user");
+		expect(result).toEqual({ kind: "committed", title: "First title" });
+		expect(manager.getLeafId()).toBe(leaf);
+		const file = manager.getSessionFile()!;
+		const lines = (await Bun.file(file).text())
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type: string;
+						id?: string;
+						title?: string;
+						message?: { content: string };
+					},
+			);
+		expect(lines[0]).toMatchObject({ type: "session", title: "First title" });
+		expect(lines.slice(1).map(entry => entry.id)).toEqual([first, second]);
+		expect(lines.slice(1).map(entry => entry.message?.content)).toEqual(["pending one", "pending two"]);
+		const append = await manager.appendMessageSharingSession(user("after title bootstrap"));
+		expect(append.kind).toBe("committed");
+		expect((await Bun.file(file).text()).includes('"after title bootstrap"')).toBe(true);
+	});
+
+	it("refuses an existing same-ID file without discarding unpublished title-owner entries", async () => {
+		const f = await fixture(false, true);
+		const manager = SessionManager.create(f.cwd, f.destination);
+		managers.push(manager);
+		const first = manager.appendMessage(user("pending one"));
+		const second = manager.appendMessage(user("pending two"));
+		const file = manager.getSessionFile()!;
+		expect(await Bun.file(file).exists()).toBe(false);
+		const existing = `${JSON.stringify(manager.getHeader())}\n`;
+		await Bun.write(file, existing);
+		await fs.chmod(file, 0o600);
+		const append = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync");
+		const publish = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		expect(await manager.setSessionNameSharingSession("Must not adopt", "user")).toEqual({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		expect(append).not.toHaveBeenCalled();
+		expect(publish).not.toHaveBeenCalled();
+		expect(await Bun.file(file).text()).toBe(existing);
+		expect(manager.getLeafId()).toBe(second);
+		expect(manager.getEntries().map(entry => entry.id)).toEqual([first, second]);
+		expect(manager.getSessionName()).toBeUndefined();
+	});
+
+	it("arms shared admission before a title publication yields", async () => {
+		const f = await fixture(false, true);
+		const manager = SessionManager.create(f.cwd, f.destination);
+		managers.push(manager);
+		const first = manager.appendMessage(user("pending"));
+		const title = manager.setSessionNameSharingSession("Shared title", "user");
+		let legacyError: unknown;
+		try {
+			manager.appendMessage(user("legacy mutation after shared invocation"));
+		} catch (error) {
+			legacyError = error;
+		}
+		expect(await title).toEqual({ kind: "committed", title: "Shared title" });
+		expect(legacyError).toMatchObject({ code: "shared_session_mutation_unsupported" });
+		expect(manager.getEntries().map(entry => entry.id)).toEqual([first]);
+	});
+
+	it("orders a started title before thinking", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		const earlier = f.manager.appendMessageSharingSession(user("earlier publication"));
+		let title: Promise<boolean> | undefined;
+		let thinking: Promise<void> | undefined;
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(held.entered, "earlier publication before title");
+				title = f.session.setSessionName("Before thinking", "user");
+				thinking = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+				held.release();
+				expect((await withinBarrier(earlier, "earlier publication completion")).kind).toBe("committed");
+				expect(await withinBarrier(title, "title before thinking")).toBe(true);
+				await withinBarrier(thinking, "thinking after title");
+				expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			},
+			held.release,
+			() => [earlier, title, thinking],
+			"title/thinking cleanup",
+		);
+	});
+
+	it("releases shared title admission before invoking the applied observer", async () => {
+		const f = await fixture(false, true);
+		const initial = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(initial.kind).toBe("committed");
+		let thinking: Promise<void> | undefined;
+		const title = await f.manager.setSessionNameSharingSession("Observed", "user", {
+			onApplied: () => {
+				thinking = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+			},
+		});
+		expect(title.kind).toBe("committed");
+		await withinBarrier(thinking!, "thinking after title observer");
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("retains automatic title attempt evidence after the failed result is returned", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		vi.spyOn(titleGenerator, "generateSessionTitle").mockResolvedValue("Uncertain automatic title");
+		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+		const failure = new Error("automatic title append outcome unknown");
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relative,
+			bytes,
+			expected,
+		) {
+			original.call(this, relative, bytes, expected);
+			throw failure;
+		});
+		const result = await f.session.generateAutoSessionTitle("first input");
+		const retained = await f.manager.flush().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		sessions.splice(sessions.indexOf(f.session), 1);
+		managers.splice(managers.indexOf(f.manager), 1);
+		const disposal = await Promise.allSettled([f.session.dispose()]);
+		expect(disposal[0]?.status).toBe("rejected");
+		expect(result).toEqual({ kind: "failed" });
+		expect(retained).toMatchObject({
+			cause: {
+				kind: "unknown",
+				sessionId: f.manager.getSessionId(),
+				patch: { title: "Uncertain automatic title", titleSource: "auto" },
+				error: failure,
+			},
+		});
+	});
+
+	it("retains exact patch evidence after an uncertain append without retry or live success", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const before = await Bun.file(f.file).text();
+		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+		const failure = new Error("append returned uncertain after durable write");
+		const append = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relative, bytes, expected) {
+				original.call(this, relative, bytes, expected);
+				throw failure;
+			});
+		const outcome = await f.manager.setSessionNameSharingSession("Uncertain", "user");
+		expect(outcome).toMatchObject({
+			kind: "unknown",
+			patch: { title: "Uncertain", titleSource: "user" },
+			error: failure,
+		});
+		if (outcome.kind !== "unknown") throw new Error(`Expected uncertainty: ${outcome.kind}`);
+		expect(outcome.predecessor?.sha256).toBeDefined();
+		expect(f.manager.getSessionName()).not.toBe("Uncertain");
+		expect(append).toHaveBeenCalledTimes(1);
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const followUp = await f.manager.setSessionNameSharingSession("Do not retry", "user");
+		expect(followUp).toEqual({ kind: "stale", reason: "persistence_latched" });
+		managers.splice(managers.indexOf(f.manager), 1);
+		expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
+		sessions.splice(sessions.indexOf(f.session), 1);
+		await expect(f.session.dispose()).rejects.toMatchObject({
+			errors: expect.arrayContaining([expect.objectContaining({ cause: outcome })]),
+		});
+	});
+
+	it("keeps root interactive local thinking control working after its own first shared append", async () => {
+		const f = await fixture(false, true);
+		{
+			const firstControlPublication = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+			await withinBarrier(
+				f.session.setThinkingLevelForControl(ThinkingLevel.Low, false),
+				"first root thinking control",
+			);
+			expect(firstControlPublication).toHaveBeenCalledTimes(1);
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+			await f.manager.flush();
+			const before = f.manager.getEntries().filter(entry => entry.type === "thinking_level_change").length;
+			expect(before).toBe(1);
+			expect(
+				(await Bun.file(f.file).text()).split("\n").filter(line => line.includes('"type":"thinking_level_change"')),
+			).toHaveLength(1);
+			const publication = await f.manager.appendMessageSharingSession(user("root first shared append"));
+			expect(publication.kind).toBe("committed");
+			if (publication.kind !== "committed") throw new Error(`Unexpected shared outcome: ${publication.kind}`);
+			await withinBarrier(f.session.setThinkingLevelForControl(ThinkingLevel.High, false), "root thinking control");
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(f.agent.state.thinkingLevel).toBe(ThinkingLevel.High);
+			await f.manager.flush();
+			const entries = (await Bun.file(f.file).text())
+				.trim()
+				.split("\n")
+				.map(
+					line =>
+						JSON.parse(line) as {
+							type?: string;
+							id?: string;
+							parentId?: string | null;
+							thinkingLevel?: string;
+							operatorIntent?: boolean;
+						},
+				);
+			const thinking = entries.filter(entry => entry.type === "thinking_level_change");
+			expect(f.session.getThinkingScopeForControl()).toBe("session");
+			expect(thinking).toHaveLength(before + 1);
+			expect(thinking.at(-1)).toMatchObject({
+				thinkingLevel: ThinkingLevel.High,
+				operatorIntent: true,
+				parentId: publication.id,
+			});
+		}
+	});
+
+	it("cycles root thinking after shared admission with one committed local intent", async () => {
+		const f = await fixture(false, true);
+		const anchor = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(anchor.kind).toBe("committed");
+		const levels = [ThinkingLevel.Off, ...f.session.getAvailableThinkingLevels()];
+		const current = f.session.thinkingLevel === ThinkingLevel.Inherit ? ThinkingLevel.Off : f.session.thinkingLevel;
+		const expected = levels[((current ? levels.indexOf(current) : -1) + 1) % levels.length];
+		const next = await f.session.cycleThinkingLevel();
+		expect(next).toBe(expected);
+		expect(f.session.thinkingLevel).toBe(expected);
+		expect(f.agent.state.thinkingLevel ?? ThinkingLevel.Off).toBe(expected);
+		await f.manager.flush();
+		const entries = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change");
+		expect(entries).toEqual([
+			expect.objectContaining({
+				thinkingLevel: expected,
+				operatorIntent: true,
+				parentId: anchor.kind === "committed" ? anchor.id : undefined,
+			}),
+		]);
+		expect(
+			(await Bun.file(f.file).text()).split("\n").filter(line => line.includes('"type":"thinking_level_change"')),
+		).toHaveLength(1);
+	});
+
+	it("does not apply a cycle before owned publication settles", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		const before = f.session.thinkingLevel;
+		const beforeAgent = f.agent.state.thinkingLevel;
+		const cycle = Promise.resolve().then(() => f.session.cycleThinkingLevel());
+		const settled = cycle.then(
+			value => ({ kind: "fulfilled" as const, value }),
+			error => ({ kind: "rejected" as const, error }),
+		);
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(
+					Promise.race([
+						held.entered,
+						settled.then(result => {
+							throw new Error(`Cycle settled before publication: ${result.kind}`);
+						}),
+					]),
+					"held cycle publication",
+				);
+				expect(f.session.thinkingLevel).toBe(before);
+				expect(f.agent.state.thinkingLevel).toBe(beforeAgent);
+				held.release();
+				const result = await withinBarrier(settled, "cycle completion");
+				expect(result.kind).toBe("fulfilled");
+				if (result.kind === "fulfilled") expect(f.session.thinkingLevel).toBe(result.value);
+			},
+			held.release,
+			() => [settled],
+			"cycle cleanup",
+		);
+	});
+
+	it("propagates a failed shared cycle without changing live thinking or retrying publication", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const before = f.session.thinkingLevel;
+		const bytes = await Bun.file(f.file).text();
+		const error = new Error("cycle publication refused");
+		const outcome = { kind: "rejected" as const, error };
+		const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession").mockResolvedValue(outcome);
+		await expect(Promise.resolve().then(() => f.session.cycleThinkingLevel())).rejects.toMatchObject({
+			cause: outcome,
+		});
+		expect(append).toHaveBeenCalledTimes(1);
+		expect(f.session.thinkingLevel).toBe(before);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("persists root thinking selection after shared admission with one global Inherit entry", async () => {
+		const f = await fixture(true, true);
+		try {
+			const anchor = await f.manager.appendMessageSharingSession(user("shared"));
+			expect(anchor.kind).toBe("committed");
+			const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+			await f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			expect(append).toHaveBeenCalledTimes(1);
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(f.agent.state.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(f.session.getThinkingScopeForControl()).toBe("global config");
+			const thinking = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change");
+			expect(thinking).toEqual([
+				expect.objectContaining({
+					thinkingLevel: ThinkingLevel.Inherit,
+					parentId: anchor.kind === "committed" ? anchor.id : undefined,
+				}),
+			]);
+			expect(thinking[0]).not.toHaveProperty("operatorIntent");
+			expect((await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel")).toBe(
+				ThinkingLevel.High,
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	it("resets persistent thinking to the builtin default through one inherited entry", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			await f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			const before = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change").length;
+			await f.session.setThinkingLevelForControl(ThinkingLevel.Inherit, true);
+			const expected = getDefault("defaultThinkingLevel");
+			expect(f.session.thinkingLevel).toBe(expected);
+			expect(f.session.getThinkingScopeForControl()).toBe("global config");
+			const thinking = f.manager
+				.getBranch()
+				.filter(entry => entry.type === "thinking_level_change")
+				.slice(before);
+			expect(thinking).toEqual([expect.objectContaining({ thinkingLevel: ThinkingLevel.Inherit })]);
+			expect(thinking[0]).not.toHaveProperty("operatorIntent");
+			expect((await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel")).toBe(
+				expected,
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	for (const failure of ["stale", "rejected", "unknown", "acquisition"] as const) {
+		it(`reports settings saved but ${failure} persisted thinking publication without live update`, async () => {
+			const f = await fixture(true, true);
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const before = f.session.thinkingLevel;
+				const bytes = await Bun.file(f.file).text();
+				const original = new Error("original thinking publication failure");
+				const outcome =
+					failure === "stale"
+						? { kind: "stale" as const, reason: "cursor_not_committed" as const }
+						: failure === "unknown"
+							? { kind: "unknown" as const, id: "persist-attempt", error: original }
+							: { kind: "rejected" as const, error: original };
+				const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+				if (failure === "acquisition") append.mockRejectedValue(original);
+				else append.mockResolvedValue(outcome);
+				await expect(f.session.setThinkingLevelForControl(ThinkingLevel.High, true)).rejects.toMatchObject({
+					message: expect.stringContaining(failure === "unknown" ? "persist-attempt" : "settings saved"),
+					cause: failure === "acquisition" ? original : outcome,
+				});
+				expect(append).toHaveBeenCalledTimes(1);
+				expect(f.session.thinkingLevel).toBe(before);
+				expect(await Bun.file(f.file).text()).toBe(bytes);
+				expect(
+					(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+				).toBe(ThinkingLevel.High);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	it("does not publish persisted thinking when Settings commit fails", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const before = snapshot(f.session);
+			const bytes = await Bun.file(f.file).text();
+			vi.spyOn(f.settings, "commitAtomicBatch").mockRejectedValueOnce(new Error("settings denied"));
+			const publish = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+			await expect(f.session.setThinkingLevelForControl(ThinkingLevel.High, true)).rejects.toThrow(
+				"Unable to persist reasoning settings",
+			);
+			expect(publish).not.toHaveBeenCalled();
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	it("holds persisted selection before live change and excludes unrelated shared writes", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const sibling = await SessionManager.open(f.file, f.destination);
+			managers.push(sibling);
+			const held = holdSettingsCommit(f.settings);
+			const before = f.session.thinkingLevel;
+			const control = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			const settled = observeControl(control);
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(held.entered, "persisted settings barrier");
+					expect(f.session.thinkingLevel).toBe(before);
+					for (const manager of [f.manager, sibling]) {
+						expect(await manager.appendMessageSharingSession(user("blocked"))).toMatchObject({
+							kind: "rejected",
+						});
+					}
+					held.release();
+					await withinBarrier(control, "persisted thinking publication");
+					expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+					expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(1);
+					expect((await sibling.appendMessageSharingSession(user("released"))).kind).toBe("committed");
+				},
+				held.release,
+				() => [settled],
+				"persisted control cleanup",
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	for (const order of ["failure-first", "success-first"] as const) {
+		it(`recovers an earlier saved selection after a newer Settings failure (${order})`, async () => {
+			const f = await fixture(true, true);
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const newerEntered = Promise.withResolvers<void>();
+				const releaseNewer = Promise.withResolvers<void>();
+				const commit = f.settings.commitAtomicBatch.bind(f.settings);
+				let calls = 0;
+				vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+					if (++calls === 2) {
+						newerEntered.resolve();
+						await releaseNewer.promise;
+						throw new Error("newer settings failed");
+					}
+					const receipt = await commit(patches);
+					entered.resolve();
+					await release.promise;
+					return receipt;
+				});
+				const older = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+				const olderResult = observeControl(older);
+				let newer: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						await withinBarrier(entered.promise, "older settings saved");
+						newer = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+						await withinBarrier(newerEntered.promise, "newer Settings started");
+						if (order === "success-first") {
+							release.resolve();
+							await withinBarrier(older, "older saved receipt");
+							expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
+								0,
+							);
+						}
+						releaseNewer.resolve();
+						await expect(withinBarrier(newer, "newer settings failure")).rejects.toThrow(
+							"Unable to persist reasoning settings",
+						);
+						release.resolve();
+						await withinBarrier(older, "earlier settings recovery");
+						expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+						expect(
+							(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+						).toBe(ThinkingLevel.High);
+						expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toEqual([
+							expect.objectContaining({ thinkingLevel: ThinkingLevel.Inherit }),
+						]);
+					},
+					() => {
+						release.resolve();
+						releaseNewer.resolve();
+					},
+					() => [olderResult, newer],
+					"settings overlap cleanup",
+				);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	for (const recoveryFailure of ["unknown", "acquisition"] as const) {
+		it(`keeps a failed newer Settings cause beside ${recoveryFailure} recovery after older Settings success`, async () => {
+			const f = await fixture(true, true);
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const olderSaved = Promise.withResolvers<void>();
+				const releaseOlder = Promise.withResolvers<void>();
+				const newerEntered = Promise.withResolvers<void>();
+				const releaseNewer = Promise.withResolvers<void>();
+				const realCommit = f.settings.commitAtomicBatch.bind(f.settings);
+				const settingsFailure = new Error("newer Settings write denied");
+				let commits = 0;
+				vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+					if (++commits === 2) {
+						newerEntered.resolve();
+						await releaseNewer.promise;
+						throw settingsFailure;
+					}
+					const receipt = await realCommit(patches);
+					olderSaved.resolve();
+					await releaseOlder.promise;
+					return receipt;
+				});
+				const unknown = { kind: "unknown" as const, id: "recovery-attempt", error: new Error("uncertain fsync") };
+				const publish = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+				if (recoveryFailure === "unknown") publish.mockResolvedValue(unknown);
+				else publish.mockRejectedValue(unknown.error);
+				const older = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+				const olderResult = observeControl(older);
+				let newer: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						await withinBarrier(olderSaved.promise, "older Settings durable receipt");
+						newer = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+						const newerResult = observeControl(newer);
+						await withinBarrier(newerEntered.promise, "held newer Settings failure");
+						releaseOlder.resolve();
+						await withinBarrier(older, "older Settings saved pending recovery");
+						expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+						releaseNewer.resolve();
+						const failed = await withinBarrier(newerResult, "newer Settings and recovery failure");
+						expect(failed.kind).toBe("rejected");
+						if (failed.kind === "rejected") {
+							expect(failed.error.message).toContain("Unable to persist reasoning settings");
+							if (recoveryFailure === "unknown") expect(failed.error.message).toContain(unknown.id);
+							expect(failed.error).toMatchObject({
+								cause: settingsFailure,
+								errors: [
+									settingsFailure,
+									expect.objectContaining({ cause: recoveryFailure === "unknown" ? unknown : unknown.error }),
+								],
+							});
+						}
+						expect(publish).toHaveBeenCalledTimes(1);
+						expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+						expect(
+							(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+						).toBe(ThinkingLevel.High);
+					},
+					() => {
+						releaseOlder.resolve();
+						releaseNewer.resolve();
+					},
+					() => [olderResult, newer],
+					"uncertain recovery cleanup",
+				);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	it("does not retry an uncertain older recovery after a subsequent Settings failure", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const olderSaved = Promise.withResolvers<void>();
+			const releaseOlder = Promise.withResolvers<void>();
+			const realCommit = f.settings.commitAtomicBatch.bind(f.settings);
+			const newerFailure = new Error("B Settings denied");
+			const laterFailure = new Error("C Settings denied");
+			let commits = 0;
+			vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+				const call = ++commits;
+				if (call === 2) throw newerFailure;
+				if (call === 3) throw laterFailure;
+				const receipt = await realCommit(patches);
+				olderSaved.resolve();
+				await releaseOlder.promise;
+				return receipt;
+			});
+			const unknown = { kind: "unknown" as const, id: "uncertain-older-id", error: new Error("fsync unknown") };
+			const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession").mockResolvedValue(unknown);
+			const older = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			const olderResult = observeControl(older);
+			let newer: Promise<void> | undefined;
+			let later: Promise<void> | undefined;
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(olderSaved.promise, "A Settings saved before B");
+					newer = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+					const b = await withinBarrier(observeControl(newer), "B Settings failure");
+					expect(b.kind).toBe("rejected");
+					if (b.kind === "rejected") expect(b.error).toMatchObject({ cause: newerFailure });
+					releaseOlder.resolve();
+					const a = await withinBarrier(olderResult, "A uncertain recovery");
+					expect(a.kind).toBe("rejected");
+					if (a.kind === "rejected")
+						expect(a.error).toMatchObject({
+							message: expect.stringContaining(unknown.id),
+							cause: unknown,
+						});
+					expect(append).toHaveBeenCalledTimes(1);
+					later = f.session.setThinkingLevelForControl(ThinkingLevel.Medium, true);
+					const c = await withinBarrier(observeControl(later), "C Settings failure");
+					expect(c.kind).toBe("rejected");
+					expect(append).toHaveBeenCalledTimes(1);
+					if (c.kind === "rejected") expect(c.error).toMatchObject({ cause: laterFailure });
+					expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+					expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+					expect(
+						(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+					).toBe(ThinkingLevel.High);
+				},
+				() => releaseOlder.resolve(),
+				() => [olderResult, newer, later],
+				"uncertain older recovery cleanup",
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	it("keeps a superseded Settings receipt without publishing stale thinking metadata", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const held = holdSettingsCommit(f.settings);
+			const older = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+			const settled = observeControl(older);
+			let newer: Promise<void> | undefined;
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(held.entered, "older persisted selection");
+					newer = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+					// A local selection supersedes the still-saving global choice without blocking Settings.
+					held.release();
+					await withinBarrier(older, "superseded persisted selection");
+					await withinBarrier(newer, "newer local selection");
+					expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+					expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toEqual([
+						expect.objectContaining({ thinkingLevel: ThinkingLevel.High, operatorIntent: true }),
+					]);
+				},
+				held.release,
+				() => [settled, newer],
+				"superseded Settings cleanup",
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	for (const phase of ["before Settings", "after Settings"] as const) {
+		it(`does not publish persisted selection when model changes ${phase}`, async () => {
+			const f = await fixture(true, true);
+			const replacementModel = getBundledModel("anthropic", "claude-sonnet-4-6");
+			if (!replacementModel) throw new Error("Missing replacement model");
+			const admission = vi.spyOn(f.manager, "withSharedThinkingControl");
+			const settingsCommit = phase === "before Settings" ? vi.spyOn(f.settings, "commitAtomicBatch") : undefined;
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const held = phase === "before Settings" ? holdSnapshot(f.manager) : holdSettingsCommit(f.settings);
+				let settlement: Promise<void> | undefined;
+				if (phase === "before Settings") {
+					f.agent.emitExternalEvent({ type: "message_end", message: user("earlier canonical") });
+					settlement = f.session.awaitSessionSettlement();
+					void settlement.catch(() => {});
+				}
+				let control: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						if (phase === "before Settings") await withinBarrier(held.entered, "canonical predecessor");
+						control = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+						if (phase === "after Settings") await withinBarrier(held.entered, "Settings commit started");
+						f.agent.setModel(replacementModel);
+						held.release();
+						await withinBarrier(control, "stale persisted selection");
+						if (phase === "before Settings") {
+							expect(admission).not.toHaveBeenCalled();
+							expect(settingsCommit).not.toHaveBeenCalled();
+						}
+						if (settlement) await withinBarrier(settlement, "earlier canonical settlement");
+						expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+						expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+					},
+					held.release,
+					() => [control, settlement],
+					"stale model cleanup",
+				);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	it("records same-level intent and inherited scope once each after shared admission", async () => {
+		const f = await fixture(false, true);
+		await f.session.setThinkingLevelForControl(ThinkingLevel.Low, false);
+		const admitted = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(admitted.kind).toBe("committed");
+		await f.session.setThinkingLevelForControl(ThinkingLevel.Low, false);
+		expect(f.session.getThinkingScopeForControl()).toBe("session");
+		await f.session.setThinkingLevelForControl(ThinkingLevel.Inherit, false);
+		await f.manager.flush();
+		const entries = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change");
+		expect(entries).toHaveLength(3);
+		expect(entries[1]).toMatchObject({
+			thinkingLevel: ThinkingLevel.Low,
+			operatorIntent: true,
+			parentId: admitted.kind === "committed" ? admitted.id : undefined,
+		});
+		expect(entries[2]).toMatchObject({ thinkingLevel: ThinkingLevel.Inherit });
+		expect(f.session.getThinkingScopeForControl()).toBe("global config");
+	});
+
+	it("holds live thinking behind owned publication while excluding unrelated shared writes", async () => {
+		const f = await fixture(false, true);
+		const admitted = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(admitted.kind).toBe("committed");
+		const sibling = await SessionManager.open(f.file, f.destination);
+		managers.push(sibling);
+		const held = holdSnapshot(f.manager);
+		const before = f.session.thinkingLevel;
+		const control = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+		const result = observeControl(control);
+		try {
+			await withinBarrier(held.entered, "owned thinking publication");
+			expect(f.session.thinkingLevel).toBe(before);
+			expect(f.agent.state.thinkingLevel).not.toBe(ThinkingLevel.High);
+			for (const manager of [f.manager, sibling]) {
+				const blocked = await manager.appendMessageSharingSession(user("not owned"));
+				expect(blocked).toMatchObject({ kind: "rejected" });
+			}
+			held.release();
+			await withinBarrier(control, "owned thinking completion");
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			const later = await sibling.appendMessageSharingSession(user("after release"));
+			expect(later.kind).toBe("committed");
+		} finally {
+			held.release();
+			await withinBarrier(result, "owned thinking cleanup");
+		}
+	});
+
+	for (const failure of ["stale", "rejected", "unknown", "acquisition"] as const) {
+		it(`reports ${failure} local thinking publication without live update`, async () => {
+			const f = await fixture(false, true);
+			const admitted = await f.manager.appendMessageSharingSession(user("shared"));
+			expect(admitted.kind).toBe("committed");
+			const before = f.session.thinkingLevel;
+			const bytes = await Bun.file(f.file).text();
+			const original = new Error("original thinking publication failure");
+			const result =
+				failure === "stale"
+					? { kind: "stale" as const, reason: "cursor_not_committed" as const }
+					: failure === "unknown"
+						? { kind: "unknown" as const, id: "thinking-attempt", error: original }
+						: { kind: "rejected" as const, error: original };
+			const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+			if (failure === "acquisition") append.mockRejectedValue(original);
+			else append.mockResolvedValue(result);
+			await expect(f.session.setThinkingLevelForControl(ThinkingLevel.High, false)).rejects.toMatchObject({
+				message: expect.stringContaining(failure === "unknown" ? "thinking-attempt" : "publication"),
+				cause: failure === "acquisition" ? original : result,
+			});
+			expect(append).toHaveBeenCalledTimes(1);
+			expect(f.session.thinkingLevel).toBe(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		});
+	}
+
+	it("commits a canonical AgentSession message after an owned thinking control releases", async () => {
+		const f = await fixture(false, true);
+		{
+			const initial = await f.manager.appendMessageSharingSession(user("shared"));
+			expect(initial.kind).toBe("committed");
+			const held = holdSnapshot(f.manager);
+			const abort = vi.spyOn(f.agent, "abort");
+			const control = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+			const controlResult = observeControl(control);
+			let settlement: Promise<void> | undefined;
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(held.entered, "owned local thinking publication");
+					f.agent.emitExternalEvent({ type: "message_end", message: user("canonical during thinking") });
+					settlement = f.session.awaitSessionSettlement();
+					void settlement.catch(() => {});
+					held.release();
+					await withinBarrier(control, "owned thinking control release");
+					await withinBarrier(settlement, "canonical message admission after thinking");
+					expect(abort).not.toHaveBeenCalled();
+					const branch = f.manager.getBranch();
+					const thinking = branch.filter(entry => entry.type === "thinking_level_change");
+					const canonical = branch.filter(
+						entry =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							entry.message.content === "canonical during thinking",
+					);
+					expect(thinking).toHaveLength(1);
+					expect(canonical).toHaveLength(1);
+					expect((await Bun.file(f.file).text()).includes('"canonical during thinking"')).toBe(true);
+				},
+				held.release,
+				() => [controlResult, settlement],
+				"canonical/control cleanup",
+			);
+		}
+	});
+
+	it("waits for an earlier canonical publication before owning a thinking control", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		f.agent.emitExternalEvent({ type: "message_end", message: user("earlier canonical") });
+		const settlement = f.session.awaitSessionSettlement();
+		void settlement.catch(() => {});
+		let control: Promise<void> | undefined;
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(held.entered, "earlier canonical publication");
+				control = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+				held.release();
+				await withinBarrier(settlement, "earlier canonical completion");
+				await withinBarrier(control, "subsequent thinking control");
+				expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+				const branch = f.manager.getBranch();
+				const canonical = branch.find(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						entry.message.content === "earlier canonical",
+				);
+				const thinking = branch.find(entry => entry.type === "thinking_level_change");
+				expect(canonical?.type).toBe("message");
+				expect(thinking?.parentId).toBe(canonical?.id);
+			},
+			held.release,
+			() => [settlement, control],
+			"canonical predecessor cleanup",
+		);
+	});
+
+	it("discards a thinking invocation whose model changes while an earlier canonical entry holds the lane", async () => {
+		const f = await fixture(false, true);
+		const replacementModel = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!replacementModel) throw new Error("Missing replacement model");
+		const admission = vi.spyOn(f.manager, "withSharedThinkingControl");
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		f.agent.emitExternalEvent({ type: "message_end", message: user("predecessor") });
+		const settlement = f.session.awaitSessionSettlement();
+		void settlement.catch(() => {});
+		let control: Promise<void> | undefined;
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(held.entered, "predecessor before model change");
+				control = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				f.agent.setModel(replacementModel);
+				held.release();
+				await withinBarrier(settlement, "predecessor after model change");
+				await withinBarrier(control, "superseded model control");
+				expect(admission).not.toHaveBeenCalled();
+				expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+				expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+			},
+			held.release,
+			() => [settlement, control],
+			"model change cleanup",
+		);
+	});
+
+	for (const cancelled of [false, true]) {
+		it(`defers workflow acceptance metadata while local thinking publication is held (cancelled=${cancelled})`, async () => {
+			const mock = createMockModel({ handler: { content: ["workflow complete"] } });
+			const f = await fixture(false, true, mock.stream);
+			{
+				await initializeLocalRoot({
+					getSessionId: () => f.manager.getSessionId(),
+					getArtifactsDir: () => f.manager.getArtifactsDir(),
+					isManagedDestination: () => f.manager.isManagedDestination(),
+					getManagedLegacyLocalMigrationSource: () => f.manager.getManagedLegacyLocalMigrationSource(),
+				});
+				const held = holdSnapshot(f.manager);
+				const accepted = Promise.withResolvers<void>();
+				const cancellation = new AbortController();
+				const control = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				const controlResult = observeControl(control);
+				let prompt: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						await withinBarrier(held.entered, "thinking owner before workflow prompt");
+						prompt = f.session.prompt("workflow acceptance during thinking", {
+							onPreflightAccepted: () => accepted.resolve(),
+							preflightSignal: cancellation.signal,
+						});
+						void prompt.catch(() => {});
+						await withinBarrier(accepted.promise, "workflow acceptance preflight");
+						expect(mock.calls).toHaveLength(0);
+						if (cancelled) cancellation.abort();
+						held.release();
+						await withinBarrier(control, "thinking control before workflow");
+						if (cancelled) await expect(withinBarrier(prompt, "cancelled workflow prompt")).rejects.toThrow();
+						else await withinBarrier(prompt, "workflow prompt completion");
+						expect(mock.calls).toHaveLength(cancelled ? 0 : 1);
+						const branch = f.manager.getBranch();
+						expect(
+							branch.filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
+						).toHaveLength(cancelled ? 0 : 1);
+						expect(
+							branch.some(
+								entry =>
+									entry.type === "message" &&
+									entry.message.role === "user" &&
+									JSON.stringify(entry.message.content).includes("workflow acceptance during thinking"),
+							),
+						).toBe(!cancelled);
+					},
+					held.release,
+					() => [controlResult, prompt],
+					"workflow overlap cleanup",
+				);
+			}
+		});
+	}
+
+	it("rechecks a replacement thinking group before publishing waiting workflow metadata", async () => {
+		const mock = createMockModel({ handler: { content: ["done"] } });
+		const f = await fixture(false, true, mock.stream);
+		await initializeLocalRoot({
+			getSessionId: () => f.manager.getSessionId(),
+			getArtifactsDir: () => f.manager.getArtifactsDir(),
+			isManagedDestination: () => f.manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => f.manager.getManagedLegacyLocalMigrationSource(),
+		});
+		const firstHeld = holdSnapshot(f.manager);
+		const secondRequested = Promise.withResolvers<{ completion: Promise<void> }>();
+		const secondEntered = Promise.withResolvers<void>();
+		const secondRelease = Promise.withResolvers<void>();
+		const appendThinking = f.manager.appendThinkingLevelChangeSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession").mockImplementation(async (...args) => {
+			if (args[0] === ThinkingLevel.High) {
+				secondEntered.resolve();
+				await secondRelease.promise;
+			}
+			return appendThinking(...args);
+		});
+		let second: Promise<void> | undefined;
+		const appendMessage = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(message => {
+			if (message.role === "user" && message.content === "between groups") {
+				second = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				void second.catch(() => {});
+				secondRequested.resolve({ completion: second });
+			}
+			return appendMessage(message);
+		});
+		const first = f.session.setThinkingLevelForControl(ThinkingLevel.Low, false);
+		void first.catch(() => {});
+		let prompt: Promise<void> | undefined;
+		let settlement: Promise<void> | undefined;
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(firstHeld.entered, "first thinking group");
+				f.agent.emitExternalEvent({ type: "message_end", message: user("between groups") });
+				settlement = f.session.awaitSessionSettlement();
+				void settlement.catch(() => {});
+				const accepted = Promise.withResolvers<void>();
+				prompt = f.session.prompt("workflow waits for replacement group", {
+					onPreflightAccepted: () => accepted.resolve(),
+				});
+				void prompt.catch(() => {});
+				await withinBarrier(accepted.promise, "waiting workflow acceptance");
+				firstHeld.release();
+				const replacement = await withinBarrier(secondRequested.promise, "replacement control requested");
+				await withinBarrier(
+					Promise.race([secondEntered.promise, replacement.completion]),
+					"replacement thinking group",
+				);
+				expect(
+					f.manager
+						.getBranch()
+						.filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
+				).toHaveLength(0);
+				secondRelease.resolve();
+				await withinBarrier(
+					Promise.all([first, replacement.completion, settlement, prompt]),
+					"replacement and waiting workflow",
+				);
+				const branch = f.manager.getBranch();
+				const thinking = branch.findLast(entry => entry.type === "thinking_level_change");
+				expect(thinking).toMatchObject({ thinkingLevel: ThinkingLevel.High });
+				const workflow = branch.filter(
+					entry => entry.type === "custom" && entry.customType === "workflow-intent-diff",
+				);
+				expect(workflow).toHaveLength(1);
+				expect(workflow[0].parentId).toBe(thinking!.id);
+				expect(mock.calls).toHaveLength(1);
+			},
+			() => {
+				firstHeld.release();
+				secondRelease.resolve();
+			},
+			() => [first, second, settlement, prompt],
+			"replacement cleanup",
+		);
+	});
+
+	it("waits for a started workflow publication before admitting a thinking control", async () => {
+		const mock = createMockModel({ handler: { content: ["done"] } });
+		const f = await fixture(false, true, mock.stream);
+		await initializeLocalRoot({
+			getSessionId: () => f.manager.getSessionId(),
+			getArtifactsDir: () => f.manager.getArtifactsDir(),
+			isManagedDestination: () => f.manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => f.manager.getManagedLegacyLocalMigrationSource(),
+		});
+		const held = holdSnapshot(f.manager);
+		const prompt = f.session.prompt("earlier workflow prompt");
+		void prompt.catch(() => {});
+		let control: Promise<void> | undefined;
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(held.entered, "started workflow publication");
+				control = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+				held.release();
+				await withinBarrier(prompt, "earlier workflow completion");
+				await withinBarrier(control, "thinking after workflow");
+				const entries = f.manager.getBranch();
+				const workflow = entries.find(
+					entry => entry.type === "custom" && entry.customType === "workflow-intent-diff",
+				);
+				const thinking = entries.find(entry => entry.type === "thinking_level_change");
+				expect(workflow?.id).toBeTruthy();
+				expect(thinking?.id).toBeTruthy();
+				expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			},
+			held.release,
+			() => [prompt, control],
+			"workflow predecessor cleanup",
+		);
+	});
+
+	it("does not stage a superseded local control while its shared lease awaits", async () => {
+		const f = await fixture(false, true);
+		const admitted = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(admitted.kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		const older = f.session.setThinkingLevelForControl(ThinkingLevel.Low, false);
+		const olderResult = observeControl(older);
+		let newer: Promise<void> | undefined;
+		try {
+			await withinBarrier(held.entered, "older thinking lease");
+			f.agent.emitExternalEvent({ type: "message_end", message: user("behind overlapping thinking") });
+			newer = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+			held.release();
+			await withinBarrier(older, "superseded thinking control");
+			await withinBarrier(newer, "newer thinking control");
+			await withinBarrier(f.session.awaitSessionSettlement(), "canonical behind overlapping thinking");
+			expect(
+				f.manager
+					.getBranch()
+					.some(
+						entry =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							entry.message.content === "behind overlapping thinking",
+					),
+			).toBe(true);
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			const entries = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change");
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).toMatchObject({ thinkingLevel: ThinkingLevel.High, operatorIntent: true });
+		} finally {
+			held.release();
+			await withinBarrier(Promise.allSettled([olderResult, newer].filter(Boolean)), "thinking overlap cleanup");
+		}
+	});
+
+	it("retains a committed older entry without applying it after a newer control arrives", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager, 2);
+		const older = f.session.setThinkingLevelForControl(ThinkingLevel.Low, false);
+		const olderResult = observeControl(older);
+		let newer: Promise<void> | undefined;
+		try {
+			await withinBarrier(held.entered, "older committed thinking entry");
+			newer = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+			held.release();
+			await withinBarrier(older, "older published thinking completion");
+			await withinBarrier(newer, "newer published thinking completion");
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(
+				f.manager
+					.getBranch()
+					.filter(entry => entry.type === "thinking_level_change")
+					.map(entry => entry.thinkingLevel),
+			).toEqual([ThinkingLevel.Low, ThinkingLevel.High]);
+		} finally {
+			held.release();
+			await withinBarrier(Promise.allSettled([olderResult, newer].filter(Boolean)), "committed overlap cleanup");
+		}
+	});
+
+	it("rejects controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
+		const f = await fixture();
+		await f.admit();
+		const before = snapshot(f.session);
+		const bytes = await Bun.file(f.file).text();
+		const events = vi.fn();
+		const unsubscribe = f.session.subscribe(events);
+		const credentials = vi.spyOn(f.registry, "getApiKey");
+		const persist = vi.spyOn(f.settings, "commitAtomicBatch");
+		const mutationStarted = vi.fn();
+		const operations: Array<() => unknown> = [
+			() => f.session.setServiceTier("priority"),
+			() => f.session.setFastMode(true),
+			() => f.session.setThinkingLevel(ThinkingLevel.High, true),
+			() => f.session.setThinkingLevelForControl(ThinkingLevel.High, false),
+			() => f.session.setThinkingLevelForControl(ThinkingLevel.High, true),
+			() => f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted }),
+			() => f.session.setDefaultModelSelection(f.model, ThinkingLevel.High, { onBeforeMutation: mutationStarted }),
+			() => f.session.setModelTemporary(f.model),
+			() => f.session.setDefaultModelProfileForControl("unavailable", { onBeforeActivation: mutationStarted }),
+			() => f.session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5"], "test"),
+			() => f.session.setActiveToolsByName([]),
+			() => f.session.compact(),
+			() => f.session.navigateTree(f.first, { summarize: true }),
+		];
+		try {
+			for (const operation of operations) {
+				await expect(Promise.resolve().then(operation)).rejects.toBeInstanceOf(
+					SharedSessionMutationUnsupportedError,
+				);
+				expect(snapshot(f.session)).toEqual(before);
+				expect(await Bun.file(f.file).text()).toBe(bytes);
+				expect(events).not.toHaveBeenCalled();
+				expect(credentials).not.toHaveBeenCalled();
+				expect(persist).not.toHaveBeenCalled();
+				expect(mutationStarted).not.toHaveBeenCalled();
+				expect(f.execute).not.toHaveBeenCalled();
+				expect(f.rebuild).not.toHaveBeenCalled();
+			}
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("rechecks admission after model credentials resolve", async () => {
+		const f = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<string>();
+		vi.spyOn(f.registry, "getApiKey").mockImplementation(async () => {
+			entered.resolve();
+			return release.promise;
+		});
+		const mutationStarted = vi.fn();
+		const pending = f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted });
+		const outcome = observeControl(pending);
+		try {
+			await withinBarrier(
+				Promise.race([
+					entered.promise,
+					outcome.then(result => {
+						if (result.kind === "rejected") throw result.error;
+						throw new Error("Model selection settled before credential hook");
+					}),
+				]),
+				"credential hook",
+			);
+			await withinBarrier(f.admit(), "shared admission during credential hook");
+			const before = snapshot(f.session);
+			const bytes = await Bun.file(f.file).text();
+			release.resolve("test-key");
+			const result = await withinBarrier(outcome, "model selection refusal");
+			expect(result.kind).toBe("rejected");
+			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+			expect(mutationStarted).not.toHaveBeenCalled();
+		} finally {
+			release.resolve("test-key");
+			await withinBarrier(outcome, "model selection cleanup");
+		}
+	});
+
+	it("rechecks tool selection after prompt preparation without publishing it", async () => {
+		const f = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		f.rebuild.mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["Must not publish"] };
+		});
+		const pending = f.session.setActiveToolsByName([]);
+		const outcome = observeControl(pending);
+		try {
+			await withinBarrier(
+				Promise.race([
+					entered.promise,
+					outcome.then(result => {
+						if (result.kind === "rejected") throw result.error;
+						throw new Error("Tool selection settled before prompt rebuild hook");
+					}),
+				]),
+				"prompt rebuild hook",
+			);
+			await withinBarrier(f.admit(), "shared admission during prompt rebuild hook");
+			const before = snapshot(f.session);
+			release.resolve();
+			const result = await withinBarrier(outcome, "tool selection refusal");
+			expect(result.kind).toBe("rejected");
+			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+			expect(snapshot(f.session)).toEqual(before);
+		} finally {
+			release.resolve();
+			await withinBarrier(outcome, "tool selection cleanup");
+		}
+	});
+
+	it("retains shared read-only and genuine no-op controls", async () => {
+		const f = await fixture();
+		await f.admit();
+		const before = snapshot(f.session);
+		const bytes = await Bun.file(f.file).text();
+		f.session.setServiceTier(f.session.serviceTier);
+		f.session.setThinkingLevel(f.session.thinkingLevel);
+		expect(f.session.getAvailableThinkingLevels().length).toBeGreaterThan(0);
+		expect(await f.session.cycleRoleModels([])).toBeUndefined();
+		expect(await f.session.activateDiscoveredTools([])).toEqual([]);
+		expect(await f.session.navigateTree(f.manager.getLeafId()!, { summarize: true })).toEqual({ cancelled: false });
+		expect(snapshot(f.session)).toEqual(before);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	for (const failPublication of [false, true]) {
+		it(`refuses durable thinking after sibling shared admission (failure=${failPublication})`, async () => {
+			const f = await fixture(true);
+			const sibling = await SessionManager.open(f.file, f.destination);
+			managers.push(sibling);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const capture = sibling.captureCommittedSnapshot.bind(sibling);
+			let paused = false;
+			vi.spyOn(sibling, "captureCommittedSnapshot").mockImplementation(async () => {
+				if (!paused) {
+					paused = true;
+					entered.resolve();
+					await release.promise;
+					if (failPublication) throw new Error("injected shared publication failure");
+				}
+				return capture();
+			});
+			const publication = sibling.appendMessageSharingSession(user("sibling first")).then(
+				result => ({ kind: "outcome" as const, result }),
+				error => ({ kind: "error" as const, error }),
+			);
+			try {
+				await withinBarrier(
+					Promise.race([
+						entered.promise,
+						publication.then(result => {
+							if (result.kind === "error") throw result.error;
+							throw new Error(`Shared publication settled before snapshot barrier: ${result.result.kind}`);
+						}),
+					]),
+					"sibling shared snapshot barrier",
+				);
+				const before = snapshot(f.session);
+				const bytes = await Bun.file(f.file).text();
+				const durableBefore = (await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get(
+					"defaultThinkingLevel",
+				);
+				const commit = vi.spyOn(f.settings, "commitAtomicBatch");
+				const control = await observeControl(f.session.setThinkingLevelForControl(ThinkingLevel.High, true));
+				expect(control.kind).toBe("rejected");
+				if (control.kind === "rejected")
+					expect(control.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+				expect(commit).not.toHaveBeenCalled();
+				expect(snapshot(f.session)).toEqual(before);
+				expect(await Bun.file(f.file).text()).toBe(bytes);
+				expect(
+					(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+				).toBe(durableBefore);
+				release.resolve();
+				const result = await withinBarrier(publication, "sibling publication completion");
+				if (failPublication) {
+					expect(result.kind).toBe("error");
+					if (result.kind === "error")
+						expect(String(result.error)).toContain("injected shared publication failure");
+				} else {
+					if (result.kind === "error") throw result.error;
+					expect(result.result.kind).toBe("committed");
+				}
+				// No durable write is needed to prove the short-lived count was released.
+				expect(await f.manager.withDurableThinkingControl(async () => "released")).toBe("released");
+			} finally {
+				release.resolve();
+				await withinBarrier(publication, "sibling publication cleanup");
+				await f.settings.close();
+			}
+		});
+	}
+
+	for (const fail of [false, true]) {
+		it(`holds shared admission through durable thinking commit (failure=${fail})`, async () => {
+			const f = await fixture(true);
+			const sibling = await SessionManager.open(f.file, f.destination);
+			managers.push(sibling);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const commit = f.settings.commitAtomicBatch.bind(f.settings);
+			vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+				entered.resolve();
+				await release.promise;
+				if (fail) throw new Error("injected settings commit failure");
+				return commit(patches);
+			});
+			const before = snapshot(f.session);
+			const bytes = await Bun.file(f.file).text();
+			const outcome = observeControl(f.session.setThinkingLevelForControl(ThinkingLevel.High, true));
+			try {
+				await withinBarrier(
+					Promise.race([
+						entered.promise,
+						outcome.then(result => {
+							if (result.kind === "rejected") throw result.error;
+							throw new Error("Thinking control completed before settings barrier");
+						}),
+					]),
+					"durable thinking commit barrier",
+				);
+				for (const manager of [f.manager, sibling]) {
+					const revisions = manager.revisionSnapshot();
+					const result = await manager.appendMessageSharingSession(user("blocked"));
+					expect(result.kind).toBe("rejected");
+					if (result.kind === "rejected")
+						expect(String(result.error)).toContain("durable_thinking_control_in_flight");
+					expect(manager.revisionSnapshot()).toEqual(revisions);
+				}
+				expect(snapshot(f.session)).toEqual(before);
+				expect(await Bun.file(f.file).text()).toBe(bytes);
+				const unrelated = SessionManager.create(f.cwd, f.destination);
+				managers.push(unrelated);
+				const independent = await unrelated.appendMessageSharingSession(user("unrelated session"));
+				expect(independent.kind).toBe("committed");
+				release.resolve();
+				const result = await withinBarrier(outcome, "durable thinking completion");
+				if (fail) {
+					expect(result.kind).toBe("rejected");
+					if (result.kind === "rejected")
+						expect(String(result.error)).toContain("Unable to persist reasoning settings");
+					expect(snapshot(f.session)).toEqual(before);
+				} else {
+					if (result.kind === "rejected") throw result.error;
+					expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+					expect(f.settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+					expect(
+						(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+					).toBe(ThinkingLevel.High);
+					expect(f.manager.getBranch().some(entry => entry.type === "thinking_level_change")).toBe(true);
+				}
+				await f.manager.flush();
+				const later = await f.manager.appendMessageSharingSession(user("after control"));
+				expect(later.kind).toBe("committed");
+			} finally {
+				release.resolve();
+				await withinBarrier(outcome, "durable thinking cleanup");
+				await f.settings.close();
+			}
+		});
+	}
+
+	it("keeps ordinary control mutations working", async () => {
+		const f = await fixture();
+		f.session.setServiceTier("priority");
+		expect(f.agent.serviceTier).toBe("priority");
+		await f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		f.session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5"], "test");
+		expect(f.session.getConfiguredModelChain("default")).toEqual(["anthropic/claude-sonnet-4-5"]);
+		await f.session.setActiveToolsByName([]);
+		expect(f.session.getActiveToolNames()).toEqual([]);
+		expect(f.agent.state.systemPrompt).toEqual(["Rebuilt"]);
+		expect(f.rebuild).toHaveBeenCalledTimes(1);
+		expect(f.execute).not.toHaveBeenCalled();
+		await f.manager.flush();
+		expect(await Bun.file(f.file).text()).toContain("service_tier_change");
+	});
+});

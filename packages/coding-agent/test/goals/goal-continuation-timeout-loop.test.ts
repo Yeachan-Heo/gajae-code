@@ -60,7 +60,7 @@ async function advanceGoalContinuation(): Promise<void> {
 async function createHarness(): Promise<Harness> {
 	resetSettingsForTest();
 	const tempDir = TempDir.createSync("@goal-timeout-loop-");
-	await Settings.init({ inMemory: true, cwd: tempDir.path() });
+	await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "starReminder.enabled": false } });
 	const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 	const model = new ModelRegistry(authStorage).find("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected test model");

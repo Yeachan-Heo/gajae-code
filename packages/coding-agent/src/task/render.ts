@@ -6,7 +6,7 @@
  */
 import path from "node:path";
 import type { Component } from "@gajae-code/tui";
-import { Text } from "@gajae-code/tui";
+import { Text, visibleWidth } from "@gajae-code/tui";
 import { formatNumber, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
@@ -19,6 +19,7 @@ import {
 	replaceTabs,
 	truncateToWidth,
 } from "../tools/render-utils";
+import { parseReportMetricDetails, type ReportMetricDetails, renderMetricCharts } from "../tools/report-metric";
 import {
 	type FindingPriority,
 	getPriorityInfo,
@@ -531,6 +532,8 @@ export function renderCall(args: TaskParams, _options: RenderResultOptions, them
 	return new Text(lines.join("\n"), 0, 0);
 }
 
+const RESULT_INDENT = "   ";
+
 /**
  * Render streaming progress for a single agent.
  */
@@ -539,11 +542,13 @@ function renderAgentProgress(
 	isLast: boolean,
 	expanded: boolean,
 	theme: Theme,
-	spinnerFrame?: number,
+	spinnerFrame: number | undefined,
 	/** When true, omit wall-clock-derived displays (current-tool elapsed, retry
-	 * countdown) so the output is a pure function of `progress` — required when the
-	 * caller caches these lines (the `subagent` await panel). */
-	staticTime = false,
+	 * countdown) so the output is a pure function of `progress`, for callers that
+	 * cache these lines. */
+	staticTime: boolean,
+	/** Columns available to these lines; width-fitted content (metric charts) is sized to it. */
+	width: number,
 ): string[] {
 	const lines: string[] = [];
 	const prefix = isLast ? theme.fg("dim", theme.tree.last) : theme.fg("dim", theme.tree.branch);
@@ -679,6 +684,14 @@ function renderAgentProgress(
 				continue;
 			}
 
+			if (toolName === "report_metric") {
+				const metrics = (dataArray as unknown[])
+					.map(parseReportMetricDetails)
+					.filter((metric): metric is ReportMetricDetails => metric !== undefined);
+				lines.push(...renderMetricCharts(metrics, continuePrefix, width, expanded, theme));
+				continue;
+			}
+
 			// Nested `task` data has its own dedicated tree renderer below that
 			// also merges in the in-flight snapshot — skip the generic inline
 			// path so we don't render twice.
@@ -714,7 +727,14 @@ function renderAgentProgress(
 	const inflight = progress.inflightTaskDetails;
 	if (completedTaskCalls.length > 0 || inflight) {
 		const snapshots = inflight ? [...completedTaskCalls, inflight] : completedTaskCalls;
-		const nestedLines = renderNestedTaskTree(snapshots, expanded, theme, spinnerFrame, staticTime);
+		const nestedLines = renderNestedTaskTree(
+			snapshots,
+			expanded,
+			theme,
+			spinnerFrame,
+			staticTime,
+			width - visibleWidth(continuePrefix),
+		);
 		for (const line of nestedLines) {
 			lines.push(`${continuePrefix}${line}`);
 		}
@@ -727,21 +747,6 @@ function renderAgentProgress(
 	}
 
 	return lines;
-}
-
-/**
- * Public wrapper to render a single subagent's live `AgentProgress` for the
- * `subagent` await panel. Reuses the internal task-progress renderer so the
- * await panel stays at parity with the inline task panel.
- */
-export function renderSubagentLiveProgress(
-	progress: AgentProgress,
-	expanded: boolean,
-	theme: Theme,
-	spinnerFrame?: number,
-	staticTime = false,
-): string[] {
-	return renderAgentProgress(progress, true, expanded, theme, spinnerFrame, staticTime);
 }
 
 /**
@@ -1015,7 +1020,18 @@ export function renderResult(
 				lines.push(...renderProviderDegradationNotices(details.progress, theme));
 				details.progress.forEach((progress, i) => {
 					const isLast = i === details.progress!.length - 1;
-					lines.push(...renderAgentProgress(progress, isLast, expanded, theme, spinnerFrame));
+					// The lines are indented by RESULT_INDENT below.
+					lines.push(
+						...renderAgentProgress(
+							progress,
+							isLast,
+							expanded,
+							theme,
+							spinnerFrame,
+							false,
+							width - RESULT_INDENT.length,
+						),
+					);
 				});
 			}
 			if (hasResults && !shouldRenderProgress) {
@@ -1077,7 +1093,7 @@ export function renderResult(
 			}
 
 			const indented = lines.map(line =>
-				line.length > 0 ? truncateToWidth(`   ${replaceTabs(line)}`, width, Ellipsis.Omit) : "",
+				line.length > 0 ? truncateToWidth(`${RESULT_INDENT}${replaceTabs(line)}`, width, Ellipsis.Omit) : "",
 			);
 			if (!hasDynamicRetry) cached = { key, lines: indented };
 			return indented;
@@ -1118,8 +1134,9 @@ function renderNestedTaskTree(
 	detailsList: TaskToolDetails[],
 	expanded: boolean,
 	theme: Theme,
-	spinnerFrame?: number,
-	staticTime = false,
+	spinnerFrame: number | undefined,
+	staticTime: boolean,
+	width: number,
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
@@ -1135,7 +1152,7 @@ function renderNestedTaskTree(
 			lines.push(...renderProviderDegradationNotices(inflight, theme));
 			inflight.forEach((prog, index) => {
 				const isLast = index === inflight.length - 1;
-				lines.push(...renderAgentProgress(prog, isLast, expanded, theme, spinnerFrame, staticTime));
+				lines.push(...renderAgentProgress(prog, isLast, expanded, theme, spinnerFrame, staticTime, width));
 			});
 		}
 	}

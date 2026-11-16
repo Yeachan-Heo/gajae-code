@@ -697,7 +697,15 @@ describe("AgentSession fallback upstream request counts", () => {
 
 		expect(prepareSpy).toHaveBeenCalled();
 		expect(calls).toEqual([selector(primary), selector(primary)]);
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		// Two runs, two terminals: the overflow predecessor keeps its own agent_end
+		// (published before the successor's) instead of being displaced by it.
+		expect(events.filter(event => event.type === "agent_start")).toHaveLength(2);
+		const ends = events.filter(
+			(event): event is Extract<AgentSessionEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		expect(ends).toHaveLength(2);
+		expect(ends[0]!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error", errorStatus: 400 });
+		expect(ends[1]!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			content: [{ type: "text", text: "Queued successor completed" }],

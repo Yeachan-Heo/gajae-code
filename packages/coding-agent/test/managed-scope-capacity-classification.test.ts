@@ -3,11 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
-import {
-	listManagedCandidates,
-	prepareManagedSessionScopeForWriteSync,
-	resolveManagedScope,
-} from "../src/session/internal/managed-session-scope";
+import { listManagedCandidates, resolveManagedScope } from "../src/sdk/session-readonly/scope";
+import { prepareManagedSessionScopeForWriteSync } from "../src/session/internal/managed-session-scope";
 
 const temporaryDirectories: string[] = [];
 

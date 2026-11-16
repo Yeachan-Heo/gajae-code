@@ -2,12 +2,14 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
+import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/sdk";
+import type { DurableModelProfileOwnership } from "../src/config/model-profile-ownership";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
-import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
 
@@ -31,6 +33,7 @@ interface FakeAcpBuiltinSession {
 	isFastForProvider(provider?: string): boolean;
 	isFastForSubagentProvider(provider?: string): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
+	getAgentModelOverrides(): Record<string, ModelSelectorValue>;
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
 	getSessionStats: () => {
@@ -169,6 +172,11 @@ function createRuntime() {
 			this._todoPhases = phases;
 		},
 		async refreshBaseSystemPrompt() {},
+		// Mirrors AgentSession: the effective selector map merges this session's
+		// `task.agentModelOverrides` with its live session-owned selections.
+		getAgentModelOverrides() {
+			return structuredClone(this.settings.get("task.agentModelOverrides") ?? {});
+		},
 		getAsyncJobSnapshot: () => null,
 		getSessionStats: () => ({
 			sessionFile: undefined,
@@ -317,6 +325,13 @@ function createRuntime() {
 		},
 	};
 }
+
+// Fresh isolated settings carry no persisted owner, so /model must commit against the inherited v0 owner it observed.
+const INHERITED_OWNERSHIP_V0: DurableModelProfileOwnership = {
+	schemaVersion: 1,
+	version: 0,
+	marker: { kind: "inherit" },
+};
 
 describe("ACP builtin slash commands", () => {
 	it("consumes fast status without returning prompt text", async () => {
@@ -668,7 +683,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("model: reports only default plus GJC role-agent assignment targets", async () => {
-		const { output, runtime } = createRuntime();
+		const { output, runtime, session } = createRuntime();
 		runtime.settings = Settings.isolated({
 			cycleOrder: ["smol", "task", "default"],
 			modelRoles: {
@@ -683,6 +698,8 @@ describe("ACP builtin slash commands", () => {
 				smol: { name: "Quick", color: "error" },
 			},
 		});
+		// The summary reads role overrides from the session's own settings.
+		session.settings = runtime.settings;
 
 		const result = await executeAcpBuiltinSlashCommand("/model", runtime);
 
@@ -730,6 +747,8 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(session.model).toBe(available[0]);
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: undefined,
@@ -750,6 +769,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet:low"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
@@ -771,6 +792,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet:low"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
@@ -842,13 +865,14 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(reasoningModel, "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-fable-5:xhigh"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-fable-5",
 			thinkingLevel: "xhigh",
 		});
 		expect(session.model).toBe(reasoningModel);
 		expect(output[0]).toContain("Default model set to anthropic/claude-fable-5:xhigh");
-		expect(runtime.settings.getModelRole("default")).toBe("anthropic/claude-fable-5:xhigh");
 	});
 
 	it("model: requires explicit Grok effort for argument-based role assignment", async () => {
@@ -900,6 +924,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(grok, "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "xai/grok-4.6:xhigh"]]),
 			cause: "user-selection",
 			selector: "xai/grok-4.6",
 			thinkingLevel: "xhigh",

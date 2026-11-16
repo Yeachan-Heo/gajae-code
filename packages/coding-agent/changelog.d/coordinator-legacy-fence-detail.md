@@ -1,0 +1,3 @@
+### Fixed
+
+- The coordinator MCP bridge now reports an SDK broker legacy-history refusal as `legacy_lifecycle_ambiguous` instead of collapsing it to `unavailable`, so operators can tell a ledger fence from a broker outage. For example, `gjc_coordinator_stop_session` returns `close_failed` with `detail: "legacy_lifecycle_ambiguous"`. The refusal stays retryable under the same delegate and retirement keys, as it was while it surfaced as `unavailable`: the broker refuses before recording or executing anything. Retrying will not clear it, though. It persists until an operator resolves the fencing legacy ledger rows (see `docs/sdk-session-cli.md`, "Legacy lifecycle admission fence").

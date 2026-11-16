@@ -772,6 +772,47 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		expect(Object.values(registry.deletions).filter(entry => entry.session_id === sessionId)).toEqual([]);
 	});
 
+	it("reports a broker legacy-history fence as its own close_failed detail and stays retryable", async () => {
+		const root = await tempRoot();
+		const rows = fixtureBrokerRows(root, "fenced");
+		let fenced = true;
+		let closed = false;
+		const { server, sessionFile } = await createServer(root, {
+			brokerSessionsOverride: async () => [closed ? rows.terminal : rows.live],
+			closeHandler: async () => {
+				if (fenced)
+					return {
+						ok: false,
+						error: {
+							code: "legacy_lifecycle_ambiguous",
+							message: "legacy lifecycle request has an ambiguous target",
+						},
+					};
+				closed = true;
+				return { ok: true, result: { sessionId: "fenced" } };
+			},
+		});
+		await writeSession(sessionFile("fenced"), root, "fenced", { ephemeral: true });
+		const refused = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: "fenced",
+			allow_mutation: true,
+		});
+		expect(refused).toEqual({
+			ok: false,
+			reason: "close_failed",
+			detail: "legacy_lifecycle_ambiguous",
+			closed: false,
+			session_id: "fenced",
+		});
+		expect(await Bun.file(sessionFile("fenced")).exists()).toBe(true);
+		// The refusal is pre-admission, so once the broker admits the close the same stop completes.
+		fenced = false;
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "fenced", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		expect(await Bun.file(sessionFile("fenced")).exists()).toBe(false);
+	});
+
 	it("reuses the close idempotency key when the idle reaper retries", async () => {
 		const root = await tempRoot();
 		const { server, controls, sessionFile } = await createServer(root, { closeFailures: 1 });

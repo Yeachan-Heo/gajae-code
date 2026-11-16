@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { GateContinuation } from "../src/modes/shared/agent-wire/workflow-gate-broker";
@@ -21,6 +21,9 @@ import {
 	WorkflowGateSchemaError,
 } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import type { JsonSchema, WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 function liveContinuation(): GateContinuation {
 	let live = true;
@@ -48,7 +51,7 @@ function makeBroker() {
 
 describe("FileGateStore authority red-team contract", () => {
 	it("fails closed before presenting a valid-JSON document with stale authority", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-stale-authority-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-stale-authority-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker("redteam-stale-authority", new FileGateStore(file), { advance: () => {} });
 		const gate = first.openGate(
@@ -105,7 +108,7 @@ describe("FileGateStore authority red-team contract", () => {
 		];
 
 		for (const testCase of cases) {
-			const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-malformed-lifecycle-"));
+			const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-malformed-lifecycle-"));
 			const file = path.join(dir, "gates.json");
 			const broker = new WorkflowGateBroker("redteam-malformed-lifecycle", new FileGateStore(file));
 			const gate = broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
@@ -132,7 +135,7 @@ describe("FileGateStore authority red-team contract", () => {
 	});
 
 	it("migrates realistic legacy v0 records before exposing or quarantining them", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-v0-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-v0-"));
 		const file = path.join(dir, "gates.json");
 		const createdAt = "2026-06-05T00:00:00.000Z";
 		const gate = {
@@ -171,7 +174,7 @@ describe("FileGateStore authority red-team contract", () => {
 	});
 
 	it("migrates a complete legacy accepted-unadvanced crash record to a Q12 diagnostic", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-v0-accepted-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-v0-accepted-"));
 		const file = path.join(dir, "gates.json");
 		const createdAt = "2026-06-05T00:00:00.000Z";
 		const schema: JsonSchema = {
@@ -238,7 +241,7 @@ describe("FileGateStore authority red-team contract", () => {
 	});
 
 	it("fails closed for a legacy accepted-unadvanced record missing its response hash", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-v0-accepted-malformed-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-v0-accepted-malformed-"));
 		const file = path.join(dir, "gates.json");
 		const createdAt = "2026-06-05T00:00:00.000Z";
 		const gate = {
@@ -277,7 +280,7 @@ describe("FileGateStore authority red-team contract", () => {
 	});
 
 	it("keeps a valid accepted-unadvanced restart quarantine loadable", async () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-accepted-restart-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-accepted-restart-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker("redteam-accepted-restart", new FileGateStore(file), {
 			advance: () => {
@@ -300,7 +303,7 @@ describe("FileGateStore authority red-team contract", () => {
 	it("rolls back failed file mutations and classifies post-rename fsync uncertainty", () => {
 		let syncs = 0;
 		const store = new FileGateStore(
-			path.join(mkdtempSync(path.join(tmpdir(), "workflow-gate-rollback-")), "gates.json"),
+			path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-rollback-")), "gates.json"),
 			() => {
 				syncs++;
 				if (syncs === 2) throw new Error("parent fsync failed");
@@ -435,7 +438,7 @@ describe("workflow gate red-team contract", () => {
 	});
 
 	it("quarantines fresh-process gates and requires a remint", async () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "workflow-gate-redteam-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "workflow-gate-redteam-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker("redteam-file-run", new FileGateStore(file));
 		const stale = first.openGate(

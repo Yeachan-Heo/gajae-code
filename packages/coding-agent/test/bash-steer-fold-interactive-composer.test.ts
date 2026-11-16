@@ -56,7 +56,7 @@ describe("interactive composer steer over a foreground bash", () => {
 
 	test("composer Enter while a foreground bash runs folds it and the steer is consumed by the same run", async () => {
 		tempDir = TempDir.createSync("@gjc-repro-tui-steer-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "starReminder.enabled": false } });
 		registerMockApi();
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const mock = createMockModel({

@@ -96,6 +96,19 @@ setInterval(() => {}, 1000);
 }
 
 describe("MCP manager lifecycle cleanup", () => {
+	test("empty startup publishes an authoritative empty catalog", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-empty-publication-");
+		const manager = new MCPManager(cwd, null);
+		try {
+			expect(manager.getToolCatalogSnapshot().publication).toBe("unpublished");
+			const result = await manager.connectServers({}, {});
+			expect(result.tools).toEqual([]);
+			expect(manager.getToolCatalogSnapshot()).toMatchObject({ publication: "published", tools: [] });
+		} finally {
+			await manager.disconnectAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test("initial listTools failure closes transport and does not register server", async () => {
 		const manager = new MCPManager(process.cwd());
 		const result = await manager.connectServers(
@@ -187,8 +200,14 @@ describe("MCP manager lifecycle cleanup", () => {
 			expect(warning.mock.calls.map(([message]) => message)).toContain("MCP tool catalog owner callback failed");
 
 			const bulkResult = await manager.connectServers({ second: { type: "http", url: "http://127.0.0.1:2" } }, {});
-			expect(bulkResult.tools.map(tool => tool.name)).toEqual(["mcp__second_published"]);
-			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__second_published"]);
+			expect(bulkResult.tools.map(tool => tool.name)).toEqual([
+				"mcp__late_after_unsubscribe",
+				"mcp__second_published",
+			]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual([
+				"mcp__late_after_unsubscribe",
+				"mcp__second_published",
+			]);
 			expect(remainingChanges).toEqual([
 				["mcp__late_first"],
 				["mcp__late_first"],
@@ -196,7 +215,7 @@ describe("MCP manager lifecycle cleanup", () => {
 				[],
 				["mcp__late_after_unsubscribe"],
 				["mcp__late_after_unsubscribe", "mcp__second_published"],
-				["mcp__second_published"],
+				["mcp__late_after_unsubscribe", "mcp__second_published"],
 			]);
 			expect(snapshotMutationResults.map(result => result.catalog)).toEqual(remainingChanges);
 			expect(ownerChanges).toBe(7);
@@ -316,6 +335,87 @@ describe("MCP manager lifecycle cleanup", () => {
 		} finally {
 			closeRelease.resolve();
 			pendingTools.reject(new Error("abandoned tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
+	test("stale cached fallback cannot disconnect or replace a fresh same-name connection", async () => {
+		const cacheStarted = Promise.withResolvers<void>();
+		const cacheRelease = Promise.withResolvers<void>();
+		const pendingTools = Promise.withResolvers<MCPToolDefinition[]>();
+		const cache = {
+			get: vi.fn(async () => {
+				cacheStarted.resolve();
+				await cacheRelease.promise;
+				return [{ name: "stale", inputSchema: { type: "object" } }];
+			}),
+			set: vi.fn(async () => {}),
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		const stale = makeConnection("cached", async () => {});
+		const fresh = makeConnection("cached", async () => {});
+		let connections = 0;
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async () => (++connections === 1 ? stale : fresh));
+		let toolLoads = 0;
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () =>
+			++toolLoads === 1 ? pendingTools.promise : [{ name: "fresh", inputSchema: { type: "object" } }],
+		);
+		const config: MCPServerConfig = { type: "http", url: "http://127.0.0.1:1" };
+		let initial: ReturnType<typeof manager.connectServers> | undefined;
+		try {
+			initial = manager.connectServers({ cached: config }, {});
+			await cacheStarted.promise;
+			await manager.disconnectServer("cached");
+			const replacement = await manager.connectServers({ cached: config }, {});
+			expect(replacement.tools.map(tool => tool.name)).toEqual(["mcp__cached_fresh"]);
+			cacheRelease.resolve();
+			const result = await initial;
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__cached_fresh"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__cached_fresh"]);
+			expect(manager.getConnection("cached")).toBe(fresh);
+		} finally {
+			cacheRelease.resolve();
+			pendingTools.reject(new Error("abandoned tools/list"));
+			if (initial) await initial.catch(() => undefined);
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
+	test("stale batch member does not discard an independent cached fallback", async () => {
+		const cacheStarted = Promise.withResolvers<void>();
+		const cacheRelease = Promise.withResolvers<void>();
+		const loads = new Map<string, PromiseWithResolvers<MCPToolDefinition[]>>();
+		let cacheReads = 0;
+		const cache = {
+			get: vi.fn(async () => {
+				if (++cacheReads === 2) cacheStarted.resolve();
+				await cacheRelease.promise;
+				return [{ name: "ping", inputSchema: { type: "object" } }];
+			}),
+			set: vi.fn(async () => {}),
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async name => makeConnection(name, async () => {}));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async connection => {
+			const pending = Promise.withResolvers<MCPToolDefinition[]>();
+			loads.set(connection.name, pending);
+			return pending.promise;
+		});
+		const config: MCPServerConfig = { type: "http", url: "http://127.0.0.1:1" };
+		const initial = manager.connectServers({ alpha: config, beta: config }, {});
+		try {
+			await cacheStarted.promise;
+			await manager.disconnectServer("alpha");
+			cacheRelease.resolve();
+			const result = await initial;
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__beta_ping"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__beta_ping"]);
+		} finally {
+			cacheRelease.resolve();
+			for (const pending of loads.values()) pending.reject(new Error("abandoned tools/list"));
+			await initial.catch(() => undefined);
 			await manager.disconnectAll();
 			vi.restoreAllMocks();
 		}
@@ -1423,6 +1523,123 @@ setInterval(() => {}, 1000);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("startup retains normalized collisions for promotion without stealing the live owner", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-startup-collision-");
+		const calls: string[] = [];
+		const server = Bun.serve({
+			port: 0,
+			async fetch(request) {
+				if (request.method === "DELETE") return new Response(null, { status: 204 });
+				if (request.method !== "POST") return new Response(null, { status: 405 });
+				const name = new URL(request.url).pathname.slice(1);
+				const body = (await request.json()) as JsonRpcMessage;
+				const id = "id" in body ? body.id : undefined;
+				if (id === undefined) return new Response(null, { status: 202 });
+				if ("method" in body && body.method === "initialize") {
+					return Response.json(
+						{
+							jsonrpc: "2.0",
+							id,
+							result: {
+								protocolVersion: "2025-03-26",
+								capabilities: { tools: {} },
+								serverInfo: { name, version: "1" },
+							},
+						},
+						{ headers: { "Mcp-Session-Id": `${name}-session` } },
+					);
+				}
+				if ("method" in body && body.method === "tools/list") {
+					return Response.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							tools: [{ name: "hello", inputSchema: { type: "object" } }],
+						},
+					});
+				}
+				if ("method" in body && body.method === "tools/call") {
+					calls.push(name);
+					return Response.json({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: name }] } });
+				}
+				return legacyMcpMethodNotFound(id);
+			},
+		});
+		const manager = new MCPManager(cwd);
+		const exact = new MCPManager(cwd, null, { toolsOnly: true });
+		const sequential = new MCPManager(cwd);
+		const configs = Object.fromEntries(
+			["server0", "server1"].map(name => [
+				name,
+				{
+					type: "http" as const,
+					protocol: "legacy" as const,
+					url: `${server.url}${name}`,
+				},
+			]),
+		);
+		try {
+			const result = await manager.connectServers(configs, {});
+			expect(result.errors.size).toBe(0);
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__server_hello"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__server_hello"]);
+			const owner = (manager.getTools()[0] as MCPTool).mcpServerName;
+			const successor = owner === "server0" ? "server1" : "server0";
+			const execute = async (expected: string) => {
+				const tool = manager.getTools()[0]!;
+				expect((tool as MCPTool).mcpServerName).toBe(expected);
+				const output = await tool.execute("collision", {}, undefined, {} as never);
+				expect(output.content).toEqual([{ type: "text", text: wrapUntrustedContent(expected) }]);
+				expect(calls.at(-1)).toBe(expected);
+			};
+			const control = async (name: string, action: "suspend" | "resume" | "reconnect") => {
+				const target = manager.getServerControlSnapshot().find(row => row.target.name === name)?.target;
+				if (!target) throw new Error(`Missing control target: ${name}`);
+				return manager.controlServer(target, action);
+			};
+			await execute(owner);
+			expect(await control(owner, "suspend")).toMatchObject({ status: "suspended" });
+			await execute(successor);
+			expect(await control(owner, "resume")).toMatchObject({ status: "resumed" });
+			await execute(successor);
+			expect(await control(owner, "reconnect")).toMatchObject({ status: "reconnected" });
+			await execute(successor);
+			await manager.disconnectServer(successor);
+			await execute(owner);
+
+			const unrelated = { type: "http" as const, protocol: "legacy" as const, url: `${server.url}other` };
+			await sequential.connectServers({ server0: configs.server0!, other: unrelated }, {});
+			const subsequent = await sequential.connectServers({ server1: configs.server1! }, {});
+			expect(subsequent.tools.map(tool => tool.name)).toEqual(["mcp__other_hello", "mcp__server_hello"]);
+			const sequentialTool = sequential.getTools().find(tool => tool.name === "mcp__server_hello")!;
+			expect((sequentialTool as MCPTool).mcpServerName).toBe("server0");
+			const sequentialResult = await sequentialTool.execute("sequential", {}, undefined, {} as never);
+			expect(sequentialResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("server0") }]);
+			expect(calls.at(-1)).toBe("server0");
+			await sequential.disconnectServer("server0");
+			const promoted = sequential.getTools().find(tool => tool.name === "mcp__server_hello")!;
+			expect((promoted as MCPTool).mcpServerName).toBe("server1");
+			const promotedResult = await promoted.execute("promoted", {}, undefined, {} as never);
+			expect(promotedResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("server1") }]);
+			expect(calls.at(-1)).toBe("server1");
+			expect(sequential.getTools().map(tool => tool.name)).toEqual(["mcp__other_hello", "mcp__server_hello"]);
+
+			const configPath = join(cwd, "exact.json");
+			await Bun.write(configPath, JSON.stringify({ mcpServers: configs }));
+			await expect(exact.discoverAndConnect({ configPath })).rejects.toThrow(
+				"MCP tool catalog contains duplicate tool names",
+			);
+			expect(exact.getTools()).toEqual([]);
+			expect(exact.getConnectedServers()).toEqual([]);
+		} finally {
+			await manager.disconnectAll();
+			await exact.disconnectAll();
+			await sequential.disconnectAll();
+			await server.stop(true);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("fails closed when tools-only tool names collide", async () => {
 		const cwd = await mkdtempExact("gjc-mcp-tool-collision-");
 		const configPath = join(cwd, "exact.json");

@@ -290,12 +290,14 @@ class ExpressionParser {
 	/**
 	 * Parse exponentiation operator.
 	 * Right-associative: 2 ** 3 ** 2 = 2 ** (3 ** 2) = 512
-	 * Achieved by recursive call to parsePower for the right operand.
+	 * The right operand accepts a unary sign, so negative exponents like
+	 * 2 ** -3 evaluate instead of failing as an unexpected token; recursion
+	 * through #parseUnary back into #parsePower keeps ** right-associative.
 	 */
 	#parsePower(): number {
 		let value = this.#parsePrimary();
 		if (this.#matchOperator("**")) {
-			value = value ** this.#parsePower(); // Right-associative via recursion
+			value = value ** this.#parseUnary(); // Right-associative via recursion
 		}
 		return value;
 	}

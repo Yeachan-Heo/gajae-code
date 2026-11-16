@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { harnessStateRoot } from "../../src/gjc-runtime/session-layout";
@@ -27,6 +27,9 @@ import {
 	type SessionHandle,
 	type SessionState,
 } from "../../src/harness-control-plane/types";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 let root: string;
 let registryRoot: string;
@@ -34,8 +37,8 @@ let registryEnv: NodeJS.ProcessEnv;
 let originalGjcSessionId: string | undefined;
 
 beforeEach(async () => {
-	root = await mkdtemp(path.join(tmpdir(), "harness-store-"));
-	registryRoot = await mkdtemp(path.join(tmpdir(), "harness-root-registry-"));
+	root = await tempDirs.mkdtemp(path.join(tmpdir(), "harness-store-"));
+	registryRoot = await tempDirs.mkdtemp(path.join(tmpdir(), "harness-root-registry-"));
 	registryEnv = { ...process.env, GJC_HARNESS_ROOT_REGISTRY_DIR: registryRoot };
 	originalGjcSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_SESSION_ID = "test-session";
@@ -146,7 +149,7 @@ describe("harness storage", () => {
 
 	it("controlSocketPath is stable, short, and records metadata", async () => {
 		const id = "h-socket";
-		const socketDir = await mkdtemp(path.join(tmpdir(), "h-"));
+		const socketDir = await tempDirs.mkdtemp(path.join(tmpdir(), "h-"));
 		const first = controlSocketPath(root, id, { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
 		const second = controlSocketPath(root, id, { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
 		expect(first).toBe(second);
@@ -158,7 +161,7 @@ describe("harness storage", () => {
 	});
 
 	it("controlSocketPath uses GJC_HARNESS_SOCKET_DIR when set", async () => {
-		const socketDir = await mkdtemp(path.join(tmpdir(), "e-"));
+		const socketDir = await tempDirs.mkdtemp(path.join(tmpdir(), "e-"));
 		const socketPath = controlSocketPath(root, "h-env", { GJC_HARNESS_SOCKET_DIR: socketDir } as NodeJS.ProcessEnv);
 		expect(socketPath.startsWith(socketDir)).toBe(true);
 	});
@@ -197,7 +200,7 @@ describe("harness storage", () => {
 
 	it("controlSocketPath extends the hash on metadata collision", async () => {
 		const id = "h-collision";
-		const socketDir = path.join("/tmp", `c-${process.pid}`);
+		const socketDir = await tempDirs.mkdtemp(path.join("/tmp", "c-"));
 		const digest = createHash("sha256").update(`${root}\0${id}`).digest("hex");
 		await mkdir(socketDir, { recursive: true });
 		await writeFile(
@@ -210,8 +213,8 @@ describe("harness storage", () => {
 
 	it("does not pick an arbitrary registered root when explicit session ids collide", async () => {
 		const id = `h-collide-${process.pid}`;
-		const leftRoot = await mkdtemp(path.join(tmpdir(), "h-left-"));
-		const rightRoot = await mkdtemp(path.join(tmpdir(), "h-right-"));
+		const leftRoot = await tempDirs.mkdtemp(path.join(tmpdir(), "h-left-"));
+		const rightRoot = await tempDirs.mkdtemp(path.join(tmpdir(), "h-right-"));
 		try {
 			await writeSessionState(leftRoot, { ...state(id), handle: { ...state(id).handle, workspace: "/repo/left" } });
 			await writeSessionState(rightRoot, {
@@ -241,7 +244,7 @@ describe("harness storage", () => {
 
 	it("uses expectedWorkspace registry disambiguation instead of stale local same-session state", async () => {
 		const id = `h-stale-local-${process.pid}`;
-		const registeredRoot = await mkdtemp(path.join(tmpdir(), "h-registered-"));
+		const registeredRoot = await tempDirs.mkdtemp(path.join(tmpdir(), "h-registered-"));
 		try {
 			await writeSessionState(root, { ...state(id), handle: { ...state(id).handle, workspace: "/repo/stale" } });
 			await writeSessionState(registeredRoot, {

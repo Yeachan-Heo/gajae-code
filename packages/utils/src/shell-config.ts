@@ -55,7 +55,9 @@ function isExecutable(path: string): boolean {
  * `HOMEPATH`. It runs e.g. `core.fsmonitor` during `git status` and helpers from
  * `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND` for `git://` remotes,
  * `GIT_EXTERNAL_DIFF`, `GIT_SSH(_COMMAND)`, `GIT_ASKPASS` (auth prompts, even
- * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`).
+ * with `GIT_TERMINAL_PROMPT=0`), and, when neither `GIT_ASKPASS` nor
+ * `core.askPass` is set, `SSH_ASKPASS` (also ssh's own passphrase and host-key
+ * prompt program) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`).
  * `GIT_TEMPLATE_DIR` can also seed executable hooks when `git init` creates a
  * repository. Interpreters the shell starts also load code named by the
  * environment: Node `NODE_OPTIONS` (`--require`), Python `PYTHONPATH`
@@ -65,7 +67,9 @@ function isExecutable(path: string): boolean {
  * runs code for every dynamically linked command from `LD_PRELOAD` and `LD_AUDIT` modules, and
  * resolves libraries from `LD_LIBRARY_PATH` first, so a project directory there
  * can shadow a system library (macOS: `DYLD_INSERT_LIBRARIES` and the
- * `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides). Sibling
+ * `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides). GTK loads the
+ * modules named by `GTK_MODULES`/`GTK3_MODULES` from its default directories and
+ * from `GTK_PATH` into every GTK program it initializes, such as a Linux Chrome. Sibling
  * spellings load the same code: Perl `PERLLIB`, the JVM `_JAVA_OPTIONS`, and npm
  * `npm_config_node_options` (matched separately below, in any case). Common tools also read programs from the
  * environment: ripgrep `RIPGREP_CONFIG_PATH` (a config file that can add
@@ -77,7 +81,7 @@ function isExecutable(path: string): boolean {
  * repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PYTHONUSERBASE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|_JAVA_OPTIONS|PERLLIB|RIPGREP_CONFIG_PATH|TAR_OPTIONS|RSYNC_RSH|MAKEFLAGS|MAKEFILES|SHELLOPTS|PS4|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_(?:INSERT_LIBRARIES|LIBRARY_PATH|FALLBACK_LIBRARY_PATH|FRAMEWORK_PATH|FALLBACK_FRAMEWORK_PATH|VERSIONED_LIBRARY_PATH|VERSIONED_FRAMEWORK_PATH)|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PYTHONUSERBASE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|_JAVA_OPTIONS|PERLLIB|RIPGREP_CONFIG_PATH|TAR_OPTIONS|RSYNC_RSH|MAKEFLAGS|MAKEFILES|SHELLOPTS|PS4|GTK_MODULES|GTK3_MODULES|GTK_PATH|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_(?:INSERT_LIBRARIES|LIBRARY_PATH|FALLBACK_LIBRARY_PATH|FRAMEWORK_PATH|FALLBACK_FRAMEWORK_PATH|VERSIONED_LIBRARY_PATH|VERSIONED_FRAMEWORK_PATH)|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 /**
  * npm reads `npm_config_<key>` with the prefix in any case and normalizes the key
  * (case and `_`/`-`), so `npm_config_Node_Options` and `npm_config_node-options`

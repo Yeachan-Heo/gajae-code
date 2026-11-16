@@ -583,6 +583,17 @@
 			},
 			"additionalProperties": false
 		},
+		"recap": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Generate a short recap after completed turns for session listings. Uses the default model and may incur model usage; never adds recap text to the conversation.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"modelTags": {
 			"type": "object",
 			"additionalProperties": true,

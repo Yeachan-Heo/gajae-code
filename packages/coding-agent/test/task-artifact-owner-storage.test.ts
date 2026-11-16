@@ -4,10 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { captureManagedFileNoFollow } from "../src/sdk/session-readonly/inspection";
+import type { ManagedScope } from "../src/sdk/session-readonly/scope";
 import {
 	bindManagedGcSessionRetirementTarget,
 	type ManagedGcProtocolScopeInput,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
@@ -15,7 +16,6 @@ import {
 } from "../src/session/internal/managed-session-scope";
 import {
 	acquireManagedLock,
-	captureManagedFileNoFollow,
 	isManagedLockQuarantineName,
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,

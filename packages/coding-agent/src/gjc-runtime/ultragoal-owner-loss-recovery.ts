@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
+import type { ManagedOwnerSigabrtReceipt } from "./managed-owner-binding";
 import { sessionStateDir, sessionUltragoalDir } from "./session-layout";
 import { appendJsonlIdempotent, writeJsonAtomic } from "./state-writer";
 

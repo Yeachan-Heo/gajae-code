@@ -1,0 +1,3 @@
+### Fixed
+
+- Preserve native tree-removal outcomes, expected identity and post-effect authority failures in structured errors. Certified durable payload retirement is distinguished from physical removal and unresolved retained recovery. The parent-identity-bound helper preserves raw native results, while prepared-session discard wraps unsuccessful results in structured errors with the original snapshot. Native throws and post-effect authority failures retain their causes without certifying retirement under uncertain authority. Prepared-discard retry and caller disposition handling remain separate work.

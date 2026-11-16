@@ -1323,7 +1323,7 @@ describe("registered viewport anchor", () => {
 		expect(rendered.anchors.some(anchor => anchor?.id === "literal-apc")).toBe(true);
 	});
 
-	it("wraps Kitty-protocol anchored prose into bounded rows without marker leakage while a genuine Kitty line bypasses", () => {
+	it("wraps Kitty-protocol anchored prose into bounded rows and strips a source Kitty line", () => {
 		const previousProtocol = TERMINAL.imageProtocol;
 		setTerminalImageProtocol(ImageProtocol.Kitty);
 		try {
@@ -1358,8 +1358,8 @@ describe("registered viewport anchor", () => {
 			expect(joined).not.toContain("GJC_ANCHOR");
 			expect(joined).not.toContain(ImageProtocol.Kitty);
 
-			// A genuine Kitty graphics line is still classified as an image and bypasses
-			// wrapping: it survives the same pipeline verbatim as a single unwrapped row.
+			// A Kitty APC is an image line at the terminal, but markdown source is not an
+			// image channel: the sequence is stripped before parse.
 			const kittyImageLine = `${ImageProtocol.Kitty}f=100,a=T,t=d;${"QUJD".repeat(64)}\x1b\\`;
 			expect(TERMINAL.isImageLine(kittyImageLine)).toBe(true);
 			expect(kittyImageLine.length).toBeGreaterThan(width);
@@ -1367,7 +1367,8 @@ describe("registered viewport anchor", () => {
 				width,
 				{ id: "kitty-image" },
 			);
-			expect(bypassed.lines).toEqual([kittyImageLine]);
+			expect(bypassed.lines.join("")).not.toContain(ImageProtocol.Kitty);
+			expect(bypassed.lines).toEqual([]);
 		} finally {
 			setTerminalImageProtocol(previousProtocol);
 		}

@@ -60,8 +60,16 @@ const EMPTY_COMPILED_EQUIVALENCE: CompiledEquivalenceConfig = {
 	exclude: new Set<string>(),
 };
 const kModelResolutionCache = Symbol("model-equivalence.resolutionCache");
+/**
+ * Resolution reads only a model's provider and id (plus process-constant
+ * reference data), so results are memoized per compiled equivalence config by
+ * provider, then id. Catalog rebuilds hand in fresh model objects, which an
+ * object-keyed memo could never match. The memo is not capped: it holds one
+ * entry per provider/id pair the process has catalogued, and a cap smaller than
+ * the catalog is why `HEURISTIC_CANDIDATES_CACHE` misses across rebuilds.
+ */
 interface CompiledEquivalenceConfigWithCache extends CompiledEquivalenceConfig {
-	[kModelResolutionCache]?: WeakMap<Model<Api>, ResolvedCanonicalModel>;
+	[kModelResolutionCache]?: Map<string, Map<string, ResolvedCanonicalModel>>;
 }
 const FAMILY_EXTRACTION_PATTERNS = [
 	/(?:^|[/:._-])((?:claude|gemini|gpt|grok|glm|qwen|minimax|kimi|deepseek|llama|gemma|nova|mistral|ministral|pixtral|codestral|devstral|magistral|ernie|doubao|seed|aion|olmo|molmo|nemotron|palmyra|command|codex|coder|o[1345])[-a-z0-9.]+)(?::|$)/i,
@@ -886,15 +894,20 @@ export function buildCanonicalModelIndex(
 	const compiledWithCache = compiledEquivalence as CompiledEquivalenceConfigWithCache;
 	let modelCache = compiledWithCache[kModelResolutionCache];
 	if (!modelCache) {
-		modelCache = new WeakMap<Model<Api>, ResolvedCanonicalModel>();
+		modelCache = new Map<string, Map<string, ResolvedCanonicalModel>>();
 		compiledWithCache[kModelResolutionCache] = modelCache;
 	}
 
 	for (const model of models) {
-		let canonical = modelCache.get(model);
+		let providerCache = modelCache.get(model.provider);
+		if (!providerCache) {
+			providerCache = new Map<string, ResolvedCanonicalModel>();
+			modelCache.set(model.provider, providerCache);
+		}
+		let canonical = providerCache.get(model.id);
 		if (!canonical) {
 			canonical = resolveCanonicalIdForModel(model, compiledEquivalence, referenceData);
-			modelCache.set(model, canonical);
+			providerCache.set(model.id, canonical);
 		}
 		const selector = formatCanonicalVariantSelector(model);
 		const variant: CanonicalModelVariant = {

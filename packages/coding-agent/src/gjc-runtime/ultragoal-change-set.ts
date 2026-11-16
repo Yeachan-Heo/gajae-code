@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 
 export type UltragoalChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
 export type UltragoalChangeCategory =
@@ -131,7 +132,13 @@ export async function spawnText(
 	options: { cwd: string; timeoutMs?: number; stdin?: string },
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
 	try {
-		const proc = Bun.spawn(command, { cwd: options.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawn(command, {
+			env: projectSafeSpawnEnv(),
+			cwd: options.cwd,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		const timeout = setTimeout(() => proc.kill(), options.timeoutMs ?? 5000);
 		// Drain both pipes while the stdin write runs: a child that never reads
 		// stdin blocks the write, and a child that fills stdout before draining

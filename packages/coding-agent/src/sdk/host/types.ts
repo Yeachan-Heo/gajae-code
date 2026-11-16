@@ -21,6 +21,13 @@ export interface HostEndpointAdapters {
 	token: string;
 	sendFrame: (connectionId: string, frame: SdkFrame) => "written" | "dropped" | Promise<"written" | "dropped">;
 	onFrame: (handler: (connectionId: string, frame: SdkFrame) => void) => undefined | (() => void);
+	/**
+	 * Largest directed frame, in UTF-8 bytes, that `sendFrame` delivers on its
+	 * directed write path. Omitted means the native notification server's
+	 * `RESPONSE_CEILING_BYTES`; `null` declares a transport without a ceiling,
+	 * whose replies are sent intact.
+	 */
+	directedFrameCeilingBytes?: number | null;
 }
 
 export interface BrokerIndexWriter {

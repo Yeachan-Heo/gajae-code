@@ -166,6 +166,15 @@ export interface PromptRequestV1 {
 	coordinator_turn_id?: string;
 	/** Retain prompt and source turn until the delegate's outer response is durable. */
 	delegate_response_pending?: boolean;
+	/** Preserve steer disposition durably for recovery when a prompt is converted to a steer. */
+	steer_disposition?: {
+		accepted: boolean;
+		command_id: string;
+		turn_id: string;
+		queued_as?: string;
+		/** Synthetic coordinator turn removed when the steer settled; its projection is removed too. */
+		removed_turn_id?: string;
+	};
 	safe_response?: Record<string, unknown>;
 	error_code?: PublicReason | "idempotency_conflict";
 	created_at: string;
@@ -2536,6 +2545,24 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)
 				delete group[id];
+	if (Buffer.byteLength(JSON.stringify(transaction)) > MAX_NORMAL_BYTES) {
+		// Completed turnless steer tombstones have no turn to age out with; evict the
+		// oldest first. Pinned and in-progress requests are never candidates.
+		const steerTombstones = Object.entries(transaction.requests.prompts)
+			.filter(
+				([id, request]) =>
+					request.phase === "completed" &&
+					request.steer_disposition !== undefined &&
+					request.coordinator_turn_id === undefined &&
+					!pinnedRequests.has(request) &&
+					!receiptBearingPromptIds.has(id),
+			)
+			.sort(([, left], [, right]) => left.updated_at.localeCompare(right.updated_at));
+		for (const [id] of steerTombstones) {
+			delete transaction.requests.prompts[id];
+			if (Buffer.byteLength(JSON.stringify(transaction)) <= MAX_NORMAL_BYTES) break;
+		}
+	}
 	if (Buffer.byteLength(JSON.stringify(transaction)) > MAX_NORMAL_BYTES) {
 		const terminalTurnIds = Object.values(transaction.canonical.turns)
 			.filter(turn => ["completed", "failed", "cancelled", "superseded"].includes(turn.status))

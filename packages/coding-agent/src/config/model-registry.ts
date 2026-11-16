@@ -98,6 +98,7 @@ import {
 } from "./model-preset-registry";
 import {
 	ModelProfileReplacementRequiredError,
+	readDurableModelProfileOwnership,
 	readDurableModelProfileOwnershipFromRaw,
 	UnresolvedModelProfileOwnershipError,
 } from "./model-profile-ownership";
@@ -486,6 +487,48 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(
 		model => model.id.toLowerCase() === modelId.toLowerCase(),
 	)?.api as Api | undefined;
+}
+
+/**
+ * A catalog that mixes chat rows with image, audio, video, embedding, or
+ * transcription rows can opt into `discovery.outputModalities` and
+ * `discovery.inputModalities`. Each set list admits only rows whose advertised
+ * modalities all fall inside it, so a non-chat entry never becomes a
+ * chat-completion model. Rows that omit the filtered field are skipped,
+ * because they cannot be classified. An unset list does not filter.
+ */
+function admitsAdvertisedModalities(allowed: readonly string[] | undefined, advertised: unknown): boolean {
+	if (allowed === undefined) return true;
+	return (
+		Array.isArray(advertised) &&
+		advertised.length > 0 &&
+		advertised.every(modality => typeof modality === "string" && allowed.includes(modality))
+	);
+}
+
+function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: Record<string, unknown>): boolean {
+	return (
+		admitsAdvertisedModalities(discovery.outputModalities, item.output_modalities) &&
+		admitsAdvertisedModalities(discovery.inputModalities, item.input_modalities)
+	);
+}
+
+/**
+ * Input modalities a models-list row advertises, either at the top level
+ * (`input_modalities`) or under `capabilities.input_modalities`. Returns
+ * undefined when the row advertises nothing usable, so the caller can fall back
+ * to reference metadata.
+ */
+function advertisedDiscoveryInput(item: Record<string, unknown>): Model<Api>["input"] | undefined {
+	const advertised = Array.isArray(item.input_modalities)
+		? item.input_modalities
+		: isRecord(item.capabilities) && Array.isArray(item.capabilities.input_modalities)
+			? item.capabilities.input_modalities
+			: undefined;
+	if (!advertised || advertised.length === 0 || !advertised.every(modality => typeof modality === "string")) {
+		return undefined;
+	}
+	return advertised.includes("image") ? ["text", "image"] : ["text"];
 }
 
 function resolveModelApiOverrideFromDiscovery(
@@ -1295,6 +1338,12 @@ function fingerprintConfiguredDiscoveryRequestShape(
 		api: providerConfig.api,
 		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
 		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+		...(providerConfig.discovery.outputModalities
+			? { outputModalities: [...providerConfig.discovery.outputModalities].sort() }
+			: {}),
+		...(providerConfig.discovery.inputModalities
+			? { inputModalities: [...providerConfig.discovery.inputModalities].sort() }
+			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
@@ -4374,7 +4423,17 @@ export class ModelRegistry {
 					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
 				);
 			}
-			await this.#writeCheckedModelsConfig(checkedConfig.data);
+			await this.#writeCheckedModelsConfig(checkedConfig.data, () => {
+				// A settings write can claim this profile while the batch is suspended on
+				// the filesystem. The claim wins: refuse before the deletion reaches disk,
+				// otherwise the durable owner would point at a profile that no longer exists.
+				const live = this.#settings;
+				if (!live) return;
+				const currentOwnership = readDurableModelProfileOwnership(live);
+				if (currentOwnership.marker.kind === "profile" && currentOwnership.marker.profile === normalizedName) {
+					throw new ModelProfileReplacementRequiredError(normalizedName);
+				}
+			});
 			deletedProfile = profile;
 			return [];
 		});
@@ -4404,7 +4463,7 @@ export class ModelRegistry {
 		return { current, profile };
 	}
 
-	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
+	async #writeCheckedModelsConfig(config: ModelsConfig, beforeCommit?: () => void): Promise<void> {
 		const configPath = this.#modelsConfigFile.path();
 		const parentPath = path.dirname(configPath);
 		await fs.mkdir(parentPath, { recursive: true, mode: 0o700 });
@@ -4413,6 +4472,10 @@ export class ModelRegistry {
 		// still reach the same file. The final name stays lexical, so a symlink
 		// at models.yml is still opened with O_NOFOLLOW.
 		const parent = await fs.realpath(parentPath);
+		// Runs after every await in this write path so a caller can re-assert a
+		// precondition that another actor may have changed while the write was
+		// suspended, before any bytes reach the file.
+		beforeCommit?.();
 		writeExplicitOwnerOnlyTextSync(path.join(parent, path.basename(configPath)), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
@@ -5131,6 +5194,7 @@ export class ModelRegistry {
 			configuredDiscoveryProviders,
 			providerFilter,
 			credentialSessionId,
+			strategy,
 		);
 		if (managerOptions.length === 0) {
 			return [];
@@ -5205,6 +5269,7 @@ export class ModelRegistry {
 		excludedProviderIds: ReadonlySet<string> = new Set(),
 		providerFilter?: ReadonlySet<string>,
 		credentialSessionId?: string,
+		strategy?: ModelRefreshStrategy,
 	): Promise<ModelManagerDiscoveryOptions[]> {
 		const specialProviderDescriptors = this.#specialProviderDescriptors(credentialSessionId);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
@@ -5233,7 +5298,9 @@ export class ModelRegistry {
 				descriptor.providerId,
 				this.#authStorageConfigOwner,
 			);
-			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId });
+			const apiKey =
+				(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
+				(await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId }));
 			if (
 				configurationGeneration !==
 				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
@@ -5954,6 +6021,7 @@ export class ModelRegistry {
 			// check, so IDs that appear only between requests cannot enter
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			if (!admitsDiscoveredCatalogModalities(providerConfig.discovery, item)) continue;
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same
@@ -5988,7 +6056,7 @@ export class ModelRegistry {
 				thinking: hasEndpointReasoning
 					? (endpointReasoningConfig!.thinking as ThinkingConfig)
 					: referenceModel?.thinking,
-				input: referenceModel?.input ?? ["text"],
+				input: advertisedDiscoveryInput(item) ?? referenceModel?.input ?? ["text"],
 				output: referenceModel?.output,
 				cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow:
@@ -7604,6 +7672,45 @@ export class ModelRegistry {
 		}
 	}
 
+	/**
+	 * Key behind the provider's published discovery evidence, reused by offline reloads.
+	 *
+	 * Unpinned discovery peeks rotate through a provider's stored credentials, and the
+	 * evidence generation is credential-sensitive. An offline reload sends no request,
+	 * so peeking the next account only made the cached catalog look like another
+	 * account's and dropped the models the previous refresh had just published (with
+	 * two OAuth accounts, every other `/model` open). Reuse the published key only while
+	 * it is still a stored, unexpired credential and its evidence generation still
+	 * matches. Runtime/config overrides and any credential pin for the provider (runtime,
+	 * session or unavailable) always take the normal peek, and online refreshes keep
+	 * rotating.
+	 */
+	#offlineDiscoveryEvidenceKey(provider: string): string | undefined {
+		// Same config-credential sync the peek path runs, so an `apiKeyEnv` that became
+		// set since the last refresh is installed instead of hidden behind the reuse.
+		this.#refreshRotatingConfigApiKey(provider);
+		if (
+			this.authStorage.hasRuntimeApiKey(provider) ||
+			this.authStorage.hasConfigApiKey(provider, this.#authStorageConfigOwner) ||
+			// Any pin (runtime selector, session selector or unavailable pin) can make the
+			// published evidence another scope's account: a session set to AUTO masks a
+			// runtime selector and may resolve a different account than the one that
+			// published. Only fully unpinned providers reuse.
+			this.authStorage.hasAnyCredentialPin(provider)
+		) {
+			return undefined;
+		}
+		const evidence = this.#descriptorDiscoveryEvidence.get(provider);
+		const apiKey = this.#providerEvidenceApiKeys.get(provider);
+		if (evidence === undefined || apiKey === undefined) return undefined;
+		if (!this.authStorage.hasStoredCredentialKey(provider, apiKey)) return undefined;
+		try {
+			return evidence.authGeneration === this.#getProviderEvidenceGeneration(provider, apiKey) ? apiKey : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	async #peekApiKeyForProvider(
 		provider: string,
 		options: {
@@ -7643,7 +7750,13 @@ export class ModelRegistry {
 		return this.authStorage.hasOAuth(model.provider);
 	}
 
+	/** Effective dispatch kind, including this registry's config and runtime key overrides. */
 	getSessionCredentialType(provider: string, sessionId?: string): "api_key" | "oauth" | undefined {
+		if (
+			this.authStorage.hasRuntimeApiKey(provider) ||
+			this.authStorage.hasConfigApiKey(provider, this.#authStorageConfigOwner)
+		)
+			return "api_key";
 		return this.authStorage.getSessionCredentialType(provider, sessionId);
 	}
 
@@ -8035,7 +8148,7 @@ export class ModelRegistry {
 		const probe = circuit.probe;
 		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
 		if (probeOwner !== undefined) {
-			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 30_000) };
 		}
 		return false;
 	}

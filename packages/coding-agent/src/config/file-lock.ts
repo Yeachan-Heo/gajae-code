@@ -22,6 +22,7 @@ import {
 import { logger } from "@gajae-code/utils";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 
 export interface FileLockOptions {
 	staleMs?: number;
@@ -207,6 +208,7 @@ export const FileLockTestHooks: {
 		quarantineName: string,
 	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
 	beforeDetachedLockCleanup?: (detachedPath: string) => boolean | Promise<boolean>;
+	afterLockDirectoryRetired?: (lockPath: string, transitionPath: string) => void | Promise<void>;
 	afterRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	afterRemovalTransitionMissing?: (transitionPath: string) => void | Promise<void>;
 	afterForeignTransitionMissing?: (transitionPath: string) => void | Promise<void>;
@@ -592,7 +594,7 @@ export function processStartTime(pid: number): string | null {
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
-			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+			env: { ...projectSafeSpawnEnv(), LC_ALL: "C", LANG: "C", TZ: "UTC" },
 		});
 		if (result.exitCode !== 0) return null;
 		const startTime = new TextDecoder().decode(result.stdout).trim();
@@ -1571,6 +1573,8 @@ async function exactRemoveLockTree(
 				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
 			)
 				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+			await FileLockTestHooks.afterLockDirectoryRetired?.(lockPath, transitionPath);
 			try {
 				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
 				// Handle returned transient failures (not thrown exceptions):
@@ -1591,6 +1595,32 @@ async function exactRemoveLockTree(
 				throw error;
 			}
 		}
+		const afterLockDirectoryRetired = FileLockTestHooks.afterLockDirectoryRetired;
+		if (!detachOnly && (afterLockDirectoryRetired || FileLockTestHooks.nativeQuarantineBindings === undefined)) {
+			const detached = bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, true);
+			if (!detached.ok) return detached;
+			if (
+				detached.code !== undefined ||
+				detached.detachedPath !== transitionPath ||
+				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
+			)
+				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+			await afterLockDirectoryRetired?.(lockPath, transitionPath);
+			try {
+				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+				if (!removeResult.ok && isResultTransientFailure(removeResult)) {
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+					return { ...removeResult, detachedPath: transitionPath };
+				}
+				return removeResult;
+			} catch (error) {
+				if (isTransientReleaseError(error))
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+				throw error;
+			}
+		}
+		// Custom test bindings without phase-aware receipts keep their one-call removal behavior.
 		return bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	} finally {
 		markLocalRemovalCompleted(transitionPath, publishedRecordBytes);
@@ -2180,7 +2210,7 @@ async function localLockKey(lockPath: string): Promise<string> {
 	try {
 		return normalizeLockKey(await fs.realpath(lockPath));
 	} catch (error) {
-		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
+		if (!isEnoent(error) && !isTransientReleaseError(error) && !isVanishingEntryError(error)) throw error;
 	}
 	const parent = path.dirname(lockPath);
 	let canonicalParent: string;
@@ -2761,10 +2791,10 @@ async function staleLockSnapshot(
 		throw error;
 	}
 	if (!info) {
-		// This verdict can authorize cleanup only from a recorded owner generation.
-		// Windows acquisition has a separate age- and identity-bound path for a
-		// completely empty legacy directory; that path never treats it as a dead
-		// owner or claims the existing directory as a new lock.
+		// Ownerless empty directories block acquisition regardless of age or identity.
+		// Without a recorded owner, we cannot prove the owner is dead, so we fail closed
+		// to preserve mutual exclusion and prevent a paused publisher from resuming into
+		// a successor's already-published canonical lock.
 		return { stale: false };
 	}
 
@@ -3257,6 +3287,16 @@ function isTransientReleaseError(error: unknown): boolean {
 	);
 }
 
+/**
+ * On Windows, when another process is concurrently releasing a lock file,
+ * realpath can raise EBADF instead of ENOENT. For key derivation purposes,
+ * this indicates the file is vanishing (same as ENOENT), so we fall back to
+ * parent-based key derivation.
+ */
+function isVanishingEntryError(error: unknown): boolean {
+	return process.platform === "win32" && (error as NodeJS.ErrnoException)?.code === "EBADF";
+}
+
 function throwTransientNativeResult(code: string): never {
 	throw Object.assign(new Error(`Native lock operation is transiently unavailable: ${code}.`), { code });
 }
@@ -3599,8 +3639,8 @@ async function lockHolderDescription(
 			if ((await fs.readdir(lockPath)).length === 0) {
 				return {
 					description:
-						"held by an ownerless empty lock directory; inspect and remove this exact directory manually only after " +
-						`confirming no publisher remains: ${manualLockCleanupCommand(lockPath)}`,
+						"held by an ownerless empty lock directory; it blocks acquisition because the publisher may still be alive. Inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
+						`${manualLockCleanupCommand(lockPath)}`,
 					isLive: false,
 				};
 			}
