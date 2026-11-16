@@ -310,6 +310,110 @@ function Get-WebExceptionStatus {
     }
 }
 
+function Get-IOErrorCode {
+    param($ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    while ($exception.InnerException) { $exception = $exception.InnerException }
+    return $exception.HResult -band 0xFFFF
+}
+
+function Move-InstallFile {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+    # No-overwrite rename: fails if $Destination exists. Windows refuses to delete a running exe
+    # but allows renaming it.
+    [System.IO.File]::Move($Source, $Destination)
+}
+
+function Stop-OnUpdaterLockDirectory {
+    param([string]$LockPath)
+    # `gjc update` locks with a directory holding an `info` record (JSON with the owner pid). It
+    # has no DeleteOnClose, so a killed update leaves it behind. Only the updater's identity-
+    # checked removal may reclaim it; the installer reports who holds it and how to clear it.
+    $ownerPid = 0
+    $infoPath = Join-Path $LockPath "info"
+    try {
+        $stream = New-Object System.IO.FileStream($infoPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+            $record = $reader.ReadToEnd() | ConvertFrom-Json
+            if ($record -and $record.pid) { [void][int]::TryParse([string]$record.pid, [ref]$ownerPid) }
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {}
+    if ($ownerPid -gt 0) {
+        $state = if (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) { "is still running" } else { "has exited" }
+        $owner = "'gjc update' (pid $ownerPid, which $state)"
+    } else {
+        $owner = "'gjc update' (owner unreadable)"
+    }
+    throw "The GJC install lock in $InstallDir is held by $owner (lock directory: $LockPath). Wait for that update to finish and retry. If no gjc update is running, close every gjc process, delete the directory $LockPath yourself, and retry; this installer never removes it."
+}
+
+function Enter-InstallLock {
+    param(
+        [string]$LockFile,
+        [string]$LockLine
+    )
+    # The lock is an open handle, not just a file. FileShare.None makes a second installer's open
+    # fail while this one runs, and DeleteOnClose makes Windows remove the file whenever the handle
+    # closes, including when the window is closed or the process is killed mid-download. So an
+    # interrupted install never strands a lock that blocks every later install.
+    $ERROR_FILE_NOT_FOUND = 2
+    $ERROR_SHARING_VIOLATION = 32
+    $ERROR_FILE_EXISTS = 80
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $stream = New-Object System.IO.FileStream($LockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($LockLine + "`n")
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+            return $stream
+        } catch {
+            # `gjc update`'s lock is a directory at this path; creating a file there fails with access
+            # denied. Classify after the failure rather than checking beforehand, so a directory
+            # created at any moment is reported instead of surfacing as a raw .NET error.
+            if ([System.IO.Directory]::Exists($LockFile)) { Stop-OnUpdaterLockDirectory -LockPath $LockFile }
+            $code = Get-IOErrorCode $_
+            if ($code -ne $ERROR_FILE_EXISTS -and $code -ne $ERROR_SHARING_VIOLATION) { throw }
+        }
+        # A lock file exists. Installers that hold it keep it unopenable; a file this one can open
+        # was left by an installer that published its lock and closed the handle (releases before
+        # this lock format). Reclaim it only when its recorded PID is no longer running: a live PID
+        # may still be such an installer, so that case fails closed as before.
+        $legacy = $null
+        try {
+            $legacy = New-Object System.IO.FileStream($LockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Delete)
+        } catch {
+            if ([System.IO.Directory]::Exists($LockFile)) { Stop-OnUpdaterLockDirectory -LockPath $LockFile }
+            if ((Get-IOErrorCode $_) -eq $ERROR_FILE_NOT_FOUND) { continue }
+            throw "Another GJC installer is already running in $InstallDir (lock: $LockFile). Wait for it to finish, then retry."
+        }
+        try {
+            $reader = New-Object System.IO.StreamReader($legacy, [System.Text.Encoding]::UTF8, $false, 1024, $true)
+            $ownerLine = $reader.ReadLine()
+            $ownerPid = 0
+            if (-not ($ownerLine -match '^(\d+) [0-9a-f]{32}$') -or -not [int]::TryParse($Matches[1], [ref]$ownerPid)) {
+                throw "Unrecognized GJC installer lock in $InstallDir (lock: $LockFile). Remove it only after confirming no installer is running."
+            }
+            if (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) {
+                throw "Another GJC installer (pid $ownerPid) may still be running in $InstallDir (lock: $LockFile). Wait for it to finish, or remove the lock after confirming that process is not an installer."
+            }
+            # $legacy is open without Read/Write sharing, so no other installer can open this file
+            # during the PID check. The delete itself is by path; it cannot remove a lock a
+            # successor created, because that lock is DeleteOnClose and held with FileShare.None.
+            [System.IO.File]::Delete($LockFile)
+            Write-Host "Removed a stale installer lock left by exited pid $ownerPid"
+        } finally {
+            $legacy.Dispose()
+        }
+    }
+    throw "Another GJC installer is already running in $InstallDir (lock: $LockFile). Wait for it to finish, then retry."
+}
+
 function Assert-Checksum {
     param(
         [string]$Tag,
@@ -393,6 +497,94 @@ function Assert-InstalledBinary {
     }
 }
 
+function Restore-PreviousBinary {
+    param(
+        [string]$BackupPath,
+        [string]$TargetPath
+    )
+    try {
+        Move-InstallFile -Source $BackupPath -Destination $TargetPath
+        Write-Host "Restored previous gjc binary at $TargetPath"
+        return $true
+    } catch {
+        Write-Warning "Could not restore the previous gjc binary. It is preserved at $BackupPath; delete $TargetPath if it exists, then rename $BackupPath to $TargetPath to restore it. Restore error: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-OwnedFile {
+    param([string]$Path)
+    # Deletes a file if present and reports whether it is gone; callers pass only paths they created.
+    try {
+        if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Delete($Path) }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Publish-Binary {
+    param(
+        [string]$SourcePath,
+        [string]$TargetPath,
+        [string]$BackupPath,
+        [string]$RejectedPath,
+        [string]$ExpectedVersion
+    )
+    # Replace by rename, never by delete: Windows refuses to delete a running gjc.exe (another
+    # terminal, the daemon, a bash tool) but allows renaming it. The old binary is renamed aside,
+    # the new one is moved in with no-overwrite semantics, and a failure at any point renames the
+    # old one back. A kill between the two renames leaves the old binary at $BackupPath.
+    $hadExisting = [System.IO.File]::Exists($TargetPath)
+    $restoreFailed = $false
+    try {
+        if ($hadExisting) {
+            try {
+                Move-InstallFile -Source $TargetPath -Destination $BackupPath
+            } catch {
+                throw "Could not move the existing $TargetPath aside; it was not changed. $($_.Exception.Message)"
+            }
+        }
+        try {
+            Move-InstallFile -Source $SourcePath -Destination $TargetPath
+        } catch {
+            $publishError = $_.Exception.Message
+            if ($hadExisting) { $restoreFailed = -not (Restore-PreviousBinary -BackupPath $BackupPath -TargetPath $TargetPath) }
+            throw "Failed to publish the downloaded binary. Existing install was preserved if one existed. $publishError"
+        }
+        try {
+            Assert-InstalledBinary -ExePath $TargetPath -ExpectedVersion $ExpectedVersion
+        } catch {
+            $verifyError = $_.Exception.Message
+            $retired = $false
+            try {
+                Move-InstallFile -Source $TargetPath -Destination $RejectedPath
+                $retired = $true
+            } catch {
+                $retired = Remove-OwnedFile -Path $TargetPath
+            }
+            if ($hadExisting) {
+                if ($retired) {
+                    $restoreFailed = -not (Restore-PreviousBinary -BackupPath $BackupPath -TargetPath $TargetPath)
+                } else {
+                    $restoreFailed = $true
+                    Write-Warning "Could not retire the rejected binary at $TargetPath. The previous gjc binary is preserved at $BackupPath; delete $TargetPath, then rename $BackupPath to $TargetPath, after closing gjc."
+                }
+            } elseif (-not $retired) {
+                Write-Warning "The binary that failed verification is still at $TargetPath; delete it after closing gjc."
+            }
+            throw "Verification failed; existing install was preserved if one existed. $verifyError"
+        }
+    } finally {
+        [void](Remove-OwnedFile -Path $RejectedPath)
+        if (-not $restoreFailed -and [System.IO.File]::Exists($BackupPath)) {
+            if (-not (Remove-OwnedFile -Path $BackupPath)) {
+                Write-Host "The previous binary is still in use and was kept at $BackupPath; delete it after closing gjc."
+            }
+        }
+    }
+}
+
 function Install-ViaBun {
     Write-Host "Installing from source via existing bun..."
     if ($Ref) {
@@ -473,23 +665,12 @@ function Install-Binary {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $lockFile = Join-Path $InstallDir ".gjc-install.lock"
-    $lockNonce = [guid]::NewGuid().ToString("N")
-    $lockLine = "$PID $lockNonce"
-    $lockOwned = $false
-    try {
-        $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockLine + "`n")
-        $fs.Write($bytes, 0, $bytes.Length)
-        $fs.Dispose()
-        $lockOwned = $true
-    } catch {
-        throw "Another GJC installer is already running in $InstallDir (lock: $lockFile). Remove a leftover lock file only after confirming no installer is running."
-    }
-
+    $lockLine = "$PID $([guid]::NewGuid().ToString('N'))"
+    $lockStream = Enter-InstallLock -LockFile $lockFile -LockLine $lockLine
     $OutPath = Join-Path $InstallDir "gjc.exe"
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
     $BackupPath = Join-Path $InstallDir (".gjc.bak." + [System.Guid]::NewGuid().ToString("N"))
-    $hadExisting = $false
+    $RejectedPath = Join-Path $InstallDir (".gjc.rejected." + [System.Guid]::NewGuid().ToString("N"))
     try {
         $existing = Get-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue
         $isReparse = $false
@@ -500,7 +681,6 @@ function Install-Binary {
         if ($isReparse) {
             throw "Refusing to replace symlink $OutPath with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
         }
-        $hadExisting = [bool]$existing
         $BinaryUrl = "$GithubReleases/$Latest/$BinaryName"
         Write-Host "Downloading $BinaryName..."
         try {
@@ -517,32 +697,7 @@ function Install-Binary {
 
         Assert-Checksum -Tag $Latest -AssetName $BinaryName -DownloadedPath $DownloadTmp
 
-        if ($hadExisting) {
-            Copy-Item -Force -LiteralPath $OutPath -Destination $BackupPath
-        }
-        try {
-            Move-Item -Force $DownloadTmp $OutPath
-        } catch {
-            if (Test-Path $BackupPath) {
-                Copy-Item -Force -LiteralPath $BackupPath -Destination $OutPath
-                Write-Host "Restored previous gjc binary at $OutPath"
-            }
-            throw "Failed to publish the downloaded binary. Existing install was preserved if one existed. $_"
-        }
-
-        try {
-            Assert-InstalledBinary -ExePath $OutPath -ExpectedVersion $ExpectedVersion
-        } catch {
-            if (Test-Path $BackupPath) {
-                Copy-Item -Force -LiteralPath $BackupPath -Destination $OutPath
-                Write-Host "Restored previous gjc binary at $OutPath"
-            } elseif (-not $hadExisting) {
-                Remove-Item -Force $OutPath -ErrorAction SilentlyContinue
-            }
-            throw "Verification failed; existing install was preserved if one existed. $_"
-        }
-
-        Remove-Item -Force $BackupPath -ErrorAction SilentlyContinue
+        Publish-Binary -SourcePath $DownloadTmp -TargetPath $OutPath -BackupPath $BackupPath -RejectedPath $RejectedPath -ExpectedVersion $ExpectedVersion
 
         Write-Host ""
         Write-Host "Installed gjc $ExpectedVersion to $OutPath" -ForegroundColor Green
@@ -570,12 +725,8 @@ function Install-Binary {
         }
     } finally {
         Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
-        if ($lockOwned -and (Test-Path $lockFile)) {
-            $still = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-            if ($still -eq $lockLine) {
-                Remove-Item -Force $lockFile -ErrorAction SilentlyContinue
-            }
-        }
+        # DeleteOnClose removes the lock file as the handle closes.
+        $lockStream.Dispose()
     }
 }
 
