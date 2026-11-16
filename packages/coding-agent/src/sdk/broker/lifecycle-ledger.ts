@@ -3,9 +3,99 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { captureManagedFileNoFollowBounded, sameIdentity } from "../session-readonly/inspection";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
+
+/** Directory spellings and their actual existing prefixes; absence never hides an unresolved link. */
+export interface ReadonlyDirectoryNamespace {
+	identity: string;
+	resolved?: string;
+}
+
+type DirectoryNamespaceProbe = { kind: "lstat" | "stat" | "realpath"; file: string };
+
+/** One observation algorithm for both IO modes and both ownership veto sources. */
+function* directoryNamespace(
+	directory: string,
+): Generator<DirectoryNamespaceProbe, ReadonlyDirectoryNamespace, fsSync.BigIntStats | string> {
+	const absolute = path.resolve(directory);
+	const root = path.parse(absolute).root;
+	const prefixes = [root];
+	for (const component of absolute.slice(root.length).split(path.sep).filter(Boolean))
+		prefixes.push(path.join(prefixes[prefixes.length - 1], component));
+	const identities: unknown[] = [];
+	let resolved: string | undefined;
+	for (const file of prefixes) {
+		let named: fsSync.BigIntStats;
+		try {
+			named = (yield { kind: "lstat", file }) as fsSync.BigIntStats;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				return { identity: JSON.stringify([identities, file]) };
+			throw error;
+		}
+		if (!named.isDirectory() && !named.isSymbolicLink()) throw new Error("Namespace prefix is not a directory.");
+		resolved = (yield { kind: "realpath", file }) as string;
+		const target = (yield { kind: "stat", file: resolved }) as fsSync.BigIntStats;
+		if (!target.isDirectory()) throw new Error("Namespace target is not a directory.");
+		identities.push([
+			file,
+			resolved,
+			String(named.dev),
+			String(named.ino),
+			named.isSymbolicLink() ? String(named.ctimeNs) : null,
+			String(target.dev),
+			String(target.ino),
+		]);
+	}
+	return { identity: JSON.stringify([identities, null]), resolved };
+}
+
+export async function captureReadonlyDirectoryNamespace(directory: string): Promise<ReadonlyDirectoryNamespace> {
+	const observation = directoryNamespace(directory);
+	let step = observation.next();
+	while (!step.done) {
+		let value: fsSync.BigIntStats | string;
+		try {
+			const { kind, file } = step.value;
+			value =
+				kind === "realpath"
+					? await fs.realpath(file)
+					: kind === "lstat"
+						? await fs.lstat(file, { bigint: true })
+						: await fs.stat(file, { bigint: true });
+		} catch (error) {
+			step = observation.throw(error);
+			continue;
+		}
+		step = observation.next(value);
+	}
+	return step.value;
+}
+
+export function captureReadonlyDirectoryNamespaceSync(directory: string): ReadonlyDirectoryNamespace {
+	const observation = directoryNamespace(directory);
+	let step = observation.next();
+	while (!step.done) {
+		let value: fsSync.BigIntStats | string;
+		try {
+			const { kind, file } = step.value;
+			value =
+				kind === "realpath"
+					? fsSync.realpathSync(file)
+					: kind === "lstat"
+						? fsSync.lstatSync(file, { bigint: true })
+						: fsSync.statSync(file, { bigint: true });
+		} catch (error) {
+			step = observation.throw(error);
+			continue;
+		}
+		step = observation.next(value);
+	}
+	return step.value;
+}
 
 export type LifecycleState =
 	| "accepted"
@@ -125,6 +215,16 @@ export type TerminalReadBack =
 	| { kind: "terminal"; entry: LifecycleLedgerEntry }
 	| { kind: "absent" }
 	| { kind: "rejected"; reason: TerminalReadBackRejection };
+
+export type LifecycleOwnershipReadOnly =
+	| { kind: "clear"; digest: string }
+	| { kind: "legacy_lifecycle_ambiguous"; reason: string; digest?: string }
+	| { kind: "unknown_ownership"; reason: string };
+
+type BoundedSourceReadSync =
+	| { kind: "absent"; revalidate: () => boolean }
+	| { kind: "source"; source: Buffer; revalidate: () => boolean }
+	| { kind: "rejected"; reason: BoundedSourceReadRejection };
 
 type BoundedSourceRead =
 	| { kind: "absent"; revalidate?: () => Promise<boolean> }
@@ -388,11 +488,7 @@ export class LifecycleLedger {
 		agentDir: string,
 		target: { sessionId: string; transcriptPath: string; cwd: string },
 		limits?: LifecycleLedgerLimits,
-	): Promise<
-		| { kind: "clear"; digest: string }
-		| { kind: "legacy_lifecycle_ambiguous"; reason: string; digest?: string }
-		| { kind: "unknown_ownership"; reason: string }
-	> {
+	): Promise<LifecycleOwnershipReadOnly> {
 		const ledger = new LifecycleLedger(agentDir, limits);
 		if (!Object.values(ledger.#limits).every(value => Number.isSafeInteger(value) && value > 0))
 			return { kind: "unknown_ownership", reason: "Invalid lifecycle read bounds." };
@@ -410,33 +506,8 @@ export class LifecycleLedger {
 			reason,
 			digest: hash.copy().digest("hex"),
 		});
-		if (source) {
-			if (source.length > 0 && source.at(-1) !== 0x0a) return ambiguous("Incomplete lifecycle history.");
-			let start = 0;
-			let rows = 0;
-			for (let offset = 0; offset < source.length; offset += 1) {
-				if (source[offset] !== 0x0a) continue;
-				const line = source.subarray(start, offset);
-				start = offset + 1;
-				if (line.length === 0) continue;
-				if (++rows > ledger.#limits.maxRows || line.length > ledger.#limits.maxLineBytes)
-					return ambiguous("Lifecycle history exceeds read bounds.");
-				try {
-					const entry = parseLifecycleJson(line);
-					assertSupportedStateVersion(ledger.#file, entry);
-					if (
-						!isLifecycleLedgerEntry(entry) ||
-						!hasValidTerminalDigests(entry) ||
-						!ledger.#isValidHistoryContinuation(ledger.#byIdentity.get(entry.identity), entry)
-					)
-						return ambiguous("Invalid lifecycle history.");
-					ledger.#entries.push(entry);
-					ledger.#byIdentity.set(entry.identity, entry);
-				} catch {
-					return ambiguous("Undecodable or unsupported lifecycle history.");
-				}
-			}
-		}
+		const historyRejection = ledger.#decodeOwnershipHistory(source);
+		if (historyRejection) return ambiguous(historyRejection);
 		// Attestations only exempt the exact single-row spawn mirror predicate used
 		// by recovery. Failure to verify one must never lift a legacy fence.
 		const attestation = await ledger
@@ -448,29 +519,12 @@ export class LifecycleLedger {
 		if (attestation.kind === "rejected")
 			return { kind: "unknown_ownership", reason: `Spawn-anchor evidence rejected: ${attestation.reason}.` };
 		hash.update(attestation.kind === "absent" ? "\nattestation-absent\n" : "\nattestation-present\n");
-		if (attestation.kind === "source") {
-			hash.update(attestation.source);
-			try {
-				const value: unknown = parseLifecycleJson(attestation.source);
-				if (!isBoundedLedgerJson(value)) return ambiguous("Spawn-anchor evidence exceeds shape bounds.");
-				const record = plainRecord(value);
-				if (
-					record?.version !== 1 ||
-					!Array.isArray(record.identities) ||
-					!record.identities.every(identity => typeof identity === "string")
-				)
-					return ambiguous("Malformed spawn-anchor evidence.");
-				ledger.#applySpawnAnchorAttestation(record.identities, new Set());
-			} catch {
-				return ambiguous("Undecodable spawn-anchor evidence.");
-			}
-		}
-		if (
-			ledger.hasLegacyIdentity(undefined, {
-				sessionTarget: { sessionId: target.sessionId, keyReuseIdentities: new Set() },
-			})
-		)
-			return ambiguous("Legacy lifecycle history cannot exclude the selected session target.");
+		if (attestation.kind === "source") hash.update(attestation.source);
+		const attestationRejection = ledger.#decodeOwnershipAttestation(
+			attestation.kind === "source" ? attestation.source : undefined,
+			target.sessionId,
+		);
+		if (attestationRejection) return ambiguous(attestationRejection);
 		try {
 			if (!(await read.revalidate?.()) || !(await attestation.revalidate?.()))
 				return { kind: "unknown_ownership", reason: "Lifecycle evidence changed during observation." };
@@ -478,6 +532,155 @@ export class LifecycleLedger {
 			return { kind: "unknown_ownership", reason: "Lifecycle evidence could not be revalidated." };
 		}
 		return { kind: "clear", digest: hash.digest("hex") };
+	}
+
+	/** Fresh synchronous evidence for a first-write admission; never reuses async observations. */
+	static inspectOwnershipReadOnlySync(
+		agentDir: string,
+		target: { sessionId: string; transcriptPath: string; cwd: string },
+		limits?: LifecycleLedgerLimits,
+	): LifecycleOwnershipReadOnly {
+		const ledger = new LifecycleLedger(agentDir, limits);
+		if (!Object.values(ledger.#limits).every(value => Number.isSafeInteger(value) && value > 0))
+			return { kind: "unknown_ownership", reason: "Invalid lifecycle read bounds." };
+		const read = ledger.#readBoundedSourceReadOnlySync();
+		if (read.kind === "rejected")
+			return { kind: "unknown_ownership", reason: `Lifecycle source rejected: ${read.reason}.` };
+		const source = read.kind === "source" ? read.source : undefined;
+		const hash = createHash("sha256").update(source === undefined ? "absent\n" : "present\n");
+		if (source) hash.update(source);
+		const ambiguous = (reason: string): LifecycleOwnershipReadOnly => ({
+			kind: "legacy_lifecycle_ambiguous",
+			reason,
+			digest: hash.copy().digest("hex"),
+		});
+		const historyRejection = ledger.#decodeOwnershipHistory(source);
+		if (historyRejection) return ambiguous(historyRejection);
+		const attestation = ledger.#readBoundedSourceReadOnlySync(ledger.#spawnAnchorAttestationFile);
+		if (attestation.kind === "rejected")
+			return { kind: "unknown_ownership", reason: `Spawn-anchor evidence rejected: ${attestation.reason}.` };
+		hash.update(attestation.kind === "absent" ? "\nattestation-absent\n" : "\nattestation-present\n");
+		if (attestation.kind === "source") hash.update(attestation.source);
+		const attestationRejection = ledger.#decodeOwnershipAttestation(
+			attestation.kind === "source" ? attestation.source : undefined,
+			target.sessionId,
+		);
+		if (attestationRejection) return ambiguous(attestationRejection);
+		try {
+			if (!read.revalidate() || !attestation.revalidate())
+				return { kind: "unknown_ownership", reason: "Lifecycle evidence changed during observation." };
+		} catch {
+			return { kind: "unknown_ownership", reason: "Lifecycle evidence could not be revalidated." };
+		}
+		return { kind: "clear", digest: hash.digest("hex") };
+	}
+
+	#decodeOwnershipHistory(source: Buffer | undefined): string | undefined {
+		if (!source) return;
+		if (source.length > 0 && source.at(-1) !== 0x0a) return "Incomplete lifecycle history.";
+		let start = 0;
+		let rows = 0;
+		for (let offset = 0; offset < source.length; offset += 1) {
+			if (source[offset] !== 0x0a) continue;
+			const line = source.subarray(start, offset);
+			start = offset + 1;
+			if (line.length === 0) continue;
+			if (++rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes)
+				return "Lifecycle history exceeds read bounds.";
+			try {
+				const entry = parseLifecycleJson(line);
+				assertSupportedStateVersion(this.#file, entry);
+				if (
+					!isLifecycleLedgerEntry(entry) ||
+					!hasValidTerminalDigests(entry) ||
+					!this.#isValidHistoryContinuation(this.#byIdentity.get(entry.identity), entry)
+				)
+					return "Invalid lifecycle history.";
+				this.#entries.push(entry);
+				this.#byIdentity.set(entry.identity, entry);
+			} catch {
+				return "Undecodable or unsupported lifecycle history.";
+			}
+		}
+	}
+
+	#decodeOwnershipAttestation(source: Buffer | undefined, sessionId: string): string | undefined {
+		if (source) {
+			try {
+				const value: unknown = parseLifecycleJson(source);
+				if (!isBoundedLedgerJson(value)) return "Spawn-anchor evidence exceeds shape bounds.";
+				const record = plainRecord(value);
+				if (
+					record?.version !== 1 ||
+					!Array.isArray(record.identities) ||
+					!record.identities.every(identity => typeof identity === "string")
+				)
+					return "Malformed spawn-anchor evidence.";
+				this.#applySpawnAnchorAttestation(record.identities, new Set());
+			} catch {
+				return "Undecodable spawn-anchor evidence.";
+			}
+		}
+		if (this.hasLegacyIdentity(undefined, { sessionTarget: { sessionId, keyReuseIdentities: new Set() } }))
+			return "Legacy lifecycle history cannot exclude the selected session target.";
+	}
+
+	#readBoundedSourceReadOnlySync(file = this.#file): BoundedSourceReadSync {
+		let opened = false;
+		let namespace: ReadonlyDirectoryNamespace | undefined;
+		try {
+			namespace = captureReadonlyDirectoryNamespaceSync(path.dirname(file));
+			const expectedNamespace = namespace.identity;
+			const sameNamespace = () =>
+				captureReadonlyDirectoryNamespaceSync(path.dirname(file)).identity === expectedNamespace;
+			// Only ENOENT from this initial open is absence. Later capture/name failures are unknown.
+			const fd = fsSync.openSync(
+				file,
+				fsSync.constants.O_RDONLY |
+					fsSync.constants.O_NOFOLLOW |
+					(process.platform === "win32" ? 0 : fsSync.constants.O_NONBLOCK),
+			);
+			opened = true;
+			try {
+				const stat = fsSync.fstatSync(fd, { bigint: true });
+				if (!stat.isFile()) return { kind: "rejected", reason: "not-regular-file" };
+				if (stat.size > BigInt(this.#limits.maxBytes)) return { kind: "rejected", reason: "oversized-by-stat" };
+			} finally {
+				fsSync.closeSync(fd);
+			}
+			const captured = captureManagedFileNoFollowBounded(file, this.#limits.maxBytes);
+			return {
+				kind: "source",
+				source: captured.bytes,
+				revalidate: () => {
+					if (!sameNamespace()) return false;
+					const current = captureManagedFileNoFollowBounded(file, this.#limits.maxBytes);
+					return (
+						sameIdentity(captured.identity, current.identity) &&
+						captured.identity.sha256 === current.identity.sha256
+					);
+				},
+			};
+		} catch (error) {
+			if (namespace && !opened && (error as NodeJS.ErrnoException).code === "ENOENT") {
+				const expectedNamespace = namespace.identity;
+				return {
+					kind: "absent",
+					revalidate: () => {
+						if (captureReadonlyDirectoryNamespaceSync(path.dirname(file)).identity !== expectedNamespace)
+							return false;
+						try {
+							fsSync.lstatSync(file);
+							return false;
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+							throw error;
+						}
+					},
+				};
+			}
+			return { kind: "rejected", reason: "read-error" };
+		}
 	}
 
 	async open(): Promise<this> {
@@ -746,7 +949,9 @@ export class LifecycleLedger {
 	}
 	async #readBoundedSourceReadOnly(authority = false, file = this.#file): Promise<BoundedSourceRead> {
 		let handle: fs.FileHandle | undefined;
+		let namespace: ReadonlyDirectoryNamespace | undefined;
 		try {
+			if (authority) namespace = await captureReadonlyDirectoryNamespace(path.dirname(file));
 			const nonBlocking = process.platform === "win32" ? 0 : fsSync.constants.O_NONBLOCK;
 			handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | nonBlocking);
 			const stat = await handle.stat({ bigint: true });
@@ -793,17 +998,29 @@ export class LifecycleLedger {
 					!same(await fs.lstat(file, { bigint: true }))
 				)
 					return { kind: "rejected", reason: "read-error" };
-				return { kind: "source", source, revalidate: async () => same(await fs.lstat(file, { bigint: true })) };
+				const expectedNamespace = namespace!.identity;
+				return {
+					kind: "source",
+					source,
+					revalidate: async () =>
+						(await captureReadonlyDirectoryNamespace(path.dirname(file))).identity === expectedNamespace &&
+						same(await fs.lstat(file, { bigint: true })),
+				};
 			}
 			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
 			if (bytesRead > this.#limits.maxBytes) return { kind: "rejected", reason: "oversized-by-read" };
 			return { kind: "source", source: bytes.subarray(0, bytesRead) };
 		} catch (error) {
-			if ((!authority || !handle) && (error as NodeJS.ErrnoException).code === "ENOENT")
+			if ((!authority || (namespace && !handle)) && (error as NodeJS.ErrnoException).code === "ENOENT")
 				return authority
 					? {
 							kind: "absent",
 							revalidate: async () => {
+								if (
+									(await captureReadonlyDirectoryNamespace(path.dirname(file))).identity !==
+									namespace!.identity
+								)
+									return false;
 								try {
 									await fs.lstat(file);
 									return false;
@@ -1085,8 +1302,28 @@ export class LifecycleLedger {
 			if (!target || !terminal(entry.state)) return false;
 			if (this.#isPreEffectRefusal(entry)) return true;
 			if (target.keyReuseIdentities.has(entry.identity)) return false;
-			const sessionIds = recordedSessionIds(entry);
-			return sessionIds.length > 0 && !sessionIds.includes(target.sessionId);
+			const sessionIds = new Set(recordedSessionIds(entry));
+			if (sessionIds.size === 0 || sessionIds.has(target.sessionId)) return false;
+			// A latest terminal binding cannot erase an earlier target or contradict
+			// a retained binding, even when the terminal response digest is valid.
+			for (const row of this.#entries) {
+				if (row.identity !== entry.identity) continue;
+				if (
+					row.intendedSessionId !== undefined &&
+					entry.intendedSessionId !== undefined &&
+					row.intendedSessionId !== entry.intendedSessionId
+				)
+					return false;
+				if (
+					row.resultSessionId !== undefined &&
+					entry.resultSessionId !== undefined &&
+					row.resultSessionId !== entry.resultSessionId
+				)
+					return false;
+				for (const sessionId of recordedSessionIds(row))
+					if (sessionId === target.sessionId || !sessionIds.has(sessionId)) return false;
+			}
+			return true;
 		};
 		return [...this.#byIdentity.values()].some(
 			entry =>

@@ -69,6 +69,26 @@ async function withoutEffects(
 			throw new Error(`Forbidden mutation: ${name}`);
 		}),
 	);
+	const syncMutators = [
+		"mkdirSync",
+		"mkdtempSync",
+		"chmodSync",
+		"renameSync",
+		"unlinkSync",
+		"rmSync",
+		"rmdirSync",
+		"writeFileSync",
+		"appendFileSync",
+		"truncateSync",
+		"copyFileSync",
+		"linkSync",
+		"symlinkSync",
+	] as const;
+	const syncSpies = syncMutators.map(name =>
+		vi.spyOn(fsSync, name).mockImplementation(() => {
+			throw new Error(`Forbidden mutation: ${name}`);
+		}),
+	);
 	const forbidden = [
 		vi.spyOn(LifecycleLedger.prototype, "open"),
 		vi.spyOn(SessionIndex.prototype, "open"),
@@ -76,6 +96,20 @@ async function withoutEffects(
 		vi.spyOn(SessionIndex.prototype, "diagnose"),
 		vi.spyOn(SessionIndex.prototype, "repair"),
 	];
+	const originalOpenSync = fsSync.openSync;
+	const openSync = vi.spyOn(fsSync, "openSync").mockImplementation((file, flags, mode) => {
+		expect(typeof flags).toBe("number");
+		if (typeof flags !== "number") throw new Error("Non-numeric observation flags");
+		expect(
+			flags &
+				(fsSync.constants.O_WRONLY |
+					fsSync.constants.O_RDWR |
+					fsSync.constants.O_CREAT |
+					fsSync.constants.O_TRUNC |
+					fsSync.constants.O_APPEND),
+		).toBe(0);
+		return originalOpenSync(file, flags, mode);
+	});
 	const originalOpen = fs.open;
 	const open = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
 		expect(typeof flags).toBe("number");
@@ -94,10 +128,11 @@ async function withoutEffects(
 	});
 	try {
 		await run();
-		for (const spy of [...spies, ...forbidden]) expect(spy).not.toHaveBeenCalled();
+		for (const spy of [...spies, ...syncSpies, ...forbidden]) expect(spy).not.toHaveBeenCalled();
 	} finally {
 		open.mockRestore();
-		for (const spy of [...spies, ...forbidden]) spy.mockRestore();
+		openSync.mockRestore();
+		for (const spy of [...spies, ...syncSpies, ...forbidden]) spy.mockRestore();
 	}
 	expect(await tree(dir)).toEqual(before);
 }
@@ -156,16 +191,28 @@ async function writeIndex(dir: string, events: readonly SessionIndexEvent[], tai
 	await fs.writeFile(logFile(dir), events.map(row => `${JSON.stringify(row)}\n`).join("") + tail);
 }
 
+async function lifecycleParity(dir: string, limits?: { maxBytes?: number; maxLineBytes?: number; maxRows?: number }) {
+	const result = await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir), limits);
+	expect(LifecycleLedger.inspectOwnershipReadOnlySync(dir, target(dir), limits)).toEqual(result);
+	return result;
+}
+
+async function indexParity(dir: string, sessionId = "selected", limits = indexLimits) {
+	const result = await SessionIndex.readAuthorityRootsReadOnly(dir, sessionId, limits);
+	expect(SessionIndex.readAuthorityRootsReadOnlySync(dir, sessionId, limits)).toEqual(result);
+	return result;
+}
+
 describe("read-only native ownership vetoes", () => {
 	it("leaves a genuinely absent App agentDir absent and returns empty observations, not retirement evidence", async () => {
 		await fixture(async dir => {
 			const absent = path.join(dir, "not-created");
 			await withoutEffects(dir, async () => {
-				expect(await LifecycleLedger.inspectOwnershipReadOnly(absent, target(dir))).toMatchObject({
+				expect(await lifecycleParity(absent)).toMatchObject({
 					kind: "clear",
 					digest: expect.stringMatching(/^[a-f0-9]{64}$/),
 				});
-				expect(await SessionIndex.readAuthorityRootsReadOnly(absent, "selected")).toMatchObject({
+				expect(await indexParity(absent)).toMatchObject({
 					kind: "resolved",
 					indexSeq: 0,
 					roots: [],
@@ -175,6 +222,121 @@ describe("read-only native ownership vetoes", () => {
 			});
 		});
 	});
+
+	it("accepts genuinely absent SDK children beneath a stable existing agent directory", async () => {
+		await fixture(async dir => {
+			await withoutEffects(dir, async () => {
+				expect((await lifecycleParity(dir)).kind).toBe("clear");
+				expect(await indexParity(dir)).toMatchObject({ kind: "resolved", indexSeq: 0, roots: [], identities: [] });
+			});
+		});
+	});
+
+	for (const ancestor of ["agentDir", "sdk"] as const) {
+		it(`rejects a dangling ${ancestor} ancestor instead of certifying absent ownership`, async () => {
+			await fixture(async dir => {
+				const agentDir = ancestor === "agentDir" ? path.join(dir, "agent-alias") : dir;
+				await fs.symlink(
+					path.join(dir, "missing-target"),
+					ancestor === "agentDir" ? agentDir : path.join(dir, "sdk"),
+				);
+				await withoutEffects(dir, async () => {
+					expect((await lifecycleParity(agentDir)).kind).toBe("unknown_ownership");
+					expect((await indexParity(agentDir)).kind).toBe("unknown_ownership");
+				});
+			});
+		});
+
+		it(`allows a stable ${ancestor} directory alias without mistaking its files for absence`, async () => {
+			await fixture(async dir => {
+				const agentDir = ancestor === "agentDir" ? path.join(dir, "agent-alias") : dir;
+				const destination = path.join(dir, "alias-target");
+				await fs.mkdir(destination);
+				await fs.symlink(destination, ancestor === "agentDir" ? agentDir : path.join(dir, "sdk"));
+				await writeLedger(agentDir, [accepted({ operationKey: "key", fingerprint: "fp" })]);
+				await writeIndex(agentDir, [event(agentDir, 1)]);
+				await withoutEffects(dir, async () => {
+					expect((await lifecycleParity(agentDir)).kind).toBe("clear");
+					expect(await indexParity(agentDir)).toMatchObject({
+						kind: "resolved",
+						indexSeq: 1,
+						roots: [await fs.realpath(agentDir)],
+						identities: [{ sessionId: "selected", endpointGeneration: 1 }],
+					});
+				});
+			});
+		});
+	}
+
+	for (const mode of ["async", "sync"] as const) {
+		for (const source of ["ledger", "index"] as const) {
+			it(`rechecks the existing prefix of genuinely absent ${mode} ${source} files`, async () => {
+				await fixture(async dir => {
+					const agentDir = path.join(dir, "existing-prefix");
+					const retired = path.join(dir, "retired-prefix");
+					await fs.mkdir(agentDir);
+					const resolvedPrefix = await fs.realpath(agentDir);
+					const originalStat = fs.stat;
+					const originalStatSync = fsSync.statSync;
+					const rename = fsSync.renameSync;
+					const mkdir = fsSync.mkdirSync;
+					const rmdir = fsSync.rmdirSync;
+					let changed = false;
+					const replacePrefix = () => {
+						rename(agentDir, retired);
+						mkdir(agentDir);
+						changed = true;
+					};
+					await withoutEffects(dir, async () => {
+						// Only the test changes the namespace; product mutation spies stay installed.
+						const observed =
+							mode === "async"
+								? vi.spyOn(fs, "stat").mockImplementation(
+										new Proxy(originalStat, {
+											async apply(fn, receiver, args) {
+												const result = await Reflect.apply(fn, receiver, args);
+												if (!changed && String(args[0]) === resolvedPrefix) replacePrefix();
+												return result;
+											},
+										}),
+									)
+								: undefined;
+						const observedSync =
+							mode === "sync"
+								? vi.spyOn(fsSync, "statSync").mockImplementation(
+										new Proxy(originalStatSync, {
+											apply(fn, receiver, args) {
+												const result = Reflect.apply(fn, receiver, args);
+												if (!changed && String(args[0]) === resolvedPrefix) replacePrefix();
+												return result;
+											},
+										}),
+									)
+								: undefined;
+						try {
+							const result =
+								source === "ledger"
+									? mode === "async"
+										? await LifecycleLedger.inspectOwnershipReadOnly(agentDir, target(agentDir))
+										: LifecycleLedger.inspectOwnershipReadOnlySync(agentDir, target(agentDir))
+									: mode === "async"
+										? await SessionIndex.readAuthorityRootsReadOnly(agentDir, "selected")
+										: SessionIndex.readAuthorityRootsReadOnlySync(agentDir, "selected");
+							expect(changed).toBe(true);
+							expect(result.kind).toBe("unknown_ownership");
+						} finally {
+							observed?.mockRestore();
+							observedSync?.mockRestore();
+							if (changed) {
+								rmdir(agentDir);
+								rename(retired, agentDir);
+							}
+						}
+					});
+				});
+			});
+		}
+	}
 
 	for (const damage of ["undecodable", "torn", "invalid-hash", "invalid-history", "unsupported"] as const) {
 		it(`refuses ${damage} lifecycle history without quarantine, sealing, or recovery`, async () => {
@@ -194,9 +356,7 @@ describe("read-only native ownership vetoes", () => {
 					damage === "undecodable" ? "{broken}\n" : damage === "torn" ? '{"identity":"other"' : "",
 				);
 				await withoutEffects(dir, async () => {
-					expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
-						"legacy_lifecycle_ambiguous",
-					);
+					expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
 				});
 			});
 		});
@@ -207,13 +367,11 @@ describe("read-only native ownership vetoes", () => {
 			const row = accepted();
 			await writeLedger(dir, [row, terminal(row)]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe("clear");
+				expect((await lifecycleParity(dir)).kind).toBe("clear");
 			});
 			await writeLedger(dir, [row, { ...row, state: "effect_started" }, terminal(row)]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
-					"legacy_lifecycle_ambiguous",
-				);
+				expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
 			});
 		});
 	});
@@ -223,20 +381,46 @@ describe("read-only native ownership vetoes", () => {
 			const other = accepted({ intendedSessionId: "other" });
 			await writeLedger(dir, [other, terminal(other)]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe("clear");
+				expect((await lifecycleParity(dir)).kind).toBe("clear");
 			});
 			await writeLedger(dir, [other]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
-					"legacy_lifecycle_ambiguous",
-				);
+				expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
 			});
 			const selected = accepted({ intendedSessionId: "selected" });
 			await writeLedger(dir, [selected, terminal(selected)]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
-					"legacy_lifecycle_ambiguous",
-				);
+				expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
+			});
+		});
+	});
+
+	for (const binding of ["accepted-target", "effect-target", "inconsistent-unrelated"] as const) {
+		it(`retains ${binding} history when a valid terminal digest names another target`, async () => {
+			await fixture(async dir => {
+				const row = accepted({ intendedSessionId: binding === "accepted-target" ? "selected" : "other" });
+				const effect = {
+					...row,
+					state: "effect_started" as const,
+					intendedSessionId: binding === "inconsistent-unrelated" ? "third" : "selected",
+				};
+				await writeLedger(dir, [row, effect, terminal(row, { intendedSessionId: "other" })]);
+				await withoutEffects(dir, async () => {
+					expect(await lifecycleParity(dir)).toMatchObject({
+						kind: "legacy_lifecycle_ambiguous",
+						reason: "Legacy lifecycle history cannot exclude the selected session target.",
+					});
+				});
+			});
+		});
+	}
+
+	it("keeps genuinely unrelated effect history clear rather than fencing every terminal legacy identity", async () => {
+		await fixture(async dir => {
+			const row = accepted({ intendedSessionId: "other" });
+			await writeLedger(dir, [row, { ...row, state: "effect_started" }, terminal(row)]);
+			await withoutEffects(dir, async () => {
+				expect((await lifecycleParity(dir)).kind).toBe("clear");
 			});
 		});
 	});
@@ -245,7 +429,7 @@ describe("read-only native ownership vetoes", () => {
 		await fixture(async dir => {
 			await writeLedger(dir, [accepted({ spawnAnchor: true })]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe("clear");
+				expect((await lifecycleParity(dir)).kind).toBe("clear");
 			});
 			await writeLedger(dir, [accepted()]);
 			await fs.writeFile(
@@ -253,13 +437,11 @@ describe("read-only native ownership vetoes", () => {
 				JSON.stringify({ version: 1, identities: ["legacy"] }),
 			);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe("clear");
+				expect((await lifecycleParity(dir)).kind).toBe("clear");
 			});
 			await writeLedger(dir, [accepted({ intendedSessionId: "selected" })]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
-					"legacy_lifecycle_ambiguous",
-				);
+				expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
 			});
 		});
 	});
@@ -281,9 +463,7 @@ describe("read-only native ownership vetoes", () => {
 				);
 				if (damage === "snapshot") await fs.writeFile(snapshotFile(dir), "{bad}");
 				await withoutEffects(dir, async () => {
-					expect((await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).kind).toBe(
-						"authority_roots_unresolved",
-					);
+					expect((await indexParity(dir)).kind).toBe("authority_roots_unresolved");
 				});
 			});
 		});
@@ -300,7 +480,7 @@ describe("read-only native ownership vetoes", () => {
 				}),
 			]);
 			await withoutEffects(dir, async () => {
-				const result = await SessionIndex.readAuthorityRootsReadOnly(dir, "selected");
+				const result = await indexParity(dir);
 				expect(result).toMatchObject({
 					kind: "resolved",
 					indexSeq: 2,
@@ -334,14 +514,12 @@ describe("read-only native ownership vetoes", () => {
 				}),
 			]);
 			await withoutEffects(dir, async () => {
-				expect(await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).toMatchObject({
+				expect(await indexParity(dir)).toMatchObject({
 					kind: "resolved",
 					indexSeq: 2,
 					identities: [{ sessionId: "selected" }],
 				});
-				expect((await SessionIndex.readAuthorityRootsReadOnly(dir, "legacy-other")).kind).toBe(
-					"authority_roots_unresolved",
-				);
+				expect((await indexParity(dir, "legacy-other")).kind).toBe("authority_roots_unresolved");
 			});
 		});
 	});
@@ -356,7 +534,7 @@ describe("read-only native ownership vetoes", () => {
 				JSON.stringify({ version: SESSION_INDEX_SNAPSHOT_VERSION, indexSeq: 2, events: [old, replacement] }),
 			);
 			await withoutEffects(dir, async () => {
-				expect(await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).toMatchObject({
+				expect(await indexParity(dir)).toMatchObject({
 					kind: "resolved",
 					indexSeq: 3,
 					identities: [{ hostIncarnation: "replacement", indexSeq: 2 }],
@@ -372,18 +550,166 @@ describe("read-only native ownership vetoes", () => {
 			const registered = event(dir, 2, { locator: { cwd: dir, worktreeRoot: null, stateRoot: root } });
 			await writeIndex(dir, [event(dir, 1, { endpointGeneration: 0 }), registered]);
 			await withoutEffects(dir, async () => {
-				const result = await SessionIndex.readAuthorityRootsReadOnly(dir, "selected");
+				const result = await indexParity(dir);
 				expect(result.kind).toBe("resolved");
 				if (result.kind === "resolved") expect(result.identities.every(identity => !identity.ambiguous)).toBe(true);
 			});
 			await writeIndex(dir, [event(dir, 1), registered]);
 			await withoutEffects(dir, async () => {
-				expect((await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).kind).toBe(
-					"authority_roots_unresolved",
-				);
+				expect((await indexParity(dir)).kind).toBe("authority_roots_unresolved");
 			});
 		});
 	});
+
+	for (const mode of ["async", "sync"] as const) {
+		it(`rejects a ${mode} generation-zero authority alias retarget after its realpath/stat capture`, async () => {
+			await fixture(async dir => {
+				const alias = path.join(dir, "generation-zero-root");
+				const other = path.join(dir, "other-root");
+				const retarget = path.join(dir, "retarget-root");
+				await fs.mkdir(other);
+				await fs.mkdir(retarget);
+				await fs.symlink(dir, alias);
+				await writeIndex(dir, [
+					event(dir, 1, { endpointGeneration: 0, locator: { cwd: dir, worktreeRoot: null, stateRoot: alias } }),
+					event(dir, 2, { locator: { cwd: dir, worktreeRoot: null, stateRoot: other } }),
+				]);
+				await fs.writeFile(
+					snapshotFile(dir),
+					JSON.stringify({
+						version: SESSION_INDEX_SNAPSHOT_VERSION,
+						indexSeq: 0,
+						events: [],
+					}),
+				);
+				const bytes = await fs.readFile(logFile(dir));
+				const snapshotBytes = await fs.readFile(snapshotFile(dir));
+				const resolvedAgentDir = await fs.realpath(dir);
+				const originalRealpath = fs.realpath;
+				const originalRealpathSync = fsSync.realpathSync;
+				const originalStat = fs.stat;
+				const originalStatSync = fsSync.statSync;
+				const unlink = fsSync.unlinkSync;
+				const symlink = fsSync.symlinkSync;
+				let armed = false;
+				let changed = false;
+				const retargetAlias = () => {
+					unlink(alias);
+					symlink(retarget, alias);
+					changed = true;
+				};
+				await withoutEffects(dir, async () => {
+					// Stable aliases preserve the real direct-session GC exception.
+					const stable = await indexParity(dir);
+					expect(stable.kind).toBe("resolved");
+					if (stable.kind === "resolved") {
+						expect(stable.identities.some(identity => identity.endpointGeneration === 0)).toBe(true);
+						expect(stable.identities.every(identity => !identity.ambiguous)).toBe(true);
+					}
+					const resolved =
+						mode === "async"
+							? vi.spyOn(fs, "realpath").mockImplementation(
+									new Proxy(originalRealpath, {
+										async apply(fn, receiver, args) {
+											const result = await Reflect.apply(fn, receiver, args);
+											if (String(args[0]) === alias) armed = true;
+											return result;
+										},
+									}),
+								)
+							: undefined;
+					const resolvedSync =
+						mode === "sync"
+							? vi.spyOn(fsSync, "realpathSync").mockImplementation(
+									new Proxy(originalRealpathSync, {
+										apply(fn, receiver, args) {
+											const result = Reflect.apply(fn, receiver, args);
+											if (String(args[0]) === alias) armed = true;
+											return result;
+										},
+									}),
+								)
+							: undefined;
+					const observed =
+						mode === "async"
+							? vi.spyOn(fs, "stat").mockImplementation(
+									new Proxy(originalStat, {
+										async apply(fn, receiver, args) {
+											const result = await Reflect.apply(fn, receiver, args);
+											if (armed && !changed && String(args[0]) === resolvedAgentDir) retargetAlias();
+											return result;
+										},
+									}),
+								)
+							: undefined;
+					const observedSync =
+						mode === "sync"
+							? vi.spyOn(fsSync, "statSync").mockImplementation(
+									new Proxy(originalStatSync, {
+										apply(fn, receiver, args) {
+											const result = Reflect.apply(fn, receiver, args);
+											if (armed && !changed && String(args[0]) === resolvedAgentDir) retargetAlias();
+											return result;
+										},
+									}),
+								)
+							: undefined;
+					try {
+						const result =
+							mode === "async"
+								? await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")
+								: SessionIndex.readAuthorityRootsReadOnlySync(dir, "selected");
+						expect(armed).toBe(true);
+						expect(changed).toBe(true);
+						expect(result).toMatchObject({
+							kind: "unknown_ownership",
+							reason: "Authority roots changed during observation.",
+						});
+						expect(await fs.readFile(logFile(dir))).toEqual(bytes);
+						expect(await fs.readFile(snapshotFile(dir))).toEqual(snapshotBytes);
+					} finally {
+						resolved?.mockRestore();
+						resolvedSync?.mockRestore();
+						observed?.mockRestore();
+						observedSync?.mockRestore();
+						if (changed) {
+							unlink(alias);
+							symlink(dir, alias);
+						}
+					}
+				});
+			});
+		});
+	}
+
+	for (const replacement of ["alias", "directory"] as const) {
+		it(`binds the authority ${replacement} dev/inode identity into both digests even at the same realpath`, async () => {
+			await fixture(async dir => {
+				const root = path.join(dir, "authority-root");
+				const alias = path.join(dir, "authority-alias");
+				await fs.mkdir(root);
+				await fs.symlink(root, alias);
+				await writeIndex(dir, [event(dir, 1, { locator: { cwd: dir, worktreeRoot: null, stateRoot: alias } })]);
+				const bytes = await fs.readFile(logFile(dir));
+				let digest: string | undefined;
+				await withoutEffects(dir, async () => {
+					const result = await indexParity(dir);
+					expect(result.kind).toBe("resolved");
+					if (result.kind === "resolved") digest = result.digest;
+				});
+				// Keep the old inode allocated so replacement cannot recycle its identity.
+				await fs.rename(replacement === "alias" ? alias : root, path.join(dir, "retired-identity"));
+				if (replacement === "alias") await fs.symlink(root, alias);
+				else await fs.mkdir(root);
+				await withoutEffects(dir, async () => {
+					const result = await indexParity(dir);
+					expect(result).toMatchObject({ kind: "resolved", roots: [await fs.realpath(root)] });
+					if (result.kind === "resolved") expect(result.digest).not.toBe(digest);
+					expect(await fs.readFile(logFile(dir))).toEqual(bytes);
+				});
+			});
+		});
+	}
 
 	it("never falls back when a selected authority root is missing", async () => {
 		await fixture(async dir => {
@@ -391,9 +717,7 @@ describe("read-only native ownership vetoes", () => {
 				event(dir, 1, { locator: { cwd: dir, worktreeRoot: null, stateRoot: path.join(dir, "missing") } }),
 			]);
 			await withoutEffects(dir, async () => {
-				expect((await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).kind).toBe(
-					"authority_roots_unresolved",
-				);
+				expect((await indexParity(dir)).kind).toBe("authority_roots_unresolved");
 			});
 		});
 	});
@@ -403,20 +727,14 @@ describe("read-only native ownership vetoes", () => {
 			await writeLedger(dir, [accepted({ operationKey: "key", fingerprint: "fp" })]);
 			await writeIndex(dir, [event(dir, 1)]);
 			await withoutEffects(dir, async () => {
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir), { maxBytes: 1 })).kind).toBe(
-					"unknown_ownership",
+				expect((await lifecycleParity(dir, { maxBytes: 1 })).kind).toBe("unknown_ownership");
+				expect((await lifecycleParity(dir, { maxLineBytes: 1 })).kind).toBe("legacy_lifecycle_ambiguous");
+				expect((await indexParity(dir, "selected", { ...indexLimits, maxLogBytes: 1 })).kind).toBe(
+					"authority_roots_unresolved",
 				);
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir), { maxLineBytes: 1 })).kind).toBe(
-					"legacy_lifecycle_ambiguous",
+				expect((await indexParity(dir, "selected", { ...indexLimits, maxRowBytes: 1 })).kind).toBe(
+					"authority_roots_unresolved",
 				);
-				expect(
-					(await SessionIndex.readAuthorityRootsReadOnly(dir, "selected", { ...indexLimits, maxLogBytes: 1 }))
-						.kind,
-				).toBe("authority_roots_unresolved");
-				expect(
-					(await SessionIndex.readAuthorityRootsReadOnly(dir, "selected", { ...indexLimits, maxRowBytes: 1 }))
-						.kind,
-				).toBe("authority_roots_unresolved");
 			});
 		});
 	});
@@ -452,13 +770,26 @@ describe("read-only native ownership vetoes", () => {
 			await writeIndex(dir, [event(dir, 1)]);
 			const wrong = await fs.lstat(ledgerFile(dir), { bigint: true });
 			wrong.ino += 1n;
+			const originalLstat = fs.lstat;
+			let mismatches = 0;
 			await withoutEffects(dir, async () => {
-				const lstat = vi.spyOn(fs, "lstat").mockResolvedValue(wrong);
+				const lstat = vi.spyOn(fs, "lstat").mockImplementation(
+					new Proxy(originalLstat, {
+						apply(fn, receiver, args) {
+							if ([ledgerFile(dir), logFile(dir)].includes(String(args[0]))) {
+								mismatches += 1;
+								return Promise.resolve(wrong);
+							}
+							return Reflect.apply(fn, receiver, args);
+						},
+					}),
+				);
 				try {
 					expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
 						"unknown_ownership",
 					);
 					expect((await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).kind).toBe("unknown_ownership");
+					expect(mismatches).toBe(2);
 				} finally {
 					lstat.mockRestore();
 				}
@@ -496,12 +827,185 @@ describe("read-only native ownership vetoes", () => {
 			await fs.link(logFile(dir), path.join(dir, "index-alias"));
 			await withoutEffects(dir, async () => {
 				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe("unknown_ownership");
-				expect((await SessionIndex.readAuthorityRootsReadOnly(dir, "selected")).kind).toBe(
-					"authority_roots_unresolved",
-				);
+				expect((await indexParity(dir)).kind).toBe("authority_roots_unresolved");
 			});
 		});
 	});
+
+	for (const failure of ["read-failed", "short-read", "post-open-enoent", "final-name-change"] as const) {
+		it(`fails closed on synchronous ${failure} without persistent or attempted effects`, async () => {
+			await fixture(async dir => {
+				await writeLedger(dir, [accepted({ operationKey: "key", fingerprint: "fp" })]);
+				await writeIndex(dir, [event(dir, 1)]);
+				await withoutEffects(dir, async () => {
+					for (const source of ["ledger", "index"] as const) {
+						const file = source === "ledger" ? ledgerFile(dir) : logFile(dir);
+						const initial = fsSync.lstatSync(file, { bigint: true });
+						const changed = fsSync.lstatSync(file, { bigint: true });
+						changed.ino += 1n;
+						const read =
+							failure === "read-failed"
+								? vi.spyOn(fsSync, "readSync").mockImplementation(() => {
+										throw new Error("Injected read failure");
+									})
+								: failure === "short-read"
+									? vi.spyOn(fsSync, "readSync").mockReturnValue(0)
+									: undefined;
+						const originalLstat = fsSync.lstatSync;
+						let namedChecks = 0;
+						const named =
+							failure === "post-open-enoent" || failure === "final-name-change"
+								? vi.spyOn(fsSync, "lstatSync").mockImplementation(
+										new Proxy(originalLstat, {
+											apply(fn, receiver, args) {
+												if (String(args[0]) !== file) return Reflect.apply(fn, receiver, args);
+												namedChecks += 1;
+												if (failure === "post-open-enoent")
+													throw Object.assign(new Error("Removed after open"), { code: "ENOENT" });
+												return namedChecks === 1 ? initial : changed;
+											},
+										}),
+									)
+								: undefined;
+						try {
+							const result =
+								source === "ledger"
+									? LifecycleLedger.inspectOwnershipReadOnlySync(dir, target(dir))
+									: SessionIndex.readAuthorityRootsReadOnlySync(dir, "selected");
+							expect(result.kind).toBe("unknown_ownership");
+							if (named) expect(namedChecks).toBe(failure === "final-name-change" ? 2 : 1);
+						} finally {
+							read?.mockRestore();
+							named?.mockRestore();
+						}
+					}
+				});
+			});
+		});
+	}
+
+	it("rechecks complete synchronous content hashes even when descriptor metadata stays unchanged", async () => {
+		await fixture(async dir => {
+			await writeLedger(dir, [accepted({ operationKey: "key", fingerprint: "fp" })]);
+			await writeIndex(dir, [event(dir, 1)]);
+			await withoutEffects(dir, async () => {
+				for (const source of ["ledger", "index"] as const) {
+					const originalRead = fsSync.readSync;
+					let reads = 0;
+					const read = vi
+						.spyOn(fsSync, "readSync")
+						.mockImplementation(
+							(
+								fd: number,
+								buffer: NodeJS.ArrayBufferView,
+								offsetOrOptions?: number | fsSync.ReadOptions,
+								length?: number,
+								position?: fsSync.ReadPosition | null,
+							) => {
+								const count =
+									typeof offsetOrOptions === "number"
+										? originalRead(fd, buffer, offsetOrOptions, length!, position ?? null)
+										: originalRead(fd, buffer, offsetOrOptions);
+								if (++reads === 2 && count > 0)
+									new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)[0] ^= 1;
+								return count;
+							},
+						);
+					try {
+						const result =
+							source === "ledger"
+								? LifecycleLedger.inspectOwnershipReadOnlySync(dir, target(dir))
+								: SessionIndex.readAuthorityRootsReadOnlySync(dir, "selected");
+						expect(result.kind).toBe("unknown_ownership");
+						expect(reads).toBe(2);
+					} finally {
+						read.mockRestore();
+					}
+				}
+			});
+		});
+	});
+
+	it("does not treat initial absence as clear when a source name appears before final revalidation", async () => {
+		await fixture(async dir => {
+			const existing = await fs.lstat(dir, { bigint: true });
+			const originalLstat = fs.lstat;
+			const originalLstatSync = fsSync.lstatSync;
+			const sourceNames = new Set([ledgerFile(dir), snapshotFile(dir), logFile(dir)]);
+			await withoutEffects(dir, async () => {
+				const asyncNamed = vi.spyOn(fs, "lstat").mockImplementation(
+					new Proxy(originalLstat, {
+						apply(fn, receiver, args) {
+							return sourceNames.has(String(args[0]))
+								? Promise.resolve(existing)
+								: Reflect.apply(fn, receiver, args);
+						},
+					}),
+				);
+				const syncNamed = vi.spyOn(fsSync, "lstatSync").mockImplementation(
+					new Proxy(originalLstatSync, {
+						apply(fn, receiver, args) {
+							return sourceNames.has(String(args[0])) ? existing : Reflect.apply(fn, receiver, args);
+						},
+					}),
+				);
+				try {
+					expect((await lifecycleParity(dir)).kind).toBe("unknown_ownership");
+					expect((await indexParity(dir)).kind).toBe("unknown_ownership");
+				} finally {
+					asyncNamed.mockRestore();
+					syncNamed.mockRestore();
+				}
+			});
+		});
+	});
+
+	it("shares snapshot byte and cumulative row bounds rather than a permissive sync projection", async () => {
+		await fixture(async dir => {
+			const first = event(dir, 1);
+			await writeIndex(dir, [event(dir, 2, { type: "host_heartbeat" })]);
+			await fs.writeFile(
+				snapshotFile(dir),
+				JSON.stringify({
+					version: SESSION_INDEX_SNAPSHOT_VERSION,
+					indexSeq: 1,
+					events: [first],
+				}),
+			);
+			await withoutEffects(dir, async () => {
+				expect((await indexParity(dir, "selected", { ...indexLimits, maxSnapshotBytes: 1 })).kind).toBe(
+					"authority_roots_unresolved",
+				);
+				expect((await indexParity(dir, "selected", { ...indexLimits, maxRows: 1 })).kind).toBe(
+					"authority_roots_unresolved",
+				);
+				expect((await indexParity(dir)).kind).toBe("resolved");
+			});
+		});
+	});
+
+	for (const source of ["symlink", "directory"] as const) {
+		it(`rejects ${source} sources in both readers without recovery`, async () => {
+			await fixture(async dir => {
+				await fs.mkdir(path.dirname(logFile(dir)), { recursive: true });
+				if (source === "symlink") {
+					const bytes = path.join(dir, "external");
+					await fs.writeFile(bytes, "");
+					await fs.symlink(bytes, ledgerFile(dir));
+					await fs.symlink(bytes, logFile(dir));
+				} else {
+					await fs.mkdir(ledgerFile(dir));
+					await fs.mkdir(logFile(dir));
+				}
+				await withoutEffects(dir, async () => {
+					expect((await lifecycleParity(dir)).kind).toBe("unknown_ownership");
+					expect((await indexParity(dir)).kind).toBe(
+						source === "directory" ? "authority_roots_unresolved" : "unknown_ownership",
+					);
+				});
+			});
+		});
+	}
 
 	it("keeps request-specific readTerminal behavior for unrelated torn tails", async () => {
 		await fixture(async dir => {
@@ -512,9 +1016,7 @@ describe("read-only native ownership vetoes", () => {
 					kind: "terminal",
 					entry: { state: "terminal_error" },
 				});
-				expect((await LifecycleLedger.inspectOwnershipReadOnly(dir, target(dir))).kind).toBe(
-					"legacy_lifecycle_ambiguous",
-				);
+				expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
 			});
 		});
 	});
