@@ -321,7 +321,15 @@ async function spawnCapture(cmd: string[], options: SpawnCaptureOptions = {}): P
 	}
 }
 
+// Clipboard writes that spawn a helper finish asynchronously; chain them so the
+// last copy invoked is the one left on the clipboard.
+let clipboardWriteChain: Promise<void> = Promise.resolve();
+
 async function copyToClipboardNative(text: string): Promise<boolean> {
+	const previousWrite = clipboardWriteChain;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	clipboardWriteChain = promise;
+	await previousWrite;
 	try {
 		if (process.env.TERMUX_VERSION) {
 			try {
@@ -339,6 +347,8 @@ async function copyToClipboardNative(text: string): Promise<boolean> {
 		return true;
 	} catch {
 		return false;
+	} finally {
+		resolve();
 	}
 }
 

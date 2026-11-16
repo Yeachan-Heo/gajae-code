@@ -74,6 +74,39 @@ describe("Termux write path", () => {
 		expect(nativeSpy).not.toHaveBeenCalled();
 	});
 
+	it("pipes the text to termux-clipboard-set and writes overlapping copies in invocation order", async () => {
+		const started: string[] = [];
+		const gates: Array<(code: number) => void> = [];
+		function mockSpawn(cmd: string[], opts?: SpawnOptions): Subprocess;
+		function mockSpawn(_cmd: string[], opts?: SpawnOptions): Subprocess {
+			const stdin = opts?.stdin;
+			started.push(stdin instanceof Uint8Array ? Buffer.from(stdin).toString() : String(stdin));
+			const { promise, resolve } = Promise.withResolvers<number>();
+			gates.push(resolve);
+			return {
+				pid: 1,
+				stdout: emptyStream(),
+				stderr: emptyStream(),
+				exitCode: 0,
+				exited: promise,
+				kill: () => true,
+			} as unknown as Subprocess;
+		}
+		vi.spyOn(Bun, "spawn").mockImplementation(mockSpawn as unknown as typeof Bun.spawn);
+		vi.spyOn(native, "copyToClipboard").mockImplementation(() => {});
+
+		const first = copyToClipboard("first");
+		const second = copyToClipboard("second");
+		await Bun.sleep(10);
+		expect(started).toEqual(["first"]);
+
+		gates[0](0);
+		await Bun.sleep(10);
+		expect(started).toEqual(["first", "second"]);
+		gates[1](0);
+		await Promise.all([first, second]);
+	});
+
 	it("falls back to the native write when termux-clipboard-set fails", async () => {
 		const calls: SpawnCall[] = [];
 		spySpawn(calls, 1);
