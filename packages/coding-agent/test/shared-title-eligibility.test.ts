@@ -513,6 +513,49 @@ describe("shared publication admission split", () => {
 		expect(text).toContain(`"id":"${attempted}"`);
 	});
 
+	it("joins an in-flight deferred drain so one result publishes and reports exactly once", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo once", shellResult("once output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+		// Stop the prompt right after its deferred flush; no provider call is made.
+		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
+		const append = f.manager.appendMessageSharingSession.bind(f.manager);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution" && ++publications === 1) {
+				entered.resolve();
+				await release.promise;
+			}
+			return append(message);
+		});
+		const settle = (pending: Promise<void>) =>
+			pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		const first = settle(f.session.prompt("first flush"));
+		await entered.promise;
+		// A wedged cleanup forces recovery, whose non-awaited drain overlaps the held one.
+		const waitForIdle = vi.spyOn(f.session.agent, "waitForIdle").mockReturnValue(new Promise<void>(() => {}));
+		const aborted = settle(f.session.abort({ timeoutMs: 0 }));
+		await Bun.sleep(50);
+		waitForIdle.mockRestore();
+		release.resolve();
+		await first;
+		expect(await Promise.race([aborted.then(() => "settled"), Bun.sleep(2000).then(() => "timeout")])).toBe(
+			"settled",
+		);
+		expect(publications).toBe(1);
+		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.flush();
+		expect((await Bun.file(f.file).text()).split("once output")).toHaveLength(2);
+	});
+
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });

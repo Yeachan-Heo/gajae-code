@@ -4610,6 +4610,8 @@ export class AgentSession {
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
 	}> = [];
+	/** The one in-flight deferred command-result drain; later drains join it first. */
+	#executionMessageDrain: Promise<void> | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -32744,12 +32746,37 @@ export class AgentSession {
 		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
 	}
 
+	/**
+	 * Serialize deferred command-result drains.
+	 *
+	 * Queue items stay in place while a shared publication awaits, so a second drain
+	 * (forced recovery, a replacement prompt, a prompt finalizer) must wait for the
+	 * in-flight one instead of publishing the same item again and running its
+	 * `onPersisted` twice. Waiting also keeps transcript order: a later drain retries
+	 * only what the earlier one left queued, behind the entry that failed.
+	 */
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
 		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
 		kind: "bash" | "python",
 	): Promise<void> {
+		while (this.#executionMessageDrain) {
+			// The owning caller observes the drain's failure; a joiner only waits for it.
+			await this.#executionMessageDrain.catch(() => {});
+		}
 		if (pendingMessages.length === 0) return;
+		const drain = this.#drainPendingExecutionMessages(pendingMessages, kind);
+		this.#executionMessageDrain = drain;
+		try {
+			await drain;
+		} finally {
+			if (this.#executionMessageDrain === drain) this.#executionMessageDrain = undefined;
+		}
+	}
 
+	async #drainPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		kind: "bash" | "python",
+	): Promise<void> {
 		const total = pendingMessages.length;
 		const remaining: typeof pendingMessages = [];
 		const errors: unknown[] = [];

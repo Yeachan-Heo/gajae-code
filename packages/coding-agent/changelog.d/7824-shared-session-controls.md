@@ -9,3 +9,4 @@
 - An uncertain or committed-but-unapplied shared control write now closes the session with a message that says what happened, instead of retrying or rolling back (#7824).
 - Shared tool selection now follows the same rule: an uncertain write, or a saved selection the session could not apply, closes the session and keeps the saved entry IDs, and an uncertain write blocks further writes from that session (#7824).
 - A deferred bash or Python result whose shared write is uncertain is no longer retried under a new entry ID. The session closes and reports the attempted ID (#7824).
+- Overlapping deferred bash or Python result flushes, such as forced abort recovery and a prompt, now share one flush, so each result is written and reported once (#7824).
