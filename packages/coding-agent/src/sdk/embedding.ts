@@ -857,6 +857,13 @@ export const deleteEmbeddedSession = (() => {
 			throw error;
 		}
 	};
+	const assertCanonicalTranscriptAbsent = (state: DeleteState): void => {
+		if (absent(state.file)) return;
+		state.uncertain = true;
+		throw Object.assign(new Error("Canonical transcript pathname reappeared; deletion completion is uncertain"), {
+			code: "cleanup_pending",
+		});
+	};
 	const assertArtifactCompletion = (state: DeleteState, completed = true): void => {
 		const target = state.target;
 		const detached = target.detachedArtifactsPath;
@@ -1001,6 +1008,13 @@ export const deleteEmbeddedSession = (() => {
 		state.busy = true;
 		const retained = state;
 		try {
+			// Refuse a foreign live name before acquiring owner guards or replaying
+			// cleanup authority. In particular, an empty replacement is not a retry.
+			if (options?.retry && !absent(retained.file)) {
+				const observed = inspectManagedFileNoFollow(retained.file, 0);
+				if (encode(observed.identity) !== encode(retained.target.transcriptIdentity))
+					throw new OwnerAuthorityError("authority_changed");
+			}
 			let owner = retained.owner;
 			if (
 				retained.deleted ||
@@ -1041,6 +1055,7 @@ export const deleteEmbeddedSession = (() => {
 									code: outcome.kind === "cleanup_pending" ? "cleanup_pending" : outcome.code,
 									outcome: structuredClone(outcome),
 								});
+							assertCanonicalTranscriptAbsent(retained);
 							retained.deleted = true;
 						} else {
 							const storage = new FileSessionStorage();
@@ -1079,6 +1094,7 @@ export const deleteEmbeddedSession = (() => {
 								retained.uncertain = undefined;
 								retained.outcome = structuredClone(outcome);
 								if (outcome.kind === "deleted") {
+									assertCanonicalTranscriptAbsent(retained);
 									if (
 										outcome.taskArtifactOwnerDeletionEvidence &&
 										outcome.taskArtifactOwnerRetirementOutcome?.kind !== "completed"
@@ -1106,6 +1122,7 @@ export const deleteEmbeddedSession = (() => {
 									}
 									retained.deleted = true;
 									publishCheckpoint(storage, retained);
+									assertCanonicalTranscriptAbsent(retained);
 									break;
 								}
 								const target = retained.target;
@@ -1167,6 +1184,7 @@ export const deleteEmbeddedSession = (() => {
 						}
 					}
 					if (!retained.managedBinding && retained.target.artifactsRemoved) assertArtifactCompletion(retained);
+					assertCanonicalTranscriptAbsent(retained);
 					return { deleted: true, value: undefined };
 				},
 			);

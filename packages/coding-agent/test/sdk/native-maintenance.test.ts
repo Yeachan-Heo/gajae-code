@@ -8,13 +8,16 @@ import { getSessionsDir } from "@gajae-code/utils";
 import { deleteEmbeddedSession, forkEmbeddedSession, listEmbeddedProjectSessions } from "../../src/sdk/embedding";
 import { resolveEmbeddedResumeCheckpoint } from "../../src/sdk/native-embedding";
 import { createCooperativeOwnerInspectors } from "../../src/sdk/native-ownership";
+import * as managedInspection from "../../src/sdk/session-readonly/inspection";
 import {
+	listManagedCandidates,
 	MANAGED_INTERNAL_DIRECTORY,
 	MANAGED_TOMBSTONES_DIRECTORY,
 	resolveManagedScope,
 } from "../../src/sdk/session-readonly/scope";
 import * as blobStore from "../../src/session/blob-store";
 import {
+	deleteManagedSessionCandidate,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScopeForWrite,
 } from "../../src/session/internal/managed-session-scope";
@@ -257,7 +260,7 @@ async function preparedManagedFixture() {
 	const file = path.join(resolved.scope.directoryPath, "selected.jsonl");
 	await Bun.write(file, f.records.map(entry => JSON.stringify(entry)).join("\n") + "\n");
 	await fs.rm(f.file);
-	return { ...f, file, directory: resolved.scope.directoryPath, context };
+	return { ...f, file, directory: resolved.scope.directoryPath, context, scope: resolved.scope };
 }
 
 describe("native read-only maintenance inventory", () => {
@@ -872,6 +875,197 @@ describe("owner-checked native deletion", () => {
 				).toBe(false);
 			},
 		);
+	}
+
+	for (const managed of [false, true]) {
+		for (const empty of [false, true]) {
+			it(`refuses ${managed ? "managed" : "external"} actual native deletion when the canonical name returns ${empty ? "empty" : "with foreign bytes"}`, async () => {
+				const f = managed ? await preparedManagedFixture() : await fixture();
+				await artifacts(f);
+				const token = owner(f);
+				const evidence = getOwnerMembershipEvidence(token);
+				retireOwnerMembershipSync(token);
+				const ownerRecord = await Bun.file(evidence.authorityKey).text();
+				const originalIdentity = await fs.lstat(f.file, { bigint: true });
+				const replacement = empty
+					? ""
+					: `${JSON.stringify({ ...(f.records[0] as object), id: "foreign" })}\n${JSON.stringify(user("foreign", null))}\n`;
+				const unlink = native.exactUnlink;
+				const dispositions: Array<{ ok: boolean; payloadDurable?: boolean; detachedPath?: string }> = [];
+				const dispatch = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+					const result = unlink(pathname, identity);
+					if (pathname === f.file) {
+						expect(result.ok || result.payloadDurable === true).toBe(true);
+						dispositions.push(structuredClone(result));
+						// Return the authentic result unchanged, after replacing only the
+						// canonical name. The issued quarantine is not the replacement.
+						sync.writeFileSync(f.file, replacement, { mode: 0o600 });
+					}
+					return result;
+				});
+				const remove = vi.spyOn(native, "exactRemoveDirectoryTree");
+				const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+				const outcomes: VerifiedSessionDeleteResult[] = [];
+				const lower = vi
+					.spyOn(FileSessionStorage.prototype, "deleteSessionVerified")
+					.mockImplementation(async function (this: FileSessionStorage, target, inspector) {
+						const result = await originalDelete.call(this, target, inspector);
+						outcomes.push(structuredClone(result));
+						return result;
+					});
+				const options = { ...f, ...(managed ? { managed: true as const } : {}) };
+				const refused = await caught(deleteEmbeddedSession(f.file, options));
+				expect(refused.code).toBe("cleanup_pending");
+				expect(refused.retry).toBeDefined();
+				expect(dispositions).toHaveLength(1);
+				const last = outcomes.at(-1);
+				if (last?.kind !== "cleanup_pending" || last.phase !== "transcript")
+					throw new Error("Expected canonical reappearance to retain transcript cleanup evidence");
+				expect(last.transcriptPayloadDurable).toBe(dispositions[0].payloadDurable === true ? true : undefined);
+				expect(last.detachedTranscriptPath).toBe(dispositions[0].detachedPath);
+				expect(last.taskArtifactOwnerTranscriptDeleted).toBeUndefined();
+				expect(await Bun.file(f.file).text()).toBe(replacement);
+				const replacementIdentity = await fs.lstat(f.file, { bigint: true });
+				expect([replacementIdentity.dev, replacementIdentity.ino]).not.toEqual([
+					originalIdentity.dev,
+					originalIdentity.ino,
+				]);
+				expect(await Bun.file(evidence.authorityKey).text()).toBe(ownerRecord);
+				if (managed) {
+					const directory = path.join(f.directory, MANAGED_INTERNAL_DIRECTORY, MANAGED_TOMBSTONES_DIRECTORY);
+					expect((await fs.readdir(directory)).some(name => name.includes(".cleanup-completed-"))).toBe(false);
+				}
+				const beforeRetry = await tree(f.root);
+				const calls = [dispatch.mock.calls.length, remove.mock.calls.length, lower.mock.calls.length];
+				const retried = await caught(deleteEmbeddedSession(f.file, { ...options, retry: refused.retry }));
+				expect(retried.retry).toBe(refused.retry);
+				expect([dispatch.mock.calls.length, remove.mock.calls.length, lower.mock.calls.length]).toEqual(calls);
+				expect(await tree(f.root)).toEqual(beforeRetry);
+			});
+		}
+
+		for (const boundary of ["lower-return", "completion-publication", "completion-reread"] as const) {
+			it(`refuses ${managed ? "managed" : "external"} canonical reappearance at ${boundary}`, async () => {
+				const f = managed ? await preparedManagedFixture() : await fixture();
+				await artifacts(f);
+				const token = owner(f);
+				const evidence = getOwnerMembershipEvidence(token);
+				retireOwnerMembershipSync(token);
+				const ownerRecord = await Bun.file(evidence.authorityKey).text();
+				const replacement = `${JSON.stringify({ ...(f.records[0] as object), id: "foreign" })}\n${JSON.stringify(user("foreign", null))}\n`;
+				let injected = false;
+				const inject = () => {
+					expect(sync.existsSync(f.file)).toBe(false);
+					injected = true;
+					sync.writeFileSync(f.file, replacement, { mode: 0o600 });
+				};
+				const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+				const outcomes: VerifiedSessionDeleteResult[] = [];
+				vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified").mockImplementation(async function (
+					this: FileSessionStorage,
+					target,
+					inspector,
+				) {
+					const result = await originalDelete.call(this, target, inspector);
+					outcomes.push(structuredClone(result));
+					if (result.kind === "deleted" && boundary === "lower-return") inject();
+					return result;
+				});
+				if (boundary === "completion-publication" && managed) {
+					const rename = native.renameNoReplacePathAsync;
+					vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async (source, destination) => {
+						const result = await rename(source, destination);
+						if (result.ok && destination.includes(".cleanup-completed-")) {
+							expect(JSON.parse(sync.readFileSync(destination, "utf8"))).toMatchObject({
+								state: "cleanup_completed",
+								target: { path: f.file },
+							});
+							inject();
+						}
+						return result;
+					});
+				} else if (boundary === "completion-publication") {
+					const open = FileSessionStorage.prototype.openStagedWriter;
+					vi.spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
+						this: FileSessionStorage,
+						pathname,
+						options,
+					) {
+						const writer = open.call(this, pathname, options);
+						const publish = writer.publishNoReplace.bind(writer);
+						vi.spyOn(writer, "publishNoReplace").mockImplementation(() => {
+							const result = publish();
+							if (JSON.parse(sync.readFileSync(pathname, "utf8")).outcome?.kind === "deleted") inject();
+							return result;
+						});
+						return writer;
+					});
+				} else if (boundary === "completion-reread" && managed) {
+					const capture = managedInspection.captureManagedFileNoFollow;
+					vi.spyOn(managedInspection, "captureManagedFileNoFollow").mockImplementation(pathname => {
+						const result = capture(pathname);
+						if (!injected && pathname.includes(".cleanup-completed-")) {
+							expect(JSON.parse(result.bytes.toString("utf8"))).toMatchObject({
+								state: "cleanup_completed",
+								target: { path: f.file },
+							});
+							inject();
+						}
+						return result;
+					});
+				} else if (boundary === "completion-reread") {
+					const inspect = managedInspection.inspectManagedFileNoFollow;
+					vi.spyOn(managedInspection, "inspectManagedFileNoFollow").mockImplementation((pathname, limit) => {
+						const result = inspect(pathname, limit);
+						if (!injected && pathname.endsWith("-receipt") && result.bytes.length > 0) {
+							if (JSON.parse(result.bytes.toString("utf8")).outcome?.kind === "deleted") inject();
+						}
+						return result;
+					});
+				}
+				const dispatch = vi.spyOn(native, "exactUnlink");
+				const remove = vi.spyOn(native, "exactRemoveDirectoryTree");
+				const options = { ...f, ...(managed ? { managed: true as const } : {}) };
+				const operation = deleteEmbeddedSession(f.file, options);
+				await Promise.allSettled([operation]);
+				expect(injected).toBe(true);
+				const refused = await caught(operation);
+				expect(refused.code).toBe("cleanup_pending");
+				expect(refused.retry).toBeDefined();
+				expect(outcomes.at(-1)?.kind).toBe("deleted");
+				expect(dispatch.mock.calls.filter(([pathname]) => pathname === f.file)).toHaveLength(1);
+				expect(await Bun.file(f.file).text()).toBe(replacement);
+				expect(await Bun.file(evidence.authorityKey).text()).toBe(ownerRecord);
+				const beforeRetry = await tree(f.root);
+				const calls = [dispatch.mock.calls.length, remove.mock.calls.length];
+				const retried = await caught(deleteEmbeddedSession(f.file, { ...options, retry: refused.retry }));
+				expect(retried.retry).toBe(refused.retry);
+				expect([dispatch.mock.calls.length, remove.mock.calls.length]).toEqual(calls);
+				expect(await tree(f.root)).toEqual(beforeRetry);
+			});
+		}
+	}
+
+	for (const empty of [false, true]) {
+		it(`refuses completed managed cleanup replay with a new ${empty ? "empty" : "nonempty"} canonical inode`, async () => {
+			const f = await preparedManagedFixture();
+			await artifacts(f);
+			const listing = listManagedCandidates(f.scope);
+			if (listing.kind !== "complete" || listing.owned.length !== 1)
+				throw new Error("Expected one prepared managed candidate");
+			const candidate = listing.owned[0];
+			await deleteEmbeddedSession(f.file, { ...f, managed: true });
+			const replacement = empty ? "" : `${JSON.stringify({ ...(f.records[0] as object), id: "foreign" })}\n`;
+			await Bun.write(f.file, replacement);
+			const beforeReplay = await tree(f.root);
+			const dispatch = vi.spyOn(native, "exactUnlink");
+			const remove = vi.spyOn(native, "exactRemoveDirectoryTree");
+			const replay = await deleteManagedSessionCandidate(f.scope, candidate);
+			expect(replay).toMatchObject({ kind: "error", code: "durability_failed" });
+			expect(dispatch).not.toHaveBeenCalled();
+			expect(remove).not.toHaveBeenCalled();
+			expect(await tree(f.root)).toEqual(beforeReplay);
+		});
 	}
 
 	for (const boundary of ["promotion", "transcript"] as const) {

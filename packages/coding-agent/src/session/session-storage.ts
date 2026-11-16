@@ -2897,6 +2897,49 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 				throw error;
 			}
 		};
+		const transcriptCompletionRefusal = (
+			deletion: NativeExactUnlinkResult,
+		): VerifiedSessionDeleteResult | undefined => {
+			if (!transcriptDeletionTerminal(deletion)) return undefined;
+			try {
+				// Native disposition binds its detached payload, not any replacement
+				// at the live name. Even an empty new inode is foreign authority.
+				assertNoReparsePath(path.dirname(transcriptPath));
+				const parent = this.#directoryIdentity(path.dirname(transcriptPath));
+				if (
+					parent.dev !== authorizedTranscriptParentIdentity.dev ||
+					parent.ino !== authorizedTranscriptParentIdentity.ino
+				)
+					throw new SessionDeleteVerificationError("identity", "Transcript parent changed after native deletion");
+				try {
+					fs.lstatSync(transcriptPath);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}
+				throw new SessionDeleteVerificationError(
+					"identity",
+					"Canonical transcript pathname reappeared after native deletion",
+				);
+			} catch (error) {
+				return {
+					kind: "cleanup_pending",
+					phase: "transcript",
+					error: toError(error),
+					transcriptIdentity,
+					...ownerResultFields(),
+					detachedTranscriptPath: deletion.detachedPath ?? detachedTranscriptPath,
+					...((deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+						? { transcriptPayloadDurable: true as const }
+						: {}),
+					retainedSuccessorPath: deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath,
+					retainedPlaceholderPath:
+						deletion.retainedPlaceholderPath ??
+						(deletion.ok ? nativeSuccessPlaceholder() : retainedTranscriptPlaceholderPath),
+					retainedUnknownPath: deletion.retainedUnknownPath ?? retainedTranscriptUnknownPath,
+				};
+			}
+		};
 		const finishArtifactPhase = async (): Promise<VerifiedSessionDeleteResult> => {
 			const ownerError = await retireOwnerIfRequired();
 			if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError, true);
@@ -3258,6 +3301,8 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 				sha256: transcriptIdentity.sha256,
 				quarantineName: path.basename(plannedTranscriptPath),
 			});
+			const refusal = transcriptCompletionRefusal(deletion);
+			if (refusal) return refusal;
 			if (!deletion.ok) {
 				if (transcriptDeletionTerminal(deletion)) {
 					if (ownerEvidence) ownerTranscriptDeleted = true;
@@ -3343,6 +3388,8 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			sha256: initialDigest,
 			quarantineName: path.basename(plannedTranscriptPath),
 		});
+		const refusal = transcriptCompletionRefusal(deletion);
+		if (refusal) return refusal;
 		if (!deletion.ok) {
 			if (transcriptDeletionTerminal(deletion)) {
 				if (ownerEvidence) ownerTranscriptDeleted = true;
