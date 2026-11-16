@@ -1331,6 +1331,93 @@ describe("shared publication admission split", () => {
 		}
 	});
 
+	it("stops a cancelled preflight from claiming a mixed-kind successor batch", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo A", shellResult("A output"));
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const aEntered = Promise.withResolvers<void>();
+		const aGate = Promise.withResolvers<void>();
+		const bEntered = Promise.withResolvers<void>();
+		const bGate = Promise.withResolvers<void>();
+		const publications: string[] = [];
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution") {
+				publications.push(message.command);
+				if (message.command === "echo A") {
+					aEntered.resolve();
+					await aGate.promise;
+				}
+			} else if (message.role === "pythonExecution") {
+				publications.push(message.code);
+				bEntered.resolve();
+				await bGate.promise;
+			}
+			return original(message);
+		});
+		const promptSpy = vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
+
+		const preflight = f.session.prompt("successor prompt").catch((error: unknown) => error);
+		await aEntered.promise;
+		try {
+			// B is a different kind than A: the preflight token keeps isStreaming true, so a
+			// Python result recorded now takes the Python queue while the drain is still
+			// awaiting A's publication. Claiming that queue needs its own cancellation re-read
+			// inside the same drain, not only once per drain invocation.
+			Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+			f.session.recordPythonResult("print('B')", shellResult("B output"));
+			delete (f.session as { isStreaming?: unknown }).isStreaming;
+			expect(f.session.isStreaming).toBe(true);
+
+			const settledAbort = f.session.abort().then(
+				() => "settled" as const,
+				(error: unknown) => error,
+			);
+			aGate.resolve();
+
+			// A settles and turn finalization — never the cancelled preflight — claims B, which
+			// stays gated. The preflight token must already be gone and the abort must have
+			// settled before B is released; a preflight that claimed B here would keep both.
+			await bEntered.promise;
+			expect(f.session.isStreaming).toBe(false);
+			expect(await Promise.race([settledAbort, Bun.sleep(3000).then(() => "timeout" as const)])).toBe("settled");
+
+			bGate.resolve();
+			// Cancellation unwinds as a cancellation, not as a publication failure, and the
+			// successor invocation never starts.
+			expect(await preflight).toBeUndefined();
+			expect(promptSpy).not.toHaveBeenCalled();
+			// One publication attempt per result: a double claim would show two attempts for B,
+			// and dropping B for the cancelled preflight would show none.
+			expect(publications).toEqual(["echo A", "print('B')"]);
+			expect(f.session.hasPendingPythonMessages).toBe(false);
+			const agentResults = f.session.agent.state.messages.flatMap(message =>
+				message.role === "bashExecution"
+					? [message.command]
+					: message.role === "pythonExecution"
+						? [message.code]
+						: [],
+			);
+			expect(agentResults).toEqual(["echo A", "print('B')"]);
+			await f.session.awaitSessionSettlement();
+			await f.manager.flush();
+			const durable = await Bun.file(f.file).text();
+			expect(durable.split("A output").length - 1).toBe(1);
+			expect(durable.split("B output").length - 1).toBe(1);
+			expect(durable.indexOf("A output")).toBeLessThan(durable.indexOf("B output"));
+		} finally {
+			// Release both publications even when an assertion above fails, so a regression
+			// cannot wedge session teardown behind a gate nothing opens.
+			aGate.resolve();
+			bGate.resolve();
+		}
+	});
+
 	it("orders an awaited publication behind older queued background publications", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
