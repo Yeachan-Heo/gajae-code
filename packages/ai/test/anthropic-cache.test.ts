@@ -8,6 +8,7 @@ import {
 } from "@gajae-code/ai/providers/anthropic";
 import { clearGitLabDuoDirectAccessCache, streamGitLabDuo } from "@gajae-code/ai/providers/gitlab-duo";
 import type { CacheRetention, Context, Model, TJsonSchema } from "@gajae-code/ai/types";
+import { createAbortedSignal } from "./helpers";
 
 const canonicalModel: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -58,12 +59,6 @@ function cacheMarkerLayout(payload: Payload): Map<string, CacheControl> {
 	return markers;
 }
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 function context(messages: Context["messages"] = [{ role: "user", content: "Continue", timestamp: 1 }]): Context {
 	return {
 		systemPrompt: ["Stable instructions", "Second stable instruction"],
@@ -88,7 +83,7 @@ function capturePayload(
 	streamAnthropic(model, input, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		cacheRetention,
 		onPayload: payload => {
 			const replacement = onPayload?.(payload as Payload);

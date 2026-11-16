@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "./helpers/trust-temp-dirs";
 
 /**
  * `GJC_CODING_AGENT_DIR` selects the agent directory, and the agent's own `.env`
@@ -27,13 +28,7 @@ interface Resolved {
 	probeValue: string | null;
 }
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agent-dir-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
+const { tempDir, projectDir } = createTrustTempDirs("gjc-agent-dir-trust-");
 
 /** A directory holding an `.env` that sets the probe variable. */
 function agentDirWith(value: string): string {
@@ -41,16 +36,6 @@ function agentDirWith(value: string): string {
 	fs.writeFileSync(path.join(dir, ".env"), `${PROBE_VAR}=${value}\n`);
 	return dir;
 }
-
-function projectDir(dotenv: string): string {
-	const dir = tempDir();
-	fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
 
 async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
 	const env: Record<string, string> = {};

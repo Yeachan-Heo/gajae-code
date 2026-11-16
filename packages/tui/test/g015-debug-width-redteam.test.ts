@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { type Component, TUI } from "@gajae-code/tui";
 import { Ellipsis, truncateToWidth, visibleWidth } from "@gajae-code/tui/utils";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
-import { VirtualTerminal } from "./virtual-terminal";
+import { VirtualTerminal, visible } from "./virtual-terminal";
 
 const REPORT_PATH = "artifacts/g015-qa-report.json";
 const originalTabWidth = getDefaultTabWidth();
@@ -38,10 +38,6 @@ async function settle(term: VirtualTerminal): Promise<void> {
 	await new Promise<void>(resolve => process.nextTick(resolve));
 	await Bun.sleep(25);
 	await term.flush();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 async function withTui<T>(

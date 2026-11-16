@@ -5,22 +5,14 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
-	AgentMessage,
 	AgentTool,
 	RunCancellationDomain,
 	StreamFn,
 } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
-import { createAssistantMessage, createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		(message): message is Message =>
-			message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	);
-}
+import { createAssistantMessage, createUserMessage, identityConverter } from "./helpers";
 
 it("provides a non-optional cancellation-aware maintenance lifecycle without a run signal", async () => {
 	const model = createMockModel();

@@ -15,6 +15,7 @@ import { streamAnthropic } from "../src/providers/anthropic";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamSimple } from "../src/stream";
 import type { Context, Model, SimpleStreamOptions } from "../src/types";
+import { createAbortedSignal } from "./helpers";
 import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const providers = ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const;
@@ -152,17 +153,11 @@ describe("MiniMax coding-plan payload normalization", () => {
 		messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
 	};
 
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
-
 	async function capturePayload(model: Model<"openai-completions">): Promise<Record<string, unknown>> {
 		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 		streamOpenAICompletions(model, context, {
 			apiKey: "test-key",
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			reasoning: "high",
 			onPayload: payload => resolve(payload as Record<string, unknown>),
 		});

@@ -7,10 +7,11 @@ import { Effort, type Model } from "@gajae-code/ai";
 import { type GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
 import { hookFetch } from "@gajae-code/utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const DOWN = "\x1b[B";
 
@@ -139,12 +140,7 @@ function createXaiGrokReasoningModel(id: "grok-4.5" | "grok-4.6"): Model {
 	} as Model;
 }
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 /** Enter the action menu and move the cursor onto the requested action row. */
 function selectActionRow(selector: ModelSelectorComponent, rowIndex: number): void {
@@ -160,12 +156,12 @@ const ALL_TARGETS_ROW = 7;
 
 describe("ModelSelector batch assignment thinking menu", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 
 	test("all role agents batch opens the reasoning menu for anthropic reasoning models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createAnthropicReasoningModel("claude-fable-5");
 		const settings = Settings.isolated();
 
@@ -174,7 +170,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selectActionRow(selector, ALL_ROLE_AGENTS_ROW);
 
@@ -196,14 +192,14 @@ describe("ModelSelector batch assignment thinking menu", () => {
 	});
 
 	test("direct xAI Grok default assignment requires an explicit supported effort", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createXaiGrokReasoningModel("grok-4.6");
 		let selected: SelectionCapture | undefined;
 		const selector = createSelector(model, Settings.isolated(), selection => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selectActionRow(selector, 0);
 
@@ -224,7 +220,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 	});
 
 	test("all targets batch keeps every target through the reasoning menu", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createCodexReasoningModel("gpt-5.5");
 		const settings = Settings.isolated();
 
@@ -233,7 +229,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selectActionRow(selector, ALL_TARGETS_ROW);
 
@@ -254,7 +250,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 	});
 
 	test("cancelling the batch reasoning menu restores the batch action row", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createAnthropicReasoningModel("claude-fable-5");
 		const settings = Settings.isolated();
 
@@ -263,7 +259,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selectActionRow(selector, ALL_TARGETS_ROW);
 		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for all targets");
@@ -276,7 +272,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		expect(actionRendered).toContain("Set for all targets");
 	});
 	test("drops an unsupported inherited thinking level when selecting a plain model", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const previousModel = createAnthropicReasoningModel("claude-fable-5");
 		const targetModel = {
 			...previousModel,
@@ -299,7 +295,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 			[{ model: targetModel }],
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selectActionRow(selector, 1);
 		await Bun.sleep(0);
@@ -311,7 +307,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 });
 
 test("updates the rendered catalog when an in-flight registry refresh completes", async () => {
-	installTestTheme();
+	setThemeInstance(testTheme);
 	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-model-selector-catalog-"));
 	const modelsPath = path.join(tempDir, "models.json");
 	const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -350,7 +346,7 @@ test("updates the rendered catalog when an in-flight registry refresh completes"
 			{ initialSearchInput: "newly" },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const refresh = registry.refresh("online");
 		await Bun.sleep(0);
 		expect(normalizeRenderedText(selector.render(220).join("\n"))).not.toContain("newly-available-model");
@@ -363,7 +359,7 @@ test("updates the rendered catalog when an in-flight registry refresh completes"
 		);
 		await refresh;
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("newly-available-model");
 	} finally {
