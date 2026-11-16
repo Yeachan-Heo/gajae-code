@@ -1656,22 +1656,61 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 				named.ino !== stagedIdentity.ino
 			)
 				throw new Error("destination_identity_changed");
-			if (linkPublished) unlinkOwnedStagedSync(publishSource, stagedIdentity);
-			if (materialized) unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
-			fsyncDirectorySync(dir);
-			const stat = statFromNode(fs.fstatSync(selectedFd, { bigint: true }));
-			const publishedName = statFromNode(fs.lstatSync(this.#destinationPath, { bigint: true }));
+			const publicationFd = selectedFd;
+			const validatePublishedBytes = (expected: SessionStorageStat): void => {
+				const current = statFromNode(fs.fstatSync(publicationFd, { bigint: true }));
+				const publishedName = statFromNode(fs.lstatSync(this.#destinationPath, { bigint: true }));
+				if (
+					!current.isFile ||
+					!publishedName.isFile ||
+					!sameDescriptorIdentity(current, expected) ||
+					!sameDescriptorIdentity(publishedName, current)
+				)
+					throw new Error("destination_identity_changed");
+				const publishedHash = createHash("sha256");
+				let readOffset = 0;
+				while (readOffset < current.size) {
+					const count = fs.readSync(
+						publicationFd,
+						chunk,
+						0,
+						Math.min(chunk.byteLength, current.size - readOffset),
+						readOffset,
+					);
+					if (count === 0) throw new Error("destination_content_changed");
+					publishedHash.update(chunk.subarray(0, count));
+					readOffset += count;
+				}
+				if (publishedHash.digest("hex") !== sha256) throw new Error("destination_content_changed");
+				if (
+					!sameDescriptorIdentity(statFromNode(fs.fstatSync(publicationFd, { bigint: true })), current) ||
+					!sameDescriptorIdentity(statFromNode(fs.lstatSync(this.#destinationPath, { bigint: true })), current)
+				)
+					throw new Error("destination_identity_changed");
+			};
+			// Rename/link may legitimately change ctime, but never the issued bytes.
+			// Validate before any cleanup, especially a shared-inode link source.
+			const installed = statFromNode(fs.fstatSync(selectedFd, { bigint: true }));
 			if (
-				!stat.isFile ||
-				stat.dev !== staged.dev ||
-				stat.ino !== staged.ino ||
-				stat.size !== staged.size ||
-				stat.mtimeNs !== staged.mtimeNs ||
-				stat.nlink !== 1n ||
-				!publishedName.isFile ||
-				!sameDescriptorIdentity(publishedName, stat)
+				installed.dev !== staged.dev ||
+				installed.ino !== staged.ino ||
+				installed.size !== staged.size ||
+				installed.mtimeNs !== staged.mtimeNs ||
+				installed.nlink !== (linkPublished ? 2n : 1n)
 			)
 				throw new Error("destination_identity_changed");
+			validatePublishedBytes(installed);
+			if (linkPublished) unlinkOwnedStagedSync(publishSource, stagedIdentity);
+			if (materialized) unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
+			const stat = statFromNode(fs.fstatSync(selectedFd, { bigint: true }));
+			if (stat.nlink !== 1n || (!linkPublished && !sameDescriptorIdentity(installed, stat)))
+				throw new Error("destination_identity_changed");
+			if (linkPublished) validatePublishedBytes(stat);
+			// Bind the published snapshot (including its post-rename ctime) to a
+			// real file sync, then reject changes during either sync or the last read.
+			fs.fsyncSync(selectedFd);
+			fsyncDirectorySync(dir);
+			validatePublishedBytes(stat);
 			receipt = { publicationId: randomUUID(), stat, sha256, kind: "fsync", namespaceSynced: true };
 		} catch (error) {
 			failure = this.#recordError(error);
@@ -1679,16 +1718,11 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			// Before dispatch, or after a validated pre-mutation outcome, our exact
 			// staged name is disposable. Unknown native mutations never authorize cleanup.
 			if (materialized) {
-				if (
-					stagedIdentity &&
-					(!publicationAttempted || linkPublished || (outcome && mayCleanCurrentStaging(outcome)))
-				)
+				if (stagedIdentity && (!publicationAttempted || (outcome && mayCleanCurrentStaging(outcome))))
 					unlinkOwnedStagedSync(materialized, stagedIdentity);
-				unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
-			} else if (
-				stagedIdentity &&
-				(!publicationAttempted || linkPublished || (outcome && mayCleanCurrentStaging(outcome)))
-			) {
+				if (!publicationAttempted || (outcome && mayCleanCurrentStaging(outcome)))
+					unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
+			} else if (stagedIdentity && (!publicationAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 				unlinkOwnedStagedSync(this.#stagingPath, stagedIdentity);
 			}
 			if (selectedFd !== undefined) fs.closeSync(selectedFd);

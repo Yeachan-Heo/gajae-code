@@ -66,7 +66,8 @@ describe.skipIf(process.platform === "win32")("descriptor-bound staged publicati
 			expect(snapshot.bytes).toEqual(expected);
 			expect(syncedFiles).toContainEqual({ dev: receipt.stat.dev, ino: receipt.stat.ino });
 			expect(events.indexOf("file_sync")).toBeLessThan(events.indexOf("publish"));
-			expect(events.indexOf("publish")).toBeLessThan(events.lastIndexOf("directory_sync"));
+			expect(events.indexOf("publish")).toBeLessThan(events.lastIndexOf("file_sync"));
+			expect(events.lastIndexOf("file_sync")).toBeLessThan(events.lastIndexOf("directory_sync"));
 			expect(receipt.stat.dev).toBe(original.dev);
 			if (patched) expect(receipt.stat.ino).not.toBe(original.ino);
 			else expect(receipt.stat.ino).toBe(original.ino);
@@ -191,6 +192,164 @@ describe.skipIf(process.platform === "win32")("descriptor-bound staged publicati
 		expect(await Bun.file(destination).text()).toBe("original\n");
 	});
 
+	for (const patched of [false, true]) {
+		for (const boundary of ["dispatch", "file_sync", "directory_sync"] as const) {
+			it(`rejects same-inode equal-mtime byte changes at ${boundary} for a ${patched ? "patched" : "plain"} stage`, async () => {
+				const writer = storage.openStagedWriter(destination);
+				writer.writeLine(Buffer.from("original"));
+				if (patched) writer.patchLine(0, Buffer.from("ORIGINAL"));
+				// A whole-second timestamp survives an exact utimes round trip.
+				const mtime = new Date("2020-01-01T00:00:00.000Z");
+				fs.utimesSync(stagingPath(), mtime, mtime);
+				writer.closeSync();
+				let changed = false;
+				let installedIdentity: { dev: bigint; ino: bigint } | undefined;
+				const replacement = "tampered\n";
+				const overwrite = (file: string): void => {
+					const before = fs.lstatSync(file, { bigint: true });
+					const fd = fs.openSync(file, fs.constants.O_WRONLY);
+					try {
+						fs.writeSync(fd, Buffer.from(replacement), 0, Buffer.byteLength(replacement), 0);
+						fs.futimesSync(fd, mtime, mtime);
+					} finally {
+						fs.closeSync(fd);
+					}
+					const after = fs.lstatSync(file, { bigint: true });
+					expect([after.dev, after.ino, after.size, after.mtimeNs]).toEqual([
+						before.dev,
+						before.ino,
+						before.size,
+						before.mtimeNs,
+					]);
+					installedIdentity = { dev: after.dev, ino: after.ino };
+					changed = true;
+				};
+				const realPublish = native.renameNoReplacePath;
+				const publish = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, target) => {
+					if (boundary === "dispatch") overwrite(source);
+					return realPublish(source, target);
+				});
+				const realSync = fs.fsyncSync;
+				vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+					realSync(fd);
+					if (changed || !fs.existsSync(destination)) return;
+					const synced = fs.fstatSync(fd);
+					if (
+						(boundary === "directory_sync" && synced.isDirectory()) ||
+						(boundary === "file_sync" && synced.isFile())
+					)
+						overwrite(destination);
+				});
+				const cleanup = vi.spyOn(native, "exactUnlink");
+				let receipt: SessionNoReplacePublicationReceipt | undefined;
+				let failure: unknown;
+				try {
+					receipt = writer.publishNoReplace();
+				} catch (error) {
+					failure = error;
+				}
+				expect(changed).toBe(true);
+				expect(receipt).toBeUndefined();
+				expect(failure).toBeInstanceOf(Error);
+				expect((failure as Error).message).toMatch(/^destination_(content|identity)_changed$/);
+				expect(await Bun.file(destination).text()).toBe(replacement);
+				const surviving = fs.lstatSync(destination, { bigint: true });
+				if (!installedIdentity) throw new Error("Missing actually published inode identity");
+				expect({ dev: surviving.dev, ino: surviving.ino }).toEqual(installedIdentity);
+				expect(cleanup).not.toHaveBeenCalled();
+				const publishCount = publish.mock.calls.length;
+				let repeated: unknown;
+				try {
+					writer.publishNoReplace();
+				} catch (error) {
+					repeated = error;
+				}
+				expect(repeated).toBe(failure);
+				expect(publish.mock.calls).toHaveLength(publishCount);
+			});
+		}
+	}
+
+	it("retains both uncertain hard-link names without cleanup when publication changes their shared bytes", async () => {
+		const writer = storage.openStagedWriter(destination);
+		writer.writeLine(Buffer.from("original"));
+		const stage = stagingPath();
+		const mtime = new Date("2020-01-01T00:00:00.000Z");
+		fs.utimesSync(stage, mtime, mtime);
+		writer.closeSync();
+		vi.spyOn(native, "renameNoReplacePath").mockReturnValue({
+			ok: false,
+			code: "atomic_unavailable",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "atomic_unavailable",
+			primitive: "unsupported",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "complete" },
+		});
+		const realLink = native.linkNoReplacePath;
+		let linked = false;
+		vi.spyOn(native, "linkNoReplacePath").mockImplementation((source, target) => {
+			const outcome = realLink(source, target);
+			if (outcome.ok) {
+				const fd = fs.openSync(target, fs.constants.O_WRONLY);
+				try {
+					fs.writeSync(fd, Buffer.from("tampered\n"), 0, 9, 0);
+					fs.futimesSync(fd, mtime, mtime);
+				} finally {
+					fs.closeSync(fd);
+				}
+				linked = true;
+			}
+			return outcome;
+		});
+		const cleanup = vi.spyOn(native, "exactUnlink");
+		expect(() => writer.publishNoReplace()).toThrow("destination_content_changed");
+		expect(linked).toBe(true);
+		expect(cleanup).not.toHaveBeenCalled();
+		expect(await Bun.file(stage).text()).toBe("tampered\n");
+		expect(await Bun.file(destination).text()).toBe("tampered\n");
+		const staged = fs.lstatSync(stage, { bigint: true });
+		const installed = fs.lstatSync(destination, { bigint: true });
+		expect([installed.dev, installed.ino, installed.nlink, installed.mtimeNs]).toEqual([
+			staged.dev,
+			staged.ino,
+			2n,
+			BigInt(mtime.getTime()) * 1_000_000n,
+		]);
+		expect(() => writer.publishNoReplace()).toThrow("destination_content_changed");
+		expect(cleanup).not.toHaveBeenCalled();
+	});
+
+	it("rejects a ctime-only change during directory sync even when bytes and mtime are restored", async () => {
+		const writer = storage.openStagedWriter(destination);
+		writer.writeLine(Buffer.from("original"));
+		const mtime = new Date("2020-01-01T00:00:00.000Z");
+		fs.utimesSync(stagingPath(), mtime, mtime);
+		writer.closeSync();
+		const realSync = fs.fsyncSync;
+		let changed = false;
+		vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+			realSync(fd);
+			if (!fs.fstatSync(fd).isDirectory()) return;
+			const before = fs.lstatSync(destination, { bigint: true });
+			fs.utimesSync(destination, mtime, mtime);
+			const after = fs.lstatSync(destination, { bigint: true });
+			expect([after.dev, after.ino, after.size, after.mtimeNs]).toEqual([
+				before.dev,
+				before.ino,
+				before.size,
+				before.mtimeNs,
+			]);
+			expect(after.ctimeNs).not.toBe(before.ctimeNs);
+			changed = true;
+		});
+		expect(() => writer.publishNoReplace()).toThrow("destination_identity_changed");
+		expect(changed).toBe(true);
+		expect(await Bun.file(destination).text()).toBe("original\n");
+		expect(() => writer.publishNoReplace()).toThrow("destination_identity_changed");
+	});
+
 	it("does not issue a receipt for an existing destination or overwrite its generation", async () => {
 		await Bun.write(destination, "existing\n");
 		const before = await fsp.lstat(destination, { bigint: true });
@@ -230,6 +389,26 @@ describe.skipIf(process.platform === "win32")("descriptor-bound staged publicati
 			expect(() => writer.publishNoReplace()).toThrow(failure);
 		});
 	}
+
+	it("retains the published destination without a receipt when its postpublication file sync fails", async () => {
+		const writer = storage.openStagedWriter(destination);
+		writer.writeLine(Buffer.from("original"));
+		writer.closeSync();
+		const realSync = fs.fsyncSync;
+		const failure = new Error("postpublication file sync failed");
+		vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+			if (fs.fstatSync(fd).isFile() && fs.existsSync(destination)) throw failure;
+			realSync(fd);
+		});
+		const cleanup = vi.spyOn(native, "exactUnlink");
+		const publish = vi.spyOn(native, "renameNoReplacePath");
+		expect(() => writer.publishNoReplace()).toThrow(failure);
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(cleanup).not.toHaveBeenCalled();
+		expect(await Bun.file(destination).text()).toBe("original\n");
+		expect(() => writer.publishNoReplace()).toThrow(failure);
+		expect(publish).toHaveBeenCalledTimes(1);
+	});
 
 	it("hashes and overlays a multi-chunk transcript without full-buffer reads or allocations", () => {
 		const writer = storage.openStagedWriter(destination);
