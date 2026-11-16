@@ -1,4 +1,5 @@
-import type { AssistantMessage, Usage, UserMessage } from "@gajae-code/ai";
+import type { AgentMessage } from "@gajae-code/agent-core/types";
+import type { AssistantMessage, Message, Usage, UserMessage } from "@gajae-code/ai";
 
 export function createUserMessage(text: string): UserMessage {
 	return { role: "user", content: text, timestamp: Date.now() };
@@ -18,6 +19,13 @@ export function createAssistantMessage(
 		stopReason,
 		timestamp: Date.now(),
 	};
+}
+
+/** Pass-through converter for tests that only need standard user/assistant/toolResult messages. */
+export function identityConverter(messages: AgentMessage[]): Message[] {
+	return messages.filter(
+		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+	) as Message[];
 }
 
 function createUsage(): Usage {

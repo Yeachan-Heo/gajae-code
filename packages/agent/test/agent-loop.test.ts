@@ -20,12 +20,7 @@ import type { AssistantMessage, Context, Message, Model, ToolResultMessage } fro
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
-import { createAssistantMessage, createUserMessage } from "./helpers";
-
-// Simple identity converter for tests - just passes through standard messages
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createAssistantMessage, createUserMessage, identityConverter } from "./helpers";
 
 describe("agentLoop with AgentMessage", () => {
 	it("forwards provider conversation authority separately from generic session affinity", async () => {

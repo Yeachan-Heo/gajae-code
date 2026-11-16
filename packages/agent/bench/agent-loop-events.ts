@@ -15,6 +15,7 @@ import type { AssistantMessage, Message, Model, SimpleStreamOptions } from "@gaj
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
+import { identityConverter } from "../test/helpers";
 
 const WARMUP_ITERATIONS = 20;
 const MEASURE_ITERATIONS = 100;
@@ -69,10 +70,6 @@ type BenchOutput = {
 	metadata: BenchRunMetadata;
 	fixtures: BenchSample[];
 };
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 function createUserMessage(text: string): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }] } as AgentMessage;
