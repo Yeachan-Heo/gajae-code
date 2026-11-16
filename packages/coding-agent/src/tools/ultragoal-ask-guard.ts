@@ -27,8 +27,9 @@ export interface UltragoalAskGuardContext {
 export interface UltragoalAskAdmission {
 	/**
 	 * Set when a verified human-only blocker admitted the ask. Each `human_blocked`
-	 * classification admits one answered question: the caller records the answer
-	 * against it with `recordUltragoalHumanBlockedAskAnswered`.
+	 * classification admits one question: the caller reserves it with
+	 * `recordUltragoalHumanBlockedAskReserved` before asking, then records the
+	 * answer or releases the reservation.
 	 */
 	humanBlockedReceipt?: { sessionId: string; classificationEventId: string };
 }
@@ -85,7 +86,7 @@ export async function assertUltragoalAskAllowed(
 		const pause = await isUltragoalPauseBlocked(cwd, { sessionId });
 		if (!pause.blocked) {
 			if (!pause.classificationEventId) return;
-			if (!pause.askAnswered) {
+			if (!pause.askSpent) {
 				const questions = (pendingQuestions as { questions?: unknown } | undefined)?.questions;
 				if (!Array.isArray(questions) || questions.length !== 1) {
 					throw new ToolError(

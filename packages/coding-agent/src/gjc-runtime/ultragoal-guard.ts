@@ -13,7 +13,7 @@ import {
 import {
 	getUltragoalPaths,
 	getUltragoalRunCompletionState,
-	isUltragoalHumanBlockedAskAnswered,
+	isUltragoalHumanBlockedAskSpent,
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalNudgeIfBudgetRemaining,
@@ -908,7 +908,7 @@ export interface UltragoalPauseBlockDiagnostic {
 	/** Event id of the `human_blocked` classification, set only when its verified receipt is what allows the pause. */
 	classificationEventId?: string;
 	/** Whether that classification's single `ask` was already spent on an answered question. */
-	askAnswered?: boolean;
+	askSpent?: boolean;
 }
 
 /**
@@ -991,7 +991,7 @@ export async function isUltragoalPauseBlocked(
 		reason:
 			"Latest blocker_classified event is human_blocked with a later fresh clean bound pause terminal critic verdict.",
 		classificationEventId: classification.eventId,
-		askAnswered: isUltragoalHumanBlockedAskAnswered(ledger, classification.eventId),
+		askSpent: isUltragoalHumanBlockedAskSpent(ledger, classification.eventId),
 	};
 }
 
