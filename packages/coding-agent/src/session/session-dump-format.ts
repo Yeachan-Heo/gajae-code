@@ -188,22 +188,6 @@ function serializeParameterValue(value: unknown): string {
 	return typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
 }
 
-/**
- * Redact a private-key block that spans an execution message's rendered sections.
- * The fields are paired in render order — a message whose `output` is stored before its
- * `command` must still be read command-first — and before field-level credential masking
- * can remove one of the banners.
- */
-function redactExecutionPrivateKey<T extends object>(message: T, textFields: readonly string[]): T {
-	const source = message as Record<string, unknown>;
-	const redacted = redactCrossFieldPrivateKeys(textFields.map(field => source[field]));
-	const result = { ...source };
-	for (let index = 0; index < textFields.length; index++) {
-		result[textFields[index]] = redacted[index];
-	}
-	return result as T;
-}
-
 /** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
 function formatArgumentText(value: unknown, key: string): string {
 	const structured = redactStructuredSecrets(value, key, { headerPairs: isHeaderCollectionKey });
@@ -219,8 +203,8 @@ const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"
  * the same rules as tool arguments: credential-named fields are masked, text is scrubbed,
  * and a known header collection keeps its value redaction.
  */
-function scrubSchemaData(value: unknown): unknown {
-	return redactStructuredSecrets(decodeValueStrings(value), undefined, { headerPairs: isHeaderCollectionKey });
+function scrubSchemaData(value: unknown, propertyName?: string): unknown {
+	return redactStructuredSecrets(decodeValueStrings(value), propertyName, { headerPairs: isHeaderCollectionKey });
 }
 
 /** Replace every leaf of a data value with the marker, preserving its shape. */
@@ -283,7 +267,7 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] =
 				propertyName !== undefined && isCredentialKey(propertyName)
 					? maskSchemaData(paired)
-					: scrubSchemaData(paired);
+					: scrubSchemaData(paired, propertyName);
 			continue;
 		}
 		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = redactSchemaValue(nested, propertyName);
@@ -308,18 +292,20 @@ function formatArgsAsXml(
 	mode: "arguments" | "schema" = "arguments",
 	indent = "\t",
 ): string {
-	const entries = Object.entries(args).filter(([key]) => key !== INTENT_FIELD);
+	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
+	// A scrubbed schema key no longer matches the original argument name, so the schema's own
+	// entries are used once it exists; the scrubbed title is already part of them.
+	const entries = (schema === undefined ? Object.entries(args) : Object.entries(schema)).filter(
+		([key]) => key !== INTENT_FIELD,
+	);
 	const spannedValues =
 		mode === "arguments" ? redactCrossFieldPrivateKeys(entries.map(([, value]) => value)) : undefined;
-	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
 	const parts: string[] = [];
 	for (let index = 0; index < entries.length; index++) {
 		const [key, value] = entries[index];
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
 		const text =
-			schema === undefined
-				? formatArgumentText(spannedValues?.[index] ?? value, key)
-				: formatSchemaText(schema[key]);
+			schema === undefined ? formatArgumentText(spannedValues?.[index] ?? value, key) : formatSchemaText(value);
 		if (text.includes("\n")) {
 			const indentedText = text
 				.split("\n")
@@ -451,20 +437,16 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const bashMsg = msg as BashExecutionMessage;
 			if (!bashMsg.excludeFromContext) {
 				lines.push("## Bash Execution\n");
-				const structured = redactStructuredSecrets(
-					redactExecutionPrivateKey(bashMsg, ["command", "output", "signal", "meta"]),
-				) as BashExecutionMessage;
-				lines.push(redactCrashSecrets(bashExecutionToText(structured)));
+				// The renderer emits the sections in reading order, so scrubbing its output pairs a
+				// private-key block across command, output and notice without ordering assumptions.
+				lines.push(redactCrashSecrets(bashExecutionToText(bashMsg)));
 				lines.push("\n");
 			}
 		} else if (msg.role === "pythonExecution") {
 			const pythonMsg = msg as PythonExecutionMessage;
 			if (!pythonMsg.excludeFromContext) {
 				lines.push("## Python Execution\n");
-				const structured = redactStructuredSecrets(
-					redactExecutionPrivateKey(pythonMsg, ["code", "output", "meta"]),
-				) as PythonExecutionMessage;
-				lines.push(redactCrashSecrets(pythonExecutionToText(structured)));
+				lines.push(redactCrashSecrets(pythonExecutionToText(pythonMsg)));
 				lines.push("\n");
 			}
 		} else if (msg.role === "custom" || msg.role === "hookMessage") {

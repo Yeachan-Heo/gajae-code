@@ -369,13 +369,23 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"default": "«redacted-api-key»"');
 	});
 
-	it("keeps a container that closes after the scan budget is spent", () => {
+	it("keeps a long container that closes after several unclosed containers", () => {
 		const filler = "secret={\n".repeat(12);
 		const longPayload = "A".repeat(1_500);
 		const tail = `secret={\n  "payload": "${longPayload}OPAQUE_TAIL_SECRET"\n}\nafter`;
 		const dumped = dump([{ role: "user", content: `${filler}${tail}`, timestamp: 1 }] as AgentMessage[]);
 
 		expect(dumped).not.toContain("OPAQUE_TAIL_SECRET");
+		expect(dumped).toContain("after");
+	});
+
+	it("keeps a very long container that closes after several unclosed containers", () => {
+		const filler = "secret={\n".repeat(12);
+		const longPayload = "A".repeat(20_000);
+		const tail = `secret={\n  "payload": "${longPayload}OPAQUE_LONG_TAIL_SECRET"\n}\nafter`;
+		const dumped = dump([{ role: "user", content: `${filler}${tail}`, timestamp: 1 }] as AgentMessage[]);
+
+		expect(dumped).not.toContain("OPAQUE_LONG_TAIL_SECRET");
 		expect(dumped).toContain("after");
 	});
 
@@ -518,6 +528,46 @@ describe("formatSessionDumpText credential scrub", () => {
 
 		expect(dumped).not.toContain("sk-abcdefghijklmnop");
 		expect(dumped).toContain("«redacted-api-key»");
+	});
+
+	it("redacts a header default under a property named after a header collection", () => {
+		const secret = "OPAQUE_PROPERTY_HEADER_SECRET";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						properties: { headers: { type: "array", default: ["Authorization", secret] } },
+					},
+				},
+			],
+		});
+
+		expect(dumped).toContain('"Authorization"');
+		expect(dumped).not.toContain(secret);
+	});
+
+	it("keeps a schema definition whose root key is credential-shaped", () => {
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: { "sk-abcdefghijklmnop": { type: "string", description: "KEEP_ROOT_SCHEMA" } },
+				},
+			],
+		});
+
+		expect(dumped).not.toContain("sk-abcdefghijklmnop");
+		expect(dumped).toContain("KEEP_ROOT_SCHEMA");
+		expect(dumped).not.toContain("null");
 	});
 
 	it("keeps both schema definitions when two keys scrub to the same marker", () => {

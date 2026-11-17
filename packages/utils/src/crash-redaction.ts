@@ -666,36 +666,18 @@ function redactCredentialValue(
  */
 const CONTAINER_SCAN_BUDGET_FACTOR = 16;
 
-/**
- * Characters a container scan may still examine once the shared budget is spent.
- * A container that closes within this lookahead is still redacted in full, so
- * pathological input degrades to a bounded scan instead of losing the close.
- */
-const CONTAINER_SCAN_FLOOR = 8192;
-
 interface ContainerScanBudget {
-	/** Lookahead left for scans that still see ordinary nesting. */
+	/**
+	 * Lookahead left for container scans. Once it is spent, later containers are treated as
+	 * unterminated and end at their line: a run of malformed containers must not cost a full
+	 * text scan each. The give-up point is reachable only by a text that is already dominated
+	 * by unclosed containers.
+	 */
 	remaining: number;
-	/** Lookahead left for scans that only get the floor treatment. */
-	floorRemaining: number;
 }
 
 function createContainerScanBudget(length: number): ContainerScanBudget {
-	const initial = length * CONTAINER_SCAN_BUDGET_FACTOR + 1024;
-	return { remaining: initial, floorRemaining: initial };
-}
-
-/**
- * Lookahead for the next container scan.
- * While the main budget lasts a scan may look at everything that is left. Once it is
- * spent, each scan gets at most the floor, and the floor allowance is cumulative and can
- * reach zero — so a long enough run of malformed containers gives up on finding a distant
- * closing brace and treats later ones as unterminated. The give-up point is deliberate: it
- * is what keeps a repeated unterminated container from costing a full text scan each time.
- */
-function containerLookahead(budget: ContainerScanBudget): number {
-	if (budget.remaining > 0) return budget.remaining;
-	return Math.min(CONTAINER_SCAN_FLOOR, Math.max(budget.floorRemaining, 0));
+	return { remaining: length * CONTAINER_SCAN_BUDGET_FACTOR + 1024 };
 }
 
 function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
@@ -716,10 +698,8 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
-		const mainBudgetLeft = budget.remaining > 0;
-		const scan = findCredentialContainerEnd(text, containerStart, containerLookahead(budget), lineScan);
-		if (mainBudgetLeft) budget.remaining -= scan.scanned;
-		else budget.floorRemaining -= scan.scanned;
+		const scan = findCredentialContainerEnd(text, containerStart, Math.max(budget.remaining, 0), lineScan);
+		budget.remaining -= scan.scanned;
 		const containerEnd = scan.value;
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
 		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
