@@ -11043,7 +11043,7 @@ export class AgentSession {
 		return rules.filter((ruleName): ruleName is string => typeof ruleName === "string");
 	}
 
-	#markTtsrInjected(ruleNames: string[]): void {
+	#markTtsrInjected(ruleNames: string[], persistMarker = true): void {
 		const uniqueRuleNames = Array.from(
 			new Set(ruleNames.map(ruleName => ruleName.trim()).filter(ruleName => ruleName.length > 0)),
 		);
@@ -11051,11 +11051,11 @@ export class AgentSession {
 			return;
 		}
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
+		if (!persistMarker) return;
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
 		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-		// A shared session refuses the legacy append once admission is armed, and this runs
-		// inside the message_end handler: publishing through the admitted path keeps a TTSR
-		// match from failing the run (#7815).
+		// A shared session refuses the legacy append once admission is armed. Publish durable
+		// markers through the admitted path so message_end handling and committed retries work.
 		if (!this.#usesSharedSessionPublication()) {
 			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
 			return;
@@ -11321,7 +11321,11 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					this.#markTtsrInjected(details.rules);
+					// A stale/rejected publication lets us retry with the reminder in
+					// memory only. Consume it in this live manager to avoid a repeatMode
+					// once interrupt loop, but do not persist a marker that would suppress
+					// the still-eligible rule when this session is reopened.
+					this.#markTtsrInjected(details.rules, publicationFailure === undefined);
 				}
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
