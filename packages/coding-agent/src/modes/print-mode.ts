@@ -414,7 +414,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				// search from the end (all messages are potentially new).
 				const searchStart = boundaryIndex >= 0 ? boundaryIndex : -1;
 				for (let i = session.state.messages.length - 1; i > searchStart; i--) {
-					if (session.state.messages[i]?.role === "user") {
+					if (session.state.messages[i]?.role === "user" || session.state.messages[i]?.role === "custom") {
 						// Verify this user message has a following assistant message in this turn
 						const hasFollowingAssistant = session.state.messages.some(
 							(msg, idx) => idx > i && msg.role === "assistant",
@@ -475,6 +475,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 							const safetyStopHint = resolveProviderSafetyStopHint(assistantMsg, session);
 							if (safetyStopHint) await writeStderrAndQuiesce(`${sanitizeText(safetyStopHint)}\n`);
 						}
+					} else {
+						// Fallback: write the error directly if the assistant message isn't found
+						if (!options.suppressProcessExit) process.exitCode = 1;
+						await writeStderrAndQuiesce(`${terminal.error.message}\n`);
 					}
 				}
 			}

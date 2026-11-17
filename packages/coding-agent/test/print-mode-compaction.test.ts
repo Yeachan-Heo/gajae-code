@@ -33,6 +33,16 @@ function makeUserMessage(text: string): UserMessage {
 	};
 }
 
+function makeCustomMessage(text: string): ReturnType<typeof makeUserMessage> & { role: "custom"; customType: string } {
+	return {
+		role: "custom",
+		customType: "skill-prompt",
+		content: [{ type: "text", text }],
+		display: true,
+		timestamp: Date.now(),
+	} as unknown as ReturnType<typeof makeUserMessage> & { role: "custom"; customType: string };
+}
+
 function installImmediateStderrMock(output: string[]): void {
 	vi.spyOn(process.stderr, "write").mockImplementation((...args: unknown[]) => {
 		output.push(String(args[0]));
@@ -353,5 +363,78 @@ describe("Print mode with message compaction", () => {
 				expect(disposition.error.code).toBe("assistant_error");
 			}
 		}
+	});
+
+	it("resolves success when custom message (skill prompt) is captured after compaction", () => {
+		// This tests the fix for issue #7841 where skill invocations submit user-attributed
+		// custom messages (role: 'custom'). When compaction removes earlier ordinary user messages
+		// while retaining the current custom prompt and its assistant response, the scan must
+		// include role === 'custom' to find the anchor.
+		const messages: Message[] = [
+			makeUserMessage("context message 1"),
+			makeAssistantMessage({ content: [{ type: "text", text: "context response 1" }] }),
+			makeUserMessage("context message 2"),
+			makeAssistantMessage({ content: [{ type: "text", text: "context response 2" }] }),
+		];
+
+		const indexBeforeCompaction = messages.length;
+
+		// Simulate compaction removing earlier messages
+		messages.splice(0, 4);
+
+		// Add a custom message (skill prompt) and its assistant response
+		const customMessage = makeCustomMessage("skill invocation prompt");
+		messages.push(customMessage);
+		messages.push(
+			makeAssistantMessage({
+				content: [{ type: "text", text: "skill response" }],
+			}),
+		);
+
+		// When the custom message is passed as turnStartUserMessage (which it should be),
+		// the resolution should find the assistant response after it, even though the
+		// pre-compaction index is now stale.
+		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction, customMessage);
+
+		expect(disposition).toEqual({
+			status: "success",
+			assistantText: true,
+		});
+	});
+
+	it("fails to find custom message when it's not checked in the scan loop", () => {
+		// This demonstrates that without checking role === 'custom', the scan loop
+		// at print-mode.ts:417 will not capture a custom message, leaving lastPromptUserMessage undefined.
+		// Then resolvePrintTerminalDisposition falls back to the stale pre-compaction index,
+		// which may resolve as empty_response.
+		const messages: Message[] = [
+			makeUserMessage("context message 1"),
+			makeAssistantMessage({ content: [{ type: "text", text: "context response 1" }] }),
+		];
+
+		const indexBeforeCompaction = messages.length;
+
+		// Simulate compaction removing earlier messages
+		messages.splice(0, 2);
+
+		// Add a custom message (skill prompt) and its assistant response
+		const customMessage = makeCustomMessage("skill invocation prompt");
+		messages.push(customMessage);
+		messages.push(
+			makeAssistantMessage({
+				content: [{ type: "text", text: "skill response" }],
+			}),
+		);
+
+		// Without passing the custom message as turnStartUserMessage, the function falls back
+		// to using the stale index (which is 2, out of bounds of the new array of size 2).
+		// This would result in an empty_response error.
+		// With the fix, we pass the custom message and it should still find the assistant response.
+		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction, customMessage);
+
+		expect(disposition).toEqual({
+			status: "success",
+			assistantText: true,
+		});
 	});
 });
