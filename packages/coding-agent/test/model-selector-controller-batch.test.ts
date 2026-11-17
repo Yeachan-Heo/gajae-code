@@ -191,6 +191,10 @@ function createControllerContext() {
 		setThinkingLevel(thinkingLevel: ThinkingLevel) {
 			this.thinkingLevel = thinkingLevel;
 		},
+		// Unshared sessions apply session-only thinking through the synchronous setter.
+		async setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined) {
+			if (thinkingLevel !== undefined) this.setThinkingLevel(thinkingLevel);
+		},
 		getActiveModelProfile: () => activeModelProfile,
 		isFastForProvider: () => false,
 		isFastForSubagentProvider: () => false,
