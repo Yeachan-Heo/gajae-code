@@ -184,7 +184,12 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 				const headers = init?.headers as Headers | Record<string, string> | undefined;
 				const authorization = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
 				expect(authorization).toBe("Bearer test-rapid-mlx-key");
-				return new Response(JSON.stringify({ data: [{ id: "loopback-rapid-mlx-model" }] }), { status: 200 });
+				return new Response(
+					JSON.stringify({ data: [{ id: "loopback-rapid-mlx-model", context_window: 131072 }] }),
+					{
+						status: 200,
+					},
+				);
 			}
 			return new Response(null, { status: 404 });
 		});
@@ -284,4 +289,150 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		expect(registry.find("rapid-mlx", "explicit-model")?.contextWindow).toBe(131072);
 		expect(requestedUrls.includes("http://localhost:8000/v1/models")).toBe(false);
 	});
+
+	test("does not publish a vLLM-only endpoint on the shared default port", async () => {
+		// vLLM also serves `http://127.0.0.1:8000/v1` and answers the same
+		// OpenAI `/v1/models` shape, so the response alone cannot name the
+		// implementation. vLLM keeps its own catalog; the implicit Rapid-MLX probe
+		// must not republish the same rows under a provider that resolves
+		// RAPID_MLX_API_KEY.
+		const vllmCatalog = {
+			object: "list",
+			data: [{ id: "meta-llama/Llama-3.1-8B-Instruct", object: "model", max_model_len: 131072 }],
+		};
+		using _hook = hookFetch(input => {
+			const url = String(input);
+			if (url === "http://localhost:8000/v1/models" || url === "http://127.0.0.1:8000/v1/models") {
+				return Response.json(vllmCatalog);
+			}
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		expect(registry.find("vllm", "meta-llama/Llama-3.1-8B-Instruct")?.contextWindow).toBe(131072);
+		expect(registry.find("rapid-mlx", "meta-llama/Llama-3.1-8B-Instruct")).toBeUndefined();
+		expect(registry.getAvailable().some(model => model.provider === "rapid-mlx")).toBe(false);
+		expect(registry.getProviderDiscoveryState("rapid-mlx")?.models).toEqual([]);
+	});
+
+	test("takes an explicit rapid-mlx selection at its word when the catalog is unidentified", async () => {
+		// The identity check exists to keep an unrequested vLLM endpoint from being
+		// attributed to Rapid-MLX. An operator who names rapid-mlx in models.json
+		// has made that attribution themselves.
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"rapid-mlx": {
+						api: "openai-completions",
+						auth: "none",
+						baseUrl: "http://localhost:8123/v1",
+						discovery: { type: "rapid-mlx" },
+					},
+				},
+			}),
+		);
+		using _hook = hookFetch(input => {
+			if (String(input) === "http://localhost:8123/v1/models") {
+				return Response.json({ data: [{ id: "operator-selected-model" }] });
+			}
+			return new Response(null, { status: 404 });
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+		expect(registry.find("rapid-mlx", "operator-selected-model")).toBeDefined();
+	});
+
+	test("keeps a credentialed loopback probe off the proxy environment", async () => {
+		// A project `.env` can set HTTP_PROXY, and Bun applies it to loopback
+		// requests too. The discovery request carries RAPID_MLX_API_KEY, so it must
+		// reach the server directly instead of handing the bearer to the proxy.
+		const serverAuthorizations: (string | null)[] = [];
+		const rapidMlxServer = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (new URL(request.url).pathname !== "/v1/models") return new Response(null, { status: 404 });
+				serverAuthorizations.push(request.headers.get("authorization"));
+				return Response.json({ object: "list", data: [{ id: "proxy-probe-model", context_window: 131072 }] });
+			},
+		});
+		const proxyRequests: string[] = [];
+		const proxyServer = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				proxyRequests.push(
+					`${request.method} ${request.url} authorization=${request.headers.get("authorization") ?? "none"}`,
+				);
+				return new Response("loopback discovery must not use the proxy", { status: 502 });
+			},
+		});
+		try {
+			const projectDir = path.join(tempDir, "proxy-project");
+			const agentDir = path.join(tempDir, "proxy-agent");
+			await fs.mkdir(projectDir);
+			await fs.mkdir(agentDir);
+			const inheritedEnv: Record<string, string> = {};
+			for (const [name, value] of Object.entries(process.env)) {
+				if (value === undefined) continue;
+				const normalized = name.toLowerCase();
+				if (
+					normalized === "http_proxy" ||
+					normalized === "https_proxy" ||
+					normalized === "all_proxy" ||
+					normalized === "no_proxy"
+				) {
+					continue;
+				}
+				inheritedEnv[name] = value;
+			}
+			const proxyUrl = `http://127.0.0.1:${proxyServer.port}`;
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					path.join(import.meta.dir, "fixtures", "rapid-mlx-proxy-probe.ts"),
+					path.join(tempDir, "proxy-scratch"),
+				],
+				{
+					cwd: projectDir,
+					env: {
+						...inheritedEnv,
+						GJC_CODING_AGENT_DIR: agentDir,
+						HTTP_PROXY: proxyUrl,
+						http_proxy: proxyUrl,
+						HTTPS_PROXY: proxyUrl,
+						https_proxy: proxyUrl,
+						ALL_PROXY: proxyUrl,
+						all_proxy: proxyUrl,
+						RAPID_MLX_API_KEY: "proxy-probe-key",
+						RAPID_MLX_BASE_URL: `http://127.0.0.1:${rapidMlxServer.port}/v1`,
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+			const result = JSON.parse(stdout);
+			expect(result.modelIds).toEqual(["proxy-probe-model"]);
+			expect(result.baseUrl).toBe(`http://127.0.0.1:${rapidMlxServer.port}/v1`);
+			expect(serverAuthorizations).toEqual(["Bearer proxy-probe-key"]);
+			// The fixture's control `fetch` to the same loopback origin went through the
+			// proxy, proving the proxy configuration was live for the child; the
+			// credentialed discovery request did not.
+			expect(proxyRequests.some(request => request.includes("/v1/control"))).toBe(true);
+			expect(proxyRequests.filter(request => request.includes("proxy-probe-key"))).toEqual([]);
+			expect(proxyRequests.filter(request => request.includes(`:${rapidMlxServer.port}/v1/models`))).toEqual([]);
+		} finally {
+			rapidMlxServer.stop(true);
+			proxyServer.stop(true);
+		}
+	}, 20_000);
 });

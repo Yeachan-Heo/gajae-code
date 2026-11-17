@@ -1,3 +1,6 @@
+import * as dns from "node:dns/promises";
+import * as http from "node:http";
+import * as https from "node:https";
 import * as net from "node:net";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import * as z from "zod/v4";
@@ -49,6 +52,129 @@ function isLoopbackHost(hostname: string): boolean {
 	const isIpv4MappedLoopback =
 		hextets.slice(0, 5).every(part => part === 0) && hextets[5] === 0xffff && hextets[6]! >> 8 === 0x7f;
 	return isIpv6Loopback || isIpv4MappedLoopback;
+}
+
+/**
+ * Environment proxy variables Bun's `fetch` applies to every request,
+ * loopback included. It resolves them once per process and exposes no
+ * per-request bypass. Same key set as
+ * `coding-agent/src/web/insane/url-guard.ts` so the web-fetch guard and local
+ * discovery agree on what counts as a configured proxy.
+ */
+const PROXY_ENV_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
+
+/** True when an environment proxy is configured, so `fetch` would route through it. */
+export function hasConfiguredProxyEnv(env: Record<string, string | undefined> = process.env): boolean {
+	return PROXY_ENV_KEYS.some(key => Boolean(env[key]));
+}
+
+export interface LoopbackDirectFetchInit {
+	headers?: Record<string, string>;
+	signal?: AbortSignal;
+}
+
+async function resolveLoopbackAddresses(hostname: string): Promise<string[]> {
+	const records = await dns.lookup(hostname, { all: true, verbatim: true });
+	const addresses = records.map(record => record.address).filter(address => isLoopbackHost(address));
+	if (addresses.length === 0) {
+		throw new Error("Loopback discovery host did not resolve to a loopback address");
+	}
+	return addresses;
+}
+
+function toResponseHeaders(headers: http.IncomingHttpHeaders): Headers {
+	const result = new Headers();
+	for (const [name, value] of Object.entries(headers)) {
+		if (value === undefined) continue;
+		result.set(name, Array.isArray(value) ? value.join(", ") : value);
+	}
+	return result;
+}
+
+/**
+ * GET a loopback discovery endpoint over a direct socket.
+ *
+ * Used instead of `fetch` when an environment proxy is configured: Bun applies
+ * `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to loopback requests too, so a
+ * credentialed probe issued through `fetch` would hand its `Authorization`
+ * header to whatever proxy a project `.env` or the process environment named.
+ * The DNS lookup and the connected peer are pinned to loopback addresses, TLS
+ * verification stays on, and redirects are never followed (the caller sees the
+ * 3xx status, matching the `redirect: "error"` refusal of the `fetch` path).
+ */
+export async function fetchLoopbackDirect(url: URL, init: LoopbackDirectFetchInit = {}): Promise<Response> {
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error(`Unsupported loopback discovery protocol ${url.protocol}`);
+	}
+	const hostname = url.hostname.replace(/^\[|\]$/g, "");
+	if (!isLoopbackHost(hostname)) {
+		throw new Error("Loopback discovery transport requires a loopback host");
+	}
+	const addresses = net.isIP(hostname) ? [hostname] : await resolveLoopbackAddresses(hostname);
+	const approved = addresses.map(address => ({ address, family: net.isIP(address) }));
+	const lookup: net.LookupFunction = (requestedHostname, lookupOptions, callback) => {
+		if (requestedHostname.replace(/^\[|\]$/g, "").toLowerCase() !== hostname.toLowerCase()) {
+			callback(Object.assign(new Error("Unexpected loopback discovery host"), { code: "ENOTFOUND" }), "", 0);
+			return;
+		}
+		const requestedFamily =
+			lookupOptions.family === "IPv4" ? 4 : lookupOptions.family === "IPv6" ? 6 : (lookupOptions.family ?? 0);
+		const matching = approved.filter(record => requestedFamily === 0 || record.family === requestedFamily);
+		if (matching.length === 0) {
+			callback(Object.assign(new Error("No loopback address for discovery host"), { code: "ENOTFOUND" }), "", 0);
+			return;
+		}
+		if (lookupOptions.all) callback(null, matching);
+		else callback(null, matching[0].address, matching[0].family);
+	};
+	const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+	const requestFn = url.protocol === "https:" ? https.request : http.request;
+	const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+		const request = requestFn(
+			{
+				protocol: url.protocol,
+				hostname,
+				port,
+				path: `${url.pathname}${url.search}`,
+				method: "GET",
+				headers: { ...init.headers },
+				agent: false,
+				insecureHTTPParser: false,
+				lookup,
+				signal: init.signal,
+				...(url.protocol === "https:" ? { rejectUnauthorized: true } : {}),
+			},
+			resolve,
+		);
+		request.once("error", reject);
+		request.end();
+	});
+	const peer = response.socket.remoteAddress;
+	if (peer === undefined || !isLoopbackHost(peer)) {
+		response.destroy();
+		throw new Error("Loopback discovery peer was not a loopback address");
+	}
+	const chunks: Buffer[] = [];
+	let total = 0;
+	try {
+		for await (const chunk of response) {
+			const bytes = Buffer.from(chunk);
+			total += bytes.byteLength;
+			if (total > MAX_MODELS_RESPONSE_BYTES) {
+				response.destroy();
+				throw new Error("OpenAI-compatible models response exceeds the size limit");
+			}
+			chunks.push(bytes);
+		}
+	} catch (error) {
+		response.destroy();
+		throw error;
+	}
+	return new Response(Buffer.concat(chunks, total), {
+		status: response.statusCode ?? 502,
+		statusText: response.statusMessage,
+		headers: toResponseHeaders(response.headers),
+	});
 }
 
 /** Catalog identities are rendered and used for routing; unsafe values are dropped, never rewritten. */

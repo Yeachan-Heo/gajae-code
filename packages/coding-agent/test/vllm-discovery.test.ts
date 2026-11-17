@@ -246,14 +246,6 @@ describe("ModelRegistry vLLM Discovery", () => {
 	});
 
 	test("accepts a loopback VLLM_BASE_URL override for the implicit endpoint", async () => {
-		await Settings.init({
-			inMemory: true,
-			overrides: {
-				// Rapid-MLX implicitly probes the same default port; this test asserts
-				// vLLM's own request set, so isolate the sibling provider.
-				disabledProviders: ["rapid-mlx"],
-			},
-		});
 		Bun.env.VLLM_BASE_URL = "http://127.0.0.1:19000/v1";
 		const requestedUrls: string[] = [];
 
@@ -270,7 +262,9 @@ describe("ModelRegistry vLLM Discovery", () => {
 		await registry.refresh();
 
 		expect(registry.find("vllm", "custom-port-vllm-model")).toBeDefined();
-		expect(requestedUrls.some(url => url.includes(":8000/v1/models"))).toBe(false);
+		// The override replaces vLLM's own implicit endpoint; the sibling Rapid-MLX probe
+		// uses `localhost:8000` and is not part of vLLM's request set.
+		expect(requestedUrls).not.toContain("http://127.0.0.1:8000/v1/models");
 	});
 
 	test("skips malformed records and bounds vLLM limits to finite positive values", async () => {
@@ -297,14 +291,6 @@ describe("ModelRegistry vLLM Discovery", () => {
 	});
 
 	test("treats an unreachable implicit vLLM server as optional", async () => {
-		await Settings.init({
-			inMemory: true,
-			overrides: {
-				// Rapid-MLX implicitly probes the same default port; keep the stall
-				// scoped to vLLM's own endpoint.
-				disabledProviders: ["rapid-mlx"],
-			},
-		});
 		using _hook = hookFetch((input, init) => {
 			if (String(input).includes(":8000/v1/models")) {
 				const response = Promise.withResolvers<Response>();

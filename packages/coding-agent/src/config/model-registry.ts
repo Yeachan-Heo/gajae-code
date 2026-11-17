@@ -50,6 +50,7 @@ import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai
 import { getAntigravityDiscoveryUserAgent } from "@gajae-code/ai/utils/discovery/antigravity";
 import {
 	detectDiscoveredApiFamily,
+	fetchLoopbackDirect,
 	isSafeCatalogModelId,
 	MODELS_LIST_REQUEST_TIMEOUT_MS,
 	readBoundedModelsJson,
@@ -84,6 +85,7 @@ import {
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import { writeExplicitOwnerOnlyTextSync } from "../session/session-storage";
+import { hasConfiguredProxy } from "../web/insane/url-guard";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type BillingPath, deriveBillingPath } from "./billing-path";
 import { ConfigError, ConfigFile, type LoadResult } from "./config-file";
@@ -515,6 +517,27 @@ function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: R
 		admitsAdvertisedModalities(discovery.outputModalities, item.output_modalities) &&
 		admitsAdvertisedModalities(discovery.inputModalities, item.input_modalities)
 	);
+}
+
+/**
+ * Rapid-MLX-native `/v1/models` fields. The bare OpenAI shape is shared with
+ * vLLM and SGLang, which also live on loopback port 8000, so the response alone
+ * cannot name the implementation. Rapid-MLX publishes these runtime-fact fields
+ * (and, because its model card does not drop nulls, `reasoning_parser` is
+ * present even when it is null); vLLM/SGLang never do. An entry that carries
+ * none of them is not admitted by the implicit probe.
+ */
+const RAPID_MLX_NATIVE_MODEL_FIELDS = [
+	"context_window",
+	"reasoning_parser",
+	"tool_call_parser",
+	"recommended_sampling",
+	"is_hybrid",
+	"is_moe",
+] as const;
+
+function isRapidMlxDiscoveryRecord(item: Record<string, unknown>): boolean {
+	return RAPID_MLX_NATIVE_MODEL_FIELDS.some(field => Object.hasOwn(item, field));
 }
 
 /**
@@ -6151,15 +6174,24 @@ export class ModelRegistry {
 				providerConfig.discovery.type === "vllm" ||
 				providerConfig.discovery.type === "sglang") &&
 			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
-		const response = await fetch(modelsUrl, {
-			headers: requestHeaders,
-			...(providerConfig.discovery.type === "rapid-mlx" ||
-			providerConfig.discovery.type === "vllm" ||
-			providerConfig.discovery.type === "sglang"
-				? { redirect: "error" as const }
-				: {}),
-			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS),
-		});
+		const signal = AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS);
+		// `fetch` routes loopback requests through HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+		// when they are set — including by a project `.env` — which would hand
+		// this request's Authorization header to that proxy. A loopback discovery
+		// request therefore goes over a direct socket. Same rule the public-fetch
+		// guard (web/insane/url-guard.ts) applies by refusing proxy routing.
+		const response =
+			hardenedLocalDiscovery && hasConfiguredProxy(process.env)
+				? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
+				: await fetch(modelsUrl, {
+						headers: requestHeaders,
+						...(providerConfig.discovery.type === "rapid-mlx" ||
+						providerConfig.discovery.type === "vllm" ||
+						providerConfig.discovery.type === "sglang"
+							? { redirect: "error" as const }
+							: {}),
+						signal,
+					});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
 				// Redacted by construction: name the provider, endpoint, and the
@@ -6189,6 +6221,18 @@ export class ModelRegistry {
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
 			if (!admitsDiscoveredCatalogModalities(providerConfig.discovery, item)) continue;
+			// vLLM and SGLang answer the same OpenAI `/v1/models` shape on the same
+			// loopback ports Rapid-MLX uses, so an unidentified response must not be
+			// republished as Rapid-MLX models. The implicit probe therefore requires
+			// a Rapid-MLX-native field; a `discovery.type: rapid-mlx` entry in
+			// models.json is an explicit selection and is trusted as written.
+			if (
+				providerConfig.discovery.type === "rapid-mlx" &&
+				providerConfig.optional === true &&
+				!isRapidMlxDiscoveryRecord(item)
+			) {
+				continue;
+			}
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same

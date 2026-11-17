@@ -1,3 +1,3 @@
 ### Added
 
-- Added implicit, keyless Rapid-MLX discovery at `http://localhost:8000/v1`, explicit `discovery.type: rapid-mlx` configuration, and served context-window metadata. Loopback discovery aborts after 500 ms and refuses redirects, so an unresponsive or redirecting server cannot stall startup or forward `RAPID_MLX_API_KEY`.
+- Added implicit, keyless Rapid-MLX discovery at `http://localhost:8000/v1`, explicit `discovery.type: rapid-mlx` configuration, and served context-window metadata. Loopback discovery aborts after 500 ms and refuses redirects, so an unresponsive or redirecting server cannot stall startup or forward `RAPID_MLX_API_KEY`. With an environment proxy configured (including from a project `.env`), the credentialed probe goes over a direct socket so the bearer never reaches that proxy, and the implicit probe only publishes entries that carry a Rapid-MLX-native field, so a vLLM-only server on port 8000 keeps its own `vllm` catalog.

@@ -13,7 +13,8 @@ using _hook = hookFetch((input, init) => {
 	const authorization = new Headers(init?.headers).get("Authorization");
 	requests.push({ url, authorization });
 	if (url === "http://localhost:8000/v1/models" || url === "http://127.0.0.1:8477/v1/models") {
-		return Response.json({ data: [{ id: "trusted-model" }] });
+		// Rapid-MLX-native field so the implicit probe identifies the endpoint.
+		return Response.json({ data: [{ id: "trusted-model", context_window: 131072 }] });
 	}
 	return new Response(null, { status: 404 });
 });

@@ -5,7 +5,9 @@ import { getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, Provider, ThinkingConfig } from "../types";
 import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
 import {
+	fetchLoopbackDirect,
 	fetchOpenAICompatibleModels,
+	hasConfiguredProxyEnv,
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
 	resolveLoopbackOpenAIBaseUrl,
@@ -1675,6 +1677,9 @@ export function rapidMlxModelManagerOptions(
 		config?.baseUrl ?? $credentialEnv("RAPID_MLX_BASE_URL"),
 		"http://localhost:8000/v1",
 	);
+	// Resolved once: Bun reads the proxy variables once per process and applies
+	// them to loopback requests too.
+	const proxyConfigured = hasConfiguredProxyEnv();
 	return {
 		providerId: "rapid-mlx",
 		fetchDynamicModels: () =>
@@ -1687,12 +1692,21 @@ export function rapidMlxModelManagerOptions(
 				// server must not hold registry refresh for the full remote timeout,
 				// and a redirect must not forward RAPID_MLX_API_KEY off-host. Mirrors
 				// the local vLLM/SGLang discovery hardening.
-				fetch: (input, init) =>
-					fetch(input, {
-						...init,
-						redirect: "error",
-						signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(500)]) : init?.signal,
-					}),
+				fetch: (input, init) => {
+					const signal = init?.signal
+						? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
+						: AbortSignal.timeout(500);
+					// `fetch` would hand the Authorization header to HTTP(S)_PROXY,
+					// including a proxy declared by a project `.env`. Loopback discovery
+					// goes over a direct socket instead.
+					if (proxyConfigured) {
+						return fetchLoopbackDirect(new URL(String(input)), {
+							headers: Object.fromEntries(new Headers(init?.headers).entries()),
+							signal,
+						});
+					}
+					return fetch(input, { ...init, redirect: "error", signal });
+				},
 			}),
 	};
 }

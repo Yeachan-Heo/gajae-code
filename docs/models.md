@@ -803,6 +803,10 @@ If `rapid-mlx` is not explicitly configured, registry adds an implicit discovera
 
 Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `context_window` support. The implicit endpoint override accepts only HTTP(S) loopback URLs.
 
+vLLM and SGLang answer the same OpenAI `/v1/models` shape on the same loopback ports, so the implicit probe only publishes entries that carry a Rapid-MLX-native field (`context_window`, `reasoning_parser`, `tool_call_parser`, `recommended_sampling`, `is_hybrid`, or `is_moe`). A vLLM-only server keeps its own `vllm` catalog instead of being republished as Rapid-MLX; naming `rapid-mlx` with `discovery.type: rapid-mlx` in `models.json` is an explicit selection and skips that check.
+
+When `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` is set — including by a project `.env` — the loopback discovery request is issued over a direct socket instead of `fetch`, so `RAPID_MLX_API_KEY` is never handed to that proxy. Redirects are never followed.
+
 Install with `brew install rapid-mlx`, then run `rapid-mlx serve qwen3.5-4b-4bit --port 8000`. If another local runtime uses port 8000, choose a free port with `--port` and set `RAPID_MLX_BASE_URL` accordingly. Without `--port`, Rapid-MLX selects the first free port in 8000–8009.
 
 ### Implicit vLLM discovery
