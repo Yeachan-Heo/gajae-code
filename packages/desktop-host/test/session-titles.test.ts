@@ -8,6 +8,7 @@ import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/c
 import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
+import * as nativeSession from "../src/native-session";
 import type { DesktopFrame, DesktopProject, DesktopRequest, DesktopSession } from "../src/protocol";
 
 describe("desktop automatic session titles", () => {
@@ -16,12 +17,21 @@ describe("desktop automatic session titles", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 	const spies: Array<{ mockRestore(): void }> = [];
 	const releases: Array<() => void> = [];
+	const nativeSessions = new Map<CreateAgentSessionResult["session"], nativeSession.NativeSession>();
 
 	beforeEach(() => {
 		environment = { ...process.env };
 		agentDir = getAgentDir();
 		process.env.GJC_DESKTOP_ISOLATED = "1";
 		spies.push(vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined));
+		const openNativeSession = nativeSession.openNativeSession;
+		spies.push(
+			vi.spyOn(nativeSession, "openNativeSession").mockImplementation(async input => {
+				const opened = await openNativeSession(input);
+				if (opened.kind === "opened") nativeSessions.set(opened.session.sdk, opened.session);
+				return opened;
+			}),
+		);
 	});
 	afterEach(async () => {
 		try {
@@ -29,6 +39,7 @@ describe("desktop automatic session titles", () => {
 			for (const cleanup of cleanups.splice(0)) await cleanup();
 		} finally {
 			for (const spy of spies.splice(0)) spy.mockRestore();
+			nativeSessions.clear();
 			for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];
 			Object.assign(process.env, environment);
 			setAgentDir(agentDir);
@@ -88,6 +99,8 @@ describe("desktop automatic session titles", () => {
 		const project = await call<DesktopProject>("project.open", { path: projectDir });
 		const session = await call<DesktopSession>("session.create", { projectId: project.id });
 		const sdk = sessions[0]!.session;
+		const native = nativeSessions.get(sdk);
+		if (!native) throw new Error("Missing native session for fixture SDK session");
 		const restart = async () => {
 			await host.close();
 			await Promise.all(sessions.map(result => result.session.awaitDisposeCompletion()));
@@ -99,6 +112,7 @@ describe("desktop automatic session titles", () => {
 			project,
 			session,
 			sdk,
+			runtime: native.runtime,
 			sessions,
 			extensionStarted: extensionStarted.promise,
 			extensionStarts: () => extensionStarts,
@@ -200,7 +214,8 @@ describe("desktop automatic session titles", () => {
 
 	test("reopening reconciles a committed transcript title even when the catalog was never updated", async () => {
 		const h = await fixture();
-		await h.sdk.setSessionName("Recovered title", "auto");
+		// Commit an auto transcript title without updating the stale host catalog.
+		await h.runtime.session.setSessionName("Recovered title", "auto");
 		await h.restart();
 		expect(h.snapshot().sessions[0]?.title).toBe("Recovered title");
 		const catalog = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
@@ -325,7 +340,8 @@ describe("desktop automatic session titles", () => {
 		const h = await fixture();
 		const second = await h.call<DesktopSession>("session.create", { projectId: h.project.id });
 		const secondSdk = h.sessions[1]!.session;
-		await h.sdk.setSessionName("Manual SDK title", "user");
+		// Admit a user transcript title only; command synchronization must reconcile the stale catalog.
+		await h.runtime.session.setSessionName("Manual SDK title", "user");
 		expect(h.sdk.sessionManager.titleSource).toBe("user");
 		const catalogPath = path.join(h.dataDir, "catalog.json");
 		const stale = await Bun.file(catalogPath).json();
@@ -384,7 +400,8 @@ describe("desktop automatic session titles", () => {
 		await h.call("prompt", { sessionId: second.id, text: "unrelated prompt" });
 		expect(h.snapshot().deliveries.at(-1)?.disposition).toBe("unknown");
 		expect(optionalWrites).toBe(0);
-		await h.sdk.setSessionName("Reopened SDK title", "user");
+		// Again leave the catalog unchanged so reopen must reconcile this user transcript title.
+		await h.runtime.session.setSessionName("Reopened SDK title", "user");
 		const beforeRestart = await Bun.file(catalogPath).json();
 		expect(beforeRestart.sessions.find((item: { id: string }) => item.id === h.session.id).title).toBe(
 			"Manual SDK title",
@@ -476,7 +493,8 @@ describe("desktop automatic session titles", () => {
 			if (reason === "disabled") process.env.GJC_NO_TITLE = "1";
 			else {
 				delete process.env.GJC_NO_TITLE;
-				await h.sdk.setSessionName("Manual", "user");
+				// Commit a user title through the host before the first prompt admission.
+				await h.call("session.rename", { sessionId: h.session.id, title: "Manual" });
 			}
 			const generator = vi.spyOn(titleGenerator, "generateSessionTitle").mockResolvedValue("Unexpected");
 			const operation = vi.spyOn(h.sdk, "generateAutoSessionTitle");

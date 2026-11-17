@@ -21,6 +21,7 @@ import { getAgentDir, setAgentDir, VERSION } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { DesktopHost } from "../src/host";
 import type { DesktopMcpOperationResult, DesktopMcpServer, DesktopMcpSnapshot } from "../src/mcp-protocol";
+import * as nativeSessions from "../src/native-session";
 import type { DesktopOperatorOperation } from "../src/operator-protocol";
 import { projectPreferenceOutcome } from "../src/preferences-controls";
 import type { DesktopPreferenceResult } from "../src/preferences-protocol";
@@ -1031,11 +1032,21 @@ describe("desktop service public SDK transport", () => {
 	}, 30_000);
 
 	test("session.info projects actual recorded/active SDK telemetry and catalog identity without SDK ownership, config or billing guesses", async () => {
+		const open = nativeSessions.openNativeSession;
+		let owner: nativeSessions.NativeSession | undefined;
+		vi.spyOn(nativeSessions, "openNativeSession").mockImplementation(async input => {
+			const result = await open(input);
+			if (result.kind === "opened") owner = result.session;
+			return result;
+		});
 		const f = await fixture();
 		const sdk = f.first.sdk;
 		const identities = [sdk.sessionId, sdk.sessionManager.getSessionId(), sdk.credentialSessionId, sdk.getAgentId()!];
 		expect(new Set(identities).size).toBe(4);
-		await sdk.setSessionName(`private identities ${identities.join(" ")} ${secret}`, "user");
+		if (!owner || owner.sdk !== sdk) throw new Error("Missing exact native fixture owner");
+		expect(
+			await owner.runtime.session.setSessionName(`private identities ${identities.join(" ")} ${secret}`, "user"),
+		).toMatchObject({ kind: "applied" });
 		const before = f.counters();
 		const info = await f.info();
 		expect(info.metadata.catalogSessionId).toBe(f.first.dto.id);
