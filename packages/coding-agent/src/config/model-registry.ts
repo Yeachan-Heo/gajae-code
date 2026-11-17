@@ -6208,10 +6208,11 @@ export class ModelRegistry {
 		// loopback requests — including a proxy a project `.env` declared — caches
 		// that decision per process, and offers no per-request bypass, so only a
 		// direct socket proves the Authorization header cannot reach a proxy.
-		// Other explicitly configured providers keep their existing transport; the
-		// Rapid-MLX provider is covered even when named in models.json.
+		// Other explicitly configured providers keep their existing transport; any
+		// provider that declares Rapid-MLX discovery is covered, including a custom
+		// alias named in models.json.
 		const response =
-			(providerConfig.implicitProbe === true || providerConfig.provider === "rapid-mlx") &&
+			(providerConfig.implicitProbe === true || providerConfig.discovery.type === "rapid-mlx") &&
 			loopbackDiscovery &&
 			headerValue(requestHeaders, "Authorization") !== undefined
 				? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
