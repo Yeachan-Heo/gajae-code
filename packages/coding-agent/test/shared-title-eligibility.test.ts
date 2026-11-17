@@ -1249,11 +1249,11 @@ describe("shared publication admission split", () => {
 		const gate = Promise.withResolvers<void>();
 		const original = f.manager.appendMessageSharingSession.bind(f.manager);
 		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
-			if (message.role === "bashExecution") {
+			if ((message as any).role === "bashExecution") {
 				entered.resolve();
 				await gate.promise;
 			}
-			return original(message);
+			return await original(message);
 		});
 		// Captured synchronously when the successor run is entered. A result that arrived
 		// while the joined drain was awaiting must already be in agent state, in order.
@@ -1280,6 +1280,7 @@ describe("shared publication admission split", () => {
 		expect(enteredCommands).toBeUndefined();
 
 		gate.resolve();
+		await Bun.sleep(100);
 		await successor;
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		// The successor invocation must not start while its result is still queued.
