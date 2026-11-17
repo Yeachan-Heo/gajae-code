@@ -4684,6 +4684,9 @@ export function createNotificationsExtension(
 		  }
 		| undefined;
 	let extensionShuttingDown = false;
+	// A shutdown cancels only start flights reserved before it; a later same-ID
+	// replacement runtime may start again on this extension instance.
+	let shutdownEpoch = 0;
 	const consumedMasterNonces = new Map<string, number>();
 
 	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
@@ -5128,6 +5131,7 @@ export function createNotificationsExtension(
 		// Reserve before identity preflight (or writer admission) can yield. Stops
 		// must be able to cancel this exact flight even before it owns a runtime.
 		const settled = Promise.withResolvers<SessionStartResult>();
+		const reservedShutdownEpoch = shutdownEpoch;
 		let cancelled = false;
 		sessionStartPromises.set(id, settled.promise);
 		cancelSessionStarts.set(id, () => {
@@ -5145,12 +5149,15 @@ export function createNotificationsExtension(
 			releaseReservation();
 			settled.resolve(result);
 		};
-		void startOwnedSession(ctx, () => cancelled, finish).then(finish, error => {
-			if (finished) return;
-			finished = true;
-			releaseReservation();
-			settled.reject(error);
-		});
+		void startOwnedSession(ctx, () => cancelled || shutdownEpoch !== reservedShutdownEpoch, finish).then(
+			finish,
+			error => {
+				if (finished) return;
+				finished = true;
+				releaseReservation();
+				settled.reject(error);
+			},
+		);
 		return settled.promise;
 	}
 
@@ -5183,7 +5190,6 @@ export function createNotificationsExtension(
 		};
 		const throwIfLifecycleStopped = (): void => {
 			if (
-				extensionShuttingDown ||
 				startupCancelled() ||
 				lifecycleStartupCapability?.cancelled ||
 				runtime?.stopping ||
@@ -5210,7 +5216,7 @@ export function createNotificationsExtension(
 			return { status: "already", runtime: existingRuntime };
 		}
 
-		if (extensionShuttingDown || startupCancelled() || lifecycleStartupCapability?.cancelled)
+		if (startupCancelled() || lifecycleStartupCapability?.cancelled)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup was cancelled.");
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
 		let isolateChatEndpoint = forceIsolatedChatSessions.delete(id);
@@ -5229,7 +5235,7 @@ export function createNotificationsExtension(
 			else {
 				const identity = await proposedTelegramIdentity({ settings, botToken: cfg.botToken, chatId: cfg.chatId });
 				// Shutdown can cancel the reserved flight before it owns any resources.
-				if (extensionShuttingDown || startupCancelled() || lifecycleStartupCapability?.cancelled)
+				if (startupCancelled() || lifecycleStartupCapability?.cancelled)
 					return failLifecycleStartup("failed", "Lifecycle SDK startup was cancelled.");
 				isolateChatEndpoint = identity.status === "foreign" || identity.status === "unknown";
 			}
@@ -11449,6 +11455,7 @@ export function createNotificationsExtension(
 
 	api.on("session_shutdown", async (_event, ctx) => {
 		extensionShuttingDown = true;
+		shutdownEpoch++;
 		for (const runtime of runtimes.values()) runtime.abortBtwQuestions();
 		for (const runtime of cleanupRetries.values()) runtime.abortBtwQuestions();
 		identityControlInFlight = false;
