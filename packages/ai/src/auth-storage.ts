@@ -125,6 +125,13 @@ export type OAuthCredential = {
 
 export type AuthCredential = ApiKeyCredential | OAuthCredential;
 
+/** Per-operation admission around the actual credential-store mutation. */
+export interface AuthCredentialCommitOptions {
+	withCredentialCommit?: <T>(commit: () => T | Promise<T>) => Promise<T>;
+}
+
+export type { OAuthLoginOptions } from "./utils/oauth/types";
+
 export type UsageLimitMarkResult =
 	| {
 			state: "marked";
@@ -3849,13 +3856,23 @@ export class AuthStorage {
 	/**
 	 * Set credential for a provider.
 	 */
-	async set(provider: string, credential: AuthCredentialEntry): Promise<void> {
+	async set(
+		provider: string,
+		credential: AuthCredentialEntry,
+		options: AuthCredentialCommitOptions = {},
+	): Promise<void> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const normalized = Array.isArray(credential) ? credential : [credential];
 		const deduped = this.#dedupeOAuthCredentials(storageProvider, normalized);
-		const stored = this.#store.replaceAuthCredentialsRemote
-			? await this.#store.replaceAuthCredentialsRemote(storageProvider, deduped)
-			: this.#store.replaceAuthCredentialsForProvider(storageProvider, deduped);
+		const commit = (): StoredAuthCredential[] | Promise<StoredAuthCredential[]> =>
+			this.#store.replaceAuthCredentialsRemote
+				? this.#store.replaceAuthCredentialsRemote(storageProvider, deduped)
+				: this.#store.replaceAuthCredentialsForProvider(storageProvider, deduped);
+		const stored = options.withCredentialCommit
+			? await options.withCredentialCommit(commit)
+			: this.#store.replaceAuthCredentialsRemote
+				? await this.#store.replaceAuthCredentialsRemote(storageProvider, deduped)
+				: this.#store.replaceAuthCredentialsForProvider(storageProvider, deduped);
 		this.#setStoredCredentials(
 			storageProvider,
 			stored.map(record => ({ id: record.id, credential: record.credential, revision: record.revision })),
@@ -3918,10 +3935,20 @@ export class AuthStorage {
 		};
 	}
 
-	async #upsertOAuthCredential(provider: string, credential: OAuthCredential): Promise<void> {
-		const stored = this.#store.upsertAuthCredentialRemote
-			? await this.#store.upsertAuthCredentialRemote(provider, credential)
-			: this.#store.upsertAuthCredentialForProvider(provider, credential);
+	async #upsertOAuthCredential(
+		provider: string,
+		credential: OAuthCredential,
+		options: AuthCredentialCommitOptions = {},
+	): Promise<void> {
+		const commit = (): StoredAuthCredential[] | Promise<StoredAuthCredential[]> =>
+			this.#store.upsertAuthCredentialRemote
+				? this.#store.upsertAuthCredentialRemote(provider, credential)
+				: this.#store.upsertAuthCredentialForProvider(provider, credential);
+		const stored = options.withCredentialCommit
+			? await options.withCredentialCommit(commit)
+			: this.#store.upsertAuthCredentialRemote
+				? await this.#store.upsertAuthCredentialRemote(provider, credential)
+				: this.#store.upsertAuthCredentialForProvider(provider, credential);
 		this.#setStoredCredentials(
 			provider,
 			stored.map(record => ({ id: record.id, credential: record.credential, revision: record.revision })),
@@ -4213,11 +4240,12 @@ export class AuthStorage {
 			onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string>;
 		},
 		options: OAuthLoginOptions = {},
+		commitOptions: AuthCredentialCommitOptions = {},
 	): Promise<void> {
 		let credentials: OAuthCredentials;
 		const saveApiKeyCredential = async (apiKey: string): Promise<void> => {
 			const newCredential: ApiKeyCredential = { type: "api_key", key: apiKey };
-			await this.set(provider, newCredential);
+			await this.set(provider, newCredential, commitOptions);
 		};
 		const manualCodeInput = () => ctrl.onPrompt({ message: "Paste the authorization code (or full redirect URL):" });
 
@@ -4282,7 +4310,7 @@ export class AuthStorage {
 				// provider can pick them up without a separate provider configuration.
 				const deviceCredentials = await loginOpenAICodexDevice(ctrl);
 				const newCredential: OAuthCredential = { type: "oauth", ...deviceCredentials };
-				await this.#upsertOAuthCredential("openai-codex", newCredential);
+				await this.#upsertOAuthCredential("openai-codex", newCredential, commitOptions);
 				return;
 			}
 			case "gitlab-duo": {
@@ -4610,10 +4638,10 @@ export class AuthStorage {
 			const existingOAuthCredentials = this.#getCredentialsForProvider(provider).filter(
 				(credential): credential is OAuthCredential => credential.type === "oauth",
 			);
-			await this.set(provider, [...existingOAuthCredentials, newCredential]);
+			await this.set(provider, [...existingOAuthCredentials, newCredential], commitOptions);
 			return;
 		}
-		await this.#upsertOAuthCredential(provider, newCredential);
+		await this.#upsertOAuthCredential(provider, newCredential, commitOptions);
 	}
 
 	/**
