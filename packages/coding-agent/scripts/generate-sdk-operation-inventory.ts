@@ -401,6 +401,32 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setSessionAgentModelSelection":
 		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
+	"agent_session:appendCustomEntryForSession":
+		"internal shared-session transcript publication for in-process extension and controller writers, not a user-facing SDK control seam",
+	"agent_session:appendCustomEntryInBackground":
+		"internal shared-session transcript publication from synchronous in-process call sites, not a user-facing SDK control seam",
+	"agent_session:appendMessageInBackground":
+		"internal shared-session transcript publication from synchronous in-process call sites, not a user-facing SDK control seam",
+	"agent_session:appendMessageForSession":
+		"internal shared-session transcript publication for in-process writers, not a user-facing SDK control seam",
+	"agent_session:appendSessionRecapForSession":
+		"internal shared-session recap publication behind the reviewed session recap surfaces, not an independent public SDK operation",
+	"agent_session:appendLabelChangeInBackground":
+		"internal shared-session label publication for the local TUI tree navigator, not a user-facing SDK control seam",
+	"agent_session:appendModeChangeInBackground":
+		"internal shared-session mode-change publication for plan/goal mode persistence, not a user-facing SDK control seam",
+	"agent_session:assertConfiguredModelChainWritable":
+		"internal fail-closed guard before profile/fallback-chain writes on adopted shared sessions, not a user-facing SDK control seam",
+	"agent_session:usesSharedControlPublication":
+		"internal shared-publication eligibility query for in-process control paths, not a user-facing SDK control seam",
+	"agent_session:withModelProfilePublication":
+		"internal shared publication scope behind the reviewed model.profile.set seam, not an independent public SDK operation",
+	"agent_session:appendModelProfileActivationForControl":
+		"internal shared transcript append behind the reviewed model.profile.set seam, not an independent public SDK operation",
+	"agent_session:publishCommittedModelProfileSessionState":
+		"internal receipt-bound live-state publication behind the reviewed model.profile.set seam, not an independent public SDK operation",
+	"agent_session:setThinkingLevelForSession":
+		"internal non-operator session-only thinking follow (plan mode, model assignment) over the reviewed thinking.set seam, not an independent public SDK operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
