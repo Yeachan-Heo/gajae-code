@@ -16940,14 +16940,16 @@ export class AgentSession {
 	 * @returns The plan mode message, or null if plan mode is not enabled.
 	 */
 	async #buildPlanReferenceMessage(): Promise<CustomMessage | null> {
+		// Complete the mandatory local:// migration gate before ANY plan path resolves.
+		// This builder returns early in plan mode, where #buildPlanModeMessage still
+		// resolves local://PLAN.md through the synchronous resolver, so the gate cannot
+		// live below the early returns (managed destinations without a settled marker
+		// would throw "local:// legacy migration must complete before path resolution").
+		await initializeLocalRoot(this.#localProtocolOptions());
 		if (this.#planModeState?.enabled) return null;
 		if (this.#planReferenceSent) return null;
 
 		const planFilePath = this.#planReferencePath;
-		// Ensure local protocol is initialized before resolving local:// paths.
-		// Without this, managed destinations with legacy migration sources fail on
-		// synchronous resolution (issue #7815).
-		await initializeLocalRoot(this.#localProtocolOptions());
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, this.#localProtocolOptions());
 		let planContent: string;
 		try {
