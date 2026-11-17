@@ -1766,4 +1766,54 @@ describe("AgentSession fallback upstream request counts", () => {
 		// With a 100ms budget, we expect a small number of primary attempts before advancing.
 		expect(primaryAttempts).toBeLessThan(10); // Should not retry indefinitely
 	});
+
+	it("enforces concurrency Retry-After deadline before credential rotation (Issue 7796)", async () => {
+		// When a typed concurrency 429 with Retry-After exceeds the remaining budget,
+		// the deadline must be enforced even when credential rotation is available.
+		// A rotating credential should not retry the same selector before the deadline.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const primarySelector = selector(primaryModel);
+		const retryAfterMs = 1000; // 1-second deadline
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				// Return concurrency-typed 429 with Retry-After that exceeds budget
+				return typedRateLimitStream(
+					model,
+					retryAfterMs,
+					"too many concurrent requests",
+					"too_many_concurrent_requests",
+				);
+			}
+			// Fallback
+			fallbackAttempts++;
+			// Always succeed on fallback
+			return successfulStream(model);
+		};
+
+		const { fallback: f } = createSession(50, streamFn, {
+			// Very small budget (200ms) vs Retry-After (1s)
+			"fallback.concurrencyWaitMs": 200,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		const requestsBefore = primaryAttempts;
+		await session!.prompt("Test credential rotation deadline enforcement");
+		await session!.waitForIdle();
+
+		// Verify primary was attempted and deadline was enforced
+		expect(primaryAttempts).toBeGreaterThan(requestsBefore);
+		expect(fallbackAttempts).toBeGreaterThan(0);
+		// Final model should be fallback (which succeeded)
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+
+		// Most importantly: credential rotation should not bypass the deadline.
+		// With a 200ms budget and a 1s Retry-After, we should NOT see many primary
+		// attempts (would indicate deadline was not enforced before rotation).
+		expect(primaryAttempts).toBeLessThan(5);
+	});
 });

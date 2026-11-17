@@ -30733,8 +30733,18 @@ export class AgentSession {
 			// A credential retry is a separate dimension from model fallback
 			// attempts. Leave the controller on the current entry and refund its
 			// provisional request charge so every same-kind account is tried first.
-			controller.discardStartedAttempt();
-			outcome = "retry";
+			// However, enforce the concurrency Retry-After deadline before allowing
+			// same-selector rotation/retry: if a deadline exists for this selector,
+			// advance instead of retrying before the deadline.
+			const deadlineMs = failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+				// Deadline not yet reached; advance instead of retrying
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				// No deadline or deadline reached; allow credential rotation retry
+				controller.discardStartedAttempt();
+				outcome = "retry";
+			}
 		} else if (managedFallback) {
 			// When Retry-After exceeds the remaining budget, force advance to the next entry
 			// instead of retrying the same entry. This prevents re-sending before the provider's
