@@ -1145,13 +1145,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		client: MCPOAuthRefreshClient,
 		signal?: AbortSignal,
 	): Promise<OAuthCredential> {
+		// Entry precondition: a direct caller must not hand the broker a client
+		// secret for a transport-disallowed binding. AuthStorage asserts the same
+		// thing before delegating, but this public entry point has to defend itself.
+		assertMCPOAuthBindingTransportAdmitted(credential.mcpBinding);
 		await this.#client.refreshMCPCredential(credentialId, client, signal);
 		await this.refreshSnapshot(signal);
 		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		if (accepted?.credential.type !== "oauth") {
 			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
-		assertMCPOAuthBindingTransportAdmitted(credential.mcpBinding);
 		assertMCPOAuthBindingTransportAdmitted(accepted.credential.mcpBinding);
 		if (
 			accepted.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
