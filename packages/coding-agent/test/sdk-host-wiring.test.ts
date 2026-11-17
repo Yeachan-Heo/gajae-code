@@ -8363,6 +8363,18 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 		}),
 	);
 	await waitFor(() => deliveries.length === 1, "terminal prompt accepted");
+	// Wait for the durable acceptance response so the abort below observes the
+	// accepted-but-not-started state this test names. Aborting during admission
+	// instead races the preflight-cancellation cleanup, which fail-closes to
+	// `turn: "uncertain"` (reason `worker_unsettled`) and would let a
+	// non-settled finalization satisfy this test.
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-prompt"),
+		"terminal prompt acceptance response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-prompt")).toMatchObject({
+		ok: true,
+	});
 	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	// The fixture harness fires agent_start without binding an exact run handle,
 	// so the prompt is normally accepted-but-not-started: terminal abort must
