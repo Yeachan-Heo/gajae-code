@@ -1340,7 +1340,7 @@ describe("pinned public OAuth fetches", () => {
 			const flow = new MCPOAuthFlow(
 				{
 					authorizationUrl: "https://provider.example/authorize",
-					tokenUrl: `http://token.example:${port}/token`,
+					tokenUrl: `https://token.example:${port}/token`,
 					clientId: "client-id",
 					clientSecret: "client-secret",
 				},
@@ -1375,7 +1375,7 @@ describe("pinned public OAuth fetches", () => {
 			const flow = new MCPOAuthFlow(
 				{
 					authorizationUrl: "https://provider.example/authorize",
-					tokenUrl: `http://token.example:${port}/token`,
+					tokenUrl: `https://token.example:${port}/token`,
 					clientId: "client-id",
 					clientSecret: "client-secret",
 				},
@@ -1640,5 +1640,56 @@ describe("pinned public OAuth fetches", () => {
 		const values: Record<string, string | undefined> = {};
 		for (const key of PROXY_ENV_KEYS) values[key] = "";
 		await withProxyEnv(values, () => expectPublicExchangeAndRegistration());
+	});
+});
+
+describe("MCP OAuth token endpoint TLS on exchange", () => {
+	it("rejects a public http token endpoint before the authorization code is sent", async () => {
+		let fetches = 0;
+		using _hook = hookFetch(() => {
+			fetches += 1;
+			return Response.json({ access_token: "should-not-issue" });
+		});
+		for (const tokenUrl of ["http://1.1.1.1/token", "http://public.example/token"]) {
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: "https://provider.example/authorize",
+					tokenUrl,
+					clientId: "client-id",
+					clientSecret: "client-secret",
+				},
+				{},
+			);
+			await expect(
+				flow.exchangeToken("authorization-code", "state", "https://client.example/callback"),
+			).rejects.toThrow(/OAuth token endpoint must use HTTPS/);
+		}
+		expect(fetches).toBe(0);
+	});
+
+	it("still sends the authorization code to the https form of that public token endpoint", async () => {
+		const bodies: string[] = [];
+		using _hook = hookFetch((_input, init) => {
+			bodies.push(String(init?.body ?? ""));
+			return Response.json({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 3600 });
+		});
+		for (const tokenUrl of ["https://1.1.1.1/token", "https://public.example/token"]) {
+			const flow = new MCPOAuthFlow(
+				{
+					authorizationUrl: "https://provider.example/authorize",
+					tokenUrl,
+					clientId: "client-id",
+					clientSecret: "client-secret",
+				},
+				{},
+			);
+			const credentials = await flow.exchangeToken("authorization-code", "state", "https://client.example/callback");
+			expect(credentials.access).toBe("access-token");
+		}
+		expect(bodies).toHaveLength(2);
+		for (const body of bodies) {
+			expect(body).toContain("code=authorization-code");
+			expect(body).toContain("client_secret=client-secret");
+		}
 	});
 });
