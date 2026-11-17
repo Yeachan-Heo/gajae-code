@@ -409,10 +409,15 @@ export async function appendLedger(
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
 	// Write the activity marker to record the ledger update for implicit session resolution.
-	// If the marker write fails, callers that depend on marker freshness (e.g., implicit
-	// pause checks) need to know about it. Settlement paths that only need durable ledger
-	// rows can catch this error themselves if they need best-effort behavior.
-	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
+	// The activity marker is best-effort: a failure to write it should not fail the durable
+	// ledger append. Log the error so it can be observed but do not throw, following the
+	// pattern of writeSessionActivityMarker's own contract (state-command callers MUST
+	// treat thrown errors as failures; non-critical writers may swallow them).
+	try {
+		await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
+	} catch (error) {
+		logger.warn(`Failed to write session activity marker for ledger append: ${error}`);
+	}
 	return entry;
 }
 
