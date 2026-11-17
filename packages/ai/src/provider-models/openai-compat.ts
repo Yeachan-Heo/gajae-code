@@ -7,7 +7,6 @@ import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber 
 import {
 	fetchLoopbackDirect,
 	fetchOpenAICompatibleModels,
-	hasConfiguredProxyEnv,
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
 	resolveLoopbackOpenAIBaseUrl,
@@ -1677,9 +1676,11 @@ export function rapidMlxModelManagerOptions(
 		config?.baseUrl ?? $credentialEnv("RAPID_MLX_BASE_URL"),
 		"http://localhost:8000/v1",
 	);
-	// Resolved once: Bun reads the proxy variables once per process and applies
-	// them to loopback requests too.
-	const proxyConfigured = hasConfiguredProxyEnv();
+	// A credentialed loopback probe never goes through `fetch`: Bun applies
+	// HTTP(S)_PROXY/ALL_PROXY to loopback requests and caches that decision per
+	// process, so no environment check here can prove where `fetch` would send
+	// the bearer.
+	const sendsCredential = apiKey !== undefined && apiKey !== "";
 	return {
 		providerId: "rapid-mlx",
 		fetchDynamicModels: () =>
@@ -1696,10 +1697,7 @@ export function rapidMlxModelManagerOptions(
 					const signal = init?.signal
 						? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
 						: AbortSignal.timeout(500);
-					// `fetch` would hand the Authorization header to HTTP(S)_PROXY,
-					// including a proxy declared by a project `.env`. Loopback discovery
-					// goes over a direct socket instead.
-					if (proxyConfigured) {
+					if (sendsCredential) {
 						return fetchLoopbackDirect(new URL(String(input)), {
 							headers: Object.fromEntries(new Headers(init?.headers).entries()),
 							signal,

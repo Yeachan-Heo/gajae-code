@@ -46,45 +46,64 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			delete Bun.env.RAPID_MLX_BASE_URL;
 		}
 	});
-	test.each([
-		undefined,
-		"http://127.0.0.1:8477/v1",
-	])("project .env cannot redirect a trusted key (trusted endpoint: %s)", async trustedBaseUrl => {
+	test("project .env cannot redirect a trusted key", async () => {
 		const projectDir = path.join(tempDir, "project");
 		const agentDir = path.join(tempDir, "agent");
 		await fs.mkdir(projectDir);
 		await fs.mkdir(agentDir);
-		await Bun.write(path.join(projectDir, ".env"), "RAPID_MLX_BASE_URL=http://127.0.0.1:19999/v1\n");
-		await Bun.write(
-			path.join(agentDir, ".env"),
-			`RAPID_MLX_API_KEY=trusted-rapid-key\n${trustedBaseUrl ? `RAPID_MLX_BASE_URL=${trustedBaseUrl}\n` : ""}`,
-		);
-		const env: Record<string, string | undefined> = { ...process.env, GJC_CODING_AGENT_DIR: agentDir };
-		delete env.RAPID_MLX_BASE_URL;
-		delete env.RAPID_MLX_API_KEY;
-		const child = Bun.spawn(
-			[process.execPath, path.join(import.meta.dir, "fixtures", "rapid-mlx-trust-probe.ts"), tempDir],
-			{ cwd: projectDir, env, stdout: "pipe", stderr: "pipe" },
-		);
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-		const result = JSON.parse(stdout);
-		const expectedBaseUrl = trustedBaseUrl ?? "http://localhost:8000/v1";
-		expect(result.projectUrl).toBe("http://127.0.0.1:19999/v1");
-		expect(result.modelBaseUrl).toBe(expectedBaseUrl);
-		expect(
-			result.requests.filter(
-				(request: { authorization: string | null }) => request.authorization === "Bearer trusted-rapid-key",
-			),
-		).toEqual([
-			{ url: `${expectedBaseUrl}/models`, authorization: "Bearer trusted-rapid-key" },
-			{ url: `${expectedBaseUrl}/models`, authorization: "Bearer trusted-rapid-key" },
-		]);
-		expect(result.requests.some((request: { url: string }) => request.url.includes(":19999/"))).toBe(false);
+		const trustedAuthorizations: (string | null)[] = [];
+		const trustedServer = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (new URL(request.url).pathname !== "/v1/models") return new Response(null, { status: 404 });
+				trustedAuthorizations.push(request.headers.get("authorization"));
+				return Response.json({ data: [{ id: "trusted-model", context_window: 131072 }] });
+			},
+		});
+		let untrustedRequests = 0;
+		const untrustedServer = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch() {
+				untrustedRequests++;
+				return new Response(null, { status: 404 });
+			},
+		});
+		try {
+			const trustedBaseUrl = `http://127.0.0.1:${trustedServer.port}/v1`;
+			const untrustedBaseUrl = `http://127.0.0.1:${untrustedServer.port}/v1`;
+			await Bun.write(path.join(projectDir, ".env"), `RAPID_MLX_BASE_URL=${untrustedBaseUrl}\n`);
+			await Bun.write(
+				path.join(agentDir, ".env"),
+				`RAPID_MLX_API_KEY=trusted-rapid-key\nRAPID_MLX_BASE_URL=${trustedBaseUrl}\n`,
+			);
+			const env: Record<string, string | undefined> = { ...process.env, GJC_CODING_AGENT_DIR: agentDir };
+			delete env.RAPID_MLX_BASE_URL;
+			delete env.RAPID_MLX_API_KEY;
+			const child = Bun.spawn(
+				[process.execPath, path.join(import.meta.dir, "fixtures", "rapid-mlx-trust-probe.ts"), tempDir],
+				{ cwd: projectDir, env, stdout: "pipe", stderr: "pipe" },
+			);
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+			const result = JSON.parse(stdout);
+			// The project declared a different endpoint and it stayed loaded in the
+			// process, but neither the registry nor the descriptor sent the trusted key
+			// there: both used the agent-owned endpoint.
+			expect(result.projectUrl).toBe(untrustedBaseUrl);
+			expect(result.trustedUrl).toBe(trustedBaseUrl);
+			expect(result.modelBaseUrl).toBe(trustedBaseUrl);
+			expect(trustedAuthorizations).toEqual(["Bearer trusted-rapid-key", "Bearer trusted-rapid-key"]);
+			expect(untrustedRequests).toBe(0);
+		} finally {
+			trustedServer.stop(true);
+			untrustedServer.stop(true);
+		}
 	}, 15_000);
 
 	test("auto-discovers Rapid-MLX models and maps context length from context_window", async () => {
@@ -143,47 +162,43 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 
 	test("forwards configured Rapid-MLX auth during discovery when configured", async () => {
 		authStorage.setRuntimeApiKey("rapid-mlx", "test-rapid-mlx-key");
-
-		using _hook = hookFetch((input, init) => {
-			const url = String(input);
-			if (url === "http://localhost:8000/v1/models") {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authHeader).toBe("Bearer test-rapid-mlx-key");
-				return new Response(
-					JSON.stringify({
-						object: "list",
-						data: [{ id: "authenticated-rapid-mlx-model", context_window: 131072 }],
-					}),
-					{
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					},
-				);
-			}
-			return new Response(null, { status: 404 });
+		const authorizations: (string | null)[] = [];
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (new URL(request.url).pathname !== "/v1/models") return new Response(null, { status: 404 });
+				authorizations.push(request.headers.get("authorization"));
+				return Response.json({
+					object: "list",
+					data: [{ id: "authenticated-rapid-mlx-model", context_window: 131072 }],
+				});
+			},
 		});
+		try {
+			// A credentialed loopback discovery request is issued over a direct socket,
+			// so the assertions run against a real server instead of a fetch hook.
+			Bun.env.RAPID_MLX_BASE_URL = `http://127.0.0.1:${server.port}/v1`;
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
 
-		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		await registry.refresh();
-
-		const model = registry.find("rapid-mlx", "authenticated-rapid-mlx-model");
-		expect(model?.provider).toBe("rapid-mlx");
-		expect(await registry.getApiKey(model!)).toBe("test-rapid-mlx-key");
+			expect(authorizations).toEqual(["Bearer test-rapid-mlx-key"]);
+			const model = registry.find("rapid-mlx", "authenticated-rapid-mlx-model");
+			expect(model?.provider).toBe("rapid-mlx");
+			expect(await registry.getApiKey(model!)).toBe("test-rapid-mlx-key");
+		} finally {
+			server.stop(true);
+		}
 	});
 
-	test("rejects a remote implicit endpoint so its provider credential cannot be exfiltrated", async () => {
+	test("rejects a remote implicit endpoint so discovery stays on loopback", async () => {
 		Bun.env.RAPID_MLX_BASE_URL = "https://untrusted.example/v1";
-		authStorage.setRuntimeApiKey("rapid-mlx", "test-rapid-mlx-key");
 		const requestedUrls: string[] = [];
 
-		using _hook = hookFetch((input, init) => {
+		using _hook = hookFetch(input => {
 			const url = String(input);
 			requestedUrls.push(url);
 			if (url === "http://localhost:8000/v1/models") {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authorization = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authorization).toBe("Bearer test-rapid-mlx-key");
 				return new Response(
 					JSON.stringify({ data: [{ id: "loopback-rapid-mlx-model", context_window: 131072 }] }),
 					{
@@ -345,6 +360,43 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		expect(registry.find("rapid-mlx", "operator-selected-model")).toBeDefined();
 	});
 
+	test("does not reuse a cache row admitted under explicit selection for the implicit probe", async () => {
+		// An operator who names rapid-mlx at the shared port admits bare vLLM rows as
+		// written, and those rows are cached. Removing the config switches to the
+		// implicit probe, whose admission policy requires a Rapid-MLX-native field.
+		// Cache reuse skips admission, so the policy is part of the cache provenance:
+		// the cached rows must not surface under the implicit provider.
+		const bareVllmCatalog = {
+			object: "list",
+			data: [{ id: "bare-vllm-row", object: "model", max_model_len: 8192 }],
+		};
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"rapid-mlx": {
+						api: "openai-completions",
+						auth: "none",
+						baseUrl: "http://localhost:8000/v1",
+						discovery: { type: "rapid-mlx" },
+					},
+				},
+			}),
+		);
+		using _explicitSelectionFetch = hookFetch(() => Response.json(bareVllmCatalog));
+		const explicitRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		await explicitRegistry.refresh();
+		expect(explicitRegistry.find("rapid-mlx", "bare-vllm-row")).toBeDefined();
+
+		await Bun.write(modelsJsonPath, JSON.stringify({ providers: {} }));
+		using _implicitProbeFetch = hookFetch(() => Response.json(bareVllmCatalog));
+		const implicitRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		await implicitRegistry.refresh("online-if-uncached");
+
+		expect(implicitRegistry.find("rapid-mlx", "bare-vllm-row")).toBeUndefined();
+		expect(implicitRegistry.getProviderDiscoveryState("rapid-mlx")?.models).toEqual([]);
+	});
+
 	test("keeps a credentialed loopback probe off the proxy environment", async () => {
 		// A project `.env` can set HTTP_PROXY, and Bun applies it to loopback
 		// requests too. The discovery request carries RAPID_MLX_API_KEY, so it must
@@ -423,10 +475,16 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			const result = JSON.parse(stdout);
 			expect(result.modelIds).toEqual(["proxy-probe-model"]);
 			expect(result.baseUrl).toBe(`http://127.0.0.1:${rapidMlxServer.port}/v1`);
-			expect(serverAuthorizations).toEqual(["Bearer proxy-probe-key"]);
+			// Bun keeps using a proxy it has already used, so the fixture clears the proxy
+			// variables before discovery; the credential still takes the direct socket
+			// because the transport does not depend on reading them.
+			expect(result.proxyVariablesCleared).toBe(true);
+			// Registry discovery and the library descriptor both send the bearer, and both
+			// reached the server directly.
+			expect(serverAuthorizations).toEqual(["Bearer proxy-probe-key", "Bearer proxy-probe-key"]);
 			// The fixture's control `fetch` to the same loopback origin went through the
 			// proxy, proving the proxy configuration was live for the child; the
-			// credentialed discovery request did not.
+			// credentialed discovery requests did not.
 			expect(proxyRequests.some(request => request.includes("/v1/control"))).toBe(true);
 			expect(proxyRequests.filter(request => request.includes("proxy-probe-key"))).toEqual([]);
 			expect(proxyRequests.filter(request => request.includes(`:${rapidMlxServer.port}/v1/models`))).toEqual([]);

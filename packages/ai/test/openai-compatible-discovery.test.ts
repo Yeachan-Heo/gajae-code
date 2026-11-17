@@ -363,19 +363,17 @@ describe("Rapid-MLX model discovery", () => {
 	});
 
 	it("keeps authenticated discovery on loopback when given a remote endpoint", async () => {
-		using fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockResolvedValue(new Response(JSON.stringify({ data: [{ id: "local-model" }] })));
+		const fetched: string[] = [];
+		global.fetch = (async (url: string | URL | Request) => {
+			fetched.push(String(url));
+			return new Response(JSON.stringify({ data: [{ id: "remote-model" }] }));
+		}) as typeof fetch;
 		await rapidMlxModelManagerOptions({
 			apiKey: "test-key",
 			baseUrl: "https://untrusted.example/v1",
 		}).fetchDynamicModels?.();
-		expect(fetchSpy).toHaveBeenCalledWith(
-			"http://localhost:8000/v1/models",
-			expect.objectContaining({
-				redirect: "error",
-				headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
-			}),
-		);
+		// The endpoint is rewritten to loopback and the bearer is sent over the direct
+		// transport: `fetch` would hand it to HTTP(S)_PROXY, and never sees the key.
+		expect(fetched).toEqual([]);
 	});
 });

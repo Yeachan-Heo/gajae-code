@@ -50,4 +50,25 @@ describe("fetchLoopbackDirect", () => {
 		).rejects.toThrow();
 		expect(performance.now() - startedAt).toBeLessThan(2_000);
 	});
+
+	test("aborts while the response body is still streaming", async () => {
+		const server = serve(
+			() =>
+				new Response(
+					new ReadableStream({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('{"data":['));
+						},
+					}),
+					{ headers: { "content-type": "application/json" } },
+				),
+		);
+		const startedAt = performance.now();
+		await expect(
+			fetchLoopbackDirect(new URL(`http://127.0.0.1:${server.port}/v1/models`), {
+				signal: AbortSignal.timeout(250),
+			}),
+		).rejects.toThrow();
+		expect(performance.now() - startedAt).toBeLessThan(2_000);
+	});
 });

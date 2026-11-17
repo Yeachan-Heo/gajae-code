@@ -54,28 +54,40 @@ function isLoopbackHost(hostname: string): boolean {
 	return isIpv6Loopback || isIpv4MappedLoopback;
 }
 
-/**
- * Environment proxy variables Bun's `fetch` applies to every request,
- * loopback included. It resolves them once per process and exposes no
- * per-request bypass. Same key set as
- * `coding-agent/src/web/insane/url-guard.ts` so the web-fetch guard and local
- * discovery agree on what counts as a configured proxy.
- */
-const PROXY_ENV_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
-
-/** True when an environment proxy is configured, so `fetch` would route through it. */
-export function hasConfiguredProxyEnv(env: Record<string, string | undefined> = process.env): boolean {
-	return PROXY_ENV_KEYS.some(key => Boolean(env[key]));
-}
-
 export interface LoopbackDirectFetchInit {
 	headers?: Record<string, string>;
 	signal?: AbortSignal;
 }
 
-async function resolveLoopbackAddresses(hostname: string): Promise<string[]> {
-	const records = await dns.lookup(hostname, { all: true, verbatim: true });
-	const addresses = records.map(record => record.address).filter(address => isLoopbackHost(address));
+/** Sockets may report an IPv4-mapped IPv6 peer as `::ffff:127.0.0.1`; fold it back to IPv4. */
+function normalizeSocketAddress(address: string): string {
+	const normalized = address.toLowerCase();
+	if (!normalized.startsWith("::ffff:")) return normalized;
+	const tail = normalized.slice("::ffff:".length);
+	return net.isIP(tail) === 4 ? tail : normalized;
+}
+
+async function resolveLoopbackAddresses(hostname: string, signal?: AbortSignal): Promise<string[]> {
+	if (signal?.aborted) throw signal.reason;
+	const lookup = dns.lookup(hostname, { all: true, verbatim: true });
+	let records: Awaited<typeof lookup>;
+	if (signal) {
+		const aborted = Promise.withResolvers<never>();
+		const onAbort = () => aborted.reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			records = await Promise.race([lookup, aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+			// A losing lookup must not surface as an unhandled rejection.
+			lookup.catch(() => undefined);
+		}
+	} else {
+		records = await lookup;
+	}
+	const addresses = records
+		.map(record => record.address)
+		.filter(address => isLoopbackHost(normalizeSocketAddress(address)));
 	if (addresses.length === 0) {
 		throw new Error("Loopback discovery host did not resolve to a loopback address");
 	}
@@ -94,11 +106,11 @@ function toResponseHeaders(headers: http.IncomingHttpHeaders): Headers {
 /**
  * GET a loopback discovery endpoint over a direct socket.
  *
- * Used instead of `fetch` when an environment proxy is configured: Bun applies
- * `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to loopback requests too, so a
- * credentialed probe issued through `fetch` would hand its `Authorization`
- * header to whatever proxy a project `.env` or the process environment named.
- * The DNS lookup and the connected peer are pinned to loopback addresses, TLS
+ * Credentialed loopback discovery must never go through `fetch`: Bun applies
+ * `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to loopback requests, caches that
+ * configuration per process, and offers no per-request bypass, so no check of
+ * `process.env` at request time can prove where the request would go. The DNS
+ * lookup and the connected peer are pinned to loopback addresses, TLS
  * verification stays on, and redirects are never followed (the caller sees the
  * 3xx status, matching the `redirect: "error"` refusal of the `fetch` path).
  */
@@ -110,7 +122,7 @@ export async function fetchLoopbackDirect(url: URL, init: LoopbackDirectFetchIni
 	if (!isLoopbackHost(hostname)) {
 		throw new Error("Loopback discovery transport requires a loopback host");
 	}
-	const addresses = net.isIP(hostname) ? [hostname] : await resolveLoopbackAddresses(hostname);
+	const addresses = net.isIP(hostname) ? [hostname] : await resolveLoopbackAddresses(hostname, init.signal);
 	const approved = addresses.map(address => ({ address, family: net.isIP(address) }));
 	const lookup: net.LookupFunction = (requestedHostname, lookupOptions, callback) => {
 		if (requestedHostname.replace(/^\[|\]$/g, "").toLowerCase() !== hostname.toLowerCase()) {
@@ -150,7 +162,7 @@ export async function fetchLoopbackDirect(url: URL, init: LoopbackDirectFetchIni
 		request.end();
 	});
 	const peer = response.socket.remoteAddress;
-	if (peer === undefined || !isLoopbackHost(peer)) {
+	if (peer === undefined || !isLoopbackHost(normalizeSocketAddress(peer))) {
 		response.destroy();
 		throw new Error("Loopback discovery peer was not a loopback address");
 	}

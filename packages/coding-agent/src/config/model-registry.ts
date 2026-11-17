@@ -85,7 +85,6 @@ import {
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import { writeExplicitOwnerOnlyTextSync } from "../session/session-storage";
-import { hasConfiguredProxy } from "../web/insane/url-guard";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type BillingPath, deriveBillingPath } from "./billing-path";
 import { ConfigError, ConfigFile, type LoadResult } from "./config-file";
@@ -1360,6 +1359,8 @@ interface DiscoveryProviderConfig {
 	cacheRetention?: CacheRetention;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
+	/** Set only by the registry's own implicit local probes, never by models.json. */
+	implicitProbe?: boolean;
 }
 
 const REUSABLE_DISCOVERY_HEADER_NAMES = new Set([
@@ -1379,6 +1380,21 @@ function isSensitiveDiscoveryHeader(name: string): boolean {
 	// Unknown headers fail closed because their semantics cannot be inferred from
 	// their names (for example, CF-Access-Jwt-Assertion carries a credential).
 	return !REUSABLE_DISCOVERY_HEADER_NAMES.has(name.toLowerCase());
+}
+
+/**
+ * Whether this Rapid-MLX probe describes an endpoint the operator selected or
+ * one the registry volunteered to probe.
+ *
+ * The implicit probe requires a Rapid-MLX-native field before publishing a row,
+ * while an explicit `discovery.type: rapid-mlx` entry is trusted as written. The
+ * admission policy is part of the cache provenance below: a row admitted under
+ * one policy (notably bare vLLM rows admitted by an operator's explicit
+ * selection) must not be reused by the other, because cache reuse skips the
+ * admission check entirely.
+ */
+function rapidMlxAdmissionPolicy(providerConfig: DiscoveryProviderConfig): "identity-required" | "operator-selected" {
+	return providerConfig.implicitProbe === true ? "identity-required" : "operator-selected";
 }
 
 /**
@@ -1421,6 +1437,12 @@ function fingerprintConfiguredDiscoveryRequestShape(
 			: {}),
 		...(providerConfig.discovery.inputModalities
 			? { inputModalities: [...providerConfig.discovery.inputModalities].sort() }
+			: {}),
+		// Rapid-MLX publication depends on the admission policy above; keep it in
+		// the key so a cache written under one policy is not reusable under the
+		// other without re-running admission.
+		...(providerConfig.discovery.type === "rapid-mlx"
+			? { rapidMlxAdmission: rapidMlxAdmissionPolicy(providerConfig) }
 			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
@@ -4130,6 +4152,7 @@ export class ModelRegistry {
 				baseUrl: Bun.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434",
 				discovery: { type: "ollama" },
 				optional: true,
+				implicitProbe: true,
 			});
 			// Implicit Ollama auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("ollama");
@@ -4142,6 +4165,7 @@ export class ModelRegistry {
 				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
 				discovery: { type: "llama.cpp" },
 				optional: true,
+				implicitProbe: true,
 			});
 			// Implicit llama.cpp auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("llama.cpp");
@@ -4154,6 +4178,7 @@ export class ModelRegistry {
 				baseUrl: Bun.env.LM_STUDIO_BASE_URL || "http://127.0.0.1:1234/v1",
 				discovery: { type: "lm-studio" },
 				optional: true,
+				implicitProbe: true,
 			});
 			// Implicit LM Studio auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("lm-studio");
@@ -4166,6 +4191,7 @@ export class ModelRegistry {
 				baseUrl: resolveLoopbackOpenAIBaseUrl(Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1"),
 				discovery: { type: "omlx" },
 				optional: true,
+				implicitProbe: true,
 			});
 			// Implicit oMLX auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("omlx");
@@ -4178,6 +4204,7 @@ export class ModelRegistry {
 				baseUrl: resolveProviderBaseUrlFromEnv("rapid-mlx") ?? "http://localhost:8000/v1",
 				discovery: { type: "rapid-mlx" },
 				optional: true,
+				implicitProbe: true,
 			});
 			// Implicit Rapid-MLX auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("rapid-mlx");
@@ -6169,19 +6196,24 @@ export class ModelRegistry {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
+		const loopbackDiscovery = resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 		const hardenedLocalDiscovery =
 			(providerConfig.discovery.type === "rapid-mlx" ||
 				providerConfig.discovery.type === "vllm" ||
 				providerConfig.discovery.type === "sglang") &&
-			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
+			loopbackDiscovery;
 		const signal = AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS);
-		// `fetch` routes loopback requests through HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
-		// when they are set — including by a project `.env` — which would hand
-		// this request's Authorization header to that proxy. A loopback discovery
-		// request therefore goes over a direct socket. Same rule the public-fetch
-		// guard (web/insane/url-guard.ts) applies by refusing proxy routing.
+		// A credentialed probe of a local endpoint the user did not configure must
+		// not go through `fetch`: Bun applies HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to
+		// loopback requests — including a proxy a project `.env` declared — caches
+		// that decision per process, and offers no per-request bypass, so only a
+		// direct socket proves the Authorization header cannot reach a proxy.
+		// Other explicitly configured providers keep their existing transport; the
+		// Rapid-MLX provider is covered even when named in models.json.
 		const response =
-			hardenedLocalDiscovery && hasConfiguredProxy(process.env)
+			(providerConfig.implicitProbe === true || providerConfig.provider === "rapid-mlx") &&
+			loopbackDiscovery &&
+			headerValue(requestHeaders, "Authorization") !== undefined
 				? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
 				: await fetch(modelsUrl, {
 						headers: requestHeaders,
@@ -6228,7 +6260,7 @@ export class ModelRegistry {
 			// models.json is an explicit selection and is trusted as written.
 			if (
 				providerConfig.discovery.type === "rapid-mlx" &&
-				providerConfig.optional === true &&
+				rapidMlxAdmissionPolicy(providerConfig) === "identity-required" &&
 				!isRapidMlxDiscoveryRecord(item)
 			) {
 				continue;
