@@ -354,22 +354,28 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				if (command !== false) text = command.prompt;
 			}
 			submittedPrompt = true;
+			// Track the last message before prompt to detect if anything changed.
+			// If nothing was added (e.g., command handled without appending messages),
+			// the last message will be the same, and we won't capture a user message.
+			const lastMessageBefore = session.state.messages[session.state.messages.length - 1];
 			lastPromptMessageStart = session.state.messages.length;
 			await session.prompt(text, images ? { images } : undefined);
 			// Capture the user message that was just added, for compaction-robust turn tracking.
-			// Search backward for a user message, but only capture it if it's part of the current turn
-			// (verified by the presence of an assistant message after it).
-			// This prevents capturing historical messages when no new user message is added
-			// (e.g., when a slash command is handled without appending messages).
-			for (let i = session.state.messages.length - 1; i >= 0; i--) {
-				if (session.state.messages[i]?.role === "user") {
-					// Verify this user message is part of the current turn by checking for a following assistant message
-					const hasFollowingAssistant = session.state.messages.some(
-						(msg, idx) => idx > i && msg.role === "assistant",
-					);
-					if (hasFollowingAssistant) {
-						lastPromptUserMessage = session.state.messages[i];
-						break;
+			// Only capture if the last message changed (indicating messages were added/modified).
+			// This prevents capturing historical messages when no new user message is added.
+			const currentLastMessage = session.state.messages[session.state.messages.length - 1];
+			if (currentLastMessage !== lastMessageBefore) {
+				// Messages were added in this turn. Search backward for a user message with a following assistant.
+				for (let i = session.state.messages.length - 1; i >= 0; i--) {
+					if (session.state.messages[i]?.role === "user") {
+						// Verify this user message has a following assistant message in this turn
+						const hasFollowingAssistant = session.state.messages.some(
+							(msg, idx) => idx > i && msg.role === "assistant",
+						);
+						if (hasFollowingAssistant) {
+							lastPromptUserMessage = session.state.messages[i];
+							break;
+						}
 					}
 				}
 			}
@@ -399,8 +405,8 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			}
 		}
 
-		// In text mode, output final response.
-		if (mode === "text" && (!consumedCommand || submittedPrompt)) {
+		// In text mode, output final response (unless terminal indicates failure).
+		if (mode === "text" && (!consumedCommand || submittedPrompt) && terminal?.status !== "failure") {
 			const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
 			if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;

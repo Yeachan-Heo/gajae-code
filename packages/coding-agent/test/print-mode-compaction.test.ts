@@ -101,7 +101,7 @@ describe("Print mode with message compaction", () => {
 						"content" in m &&
 						Array.isArray(m.content) &&
 						m.content[0]?.type === "text" &&
-						(m.content[0] as any).text === "test prompt",
+						(m.content[0] as { type: "text"; text: string }).text === "test prompt",
 				);
 
 				if (userIndex > 0) {
@@ -254,43 +254,48 @@ describe("Print mode with message compaction", () => {
 	});
 
 	it("does not falsely report success when a slash command is handled without adding messages", async () => {
-		// Regression for probepark's finding: a resumed session with a historical assistant message
+		// Regression for issue #7841: a resumed session with a historical assistant message
 		// receives a command that is handled without adding new messages (e.g., /help).
-		// The resolver should report failure (empty_response), not reuse the historical message.
+		// The backward scan should NOT capture the historical message, and the resolver
+		// should report failure (empty_response), not falsely reuse the historical response.
 		const messages: Message[] = [
 			makeUserMessage("previous turn"),
 			makeAssistantMessage({ content: [{ type: "text", text: "previous response" }] }),
 		];
 
-		const session = createMockSession({
-			messages,
-			onPrompt: () => {
+		// Create a mock session that handles commands without adding messages
+		const session = {
+			configWarnings: [],
+			state: { messages },
+			model: undefined,
+			autoCompactionEnabled: false,
+			sessionManager: {
+				getHeader: () => undefined,
+				getCwd: () => import.meta.dir,
+			},
+			setSlashCommands: () => {},
+			extensionRunner: undefined,
+			subscribe: () => () => {},
+			prompt: async (_text: string) => {
 				// Simulate a handled slash command: prompt returns without adding messages
 				// (simulating the early return in AgentSession.#promptInternal for extension/command handlers)
+				// A command like "/help" or other extension command returns without modifying the messages array
 			},
-		});
-
-		// Create a mock session that supports the slash-command consumption path
-		const originalSession = session as any;
-		originalSession.sessionManager.getCwd = () => import.meta.dir;
+			dispose: async () => {},
+		} as unknown as AgentSession;
 
 		const stderrOutput: string[] = [];
+		const stdoutOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock(stdoutOutput);
 
-		// Test the resolver directly with the historical message scenario
-		const indexBeforeTurn = messages.length;
+		// Run print mode, which will execute the backward scan logic
+		await runPrintMode(session, { mode: "text", initialMessage: "/help" });
 
-		const disposition = resolvePrintTerminalDisposition(
-			messages,
-			true, // submittedPrompt
-			indexBeforeTurn,
-			undefined, // lastPromptUserMessage = undefined because no new user message was added
-		);
-
-		// Should report failure because no assistant response was generated for this turn
-		expect(disposition).toEqual({
-			status: "failure",
-			error: { code: "empty_response", message: "Turn completed without assistant text." },
-		});
+		// Should report failure (empty_response), not reuse the historical response
+		expect(stderrOutput.join("")).toContain("Turn completed without assistant text");
+		expect(process.exitCode).toBe(1);
+		// Should NOT contain the previous response
+		expect(stdoutOutput.join("")).not.toContain("previous response");
 	});
 });
