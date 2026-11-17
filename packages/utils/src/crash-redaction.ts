@@ -10,7 +10,15 @@
 const PEM_BEGIN = "-----BEGIN ";
 const PEM_END = "-----END ";
 const PEM_LABEL = "PRIVATE KEY-----";
-const PEM_MARKER = "«redacted-private-key»";
+
+/** Marker substituted for a complete private-key block. */
+export const PRIVATE_KEY_REDACTION_MARKER = "«redacted-private-key»";
+
+/** Half-open range of one private-key block inside the scanned text. */
+export interface PrivateKeySpan {
+	readonly start: number;
+	readonly end: number;
+}
 
 /** Header or footer end, or -1. The type prefix is only A-Z, digits, and spaces, then the label. */
 function privateKeyMarkerEnd(text: string, at: number, token: string): number {
@@ -29,12 +37,12 @@ function privateKeyMarkerEnd(text: string, at: number, token: string): number {
 }
 
 /**
- * Replace each complete private-key block in one forward pass.
- * An opening banner with no footer later in the text is left as-is, and the scan stops.
+ * Find each complete private-key block in one forward pass.
+ * An opening banner with no footer later in the text is left unmatched, and the
+ * scan stops: nothing after it can close the same block.
  */
-function redactPemPrivateKeys(text: string): string {
-	const parts: string[] = [];
-	let cursor = 0;
+export function findPrivateKeySpans(text: string): PrivateKeySpan[] {
+	const spans: PrivateKeySpan[] = [];
 	let i = 0;
 	while (i < text.length) {
 		const start = text.indexOf(PEM_BEGIN, i);
@@ -57,11 +65,22 @@ function redactPemPrivateKeys(text: string): string {
 			j = endAt + PEM_END.length;
 		}
 		if (footerEnd < 0) break;
-		parts.push(text.slice(cursor, start), PEM_MARKER);
-		cursor = footerEnd;
+		spans.push({ start, end: footerEnd });
 		i = footerEnd;
 	}
-	if (cursor === 0) return text;
+	return spans;
+}
+
+/** Replace each complete private-key block in one forward pass. */
+function redactPemPrivateKeys(text: string): string {
+	const spans = findPrivateKeySpans(text);
+	if (spans.length === 0) return text;
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const span of spans) {
+		parts.push(text.slice(cursor, span.start), PRIVATE_KEY_REDACTION_MARKER);
+		cursor = span.end;
+	}
 	parts.push(text.slice(cursor));
 	return parts.join("");
 }
@@ -313,15 +332,27 @@ export function isCredentialKey(key: string): boolean {
 	return isCredentialKeyWithRules(key, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
+/** Context the caller established for a value tree. */
+export interface StructuredRedactionOptions {
+	/**
+	 * Treat flat `[name, value, ...]` string arrays as header pairs. Only set this
+	 * where the collection is known to hold header names and values; an ordinary
+	 * argument array such as `["auth", "src"]` is not a header pair, and reading it
+	 * as one would replace an unrelated search target.
+	 */
+	readonly headerPairs?: boolean;
+}
+
 /**
  * Redact credential values in JSON-like data before serialization.
  * `key` lets callers preserve credential-field context when formatting one value.
  */
-export function redactStructuredSecrets(value: unknown, key?: string): unknown {
+export function redactStructuredSecrets(value: unknown, key?: string, options?: StructuredRedactionOptions): unknown {
 	if (key !== undefined && isCredentialKey(key)) return "«redacted»";
 	if (typeof value === "string") return redactCrashSecrets(value);
 	if (Array.isArray(value)) {
 		const isFlatKeyValueArray =
+			options?.headerPairs === true &&
 			value.length > 0 &&
 			value.length % 2 === 0 &&
 			value.every((item, index) => index % 2 === 1 || typeof item === "string");
@@ -331,10 +362,10 @@ export function redactStructuredSecrets(value: unknown, key?: string): unknown {
 					const field = value[index - 1];
 					if (typeof field === "string" && isCredentialKey(field)) return "«redacted»";
 				}
-				return redactStructuredSecrets(item);
+				return redactStructuredSecrets(item, undefined, options);
 			});
 		}
-		return value.map(item => redactStructuredSecrets(item));
+		return value.map(item => redactStructuredSecrets(item, undefined, options));
 	}
 	if (value === null || typeof value !== "object") return value;
 
@@ -360,7 +391,7 @@ export function redactStructuredSecrets(value: unknown, key?: string): unknown {
 			redacted[redactedKey] =
 				normalized === "values" && Array.isArray(headerValue) ? headerValue.map(() => "«redacted»") : "«redacted»";
 		} else {
-			redacted[redactedKey] = redactStructuredSecrets(source[field], field);
+			redacted[redactedKey] = redactStructuredSecrets(source[field], field, options);
 		}
 	}
 	return redacted;
@@ -603,6 +634,23 @@ function redactCredentialValue(
 	return `${prefix}«redacted»`;
 }
 
+/**
+ * Lookahead the nested-container scan may spend on one scrub call, in characters.
+ * Proportional to the input so ordinary text always receives a complete scan while
+ * repeated unterminated containers cannot force a quadratic rescan. Once spent,
+ * later containers are bounded to their own line — the treatment an unterminated
+ * container already receives.
+ */
+const CONTAINER_SCAN_BUDGET_FACTOR = 4;
+
+interface ContainerScanBudget {
+	remaining: number;
+}
+
+function createContainerScanBudget(length: number): ContainerScanBudget {
+	return { remaining: length * CONTAINER_SCAN_BUDGET_FACTOR + 1024 };
+}
+
 function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
 	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
@@ -614,12 +662,15 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
 }
 
 function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
+	const budget = createContainerScanBudget(text.length);
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
-		const containerEnd = findCredentialContainerEnd(text, containerStart);
+		const scan = findCredentialContainerEnd(text, containerStart, budget);
+		budget.remaining -= scan.scanned;
+		const containerEnd = scan.value;
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
 		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
 		const container = text.slice(containerStart, containerEnd);
@@ -640,21 +691,34 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 
 type EscapedQuoteDelimiter = { delimiter: "'" | '"' | "`"; backslashCount: number };
 
-function findCredentialContainerEnd(text: string, start: number): number {
-	const closing = [text[start] === "[" ? "]" : "}"];
-	const escapedQuoteDelimiter = findEscapedQuoteDelimiter(text, start);
+interface BoundedScan<T> {
+	readonly value: T;
+	/** Characters this call examined; charged against the caller's scan budget. */
+	readonly scanned: number;
+}
+
+function currentLineEnd(text: string, start: number): number {
 	const lineFeedIndex = text.indexOf("\n", start);
 	const carriageReturnIndex = text.indexOf("\r", start);
-	const unclosedEnd =
-		lineFeedIndex < 0
-			? carriageReturnIndex < 0
-				? text.length
-				: carriageReturnIndex
-			: carriageReturnIndex < 0
-				? lineFeedIndex
-				: Math.min(lineFeedIndex, carriageReturnIndex);
+	if (lineFeedIndex < 0) return carriageReturnIndex < 0 ? text.length : carriageReturnIndex;
+	return carriageReturnIndex < 0 ? lineFeedIndex : Math.min(lineFeedIndex, carriageReturnIndex);
+}
+
+/**
+ * End of the container that opens at `start`.
+ * The scan never looks past `start + budget.remaining`; once the budget is spent it
+ * stops at the current line, which is also where an unterminated container ends.
+ */
+function findCredentialContainerEnd(text: string, start: number, budget: ContainerScanBudget): BoundedScan<number> {
+	// An unterminated container ends at its own line end, and always consumes at least
+	// its opening character so the caller's scan position strictly advances.
+	const unclosedEnd = Math.min(text.length, Math.max(currentLineEnd(text, start), start + 1));
+	const limit = budget.remaining > 0 ? Math.min(text.length, start + budget.remaining) : unclosedEnd;
+	const delimiterScan = findEscapedQuoteDelimiter(text, start, limit);
+	const escapedQuoteDelimiter = delimiterScan.value;
+	const closing = [text[start] === "[" ? "]" : "}"];
 	let quote: "'" | '"' | "`" | undefined;
-	for (let index = start + 1; index < text.length; index++) {
+	for (let index = start + 1; index < limit; index++) {
 		const character = text[index] ?? "";
 		if (character === "\\") {
 			let backslashEnd = index;
@@ -687,15 +751,21 @@ function findCredentialContainerEnd(text: string, start: number): number {
 		else if (character === "{") closing.push("}");
 		else if (character === closing[closing.length - 1]) {
 			closing.pop();
-			if (closing.length === 0) return index + 1;
+			if (closing.length === 0) {
+				return { value: index + 1, scanned: delimiterScan.scanned + (index + 1 - start) };
+			}
 		}
 	}
-	return unclosedEnd;
+	return { value: unclosedEnd, scanned: delimiterScan.scanned + (limit - start) };
 }
 
-function findEscapedQuoteDelimiter(text: string, start: number): EscapedQuoteDelimiter | undefined {
+function findEscapedQuoteDelimiter(
+	text: string,
+	start: number,
+	limit: number,
+): BoundedScan<EscapedQuoteDelimiter | undefined> {
 	const closing = [text[start] === "[" ? "]" : "}"];
-	for (let index = start + 1; index < text.length; index++) {
+	for (let index = start + 1; index < limit; index++) {
 		const character = text[index] ?? "";
 		if (character === "\\") {
 			let backslashEnd = index;
@@ -703,20 +773,22 @@ function findEscapedQuoteDelimiter(text: string, start: number): EscapedQuoteDel
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
 			if ((nextCharacter === '"' || nextCharacter === "'" || nextCharacter === "`") && backslashCount % 2 === 1) {
-				return { delimiter: nextCharacter, backslashCount };
+				return { value: { delimiter: nextCharacter, backslashCount }, scanned: index + 1 - start };
 			}
 			index = nextCharacter !== undefined && backslashCount % 2 === 1 ? backslashEnd + 1 : backslashEnd;
 			continue;
 		}
-		if (character === '"' || character === "'" || character === "`") return undefined;
+		if (character === '"' || character === "'" || character === "`") {
+			return { value: undefined, scanned: index + 1 - start };
+		}
 		if (character === "[") closing.push("]");
 		else if (character === "{") closing.push("}");
 		else if (character === closing[closing.length - 1]) {
 			closing.pop();
-			if (closing.length === 0) return undefined;
+			if (closing.length === 0) return { value: undefined, scanned: index + 1 - start };
 		}
 	}
-	return undefined;
+	return { value: undefined, scanned: limit - start };
 }
 
 /** Every placeholder `redactCrashSecrets` can emit. Used by downstream normalizers. */
