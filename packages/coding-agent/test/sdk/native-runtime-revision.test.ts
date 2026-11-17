@@ -12,7 +12,7 @@ import {
 	prepareEmbeddedDisconnect,
 	terminateEmbeddedAgentSession,
 } from "../../src/sdk/native-embedding";
-import { invokeNativeRuntime } from "../../src/sdk/native-lifecycle";
+import { invokeNativeRuntime, NativeRuntimeRefusal } from "../../src/sdk/native-lifecycle";
 import { AuthStorage } from "../../src/session/auth-storage";
 
 type Opened = Extract<NativeEmbeddedOpenResult, { kind: "opened" }>;
@@ -139,19 +139,16 @@ describe("native runtime view transitions", () => {
 		await session.waitForIdle();
 	});
 
-	it("still fences a view transition performed outside its own admitted dispatch", async () => {
+	it("refuses a view transition attempted outside its own admitted dispatch", async () => {
 		const opened = await fixture();
 		const session = opened.result.session;
 		expect((await opened.runtime.prompt.prompt("first")).kind).toBe("applied");
 		await session.waitForIdle();
 
-		// A raw tree move is not this runtime's admitted work, so the binding must not
-		// re-pin to it: the next dispatch fails closed instead of adopting the new view.
-		await session.navigateTree(userEntries(session)[0]!.id);
+		// A raw tree move is not this runtime's admitted work: the entry point itself
+		// refuses, so nothing is adopted and the runtime stays coherent.
+		await expect(session.navigateTree(userEntries(session)[0]!.id)).rejects.toBeInstanceOf(NativeRuntimeRefusal);
+		expect((await opened.runtime.prompt.prompt("after refused navigation")).kind).toBe("applied");
 		await session.waitForIdle();
-
-		const refused = await opened.runtime.prompt.prompt("after raw navigation");
-		expect(refused.kind).toBe("refused");
-		if (refused.kind === "refused") expect(refused.reason).toBe("context_mismatch");
 	});
 });

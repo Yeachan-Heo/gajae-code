@@ -20461,6 +20461,7 @@ export class AgentSession {
 
 	/** Refresh the live registered-skill catalog after install/remove/reload. */
 	async reloadSkills(cwd = this.sessionManager.getCwd()): Promise<void> {
+		assertNativeRuntimeInvocation(this);
 		if (!this.#reloadSkills) return;
 		const reloaded = await this.#reloadSkills(cwd);
 		const previousSkills = this.#skills;
@@ -22267,6 +22268,7 @@ export class AgentSession {
 	 * A host retiring this session must abort signal synchronously before retirement.
 	 */
 	async generateAutoSessionTitle(text: string, options?: { signal?: AbortSignal }): Promise<AutoSessionTitleResult> {
+		assertNativeRuntimeInvocation(this);
 		const sharedPublication = this.#usesSharedSessionPublication();
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
@@ -22364,6 +22366,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+		assertNativeRuntimeInvocation(this);
 		if (!this.#usesSharedSessionPublication()) return this.sessionManager.setSessionName(name, source);
 		const manager = this.sessionManager;
 		const sessionId = manager.getSessionId();
@@ -33189,6 +33192,7 @@ export class AgentSession {
 	 * @returns true if retry/resume was initiated, false if no retryable tail exists or agent is busy
 	 */
 	async retry(): Promise<boolean> {
+		assertNativeRuntimeInvocation(this);
 		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
 		// A handoff transition owns the session; retrying would mutate the tail and
 		// schedule a continuation against the session being handed off.
@@ -35596,6 +35600,7 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		assertNativeRuntimeInvocation(this);
 		const previousSessionId = this.sessionId;
 		this.#beginSessionTransition("branch");
 		try {
@@ -36002,6 +36007,7 @@ export class AgentSession {
 			beforeExecutionCommit?: () => void;
 		} = {},
 	): Promise<TreeNavigationResult> {
+		assertNativeRuntimeInvocation(this);
 		return this.#navigateTree(targetId, options, true);
 	}
 
@@ -36010,6 +36016,7 @@ export class AgentSession {
 		targetId: string,
 		options: { beforeExecutionCommit?: () => void } = {},
 	): Promise<TreeNavigationResult> {
+		assertNativeRuntimeInvocation(this);
 		return this.#navigateTree(targetId, options, false);
 	}
 
