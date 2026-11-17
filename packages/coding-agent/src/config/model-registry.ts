@@ -5472,9 +5472,17 @@ export class ModelRegistry {
 						credentialSessionId,
 						refreshOAuth,
 					}));
+				// If configuration generation changed but we did NOT trigger an OAuth refresh,
+				// it means a concurrent unrelated credential change happened (not our refresh).
+				// If we did trigger an OAuth refresh, allow the generation bump caused by the refresh,
+				// which may occur for identity-less credentials. Use the post-refresh generation.
 				if (
 					configurationGeneration !==
-					this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
+						this.authStorage.getProviderConfigurationGeneration(
+							descriptor.providerId,
+							this.#authStorageConfigOwner,
+						) &&
+					!refreshOAuth
 				) {
 					return { apiKey: undefined, authGeneration: undefined };
 				}

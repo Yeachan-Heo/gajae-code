@@ -11259,6 +11259,78 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+
+		test("keeps discovered models when identity-less expired OAuth credential refreshes successfully", async () => {
+			// Regression: for an expired OAuth credential without a resolvable account identity,
+			// a successful getApiKey refresh bumps the provider auth generation because AuthStorage
+			// cannot classify it as identity-preserving rotation. The generation comparison was then
+			// discarding the refreshed discovery result. The fix captures generation after refresh
+			// and compares against post-refresh generation instead of comparing to pre-refresh.
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "refresh-token",
+					// Token is expired right now
+					expires: Date.now() - 1000,
+					// Identity-less: no email field to resolve account identity
+				},
+			]);
+
+			let discoveryFetches = 0;
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				// Simulate OAuth token refresh for identity-less credential.
+				// This will bump the configuration generation because there's no account identity.
+				await authStorage.set("google-antigravity", [
+					{
+						type: "oauth",
+						access: "refreshed-access",
+						refresh: "refresh-token",
+						// New token is fresh
+						expires: Date.now() + 60 * 60 * 1000,
+						// Still identity-less
+					},
+				]);
+				return "refreshed-access";
+			});
+
+			using _hook = hookFetch((input, _init) => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					return new Response(
+						JSON.stringify({
+							models: { "identity-less-discovered": { displayName: "Identity-less Discovery" } },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("google-antigravity", "online");
+
+				// Verify that getApiKey was called (meaning OAuth refresh was attempted)
+				expect(getApiKeySpy).toHaveBeenCalled();
+
+				// Verify that the discovery endpoint was called.
+				// Before the fix, this would be 0 because the generation comparison would fail
+				// and return undefined, skipping discovery.
+				expect(discoveryFetches).toBe(1);
+
+				// Verify that the discovered model is in the registry
+				const model = registry.find("google-antigravity", "identity-less-discovered");
+				expect(model).toBeDefined();
+				expect(model?.name).toContain("Identity-less Discovery");
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
 	});
 });
 
