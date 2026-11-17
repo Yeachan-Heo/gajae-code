@@ -3,9 +3,15 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
-import { oauthCredentialSchema, remoteOauthCredentialSchema } from "../src/auth-broker/wire-schemas";
+import {
+	oauthCredentialSchema,
+	remoteOauthCredentialSchema,
+	writableAuthCredentialSchema,
+} from "../src/auth-broker/wire-schemas";
 import {
 	AuthStorage,
+	isCanonicalMCPOAuthBinding,
+	isMCPOAuthBindingTransportAdmitted,
 	REMOTE_REFRESH_SENTINEL,
 	resolveMCPOAuthResourceOrigin,
 	resolveMCPOAuthTokenEndpoint,
@@ -353,6 +359,12 @@ describe("MCP OAuth token endpoint TLS", () => {
 		"http://192.0.0.11/token",
 		"http://attacker.example/token",
 		"http://10.0.0.1/token",
+		"http://0.0.0.0/token",
+		"http://169.254.169.254/token",
+		"http://[::ffff:a9fe:a9fe]/token",
+		"http://[::]/token",
+		"http://[::ffff:0:0]/token",
+		"http://[fe80::1]/token",
 	];
 	const httpsStillAllowed = [
 		"https://192.0.0.9/token",
@@ -366,10 +378,12 @@ describe("MCP OAuth token endpoint TLS", () => {
 	];
 	const loopbackStillAllowed = [
 		"http://127.0.0.1/token",
+		"http://127.0.0.2/token",
 		"http://localhost/token",
 		"http://localhost./token",
 		"http://[::1]/token",
 		"http://[::ffff:7f00:1]/token",
+		"http://[::ffff:127.0.0.2]/token",
 	];
 
 	async function refreshTokenEndpoint(
@@ -424,7 +438,7 @@ describe("MCP OAuth token endpoint TLS", () => {
 			expect(resolveMCPOAuthTokenEndpoint("http://[0:0:0:0:0:ffff:192.0.0.10]/token")).toBeUndefined();
 			const outcome = await refreshTokenEndpoint(tokenEndpoint);
 			expect(outcome.fetchedBody).toBeNull();
-			expect(outcome.error).toContain("Invalid MCP OAuth credential binding");
+			expect(outcome.error).toContain("cleartext HTTP is loopback-only");
 		}
 	});
 
@@ -453,14 +467,72 @@ describe("MCP OAuth token endpoint TLS", () => {
 		}
 		expect(resolveMCPOAuthResourceOrigin("http://192.0.0.9")).toBe("http://192.0.0.9");
 		expect(resolveMCPOAuthResourceOrigin("http://attacker.example")).toBe("http://attacker.example");
-		const credential = {
-			type: "oauth" as const,
-			access: "access",
-			refresh: "refresh",
-			expires: 0,
-			mcpBinding: { resourceOrigin: "https://mcp.example", tokenEndpoint: "http://192.0.0.9/token" },
-		};
-		expect(oauthCredentialSchema.safeParse(credential).success).toBe(false);
+	});
+
+	test("separates persisted wire shape from transport admission", () => {
+		const mcpBinding = { resourceOrigin: "https://mcp.example", tokenEndpoint: "http://192.0.0.9/token" };
+		const credential = { type: "oauth" as const, access: "access", refresh: "refresh", expires: 0, mcpBinding };
+		// A legacy row must keep decoding so one stale binding cannot invalidate a snapshot...
+		expect(isCanonicalMCPOAuthBinding(mcpBinding)).toBe(true);
+		expect(oauthCredentialSchema.safeParse(credential).success).toBe(true);
+		expect(remoteOauthCredentialSchema.safeParse({ ...credential, refresh: REMOTE_REFRESH_SENTINEL }).success).toBe(
+			true,
+		);
+		// ...while admission refuses to persist or use it in cleartext.
+		expect(isMCPOAuthBindingTransportAdmitted(mcpBinding)).toBe(false);
+		expect(writableAuthCredentialSchema.safeParse(credential).success).toBe(false);
+		expect(
+			writableAuthCredentialSchema.safeParse({
+				...credential,
+				mcpBinding: { resourceOrigin: "https://mcp.example", tokenEndpoint: "http://127.0.0.1:8765/token" },
+			}).success,
+		).toBe(true);
+	});
+
+	test("keeps an unrelated credential available when a legacy cleartext binding is persisted", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-oauth-mixed-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		store.replaceAuthCredentialsForProvider("mcp_oauth_legacy", [
+			{
+				type: "oauth",
+				access: "legacy-access",
+				refresh: "legacy-refresh",
+				expires: 0,
+				mcpBinding: { resourceOrigin: "https://legacy.example", tokenEndpoint: "http://192.0.0.9/token" },
+			},
+		]);
+		store.replaceAuthCredentialsForProvider("anthropic", [{ type: "api_key", key: "sk-live" }]);
+		const storage = new AuthStorage(store);
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		try {
+			await storage.reload();
+			// Initialization keeps the unrelated valid credential and still exposes the
+			// legacy row, so one stale binding does not invalidate credential state.
+			expect(storage.get("anthropic")).toEqual({ type: "api_key", key: "sk-live" });
+			expect(storage.get("mcp_oauth_legacy")?.type).toBe("oauth");
+
+			// The update path is unaffected by the legacy row.
+			await storage.set("anthropic", { type: "api_key", key: "sk-rotated" });
+			expect(storage.get("anthropic")).toEqual({ type: "api_key", key: "sk-rotated" });
+
+			// Using the legacy credential is refused before any token leaves the process.
+			const legacy = storage.get("mcp_oauth_legacy");
+			if (legacy?.type !== "oauth") throw new Error("expected OAuth credential");
+			await expect(
+				storage.forceRefreshOAuthCredential("mcp_oauth_legacy", legacy, {
+					clientId: "legacy-client",
+					clientSecret: "legacy-secret",
+				}),
+			).rejects.toThrow("cleartext HTTP is loopback-only");
+			expect(fetchSpy).not.toHaveBeenCalled();
+
+			// The valid credential stays available after the refusal.
+			expect(storage.get("anthropic")).toEqual({ type: "api_key", key: "sk-rotated" });
+		} finally {
+			fetchSpy.mockRestore();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("property: non-loopback token endpoints are https, fc.property seed 65827, numRuns 80", () => {

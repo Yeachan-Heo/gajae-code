@@ -10,7 +10,6 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
-import { isIP } from "node:net";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
 import { checkOpenCodexStatus } from "./providers/openai-opencodex-responses";
@@ -103,65 +102,32 @@ export function resolveMCPOAuthResourceOrigin(value: string): string | undefined
 	return resolveCanonicalHttpUrl(value)?.origin;
 }
 
-/** Dotted IPv4 embedded in an IPv4-mapped IPv6 address (::ffff:0:0/96). */
-function ipv4MappedAddress(hostname: string): string | undefined {
-	const bare = hostname
-		.toLowerCase()
-		.replace(/^\[|\]$/g, "")
-		.replace(/%.*$/, "");
-	if (isIP(bare) !== 6) return undefined;
-	const bytes = ipv6ToBytes(bare);
-	if (!bytes) return undefined;
-	for (let index = 0; index < 10; index++) {
-		if (bytes[index] !== 0) return undefined;
-	}
-	if (bytes[10] !== 0xff || bytes[11] !== 0xff) return undefined;
-	return `${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`;
-}
-
-function ipv6ToBytes(address: string): Uint8Array | undefined {
-	let normalized = address.toLowerCase();
-	const lastColon = normalized.lastIndexOf(":");
-	const tail = lastColon >= 0 ? normalized.slice(lastColon + 1) : "";
-	if (tail.includes(".")) {
-		const parts = tail.split(".").map(part => Number.parseInt(part, 10));
-		if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return undefined;
-		const hi = ((parts[0] << 8) | parts[1]).toString(16);
-		const lo = ((parts[2] << 8) | parts[3]).toString(16);
-		normalized = `${normalized.slice(0, lastColon + 1)}${hi}:${lo}`;
-	}
-	const halves = normalized.split("::");
-	if (halves.length > 2) return undefined;
-	const left = halves[0] ? halves[0].split(":") : [];
-	const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
-	const omitted = 8 - left.length - right.length;
-	if ((halves.length === 1 && omitted !== 0) || (halves.length === 2 && omitted < 1)) return undefined;
-	const words = [...left, ...Array.from({ length: omitted }, () => "0"), ...right];
-	if (words.length !== 8 || words.some(word => !/^[0-9a-f]{1,4}$/.test(word))) return undefined;
-	const bytes = new Uint8Array(16);
-	for (let index = 0; index < words.length; index++) {
-		const word = Number.parseInt(words[index] ?? "0", 16);
-		bytes[index * 2] = word >> 8;
-		bytes[index * 2 + 1] = word & 0xff;
-	}
-	return bytes;
-}
-
 /**
- * Cleartext token traffic has no remote observer only on loopback.
- * Non-loopback hosts, including special-purpose addresses and their
- * IPv4-mapped forms, are not a cleartext exception.
+ * Cleartext token traffic has no remote observer only on loopback. Special-purpose
+ * and every other non-loopback address are not a cleartext exception.
+ *
+ * `URL` serializes every IPv4-mapped IPv6 literal as `[::ffff:<hi>:<lo>]`, so that
+ * single shape is the only mapped form that can reach this predicate; an
+ * unnormalized mapped literal fails closed instead of being read as dotted IPv4.
  */
 function cleartextTokenEndpointAllowed(hostname: string): boolean {
 	const normalized = hostname
 		.toLowerCase()
 		.replace(/^\[|\]$/g, "")
-		.replace(/\.$/, "");
+		.replace(/\.+$/, "");
 	if (isLoopbackHostname(normalized)) return true;
-	const mapped = ipv4MappedAddress(normalized);
-	return mapped !== undefined && isLoopbackHostname(mapped);
+	const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(normalized);
+	if (!mapped) return false;
+	const high = Number.parseInt(mapped[1] ?? "", 16);
+	const low = Number.parseInt(mapped[2] ?? "", 16);
+	return isLoopbackHostname(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
 }
 
+/**
+ * Canonical token endpoint with the cleartext policy applied. Configuration and
+ * every token-use boundary admit only this shape; see
+ * {@link isMCPOAuthBindingTransportAdmitted} for the binding form.
+ */
 export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined {
 	const url = resolveCanonicalHttpUrl(value);
 	if (!url) return undefined;
@@ -169,18 +135,41 @@ export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined 
 	return url.href;
 }
 
+/**
+ * Persisted wire shape only: canonical http(s) URLs, no credentials, no fragment.
+ *
+ * A row written before the cleartext policy existed may carry a non-loopback HTTP
+ * token endpoint. Decoding must still accept its shape so one such row cannot
+ * invalidate the whole persisted or broker snapshot; the cleartext policy is
+ * applied separately at every token-use boundary.
+ */
 export function isCanonicalMCPOAuthBinding(binding: MCPOAuthBinding): boolean {
 	return (
 		resolveMCPOAuthResourceOrigin(binding.resourceOrigin) === binding.resourceOrigin &&
+		resolveCanonicalHttpUrl(binding.tokenEndpoint)?.href === binding.tokenEndpoint
+	);
+}
+
+/**
+ * Transport admission: the persisted wire shape plus the cleartext policy. A
+ * binding that fails here must never receive a refresh token, client secret, or
+ * authorization code, and must never be dispatched to an MCP server.
+ */
+export function isMCPOAuthBindingTransportAdmitted(binding: MCPOAuthBinding): boolean {
+	return (
+		isCanonicalMCPOAuthBinding(binding) &&
 		resolveMCPOAuthTokenEndpoint(binding.tokenEndpoint) === binding.tokenEndpoint
 	);
 }
 
-export function assertCanonicalMCPOAuthBinding(
+export function assertMCPOAuthBindingTransportAdmitted(
 	binding: MCPOAuthBinding | undefined,
 ): asserts binding is MCPOAuthBinding {
 	if (!binding || !isCanonicalMCPOAuthBinding(binding)) {
 		throw new Error("Invalid MCP OAuth credential binding");
+	}
+	if (!isMCPOAuthBindingTransportAdmitted(binding)) {
+		throw new Error("MCP OAuth token endpoint refused: cleartext HTTP is loopback-only");
 	}
 }
 
@@ -217,7 +206,7 @@ async function refreshBoundMCPOAuthCredential(
 	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	const binding = credential.mcpBinding;
-	assertCanonicalMCPOAuthBinding(binding);
+	assertMCPOAuthBindingTransportAdmitted(binding);
 	const params = new URLSearchParams({
 		grant_type: "refresh_token",
 		refresh_token: credential.refresh,
@@ -7797,7 +7786,7 @@ export class AuthStorage {
 			if (target.credential.mcpBinding && remoteRefresh) {
 				// Remote (broker) stores refresh MCP-bound rows server-side; the
 				// server runs the guarded local path against its own row.
-				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
 				const refreshedCredential = await remoteRefresh(id, stale, mcpClient, signal);
 				if (
 					refreshedCredential.mcpBinding?.resourceOrigin !== target.credential.mcpBinding.resourceOrigin ||
@@ -7813,7 +7802,7 @@ export class AuthStorage {
 				// stale-snapshot guard, memo recording, and failure provenance.
 				// The outer #oauthRefreshInFlight map already single-flights
 				// concurrent public force callers per row.
-				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
 				refreshed = await this.#refreshOAuthCredentialUnshared(
 					provider as Provider,
 					stale,

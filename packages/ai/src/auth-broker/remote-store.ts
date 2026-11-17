@@ -18,7 +18,7 @@ import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
 	type AuthCredentialStore,
-	assertCanonicalMCPOAuthBinding,
+	assertMCPOAuthBindingTransportAdmitted,
 	type CachedCredentialHealth,
 	type CachedUsagePresentation,
 	type CredentialDispatchTicket,
@@ -1151,8 +1151,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (accepted?.credential.type !== "oauth") {
 			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
-		assertCanonicalMCPOAuthBinding(credential.mcpBinding);
-		assertCanonicalMCPOAuthBinding(accepted.credential.mcpBinding);
+		assertMCPOAuthBindingTransportAdmitted(credential.mcpBinding);
+		assertMCPOAuthBindingTransportAdmitted(accepted.credential.mcpBinding);
 		if (
 			accepted.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
 			accepted.credential.mcpBinding.tokenEndpoint !== credential.mcpBinding.tokenEndpoint
