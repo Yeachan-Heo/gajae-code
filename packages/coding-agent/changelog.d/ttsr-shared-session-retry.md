@@ -1,0 +1,4 @@
+### Fixed
+
+- A TTSR interrupt in a shared session now retries the turn with its reminder instead of leaving the turn aborted with "TTSR recovery was refused because this session entered shared mode". The reminder is saved through the shared session path before the retry changes live history; if that save is refused, the retry continues with the reminder in memory and shows a warning.
+- A TTSR retry that is aborted or disposed while its reminder is being saved no longer changes live history or claims the rule, and per-tool reminders it carried become eligible again. A newer prompt or interrupt that arrives meanwhile keeps its own TTSR state. A reminder already saved before the cancel stays in the transcript, but its rules are not marked as injected.

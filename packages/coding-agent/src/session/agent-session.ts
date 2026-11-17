@@ -10859,8 +10859,12 @@ export class AgentSession {
 	#getTtsrInjectionContent(): { content: string; rules: Rule[] } | undefined {
 		if (this.#pendingTtsrInjections.length === 0) return undefined;
 		const rules = this.#pendingTtsrInjections;
-		const content = rules.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r))).join("\n\n");
 		this.#pendingTtsrInjections = [];
+		return this.#renderTtsrInjection(rules);
+	}
+
+	#renderTtsrInjection(rules: Rule[]): { content: string; rules: Rule[] } {
+		const content = rules.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r))).join("\n\n");
 		return { content, rules };
 	}
 
@@ -11180,13 +11184,12 @@ export class AgentSession {
 		// late cleanup can only end the request it was scheduled for, never a newer admission's.
 		const recapRequest = this.#recapRequest;
 		this.#schedulePostPromptTask(
-			async () => {
+			async signal => {
 				if (this.#ttsrRetryToken !== retryToken) {
 					// A newer interrupt owns the resume (and the same request); leave the request to it.
 					this.#resolveTtsrResume();
 					return;
 				}
-				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
 				if (!this.#ttsrAbortPending || this.#promptGeneration !== generation) {
 					this.#ttsrAbortPending = false;
 					this.#pendingTtsrInjections = [];
@@ -11195,38 +11198,89 @@ export class AgentSession {
 					this.#endSessionRecapRequestIf(recapRequest);
 					return;
 				}
-				try {
-					this.sessionManager.assertLegacyMutationAllowed("resume TTSR");
-				} catch (error) {
-					if (!(error instanceof SharedSessionMutationUnsupportedError)) throw error;
-					this.#releasePerToolTtsrInjections();
-					this.#pendingTtsrInjections = [];
-					this.#ttsrAbortPending = false;
-					this.#resolveTtsrResume();
-					this.#endSessionRecapRequestIf(recapRequest);
-					this.emitNotice(
-						"warning",
-						"TTSR recovery was refused because this session entered shared mode. The interrupted turn remains aborted; no retry was started.",
-						"ttsr",
-					);
-					return;
-				}
 				// Reminders bucketed onto tool calls that never produced a delivered
 				// result (blocked, aborted, or not started) are already claimed; carry
-				// them into the retry injection, whose delivery re-marks them.
-				for (const rules of this.#perToolTtsrInjections.values()) this.#addPendingTtsrInjections(rules);
-				for (const { rules } of this.#perToolTtsrFolded.values()) this.#addPendingTtsrInjections(rules);
+				// them into the retry injection, whose delivery re-marks them. The per-tool
+				// maps hold their rollback records, so they are only cleared once the retry
+				// is committed below; a cancelled publication still releases those claims.
+				const carried = [...this.#pendingTtsrInjections];
+				const carriedNames = new Set(carried.map(rule => rule.name));
+				const carry = (rules: Rule[]) => {
+					for (const rule of rules) {
+						if (carriedNames.has(rule.name)) continue;
+						carried.push(rule);
+						carriedNames.add(rule.name);
+					}
+				};
+				for (const rules of this.#perToolTtsrInjections.values()) carry(rules);
+				for (const { rules } of this.#perToolTtsrFolded.values()) carry(rules);
+				// Identity snapshot of the buckets this retry owns, so a cancelled publication
+				// releases only them and never a newer prompt's claim on a reused tool call id.
+				const ownedBuckets = new Map<string, unknown[]>();
+				for (const map of [this.#perToolTtsrInjections, this.#perToolTtsrFolded, this.#perToolTtsrClaims]) {
+					for (const [id, bucket] of map) ownedBuckets.set(id, [...(ownedBuckets.get(id) ?? []), bucket]);
+				}
+				const injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
+				const details = injection ? { rules: injection.rules.map(rule => rule.name) } : undefined;
+				if (injection && details) {
+					// Persist before any live mutation. A shared session refuses the legacy append,
+					// so publish through the admitted path like other in-turn custom messages
+					// (#7815). The retry carries the reminder live, so a refused record only warns.
+					try {
+						await this.#appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
+					} catch (error) {
+						logger.warn("TTSR injection message could not be persisted", {
+							rules: details.rules,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						this.emitNotice(
+							"warning",
+							"TTSR reminder could not be saved to the session transcript; retrying with it in memory only.",
+							"ttsr",
+						);
+					}
+				}
+				// The publication awaited: an abort, dispose, or newer prompt/interrupt may have
+				// landed meanwhile. A newer interrupt owns the resume; leave everything to it.
+				if (this.#ttsrRetryToken !== retryToken) return;
+				if (
+					signal.aborted ||
+					this.#isDisposed ||
+					!this.#ttsrAbortPending ||
+					this.#promptGeneration !== generation
+				) {
+					this.#ttsrAbortPending = false;
+					// A newer prompt owns the pending and per-tool state; the abort that preceded
+					// it already released this retry's claims. Same generation: release only the
+					// buckets this retry captured, still identical, and drop only its carried rules.
+					if (this.#promptGeneration === generation) {
+						this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
+						for (const [id, buckets] of ownedBuckets) {
+							const live = [
+								this.#perToolTtsrInjections.get(id),
+								this.#perToolTtsrFolded.get(id),
+								this.#perToolTtsrClaims.get(id),
+							];
+							if (live.some(bucket => bucket !== undefined && buckets.includes(bucket)))
+								this.#releasePerToolTtsrInjections(id);
+						}
+					}
+					this.#resolveTtsrResume();
+					this.#endSessionRecapRequestIf(recapRequest);
+					return;
+				}
+				// Committed to the retry: the carried rules leave their pending and per-tool buckets.
+				this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
 				this.#perToolTtsrInjections.clear();
 				this.#perToolTtsrFolded.clear();
 				this.#perToolTtsrClaims.clear();
+				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
 				if (this.#ttsrManager?.getSettings().contextMode === "discard" && targetAssistantIndex !== -1) {
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
 						historyRewrite: { reason: "retry", preserveSeededPrefix: true },
 					});
 				}
-				const injection = this.#getTtsrInjectionContent();
-				if (injection) {
-					const details = { rules: injection.rules.map(rule => rule.name) };
+				if (injection && details) {
 					this.agent.appendMessage({
 						role: "custom",
 						customType: "ttsr-injection",
@@ -11236,28 +11290,25 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					this.sessionManager.appendCustomMessageEntry(
-						"ttsr-injection",
-						injection.content,
-						false,
-						details,
-						"agent",
-					);
 					this.#markTtsrInjected(details.rules);
 				}
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
 					generation,
+					// Owner-guarded like the outer onSkip: a newer interrupt may own the resume.
 					shouldContinue: () => {
+						if (this.#ttsrRetryToken !== retryToken) return false;
 						this.#ttsrAbortPending = false;
 						return true;
 					},
 					onSkip: () => {
+						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					onError: () => {
+						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
