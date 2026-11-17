@@ -779,6 +779,13 @@ interface PendingWritethrough {
 	dst: string;
 	content: string;
 	file?: BunFile;
+	/**
+	 * The binding of the writethrough that staged this entry. A batch can hold
+	 * entries from different callbacks, so authority is per entry: flushing with
+	 * the first seeder's binding would publish another session's write against
+	 * the wrong local root.
+	 */
+	getLocalProtocolOptions?: () => LocalProtocolOptions | undefined;
 }
 
 interface LspWritethroughBatchRequest {
@@ -1079,7 +1086,18 @@ async function flushWritethroughBatch(
 				onDeferredDiagnostics: bundle.onDeferredDiagnostics,
 				signal: bundle.signal,
 			} as const);
-		const diag = await runLspWritethrough(entry.dst, entry.content, cwd, options, signal, entry.file, deferredInner);
+		const diag = await runLspWritethrough(
+			entry.dst,
+			entry.content,
+			cwd,
+			{
+				...options,
+				getLocalProtocolOptions: entry.getLocalProtocolOptions,
+			},
+			signal,
+			entry.file,
+			deferredInner,
+		);
 		bundle?.finalize(diag);
 		results.push(diag);
 	}
@@ -1119,7 +1137,7 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		}
 
 		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
-		state.entries.set(dst, { dst, content, file });
+		state.entries.set(dst, { dst, content, file, getLocalProtocolOptions: resolvedOptions.getLocalProtocolOptions });
 
 		if (!batch.flush) {
 			await writethroughNoop(
@@ -1129,7 +1147,7 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 				file,
 				undefined,
 				undefined,
-				state.options.getLocalProtocolOptions,
+				resolvedOptions.getLocalProtocolOptions,
 			);
 			return undefined;
 		}
