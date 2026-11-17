@@ -24424,6 +24424,9 @@ export class AgentSession {
 		identity?: string,
 		explicitHead = true,
 	): void {
+		// The legacy chain append is refused on a shared session; refuse at this seam so
+		// no caller mistakes it for a writable path (shared callers use the control form).
+		this.assertConfiguredModelChainWritable();
 		this.sessionManager.appendConfiguredModelChain({
 			role,
 			entries: [...entries],
@@ -25327,6 +25330,9 @@ export class AgentSession {
 		prepared: PreparedProfileModelSelection,
 		onThinkingLevelApplied?: (mutationRevision: number) => void,
 	): void {
+		// Refuse before the live model changes: the legacy append below cannot record it on
+		// a shared session, whose profile activation publishes through its own control.
+		this.sessionManager.assertLegacyAppendAllowed("commit profile model selection");
 		this.#assertPreparedProfileModelSelectionCurrent(prepared);
 		this.#setModelAuthoritatively(prepared.model, "profile-activation");
 		this.#syncAppendOnlyContext(prepared.model);
