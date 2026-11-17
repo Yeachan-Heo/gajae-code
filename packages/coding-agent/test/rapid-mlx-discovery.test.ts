@@ -390,9 +390,26 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 
 		await Bun.write(modelsJsonPath, JSON.stringify({ providers: {} }));
 		using _implicitProbeFetch = hookFetch(() => Response.json(bareVllmCatalog));
-		// Both cache-consuming strategies: the row was written under the operator
-		// policy, so neither reuse-online nor the offline cache path may publish it.
+		// Both cache-consuming strategies read the row the operator selection wrote,
+		// not a row rewritten by an earlier iteration, so each strategy is tested
+		// against the foreign-policy cache independently.
+		const cacheDirectory = path.dirname(modelsJsonPath);
+		const cacheSnapshot = new Map<string, Uint8Array>();
+		for (const name of await fs.readdir(cacheDirectory)) {
+			if (!name.startsWith("models.db")) continue;
+			cacheSnapshot.set(name, new Uint8Array(await Bun.file(path.join(cacheDirectory, name)).arrayBuffer()));
+		}
+		expect(cacheSnapshot.size).toBeGreaterThan(0);
+		const restoreCacheSnapshot = async () => {
+			for (const name of await fs.readdir(cacheDirectory)) {
+				if (name.startsWith("models.db") && !cacheSnapshot.has(name)) {
+					await fs.rm(path.join(cacheDirectory, name), { force: true });
+				}
+			}
+			for (const [name, bytes] of cacheSnapshot) await Bun.write(path.join(cacheDirectory, name), bytes);
+		};
 		for (const strategy of ["online-if-uncached", "offline"] as const) {
+			await restoreCacheSnapshot();
 			const implicitRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			await implicitRegistry.refresh(strategy);
 			expect({
@@ -407,18 +424,35 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			});
 		}
 
-		// Control: the same offline cache path does publish a row that was cached under
-		// the implicit policy, so the empty results above come from the policy boundary
-		// and not from the offline path ignoring the cache entirely.
+		// Control: the offline cache path itself still serves a rapid-mlx row when the
+		// admission policy does not require wire-only evidence. An explicit selection
+		// is trusted as written, so its cached row survives an offline refresh; the
+		// empty results above are the implicit policy boundary, not an inert path.
 		using _nativeRowFetch = hookFetch(() =>
 			Response.json({ object: "list", data: [{ id: "native-row", context_window: 131072 }] }),
 		);
-		const onlineImplicitRegistry = new ModelRegistry(authStorage, modelsJsonPath);
-		await onlineImplicitRegistry.refresh("online");
-		expect(onlineImplicitRegistry.find("rapid-mlx", "native-row")).toBeDefined();
-		const offlineImplicitRegistry = new ModelRegistry(authStorage, modelsJsonPath);
-		await offlineImplicitRegistry.refresh("offline");
-		expect(offlineImplicitRegistry.find("rapid-mlx", "native-row")).toBeDefined();
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"rapid-mlx": {
+						api: "openai-completions",
+						auth: "none",
+						baseUrl: "http://localhost:8000/v1",
+						discovery: { type: "rapid-mlx" },
+					},
+				},
+			}),
+		);
+		for (const name of await fs.readdir(cacheDirectory)) {
+			if (name.startsWith("models.db")) await fs.rm(path.join(cacheDirectory, name), { force: true });
+		}
+		const explicitOnlineRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		await explicitOnlineRegistry.refresh("online");
+		expect(explicitOnlineRegistry.find("rapid-mlx", "native-row")).toBeDefined();
+		const explicitOfflineRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		await explicitOfflineRegistry.refresh("offline");
+		expect(explicitOfflineRegistry.find("rapid-mlx", "native-row")).toBeDefined();
 	});
 
 	test("keeps a credentialed loopback probe off the proxy environment", async () => {
