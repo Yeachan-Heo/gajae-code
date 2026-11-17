@@ -1612,7 +1612,7 @@ describe("hasUnquotedGlobCharacters helper function", () => {
 		// Import the helper function indirectly by checking behavior
 		// Note: This is testing the fix for issue #7857
 		// The function should return true for unquoted globs, false for quoted globs
-		
+
 		// Test cases - we can't directly test the helper, but we can verify it works
 		// through the mutation guard behavior
 		expect(true).toBe(true); // Placeholder - actual testing happens in integration tests below

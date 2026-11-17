@@ -2216,7 +2216,11 @@ function collectInterpreterOneLinerWrites(
 					// `words[index]` for unquoted glob characters, not the dequoted `flagWord`, so that quoted
 					// globs like `--require="[a-z]"` are treated as literal strings, not glob patterns.
 					const originalWord = words[index] ?? part;
-					if (flagWord.startsWith("-") || hasUnquotedGlobCharacters(originalWord) || shellWordHasExpansion(originalWord)) {
+					if (
+						flagWord.startsWith("-") ||
+						hasUnquotedGlobCharacters(originalWord) ||
+						shellWordHasExpansion(originalWord)
+					) {
 						sawUnmodeledOption = true;
 					}
 					continue;
