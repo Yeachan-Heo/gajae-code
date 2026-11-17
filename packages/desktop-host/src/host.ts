@@ -29,6 +29,7 @@ import {
 	type InputEventResult,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
+	resolveEmbeddedResumeCheckpoint,
 	resolveManagedSessionScope,
 	restoreSessionView,
 	type SdkComposerCompletionResult,
@@ -1459,9 +1460,16 @@ export class DesktopHost {
 			ownedFiles.add(file);
 		};
 		try {
+			// Fork exactly the flushed live view, never an inferred physical tail. The SDK
+			// refuses with stale_snapshot if the transcript changes after this capture.
+			const resolved = resolveEmbeddedResumeCheckpoint(sourceFile);
+			if (resolved.kind !== "resolved" || resolved.checkpoint.kind === "invalid")
+				throw new Error("Session transcript cannot be forked");
+			assertSource();
 			manager = await forkEmbeddedSession({
 				file: sourceFile,
 				cwd: project.path,
+				selection: { snapshotDigest: resolved.checkpoint.snapshotDigest, targetLeafId: source.getLeafId() },
 				...(live.metadata.scope === "managed"
 					? { agentDir: this.agentDir, managed: true as const }
 					: { directory }),

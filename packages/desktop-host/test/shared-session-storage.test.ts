@@ -9,14 +9,15 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
-	captureSessionView,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
+	captureSessionView,
 	createAgentSession,
 	getSessionMessageEntryId,
 	restoreSessionView,
 	type SdkSessionView,
 } from "@gajae-code/coding-agent/sdk";
+import { RESUME_CURSOR_CUSTOM_TYPE } from "@gajae-code/coding-agent/session/resume-cursor";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
@@ -182,6 +183,19 @@ async function controlledFixture(handler?: () => Promise<void>) {
 	return { ...h, project, session, sdk, model, lastUser };
 }
 
+/**
+ * Native revision selection durably pins the exact answered tip with a resume cursor
+ * child, so the restored view is that cursor rather than an inferred physical tail.
+ */
+function expectSelectedTip(session: { sessionManager: SessionManager }, view: SdkSessionView, tip: SdkSessionView) {
+	expect(view.sessionId).toBe(tip.sessionId);
+	if (view.leafEntryId === tip.leafEntryId) return;
+	const entry = view.leafEntryId ? session.sessionManager.getEntry(view.leafEntryId) : undefined;
+	expect(entry?.type).toBe("custom");
+	expect(entry?.type === "custom" ? entry.customType : undefined).toBe(RESUME_CURSOR_CUSTOM_TYPE);
+	expect(entry?.parentId).toBe(tip.leafEntryId);
+}
+
 /** The terminal's own resume path, used here as the other surface of the shared store. */
 async function resumeAsTerminal(file: string, cwd: string, agentDir: string) {
 	return SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
@@ -209,23 +223,26 @@ test("exact old, revised and continued views survive fresh host and SDK owners w
 
 	// The old branch is not the last physical branch in the JSONL file.
 	await h.call("session.revision", { sessionId, entryId: original });
-	expect((await readCatalog(h.dataDir)).sessions[0]?.view).toEqual(oldView);
+	const selectedOld = captureSessionView(h.sdk());
+	expectSelectedTip(h.sdk(), selectedOld, oldView);
+	expect((await readCatalog(h.dataDir)).sessions[0]?.view).toEqual(selectedOld);
 	const retired = h.sdk();
 	await h.restart();
 	await h.call("session.select", { sessionId });
 	expect(retired.isDisposed).toBe(true);
 	expect(h.sdk()).not.toBe(retired);
-	expect(captureSessionView(h.sdk())).toEqual(oldView);
+	expect(captureSessionView(h.sdk())).toEqual(selectedOld);
 	const oldHistory = await h.call<DesktopHistory>("history.get", { sessionId });
 	expect(JSON.stringify(oldHistory.messages)).toContain("original continuation");
 	expect(JSON.stringify(oldHistory.messages)).not.toContain("revised prompt");
 	expect(h.model.calls).toHaveLength(calls);
 
 	await h.call("session.revision", { sessionId, entryId: revised });
-	expect(captureSessionView(h.sdk())).toEqual(continuedView);
+	const selectedContinued = captureSessionView(h.sdk());
+	expectSelectedTip(h.sdk(), selectedContinued, continuedView);
 	await h.restart();
 	await h.call("session.select", { sessionId });
-	expect(captureSessionView(h.sdk())).toEqual(continuedView);
+	expect(captureSessionView(h.sdk())).toEqual(selectedContinued);
 	const continuedHistory = await h.call<DesktopHistory>("history.get", { sessionId });
 	expect(JSON.stringify(continuedHistory.messages)).toContain("revised continuation");
 	expect(JSON.stringify(continuedHistory.messages)).not.toContain("original continuation");
@@ -235,6 +252,7 @@ test("exact old, revised and continued views survive fresh host and SDK owners w
 	await h.call("prompt", { sessionId, text: "new settled continuation" });
 	const latest = captureSessionView(h.sdk());
 	expect(latest).not.toEqual(continuedView);
+	expect(latest).not.toEqual(selectedContinued);
 	expect(latest).not.toEqual(revisedView);
 	expect((await readCatalog(h.dataDir)).sessions[0]?.view).toEqual(latest);
 	const callsAfterContinuation = h.model.calls.length;
@@ -384,7 +402,10 @@ test("persisted view shape and catalog or actual SDK identity mismatches are rej
 		{ ...saved, authority: true },
 		{ ...saved, sessionId: crypto.randomUUID() },
 	]) {
-		await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify({ ...catalog, sessions: [{ ...row, view }] }));
+		await Bun.write(
+			path.join(h.dataDir, "catalog.json"),
+			JSON.stringify({ ...catalog, sessions: [{ ...row, view }] }),
+		);
 		await expect(h.restart()).rejects.toThrow();
 		const persisted = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
 		expect(persisted.sessions[0].view).toEqual(view);
