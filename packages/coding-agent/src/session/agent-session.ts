@@ -4860,6 +4860,11 @@ export class AgentSession {
 	 * it had none), restored if the reminder is never delivered.
 	 */
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
+	/**
+	 * Settled per-tool reminders from tool results that completed before the TTSR retry.
+	 * Keyed by tool call id: { rules, reminderText }. Cleared after extraction into the retry injection.
+	 */
+	#settledToolTtsrReminders = new Map<string, { rules: Rule[]; reminderText: string }>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -11006,6 +11011,11 @@ export class AgentSession {
 			if (!this.#ttsrAbortPending) this.#releasePerToolTtsrInjections(message.toolCallId);
 			return;
 		}
+		// Store the settled reminder so it can be extracted into a retry injection if needed (#7838).
+		this.#settledToolTtsrReminders.set(message.toolCallId, {
+			rules: folded.rules,
+			reminderText: folded.block.text,
+		});
 		this.#perToolTtsrFolded.delete(message.toolCallId);
 		this.#perToolTtsrClaims.delete(message.toolCallId);
 		// The TTSR manager was already claimed at bucket time; only persistence remains.
@@ -11064,8 +11074,19 @@ export class AgentSession {
 			}
 		}
 		if (reconciledRuleNames.size > 0) {
-			// Mark the rules as injected based on custom messages in the history
-			this.#ttsrManager.markInjectedByNames(Array.from(reconciledRuleNames));
+			// Only reconcile rules without restored records to preserve checkpoint timestamps (#7838).
+			// Rules that were restored from session state have exact per-rule ttsr_injection records
+			// with computed after-gap checkpoints; re-marking them resets the checkpoint, suppressing
+			// legitimate future injections. Only mark rules found in the message history that don't
+			// yet have a record, allowing the fallback for genuinely missing markers.
+			const existingRecords = new Set<string>();
+			for (const record of this.#ttsrManager.getInjectedRecords()) {
+				existingRecords.add(record.name);
+			}
+			const namesToReconcile = Array.from(reconciledRuleNames).filter(name => !existingRecords.has(name));
+			if (namesToReconcile.length > 0) {
+				this.#ttsrManager.markInjectedByNames(namesToReconcile);
+			}
 		}
 	}
 
@@ -11282,8 +11303,16 @@ export class AgentSession {
 					this.#promptGeneration !== generation
 				) {
 					this.#ttsrAbortPending = false;
-					// Known limit: a reminder saved above stays in the transcript (append-only) without a
-					// ttsr_injection record, so a resumed session sees it and the rule can be injected again.
+					// If the shared append succeeded but abort invalidated the retry, still reconcile the
+					// committed reminder to prevent the rule from suppressing another interrupt while the
+					// reminder already exists in the transcript (#7838).
+					if (publicationFailure === undefined && injection && details) {
+						// The append committed; mark rules as consumed even though abort prevents full retry setup.
+						// A stale/rejected publication lets us retry in memory; a committed append requires
+						// marking to suppress repeat-gap intervals, but we do not persist a marker since the
+						// session may be reopened without the in-memory appended message.
+						this.#markTtsrInjected(details.rules, false);
+					}
 					// A newer prompt owns the pending and per-tool state; the abort that preceded
 					// it already released this retry's claims. Same generation: release only the
 					// buckets this retry captured, still identical, and drop only its carried rules.
@@ -11374,11 +11403,25 @@ export class AgentSession {
 				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
 				// Extract TTSR reminders from discarded messages before truncating them.
 				// In a shared-concurrency batch, one tool can emit a folded reminder before another tool
-				// triggers an AST interrupt. Settlement removes it from pending/folded, but it's still present
-				// in the assistant message as a custom ttsr-injection. With contextMode=discard, we must preserve
-				// these settled reminders by extracting them before truncation (#7838).
+				// triggers an AST interrupt. Settlement removes it from pending/folded, but settled reminders
+				// must be preserved when discarding context. Extract both custom messages and settled per-tool
+				// reminders to avoid losing the reminder while its rule remains consumed (#7838).
 				if (this.#ttsrManager?.getSettings().contextMode === "discard" && targetAssistantIndex !== -1) {
 					const discardedContent: string[] = [];
+					const settledRules: Rule[] = [];
+					
+					// Extract settled per-tool reminders that were delivered but are now being discarded
+					for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
+						for (const rule of rules) {
+							if (!carriedNames.has(rule.name)) {
+								carriedNames.add(rule.name);
+								settledRules.push(rule);
+							}
+						}
+						discardedContent.push(reminderText);
+					}
+					
+					// Extract custom ttsr-injection messages from the assistant message history
 					for (let i = targetAssistantIndex; i < this.agent.state.messages.length; i++) {
 						const msg = this.agent.state.messages[i];
 						if (msg.role === "custom" && msg.customType === "ttsr-injection") {
@@ -11393,16 +11436,31 @@ export class AgentSession {
 							}
 						}
 					}
-					// Augment injection content with reminders that were settled but discarded
-					if (discardedContent.length > 0 && injection) {
-						injection = {
-							...injection,
-							content: injection.content + "\n\n" + discardedContent.join("\n\n"),
-						};
+					
+					// Create or augment injection with discarded reminders
+					if (discardedContent.length > 0) {
+						if (injection) {
+							// Augment existing injection with settled reminders
+							injection = {
+								...injection,
+								content: injection.content + "\n\n" + discardedContent.join("\n\n"),
+							};
+						} else if (settledRules.length > 0) {
+							// Create new injection from settled reminders only
+							injection = {
+								content: discardedContent.join("\n\n"),
+								rules: settledRules,
+							};
+							details = { rules: settledRules.map(rule => rule.name) };
+						}
 					}
+					
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
 						historyRewrite: { reason: "retry", preserveSeededPrefix: true },
 					});
+					
+					// Clear settled reminders after extraction
+					this.#settledToolTtsrReminders.clear();
 				}
 				if (injection && details) {
 					this.agent.appendMessage({

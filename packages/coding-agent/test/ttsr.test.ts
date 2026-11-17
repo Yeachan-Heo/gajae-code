@@ -1370,13 +1370,14 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			await published.promise;
 			await Bun.sleep(0);
 			await target.session.waitForIdle();
-			// The stale task neither mutates live history nor claims the rule nor calls the model.
+			// The retry does not run, but the committed reminder is reconciled to prevent
+			// duplicate interrupts while the rule remains in the transcript (#7838).
 			expect(
 				target.session.agent.state.messages.some(
 					message => message.role === "custom" && message.customType === "ttsr-injection",
 				),
 			).toBe(false);
-			expect(target.ttsrManager.getInjectedRuleNames()).toEqual([]);
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
 			expect(target.modelMessages).toHaveLength(1);
 			expect(target.session.isTtsrAbortPending).toBe(false);
 			expect(target.session.isStreaming).toBe(false);
@@ -2533,9 +2534,11 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			await published.promise;
 			await Bun.sleep(0);
 			await target.session.waitForIdle();
-			// No retry ran and the undelivered sibling reminder is matchable again.
+			// No retry ran, but the committed reminder is reconciled to prevent duplicate interrupts (#7838).
+			// Both carried rules (main and sibling) are marked in memory to suppress repeat-gap intervals,
+			// but neither is persisted since the full retry setup was aborted before in-memory append.
 			expect(target.modelMessages).toHaveLength(1);
-			expect(target.ttsrManager.getInjectedRuleNames()).toEqual([]);
+			expect(target.ttsrManager.getInjectedRuleNames().sort()).toEqual(["named-exports", "sibling"]);
 			expect(injectedNames(target.session)).not.toContain("sibling");
 			expect(target.session.isTtsrAbortPending).toBe(false);
 		} finally {
