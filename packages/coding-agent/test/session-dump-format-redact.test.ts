@@ -169,6 +169,119 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(XMLValidator.validate(`<dump>${dumped}</dump>`)).toBe(true);
 	});
 
+	it("removes a private-key block whose footer sits under a credential-named argument", () => {
+		const body = "MIIEowIBAAKCAQEAxGZ0001";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-credential-named-footer",
+						name: "request",
+						arguments: {
+							body: `${pem("RSA", "BEGIN")}\n${body}`,
+							private_key: pem("RSA", "END"),
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		expect(XMLValidator.validate(`<dump>${dumped}</dump>`)).toBe(true);
+	});
+
+	it("keeps parameter markup out of the credential scrubber", () => {
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-tag-boundary",
+						name: "bash",
+						arguments: { command: "export PASSWORD=opaque-secret-value", note: "keep-note" },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain("export PASSWORD=«redacted»");
+		expect(dumped).toContain('<parameter name="note">keep-note</parameter>');
+		expect(dumped).not.toContain("opaque-secret-value");
+		expect(XMLValidator.validate(`<dump>${dumped}</dump>`)).toBe(true);
+	});
+
+	it("keeps a credential-named tool parameter definition while masking its default", () => {
+		const defaultValue = "opaque-schema-default";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							token: { type: "string", minLength: 10, default: defaultValue },
+							publicFlag: { type: "boolean" },
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).toContain('"token"');
+		expect(dumped).toContain('"type": "string"');
+		expect(dumped).toContain('"minLength": 10');
+		expect(dumped).toContain('"default": "«redacted»"');
+		expect(dumped).toContain('"publicFlag"');
+		expect(dumped).toContain('"type": "boolean"');
+		expect(dumped).not.toContain(defaultValue);
+		expect(XMLValidator.validate(`<dump>${dumped}</dump>`)).toBe(true);
+	});
+
+	it("does not read an ordinary argument array as header pairs", () => {
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-search-paths",
+						name: "ast_grep",
+						arguments: { paths: ["auth", "src"] },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain('"auth"');
+		expect(dumped).toContain('"src"');
+	});
+
+	it("bounds unclosed credential containers in the session dump", () => {
+		const line = "secret={unclosed\n";
+		const measure = (lines: number): number => {
+			const started = performance.now();
+			const dumped = dump([{ role: "user", content: line.repeat(lines), timestamp: 1 }] as AgentMessage[]);
+			expect(dumped).toContain("«redacted»");
+			return performance.now() - started;
+		};
+		measure(1_000);
+		const small = measure(4_000);
+		const large = measure(16_000);
+		// Rescanning the remaining suffix per unclosed container grows with the square of the input;
+		// a work-bounded scan stays close to linear, so quadrupling the input must not cost 16x.
+		expect(large).toBeLessThan(small * 10 + 2_000);
+	});
+
 	it("keeps an ordinary sentence in the session dump", () => {
 		const sentence = "The ordinary sentence remains.";
 		const dumped = dump(

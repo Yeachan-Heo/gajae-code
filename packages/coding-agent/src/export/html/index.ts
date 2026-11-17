@@ -254,7 +254,8 @@ async function writeSessionHtml(
 }
 
 function sessionEmbedJson(value: unknown): string {
-	return JSON.stringify(redactStructuredSecrets(JSON.parse(JSON.stringify(value))));
+	// Session JSON carries MCP/HTTP header collections as flat name/value arrays.
+	return JSON.stringify(redactStructuredSecrets(JSON.parse(JSON.stringify(value)), undefined, { headerPairs: true }));
 }
 
 /** Export session to HTML using SessionManager and AgentState. */

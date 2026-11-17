@@ -4,7 +4,14 @@
 import type { AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
-import { redactCrashSecrets, redactStructuredSecrets } from "@gajae-code/utils";
+import {
+	findPrivateKeySpans,
+	isCredentialKey,
+	PRIVATE_KEY_REDACTION_MARKER,
+	type PrivateKeySpan,
+	redactCrashSecrets,
+	redactStructuredSecrets,
+} from "@gajae-code/utils";
 import { buildCacheEconomicsWarning, type CacheWarningBuildState } from "./cache-economics";
 import {
 	type BashExecutionMessage,
@@ -49,17 +56,6 @@ function stripTypeBoxFields(obj: unknown): unknown {
 	return obj;
 }
 
-function redactStringValues(value: unknown): unknown {
-	if (typeof value === "string") return redactCrashSecrets(value);
-	if (Array.isArray(value)) return value.map(redactStringValues);
-	if (value === null || typeof value !== "object") return value;
-	const redacted = Object.create(null) as Record<string, unknown>;
-	for (const [key, nested] of Object.entries(value)) {
-		redacted[key] = redactStringValues(nested);
-	}
-	return redacted;
-}
-
 function takeRedactedTextRun(parts: string[]): string | undefined {
 	if (parts.length === 0) return undefined;
 	const redacted = redactCrashSecrets(parts.join("\n"));
@@ -94,19 +90,122 @@ function decodeUnicodeEscapeText(input: string): string {
 		.replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => decodeCodePoint(hex));
 }
 
-function formatParameterValue(value: unknown): string {
-	const raw = typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
-	return escapeXmlText(decodeUnicodeEscapeText(raw));
+/** Redact the private-key blocks that a caller located in a wider source string. */
+function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]): string {
+	if (spans.length === 0) return text;
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const span of spans) {
+		parts.push(text.slice(cursor, span.start), PRIVATE_KEY_REDACTION_MARKER);
+		cursor = span.end;
+	}
+	parts.push(text.slice(cursor));
+	return parts.join("");
 }
 
-/** Serialize an object as XML parameter elements, one per key. */
-function formatArgsAsXml(args: Record<string, unknown>, indent = "\t", redactCredentialKeys = true): string {
+/**
+ * Locate private-key blocks that span sibling argument values.
+ * Fields are joined in output order without a separator so a banner split
+ * mid-token is still paired, and each block is mapped back to ranges of the
+ * original values. Detection happens before any field-level credential masking
+ * can remove one of the two banners.
+ */
+function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][] {
+	const offsets: number[] = [];
+	let joined = "";
+	for (const value of values) {
+		offsets.push(joined.length);
+		joined += value;
+	}
+	const spansByValue: PrivateKeySpan[][] = values.map(() => []);
+	for (const span of findPrivateKeySpans(joined)) {
+		for (let index = 0; index < values.length; index++) {
+			const valueEnd = offsets[index] + values[index].length;
+			const start = Math.max(span.start, offsets[index]) - offsets[index];
+			const end = Math.min(span.end, valueEnd) - offsets[index];
+			if (end > start) spansByValue[index].push({ start, end });
+		}
+	}
+	return spansByValue;
+}
+
+function serializeParameterValue(value: unknown): string {
+	return typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
+}
+
+/** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
+function formatArgumentText(value: unknown, key: string, spans: readonly PrivateKeySpan[]): string {
+	const spanned = typeof value === "string" ? redactPrivateKeyRanges(value, spans) : value;
+	const structured = redactStructuredSecrets(spanned, key, { headerPairs: false });
+	return escapeXmlText(redactCrashSecrets(decodeUnicodeEscapeText(serializeParameterValue(structured))));
+}
+
+/** Keywords whose value is one concrete literal, so a credential-named property's own data can be masked. */
+const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"]);
+
+/**
+ * Scrub a tool schema without destroying its definitions.
+ * Property names are schema structure, not credential assignments, so they stay
+ * readable; only string leaves and data-carrying keywords under a credential-named
+ * property are redacted. The whole schema is sanitized at once so a property map
+ * nested under `properties` keeps its property names as context.
+ */
+function redactSchemaValue(value: unknown, propertyName?: string): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (Array.isArray(value)) return value.map(item => redactSchemaValue(item, propertyName));
+	if (value === null || typeof value !== "object") return value;
+
+	const source = value as Record<string, unknown>;
+	const redacted = Object.create(null) as Record<string, unknown>;
+	for (const [field, nested] of Object.entries(source)) {
+		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+			const properties = Object.create(null) as Record<string, unknown>;
+			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
+				properties[name] = redactSchemaValue(schema, name);
+			}
+			redacted[field] = properties;
+			continue;
+		}
+		if (propertyName !== undefined && SCHEMA_VALUE_KEYWORDS.has(field) && isCredentialKey(propertyName)) {
+			redacted[field] = Array.isArray(nested) ? nested.map(() => "«redacted»") : "«redacted»";
+			continue;
+		}
+		redacted[field] = redactSchemaValue(nested, propertyName);
+	}
+	return redacted;
+}
+
+/** Text of one already-sanitized schema value: decoded, then escaped for XML. */
+function formatSchemaText(value: unknown): string {
+	return escapeXmlText(decodeUnicodeEscapeText(serializeParameterValue(value)));
+}
+
+/**
+ * Serialize an object as XML parameter elements, one per key.
+ * The generated `<parameter>` markup is never passed through the text scrubber:
+ * a value ending in `KEY=<placeholder>` must not consume the closing tag, and a
+ * private-key block spanning two values is redacted inside those values so each
+ * parameter keeps its own identity.
+ */
+function formatArgsAsXml(
+	args: Record<string, unknown>,
+	mode: "arguments" | "schema" = "arguments",
+	indent = "\t",
+): string {
+	const entries = Object.entries(args).filter(([key]) => key !== INTENT_FIELD);
+	const spansByEntry =
+		mode === "arguments"
+			? crossFieldPrivateKeySpans(entries.map(([, value]) => (typeof value === "string" ? value : "")))
+			: undefined;
+	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
 	const parts: string[] = [];
-	for (const [key, value] of Object.entries(args)) {
-		if (key === INTENT_FIELD) continue;
+	for (let index = 0; index < entries.length; index++) {
+		const [key, value] = entries[index];
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
-		const safeValue = redactCredentialKeys ? redactStructuredSecrets(value, key) : redactStringValues(value);
-		const text = redactCrashSecrets(formatParameterValue(safeValue));
+		const text =
+			schema === undefined
+				? formatArgumentText(value, key, spansByEntry?.[index] ?? [])
+				: formatSchemaText(schema[key]);
 		if (text.includes("\n")) {
 			const indentedText = text
 				.split("\n")
@@ -117,7 +216,7 @@ function formatArgsAsXml(args: Record<string, unknown>, indent = "\t", redactCre
 			parts.push(`${indent}<parameter name="${escapedKey}">${text}</parameter>`);
 		}
 	}
-	return redactCrashSecrets(parts.join("\n"));
+	return parts.join("\n");
 }
 
 /**
@@ -157,7 +256,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			lines.push(`<tool name="${redactCrashSecrets(tool.name)}">`);
 			lines.push(redactCrashSecrets(tool.description));
 			const parametersClean = stripTypeBoxFields(tool.parameters);
-			lines.push(`\nParameters:\n${formatArgsAsXml(parametersClean as Record<string, unknown>, "\t", false)}`);
+			lines.push(`\nParameters:\n${formatArgsAsXml(parametersClean as Record<string, unknown>, "schema")}`);
 			lines.push("<" + "/tool>\n");
 		}
 		lines.push("\n");
@@ -204,7 +303,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 					if (redactedText !== undefined) lines.push(redactedText);
 					lines.push(`<invoke name="${redactCrashSecrets(c.name)}">`);
 					if (c.arguments && typeof c.arguments === "object") {
-						lines.push(formatArgsAsXml(c.arguments as Record<string, unknown>));
+						lines.push(formatArgsAsXml(c.arguments as Record<string, unknown>, "arguments"));
 					}
 					lines.push("<" + "/invoke>\n");
 				}
