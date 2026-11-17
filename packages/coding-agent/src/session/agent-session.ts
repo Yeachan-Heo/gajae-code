@@ -142,6 +142,7 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
+	type FallbackTrigger,
 	type FallbackTriggerClass,
 	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
@@ -149,10 +150,12 @@ import {
 } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import {
+	adoptNativeRuntimeSelection,
 	assertNativeDisposalAuthorized,
 	assertNativeRuntimeEffect,
 	assertNativeRuntimeInvocation,
 	NativeRuntimeRefusal,
+	noteNativeRuntimeViewTransition,
 	retainNativeRuntimeWork,
 	withNativeRuntimeEffect,
 } from "../sdk/native-lifecycle";
@@ -1640,6 +1643,15 @@ type RetryErrorClassification =
 	| "local_snapshot"
 	| "local_buffer_overflow"
 	| "unknown";
+
+/** Longest single pause while waiting for a provider's parallel-request slot. */
+const CONCURRENCY_WAIT_MAX_POLL_MS = 15_000;
+/**
+ * Minimum poll interval when Retry-After is 0, used to bound request volume.
+ * With a budget of 300,000ms (default), this 1000ms interval bounds requests to ~300,
+ * preventing unbounded polling when a provider returns Retry-After: 0.
+ */
+const CONCURRENCY_POLL_MIN_INTERVAL_MS = 1000;
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
@@ -4412,6 +4424,7 @@ export class AgentSession {
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
 		this.#managedFallbackProviderAttemptCount = 0;
+		this.#resetConcurrencyWait();
 		this.#managedFallbackTriedCredentialRows.clear();
 		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
 		this.#managedFallbackQuotaCeilingModels.clear();
@@ -4460,6 +4473,14 @@ export class AgentSession {
 	#providerRetryMaxAttempts: number | undefined;
 	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
+	/** First concurrency-saturation failure of the current request; bounds `fallback.concurrencyWaitMs`. */
+	#concurrencyWaitStartedAt: number | undefined;
+	/** Tracks poll attempts in concurrency wait; bounds requests independently of elapsed time. */
+	#concurrencyWaitPollCount = 0;
+	/** Set to selector when Retry-After exceeds remaining budget; prevents same-entry credential rotations. Scoped to originating entry. */
+	#concurrencyWaitRetryAfterExceededBudgetEntry: string | undefined = undefined;
+	/** Tracks absolute deadline per selector when poll ceiling reached with active Retry-After, preventing same-entry retries before deadline. */
+	#concurrencyWaitRetryAfterDeadlines = new Map<string, number>();
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -5410,6 +5431,7 @@ export class AgentSession {
 		if (!this.#sessionTransitionCommitted) {
 			this.#sessionTransitionCommitted = true;
 			this.#sessionTransitionGeneration += 1;
+			noteNativeRuntimeViewTransition(this);
 			this.#discoveredToolActivationChain = Promise.resolve();
 			if (this.#sessionTransitionKind !== "mcp-control") this.#btwGeneration += 1;
 		}
@@ -9634,6 +9656,7 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this.#providerRetryMaxAttempts = undefined;
 					this.#managedFallbackProviderAttemptCount = 0;
+					this.#resetConcurrencyWait();
 				}
 			}
 
@@ -20447,6 +20470,7 @@ export class AgentSession {
 
 	/** Refresh the live registered-skill catalog after install/remove/reload. */
 	async reloadSkills(cwd = this.sessionManager.getCwd()): Promise<void> {
+		assertNativeRuntimeInvocation(this);
 		if (!this.#reloadSkills) return;
 		const reloaded = await this.#reloadSkills(cwd);
 		const previousSkills = this.#skills;
@@ -22253,6 +22277,7 @@ export class AgentSession {
 	 * A host retiring this session must abort signal synchronously before retirement.
 	 */
 	async generateAutoSessionTitle(text: string, options?: { signal?: AbortSignal }): Promise<AutoSessionTitleResult> {
+		assertNativeRuntimeInvocation(this);
 		const sharedPublication = this.#usesSharedSessionPublication();
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
@@ -22350,6 +22375,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+		assertNativeRuntimeInvocation(this);
 		if (!this.#usesSharedSessionPublication()) return this.sessionManager.setSessionName(name, source);
 		const manager = this.sessionManager;
 		const sessionId = manager.getSessionId();
@@ -31476,6 +31502,89 @@ export class AgentSession {
 		};
 	}
 
+	#resetConcurrencyWait(): void {
+		this.#concurrencyWaitStartedAt = undefined;
+		this.#concurrencyWaitPollCount = 0;
+		this.#concurrencyWaitRetryAfterExceededBudgetEntry = undefined;
+		this.#concurrencyWaitRetryAfterDeadlines.clear();
+	}
+
+	/**
+	 * Delay before re-sending a request the provider refused for concurrency
+	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent,
+	 * poll count ceiling reached, and the failure must take the ordinary rate-limit path.
+	 * Also returns `undefined` when Retry-After exceeds the remaining budget, signaling
+	 * that the same entry should not be retried via credential rotation.
+	 */
+	#nextConcurrencyWaitMs(retryAfterMs: number | undefined, selector: string | undefined): number | undefined {
+		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
+		if (budgetMs <= 0) return undefined;
+		const now = Date.now();
+		this.#concurrencyWaitStartedAt ??= now;
+		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
+		if (remainingMs <= 0) {
+			// Record deadline on early exit when budget exhausted, before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// If the provider's Retry-After exceeds the remaining budget, mark the condition
+		// to prevent same-entry credential rotations (which would retry before deadline),
+		// and exit the concurrency wait to take the ordinary rate-limit path instead.
+		// This ensures we either advance to another entry or wait until budget expiry.
+		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
+			this.#concurrencyWaitRetryAfterExceededBudgetEntry = selector;
+			// Record deadline before no-poll return when budget would be exceeded.
+			if (selector !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// Bound poll count independently of elapsed time to prevent unbounded retries
+		// when Retry-After is zero or very small. The maximum poll attempts is determined
+		// by the budget divided by the minimum reasonable poll interval (1000ms).
+		// This prevents unbounded polling with tight intervals on a large budget (e.g., ~3000 requests with 100ms would fit 300s).
+		const maxPolls = Math.ceil(budgetMs / CONCURRENCY_POLL_MIN_INTERVAL_MS);
+		this.#concurrencyWaitPollCount++;
+		if (this.#concurrencyWaitPollCount > maxPolls) {
+			// Poll ceiling reached: if we have a Retry-After, track the absolute deadline per selector
+			// to prevent same-entry retries before the provider's deadline.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// A slot frees when any running request ends; poll with capped jitter so
+		// several waiting sessions do not retry in lockstep. Use explicit positive
+		// bounds independent of generic retry sentinels to avoid zero-delay bursts
+		// (when baseDelayMs is 0) or unbounded delays (when maxDelayMs is 0).
+		const minPollMs = CONCURRENCY_POLL_MIN_INTERVAL_MS;
+		let delayMs: number;
+		if (retryAfterMs !== undefined) {
+			// Use Retry-After as the base, with bounded jitter (0–1s when Retry-After > 0)
+			// to desynchronize concurrent waiters. Ensure we don't return sub-1s delays
+			// (which could burst when Retry-After is 0 and waste the budget).
+			const jitterMs = retryAfterMs > 0 ? Math.random() * 1000 : 0;
+			delayMs = Math.max(minPollMs, retryAfterMs + jitterMs);
+		} else {
+			// No Retry-After: poll with random jitter between 1s–15s.
+			delayMs = minPollMs + Math.random() * (CONCURRENCY_WAIT_MAX_POLL_MS - minPollMs);
+		}
+		// Cap by remaining budget.
+		const cappedDelayMs = Math.min(remainingMs, delayMs);
+		// If capped result falls below the minimum, exit concurrency wait
+		// to avoid sub-1s bursts at budget expiry.
+		if (cappedDelayMs < minPollMs) {
+			// Record deadline on early exit before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		return cappedDelayMs;
+	}
+
 	#fallbackTriggerFor(
 		message: AssistantMessage,
 		allowLegacyUsageLimit: boolean,
@@ -31483,7 +31592,7 @@ export class AgentSession {
 		// `authDisposition` is carried through from `classifyFallbackTrigger`, whose
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
-	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+	): FallbackTrigger | undefined {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return undefined;
 		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
@@ -32228,9 +32337,7 @@ export class AgentSession {
 				: false;
 		}
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		const trigger:
-			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined =
+		const trigger: FallbackTrigger | undefined =
 			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
 		if (!trigger) {
 			return managedOutcome
@@ -32243,6 +32350,18 @@ export class AgentSession {
 			: attemptsUsed;
 		const providerRetryCeilingReached =
 			providerRetryMaxAttempts !== undefined && providerAttemptsUsed >= providerRetryMaxAttempts;
+		// The account is running its maximum number of parallel requests: the
+		// model and credential are healthy, so wait on the same entry instead of
+		// spending fallback attempts, marking the credential, or opening the
+		// circuit for sibling sessions that share the same saturated account.
+		const concurrencyWaitMs =
+			managedFallback &&
+			trigger.concurrencyLimited &&
+			!providerRetryCeilingReached &&
+			!assistantMessageHasVisibleOrToolContent(message)
+				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs, controller.currentSelector())
+				: undefined;
+		const concurrencyWait = concurrencyWaitMs !== undefined;
 		if (
 			managedFallback &&
 			providerRetryCeilingReached &&
@@ -32273,6 +32392,7 @@ export class AgentSession {
 			}
 		}
 		if (
+			!concurrencyWait &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
@@ -32345,7 +32465,11 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (
+		if (concurrencyWait) {
+			// Waiting for a free parallel slot is not a failed fallback attempt.
+			controller.discardStartedAttempt();
+			outcome = "retry";
+		} else if (
 			managedFallback &&
 			(quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate") &&
 			!providerRetryCeilingReached
@@ -32353,10 +32477,37 @@ export class AgentSession {
 			// A credential retry is a separate dimension from model fallback
 			// attempts. Leave the controller on the current entry and refund its
 			// provisional request charge so every same-kind account is tried first.
-			controller.discardStartedAttempt();
-			outcome = "retry";
+			// However, enforce the concurrency Retry-After deadline before allowing
+			// same-selector rotation/retry: if a deadline exists for this selector,
+			// advance instead of retrying before the deadline.
+			const deadlineMs =
+				failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+				// Deadline not yet reached; advance instead of retrying
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				// No deadline or deadline reached; allow credential rotation retry
+				controller.discardStartedAttempt();
+				outcome = "retry";
+			}
 		} else if (managedFallback) {
-			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			// When Retry-After exceeds the remaining budget, force advance to the next entry
+			// instead of retrying the same entry. This prevents re-sending before the provider's
+			// deadline via the ordinary rate-limit path.
+			// Only apply the flag if it matches the current failed selector (scoped per entry).
+			if (this.#concurrencyWaitRetryAfterExceededBudgetEntry === failedSelector) {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+				// If poll ceiling was reached with a Retry-After deadline for this entry,
+				// don't retry the same entry before the deadline. Advance instead.
+				if (outcome === "retry" && failedSelector !== undefined) {
+					const deadlineMs = this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector);
+					if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+						outcome = controller.advance() ? "advance" : "exhausted";
+					}
+				}
+			}
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
@@ -32480,8 +32631,9 @@ export class AgentSession {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
-		const delayMs =
-			credentialRotated || outcome === "advance"
+		const delayMs = concurrencyWait
+			? concurrencyWaitMs
+			: credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed)
@@ -32501,6 +32653,7 @@ export class AgentSession {
 			let quotaPoolExhausted = quotaCredentialMark === "exhausted";
 			if (
 				managedFallback &&
+				!concurrencyWait &&
 				!credentialRotated &&
 				quotaCredentialMark === undefined &&
 				!providerRetryCeilingReached &&
@@ -33048,6 +33201,7 @@ export class AgentSession {
 	 * @returns true if retry/resume was initiated, false if no retryable tail exists or agent is busy
 	 */
 	async retry(): Promise<boolean> {
+		assertNativeRuntimeInvocation(this);
 		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
 		// A handoff transition owns the session; retrying would mutate the tail and
 		// schedule a continuation against the session being handed off.
@@ -35455,6 +35609,7 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		assertNativeRuntimeInvocation(this);
 		const previousSessionId = this.sessionId;
 		this.#beginSessionTransition("branch");
 		try {
@@ -35801,6 +35956,9 @@ export class AgentSession {
 		const identity = manager.getSessionIdentityGeneration();
 		const priorRevisions = manager.revisionSnapshot();
 		const pending = await manager.selectExecutionBranch(targetLeafId, { op, beforeCommit });
+		// A native runtime owns this transcript: adopt the cursor it just committed so its
+		// next dispatch reconciles the selection instead of the superseded operation.
+		adoptNativeRuntimeSelection(this, pending);
 		const restoreOwnPresentation = (): void => {
 			const current = manager.revisionSnapshot();
 			if (
@@ -35858,6 +36016,7 @@ export class AgentSession {
 			beforeExecutionCommit?: () => void;
 		} = {},
 	): Promise<TreeNavigationResult> {
+		assertNativeRuntimeInvocation(this);
 		return this.#navigateTree(targetId, options, true);
 	}
 
@@ -35866,6 +36025,7 @@ export class AgentSession {
 		targetId: string,
 		options: { beforeExecutionCommit?: () => void } = {},
 	): Promise<TreeNavigationResult> {
+		assertNativeRuntimeInvocation(this);
 		return this.#navigateTree(targetId, options, false);
 	}
 
