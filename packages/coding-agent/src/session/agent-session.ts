@@ -24362,7 +24362,7 @@ export class AgentSession {
 		if (
 			this.#usesSharedSessionPublication() &&
 			options?.persistAsSessionDefault === true &&
-			options.cause === "user-selection"
+			(options.cause === "user-selection" || options.cause === "startup-override")
 		) {
 			return this.#setSharedSessionDefaultModel(model, thinkingLevel, options);
 		}

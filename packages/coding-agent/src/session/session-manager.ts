@@ -12473,7 +12473,7 @@ export class SessionManager {
 	}
 
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
-		this.assertLegacyMutationAllowed("move session");
+		this.assertSessionLevelMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
@@ -12579,7 +12579,7 @@ export class SessionManager {
 			this.destination !== previousDestination
 		)
 			throw new Error("Session cwd move admission changed during validation; retry after it settles.");
-		this.assertLegacyMutationAllowed("move session");
+		this.assertSessionLevelMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
@@ -12597,7 +12597,7 @@ export class SessionManager {
 		const hadPersistedSession = this.#ensuredOnDisk;
 		try {
 			await this.#runBeforeMoveListeners(moveDetails);
-			this.assertLegacyMutationAllowed("move session");
+			this.assertSessionLevelMutationAllowed("move session");
 		} catch (error) {
 			await this.#runMoveAbortListeners(moveDetails);
 			throw error;
@@ -12609,7 +12609,7 @@ export class SessionManager {
 			// Close the persist writer before moving files
 			try {
 				await this.#closePersistWriter();
-				this.assertLegacyMutationAllowed("move session");
+				this.assertSessionLevelMutationAllowed("move session");
 			} catch (error) {
 				await this.#runMoveAbortListeners(moveDetails);
 				throw error;
@@ -20546,7 +20546,19 @@ export class SessionManager {
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
+		// Allow mutations during exclusive cwd transitions (move session operations) even in shared sessions,
+		// since the transition provides serialization and these mutations don't affect the transcript (#7856).
+		if (this.#ownsCwdTransition()) return;
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
+	}
+
+	/** Refuse session-level mutations that don't append to the transcript and are safe during shared publications. */
+	assertSessionLevelMutationAllowed(operation: string): void {
+		// Session-level mutations like moveTo don't conflict with transcript-based shared control publications
+		// or latched bars, since they don't mutate the transcript or graph.
+		// When within an exclusive cwd transition, these operations are already serialized.
+		if (this.#strictClosePending && !this.#ownsCwdTransition())
+			throw new SharedSessionMutationUnsupportedError(operation);
 	}
 
 	/** Additive legacy appends are safe once a control publication's transaction has settled. */
