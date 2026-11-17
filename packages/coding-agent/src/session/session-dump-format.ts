@@ -221,12 +221,6 @@ function scrubSchemaData(value: unknown, propertyName?: string): unknown {
 	return redactStructuredSecrets(decodeValueStrings(value), propertyName, { headerPairs: isHeaderCollectionKey });
 }
 
-/**
- * Pair a private-key block that spans the data of sibling property definitions.
- * Only data keywords take part, so a neighbour's type and description stay intact
- * while an opener in one definition's `default` and a footer in another's are paired.
- */
-
 /** Replace every leaf of a data value with the marker, preserving its shape. */
 function maskSchemaData(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(maskSchemaData);
@@ -313,10 +307,8 @@ function formatArgsAsXml(
 	indent = "\t",
 ): string {
 	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
-	// A scrubbed schema key no longer matches the original argument name, so the schema's own
-	// entries are used once it exists; the scrubbed title is already part of them.
-	// Arguments are paired over the whole object — names included — and a scrubbed schema name
-	// no longer matches the original argument name, so each mode walks its own entries.
+	// A scrubbed schema key no longer matches the original argument name, so each mode walks its
+	// own entries: arguments over the value-paired tree, schemas over the sanitized schema.
 	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
 	const entries = Object.entries(paired ?? args).filter(([key]) => key !== INTENT_FIELD);
 	const parts: string[] = [];
