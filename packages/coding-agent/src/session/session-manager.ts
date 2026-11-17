@@ -1995,7 +1995,10 @@ export type SharedTitleOutcome =
  * persistence - and the caller has to reopen. `committed` means the entry is on disk.
  * `unknown` preserves the original attempted ID across publication and lease-release
  * failures; reconcile it against the transcript before retrying. `rejected` proves
- * no append was committed. Lock acquisition failures before staging still throw.
+ * no append was committed. Lock acquisition, admission, and staging failures before an
+ * ID is attempted still throw, and they carry no attempted ID: a throw therefore proves
+ * no entry was staged, and every failure after an ID is attempted arrives as `unknown`
+ * instead. Callers must not treat a throw as a possibly-persisted entry.
  */
 export type SharedEntriesAppendOutcome =
 	| { readonly kind: "committed"; readonly ids: readonly string[] }

@@ -16,6 +16,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import { ManagedSessionBusyError } from "../src/session/internal/managed-session-transaction";
 import {
 	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SessionManager,
@@ -984,23 +985,150 @@ describe("shared publication admission split", () => {
 		expect(noticeText).not.toContain("transcript read failed");
 	});
 
-	it("treats a thrown background publication as unconfirmed durability", async () => {
+	it("reports a pre-stage append failure as not persisted instead of unconfirmed", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
 		await f.session.awaitSessionSettlement();
-		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockRejectedValue(new Error("lease connection dropped"));
+		// A lock-acquisition failure is raised before the manager stages an entry, so it keeps
+		// the throwing contract and nothing of this publication reached the transcript.
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockRejectedValue(
+			new ManagedSessionBusyError(f.manager.getSessionId()),
+		);
+		const reconcile = vi.spyOn(f.manager, "reconcileUnknownSharedAppend");
 		const notice = vi.spyOn(f.session, "emitNotice");
 
-		// A throw does not prove the entry was absent: it may have committed before the
-		// failure, so the operator must be told the outcome is unconfirmed, not refused.
+		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toEqual({
+			committed: false,
+			cause: "managed_session_transaction_busy",
+		});
+		// Nothing was staged, so there is no attempted id to reconcile and the operator must
+		// not be told the entry may already be in the transcript.
+		expect(reconcile).not.toHaveBeenCalled();
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Could not save the custom entry extension-state to this session: the write could not be started.",
+			"session-publication",
+		);
+	});
+
+	it("keeps an unknown background outcome unconfirmed when reconciliation itself fails", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+		// A throw after the append was attempted proves nothing: the entry may already be
+		// durable, so this is the one path that must stay unconfirmed.
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockResolvedValue({
+			kind: "unknown",
+			id: "staged-entry",
+			error: new Error("release failed"),
+		});
+		vi.spyOn(f.manager, "reconcileUnknownSharedAppend").mockRejectedValue(new Error("transcript read failed"));
+		const notice = vi.spyOn(f.session, "emitNotice");
+
 		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toMatchObject({
 			committed: false,
 			durability: "unknown",
-			cause: "lease connection dropped",
+			entryId: "staged-entry",
+			cause: expect.stringContaining("reconciliation failed: transcript read failed"),
 		});
 		expect(notice).toHaveBeenCalledWith(
 			"warning",
-			"Could not confirm that the custom entry extension-state was saved to this session: the write did not complete. It may already be in the transcript.",
+			"Could not confirm that the custom entry extension-state was saved to this session: the transcript could not be read back. It may already be in the transcript.",
+			"session-publication",
+		);
+	});
+
+	it("does not reconcile a background outcome against a transcript that replaced its own", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let publications = 0;
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockImplementation(async () => {
+			publications++;
+			entered.resolve();
+			await gate.promise;
+			// The predecessor entry may have committed, but the append reported an unknown outcome.
+			return { kind: "unknown", id: "predecessor-entry", error: new Error("transaction release failed") };
+		});
+		const reconcile = vi.spyOn(f.manager, "reconcileUnknownSharedAppend");
+		const notice = vi.spyOn(f.session, "emitNotice");
+		const publication = f.session.appendCustomEntryInBackground("extension-state", { ok: true });
+		await entered.promise;
+
+		const successor = SessionManager.create(f.manager.getCwd(), f.destination);
+		managers.push(successor);
+		successor.appendMessage(user("successor root"));
+		await successor.ensureOnDisk();
+		await successor.flush();
+		const successorFile = successor.getSessionFile();
+		if (!successorFile) throw new Error("missing successor file");
+		await f.manager.setSessionFile(successorFile);
+		gate.resolve();
+
+		// The successor's transcript cannot disprove a predecessor entry, so its absence must
+		// not become a refusal, and the entry must never be resubmitted automatically.
+		expect(await publication).toMatchObject({
+			committed: false,
+			durability: "unknown",
+			entryId: "predecessor-entry",
+			cause: expect.stringContaining("the transcript changed before the outcome could be reconciled"),
+		});
+		expect(publications).toBe(1);
+		expect(reconcile).not.toHaveBeenCalled();
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Could not confirm that the custom entry extension-state was saved to this session: the session switched before the outcome could be confirmed. It may already be in the transcript.",
+			"session-publication",
+		);
+	});
+
+	it("does not trust an absence reconciled across a transcript switch", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockResolvedValue({
+			kind: "unknown",
+			id: "predecessor-held-entry",
+			error: new Error("transaction release failed"),
+		});
+		const originalReconcile = f.manager.reconcileUnknownSharedAppend.bind(f.manager);
+		const reconciling = Promise.withResolvers<void>();
+		const reconcileGate = Promise.withResolvers<void>();
+		vi.spyOn(f.manager, "reconcileUnknownSharedAppend").mockImplementation(async (entryId, error) => {
+			const outcome = await originalReconcile(entryId, error);
+			reconciling.resolve();
+			await reconcileGate.promise;
+			return outcome;
+		});
+		const notice = vi.spyOn(f.session, "emitNotice");
+		const publication = f.session.appendCustomEntryInBackground("extension-state", { ok: true });
+		await reconciling.promise;
+
+		const successor = SessionManager.create(f.manager.getCwd(), f.destination);
+		managers.push(successor);
+		successor.appendMessage(user("successor root"));
+		await successor.ensureOnDisk();
+		await successor.flush();
+		const successorFile = successor.getSessionFile();
+		if (!successorFile) throw new Error("missing successor file");
+		await f.manager.setSessionFile(successorFile);
+		reconcileGate.resolve();
+
+		// The reconciliation proved the id absent from the predecessor, which says nothing about
+		// the successor: the outcome stays unconfirmed rather than becoming a refusal.
+		expect(await publication).toMatchObject({
+			committed: false,
+			durability: "unknown",
+			entryId: "predecessor-held-entry",
+			cause: expect.stringContaining("the transcript changed while the outcome was being reconciled"),
+		});
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Could not confirm that the custom entry extension-state was saved to this session: the session switched before the outcome could be confirmed. It may already be in the transcript.",
 			"session-publication",
 		);
 	});

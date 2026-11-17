@@ -600,6 +600,7 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 	SharedAppendOutcome,
+	SharedAppendReconciliation,
 	SharedControlEntry,
 	SharedEntriesAppendOutcome,
 } from "./session-manager";
@@ -666,6 +667,8 @@ type SharedPublicationObstacle =
 	| "transcript-changed"
 	| "write-refused"
 	| "write-failed"
+	| "write-not-started"
+	| "origin-changed"
 	| "transcript-limit"
 	| "unreadable-transcript";
 
@@ -17313,7 +17316,14 @@ export class AgentSession {
 	 * `unknown` is not a refusal: the entry may have been committed before the failure that
 	 * produced the outcome. It is reconciled against the transcript first and reported as
 	 * unconfirmed when reconciliation cannot decide.
- */
+	 *
+	 * A throw is a refusal, not an uncertainty: a shared append promise keeps its throwing
+	 * contract only for failures raised before it stages an entry (lock acquisition,
+	 * admission, staging), so nothing of this publication can be in the transcript.
+	 * Reconciliation only ever reads the transcript this publication was scheduled against;
+	 * once the origin changes, the outcome stays unconfirmed because a successor transcript
+	 * cannot corroborate or disprove a predecessor entry.
+	 */
 	#publishInBackground(
 		operation: string,
 		publish: () => Promise<SharedAppendOutcome>,
@@ -17329,39 +17339,78 @@ export class AgentSession {
 				this.#reportBackgroundRefusal(operation, "session-switched");
 				return { committed: false, cause: reason };
 			}
+			let outcome: SharedAppendOutcome;
 			try {
-				const outcome = await publish();
-				if (outcome.kind === "committed") return { committed: true };
-				const cause = describeSharedAppendFailure(outcome);
-				if (outcome.kind === "unknown") {
-					const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
-					if (reconciled.kind === "committed") return { committed: true };
-					if (reconciled.kind === "unresolved") {
-						const reason = `${cause.reason ?? cause.outcome}; durability could not be confirmed or disproved`;
-						logger.warn(
-							"Shared session append has an unknown outcome; the entry may already be in the transcript",
-							{ operation, entryId: outcome.id, cause: reason },
-						);
-						this.#reportBackgroundUncertainty(operation, "unreadable-transcript");
-						return { committed: false, durability: "unknown", entryId: outcome.id, cause: reason };
-					}
-				}
-				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
-				this.#reportBackgroundRefusal(operation, sharedAppendObstacle(outcome));
-				return { committed: false, cause: cause.reason };
+				outcome = await publish();
 			} catch (error) {
+				// The manager rethrows acquisition, admission, and staging failures while no entry
+				// id was attempted (`#appendEntrySharingSession` rethrows only when `attempted` is
+				// 0) and reports every later failure through the outcome, so a throw proves this
+				// entry was never staged. Reporting it as unconfirmed would tell the operator the
+				// entry may be in the transcript when nothing was written.
 				const reason = error instanceof Error ? error.message : String(error);
-				// A throw here does not prove the entry was absent: the manager may have
-				// committed it before the failure, and this catch also covers a reconciliation
-				// attempt that itself failed. Report the outcome as unconfirmed rather than
-				// claiming a refusal the transcript cannot corroborate.
-				logger.warn("Shared session append failed; whether the entry persisted is unconfirmed", {
+				logger.warn("Shared session append failed before the entry was staged; the entry was not persisted", {
 					operation,
 					cause: reason,
 				});
-				this.#reportBackgroundUncertainty(operation, "write-failed");
-				return { committed: false, durability: "unknown", cause: reason };
+				this.#reportBackgroundRefusal(operation, "write-not-started");
+				return { committed: false, cause: reason };
 			}
+			if (outcome.kind === "committed") return { committed: true };
+			const cause = describeSharedAppendFailure(outcome);
+			const baseReason = cause.reason ?? cause.outcome;
+			// An entry that may already be durable is never reported as refused.
+			const unconfirmed = (
+				entryId: string,
+				reason: string,
+				obstacle: SharedPublicationObstacle,
+			): BackgroundPublicationResult => {
+				logger.warn("Shared session append has an unknown outcome; the entry may already be in the transcript", {
+					operation,
+					entryId,
+					cause: reason,
+				});
+				this.#reportBackgroundUncertainty(operation, obstacle);
+				return { committed: false, durability: "unknown", entryId, cause: reason };
+			};
+			if (outcome.kind === "unknown") {
+				// Reconcile only the transcript this publication belongs to. A switch or adoption
+				// during the append makes the successor's answer meaningless for the predecessor:
+				// its absence there would read as a refusal even though the entry is durable in the
+				// predecessor, and an operator retry would then duplicate the write.
+				if (!this.#isPublicationOriginCurrent(origin))
+					return unconfirmed(
+						outcome.id,
+						`${baseReason}; the transcript changed before the outcome could be reconciled`,
+						"origin-changed",
+					);
+				let reconciled: SharedAppendReconciliation;
+				try {
+					reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
+				} catch (error) {
+					// The read failed after the append, which proves nothing either way.
+					const detail = error instanceof Error ? error.message : String(error);
+					return unconfirmed(outcome.id, `${baseReason}; reconciliation failed: ${detail}`, "unreadable-transcript");
+				}
+				if (reconciled.kind === "committed") return { committed: true };
+				if (reconciled.kind === "unresolved")
+					return unconfirmed(
+						reconciled.id,
+						`${baseReason}; durability could not be confirmed or disproved`,
+						"unreadable-transcript",
+					);
+				// Reconciled absent, but only this transcript's absence may authorize the refusal
+				// below: a switch during the read leaves that answer describing another transcript.
+				if (!this.#isPublicationOriginCurrent(origin))
+					return unconfirmed(
+						outcome.id,
+						`${baseReason}; the transcript changed while the outcome was being reconciled`,
+						"origin-changed",
+					);
+			}
+			logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
+			this.#reportBackgroundRefusal(operation, sharedAppendObstacle(outcome));
+			return { committed: false, cause: cause.reason };
 		});
 		return this.#trackBackgroundPublication(task);
 	}
@@ -36853,6 +36902,10 @@ function sharedPublicationObstacleText(obstacle: SharedPublicationObstacle): str
 			return "the session refused the write";
 		case "write-failed":
 			return "the write did not complete";
+		case "write-not-started":
+			return "the write could not be started";
+		case "origin-changed":
+			return "the session switched before the outcome could be confirmed";
 		case "transcript-limit":
 			return "the transcript is at its size limit";
 		case "unreadable-transcript":
