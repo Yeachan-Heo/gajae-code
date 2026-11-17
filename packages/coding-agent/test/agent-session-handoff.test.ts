@@ -478,7 +478,7 @@ describe("AgentSession handoff", () => {
 		const originalCommit = sessionManager.commitPreparedNewSession.bind(sessionManager);
 		vi.spyOn(sessionManager, "commitPreparedNewSession").mockImplementation(prepared => {
 			order.push("commit");
-			originalCommit(prepared);
+			return originalCommit(prepared);
 		});
 
 		await expect(session.handoff()).resolves.toBeDefined();

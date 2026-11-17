@@ -150,6 +150,7 @@ import {
 } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import {
+	adoptNativeRuntimeCommit,
 	adoptNativeRuntimeSelection,
 	assertNativeDisposalAuthorized,
 	assertNativeRuntimeEffect,
@@ -603,6 +604,7 @@ import type {
 	ModelProfileTranscriptPlan,
 	NewSessionOptions,
 	PreparedNewSession,
+	CommittedSessionEvidence,
 	RecoveryHydrationContext,
 	RecoveryHydrationPromotionFence,
 	SessionArtifactPublication,
@@ -14311,11 +14313,15 @@ export class AgentSession {
 		this.#invalidateDiscoveryCaches();
 	}
 
-	#commitPreparedSessionWithExactMcpBoundary(prepared: PreparedNewSession): void {
+	async #commitPreparedSessionWithExactMcpBoundary(prepared: PreparedNewSession): Promise<CommittedSessionEvidence> {
 		const id = this.sessionManager.getSessionId();
 		const file = this.sessionManager.getSessionFile();
+		if (this.sessionManager.getSessionOwnerEvidence()?.policy.kind === "exclusive_native")
+			await this.sessionManager.ensurePreparedNewSessionOnDisk(prepared);
 		try {
-			this.sessionManager.commitPreparedNewSession(prepared);
+			const receipt = this.sessionManager.commitPreparedNewSession(prepared);
+			adoptNativeRuntimeCommit(this, receipt);
+			return receipt;
 		} finally {
 			if (this.sessionManager.getSessionId() !== id || this.sessionManager.getSessionFile() !== file) {
 				this.retireSessionAgentModelOverrides();
@@ -21921,7 +21927,7 @@ export class AgentSession {
 				exactRetirement = await this.#prepareExactMcpControlRetirement();
 				if (exactRetirement && !exactRetirement.canCommit())
 					throw new Error("Exact MCP control retirement changed before session adoption");
-				this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+				await this.#commitPreparedSessionWithExactMcpBoundary(prepared);
 				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 				// Endpoint identity committed to the successor: re-register the
@@ -22006,7 +22012,7 @@ export class AgentSession {
 				exactRetirement = await this.#prepareExactMcpControlRetirement();
 				if (exactRetirement && !exactRetirement.canCommit())
 					throw new Error("Exact MCP control retirement changed before session adoption");
-				this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+				await this.#commitPreparedSessionWithExactMcpBoundary(prepared);
 				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 				// Endpoint identity committed to the successor: re-register the
@@ -22533,7 +22539,7 @@ export class AgentSession {
 					exactRetirement = await this.#prepareExactMcpControlRetirement();
 					if (exactRetirement && !exactRetirement.canCommit())
 						throw new Error("Exact MCP control retirement changed before session adoption");
-					this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+					await this.#commitPreparedSessionWithExactMcpBoundary(prepared);
 					this.#commitSessionTransition();
 					await exactRetirement?.commit();
 					// Fork commits a successor endpoint identity; re-register the
@@ -27774,9 +27780,10 @@ export class AgentSession {
 				// Handoff can roll back after adoption. Keep an existing predecessor grant
 				// fenced until retirement succeeds; never recreate it on rollback.
 				if (exactRetirement) {
-					this.sessionManager.commitPreparedNewSession(prepared);
+					const receipt = this.sessionManager.commitPreparedNewSession(prepared);
+					adoptNativeRuntimeCommit(this, receipt);
 					this.retireSessionAgentModelOverrides();
-				} else this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+				} else await this.#commitPreparedSessionWithExactMcpBoundary(prepared);
 				retiredSessionAgentModelRevision = this.#sessionAgentModelSelectionRevision;
 				this.#commitSessionTransition();
 				await exactRetirement?.commit();
@@ -35660,7 +35667,7 @@ export class AgentSession {
 				exactRetirement = await this.#prepareExactMcpControlRetirement();
 				if (exactRetirement && !exactRetirement.canCommit())
 					throw new Error("Exact MCP control retirement changed before session adoption");
-				this.#commitPreparedSessionWithExactMcpBoundary(prepared);
+				await this.#commitPreparedSessionWithExactMcpBoundary(prepared);
 				this.#commitSessionTransition();
 				await exactRetirement?.commit();
 			} catch (error) {

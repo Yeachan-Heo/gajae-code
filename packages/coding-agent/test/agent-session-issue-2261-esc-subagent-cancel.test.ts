@@ -758,7 +758,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		const originalCommit = sessionManager.commitPreparedNewSession.bind(sessionManager);
 		vi.spyOn(sessionManager, "commitPreparedNewSession").mockImplementation(prepared => {
 			order.push("commit");
-			originalCommit(prepared);
+			return originalCommit(prepared);
 		});
 
 		await expect(session.fork()).resolves.toBe(true);

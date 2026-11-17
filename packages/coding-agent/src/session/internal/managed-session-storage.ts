@@ -2858,7 +2858,13 @@ export class ManagedSessionDescendantStore {
 			);
 			const outcome = classifyNativePublishOutcome(published, "retained_file");
 			if (!outcome.ok) throw publishFailure(outcome);
-			return { ...managedFileIdentityFromNative(captured.identity), sha256: digest };
+			const successor = this.#authority.readManaged(relative);
+			if (!successor.ok || !successor.identity || !successor.data ||
+				successor.identity.dev !== captured.identity.dev || successor.identity.ino !== captured.identity.ino ||
+				successor.identity.size !== captured.identity.size || successor.identity.mtimeNs !== captured.identity.mtimeNs ||
+				createHash("sha256").update(successor.data).digest("hex") !== digest)
+				throw new Error("managed_publish_identity_mismatch");
+			return { ...managedFileIdentityFromNative(successor.identity), sha256: digest };
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result
@@ -4082,10 +4088,21 @@ export async function publishManagedFileNoReplace(
 			throw new Error("destination_identity_changed");
 		}
 		secureFileDescriptor(destination, handle.fd, "verify");
+		if (linkPublished) {
+			await fsp.unlink(staging);
+			linkPublished = false;
+			stagingIdentity = undefined;
+		}
+		await fsyncDirectoryAsync(parent);
+		const committed = await handle.stat({ bigint: true });
+		const current = await fsp.lstat(destination, { bigint: true });
+		if (!current.isFile() || current.isSymbolicLink() || !sameFileIdentity(committed, current) ||
+			committed.dev !== staged.dev || committed.ino !== staged.ino || committed.nlink !== 1n ||
+			committed.size !== staged.size || committed.mtimeNs !== staged.mtimeNs)
+			throw new Error("destination_identity_changed");
+		publishedIdentity = identity(committed, publishedIdentity.sha256);
 		await handle.close();
 		handle = undefined;
-
-		await fsyncDirectoryAsync(parent);
 	} catch (error) {
 		failure = error;
 	} finally {
@@ -4164,9 +4181,21 @@ export function publishManagedFileNoReplaceSync(
 			throw new Error("destination_identity_changed");
 		}
 		secureFileDescriptor(destination, fd, "verify");
+		if (linkPublished) {
+			fs.unlinkSync(staging);
+			linkPublished = false;
+			stagingIdentity = undefined;
+		}
+		fsyncDirectory(parent);
+		const committed = fs.fstatSync(fd, { bigint: true });
+		const current = fs.lstatSync(destination, { bigint: true });
+		if (!current.isFile() || current.isSymbolicLink() || !sameFileIdentity(committed, current) ||
+			committed.dev !== staged.dev || committed.ino !== staged.ino || committed.nlink !== 1n ||
+			committed.size !== staged.size || committed.mtimeNs !== staged.mtimeNs)
+			throw new Error("destination_identity_changed");
+		publishedIdentity = identity(committed, publishedIdentity.sha256);
 		fs.closeSync(fd);
 		fd = undefined;
-		fsyncDirectory(parent);
 	} catch (error) {
 		failure = error;
 	} finally {

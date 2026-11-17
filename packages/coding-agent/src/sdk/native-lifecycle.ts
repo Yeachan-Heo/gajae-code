@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isDeepStrictEqual } from "node:util";
 import * as crypto from "node:crypto";
 import type { AgentSession, ExternalStopAdmissionLease } from "../session/agent-session";
 import type {
@@ -10,7 +11,9 @@ import type {
 	ResumeRouting,
 	ResumeTerminationAuthorization,
 } from "../session/resume-operation";
-import type { SessionManager } from "../session/session-manager";
+import { captureNativeResumeTranscript, nativeResumeBinding } from "../session/native-resume";
+import { getOwnerMembershipEvidence, type OwnerMembership } from "../session/owner-group";
+import { consumeCommittedSessionEvidence, type CommittedSessionEvidence, type SessionManager } from "../session/session-manager";
 import {
 	acquireEmbeddedStopAdmission,
 	cancelEmbeddedOwnedWork,
@@ -168,7 +171,8 @@ interface NativeRuntimeBinding {
 	 */
 	readonly settle: () => void;
 	/** Adopt a durable selection this runtime's own admitted work committed. */
-	readonly adoptSelection: (pending: PendingResumeOp) => void;
+	readonly adoptSelection: (pending: PendingResumeOp, membership?: OwnerMembership) => void;
+	readonly adoptCommit: (receipt: CommittedSessionEvidence) => void;
 }
 interface RuntimeInvocation {
 	readonly member: Member;
@@ -222,15 +226,16 @@ function invocationCurrent(invocation: RuntimeInvocation): boolean {
 export function bindNativeRuntimeInvocation(
 	handle: NativeLifecycleHandle,
 	pending: () => PendingResumeOp,
-	adopt: (pending: PendingResumeOp) => void,
+	adopt: (pending: PendingResumeOp, membership?: OwnerMembership) => EmbeddedWorkSource["interaction"] | void,
 ): void {
 	const member = memberFor(handle);
 	const session = member.workSource?.result.session;
 	if (!session || member.context !== "runtime" || member.runtimeBinding)
 		throw new Error("Native runtime binding context mismatch");
 	const manager = session.sessionManager;
-	const sessionId = session.sessionId;
-	const identity = manager.getSessionIdentityGeneration();
+	let sessionId = session.sessionId;
+	let sessionFile = manager.getSessionFile();
+	let identity = manager.getSessionIdentityGeneration();
 	const generation = session.sessionLifecycle.generation;
 	const agent = session.agent;
 	const settings = session.settings;
@@ -260,8 +265,48 @@ export function bindNativeRuntimeInvocation(
 			if (session.settings !== settings || session.modelRegistry !== registry) return;
 			observedGeneration = session.sessionLifecycle.generation;
 		},
-		adoptSelection: selected => {
-			adopt(selected);
+		adoptCommit: receipt => {
+			const current = runtimeInvocation.getStore();
+			if (!current || !current.active || current.member !== member || current.binding !== member.runtimeBinding ||
+				member.currentInvocation !== current || current.epoch !== member.publicationEpoch ||
+				current.op !== pending() || member.intent || closeState(member) !== "none_started" ||
+				receipt.predecessor.sessionId !== sessionId || receipt.predecessor.sessionFile !== sessionFile ||
+				receipt.predecessor.generation !== identity || receipt.successor.generation !== identity + 1 ||
+				session.sessionManager !== manager || session.agent !== agent || session.settings !== settings ||
+				session.modelRegistry !== registry || session.sessionLifecycle.disposed ||
+				!receipt.membership || !receipt.pending || !receipt.publication)
+				throw new NativeRuntimeRefusal("context_mismatch");
+			const operation = receipt.pending;
+			const state = nativeResumeBinding(operation);
+			const owner = getOwnerMembershipEvidence(receipt.membership);
+			const observed = captureNativeResumeTranscript(state.path, state.storage);
+			if (state.path !== receipt.successor.sessionFile || owner.policy.kind !== "exclusive_native" ||
+				operation.memberToken !== owner.memberId || operation.authorityKey !== owner.authorityKey ||
+				operation.epoch !== owner.epoch || operation.policy.rev !== owner.rev ||
+				operation.plan.target !== receipt.targetLeafId ||
+				!observed.identity || !isDeepStrictEqual(observed.identity, receipt.publication))
+				throw new NativeRuntimeRefusal("uncertain_cursor");
+			if (!consumeCommittedSessionEvidence(manager, receipt)) throw new NativeRuntimeRefusal("context_mismatch");
+			sessionId = receipt.successor.sessionId;
+			sessionFile = receipt.successor.sessionFile;
+			identity = receipt.successor.generation;
+			observedGeneration = session.sessionLifecycle.generation;
+			member.runtimeBinding!.adoptSelection(operation, receipt.membership);
+		},
+		adoptSelection: (selected, membership) => {
+			if (!manager.isRegisteredNativeResumeOperation(selected) ||
+				nativeResumeBinding(selected).path !== manager.getSessionFile())
+				throw new NativeRuntimeRefusal("context_mismatch");
+			if (sessionFile !== manager.getSessionFile()) {
+				if (session.sessionId !== sessionId || manager.getSessionIdentityGeneration() !== identity)
+					throw new NativeRuntimeRefusal("context_mismatch");
+				sessionFile = nativeResumeBinding(selected).path;
+			}
+			const interaction = adopt(selected, membership);
+			if (interaction && member.workSource) {
+				member.workSource = snapshotSource({ ...member.workSource, interaction }, manager);
+				member.workSource.result.setToolUIContext(interaction.service.ui, true);
+			}
 			const current = member.currentInvocation;
 			if (!current || current.binding !== member.runtimeBinding) return;
 			// The selecting dispatch stays current; every other in-flight dispatch is fenced.
@@ -500,11 +545,23 @@ export function noteNativeRuntimeViewTransition(session: AgentSession): void {
  * a new resume operation in the manager. Point this runtime at it, otherwise every later
  * dispatch keeps reconciling the superseded cursor and reports an unknown suffix.
  */
+export function adoptNativeRuntimeCommit(session: AgentSession, receipt: CommittedSessionEvidence): void {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context !== "runtime") return;
+	if (member.runtimeBinding?.session !== session) throw new NativeRuntimeRefusal("context_mismatch");
+	member.runtimeBinding.adoptCommit(receipt);
+}
+
 export function adoptNativeRuntimeSelection(session: AgentSession, pending: PendingResumeOp): void {
 	const member = managers.get(session.sessionManager);
 	if (!member || member.context !== "runtime") return;
 	const binding = member.runtimeBinding;
 	if (!binding || binding.session !== session) return;
+	const current = runtimeInvocation.getStore();
+	if (!current || !current.active || current.member !== member || current.binding !== binding ||
+		member.currentInvocation !== current || current.epoch !== member.publicationEpoch ||
+		current.op !== binding.pending() || member.intent || closeState(member) !== "none_started")
+		throw new NativeRuntimeRefusal("context_mismatch");
 	binding.adoptSelection(pending);
 }
 

@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as util from "node:util";
 import type { AgentSession } from "../session/agent-session";
+import { CURRENT_SESSION_VERSION } from "./session-readonly/format";
 import { captureNativeResumeTranscript } from "../session/native-resume";
 import {
 	admitOwnerMembershipWithAsyncEvidence,
@@ -10,6 +11,7 @@ import {
 	type LegacyTakeoverAttestation,
 	OwnerAuthorityError,
 	type OwnerMembership,
+	type OwnerFreshCreation,
 	probeSessionOwnershipWithAsyncEvidence,
 	retireOwnerMembershipSync,
 	type SessionOwnerPolicy,
@@ -22,7 +24,7 @@ import type {
 	ResumeRetirementEvidence,
 	ResumeTerminationAuthorization,
 } from "../session/resume-operation";
-import { SessionManager } from "../session/session-manager";
+import { SessionManager, type PreparedNewSession } from "../session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
 import type {
 	ActivityControlOperation,
@@ -45,6 +47,7 @@ import {
 } from "./embedding";
 import { ExtensionInteractionService } from "./extension-interaction";
 import {
+	adoptNativeRuntimeSelection,
 	bindNativeRuntimeInvocation,
 	createNativeOpenCoordinator,
 	invokeNativeRuntime,
@@ -259,23 +262,57 @@ export async function attestEmbeddedLegacyTakeover(input: {
 
 interface NativeOwner {
 	readonly manager: SessionManager;
-	readonly membership: OwnerMembership;
+	membership: OwnerMembership;
 	readonly coordinator: NativeOpenCoordinator;
 	pending: PendingResumeOp;
 	readonly operations: Set<PendingResumeOp>;
 	readonly options: EmbeddedAgentSessionOptions;
 	cleanup?: () => Promise<void>;
 	interaction?: NonNullable<EmbeddedWorkSource["interaction"]>;
+	session?: AgentSession;
 	last?: ReconcileResult;
 	openFlight?: Promise<NativeEmbeddedOpenResult>;
 }
 const nativeOwners = new WeakMap<SessionManager, NativeOwner>();
 const handles = new WeakMap<NativeLifecycleHandle, NativeOwner>();
 
+/** Internal producer lookup, never inferred from transcript order or a manager leaf. */
+export function nativeEmbeddedOwnerOperation(manager: SessionManager): PendingResumeOp | undefined {
+	return nativeOwners.get(manager)?.pending;
+}
+
+/** The manager has registered and durably published this exact moved operation. */
+export function nativeEmbeddedOperationMoved(manager: SessionManager, previous: PendingResumeOp, pending: PendingResumeOp): void {
+	const owner = nativeOwners.get(manager);
+	if (!owner || !owner.session || owner.pending !== previous || manager.getOwnerMembership() !== owner.membership ||
+		!manager.isRegisteredNativeResumeOperation(pending)) throw new Error("context_mismatch");
+	adoptNativeRuntimeSelection(owner.session, pending);
+}
+
+/** Producer-only preparation: fresh capability and all async vetoes precede publication. */
+export async function admitNativePreparedSuccessor(
+	manager: SessionManager,
+	prepared: PreparedNewSession,
+	freshCreation: OwnerFreshCreation,
+): Promise<OwnerMembership> {
+	const owner = nativeOwners.get(manager);
+	if (!owner || manager.getOwnerMembership() !== owner.membership || !prepared.sessionFile ||
+		freshCreation.headerId !== prepared.sessionId) throw new Error("context_mismatch");
+	const target = captureOwnerTargetSync({ transcriptPath: prepared.sessionFile, headerId: prepared.sessionId });
+	if (target.transcriptExists) throw new Error("stale_snapshot");
+	const header = { type: "session" as const, version: CURRENT_SESSION_VERSION, id: prepared.sessionId,
+		timestamp: new Date().toISOString(), cwd: manager.getCwd() };
+	const resolved = resolveResumeCheckpoint([header], target.snapshotDigest);
+	return admitOwnerMembershipWithAsyncEvidence(target,
+		{ kind: "exclusive_native", expected: { snapshotDigest: target.snapshotDigest, resolved }, freshCreation },
+		{ ...createNativeOwnerInspectors(owner.options), runtime: "embedded_native", capabilities: ["native_resume"] });
+}
+
 /** Internal baseline-factory hook: only a coordinator already owning this exact manager participates. */
 export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result: CreateAgentSessionResult): void {
 	const owner = nativeOwners.get(manager);
 	if (!owner) return;
+	owner.session = result.session;
 	const service = new ExtensionInteractionService(manager.getSessionId());
 	const { connectionId } = service.connect();
 	const interaction = Object.freeze({ service, connectionId, ownership: "owned" as const });
@@ -284,12 +321,12 @@ export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result
 	owner.interaction = interaction;
 	owner.coordinator.recordRuntimeStarted({ result, interaction, asyncJobs: owner.options.asyncJobs });
 	const setToolUIContext = result.setToolUIContext;
-	let bound = false;
+	let boundUI: typeof service.ui | undefined;
 	result.setToolUIContext = (ui, hasUI) => {
-		if (ui !== service.ui || !hasUI) throw new Error("Native UI must use its registered interaction service");
-		if (bound) return;
+		if (ui !== owner.interaction?.service.ui || !hasUI) throw new Error("Native UI must use its registered interaction service");
+		if (boundUI === ui) return;
 		setToolUIContext(ui, hasUI);
-		bound = true;
+		boundUI = ui;
 	};
 	result.setToolUIContext(service.ui, true);
 }
@@ -469,6 +506,7 @@ function beginNativeFactory(
 	admittedOptions: EmbeddedAgentSessionOptions,
 ): Promise<NativeEmbeddedOpenResult> {
 	const closures = new WeakMap<ResumeTerminationAuthorization, ResumeClosureEvidence>();
+	let owner: NativeOwner;
 	const coordinator = createNativeOpenCoordinator({
 		manager,
 		reconcile: (op, mode, routing) => manager.reconcileResumeOperation(op, mode, routing),
@@ -480,9 +518,9 @@ function beginNativeFactory(
 			return closure;
 		},
 		retire: (op, result, authorization) =>
-			retire({ manager, membership }, op, result, authorization, closures.get(authorization)),
+			retire(owner, op, result, authorization, closures.get(authorization)),
 	});
-	const owner: NativeOwner = {
+	owner = {
 		manager,
 		membership,
 		pending,
@@ -532,9 +570,15 @@ async function constructNativeRuntime(
 		bindNativeRuntimeInvocation(
 			handle,
 			() => owner.pending,
-			adopted => {
+			(adopted, membership) => {
 				owner.operations.add(adopted);
 				owner.pending = adopted;
+				if (!membership) return undefined;
+				owner.membership = membership;
+				const service = new ExtensionInteractionService(owner.manager.getSessionId());
+				const { connectionId } = service.connect();
+				owner.interaction = Object.freeze({ service, connectionId, ownership: "owned" as const });
+				return owner.interaction;
 			},
 		);
 		const runtime = createNativeEmbeddedRuntime(handle, result);

@@ -73,6 +73,7 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
+import { admitNativePreparedSuccessor, nativeEmbeddedOwnerOperation, nativeEmbeddedOperationMoved } from "../sdk/native-embedding";
 import { createCooperativeOwnerInspectors } from "../sdk/native-ownership";
 import {
 	applyHeaderPatch,
@@ -423,6 +424,29 @@ export interface PreparedNewSession {
 	readonly managedLegacyLocalMigrationSource: ManagedLegacyLocalMigrationSource | null;
 }
 
+/** Producer-issued authority for exactly one committed prepared identity. @internal */
+export interface CommittedSessionEvidence {
+	readonly manager: SessionManager;
+	readonly prepared: Readonly<Pick<PreparedNewSession, "sessionId" | "sessionFile">>;
+	readonly targetLeafId: string | null;
+	readonly predecessor: Readonly<{ sessionId: string; sessionFile: string | undefined; generation: number }>;
+	readonly successor: Readonly<{ sessionId: string; sessionFile: string | undefined; generation: number }>;
+	readonly membership: OwnerMembership | undefined;
+	readonly pending: PendingResumeOp | undefined;
+	readonly publication: Readonly<ResumeSessionIdentity> | undefined;
+}
+const committedSessionEvidence = new WeakSet<CommittedSessionEvidence>();
+
+/** Internal one-shot validation; readable receipt fields alone never grant authority. */
+export function consumeCommittedSessionEvidence(manager: SessionManager, receipt: CommittedSessionEvidence): boolean {
+	if (!committedSessionEvidence.has(receipt) || receipt.manager !== manager) return false;
+	committedSessionEvidence.delete(receipt);
+	return manager.getSessionId() === receipt.successor.sessionId &&
+		manager.getSessionFile() === receipt.successor.sessionFile &&
+		manager.getSessionIdentityGeneration() === receipt.successor.generation &&
+		manager.getOwnerMembership() === receipt.membership;
+}
+
 interface PreparedSessionIndex {
 	readonly byId: Map<string, SessionEntry>;
 	readonly labelsById: Map<string, string>;
@@ -435,6 +459,12 @@ interface PreparedNewSessionState extends PreparedNewSession {
 	readonly fileEntries: FileEntry[];
 	readonly sessionName: string | undefined;
 	readonly titleSource: "auto" | "user" | undefined;
+	readonly freshCreation?: OwnerFreshCreation;
+	executionTargetLeafId?: string | null;
+	membership?: OwnerMembership;
+	ownerMarker?: { entry: CustomEntry; marker: OwnerFirstWriteMarker };
+	pending?: PendingResumeOp;
+	publication?: Readonly<ResumeSessionIdentity>;
 	residentFileEntries?: FileEntry[];
 	residentTextBlobStore?: BlobStore;
 	index?: PreparedSessionIndex;
@@ -11232,8 +11262,10 @@ export class SessionManager {
 	}
 
 	async #allocatePreparedNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
+		const freshCreation = this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native"
+			? allocateFreshOwnerCreation() : undefined;
 		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
-		const sessionId = preallocated ?? createSessionId();
+		const sessionId = freshCreation?.headerId ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
@@ -11254,6 +11286,7 @@ export class SessionManager {
 			managedLegacyLocalMigrationSource: this.#managedLegacyLocalMigrationSourceFor(sessionFile),
 			header,
 			fileEntries: [header],
+			freshCreation,
 			sessionName: undefined,
 			titleSource: undefined,
 			flushed: false,
@@ -11342,15 +11375,33 @@ export class SessionManager {
 		this.#assertPreparedGraphPublicationAllowed(stage);
 		const sessionFile = stage.sessionFile;
 		if (!this.persist || !sessionFile || stage.flushed) return;
+		await this.#admitPreparedNativeSuccessor(stage);
 		const entries = await Promise.all(
 			stage.fileEntries.map(entry => prepareEntryForPersistence(entry, this.#blobStore)),
 		);
-		await this.#publication.publish(async () => {
+		const publish = async (): Promise<void> => {
 			if (this.#persistError) throw this.#persistError;
 			this.#assertPreparedGraphPublicationAllowed(stage);
 			if (this.destination.kind === "managed") {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-				await this.#managedTranscriptStore(sessionFile).publishNoReplace(path.basename(sessionFile), bytes);
+				const identity = await this.#managedTranscriptStore(sessionFile).publishNoReplace(path.basename(sessionFile), bytes);
+				stage.publication = this.#preparedPublicationIdentity(stage, identity);
+			} else if (stage.membership) {
+				if (!this.#storage.openStagedWriter) throw new Error("durability_repair_unavailable");
+				const writer = this.#storage.openStagedWriter(sessionFile);
+				try {
+					for (const entry of entries) writer.writeLine(Buffer.from(JSON.stringify(entry)));
+					writer.fsync();
+					writer.closeSync();
+					const receipt = writer.publishNoReplace();
+					if (receipt.kind !== "fsync" || !receipt.namespaceSynced) throw new Error("durability_unproven");
+					stage.publication = Object.freeze({
+						canonicalPath: resolveEquivalentPath(sessionFile), sessionId: stage.sessionId,
+						dev: receipt.stat.dev, ino: receipt.stat.ino, nlink: receipt.stat.nlink,
+						size: receipt.stat.size, mtimeMs: receipt.stat.mtimeMs, mtimeNs: receipt.stat.mtimeNs,
+						ctimeNs: receipt.stat.ctimeNs, sha256: receipt.sha256,
+					});
+				} finally { writer.closeSync(); }
 			} else {
 				const staleCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
 				if (staleCleanupError) throw staleCleanupError;
@@ -11378,7 +11429,94 @@ export class SessionManager {
 				}
 			}
 			stage.flushed = true;
+			if (stage.membership) this.#completePreparedNativePublication(stage);
+		};
+		await this.#publication.publish(() => stage.membership ? withOwnerPublication(stage.membership, publish) : publish());
+	}
+
+	#preparedPublicationIdentity(stage: PreparedNewSessionState, identity: ManagedFileIdentity): Readonly<ResumeSessionIdentity> {
+		if (!stage.sessionFile || !identity.sha256 || identity.ctimeNs === undefined) throw new Error("stale_snapshot");
+		return Object.freeze({
+			canonicalPath: resolveEquivalentPath(stage.sessionFile), sessionId: stage.sessionId,
+			dev: identity.dev, ino: identity.ino, nlink: identity.nlink, size: identity.size,
+			mtimeMs: Number(identity.mtimeNs / 1_000_000n), mtimeNs: identity.mtimeNs,
+			ctimeNs: identity.ctimeNs, sha256: identity.sha256,
 		});
+	}
+
+	async #admitPreparedNativeSuccessor(stage: PreparedNewSessionState): Promise<void> {
+		if (!stage.freshCreation || stage.membership) return;
+		stage.membership = await admitNativePreparedSuccessor(this, stage, stage.freshCreation);
+		const token = stage.membership;
+		withOwnerPublicationSync(token, () => {
+			if (stage.executionTargetLeafId === undefined)
+				stage.executionTargetLeafId = this.#buildIndexForEntries(stage.fileEntries, stage.sessionFile).leafId;
+			const target = stage.executionTargetLeafId;
+			const marker = ownerFirstWriteMarkerSync(token);
+			if (!marker) throw new Error("participation_lost");
+			const entry: CustomEntry = {
+				type: "custom", customType: OWNER_ENROLL_CUSTOM_TYPE,
+				id: this.#nextPreparedNewSessionEntryId(stage), parentId: target,
+				timestamp: new Date().toISOString(),
+				data: { v: 1, bind: stage.sessionId, member: marker.memberId, runtime: marker.runtime,
+					pid: marker.pid, processIncarnation: marker.processIncarnation, hostId: marker.hostId, epoch: marker.epoch },
+			};
+			stage.ownerMarker = { entry, marker };
+			stage.fileEntries.push(entry);
+			const reduction = reduceResumeTranscript(stage.fileEntries, "");
+			if (reduction.checkpoint.kind === "invalid") throw new Error("invalid_resume_graph");
+			const candidates = (reduction.checkpoint.candidates ?? []).filter(id => id !== target);
+			const op = crypto.randomUUID();
+			let parent = target;
+			for (let start = 0; start < candidates.length; start += 256) {
+				const cursor: CustomEntry = {
+					type: "custom", customType: RESUME_CURSOR_CUSTOM_TYPE,
+					id: this.#nextPreparedNewSessionEntryId(stage), parentId: parent,
+					timestamp: new Date().toISOString(),
+					data: { v: 1, bind: stage.sessionId, op, idx: start / 256,
+						member: marker.memberId, reason: "fork_init", supersedes: candidates.slice(start, start + 256) },
+				};
+				stage.fileEntries.push(cursor);
+				parent = cursor.id;
+			}
+		});
+	}
+
+	#completePreparedNativePublication(stage: PreparedNewSessionState): void {
+		const token = stage.membership!;
+		const observed = captureNativeResumeTranscript(stage.sessionFile!, this.#storage);
+		if (observed.capture.kind !== "captured" || !observed.identity || !stage.publication ||
+			!util.isDeepStrictEqual(observed.identity, stage.publication)) throw new Error("stale_snapshot");
+		const marker = stage.ownerMarker!;
+		confirmOwnerFirstWriteMarkerSync(token, marker.marker, () => observed.capture.kind === "captured" &&
+			observed.capture.entries.some(entry => entry.id === marker.entry.id &&
+				entry.payloadDigest === resumeDigest(JSON.stringify(marker.entry))));
+		const owner = getOwnerMembershipEvidence(token);
+		const capture = observed.capture;
+		const pending: PendingResumeOp = Object.freeze({
+			memberToken: owner.memberId, authorityKey: owner.authorityKey, epoch: owner.epoch,
+			policy: Object.freeze({ kind: "exclusive_native", memberKind: owner.memberKind, rev: owner.rev,
+				authorityKey: owner.authorityKey, epoch: owner.epoch }),
+			op: crypto.randomUUID(),
+			plan: Object.freeze({ enroll: null, selectionRequested: false, cursorIds: Object.freeze([] as string[]),
+				dependentIds: Object.freeze([] as string[]), target: stage.executionTargetLeafId! }),
+			manifest: Object.freeze([]), CB: observed.executionTail ?? null,
+			g0: Object.freeze({ fileEntriesIndex0: stage.fileEntries.length, entryRevision0: 0 }),
+			durabilityDebt: Object.freeze({ ids: Object.freeze([] as string[]), fileIdentity: Object.freeze(capture.fileIdentity),
+				snapshotDigest: capture.snapshotDigest, snapshotByteLength: resumeCaptureByteLength(capture), attempts: 0 }),
+		});
+		bindNativeResumeOperation(pending, {
+			path: stage.sessionFile!, storage: this.#storage,
+			preOpEntries: capture.entries.map(entry => ({ ...entry, kind: "dependent" })),
+			preOpCommittedTail: observed.executionTail ?? null, prepared: [], ledger: new Map(), proofs: [],
+			publicationSuccessions: [], durabilityState: "proven", attempts: 0, residentTip: pending.CB,
+		});
+		const repaired = repairNativeResumeDurability(pending, observed);
+		const state = nativeResumeBinding(pending);
+		if (repaired.capture.kind !== "captured" || state.durabilityState !== "proven" || !state.publicationIdentity)
+			throw new Error(state.lastError ?? "durability_unproven");
+		stage.publication = state.publicationIdentity;
+		stage.pending = pending;
 	}
 
 	/** Build context from an unpublished successor without reading active manager state. @internal */
@@ -11444,11 +11582,11 @@ export class SessionManager {
 	}
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
-	async prepareFork(): Promise<PreparedNewSession | undefined> {
-		return this.#publication.prepare(() => this.#prepareForkAdmitted());
+	async prepareFork(targetLeafId: string | null = this.#leafId): Promise<PreparedNewSession | undefined> {
+		return this.#publication.prepare(() => this.#prepareForkAdmitted(targetLeafId));
 	}
 
-	async #prepareForkAdmitted(): Promise<PreparedNewSession | undefined> {
+	async #prepareForkAdmitted(targetLeafId: string | null): Promise<PreparedNewSession | undefined> {
 		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
@@ -11458,7 +11596,9 @@ export class SessionManager {
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
 		const timestamp = new Date().toISOString();
-		const sessionId = createSessionId();
+		const freshCreation = this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native"
+			? allocateFreshOwnerCreation() : undefined;
+		const sessionId = freshCreation?.headerId ?? createSessionId();
 		const sessionFile = path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
 		const header: SessionHeader = {
 			type: "session",
@@ -11484,9 +11624,11 @@ export class SessionManager {
 			managedLegacyLocalMigrationSource: this.#managedLegacyLocalMigrationSourceFor(sessionFile),
 			header,
 			fileEntries: entries,
+			freshCreation,
+			executionTargetLeafId: targetLeafId,
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
-			flushed: true,
+			flushed: false,
 			committed: false,
 			discarded: false,
 		};
@@ -11494,19 +11636,8 @@ export class SessionManager {
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
-			await this.#publication.publish(async () => {
-				await this.copyArtifactsForFork(sourceFile, sessionFile);
-				this.#assertPreparedGraphPublicationAllowed(stage);
-				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-				if (this.destination.kind === "managed") {
-					this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
-						path.basename(sessionFile),
-						Buffer.from(content, "utf8"),
-					);
-				} else {
-					this.#storage.writeTextSync(sessionFile, content);
-				}
-			});
+			await this.#publication.publish(() => this.copyArtifactsForFork(sourceFile, sessionFile));
+			await this.#ensurePreparedNewSessionOnDiskAdmitted(stage);
 		} catch (error) {
 			try {
 				await this.discardPreparedNewSession(stage);
@@ -11537,7 +11668,9 @@ export class SessionManager {
 		await this.#closePersistWriter();
 		this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session", true);
 		const timestamp = new Date().toISOString();
-		const sessionId = createSessionId();
+		const freshCreation = this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native"
+			? allocateFreshOwnerCreation() : undefined;
+		const sessionId = freshCreation?.headerId ?? createSessionId();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
 			: undefined;
@@ -11580,9 +11713,11 @@ export class SessionManager {
 			managedLegacyLocalMigrationSource: this.#managedLegacyLocalMigrationSourceFor(sessionFile),
 			header,
 			fileEntries: entries,
+			freshCreation,
+			executionTargetLeafId: leafId,
 			sessionName: undefined,
 			titleSource: undefined,
-			flushed: this.persist,
+			flushed: false,
 			committed: false,
 			discarded: false,
 		};
@@ -11590,19 +11725,7 @@ export class SessionManager {
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
-			await this.#publication.publish(async () => {
-				if (sessionFile) {
-					const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-					if (this.destination.kind === "managed") {
-						this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
-							path.basename(sessionFile),
-							Buffer.from(content, "utf8"),
-						);
-					} else {
-						this.#storage.writeTextSync(sessionFile, content);
-					}
-				}
-			});
+			await this.#ensurePreparedNewSessionOnDiskAdmitted(stage);
 			return stage;
 		} catch (error) {
 			try {
@@ -11618,7 +11741,7 @@ export class SessionManager {
 	}
 
 	/** Publish a prepared successor synchronously after all readiness awaits succeed. @internal */
-	commitPreparedNewSession(prepared: PreparedNewSession): void {
+	commitPreparedNewSession(prepared: PreparedNewSession): CommittedSessionEvidence {
 		if (this.#publication.blocked) throw new Error("publication_freeze_parked");
 		this.#assertRecoveryHydrationWritable();
 		const stage = prepared as PreparedNewSessionState;
@@ -11626,6 +11749,8 @@ export class SessionManager {
 			throw new Error("Prepared session is no longer available.");
 		}
 		this.#assertPreparedGraphPublicationAllowed(stage);
+		if (stage.freshCreation && (!stage.membership || !stage.pending || !stage.publication))
+			throw new Error("prepared_native_successor_not_published");
 		this.#preparePreparedNewSessionForCommit(stage);
 		const residentFileEntries = stage.residentFileEntries;
 		const residentTextBlobStore = stage.residentTextBlobStore;
@@ -11657,7 +11782,15 @@ export class SessionManager {
 		}
 		let expectedIdentity: ManagedFileIdentity | undefined;
 		try {
-			if (stage.flushed && stage.sessionFile && this.destination.kind === "managed")
+			if (stage.membership && stage.publication) {
+				const observed = captureNativeResumeTranscript(stage.sessionFile!, this.#storage);
+				if (!util.isDeepStrictEqual(observed.identity, stage.publication)) throw new Error("stale_snapshot");
+				const identity = stage.publication;
+				if (identity.ctimeNs === undefined) throw new Error("stale_snapshot");
+				if (this.destination.kind === "managed") expectedIdentity = {
+					...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }), sha256: identity.sha256,
+				};
+			} else if (stage.flushed && stage.sessionFile && this.destination.kind === "managed")
 				expectedIdentity = this.#captureManagedPersistIdentity(stage.sessionFile);
 		} catch (error) {
 			transition.dispose();
@@ -11665,6 +11798,7 @@ export class SessionManager {
 		}
 		const previousId = this.#sessionId;
 		const previousFile = this.#sessionFile;
+		const predecessorGeneration = this.#committedIdentityGeneration;
 		// Preparing the successor awaited the actual predecessor writer close.
 		// Never detach a live/uncertain descriptor or unpublished predecessor debt.
 		if (this.#ownerMembership) {
@@ -11723,6 +11857,22 @@ export class SessionManager {
 		stage.committed = true;
 		this.#noteCommittedIdentityChange(previousId, previousFile);
 		this.#preparedNewSessions.delete(stage);
+		if (stage.membership && stage.pending) {
+			this.installOwnerMembership(stage.membership);
+			this.#nativeResumeOperations.set(stage.pending.op, stage.pending);
+			this.#nativeResumeReadiness = "ready";
+			this.#leafId = stage.pending.CB;
+			this.#leafRevision++;
+		}
+		const receipt: CommittedSessionEvidence = Object.freeze({
+			manager: this, prepared: Object.freeze({ sessionId: stage.sessionId, sessionFile: stage.sessionFile }),
+			targetLeafId: stage.executionTargetLeafId === undefined ? index.leafId : stage.executionTargetLeafId,
+			predecessor: Object.freeze({ sessionId: previousId, sessionFile: previousFile, generation: predecessorGeneration }),
+			successor: Object.freeze({ sessionId: stage.sessionId, sessionFile: stage.sessionFile, generation: this.#committedIdentityGeneration }),
+			membership: stage.membership, pending: stage.pending, publication: stage.publication,
+		});
+		committedSessionEvidence.add(receipt);
+		return receipt;
 	}
 
 	/** Exact-discard only an uncommitted successor prepared by this manager. @internal */
@@ -11744,6 +11894,7 @@ export class SessionManager {
 			);
 			throw errors.length === 1 ? errors[0] : new AggregateError(errors, "Prepared session cleanup failed.");
 		}
+		if (stage.membership) retireOwnerMembershipSync(stage.membership);
 		this.#preparedNewSessions.delete(stage);
 		stage.discarded = true;
 		if (this.#preparedNewSessions.size === 0 && this.#fileEntries.length === 0) this.#releaseOwnedManagedAuthority();
@@ -12743,6 +12894,15 @@ export class SessionManager {
 		this.#ownerSessionId = this.#sessionId;
 		this.#ownerSessionFile = this.#sessionFile;
 		this.#ownerMarker = undefined;
+		if (outcome === "success" && this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native") {
+			const previous = nativeEmbeddedOwnerOperation(this);
+			if (!previous || this.#nativeResumeOperations.get(previous.op) !== previous) throw new Error("context_mismatch");
+			// This is the exact producer-recorded execution tip, not an eventual manager leaf.
+			const target = nativeResumeBinding(previous).residentTip;
+			this.#nativeResumeOperations.clear();
+			const pending = await this.appendResumeCursorDurably(target, { op: crypto.randomUUID(), reason: "pin" });
+			nativeEmbeddedOperationMoved(this, previous, pending);
+		}
 	}
 
 	async #runAfterMoveListeners(move: {
@@ -14230,6 +14390,14 @@ export class SessionManager {
 		const fresh = captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending));
 		if (fresh.capture.kind !== "captured" || state.durabilityState !== "proven") return;
 		const capture = fresh.capture;
+		if (this.destination.kind === "managed" && state.publicationIdentity && fresh.identity &&
+			util.isDeepStrictEqual(state.publicationIdentity, fresh.identity)) {
+			const identity = state.publicationIdentity;
+			if (identity.ctimeNs === undefined) throw new Error("stale_snapshot");
+			this.#managedPersistExpectedIdentity = {
+				...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }), sha256: identity.sha256,
+			};
+		}
 		const durable = new Set(
 			state.proofs.flatMap(proof =>
 				validateDurabilityProof(proof, pending, capture, state.publicationSuccessions, state.initialPublication),
@@ -14574,6 +14742,11 @@ export class SessionManager {
 			completionRefusal: refusal,
 			publishedAfterThaw: [],
 		};
+	}
+
+	/** Read-only issuer check used by the closed native selection adapter. */
+	isRegisteredNativeResumeOperation(pending: PendingResumeOp): boolean {
+		return this.#nativeResumeOperations.get(pending.op) === pending;
 	}
 
 	#nativeRuntimeContextCurrent(pending: PendingResumeOp, routing: ResumeRouting): boolean {
@@ -19131,7 +19304,9 @@ export class SessionManager {
 					});
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+				if (this.#managedPersistExpectedIdentity && !this.#ownerTransfer)
+					this.#recordResumePublicationSuccession(this.#managedPersistExpectedIdentity, publicationIdentity);
+				this.#managedPersistExpectedIdentity = publicationIdentity;
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				this.#confirmOwnerMarkerDurablySync();
 				for (const entry of entries) {
@@ -19722,7 +19897,7 @@ export class SessionManager {
 						this.#writeEntriesAtomicallySync(persistedEntries);
 						publicationSuccessor = this.#managedPersistExpectedIdentity;
 					}
-					if (publicationPredecessor && publicationSuccessor)
+					if (stage.boundedCold && publicationPredecessor && publicationSuccessor)
 						this.#recordResumePublicationSuccession(publicationPredecessor, publicationSuccessor);
 				} catch (error) {
 					transition.dispose();
@@ -19912,6 +20087,7 @@ export class SessionManager {
 								captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending)),
 							);
 							if (observed.capture.kind !== "captured" || state.durabilityState !== "proven") continue;
+							this.#settleNativeResumeDurableEntries(pending);
 							const debt = this.#publicationDebt([], false);
 							const capture = observed.capture;
 							const durable = new Set(

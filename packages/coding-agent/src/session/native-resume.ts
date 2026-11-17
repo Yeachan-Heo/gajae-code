@@ -56,6 +56,8 @@ export interface NativeResumeBinding {
 	proofs: DurabilityProof[];
 	publicationSuccessions: ResumePublicationSuccession[];
 	initialPublication?: ResumeInitialPublication;
+	/** Exact producer identity returned by the most recent successful durability repair. */
+	publicationIdentity?: Readonly<ResumeSessionIdentity>;
 	durabilityState: ResumeOperationEvidence["durabilityState"];
 	attempts: number;
 	lastError?: string;
@@ -351,6 +353,16 @@ export function repairNativeResumeDurability(
 			)
 		)
 			throw new Error("resume_repair_recapture_changed");
+		if (!after.identity || after.identity.nlink !== receipt.stat.nlink ||
+			after.identity.size !== receipt.stat.size || after.identity.mtimeMs !== receipt.stat.mtimeMs ||
+			after.identity.mtimeNs !== receipt.stat.mtimeNs || after.identity.ctimeNs !== receipt.stat.ctimeNs)
+			throw new Error("resume_repair_recapture_changed");
+		binding.publicationIdentity = Object.freeze({
+			canonicalPath: after.identity.canonicalPath, sessionId: after.identity.sessionId,
+			dev: receipt.stat.dev, ino: receipt.stat.ino, nlink: receipt.stat.nlink,
+			size: receipt.stat.size, mtimeMs: receipt.stat.mtimeMs, mtimeNs: receipt.stat.mtimeNs,
+			ctimeNs: receipt.stat.ctimeNs, sha256: receipt.sha256,
+		});
 		binding.proofs.push(
 			Object.freeze({
 				kind: "sync_ok",
