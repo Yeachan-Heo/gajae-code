@@ -169,7 +169,10 @@ import {
 	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
-import { withManagedSessionTransaction } from "./internal/managed-session-transaction";
+import {
+	type ManagedSessionTransactionScope,
+	withManagedSessionTransaction,
+} from "./internal/managed-session-transaction";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	applyReducerDelta,
@@ -926,7 +929,12 @@ export type SharedControlEntry =
 	| { readonly type: "model_role_clear"; readonly role: string }
 	| { readonly type: "thinking_level_change"; readonly level: string | undefined; readonly operatorIntent: boolean }
 	| { readonly type: "service_tier_change"; readonly serviceTier: ServiceTier | null }
-	| { readonly type: "custom"; readonly customType: string; readonly data: unknown };
+	| { readonly type: "custom"; readonly customType: string; readonly data: unknown }
+	/**
+	 * A parentless `context_clear` root: it starts this opener's fresh active branch. Only
+	 * valid as the first entry of a publication; later entries descend from it.
+	 */
+	| { readonly type: "context_clear"; readonly data: Record<string, unknown> | undefined };
 
 export interface DefaultModelSelectionEntriesOptions {
 	readonly appendThinkingLevel: boolean;
@@ -19072,10 +19080,25 @@ export class SessionManager {
 			await this.#setLivePickerStar(session, starred);
 			return;
 		}
-		await SessionManager.setSessionStarredForPicker(
+		await SessionManager.#setPickerCandidateStar(
 			session,
 			starred,
 			this.destination.kind === "explicit" ? this.destination.directory : undefined,
+			this.#publishedSharedSession(session.id),
+		);
+	}
+
+	/**
+	 * Whether this manager ever published `sessionId` through shared admission, or has a
+	 * shared publication of it in flight. After `/new` such a predecessor may still be
+	 * live in a peer, so its star must follow the shared header-patch protocol (#7824).
+	 */
+	#publishedSharedSession(sessionId: string): boolean {
+		return (
+			this.#sharedAppendBarSessionIds.has(sessionId) ||
+			this.#sharedRewriteBarSessionIds.has(sessionId) ||
+			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0 ||
+			(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) > 0
 		);
 	}
 
@@ -19189,6 +19212,21 @@ export class SessionManager {
 		starred: boolean,
 		explicitSessionDir?: string,
 	): Promise<void> {
+		await SessionManager.#setPickerCandidateStar(session, starred, explicitSessionDir, false);
+	}
+
+	/**
+	 * Star a non-live picker candidate. A `shared` candidate (a predecessor this manager
+	 * published through shared admission) is patched only by an append under its managed
+	 * session transaction lease, like a shared title; a whole-transcript header upgrade
+	 * is refused because it would move a live peer's transcript identity.
+	 */
+	static async #setPickerCandidateStar(
+		session: SessionInfo,
+		starred: boolean,
+		explicitSessionDir: string | undefined,
+		shared: boolean,
+	): Promise<void> {
 		if (isStagedSessionPath(session.path)) throw new Error("Staged session paths are not resumable");
 		const directory = await fs.promises.realpath(path.dirname(session.path));
 		const sessionPath = path.join(directory, path.basename(session.path));
@@ -19208,6 +19246,23 @@ export class SessionManager {
 			)
 				throw new Error("Session is not an authorized managed candidate.");
 		}
+		if (!shared) {
+			SessionManager.#writePickerCandidateStar(session, starred, directory);
+			return;
+		}
+		const locksDirectory = managedSessionTransactionLocksDirectory(directory);
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		await withManagedSessionTransaction({ locksDirectory, sessionId: session.id }, scope =>
+			SessionManager.#writePickerCandidateStar(session, starred, directory, scope),
+		);
+	}
+
+	static #writePickerCandidateStar(
+		session: SessionInfo,
+		starred: boolean,
+		directory: string,
+		sharedScope?: ManagedSessionTransactionScope,
+	): void {
 		const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
 		try {
 			const relativePath = path.basename(session.path);
@@ -19232,6 +19287,10 @@ export class SessionManager {
 
 			const patch = `${JSON.stringify({ type: "header_patch", patch: { starred } })}\n`;
 			const appendOnly = rawHeader.starredPatchVersion === 1 && Number(rawHeader.version) >= 4;
+			if (sharedScope && !appendOnly)
+				throw new Error(
+					"Selected session is shared; shared session star requires an append-only header patch. Resume it to upgrade its format.",
+				);
 			let bytes: Uint8Array;
 			if (appendOnly) {
 				bytes = Buffer.from(`${content.endsWith("\n") ? "" : "\n"}${patch}`);
@@ -19243,6 +19302,7 @@ export class SessionManager {
 					`${JSON.stringify(rawHeader)}\n${body}${body && !body.endsWith("\n") ? "\n" : ""}${patch}`,
 				);
 			}
+			sharedScope?.assertOwned();
 			if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
 			else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
 			const committedDescriptor = authority.descriptorExpected(relativePath);
@@ -20681,6 +20741,9 @@ export class SessionManager {
 		isCurrent: () => boolean,
 	): Promise<SharedEntriesAppendOutcome> {
 		const snapshot = entries.map(entry => structuredClone(entry));
+		// A new root mid-publication would orphan the entries before it from the branch.
+		if (snapshot.some((entry, index) => entry.type === "context_clear" && index > 0))
+			return { kind: "rejected", error: new Error("shared_control_context_clear_must_be_first") };
 		const owner = SessionManager.#thinkingControlOwner.getStore();
 		if (owner) {
 			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
@@ -20715,6 +20778,8 @@ export class SessionManager {
 				return this.#appendServiceTierChangeWithId(entry.serviceTier, id);
 			case "custom":
 				return this.#appendCustomEntryWithId(entry.customType, entry.data, id);
+			case "context_clear":
+				return this.#appendContextClearRootWithId(entry.data, id);
 		}
 	}
 
@@ -21384,16 +21449,38 @@ export class SessionManager {
 	 */
 	appendContextClearEntry(data?: Record<string, unknown>): string {
 		const ownershipMarker = this.getModelProfileOwnershipMarker();
+		const id = this.#appendContextClearRootWithId(data, this.#generateEntryId());
+		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
+		return id;
+	}
+
+	/**
+	 * The admitted shared form of {@link appendContextClearEntry}: the parentless root and
+	 * the carried-over profile ownership marker, as entries for
+	 * {@link appendControlEntriesSharingSession}. The root is appended, never rewritten, so
+	 * earlier history and any unseen sibling branch stay in the transcript.
+	 */
+	contextClearControlEntries(data: Record<string, unknown> | undefined): SharedControlEntry[] {
+		const ownershipMarker = this.getModelProfileOwnershipMarker();
+		const entries: SharedControlEntry[] = [{ type: "context_clear", data }];
+		if (ownershipMarker) {
+			const validated = validateModelProfileOwnershipMarker(ownershipMarker);
+			if (!validated) throw new InvalidModelProfileOwnershipError();
+			entries.push({ type: "custom", customType: MODEL_PROFILE_OWNERSHIP_ENTRY, data: validated });
+		}
+		return entries;
+	}
+
+	#appendContextClearRootWithId(data: Record<string, unknown> | undefined, id: string): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType: "context_clear",
 			data,
-			id: this.#generateEntryId(),
+			id,
 			parentId: null,
 			timestamp: new Date().toISOString(),
 		};
 		this.#appendEntry(entry);
-		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
 		return entry.id;
 	}
 

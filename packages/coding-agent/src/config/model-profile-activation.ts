@@ -69,6 +69,7 @@ type ModelProfileActivationSession = Pick<
 	credentialSessionId?: string;
 	usesSharedControlPublication?: AgentSession["usesSharedControlPublication"];
 	assertConfiguredModelChainWritable?: AgentSession["assertConfiguredModelChainWritable"];
+	setConfiguredModelChainForControl?: AgentSession["setConfiguredModelChainForControl"];
 	withModelProfilePublication?: AgentSession["withModelProfilePublication"];
 	appendModelProfileActivationForControl?: AgentSession["appendModelProfileActivationForControl"];
 	publishCommittedModelProfileSessionState?: AgentSession["publishCommittedModelProfileSessionState"];
@@ -321,6 +322,8 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
 		| "assertConfiguredModelChainWritable"
+		| "setConfiguredModelChainForControl"
+		| "usesSharedControlPublication"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getActivatedModelProfile"
@@ -354,6 +357,8 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
 		| "assertConfiguredModelChainWritable"
+		| "setConfiguredModelChainForControl"
+		| "usesSharedControlPublication"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getActivatedModelProfile"
@@ -564,11 +569,17 @@ async function commitMaterializedProfileAssignments(
 			throw new Error("The active profile does not own durable assignment materialization");
 	}
 	const writesChain = !preserveStartupOverrideChain || previousChain?.origin !== "startup-override";
+	// A shared session publishes the chain through admitted shared publication after the
+	// durable settings commit (#7824); a legacy session keeps the synchronous append.
+	const sharedChain = writesChain && options.session.usesSharedControlPublication?.() === true;
+	if (sharedChain && !options.session.setConfiguredModelChainForControl)
+		throw new Error("Session cannot publish a shared configured model chain");
 	const assertCurrent = () => {
 		options.validateCurrent?.();
-		// The chain append below is a legacy write: refuse before the durable settings
-		// commit once the session requires shared admission (#7824).
-		if (writesChain) options.session.assertConfiguredModelChainWritable?.();
+		if (writesChain && (options.session.usesSharedControlPublication?.() === true) !== sharedChain)
+			throw new Error("Session publication protocol changed while materializing profile assignments");
+		// The legacy chain append below must not be refused after the durable settings commit.
+		if (writesChain && !sharedChain) options.session.assertConfiguredModelChainWritable?.();
 		if (
 			options.session.sessionId !== sessionId ||
 			options.session.model !== previousModel ||
@@ -602,12 +613,32 @@ async function commitMaterializedProfileAssignments(
 			)
 		).ownership;
 		assertCurrent();
-		if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(options.settings), committed))
+		const committedOwnership = committed;
+		if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(options.settings), committedOwnership))
 			throw new Error("Profile materialization was superseded before publication");
+		if (sharedChain) {
+			// Transcript before any live settings override; never compensated afterwards.
+			await options.session.setConfiguredModelChainForControl!(
+				"default",
+				normalizeModelSelectorValue(nextModelRoles.default),
+				"modelRoles",
+				undefined,
+				true,
+				() => {
+					try {
+						assertCurrent();
+						return util.isDeepStrictEqual(readDurableModelProfileOwnership(options.settings), committedOwnership);
+					} catch {
+						return false;
+					}
+				},
+			);
+			assertCurrent();
+		}
 		options.settings.clearOverride("modelProfile.default");
 		options.settings.override("modelRoles", nextModelRoles);
 		options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
-		if (writesChain) {
+		if (writesChain && !sharedChain) {
 			options.session.setConfiguredModelChain(
 				"default",
 				normalizeModelSelectorValue(nextModelRoles.default),
@@ -2227,12 +2258,17 @@ export class ModelProfilePublicationError extends Error {
 	readonly publicationCause: unknown;
 }
 
-type CommittedModelProfileSessionPublication = {
+export type CommittedModelProfileSessionPublication = {
 	plan: ModelProfileTranscriptPlan;
 	receipt: Extract<SharedEntriesAppendOutcome, { kind: "committed" }>;
+	/**
+	 * The prepared selection whose model the plan's temporary entry records, when it is not
+	 * the profile's own default selection (a configuration reload of the live model).
+	 */
+	selection?: PreparedProfileModelSelection;
 };
 
-function buildModelProfileTranscriptPlan(
+export function buildModelProfileTranscriptPlan(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions,
 ): ModelProfileTranscriptPlan {
@@ -2299,11 +2335,11 @@ export function publishPreparedModelProfileActivation(
 	if (committedSessionPublication) {
 		if (!prepared.session.publishCommittedModelProfileSessionState)
 			throw new Error("Session cannot publish committed profile state");
-		const { plan, receipt } = committedSessionPublication;
+		const { plan, receipt, selection } = committedSessionPublication;
 		prepared.session.publishCommittedModelProfileSessionState(
 			plan,
 			receipt,
-			plan.temporaryModel === undefined ? undefined : prepared.preparedDefaultModelSelection,
+			selection ?? (plan.temporaryModel === undefined ? undefined : prepared.preparedDefaultModelSelection),
 		);
 	}
 	retireSessionAgentModelsForActivation(prepared);

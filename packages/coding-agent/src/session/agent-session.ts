@@ -251,6 +251,8 @@ import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/c
 import {
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
+	buildModelProfileTranscriptPlan,
+	type CommittedModelProfileSessionPublication,
 	finishPreparedModelProfileActivation,
 	getModelAssignmentPatches,
 	getModelProfileAssignmentMaterializationPatches,
@@ -884,6 +886,24 @@ export class SharedControlPublicationError extends Error {
 		this.name = "SharedControlPublicationError";
 		this.code = code;
 	}
+}
+
+/**
+ * Durable session intent a model-selection rollback restores along with the live model:
+ * the configured DEFAULT chain and the resume default. Absent fields are left alone.
+ */
+export interface ModelSelectionRollbackDurableState {
+	readonly defaultChain?: {
+		readonly state:
+			| {
+					readonly entries: readonly string[];
+					readonly origin: string;
+					readonly identity?: string;
+					readonly explicitHead?: boolean;
+			  }
+			| undefined;
+	};
+	readonly resumeDefault?: { readonly selector: string | undefined };
 }
 
 function sharedControlPublicationMessage(operation: string, outcome: SharedEntriesAppendOutcome): string {
@@ -21844,10 +21864,13 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		// A context clear appends a parentless root marker. A shared transcript has no
-		// admitted protocol for a new root yet (#7824), so refuse before any live effect
-		// instead of resetting the agent and then hitting the legacy append guard.
-		this.sessionManager.assertLegacyAppendAllowed("clear context");
+		// A context clear appends a parentless root marker. A shared session publishes that
+		// root through the common admitted control publication before resetting anything
+		// (#7824); a legacy session keeps the legacy refusal. Adoption while the turn is
+		// aborted refuses before the reset rather than switching protocols mid-clear.
+		const operation = "clear context";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const sharedPublication = this.#usesSharedSessionPublication();
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -21863,7 +21886,16 @@ export class AgentSession {
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
 			// Shared admission may have latched while the turn was aborted and settled.
-			this.sessionManager.assertLegacyAppendAllowed("clear context");
+			assertMode();
+			if (sharedPublication) {
+				const committed = await this.#publishSharedContextClear(operation, sessionId, assertMode);
+				try {
+					this.#applyContextClear(sessionId);
+				} catch (error) {
+					return this.#failClosedSharedControl(operation, committed, error);
+				}
+				return true;
+			}
 			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
@@ -21888,6 +21920,76 @@ export class AgentSession {
 			if (!this.#isDisposed) this.#reconnectToAgent();
 			this.#endSessionTransition();
 		}
+	}
+
+	/**
+	 * Publish the shared `/clear` root and its carried-over model, thinking, tier and
+	 * profile-ownership intent as one admitted append at this opener's cursor. The root
+	 * is parentless, so the earlier branch and any unseen sibling stay in the transcript;
+	 * nothing is rewritten. Throws before any live reset unless the entries committed.
+	 */
+	async #publishSharedContextClear(
+		operation: string,
+		sessionId: string,
+		assertMode: () => void,
+	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
+		// Entries already handed to background publication belong to the cleared branch.
+		await this.#joinBackgroundPublications();
+		assertMode();
+		const manager = this.sessionManager;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const model = this.model;
+		const thinkingLevel = this.thinkingLevel;
+		const serviceTier = this.serviceTier ?? null;
+		const entries: SharedControlEntry[] = [
+			...manager.contextClearControlEntries({ sessionId }),
+			{ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false },
+		];
+		if (model) entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "default" });
+		entries.push({ type: "service_tier_change", serviceTier });
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === model &&
+				this.thinkingLevel === thinkingLevel &&
+				(this.serviceTier ?? null) === serviceTier
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => manager.appendControlEntriesSharingSession(entries, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return outcome;
+	}
+
+	/** The live half of a committed shared `/clear`; its transcript entries are already durable. */
+	#applyContextClear(sessionId: string): void {
+		this.#commitSessionTransition();
+		this.agent.reset();
+		this.setTodoPhases([]);
+		this.#syncAgentSessionId(sessionId);
+		this.#steeringMessages = [];
+		this.#followUpMessages = [];
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#todoReminderCount = 0;
+		this.#planReferenceSent = false;
+		this.#planReferencePath = "local://PLAN.md";
 	}
 
 	/**
@@ -22759,12 +22861,22 @@ export class AgentSession {
 						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
 					}
 
+					// A shared session publishes the profile/live-model transcript entries through the
+					// common admitted control publication before settings, catalog or live model
+					// publication (#7824); a legacy session keeps the synchronous legacy writes.
+					let sharedReload: CommittedModelProfileSessionPublication | undefined;
 					if (prepared || preparedLiveModelSelection) {
-						// Profile publication below writes the transcript synchronously through legacy
-						// appends. Once shared admission is latched that write has no protocol (#7824),
-						// so refuse before settings, catalog or live model publication.
 						try {
-							this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
+							if (this.#usesSharedSessionPublication()) {
+								sharedReload = await this.#publishSharedConfigurationReload(
+									prepared,
+									preparedLiveModelSelection,
+									{ preserveDefaultModelSelection, preserveLiveModelSelection },
+									() => stagedModels?.isCurrent() === true && !reloadSignal.aborted,
+								);
+							} else {
+								this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
+							}
 						} catch (error) {
 							stagedModels!.rollback();
 							modelRollbackAttempted = true;
@@ -22783,12 +22895,22 @@ export class AgentSession {
 							stagedModels!.commit();
 							if (prepared) {
 								activationPublicationStarted = true;
-								publishPreparedModelProfileActivation(prepared, {
-									preserveDefaultModelSelection,
-									preserveLiveModelSelection,
-								});
+								publishPreparedModelProfileActivation(
+									prepared,
+									{
+										preserveDefaultModelSelection,
+										preserveLiveModelSelection,
+									},
+									sharedReload,
+								);
+							} else if (sharedReload) {
+								this.publishCommittedModelProfileSessionState(
+									sharedReload.plan,
+									sharedReload.receipt,
+									sharedReload.selection,
+								);
 							}
-							if (preparedLiveModelSelection) {
+							if (preparedLiveModelSelection && !sharedReload) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
 								this.commitPreparedProfileModelSelection(preparedLiveModelSelection, mutationRevision => {
@@ -22801,6 +22923,34 @@ export class AgentSession {
 						publication.finalize();
 						modelCommitSucceeded = true;
 					} catch (error) {
+						if (sharedReload) {
+							// The transcript already holds the reload's intent: restore only the
+							// process-wide settings and catalog, never compensate the session over its
+							// admitted write. The session is closed instead.
+							const rollbackErrors: unknown[] = [];
+							try {
+								publication?.rollback();
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+							if (modelCommitStarted) {
+								try {
+									stagedModels!.rollback();
+								} catch (rollbackError) {
+									rollbackErrors.push(rollbackError);
+								}
+								modelRollbackAttempted = true;
+							}
+							try {
+								this.#failClosedSharedControl(
+									"reload model profile configuration",
+									sharedReload.receipt,
+									rollbackErrors.length > 0 ? new AggregateError([error, ...rollbackErrors]) : error,
+								);
+							} catch (closed) {
+								throw new ConfigurationReloadError("PUBLICATION_FAILED", closed);
+							}
+						}
 						const rollbackErrors: unknown[] = [];
 						if (liveModelSelectionCommitted && committedThinkingLevelLiveMutationRevision === undefined) {
 							committedThinkingLevelLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
@@ -23701,6 +23851,76 @@ export class AgentSession {
 		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
 	}
 
+	/**
+	 * Persist a configured chain on behalf of a control that already committed its durable
+	 * settings. A shared session publishes the chain through the common admitted control
+	 * publication before the runtime fallback controller changes (#7824); a legacy session
+	 * appends it as {@link setConfiguredModelChain} does. `isCurrent` is the caller's own
+	 * currentness fence and is re-checked under the publication lease.
+	 */
+	async setConfiguredModelChainForControl(
+		role: string,
+		entries: readonly string[],
+		origin: string,
+		identity: string | undefined,
+		explicitHead: boolean,
+		isCurrent: () => boolean,
+	): Promise<void> {
+		const operation = "set configured model chain";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		if (!this.#usesSharedSessionPublication()) {
+			this.setConfiguredModelChain(role, entries, origin, identity, explicitHead);
+			return;
+		}
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent()
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() =>
+				manager.appendControlEntriesSharingSession(
+					[
+						{
+							type: "configured_model_chain",
+							chain: {
+								role,
+								entries: [...entries],
+								origin,
+								identity,
+								explicitHead,
+								cleared: entries.length === 0,
+							},
+						},
+					],
+					current,
+				),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		if (role === "default") {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
+	}
+
 	/** Persist the configured fallback selectors for a model role. */
 	setConfiguredModelChain(
 		role: string,
@@ -24365,6 +24585,61 @@ export class AgentSession {
 		return outcome;
 	}
 
+	/**
+	 * Publish a configuration reload's profile and live-model transcript entries as one
+	 * admitted append, before any settings, catalog or live model publication (#7824).
+	 * The receipt is consumed by the reload's synchronous publication step.
+	 */
+	async #publishSharedConfigurationReload(
+		prepared: PreparedModelProfileActivation | undefined,
+		liveSelection: PreparedProfileModelSelection | undefined,
+		options: { preserveDefaultModelSelection: boolean; preserveLiveModelSelection: boolean },
+		isCurrent: () => boolean,
+	): Promise<CommittedModelProfileSessionPublication> {
+		const operation = "reload model profile configuration";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const plan: ModelProfileTranscriptPlan = prepared ? buildModelProfileTranscriptPlan(prepared, options) : {};
+		if (liveSelection) {
+			if (plan.temporaryModel !== undefined)
+				throw new Error("Configuration reload prepared both a profile and a live model selection");
+			plan.temporaryModel = `${liveSelection.model.provider}/${liveSelection.model.id}`;
+			plan.thinking = { level: liveSelection.committedThinkingLevel };
+		}
+		// Entries already handed to background publication precede the reload's intent.
+		await this.#joinBackgroundPublications();
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+				if (liveSelection) this.#assertPreparedProfileModelSelectionCurrent(liveSelection);
+				if (prepared?.preparedDefaultModelSelection && plan.temporaryModel !== undefined)
+					this.#assertPreparedProfileModelSelectionCurrent(prepared.preparedDefaultModelSelection);
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent()
+			);
+		};
+		const outcome = await this.withModelProfilePublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => this.appendModelProfileActivationForControl(plan, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return { plan, receipt: outcome, selection: liveSelection };
+	}
+
 	/** Consume only a receipt issued by this session for these exact committed entries. */
 	publishCommittedModelProfileSessionState(
 		plan: ModelProfileTranscriptPlan,
@@ -24530,11 +24805,23 @@ export class AgentSession {
 	async restoreModelSelectionForRollback(
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
+		durable?: ModelSelectionRollbackDurableState,
 	): Promise<void> {
-		// Compensation writes through legacy appends. Once the session is shared, the
-		// forward write was an admitted publication; never restore the live model
-		// blindly over it (#7824).
+		// A shared session compensates through its own admitted publication (#7824).
+		if (this.#usesSharedSessionPublication())
+			return this.#restoreSharedModelSelectionForRollback(model, thinkingLevel, durable);
 		this.sessionManager.assertLegacyAppendAllowed("restore model selection");
+		if (durable?.defaultChain) {
+			const chain = durable.defaultChain.state;
+			this.setConfiguredModelChain(
+				"default",
+				chain?.entries ?? [],
+				chain?.origin ?? "rollback",
+				chain?.identity,
+				chain?.explicitHead ?? true,
+			);
+		}
+		if (durable?.resumeDefault) this.recordResumeDefaultModel(durable.resumeDefault.selector);
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (model) {
 			// Restoring a captured live model is compensation, not a new selection:
@@ -24547,6 +24834,124 @@ export class AgentSession {
 			this.#syncAppendOnlyContext(undefined);
 		}
 		this.setThinkingLevel(thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/**
+	 * Shared-session compensation for a failed selector transaction. It compares the
+	 * captured state with the current live and durable state and publishes only the
+	 * entries that actually differ, through the common admitted control publication,
+	 * before any live change. Nothing that differs means nothing is written or changed.
+	 * A refused publication changes nothing; an unknown one closes the session.
+	 */
+	async #restoreSharedModelSelectionForRollback(
+		model: Model | undefined,
+		thinkingLevel: ThinkingLevel | undefined,
+		durable: ModelSelectionRollbackDurableState | undefined,
+	): Promise<void> {
+		const operation = "restore model selection";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const liveModel = this.model;
+		const liveThinking = this.#thinkingLevel;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const entries: SharedControlEntry[] = [];
+		const targetChain = durable?.defaultChain?.state;
+		const chainChanges =
+			durable?.defaultChain !== undefined &&
+			!util.isDeepStrictEqual(
+				targetChain === undefined
+					? undefined
+					: {
+							entries: [...targetChain.entries],
+							origin: targetChain.origin,
+							identity: targetChain.identity,
+							explicitHead: targetChain.explicitHead ?? true,
+						},
+				this.getConfiguredModelChainState("default"),
+			);
+		if (chainChanges) {
+			const chainEntries = [...(targetChain?.entries ?? [])];
+			entries.push({
+				type: "configured_model_chain",
+				chain: {
+					role: "default",
+					entries: chainEntries,
+					origin: targetChain?.origin ?? "rollback",
+					identity: targetChain?.identity,
+					explicitHead: targetChain?.explicitHead ?? true,
+					cleared: chainEntries.length === 0,
+				},
+			});
+		}
+		const resumeDefault = durable?.resumeDefault;
+		if (resumeDefault && this.getSessionDefaultModelSelector() !== resumeDefault.selector) {
+			entries.push(
+				resumeDefault.selector === undefined
+					? { type: "model_role_clear", role: "default" }
+					: { type: "model_change", model: resumeDefault.selector, role: "default" },
+			);
+		}
+		const modelChanges = model !== liveModel;
+		if (model && modelChanges)
+			entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "temporary" });
+		const effectiveThinking = resolveThinkingLevelForModel(model, thinkingLevel);
+		if (effectiveThinking !== liveThinking)
+			entries.push({ type: "thinking_level_change", level: effectiveThinking, operatorIntent: false });
+		if (entries.length === 0 && !modelChanges) return;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === liveModel &&
+				this.#thinkingLevel === liveThinking &&
+				this.#thinkingLevelMutationRevision === thinkingRevision
+			);
+		};
+		let committed: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
+		if (entries.length > 0) {
+			const outcome = await this.#withStartedSharedControlPublication(
+				() => {
+					if (!current())
+						throw new SharedControlPublicationError(operation, {
+							kind: "rejected",
+							error: new Error("superseded"),
+						});
+				},
+				() => manager.appendControlEntriesSharingSession(entries, current),
+			);
+			if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+			if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+			if (!current()) return this.#failClosedSharedControl(operation, outcome);
+			committed = outcome;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		try {
+			if (chainChanges) {
+				this.#defaultFallbackController = undefined;
+				this.#defaultFallbackExhaustedLastTurn = false;
+			}
+			if (model) {
+				if (modelChanges) this.#setModelAuthoritatively(model, "rollback");
+			} else if (modelChanges) {
+				this.#clearActiveRetryFallback();
+				this.#setModelWithProviderSessionReset(undefined);
+				this.#syncAppendOnlyContext(undefined);
+			}
+			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
+		} catch (error) {
+			if (committed) return this.#failClosedSharedControl(operation, committed, error);
+			throw error;
+		}
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
@@ -30363,29 +30768,104 @@ export class AgentSession {
 			},
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
-		if (
-			resolution.model &&
-			resolveThinkingLevelForModel(
-				resolution.model,
-				this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
-			) !== this.#thinkingLevel
-		) {
-			// The synchronous thinking write below has no shared protocol yet (#7824): refuse
-			// before seeding fallback state or switching the model, not after.
-			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
-		}
-		if (activeIndex > resolutionStart) {
-			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-		} else {
-			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-		}
-		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
-		const previousEditMode = this.#resolveActiveEditMode();
-		this.#setModelAuthoritatively(resolution.model, "restore");
-		this.setThinkingLevel(
-			this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
+		const thinkingLevel = this.#thinkingLevelForResolvedFallback(
+			resolution.explicitThinkingLevel,
+			resolution.thinkingLevel,
 		);
+		const effectiveThinking = resolution.model
+			? resolveThinkingLevelForModel(resolution.model, thinkingLevel)
+			: this.#thinkingLevel;
+		let committedThinking: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
+		if (resolution.model && effectiveThinking !== this.#thinkingLevel) {
+			// A shared session publishes the thinking entry through admitted shared publication
+			// (#7824); a legacy session keeps its refusal. Either way, before seeding fallback
+			// state or switching the model.
+			if (this.#usesSharedSessionPublication())
+				committedThinking = await this.#publishSharedFallbackThinking(
+					controller,
+					resolutionStart,
+					effectiveThinking,
+				);
+			else this.sessionManager.assertLegacyMutationAllowed("set thinking level");
+		}
+		const applyResolution = (model: Model | undefined): Model => {
+			if (activeIndex > resolutionStart) {
+				this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+			} else {
+				controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+			}
+			if (!model) throw new Error(this.#fallbackExhaustionError(controller));
+			return model;
+		};
+		if (!committedThinking) {
+			const model = applyResolution(resolution.model);
+			const previousEditMode = this.#resolveActiveEditMode();
+			this.#setModelAuthoritatively(model, "restore");
+			this.setThinkingLevel(thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			return;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		try {
+			this.#setModelAuthoritatively(applyResolution(resolution.model), "restore");
+			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
+		} catch (error) {
+			return this.#failClosedSharedControl("set thinking level for default fallback", committedThinking, error);
+		}
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/**
+	 * Publish the thinking entry a default-fallback switch implies, at this opener's cursor
+	 * and before any fallback state or live model changes. Bound to the controller position,
+	 * live model, thinking revision and session identity it was resolved against.
+	 */
+	async #publishSharedFallbackThinking(
+		controller: FallbackChainController,
+		resolutionStart: number,
+		level: ThinkingLevel | undefined,
+	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
+		const operation = "set thinking level for default fallback";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const model = this.model;
+		const thinkingLevel = this.#thinkingLevel;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === model &&
+				this.#thinkingLevel === thinkingLevel &&
+				this.#thinkingLevelMutationRevision === thinkingRevision &&
+				this.#defaultFallbackController === controller &&
+				controller.activeIndex === resolutionStart
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() =>
+				manager.appendControlEntriesSharingSession(
+					[{ type: "thinking_level_change", level, operatorIntent: false }],
+					current,
+				),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return outcome;
 	}
 
 	/**
