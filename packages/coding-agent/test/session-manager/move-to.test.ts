@@ -14,6 +14,7 @@ import * as native from "@gajae-code/natives";
 import { getConfigRootDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { resolveManagedScope } from "../../src/sdk/session-readonly/scope";
 import { makeAssistantMessage } from "./helpers";
+import { injectManagedAppendPreCommit } from "./managed-failure-injection";
 
 function forceImmediateNativeCleanup(): () => void {
 	const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
@@ -410,6 +411,64 @@ describe("SessionManager.moveTo", () => {
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
+	});
+
+	it("advances the transcript incarnation when an explicit session moves into managed storage", async () => {
+		const explicitPath = path.join(cwdA, "explicit-session-committed.jsonl");
+		const session = await SessionManager.open(explicitPath);
+		const identity = session.getSessionIdentityGeneration();
+		const lineage = session.getTranscriptLineageId();
+
+		await session.moveTo(cwdB);
+
+		// The committed move re-roots the transcript, so state queued against the explicit source
+		// path must not publish into the managed destination.
+		const moved = session.getTranscriptLineageId();
+		expect(moved).not.toBe(lineage);
+		// It adopts no other transcript, and re-selecting the file it now writes is not an adoption.
+		expect(session.getSessionIdentityGeneration()).toBe(identity);
+		await session.setSessionFile(session.getSessionFile()!);
+		expect(session.getTranscriptLineageId()).toBe(moved);
+		expect(session.getSessionIdentityGeneration()).toBe(identity);
+	});
+
+	it("advances the transcript incarnation when a metadata failure retains a managed destination", async () => {
+		// An explicit file source has no managed rollback available, so a failed cwd metadata patch
+		// retains the already-published managed destination instead of restoring the source.
+		const explicitPath = path.join(cwdA, "explicit-session-retained.jsonl");
+		const session = await SessionManager.open(explicitPath);
+		// Initialize the recorded identity before the move: leaving it on the explicit path would make
+		// re-selecting the retained file look like an adoption of a different transcript.
+		const identity = session.getSessionIdentityGeneration();
+		const lineage = session.getTranscriptLineageId();
+		const destinationCwd = path.resolve(cwdB);
+		let injected = false;
+		const injection = injectManagedAppendPreCommit((_file, data) => {
+			if (injected || !Buffer.from(data).toString("utf8").includes(destinationCwd)) return "passthrough";
+			injected = true;
+			return { ok: false, code: "io_error" };
+		});
+		try {
+			await expect(session.moveTo(cwdB)).rejects.toThrow("io_error");
+		} finally {
+			injection.restore();
+		}
+		injection.assertHit();
+
+		// The destination stays adopted, so it must not report the predecessor incarnation.
+		expect(session.getCwd()).toBe(destinationCwd);
+		const retainedFile = session.getSessionFile();
+		if (!retainedFile) throw new Error("Expected the retained destination session file");
+		expect(retainedFile).toBe(path.join(getSessionsDir(), managedDirectoryName(cwdB), path.basename(explicitPath)));
+		expect(fs.existsSync(retainedFile)).toBe(true);
+		expect(fs.existsSync(explicitPath)).toBe(false);
+		const moved = session.getTranscriptLineageId();
+		expect(moved).not.toBe(lineage);
+		// The recorded identity was rebased onto the retained path, so the reselection is a no-op.
+		expect(session.getSessionIdentityGeneration()).toBe(identity);
+		await session.setSessionFile(retainedFile);
+		expect(session.getSessionIdentityGeneration()).toBe(identity);
+		expect(session.getTranscriptLineageId()).toBe(moved);
 	});
 
 	it("moves artifact dir independently when session file does not exist", async () => {

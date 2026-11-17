@@ -12942,6 +12942,9 @@ export class SessionManager {
 		else this.#managedPersistExpectedIdentity = undefined;
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
+		// Set only when the metadata patch failed while the already-published destination is kept.
+		// Wrapped so a thrown `undefined` still counts as a retained-destination outcome.
+		let retainedMetadataFailure: { error: unknown } | undefined;
 		try {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
@@ -12954,6 +12957,7 @@ export class SessionManager {
 			}
 		} catch (error) {
 			residentTransition?.dispose();
+			residentTransition = undefined;
 			await this.#closePersistWriter().catch(() => {});
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
@@ -13000,19 +13004,31 @@ export class SessionManager {
 			// back over the source after a metadata failure.
 			this.#managedTranscriptStoreCache = null;
 			this.#headerExportRevision++;
-			await this.#runAfterMoveListeners(moveDetails);
-			throw error;
+			retainedMetadataFailure = { error };
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
 
-		// The move is committed: cwd, session directory, and the transcript location all moved
-		// while the logical session id stayed the same, so state queued against the predecessor
-		// location must not publish into the destination. Advancing only here is what keeps a
-		// rolled-back attempt (which restored every one of those fields) on its predecessor
-		// lineage. The recorded identity follows the new path without an identity change: a cwd
-		// move adopts no other transcript, so the next no-op re-selection must not read as one.
-		this.#transcriptLineageIncarnation++;
-		this.#rebaseCommittedIdentity();
+		// The move is adopted whenever cwd and the transcript location ended in the destination: a
+		// successful metadata patch is not the only such outcome, because a failed one keeps the
+		// already-published destination instead of moving it back. An adopted destination must
+		// advance the incarnation, since state queued against the predecessor location must not
+		// publish into it; only a rolled-back attempt restored every field, and only it keeps the
+		// predecessor lineage current. Reading the outcome back from that state instead of flagging
+		// the success path means a retention outcome cannot skip the commit and a restore outcome
+		// cannot inherit it. The recorded identity then follows the new path without an identity
+		// change: a cwd move adopts no other transcript, so the next no-op re-selection must not
+		// read as one.
+		if (this.cwd === resolvedCwd && this.#sessionFile === nextSessionFile) {
+			this.#transcriptLineageIncarnation++;
+			this.#rebaseCommittedIdentity();
+		}
+
+		if (retainedMetadataFailure) {
+			// Every surface still rebinds to the adopted destination before the durability failure is
+			// reported; a failed metadata patch is not a reason to skip the rebinding.
+			await this.#runAfterMoveListeners(moveDetails);
+			throw retainedMetadataFailure.error;
+		}
 
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
@@ -18149,8 +18165,7 @@ export class SessionManager {
 		// recorded pair is deliberately stale there and comparing against it would report an
 		// advance for a re-selection that changed nothing. Callers capture the lineage before an
 		// adoption, so this must keep naming the predecessor until the adoption actually commits.
-		if (previousId !== this.#sessionId || previousFile !== this.#sessionFile)
-			this.#transcriptLineageIncarnation++;
+		if (previousId !== this.#sessionId || previousFile !== this.#sessionFile) this.#transcriptLineageIncarnation++;
 	}
 
 	/**
