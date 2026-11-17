@@ -458,6 +458,16 @@ describe("opted-in managed shared compaction control", () => {
 			expect(outcome.error).toBe(failure);
 			expect((await Bun.file(file).text()).split('"type":"compaction"')).toHaveLength(2);
 			expect(session.agent.state.messages.some(message => message.role === "compactionSummary")).toBe(false);
+			// The compaction is durable while live context was never compacted: the session
+			// is closed with the exact receipt, and the next prompt cannot run on it.
+			const next = session.prompt("after an uncertain compaction");
+			await expect(next).rejects.toMatchObject({
+				name: "SharedSessionClosedError",
+				code: "shared_session_closed",
+				receipt: { publication: "entries", outcome: { kind: "unknown", ids: [outcome.id], error: failure } },
+			});
+			sessions.splice(sessions.indexOf(session), 1);
+			await expect(session.dispose()).rejects.toThrow("Session disposal did not reach a terminal state");
 		});
 	}
 

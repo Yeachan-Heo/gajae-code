@@ -2054,17 +2054,45 @@ export type SharedAppendOutcome =
 	| { readonly kind: "rejected"; readonly error: unknown };
 
 /**
- * What reconciliation proved about an `unknown` shared append.
+ * What reconciliation proved about the attempted IDs of an `unknown` shared append batch.
  *
- * `committed` means the attempted entry is durably in the transcript. `absent` means
- * neither the transcript nor the resident graph holds it, so a retry cannot duplicate it.
- * `unresolved` means the entry may already be durable and the transcript could not be
- * read to decide; such an entry must not be resubmitted blindly.
+ * `committed` means every attempted entry is durably in the transcript. `absent` means
+ * neither the transcript nor the resident graph holds any of them, so a retry cannot
+ * duplicate them. `partial` means some of the batch is durable and the rest is provably
+ * absent: the batch did not apply as a unit. `unresolved` means at least one entry may
+ * already be durable and the transcript could not decide; such entries must not be
+ * resubmitted blindly.
  */
 export type SharedAppendReconciliation =
-	| { readonly kind: "committed"; readonly id: string }
-	| { readonly kind: "absent" }
-	| { readonly kind: "unresolved"; readonly id: string; readonly error: unknown };
+	| { readonly kind: "committed"; readonly ids: readonly string[] }
+	| { readonly kind: "absent"; readonly ids: readonly string[] }
+	| { readonly kind: "partial"; readonly committed: readonly string[]; readonly absent: readonly string[] }
+	| { readonly kind: "unresolved"; readonly ids: readonly string[]; readonly error: unknown };
+
+/**
+ * The exact receipt of a shared publication whose durability could not be proven.
+ *
+ * Every shared publication kind - canonical and custom entries, compaction, controls,
+ * title and star patches - retains its receipt here when its outcome is `unknown`. The
+ * manager latches persistence on it, so no later publication can build on a transcript
+ * state this opener does not know, and the session that owns the manager closes ingress.
+ */
+export type SharedPublicationUncertainty =
+	| { readonly publication: "entries"; readonly outcome: Extract<SharedEntriesAppendOutcome, { kind: "unknown" }> }
+	| { readonly publication: "title"; readonly outcome: Extract<SharedTitleOutcome, { kind: "unknown" }> }
+	| { readonly publication: "star"; readonly outcome: Extract<SharedStarOutcome, { kind: "unknown" }> };
+
+/** The persistence latch for a shared publication with an unknown outcome; carries the full receipt. */
+export class SharedPublicationUnknownError extends Error {
+	readonly code = "shared_publication_unknown";
+	constructor(
+		message: string,
+		readonly uncertainty: SharedPublicationUncertainty,
+	) {
+		super(message, { cause: uncertainty.outcome });
+		this.name = "SharedPublicationUnknownError";
+	}
+}
 
 /**
  * What a writable open did about pending migration.
@@ -13179,6 +13207,25 @@ export class SessionManager {
 	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
 	}
+
+	/** The retained receipt of the shared publication that latched persistence with an unknown outcome. */
+	getUnknownSharedPublication(): SharedPublicationUncertainty | undefined {
+		return this.#persistError instanceof SharedPublicationUnknownError ? this.#persistError.uncertainty : undefined;
+	}
+
+	/**
+	 * The single latch for every shared publication kind whose outcome is `unknown`.
+	 *
+	 * Replaces any raw failure an inner write already latched, so persistence - and a
+	 * strict close - carries the full receipt rather than a partial cause. Later shared
+	 * publications report `stale: persistence_latched` and legacy writers rethrow it.
+	 */
+	#latchUnknownSharedPublication(message: string, uncertainty: SharedPublicationUncertainty): void {
+		const retained = new SharedPublicationUnknownError(message, uncertainty);
+		if (this.#persistError) this.#persistError = retained;
+		else this.#recordPersistError(retained);
+	}
+
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
 		if (!this.#persistError) this.#persistError = normalized;
@@ -19167,7 +19214,7 @@ export class SessionManager {
 			let priorCommittedDigest: string | undefined;
 			let receipt: ManagedAppendReceipt | undefined;
 			const retainUnknown = (error: unknown): SharedStarOutcome => {
-				const outcome: SharedStarOutcome = {
+				const outcome: Extract<SharedStarOutcome, { kind: "unknown" }> = {
 					kind: "unknown",
 					sessionId,
 					starred,
@@ -19175,9 +19222,10 @@ export class SessionManager {
 					receipt,
 					error,
 				};
-				this.#recordPersistError(
-					new Error("Shared session star publication outcome is unknown", { cause: outcome }),
-				);
+				this.#latchUnknownSharedPublication("Shared session star publication outcome is unknown", {
+					publication: "star",
+					outcome,
+				});
 				return outcome;
 			};
 			let result: SharedStarOutcome;
@@ -19724,9 +19772,8 @@ export class SessionManager {
 			let predecessorIdentity: ManagedFileIdentity | undefined;
 			let priorCommittedDigest: string | undefined;
 			let receipt: ManagedAppendReceipt | undefined;
-			let retainedFailure: Error | undefined;
 			const retainUnknown = (error: unknown): SharedTitleOutcome => {
-				const outcome: SharedTitleOutcome = {
+				const outcome: Extract<SharedTitleOutcome, { kind: "unknown" }> = {
 					kind: "unknown",
 					sessionId,
 					patch,
@@ -19734,11 +19781,10 @@ export class SessionManager {
 					receipt,
 					error,
 				};
-				if (retainedFailure) retainedFailure.cause = outcome;
-				else {
-					retainedFailure = new Error("Shared session title publication outcome is unknown", { cause: outcome });
-					this.#recordPersistError(retainedFailure);
-				}
+				this.#latchUnknownSharedPublication("Shared session title publication outcome is unknown", {
+					publication: "title",
+					outcome,
+				});
 				return outcome;
 			};
 			try {
@@ -21171,13 +21217,14 @@ export class SessionManager {
 		let attempted = 0;
 		const unknown = (error: unknown): SharedEntriesAppendOutcome => {
 			const outcome = { kind: "unknown" as const, ids: [...ids], error };
-			if (controlOperation) {
-				const retained = new Error("Shared control publication outcome is unknown", { cause: outcome });
-				// A synchronous append may already have latched the raw failure. Retain
-				// it in the outcome and preserve the full operation receipt on close.
-				if (this.#persistError) this.#persistError = retained;
-				else this.#recordPersistError(retained);
-			}
+			// A synchronous append may already have latched the raw failure. Retain it in the
+			// outcome and preserve the full receipt on the latch and on close.
+			this.#latchUnknownSharedPublication(
+				controlOperation
+					? "Shared control publication outcome is unknown"
+					: "Shared entry publication outcome is unknown",
+				{ publication: "entries", outcome },
+			);
 			return outcome;
 		};
 		const allocateIds = () => {
@@ -21440,48 +21487,54 @@ export class SessionManager {
 	}
 
 	/**
-	 * Decide an `unknown` shared append before anyone retries or reports it.
+	 * Decide the attempted IDs of an `unknown` shared append before anyone retries or
+	 * reports it. A multi-entry publication (a control batch, a tool-selection pair) is
+	 * reconciled as the batch it was: per ID, and as a whole.
 	 *
-	 * `unknown` is not "not persisted": the entry can be committed before the failure that
+	 * `unknown` is not "not persisted": an entry can be committed before the failure that
 	 * produced the outcome (post-write snapshot verification, transaction release, a
 	 * superseded publication), and it can still be resident here unpublished. A blind retry
 	 * can therefore duplicate it, and a failure report can be wrong.
 	 *
-	 * `absent` is only returned once both the committed transcript and this manager's
-	 * resident graph are known not to hold the entry. Any read or publish failure after that
-	 * point is `unresolved`, which callers must hold rather than resubmit.
+	 * An ID is only absent once both the committed transcript and this manager's resident
+	 * graph are known not to hold it. Any read or publish failure after that point is
+	 * `unresolved`, which callers must hold rather than resubmit.
 	 */
-	async reconcileUnknownSharedAppend(id: string, error: unknown): Promise<SharedAppendReconciliation> {
-		const durable = (candidate: CommittedTranscriptRead): boolean =>
-			candidate.kind === "snapshot" &&
-			candidate.snapshot.sessionId === this.#sessionId &&
-			candidate.snapshot.entryIds.includes(id);
+	async reconcileUnknownSharedAppends(
+		attempted: readonly string[],
+		error: unknown,
+	): Promise<SharedAppendReconciliation> {
+		const ids = [...attempted];
+		const durableIn = (candidate: CommittedTranscriptRead): ReadonlySet<string> | undefined =>
+			candidate.kind === "snapshot" && candidate.snapshot.sessionId === this.#sessionId
+				? new Set(candidate.snapshot.entryIds.filter(id => ids.includes(id)))
+				: undefined;
 		let read: CommittedTranscriptRead;
 		try {
 			read = await this.captureCommittedSnapshot();
 		} catch (cause) {
-			return { kind: "unresolved", id, error: cause };
+			return { kind: "unresolved", ids, error: cause };
 		}
-		if (durable(read)) return { kind: "committed", id };
-		if (this.#byId.has(id)) {
-			// The entry was staged in this process but its publication was not proven.
-			// Publish the pending bytes and re-verify; never append it a second time.
+		let durable = durableIn(read);
+		if (durable?.size === ids.length) return { kind: "committed", ids };
+		if (ids.some(id => !durable?.has(id) && this.#byId.has(id))) {
+			// Part of the batch was staged in this process but its publication was not proven.
+			// Publish the pending bytes and re-verify; never append an entry a second time.
 			try {
 				await this.flush();
+				read = await this.captureCommittedSnapshot();
 			} catch (cause) {
-				return { kind: "unresolved", id, error: cause };
+				return { kind: "unresolved", ids, error: cause };
 			}
-			let after: CommittedTranscriptRead;
-			try {
-				after = await this.captureCommittedSnapshot();
-			} catch (cause) {
-				return { kind: "unresolved", id, error: cause };
-			}
-			return durable(after) ? { kind: "committed", id } : { kind: "unresolved", id, error };
+			durable = durableIn(read);
+			if (durable?.size === ids.length) return { kind: "committed", ids };
+			// A resident entry the re-read still does not show is neither durable nor absent.
+			if (ids.some(id => !durable?.has(id) && this.#byId.has(id))) return { kind: "unresolved", ids, error };
 		}
-		if (read.kind === "absent") return { kind: "absent" };
-		if (read.kind === "snapshot" && read.snapshot.sessionId === this.#sessionId) return { kind: "absent" };
-		return { kind: "unresolved", id, error };
+		if (read.kind !== "absent" && durable === undefined) return { kind: "unresolved", ids, error };
+		const committed = ids.filter(id => durable?.has(id));
+		if (committed.length === 0) return { kind: "absent", ids };
+		return { kind: "partial", committed, absent: ids.filter(id => !durable?.has(id)) };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */

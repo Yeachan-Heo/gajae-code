@@ -603,6 +603,7 @@ import type {
 	SharedAppendReconciliation,
 	SharedControlEntry,
 	SharedEntriesAppendOutcome,
+	SharedPublicationUncertainty,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -967,6 +968,63 @@ function sharedControlPublicationMessage(operation: string, outcome: SharedEntri
 		case "committed":
 			return `The change (${operation}) was saved to the session history but could not be applied here. The session was closed; reopen it to continue.`;
 	}
+}
+
+/**
+ * What closed a session's ingress: the exact receipt of a shared publication whose
+ * durability could not be proven, or of a committed control this session could not apply.
+ */
+export type SharedSessionClosureReceipt =
+	| SharedPublicationUncertainty
+	| { readonly publication: "entries"; readonly outcome: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> };
+
+/**
+ * Ingress refusal for a session closed after a shared publication it could not reconcile
+ * with its live state (#7824). Every later prompt, control, or command that enters the
+ * session reports this - with the exact receipt and the reopen command - instead of
+ * `busy` or a stale-persistence failure.
+ */
+export class SharedSessionClosedError extends Error {
+	readonly code = "shared_session_closed";
+
+	constructor(
+		readonly operation: string,
+		readonly sessionId: string,
+		readonly receipt: SharedSessionClosureReceipt,
+		publicationCause?: unknown,
+	) {
+		const what =
+			receipt.outcome.kind === "committed"
+				? `${operation} was saved to its shared history but could not be applied here`
+				: `${operation} could not be confirmed in its shared history`;
+		super(
+			`Session ${sessionId} is closed: ${what}. Its history on disk is authoritative. Restart with \`gjc --resume ${sessionId}\`, or pick it with /resume in another gjc session, to continue from the saved history.`,
+			{ cause: publicationCause ?? receipt.outcome },
+		);
+		this.name = "SharedSessionClosedError";
+	}
+}
+
+function sharedPublicationUncertaintyOperation(uncertainty: SharedPublicationUncertainty): string {
+	switch (uncertainty.publication) {
+		case "title":
+			return "the session title change";
+		case "star":
+			return "the session star change";
+		case "entries":
+			return `the session write (entries ${uncertainty.outcome.ids.join(", ") || "none"})`;
+	}
+}
+
+function isUnknownSharedAppendOutcome(value: unknown): value is Extract<SharedAppendOutcome, { kind: "unknown" }> {
+	return (
+		value !== null &&
+		typeof value === "object" &&
+		"kind" in value &&
+		value.kind === "unknown" &&
+		"id" in value &&
+		typeof value.id === "string"
+	);
 }
 
 class SharedCompactionPublicationError extends Error {
@@ -5139,6 +5197,9 @@ export class AgentSession {
 		}
 	}
 
+	/** Set once by {@link #closeSharedSession}; refuses every later ingress. */
+	#sharedSessionClosure: SharedSessionClosedError | undefined;
+
 	#sessionAdmissionBusyError(): AgentBusyError {
 		return Object.assign(new AgentBusyError("Agent session admission is busy due to same-session reentrancy."), {
 			code: "busy",
@@ -5146,6 +5207,7 @@ export class AgentSession {
 	}
 
 	#assertSessionAdmissionOpen(): void {
+		this.#assertSharedSessionOpen();
 		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
 			throw this.#sessionAdmissionBusyError();
 		}
@@ -17149,10 +17211,17 @@ export class AgentSession {
 			observationId,
 		);
 		if (outcome.kind !== "committed") {
-			throw new Error(
+			const error = new Error(
 				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 				{ cause: outcome },
 			);
+			if (outcome.kind === "unknown")
+				throw this.#closeSharedSessionForUncertainty(
+					`the ${customType} custom message`,
+					{ publication: "entries", outcome: { kind: "unknown", ids: [outcome.id], error: outcome.error } },
+					error,
+				);
+			throw error;
 		}
 		return outcome.id;
 	}
@@ -17320,7 +17389,11 @@ export class AgentSession {
 				if (outcome.kind === "committed") return { committed: true };
 				const cause = describeSharedAppendFailure(outcome);
 				if (outcome.kind === "unknown") {
-					const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
+					// The manager latched this receipt: no later write can build on it, so the
+					// session closes now rather than at its next ingress.
+					const latched = this.sessionManager.getUnknownSharedPublication();
+					if (latched) this.#closeSharedSession(`the ${operation}`, latched);
+					const reconciled = await this.sessionManager.reconcileUnknownSharedAppends([outcome.id], outcome.error);
 					if (reconciled.kind === "committed") return { committed: true };
 					if (reconciled.kind === "unresolved") {
 						const reason = `${cause.reason ?? cause.outcome}; durability could not be confirmed or disproved`;
@@ -17534,7 +17607,7 @@ export class AgentSession {
 		return await this.#trackBackgroundPublication(
 			this.#withCanonicalSchedulingLane(async () => {
 				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
-				return await this.sessionManager.reconcileUnknownSharedAppend(entryId, error);
+				return await this.sessionManager.reconcileUnknownSharedAppends([entryId], error);
 			}),
 		);
 	}
@@ -17546,9 +17619,19 @@ export class AgentSession {
 	 * underlying cause is logged here instead, where the operation that failed is known.
 	 */
 	#abortRunForPublicationFailure(operation: string, error: unknown): never {
+		// The publication already closed the session and aborted the run.
+		if (error instanceof SharedSessionClosedError) throw error;
 		// The thrown wrapper keeps the publication outcome as its cause; surface the
 		// underlying refusal so the log names why the append was rejected.
 		const refusal = error instanceof Error ? error.cause : undefined;
+		// An unknown outcome is not a refusal: the entry may be durable while this run
+		// treats it as failed, so the next prompt would build on a diverged history.
+		if (isUnknownSharedAppendOutcome(refusal))
+			throw this.#closeSharedSessionForUncertainty(
+				`the ${operation}`,
+				{ publication: "entries", outcome: { kind: "unknown", ids: [refusal.id], error: refusal.error } },
+				error,
+			);
 		const underlying =
 			refusal !== null && typeof refusal === "object" && "error" in refusal
 				? refusal.error instanceof Error
@@ -22475,6 +22558,11 @@ export class AgentSession {
 				);
 				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
 				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
+				if (outcome.kind === "unknown")
+					throw this.#closeSharedSessionForUncertainty("the generated session title", {
+						publication: "title",
+						outcome,
+					});
 				throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
 			}
 			const applied = await manager.setSessionName(title, "auto", {
@@ -22515,6 +22603,8 @@ export class AgentSession {
 		);
 		if (outcome.kind === "committed") return true;
 		if (outcome.kind === "skipped") return false;
+		if (outcome.kind === "unknown")
+			throw this.#closeSharedSessionForUncertainty("the session title change", { publication: "title", outcome });
 		throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
 	}
 
@@ -26718,6 +26808,7 @@ export class AgentSession {
 		operation: SharedControlPublicationError["operation"],
 		resolveIntent: () => { serviceTier: ServiceTier | undefined; rearm: boolean },
 	): Promise<boolean> {
+		this.#assertSharedSessionOpen();
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
 		const managerId = manager.getSessionId();
@@ -26742,6 +26833,7 @@ export class AgentSession {
 			manager.getSessionIdentityGeneration() === identity &&
 			this.#usesSharedSessionPublication();
 		const assertCurrent = () => {
+			this.#assertSharedSessionOpen();
 			if (!current())
 				throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
 		};
@@ -27313,8 +27405,20 @@ export class AgentSession {
 			},
 			() => owner.manager.appendCompactionSharingSession(payload, owner.current),
 		).then(outcome => {
-			if (outcome.kind !== "committed") throw new SharedCompactionPublicationError(outcome);
-			return outcome.id;
+			if (outcome.kind === "committed") return outcome.id;
+			const error = new SharedCompactionPublicationError(outcome);
+			// The compaction entry may be durable while live context was never compacted:
+			// close instead of letting the next turn run on a diverged history.
+			if (outcome.kind === "unknown")
+				this.#closeSharedSessionForUncertainty(
+					"the compaction",
+					{
+						publication: "entries",
+						outcome: { kind: "unknown", ids: [outcome.id], error: outcome.error },
+					},
+					error,
+				);
+			throw error;
 		});
 	}
 
@@ -32966,6 +33070,7 @@ export class AgentSession {
 		const manager = this.sessionManager;
 		const shared = this.#usesSharedSessionPublication();
 		const assertMode = () => {
+			this.#assertSharedSessionOpen();
 			if (this.sessionManager !== manager || this.#usesSharedSessionPublication() !== shared)
 				throw new SharedControlPublicationError(operation, {
 					kind: "rejected",
@@ -33016,13 +33121,68 @@ export class AgentSession {
 		outcome: Extract<SharedEntriesAppendOutcome, { kind: "committed" | "unknown" }>,
 		cause?: unknown,
 	): never {
-		void this.dispose().catch(() => {
-			logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed", operation });
+		const error = new SharedControlPublicationError(operation, outcome, cause);
+		if (outcome.kind === "unknown")
+			this.#closeSharedSessionForUncertainty(operation, { publication: "entries", outcome }, error);
+		else this.#closeSharedSession(operation, { publication: "entries", outcome }, error);
+		throw error;
+	}
+
+	/**
+	 * Close ingress for a shared publication this session cannot reconcile with its live
+	 * state. The single closure for every shared publication kind: canonical and custom
+	 * entries, compaction, controls, title, and star.
+	 *
+	 * The exact receipt is retained; nothing is retried or compensated. The run is aborted
+	 * and the session torn down, and every later ingress throws the returned
+	 * {@link SharedSessionClosedError}. The first closure wins.
+	 */
+	#closeSharedSession(
+		operation: string,
+		receipt: SharedSessionClosureReceipt,
+		cause?: unknown,
+	): SharedSessionClosedError {
+		if (this.#sharedSessionClosure) return this.#sharedSessionClosure;
+		const closure = new SharedSessionClosedError(operation, this.sessionManager.getSessionId(), receipt, cause);
+		this.#sharedSessionClosure = closure;
+		logger.warn("Shared session closed after an unreconciled publication", {
+			code: closure.code,
+			operation,
+			sessionId: closure.sessionId,
+			publication: receipt.publication,
+			outcome: receipt.outcome.kind,
 		});
-		throw new SharedControlPublicationError(operation, outcome, cause);
+		this.agent.abort();
+		void this.dispose().catch(() => {
+			logger.warn("Shared session teardown failed", { code: "shared_session_teardown_failed", operation });
+		});
+		return closure;
+	}
+
+	/** Close on an unknown outcome, preferring the exact receipt the manager latched. */
+	#closeSharedSessionForUncertainty(
+		operation: string,
+		observed: SharedPublicationUncertainty,
+		cause?: unknown,
+	): SharedSessionClosedError {
+		return this.#closeSharedSession(operation, this.sessionManager.getUnknownSharedPublication() ?? observed, cause);
+	}
+
+	/**
+	 * Refuse ingress into a closed shared session. A manager that latched an unknown
+	 * publication outside an AgentSession call site (a slash-command star, a background
+	 * publication) closes the session here, before the next prompt, control, or command
+	 * has any effect.
+	 */
+	#assertSharedSessionOpen(): void {
+		if (this.#sharedSessionClosure) throw this.#sharedSessionClosure;
+		const uncertainty = this.sessionManager.getUnknownSharedPublication();
+		if (uncertainty)
+			throw this.#closeSharedSession(sharedPublicationUncertaintyOperation(uncertainty), uncertainty);
 	}
 
 	async #withStartedSharedControlPublication<T>(assertCurrent: () => void, publish: () => Promise<T>): Promise<T> {
+		this.#assertSharedSessionOpen();
 		// A publication waiting for a thinking group must not become its predecessor.
 		while (this.#thinkingControlAdmissionGroup) {
 			const group = this.#thinkingControlAdmissionGroup;
@@ -33719,7 +33879,7 @@ export class AgentSession {
 						superseded = true;
 						break;
 					}
-					reconciled = { kind: "unresolved", id: pending.unresolved.entryId, error };
+					reconciled = { kind: "unresolved", ids: [pending.unresolved.entryId], error };
 					errors.push(error);
 				}
 				if (reconciled.kind === "committed") {
@@ -33737,7 +33897,7 @@ export class AgentSession {
 				if (reconciled.kind === "unresolved") {
 					// Still undecided: retain the row, surface the uncertainty, append nothing.
 					pending.unresolved = {
-						entryId: reconciled.id,
+						entryId: pending.unresolved.entryId,
 						reason: pending.unresolved.reason,
 						error: reconciled.error,
 					};

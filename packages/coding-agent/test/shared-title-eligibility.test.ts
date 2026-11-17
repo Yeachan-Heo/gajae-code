@@ -880,18 +880,44 @@ describe("shared publication admission split", () => {
 		const f = await fixture();
 		const committed = await f.manager.appendMessageSharingSession(user("durable entry"));
 		if (committed.kind !== "committed") throw new Error(committed.kind);
-		expect(await f.manager.reconcileUnknownSharedAppend(committed.id, new Error("release failed"))).toEqual({
+		expect(await f.manager.reconcileUnknownSharedAppends([committed.id], new Error("release failed"))).toEqual({
 			kind: "committed",
-			id: committed.id,
+			ids: [committed.id],
 		});
-		expect(await f.manager.reconcileUnknownSharedAppend("never-written-entry", new Error("release failed"))).toEqual({
+		expect(
+			await f.manager.reconcileUnknownSharedAppends(["never-written-entry"], new Error("release failed")),
+		).toEqual({
 			kind: "absent",
+			ids: ["never-written-entry"],
 		});
 		vi.spyOn(f.manager, "captureCommittedSnapshot").mockRejectedValue(new Error("transcript read failed"));
-		expect(await f.manager.reconcileUnknownSharedAppend("never-written-entry", new Error("release failed"))).toEqual({
+		expect(
+			await f.manager.reconcileUnknownSharedAppends(["never-written-entry"], new Error("release failed")),
+		).toEqual({
 			kind: "unresolved",
-			id: "never-written-entry",
+			ids: ["never-written-entry"],
 			error: expect.any(Error),
+		});
+	});
+
+	it("reconciles a multi-entry unknown append as a complete or partial batch, never as one joined id", async () => {
+		const f = await fixture();
+		const first = await f.manager.appendMessageSharingSession(user("durable first"));
+		const second = await f.manager.appendMessageSharingSession(user("durable second"));
+		if (first.kind !== "committed" || second.kind !== "committed") throw new Error("fixture append");
+		const failure = new Error("release failed");
+		expect(await f.manager.reconcileUnknownSharedAppends([first.id, second.id], failure)).toEqual({
+			kind: "committed",
+			ids: [first.id, second.id],
+		});
+		expect(await f.manager.reconcileUnknownSharedAppends([first.id, "never-written-entry"], failure)).toEqual({
+			kind: "partial",
+			committed: [first.id],
+			absent: ["never-written-entry"],
+		});
+		expect(await f.manager.reconcileUnknownSharedAppends(["never-a", "never-b"], failure)).toEqual({
+			kind: "absent",
+			ids: ["never-a", "never-b"],
 		});
 	});
 
