@@ -6011,6 +6011,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:setConfiguredModelChainForControl",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal shared-publication wrapper over profile and fallback-chain state for controls that already committed settings, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:setConfiguredModelChain",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

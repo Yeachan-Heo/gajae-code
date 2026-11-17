@@ -427,6 +427,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal receipt-bound live-state publication behind the reviewed model.profile.set seam, not an independent public SDK operation",
 	"agent_session:setThinkingLevelForSession":
 		"internal non-operator session-only thinking follow (plan mode, model assignment) over the reviewed thinking.set seam, not an independent public SDK operation",
+	"agent_session:setConfiguredModelChainForControl":
+		"internal shared-publication wrapper over profile and fallback-chain state for controls that already committed settings, not a user-facing SDK control seam",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
