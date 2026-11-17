@@ -524,6 +524,7 @@ export class DsmlToolCallHealer {
 						// Closing the outermost invocation: finalize it.
 						// Parse failures and nested invocations already marked the call.
 						this.#incomplete = this.#incomplete || this.#inParameter;
+						this.#rejectUnassignedText();
 						this.#finalizeCall();
 					}
 				}
@@ -558,6 +559,7 @@ export class DsmlToolCallHealer {
 		if (!tag.closing) {
 			// A parameter opening inside another is malformed: the call must not execute.
 			if (this.#inParameter) this.#incomplete = true;
+			else this.#rejectUnassignedText();
 			this.#inParameter = true;
 			this.#pendingParameterName = tag.name ?? "";
 			this.#pendingParameterString = tag.string !== false;
@@ -571,10 +573,22 @@ export class DsmlToolCallHealer {
 			// An observed Venice deviation closes the invoke's direct value as a
 			// parameter. Its invoke attributes describe that first parameter too.
 			this.#addArgument(this.#pendingName, this.#pendingValue, this.#pendingInvokeString);
+		} else {
+			this.#rejectUnassignedText();
 		}
 		this.#inParameter = false;
 		this.#pendingParameterName = "";
 		this.#pendingParameterString = true;
+		this.#pendingValue = "";
+	}
+
+	/**
+	 * Invocation text outside any parameter carries no argument slot. Dropping it
+	 * would execute the call without the input it represented, so non-whitespace
+	 * leftovers mark the call incomplete; formatting whitespace stays harmless.
+	 */
+	#rejectUnassignedText(): void {
+		if (this.#pendingValue.trim().length > 0) this.#incomplete = true;
 		this.#pendingValue = "";
 	}
 

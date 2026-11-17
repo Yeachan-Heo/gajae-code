@@ -1399,8 +1399,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					(name): name is string => name !== undefined,
 				);
 				const rejectAll = wireChoice.requestLevel === "none" || logicalChoice.requestedLevel === "none";
+				// Recovered calls never bypass the request's tool contract: a name the
+				// request did not offer (or any name when no tools were offered) is dropped.
+				const offeredToolNames = new Set((context.tools ?? []).map(tool => tool.name));
 				const allowedRecoveredCalls = recoveredCalls.filter(
-					call => !rejectAll && allowedNames.every(name => call.name === name),
+					call => !rejectAll && offeredToolNames.has(call.name) && allowedNames.every(name => call.name === name),
 				);
 
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");

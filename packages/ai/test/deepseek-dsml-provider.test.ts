@@ -45,9 +45,16 @@ function structured(argumentsText: string, start = true): NonNullable<Delta["too
 	];
 }
 
+const offeredTools = ["read", "write"].map(name => ({
+	name,
+	description: `${name} tool`,
+	parameters: { type: "object" as const, properties: {} },
+}));
+
 async function response(
 	deltas: Delta[],
 	options: Omit<OpenAICompletionsOptions, "apiKey"> = {},
+	offered: typeof offeredTools = offeredTools,
 ): Promise<AssistantMessage> {
 	const events = [...deltas, {}].map((delta, index) => ({
 		id: "chatcmpl-dsml",
@@ -63,7 +70,7 @@ async function response(
 	);
 	const result = await streamOpenAICompletions(
 		model,
-		{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }] },
+		{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }], tools: offered },
 		{ apiKey: "test", ...options },
 	).result();
 	expect(result.stopReason).not.toBe("error");
@@ -82,6 +89,21 @@ function text(result: AssistantMessage): string {
 }
 
 describe("DeepSeek DSML provider streaming", () => {
+	it("drops recovered calls naming a tool the request did not offer", async () => {
+		const deltas = [{ content: `${wrapperStart}${invocationStart}src/index.ts${invocationEnd}${wrapperEnd}` }];
+		expect(tools(await response(deltas))).toHaveLength(1);
+		expect(tools(await response(deltas, {}, []))).toHaveLength(0);
+		expect(
+			tools(
+				await response(
+					deltas,
+					{},
+					offeredTools.filter(tool => tool.name === "write"),
+				),
+			),
+		).toHaveLength(0);
+	});
+
 	it("recovers exactly one invocation split across three content-only deltas", async () => {
 		const result = await response([
 			{ content: `Before${wrapperStart}${invocationStart}src/` },
@@ -230,7 +252,7 @@ describe("DeepSeek DSML provider streaming", () => {
 			);
 			const result = await streamOpenAICompletions(
 				noToolChoiceModel,
-				{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }] },
+				{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }], tools: offeredTools },
 				{ apiKey: "test", toolChoice },
 			).result();
 			expect(result.stopReason).not.toBe("error");

@@ -58,6 +58,34 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(JSON.parse(calls[0].arguments)).toEqual({ path: "src/index.ts" });
 	});
 
+	it("marks an invocation incomplete when payload text sits outside any parameter", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">rm -rf /tmp/build</｜DSML｜invoke>' +
+				'<｜DSML｜invoke name="bash">echo hi<｜DSML｜parameter name="cwd" string="true">/tmp</｜DSML｜parameter></｜DSML｜invoke>' +
+				"</｜DSML｜tool_calls>",
+		);
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(2);
+		expect(calls.map(call => call.incomplete)).toEqual([true, true]);
+	});
+
+	it("keeps an empty invocation and whitespace between parameters complete", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed(
+			"<｜DSML｜tool_calls>\n" +
+				'<｜DSML｜invoke name="list">\n</｜DSML｜invoke>\n' +
+				'<｜DSML｜invoke name="read">\n  <｜DSML｜parameter name="path" string="true">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n' +
+				"</｜DSML｜tool_calls>",
+		);
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(2);
+		expect(calls.map(call => call.incomplete ?? false)).toEqual([false, false]);
+		expect(JSON.parse(calls[0].arguments)).toEqual({});
+		expect(JSON.parse(calls[1].arguments)).toEqual({ path: "a" });
+	});
+
 	it("recovers the real Venice leak including its direct _i parameter", () => {
 		const healer = new DsmlToolCallHealer();
 		const clean = healer.feed(
