@@ -11220,24 +11220,30 @@ export class AgentSession {
 				for (const map of [this.#perToolTtsrInjections, this.#perToolTtsrFolded, this.#perToolTtsrClaims]) {
 					for (const [id, bucket] of map) ownedBuckets.set(id, [...(ownedBuckets.get(id) ?? []), bucket]);
 				}
+				const releaseCarriedTtsr = () => {
+					if (this.#promptGeneration !== generation) return;
+					this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
+					for (const [id, buckets] of ownedBuckets) {
+						const live = [
+							this.#perToolTtsrInjections.get(id),
+							this.#perToolTtsrFolded.get(id),
+							this.#perToolTtsrClaims.get(id),
+						];
+						if (live.some(bucket => bucket !== undefined && buckets.includes(bucket)))
+							this.#releasePerToolTtsrInjections(id);
+					}
+				};
 				const injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
 				const details = injection ? { rules: injection.rules.map(rule => rule.name) } : undefined;
+				let publicationFailure: { error: unknown; outcome: SharedAppendFailureOutcome | undefined } | undefined;
 				if (injection && details) {
 					// Persist before any live mutation. A shared session refuses the legacy append,
 					// so publish through the admitted path like other in-turn custom messages
-					// (#7815). The retry carries the reminder live, so a refused record only warns.
+					// (#7815). Only a typed stale/rejected result proves retrying in memory is safe.
 					try {
 						await this.#appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
 					} catch (error) {
-						logger.warn("TTSR injection message could not be persisted", {
-							rules: details.rules,
-							error: error instanceof Error ? error.message : String(error),
-						});
-						this.emitNotice(
-							"warning",
-							"TTSR reminder could not be saved to the session transcript; retrying with it in memory only.",
-							"ttsr",
-						);
+						publicationFailure = { error, outcome: getSharedAppendFailureOutcome(error) };
 					}
 				}
 				// The publication awaited: an abort, dispose, or newer prompt/interrupt may have
@@ -11255,21 +11261,44 @@ export class AgentSession {
 					// A newer prompt owns the pending and per-tool state; the abort that preceded
 					// it already released this retry's claims. Same generation: release only the
 					// buckets this retry captured, still identical, and drop only its carried rules.
-					if (this.#promptGeneration === generation) {
-						this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
-						for (const [id, buckets] of ownedBuckets) {
-							const live = [
-								this.#perToolTtsrInjections.get(id),
-								this.#perToolTtsrFolded.get(id),
-								this.#perToolTtsrClaims.get(id),
-							];
-							if (live.some(bucket => bucket !== undefined && buckets.includes(bucket)))
-								this.#releasePerToolTtsrInjections(id);
-						}
-					}
+					releaseCarriedTtsr();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 					return;
+				}
+				if (publicationFailure) {
+					const { error, outcome } = publicationFailure;
+					if (outcome?.kind !== "stale" && outcome?.kind !== "rejected") {
+						const attemptedId = outcome?.kind === "unknown" ? outcome.id : undefined;
+						logger.warn("TTSR injection publication may have committed; stopping retry", {
+							rules: details?.rules,
+							outcome: outcome?.kind ?? "unclassified",
+							attemptedId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						this.emitNotice(
+							"warning",
+							attemptedId
+								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped because the reminder may already be in the session transcript.`
+								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped because the reminder may already be in the session transcript.",
+							"ttsr",
+						);
+						this.#ttsrAbortPending = false;
+						releaseCarriedTtsr();
+						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
+						return;
+					}
+					logger.warn("TTSR injection message could not be persisted", {
+						rules: details?.rules,
+						outcome: outcome.kind,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					this.emitNotice(
+						"warning",
+						"TTSR reminder could not be saved to the session transcript; retrying with it in memory only.",
+						"ttsr",
+					);
 				}
 				// Committed to the retry: the carried rules leave their pending and per-tool buckets.
 				this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
@@ -36324,6 +36353,31 @@ function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: s
 		};
 	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
 	return { outcome: outcome.kind };
+}
+
+type SharedAppendFailureOutcome = Extract<SharedAppendOutcome, { kind: "unknown" | "stale" | "rejected" }>;
+
+/** Preserve only recognized failure receipts carried by the custom-append wrapper. */
+function getSharedAppendFailureOutcome(error: unknown): SharedAppendFailureOutcome | undefined {
+	if (!(error instanceof Error)) return undefined;
+	const cause = error.cause;
+	if (cause === null || typeof cause !== "object" || Array.isArray(cause)) return undefined;
+	const record = cause as Record<string, unknown>;
+	if (record.kind === "unknown" && typeof record.id === "string" && Object.hasOwn(record, "error")) {
+		return cause as SharedAppendFailureOutcome;
+	}
+	if (
+		record.kind === "stale" &&
+		(record.reason === "transcript_moved" ||
+			record.reason === "cursor_not_committed" ||
+			record.reason === "persistence_latched" ||
+			record.reason === "rewrite_required" ||
+			record.reason === "unsupported_transcript")
+	) {
+		return cause as SharedAppendFailureOutcome;
+	}
+	if (record.kind === "rejected" && Object.hasOwn(record, "error")) return cause as SharedAppendFailureOutcome;
+	return undefined;
 }
 
 /**
