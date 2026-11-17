@@ -95,6 +95,7 @@ interface CapturedInventory {
 	result: CreateAgentSessionResult;
 	session: AgentSession;
 	manager: SessionManager;
+	managerSessionId: string;
 	binding: ExternalAdmissionTarget;
 	observation: JobObservation | undefined;
 	service: ExtensionInteractionService | undefined;
@@ -140,6 +141,9 @@ export function getEmbeddedQueuedWork(source: EmbeddedWorkSource): EmbeddedQueue
 export function getEmbeddedOwnedWork(source: EmbeddedWorkSource): EmbeddedOwnedWork {
 	const result = source.result;
 	const session = result.session;
+	// The interaction service and pending-request addresses use the transcript identity,
+	// not the provider session ID.
+	const managerSessionId = session.sessionManager.getSessionId();
 	const queued = getEmbeddedQueuedWork(source);
 	const blockers: EmbeddedWorkBlocker[] = [];
 	const targets = new Map<string, EmbeddedWorkTarget>();
@@ -201,7 +205,7 @@ export function getEmbeddedOwnedWork(source: EmbeddedWorkSource): EmbeddedOwnedW
 	else {
 		const state = interaction.service.snapshot();
 		pendingRequests =
-			state.sessionId === session.sessionId && !state.disposed
+			state.sessionId === managerSessionId && !state.disposed
 				? { status: "available", value: state.pending.map(request => request.requestId) }
 				: { status: "unavailable", reason: state.disposed ? "interaction_disposed" : "wrong_session" };
 		if (pendingRequests.status === "available")
@@ -241,6 +245,7 @@ export function getEmbeddedOwnedWork(source: EmbeddedWorkSource): EmbeddedOwnedW
 		session,
 		manager: session.sessionManager,
 		binding: { ...queued.binding },
+		managerSessionId,
 		observation,
 		service: interaction?.service,
 		connectionId: interaction?.connectionId,
@@ -261,6 +266,7 @@ function assertCurrent(source: EmbeddedWorkSource, captured: CapturedInventory):
 		result !== captured.result ||
 		session !== captured.session ||
 		session.sessionManager !== captured.manager ||
+		session.sessionManager.getSessionId() !== captured.managerSessionId ||
 		current.sessionId !== captured.binding.sessionId ||
 		current.generation !== captured.binding.generation ||
 		current.identityGeneration !== captured.binding.identityGeneration ||
@@ -275,7 +281,7 @@ function assertCurrent(source: EmbeddedWorkSource, captured: CapturedInventory):
 	if (captured.service) {
 		const interaction = captured.service.snapshot();
 		if (
-			interaction.sessionId !== captured.binding.sessionId ||
+			interaction.sessionId !== captured.managerSessionId ||
 			interaction.disposed ||
 			!interaction.connected ||
 			interaction.revision !== captured.interactionRevision
@@ -346,7 +352,7 @@ export async function cancelEmbeddedOwnedWork(
 				if (!captured.service || captured.ownership !== "owned" || !captured.connectionId)
 					return rejected("borrowed_or_unavailable_control");
 				captured.service.validateAddress({
-					sessionId: captured.binding.sessionId,
+					sessionId: captured.managerSessionId,
 					connectionId: captured.connectionId,
 					requestId: target.id,
 				});
@@ -385,7 +391,7 @@ export async function cancelEmbeddedOwnedWork(
 				}
 				case "request":
 					captured.service!.cancel({
-						sessionId: captured.binding.sessionId,
+						sessionId: captured.managerSessionId,
 						connectionId: captured.connectionId!,
 						requestId: target.id,
 					});
