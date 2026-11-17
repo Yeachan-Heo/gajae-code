@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 
 const MODE = 0o600;
+export const MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH = 512;
 
 export function brokerIdentityPath(agentDir: string): string {
 	return path.join(agentDir, "sdk", "broker.identity");
@@ -46,9 +47,26 @@ export async function deriveIdempotencyIdentity(
 	targetHash?: string,
 ): Promise<string> {
 	const key = await getBrokerIdentityKey(agentDir);
-	return createHmac("sha256", Buffer.from(key, "hex"))
-		.update(`4|${operation}|${callerKey}|${targetHash ?? ""}`)
-		.digest("hex");
+	return deriveIdentityWithKey(Buffer.from(key, "hex"), 4, operation, callerKey, targetHash);
+}
+
+function deriveIdentityWithKey(
+	key: Uint8Array,
+	version: 3 | 4,
+	operation: string,
+	callerKey: string,
+	targetHash?: string,
+): string {
+	const input = version === 3 ? `3|${operation}|${callerKey}` : `4|${operation}|${callerKey}|${targetHash ?? ""}`;
+	return createHmac("sha256", key).update(input).digest("hex");
+}
+
+/** Pure provenance check for both historical session.spawn identity formats. */
+export function deriveSpawnAnchorIdentities(key: Uint8Array, callerKey: string): readonly [string, string] {
+	return [
+		deriveIdentityWithKey(key, 3, "session.spawn", callerKey),
+		deriveIdentityWithKey(key, 4, "session.spawn", callerKey),
+	];
 }
 
 /** Native identity for an idempotency key reserved inside one managed control root. */
@@ -67,7 +85,7 @@ export async function deriveScopedIdempotencyIdentity(
 /** Identity format used by lifecycle rows written before target binding. */
 export async function deriveLegacyIdentity(agentDir: string, operation: string, callerKey: string): Promise<string> {
 	const key = await getBrokerIdentityKey(agentDir);
-	return createHmac("sha256", Buffer.from(key, "hex")).update(`3|${operation}|${callerKey}`).digest("hex");
+	return deriveIdentityWithKey(Buffer.from(key, "hex"), 3, operation, callerKey);
 }
 
 export async function deriveLegacyTargetIdentity(

@@ -11,10 +11,11 @@
 import { benchRunMetadata, type BenchRunMetadata } from "./_meta";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
+import type { AssistantMessage, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
+import { identityConverter } from "../test/helpers";
 
 const WARMUP_ITERATIONS = 20;
 const MEASURE_ITERATIONS = 100;
@@ -69,10 +70,6 @@ type BenchOutput = {
 	metadata: BenchRunMetadata;
 	fixtures: BenchSample[];
 };
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 function createUserMessage(text: string): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }] } as AgentMessage;

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,8 +7,18 @@ import { parseCrashEventLine } from "../src/crash-journal";
 import { isDesignedError, markDesignedError } from "../src/error-classification";
 import { recordHandledError, resetHandledErrorDedupeForTest } from "../src/postmortem";
 
+const trackedTempDirs: string[] = [];
+function trackedTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(() => {
+	for (const dir of trackedTempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 function handledStore(): { readonly log: string; readonly journal: string } {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-handled-error-"));
+	const dir = trackedTempDir("gjc-handled-error-");
 	return {
 		log: path.join(dir, "gjc-error.log"),
 		journal: path.join(dir, "gjc-error-events.jsonl"),

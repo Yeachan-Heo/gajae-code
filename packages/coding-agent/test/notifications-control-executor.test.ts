@@ -56,7 +56,7 @@ function fakeApi(initial: ThinkingLevel | undefined = ThinkingLevel.Off) {
 			getThinkingLevel: () => level,
 			getThinkingVisibility: () => visibility,
 			getThinkingScopeForControl: () => scope,
-			cycleThinkingLevel: () => {
+			cycleThinkingLevel: async () => {
 				cycleCalls++;
 				if (cycleResult === undefined) return undefined;
 				level = cycleResult;

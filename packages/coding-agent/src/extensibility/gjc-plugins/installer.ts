@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { compileGjcPluginBundle } from "./compiler";
 import { classifyStdioInvocation } from "./mcp-policy";
 import { gjcPluginInstallRoot, gjcPluginProjectRoot, gjcPluginSafeDirectoryName, gjcPluginUserRoot } from "./paths";
@@ -282,7 +283,7 @@ async function resolveTarball(source: string): Promise<ResolvedSource> {
 function runGit(args: string[], cwd?: string): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	// argv array (no shell) — repo/ref are passed as discrete args, not interpolated.
-	const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+	const child = spawn("git", args, { env: projectSafeSpawnEnv(), cwd, stdio: ["ignore", "pipe", "pipe"] });
 	let stdout = "";
 	child.stdout.on("data", d => {
 		stdout += d;

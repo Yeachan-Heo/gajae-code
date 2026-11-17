@@ -28,6 +28,7 @@ import type {
 	ProviderResponseMetadata,
 	SimpleStreamOptions,
 	Static,
+	StopReason,
 	TextContent,
 	Tool,
 	TSchema,
@@ -168,6 +169,8 @@ export interface ExtensionUIDialogOptions {
 		/** Empty/whitespace-only submissions may be rejected by the selector. */
 		allowEmpty?: boolean;
 	};
+	/** Local selector/editor transitions; never serialized to remote UI clients. */
+	onInputModeChange?: (mode: "selector" | "custom_editor" | "clarification_editor") => void;
 	/**
 	 * Inline free-text input for a non-answer clarification action. It is
 	 * separate from `customInput` so callers can distinguish "ask about these
@@ -311,6 +314,8 @@ export interface ExtensionUIContext {
 export interface ExtensionTranscriptEntry {
 	id: string;
 	role: string;
+	/** Authoritative assistant stop reason; absent for other roles or unknown legacy metadata. */
+	stopReason?: StopReason;
 	textSummary: string;
 	ts: string;
 	body?: string;
@@ -522,7 +527,7 @@ export interface ExtensionContext {
 	getActiveModelProfile?(): string | undefined;
 	/** Run a control-surface mutation inside the session admission boundary. */
 	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
-	cycleThinkingLevel(): ThinkingLevel | undefined;
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined>;
 	setQueueMode(kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown): boolean;
 	getSkillState(): unknown;
 	getConfigItems(): unknown;
@@ -543,7 +548,7 @@ export interface ExtensionContext {
 	getProjectProgress?(): Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
-	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
+	/** Observe live session events synchronously in producer order, without consuming queued startup fallback notices. */
 	onSessionEvent?(listener: AgentSessionEventListener): () => void;
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(
@@ -562,6 +567,8 @@ export interface ExtensionContext {
 
 	/** Typed nonvisual session controls exposed to the SDK host. */
 	sdkControl?(operation: string, input: Record<string, unknown>): unknown | Promise<unknown>;
+	/** Exact SDK-owned client services installed by this live host, not caller-supplied grants. */
+	getSdkClientControlOperations?(): readonly string[];
 	/** Install a permission callback backed by a live SDK reverse provider lease. */
 	setSdkPermissionProvider?(
 		provider:
@@ -1351,7 +1358,14 @@ export interface ExtensionAPI {
 			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
-			/** Internal SDK correlation owner for an exact queued follow-up. */
+			/**
+			 * Bind a queued steer or follow-up to one prompt run (`ctx.getActivePromptHandle()`).
+			 * A bound follow-up is consumed by that run before it stops, or removed with
+			 * `onQueuedPromoted({ removed: true })` when the run ends; it never reaches a later
+			 * run. Rejects with `code: "turn_not_active"` when that run is not active.
+			 * Feature probe for follow-ups: `pi.pi.RUN_BOUND_FOLLOW_UP === true`.
+			 */
+			expectedPromptHandle?: string | null;
 		},
 	): Promise<void>;
 
@@ -1391,7 +1405,7 @@ export interface ExtensionAPI {
 	setThinkingVisibility(visibility: "visible" | "hidden", persist?: boolean): void;
 
 	/** Cycle the current model's available thinking levels. */
-	cycleThinkingLevel(): ThinkingLevel | undefined;
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined>;
 
 	/** Set thinking level from a session or durable global control surface. */
 	setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void>;
@@ -1587,7 +1601,14 @@ export type SendUserMessageHandler = (
 		 */
 		onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 		preflightSignal?: AbortSignal;
-		/** Internal SDK correlation owner for an exact queued follow-up. */
+		/**
+		 * Bind a queued steer or follow-up to one prompt run (`ctx.getActivePromptHandle()`).
+		 * A bound follow-up is consumed by that run before it stops, or removed with
+		 * `onQueuedPromoted({ removed: true })` when the run ends; it never reaches a later
+		 * run. Rejects with `code: "turn_not_active"` when that run is not active.
+		 * Feature probe for follow-ups: `pi.pi.RUN_BOUND_FOLLOW_UP === true`.
+		 */
+		expectedPromptHandle?: string | null;
 	},
 ) => void | Promise<void>;
 
@@ -1604,7 +1625,7 @@ export type SetActiveToolsHandler = (toolNames: string[]) => Promise<void>;
 
 export type SetModelHandler = (model: Model) => Promise<boolean>;
 
-export type CycleThinkingLevelHandler = () => ThinkingLevel | undefined;
+export type CycleThinkingLevelHandler = () => Promise<ThinkingLevel | undefined>;
 
 export type SetThinkingLevelForControlHandler = (level: ThinkingLevel, persist: boolean) => Promise<void>;
 
@@ -1716,7 +1737,7 @@ export interface ExtensionContextActions {
 	) => Promise<DefaultModelProfileActivationResult>;
 	getActiveModelProfile?: () => string | undefined;
 	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
-	cycleThinkingLevel?: () => ThinkingLevel | undefined;
+	cycleThinkingLevel?: () => Promise<ThinkingLevel | undefined>;
 	setQueueMode?: (kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown) => boolean;
 	getSkillState?: () => unknown;
 	getConfigItems?: () => unknown;
@@ -1749,6 +1770,7 @@ export interface ExtensionContextActions {
 	) => void;
 	setSdkClientBridge?: (bridge: ClientBridge | undefined) => void;
 	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
+	getSdkClientControlOperations?: () => readonly string[];
 	invokeSkill?: (
 		name: string,
 		args?: string,

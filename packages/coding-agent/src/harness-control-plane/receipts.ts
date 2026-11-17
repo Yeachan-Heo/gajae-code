@@ -45,7 +45,7 @@ export interface ReceiptEnvelope<E = Record<string, unknown>> {
 
 export const RECEIPT_SCHEMA_VERSION = 1 as const;
 
-/** Deterministic stringify with sorted keys (stable hash basis). */
+/** Deterministic stringify with sorted keys (stable hash basis). Byte-identical to modes/shared/agent-wire/workflow-gate-schema.ts; kept local so this plane does not depend on agent-wire. */
 export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

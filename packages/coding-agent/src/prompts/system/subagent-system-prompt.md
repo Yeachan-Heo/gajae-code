@@ -40,6 +40,7 @@ Use `irc` to DM `0-Main` on unexpected state instead of guessing; coordinate bef
 
 [COMPLETION]
 No TODO tracking, no progress updates. Execute, call `yield`, done.
+The one exception: when you measure comparable numbers (sizes, timings, counts per variant), you MAY show them with `report_metric`. It is display-only, so the same numbers still belong in `yield`.
 
 While work remains, always continue with another tool call — investigate, edit, run, verify. Save narrative for the final `yield` payload.
 

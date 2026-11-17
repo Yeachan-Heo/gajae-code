@@ -11,7 +11,11 @@ import * as fs from "node:fs";
 import inspector from "node:inspector";
 import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
-import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
+import {
+	BROKEN_PIPE_EXIT_CODE,
+	createProcessStderrEpipeClassifier,
+	createProcessStdoutEpipeClassifier,
+} from "./broken-pipe";
 import {
 	type CrashFingerprint,
 	type CrashFingerprintInput,
@@ -53,6 +57,7 @@ let cleanupPromise: Promise<void> | undefined;
 let quietShutdownStarted = false;
 let ordinaryFatalStarted = false;
 const stdoutEpipeClassifier = createProcessStdoutEpipeClassifier();
+const stderrEpipeClassifier = createProcessStderrEpipeClassifier();
 
 function shouldSuppressCleanupLogging(quiet: boolean): boolean {
 	return quiet || quietShutdownStarted;
@@ -177,11 +182,15 @@ async function runCleanupBounded(reason: Reason, options: CleanupOptions = {}): 
 	await awaitCleanupWithDeadline(reason, options);
 }
 
-function installProcessStdoutWriteClassifier(): void {
-	const originalWrite = process.stdout.write.bind(process.stdout);
+/**
+ * Wrap a process output stream's `write` so every error it produces is marked as a direct
+ * write error of that stream before it can escape to `handleFatalError`.
+ */
+function installDirectWriteClassifier(stream: NodeJS.WriteStream, mark: (error: unknown) => void): void {
+	const originalWrite = stream.write.bind(stream);
 	const markCallback = (callback: StdoutWriteCallback): StdoutWriteCallback => {
 		return error => {
-			stdoutEpipeClassifier.markDirectProcessStdoutWriteError(error);
+			mark(error);
 			callback(error);
 		};
 	};
@@ -196,7 +205,7 @@ function installProcessStdoutWriteClassifier(): void {
 		// callback and an `unhandledRejection`) with an error object that lacks
 		// the `fd`/`syscall` fields the fallback attribution path relies on.
 		// Always attach an internal callback — even when the caller passed none —
-		// so `markDirectProcessStdoutWriteError` still runs before that async
+		// so `mark` still runs before that async
 		// rejection reaches `handleFatalError`. The synchronous `try/catch` below
 		// stays as a fallback for Bun/Node versions that still throw synchronously.
 		try {
@@ -217,12 +226,12 @@ function installProcessStdoutWriteClassifier(): void {
 						markCallback(() => {}),
 					);
 		} catch (error) {
-			stdoutEpipeClassifier.markDirectProcessStdoutWriteError(error);
+			mark(error);
 			throw error;
 		}
 	};
 
-	process.stdout.write = markedWrite as typeof process.stdout.write;
+	stream.write = markedWrite as typeof stream.write;
 }
 
 const UNREADABLE_FIELD = "[unreadable]";
@@ -709,7 +718,7 @@ function writeCrashRecord(
 	}
 }
 
-async function exitQuietlyForAttributableStdoutEpipe(reason: Reason): Promise<void> {
+async function exitQuietlyForBrokenOutputPipe(reason: Reason): Promise<void> {
 	if (ordinaryFatalStarted || quietShutdownStarted) return;
 	quietShutdownStarted = true;
 	// Set the observable status before cleanup can await or trigger another error.
@@ -720,8 +729,13 @@ async function exitQuietlyForAttributableStdoutEpipe(reason: Reason): Promise<vo
 }
 
 async function handleFatalError(label: string, reason: unknown, cleanupReason: Reason): Promise<void> {
-	if (stdoutEpipeClassifier.isAttributableProcessStdoutEpipe(reason)) {
-		await exitQuietlyForAttributableStdoutEpipe(cleanupReason);
+	// A peer-closed stdout or stderr (e.g. `gjc ... 2>&1 | head`, a closed console on
+	// Windows) is a broken output pipe, not a crash (#7790).
+	if (
+		stdoutEpipeClassifier.isAttributableProcessStdoutEpipe(reason) ||
+		stderrEpipeClassifier.isAttributableProcessStderrEpipe(reason)
+	) {
+		await exitQuietlyForBrokenOutputPipe(cleanupReason);
 		return;
 	}
 
@@ -748,7 +762,12 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 }
 
 if (isMainThread) {
-	installProcessStdoutWriteClassifier();
+	installDirectWriteClassifier(process.stdout, error =>
+		stdoutEpipeClassifier.markDirectProcessStdoutWriteError(error),
+	);
+	installDirectWriteClassifier(process.stderr, error =>
+		stderrEpipeClassifier.markDirectProcessStderrWriteError(error),
+	);
 	process
 		.on("SIGINT", async () => {
 			await runCleanupBounded(Reason.SIGINT);
@@ -794,6 +813,15 @@ if (isMainThread) {
  * Returns a Callback instance that can be used to cancel (unregister) or manually clean up.
  * If register is called after cleanup already began, invokes callback on a microtask.
  */
+/**
+ * Whether shutdown cleanup has begun for any reason (signal, fatal error, exit or
+ * manual cleanup). Signal handlers start it synchronously, so code that runs after
+ * a handled termination signal always observes it.
+ */
+export function cleanupStarted(): boolean {
+	return cleanupStage !== "idle";
+}
+
 export function register(id: string, callback: (reason: Reason) => void | Promise<void>): () => void {
 	let done = false;
 	const exec = (reason: Reason) => {

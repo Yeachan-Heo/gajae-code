@@ -3,10 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { createSlackAdapter } from "../src/sdk/bus/chat-adapters";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import { type ChatEffect, ChatEffectJournal, type ChatEffectLease } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationLockTimeoutError, ConversationStore } from "../src/sdk/bus/conversation-store";
-import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
+import { NotificationPresentationEngine } from "../src/sdk/bus/engine";
+import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
 import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackLiveProvider, SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
@@ -818,6 +820,17 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 	it("stops a root waiter promptly when the daemon shuts down during a renewed peer lease", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-shutdown-waiter-"));
 		const releasePost = Promise.withResolvers<void>();
+		let now = 1;
+		let restoreRenewalObserver: (() => void) | undefined;
+		let restoreWaiterObserver: (() => void) | undefined;
+		const observeWithinDeadline = async <T>(observation: Promise<T>): Promise<T> => {
+			const result = await Promise.race([
+				observation.then(value => ({ value })),
+				Bun.sleep(1000).then(() => undefined),
+			]);
+			if (!result) throw new Error("Root renewal/waiter observation did not progress");
+			return result.value;
+		};
 		let first: SlackNotificationDaemon | undefined;
 		let second: SlackNotificationDaemon | undefined;
 		let publisher: Promise<SlackConversation> | undefined;
@@ -832,6 +845,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
+				now: () => now,
 				publicationLeaseMs: 100,
 			};
 			first = new SlackNotificationDaemon({
@@ -847,15 +861,68 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const publisherResult = first.postRoot("session", "root");
 			publisher = publisherResult;
 			await fake.waitForPostStartCount(1);
+			const key = "T1:C1:intent:session";
+			const initialLease = await first.store.read(key);
+			if (!initialLease) throw new Error("Expected the persisted initial root lease");
+			const renewed = Promise.withResolvers<SlackConversation>();
+			const transact = first.store.transact.bind(first.store);
+			const renewalObserver = spyOn(first.store, "transact").mockImplementation(async (target, update) => {
+				try {
+					const result = await transact(target, update);
+					if (
+						target === key &&
+						result?.state === "posting_root" &&
+						result.rootPublicationOwner === "first" &&
+						(result.rootPublicationLeaseExpiresAt ?? 0) > (initialLease.rootPublicationLeaseExpiresAt ?? 0)
+					)
+						renewed.resolve(result);
+					return result;
+				} catch (error) {
+					renewed.reject(error);
+					throw error;
+				}
+			});
+			restoreRenewalObserver = () => renewalObserver.mockRestore();
+			now += 25;
+			const renewedLease = await observeWithinDeadline(renewed.promise);
+			if (initialLease.rootPublicationLeaseExpiresAt === undefined)
+				throw new Error("Expected the initial lease expiry");
+			now = initialLease.rootPublicationLeaseExpiresAt + 1;
+			expect(now).toBeLessThan(renewedLease.rootPublicationLeaseExpiresAt!);
+			const admitted = Promise.withResolvers<SlackConversation>();
+			const read = second.store.read.bind(second.store);
+			const waiterObserver = spyOn(second.store, "read").mockImplementation(async target => {
+				const record = await read(target);
+				if (
+					target === key &&
+					record?.state === "posting_root" &&
+					record.rootPublicationOwner === "first" &&
+					record.rootPublicationFence === initialLease.rootPublicationFence &&
+					record.generation > initialLease.generation &&
+					(record.rootPublicationLeaseExpiresAt ?? 0) > now
+				)
+					admitted.resolve(record);
+				return record;
+			});
+			restoreWaiterObserver = () => waiterObserver.mockRestore();
 			const waiterResult = second.notify("session", "question", "action").then(
 				() => ({ status: "fulfilled" as const }),
 				error => ({ status: "rejected" as const, error }),
 			);
 			waiter = waiterResult;
-			await Bun.sleep(50);
-			const pending = await second.store.read("T1:C1:intent:session");
-			expect(pending).toMatchObject({ state: "posting_root", rootPublicationOwner: "first" });
-			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(Date.now());
+			const observedByWaiter = await observeWithinDeadline(admitted.promise);
+			expect(observedByWaiter.rootPublicationLeaseExpiresAt).toBeGreaterThan(now);
+			// Only the daemon reads through the second store; fixture reads cannot
+			// satisfy the actual root-waiter admission barrier above.
+			const pending = await first.store.read(key);
+			expect(pending).toMatchObject({
+				state: "posting_root",
+				rootPublicationOwner: "first",
+				rootPublicationFence: initialLease.rootPublicationFence,
+			});
+			expect(pending?.generation).toBeGreaterThan(initialLease.generation);
+			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(initialLease.rootPublicationLeaseExpiresAt!);
+			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(now);
 			const waiterStillWaiting = await Promise.race([
 				waiterResult.then(() => false),
 				Bun.sleep(25).then(() => true),
@@ -880,6 +947,8 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await second?.stop();
 			if (waiter) await waiter;
 			if (publisher) await publisher;
+			restoreWaiterObserver?.();
+			restoreRenewalObserver?.();
 			await first?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
@@ -1286,6 +1355,216 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				state: "terminal",
 				payload: { threadTs: resumed.rootTs, text: "generation two notification" },
 			});
+		});
+	});
+
+	it("posts the ask root after another owner's lease ends", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-ask-lease-"));
+		let daemon: SlackNotificationDaemon | undefined;
+		try {
+			let reads = 0;
+			const fake = new FakeSlack();
+			daemon = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+				now: () => {
+					reads += 1;
+					return reads === 1 ? 1 : 50;
+				},
+				publicationLeaseMs: 10,
+				publicationOwnerId: "recovered",
+				randomId: () => "other-id",
+			});
+			const key = slackConversationKey({ teamId: "T1", channelId: "C1", rootTs: "intent:session" });
+			await daemon.store.transact(key, () => ({
+				generation: 1,
+				state: "posting_root",
+				teamId: "T1",
+				channelId: "C1",
+				sessionId: "session",
+				clientMsgId: "held-root",
+				rootPublicationOwner: "other",
+				rootPublicationLeaseExpiresAt: 40,
+				rootPublicationFence: 1,
+				endpointGeneration: 1,
+				attachmentAuthorityId: endpoint("session").authorityId,
+				updatedAt: 1,
+				seenEventIds: [],
+				seenContextIds: [],
+				seenRetryKeys: [],
+				seenInteractionIds: [],
+			}));
+			const conversation = await daemon.notify("session", "Choose /srv/prod or /srv/staging", "ask-1", 1);
+			const root = fake.posts.find(post => post.threadTs === undefined);
+			expect(root?.text).toContain("/srv/prod");
+			expect(root?.text).toContain("/srv/staging");
+			expect(root?.text).not.toContain("<path>");
+			const stored = await new ChatEffectJournal({ agentDir, transport: "slack" }).read("root:session:held-root");
+			expect(stored?.payload).toMatchObject({
+				egress: "ask",
+				text: "Choose /srv/prod or /srv/staging",
+			});
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: "notification:session:ask-replay",
+				kind: "provider-post",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					channel: "C1",
+					threadTs: conversation.rootTs,
+					text: "Choose /srv/prod or /srv/staging",
+					clientMsgId: "ask-replay",
+					attachmentAuthorityId: endpoint("session").authorityId,
+					egress: "ask",
+				},
+			});
+			await daemon.start();
+			const replayed = fake.posts.find(post => post.clientMsgId === "ask-replay");
+			expect(replayed?.text).toContain("/srv/prod");
+			expect(replayed?.text).not.toContain("<path>");
+		} finally {
+			await daemon?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps ask option paths readable when a generation rollover posts a new root", async () => {
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			await daemon.notify("session", "generation one root", undefined, 1);
+			setEndpointGeneration(2);
+			await daemon.notify("session", "Choose /srv/prod or /srv/staging", "action-1", 2);
+			const askRoot = fake.posts.find(post => post.text.includes("/srv/prod"));
+			expect(askRoot?.text).toContain("/srv/staging");
+			expect(askRoot?.text).not.toContain("<path>");
+			await daemon.postCommandResult("session", "log at /tmp/build.log");
+			expect(fake.posts.some(post => post.text === "log at /tmp/build.log")).toBe(true);
+		});
+	});
+
+	it("still allows a relative notification path", async () => {
+		await withDaemon(async (daemon, fake) => {
+			await daemon.notify("session", "see notes/todo.txt", undefined, 1);
+			expect(fake.posts.some(post => post.text === "see notes/todo.txt")).toBe(true);
+		});
+	});
+
+	it("still allows an opted-out absolute path at the provider", async () => {
+		await withDaemon(async (daemon, fake) => {
+			const engine = new NotificationPresentationEngine([createSlackAdapter({ channelId: "C1" })], {
+				redact: false,
+			});
+			const [rendered] = engine.fanout({
+				type: "frame",
+				sessionId: "session",
+				frame: { type: "context_update", text: "Build at /srv/prod" },
+			});
+			const text = (rendered?.body as { text: string }).text;
+			expect(text).toContain("/srv/prod");
+			await daemon.notify("session", text, undefined, 1, undefined, true);
+			expect(fake.posts.some(post => post.text.includes("/srv/prod") && !post.text.includes("<path>"))).toBe(true);
+		});
+	});
+
+	it("replays an opted-out Slack frame at the provider", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const engine = new NotificationPresentationEngine([createSlackAdapter({ channelId: "C1" })], {
+				redact: false,
+			});
+			const [rendered] = engine.fanout({
+				type: "frame",
+				sessionId: "session",
+				frame: { type: "context_update", text: "Build at /srv/prod" },
+			});
+			const body = rendered?.body as { text?: unknown } | undefined;
+			expect(typeof body?.text).toBe("string");
+			const text = body?.text as string;
+			expect(text).toContain("/srv/prod");
+			const opened = await daemon.notify("session", text, undefined, 1, undefined, true);
+			expect(fake.posts.some(post => post.text.includes("/srv/prod") && !post.text.includes("<path>"))).toBe(true);
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: "notification:session:opt-out-replay",
+				kind: "provider-post",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					channel: "C1",
+					threadTs: opened.rootTs,
+					text: "Keep /srv/optout",
+					clientMsgId: "opt-out-replay",
+					attachmentAuthorityId: endpoint("session").authorityId,
+					literal: true,
+				},
+			});
+			await daemon.start();
+			expect(fake.posts.find(post => post.clientMsgId === "opt-out-replay")?.text).toContain("/srv/optout");
+		});
+	});
+
+	it("masks a redacted frame at the Slack provider", async () => {
+		await withDaemon(async (daemon, fake) => {
+			const engine = new NotificationPresentationEngine([createSlackAdapter({ channelId: "C1" })], {
+				redact: true,
+			});
+			const [rendered] = engine.fanout({
+				type: "frame",
+				sessionId: "session",
+				frame: { type: "context_update", text: "Build at /srv/prod" },
+			});
+			const text = (rendered?.body as { text: string }).text;
+			expect(text).not.toContain("/srv/prod");
+			await daemon.notify("session", text, undefined, 1);
+			expect(fake.posts.some(post => post.text.includes("/srv/prod"))).toBe(false);
+		});
+	});
+
+	it("scrubs a replayed notification frame body", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const { scrubReplayedProviderText } = await import("../src/sdk/bus/engine");
+			const raw = "alert xoxb-secret-token at /home/alice/private/repo";
+			const opened = await daemon.notify("session", "open", undefined, 1);
+			expect(opened.rootTs).toBeTruthy();
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: "notification:session:legacy-frame",
+				kind: "provider-post",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					channel: "C1",
+					threadTs: opened.rootTs,
+					text: raw,
+					clientMsgId: "legacy-frame",
+					attachmentAuthorityId: endpoint("session").authorityId,
+				},
+			});
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: "notification:session:already-scrubbed",
+				kind: "provider-post",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					channel: "C1",
+					threadTs: opened.rootTs,
+					text: "status ok",
+					clientMsgId: "already-scrubbed",
+					attachmentAuthorityId: endpoint("session").authorityId,
+				},
+			});
+			await daemon.start();
+			const replayed = fake.posts.find(post => post.clientMsgId === "legacy-frame");
+			const scrubbed = scrubReplayedProviderText("notification:session:legacy-frame", raw);
+			expect(replayed?.text).toBe(scrubbed);
+			expect(scrubReplayedProviderText("notification:session:legacy-frame", replayed?.text ?? "")).toBe(scrubbed);
+			expect(replayed?.text).not.toContain("xoxb-secret-token");
+			expect(replayed?.text).not.toContain("/home/alice/private/repo");
+			expect(fake.posts.find(post => post.clientMsgId === "already-scrubbed")?.text).toBe("status ok");
 		});
 	});
 

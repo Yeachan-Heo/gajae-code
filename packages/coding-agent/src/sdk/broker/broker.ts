@@ -15,16 +15,19 @@ import { FileLockAcquireError, withFileLock } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import { SessionManager } from "../../session/session-manager";
 import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
 } from "../../session/task-artifact-owner-codec";
-import { SdkClient, SdkClientError } from "../client";
+import { lifecycleFingerprint, lifecycleRequestIdentity, SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 } from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
+import { normalizeSdkRevisionInput, type SdkRevisionInput } from "../protocol/revision-contracts";
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
@@ -35,6 +38,8 @@ import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
 	type SessionListSavedSessionOmission,
 	type SessionListSavedSessionOmissionDetailCode,
+	type SessionListSavedSessionRecap,
+	sessionListSavedSessionRecap,
 } from "../session-list";
 import {
 	type BrokerExitMode,
@@ -44,6 +49,7 @@ import {
 	type BrokerStopRequest,
 	writeBrokerExitRecord,
 } from "./broker-exit";
+import { canonicalJson } from "./canonical-json";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -68,6 +74,7 @@ import {
 	deriveLegacyTargetIdentity,
 	deriveScopedIdempotencyIdentity,
 	getBrokerIdentityKey,
+	MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH,
 } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -75,12 +82,14 @@ import {
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
 	readSessionLifecycleFailure,
+	supportsEphemeralSessions,
 	validateBrokerModelPresetSync,
 	writeEffectMarker,
 } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 	type TerminalReadBack,
@@ -148,6 +157,7 @@ import {
 	type SpawnAuthorityV1,
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
+	type SpawnLifecycleOwner,
 	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -173,6 +183,12 @@ export interface BrokerSettings {
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
+	/**
+	 * How long a headless spawn host that acknowledged an endpoint `session.close`
+	 * may take to exit before the substrate close escalates. Defaults to the host's
+	 * own postmortem cleanup deadline.
+	 */
+	spawnHostCloseGraceMs?: number;
 	/**
 	 * Grace before a broker nobody is left to use exits on its own. The clock only
 	 * runs while the index proves no live session host and no open spawn authority,
@@ -225,6 +241,7 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	spawnHostCloseGraceMs: number;
 	abandonedGraceMs: number;
 	reapWhenAbandoned: boolean;
 	restartRequestId?: string;
@@ -270,6 +287,7 @@ export type BrokerErrorCode =
 	| "worktree_in_use"
 	| "incarnation_unavailable"
 	| "close_refused"
+	| "busy"
 	| "not_found"
 	| "live_session"
 	| "cleanup_pending"
@@ -437,20 +455,6 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.reconcile_uncertain",
 ]);
 
-/** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
-function lifecycleRequestIdentity(input: Record<string, unknown>): Record<string, unknown> {
-	const identity = { ...input };
-	delete identity.coordinatorSidecarSigningKey;
-	delete identity.coordinatorSidecarKeyId;
-	return identity;
-}
-
-function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
-		.digest("hex");
-}
-
 function publicLifecycleLookupInput(
 	input: Record<string, unknown>,
 ): { operation: "session.create"; target: Record<string, unknown> } | BrokerResponse {
@@ -519,13 +523,22 @@ export type SpawnQ26Reconciliation = {
 	acceptedAt?: number;
 };
 
+/** Exact registration a spawn waits for, bounded by the original readiness deadline. */
+export interface SpawnRegistrationRequest {
+	childId: string;
+	cwd: string;
+	stateRoot: string;
+	/** Resolved SDK host (not the managed supervisor); registration must match it exactly. */
+	owner: SpawnLifecycleOwner;
+	effectMarker: string;
+	deadlineAt: number;
+}
+
 /** Q26-only host control seam. It never receives or returns durable request material. */
 export interface SpawnPromptLayer {
-	awaitRegistration(input: {
-		childId: string;
-		cwd: string;
-		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }>;
+	awaitRegistration(
+		input: SpawnRegistrationRequest,
+	): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }>;
 	dispatch(input: {
 		sessionId: string;
 		task: string;
@@ -538,6 +551,12 @@ export interface SpawnPromptLayer {
 		clientRef: string;
 		pinned: SpawnHostRegistration;
 	}): Promise<SpawnQ26Reconciliation>;
+	/**
+	 * Ask the exact pinned host to close itself through its authenticated endpoint.
+	 * `accepted` means the host acknowledged `session.close`; anything else leaves the
+	 * close to the substrate provider. Production uses the endpoint attachment.
+	 */
+	close?(input: { sessionId: string; pinned: SpawnHostRegistration }): Promise<"accepted" | "unavailable">;
 }
 
 type SpawnAdmissionInput = {
@@ -557,7 +576,7 @@ function parseSpawnInput(
 	input: Record<string, unknown>,
 	idempotencyKey: string | undefined,
 ): SpawnAdmissionInput | BrokerResponse {
-	if (!idempotencyKey || idempotencyKey.length > 512)
+	if (!idempotencyKey || idempotencyKey.length > MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH)
 		return error("invalid_input", "idempotencyKey is required for session.spawn");
 	const allowed = new Set([
 		"task",
@@ -645,9 +664,11 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
 
-const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
+const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
+/** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
+const SPAWN_HOST_CLOSE_GRACE_MS = 5_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
 const BROKER_ABANDONED_GRACE_DEFAULT_MS = 120_000;
 const MANAGED_CLOSE_WAIT_MS = 10_000;
@@ -728,10 +749,15 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 /** Exact admission predicate for the child host row published after launch. */
 export function spawnRegistrationMatches(
 	candidate: IndexedSession,
-	expected: { childId: string; cwd: string; stateRoot: string },
+	expected: { childId: string; cwd: string; stateRoot: string; owner: SpawnLifecycleOwner; effectMarker: string },
 ): boolean {
 	return (
 		candidate.sessionId === expected.childId &&
+		// The registered row must be the resolved SDK host for this exact
+		// lifecycle request, never the supervisor or a same-id stranger.
+		candidate.pid === expected.owner.pid &&
+		(candidate.hostIncarnation ?? candidate.processIncarnation) === expected.owner.incarnation &&
+		candidate.lifecycleRequestId === expected.effectMarker &&
 		candidate.endpointGeneration > 0 &&
 		candidate.live &&
 		!candidate.terminal &&
@@ -829,7 +855,23 @@ const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
 ] as const;
 
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+	if (operation === "session.revise") {
+		const request = brokerSessionRevisionRequest(input);
+		return isBrokerResponse(request) ? request : { input: { ...request } };
+	}
+	if (operation !== "session.revise" && input.body !== undefined)
+		return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 	const normalized: Record<string, unknown> = { ...input };
+	if (
+		input.sourceEntryId !== undefined &&
+		(operation !== "session.fork" ||
+			(input.sourceEntryId !== null &&
+				(typeof input.sourceEntryId !== "string" ||
+					input.sourceEntryId.length === 0 ||
+					input.sourceEntryId.length > 128 ||
+					/[\u0000-\u001f\u007f]/u.test(input.sourceEntryId))))
+	)
+		return error("invalid_input", "sourceEntryId must select a bounded fork entry or null for the root.");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
 	if (session.value !== undefined) {
@@ -932,17 +974,6 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	}
 	return { input: normalized };
 }
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 type TerminalPersistenceVerification =
 	| { kind: "unverified" }
 	| { kind: "verified" }
@@ -986,6 +1017,7 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 		if (
 			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
 			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_REVISE_CAPABILITY_FIELD ||
 			key === "token" ||
 			key === "url" ||
 			(key === "endpoint" && nested !== null && typeof nested === "object")
@@ -1047,6 +1079,12 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
 const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
+function brokerSessionRevisionRequest(input: Record<string, unknown>): SdkRevisionInput | BrokerResponse {
+	return (
+		normalizeSdkRevisionInput(input) ??
+		error("invalid_input", "session.revise requires bounded edit content or an exact revision selection.")
+	);
+}
 
 type BrokerSessionControlRequest = {
 	sessionId: string;
@@ -1055,6 +1093,8 @@ type BrokerSessionControlRequest = {
 
 type BrokerSessionControlAuthority = {
 	record: IndexedSession;
+	/** Value the session runtime's operator-abort gate expects; see `sessionAbortCapability`. */
+	abortCapability: string;
 	endpoint: Record<string, unknown>;
 	endpointIdentity: {
 		dev: bigint;
@@ -1105,6 +1145,24 @@ function brokerControlResponse(value: unknown): BrokerResponse {
 	return { ok: false, error: { code, message } };
 }
 
+/**
+ * The operator-abort marker the session's runtime expects from the Broker.
+ *
+ * A Broker-launched host expects its lifecycle request id. A TUI or direct CLI host
+ * has none and expects the marker it published in its own endpoint registration.
+ * Either way the value is read only from broker-owned index state; a session that
+ * published neither cannot be reached by the operator route.
+ */
+function sessionAbortCapability(record: IndexedSession): string | undefined {
+	const capability = record.lifecycleRequestId ?? record.abortCapability;
+	return typeof capability === "string" &&
+		capability.length > 0 &&
+		capability.length <= 128 &&
+		/^[A-Za-z0-9._-]+$/u.test(capability)
+		? capability
+		: undefined;
+}
+
 function sameSessionControlAuthority(
 	left: BrokerSessionControlAuthority,
 	right: BrokerSessionControlAuthority,
@@ -1114,6 +1172,7 @@ function sameSessionControlAuthority(
 		left.record.processIncarnation === right.record.processIncarnation &&
 		left.record.hostIncarnation === right.record.hostIncarnation &&
 		left.record.lifecycleRequestId === right.record.lifecycleRequestId &&
+		left.abortCapability === right.abortCapability &&
 		endpointIncarnation(left.record, left.record.sessionId) ===
 			endpointIncarnation(right.record, right.record.sessionId) &&
 		left.endpoint.sessionId === right.endpoint.sessionId &&
@@ -1156,6 +1215,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				worktree: lifecycleWorktreeTarget(input),
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
+				...(input.sourceEntryId === undefined ? {} : { sourceEntryId: input.sourceEntryId }),
 			};
 		case "session.resume":
 		case "session.delete":
@@ -1624,7 +1684,6 @@ type BrokerPublicationState =
 	| "heartbeat-ambiguous"
 	| "stopping";
 
-const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
@@ -1666,6 +1725,7 @@ export class Broker {
 	#managedEnrollmentFailed = false;
 	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#spawnPromptLayer: SpawnPromptLayer;
+	#spawnHostClose: NonNullable<SpawnPromptLayer["close"]>;
 	#spawnReapInFlight = false;
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -1720,6 +1780,7 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			spawnHostCloseGraceMs: settings.spawnHostCloseGraceMs ?? SPAWN_HOST_CLOSE_GRACE_MS,
 			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
 			reapWhenAbandoned: settings.reapWhenAbandoned === true,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
@@ -1752,6 +1813,10 @@ export class Broker {
 			dispatch: async input => await this.#dispatchSpawnPrompt(input),
 			reconcile: async input => await this.#reconcileSpawnPrompt(input),
 		};
+		const injectedClose = settings.spawnPromptLayer?.close;
+		this.#spawnHostClose = injectedClose
+			? async input => await injectedClose.call(settings.spawnPromptLayer, input)
+			: async input => await this.#requestSpawnHostClose(input);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -1963,7 +2028,7 @@ export class Broker {
 		setOwner(true);
 		inFlight.claimId = decision.claim.claimId;
 		inFlight.phase = decision.claim.state;
-		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac, { spawnAnchor: true });
 		return await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery);
 	}
 
@@ -2637,8 +2702,12 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
-				const { pid, processIncarnation: incarnation } = launched.proof;
-				if (pid === undefined || incarnation === undefined) {
+				if (
+					launched.proof.pid === undefined ||
+					!Number.isSafeInteger(launched.proof.pid) ||
+					launched.proof.pid <= 0 ||
+					!safeSpawnOpaque(launched.proof.processIncarnation)
+				) {
 					const failure: SpawnSubstrateFailure = {
 						substrateKind: launched.proof.substrateKind,
 						code: "substrate_proof_failed",
@@ -2734,14 +2803,74 @@ export class Broker {
 						return error("terminal_uncertain", "managed child close is unresolved after its attempt was fenced");
 					}
 				}
+				// The substrate proof names the managed supervisor (cleanup authority);
+				// the lifecycle marker and registration must name the real SDK host.
+				const resolution = await provider.resolveLifecycleOwner(launched.proof, prep.semanticReadyDeadlineAt);
+				if (!resolution.ok || Date.now() >= prep.semanticReadyDeadlineAt) {
+					const reason = resolution.ok ? "owner_deadline" : resolution.code;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "closed" || release === "gone") {
+						const failure: SpawnSubstrateFailure = {
+							substrateKind: launched.proof.substrateKind,
+							code: "lifecycle_owner_unresolved",
+							message: `session.spawn lifecycle owner resolution failed (${reason})`,
+						};
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "pre_send_rejected",
+								failure,
+							})
+						).claim;
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					}
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "uncertain",
+							failure: {
+								substrateKind: launched.proof.substrateKind,
+								code: "child_registration_release_unproven",
+								message: "session.spawn child registration could not prove substrate release",
+							},
+						})
+					).claim;
+					launchedProof = undefined;
+					return error(
+						"terminal_uncertain",
+						`session.spawn lifecycle owner resolution failed (${reason}) and substrate release could not be proven`,
+					);
+				}
+				const { pid, incarnation } = resolution.owner;
+				if (!Number.isSafeInteger(pid) || pid <= 0 || !safeSpawnOpaque(incarnation))
+					throw new Error("Invalid resolved lifecycle owner");
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle owner deadline expired");
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle marker deadline expired");
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
+					owner: resolution.owner,
+					effectMarker: prep.effectMarker,
+					deadlineAt: prep.semanticReadyDeadlineAt,
 				});
-				if (!registration.ok) {
+				if (
+					!registration.ok ||
+					Date.now() >= prep.semanticReadyDeadlineAt ||
+					registration.registration.sessionId !== prep.childId ||
+					registration.registration.pid !== pid ||
+					registration.registration.processIncarnation !== incarnation ||
+					registration.registration.lifecycleRequestId !== prep.effectMarker ||
+					!Number.isSafeInteger(registration.registration.endpointGeneration) ||
+					registration.registration.endpointGeneration <= 0 ||
+					resolveEquivalentPath(registration.registration.cwd) !== resolveEquivalentPath(prep.cwd) ||
+					resolveEquivalentPath(registration.registration.stateRoot) !== resolveEquivalentPath(prep.stateRoot)
+				) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
 					if (release === "closed" || release === "gone") {
@@ -3077,10 +3206,17 @@ export class Broker {
 		if (verdict === "gone") return "gone";
 		if (verdict !== "verified") return "unresolved";
 		try {
-			return (await provider.close(proof)).ok ? "closed" : "unresolved";
+			if ((await provider.close(proof)).ok) return "closed";
 		} catch {
-			// The substrate may survive. The caller still records uncertainty, which
-			// is the honest durable outcome for an unclosed unowned substrate.
+			// Reconciled below: the substrate may survive.
+		}
+		// An unowned substrate can exit on its own while its close runs (a host that gave
+		// up at its readiness cutoff), which fails or refuses the exact close. Its proven
+		// absence releases it exactly as before the close; anything else stays uncertain,
+		// the honest durable outcome for an unclosed unowned substrate.
+		try {
+			return (await provider.verify(proof)) === "gone" ? "gone" : "unresolved";
+		} catch {
 			return "unresolved";
 		}
 	}
@@ -3389,11 +3525,16 @@ export class Broker {
 		childId: string;
 		cwd: string;
 		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }> {
-		const deadline = Date.now() + SPAWN_HOST_REGISTRATION_TIMEOUT_MS;
+		owner: SpawnLifecycleOwner;
+		effectMarker: string;
+		deadlineAt: number;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }> {
+		const deadline = input.deadlineAt;
 		for (;;) {
+			if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false };
 			try {
 				await this.index.refresh();
+				if (Date.now() >= deadline) return { ok: false };
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
 				const row = this.index
@@ -3411,6 +3552,7 @@ export class Broker {
 								endpointGeneration: row.endpointGeneration,
 								pid: row.pid,
 								processIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
 								cwd: row.locator.cwd,
 								stateRoot: row.locator.stateRoot,
 							},
@@ -3420,8 +3562,8 @@ export class Broker {
 			} catch {
 				// A transient index read failure only delays the poll.
 			}
-			if (Date.now() > deadline) return { ok: false };
-			await Bun.sleep(SPAWN_HOST_REGISTRATION_POLL_MS);
+			if (Date.now() >= deadline) return { ok: false };
+			await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
 		}
 	}
 
@@ -3430,7 +3572,8 @@ export class Broker {
 		sessionId: string;
 		/** Endpoint identity captured at registration; the exchange refuses to talk to anything else. */
 		pinned: SpawnHostRegistration;
-		frame: (id: string) => Record<string, unknown>;
+		/** Request for the exact pinned row; `undefined` refuses the exchange before connecting. */
+		frame: (id: string, row: IndexedSession) => Record<string, unknown> | undefined;
 		responseType: string;
 		timeoutMs: number;
 	}): Promise<{ handedOff: boolean; frame?: Record<string, unknown> }> {
@@ -3458,6 +3601,8 @@ export class Broker {
 		const endpoint = await readEndpoint(row);
 		if (!endpoint) return { handedOff: false };
 		const id = randomBytes(16).toString("base64url");
+		const request = input.frame(id, row);
+		if (!request) return { handedOff: false };
 		const settled = Promise.withResolvers<Record<string, unknown> | undefined>();
 		let handedOff = false;
 		let complete = false;
@@ -3484,7 +3629,7 @@ export class Broker {
 				}
 				if (frame.type === "hello") {
 					try {
-						socket?.send(JSON.stringify(input.frame(id)));
+						socket?.send(JSON.stringify(request));
 						handedOff = true;
 					} catch {
 						settle(undefined);
@@ -3561,10 +3706,72 @@ export class Broker {
 	}
 
 	/**
+	 * Authenticated graceful close of the exact pinned host. The host accepts it only
+	 * with the Broker lifecycle marker it was launched with, which its own index row
+	 * carries, so no other caller and no other endpoint can satisfy it.
+	 */
+	async #requestSpawnHostClose(input: {
+		sessionId: string;
+		pinned: SpawnHostRegistration;
+	}): Promise<"accepted" | "unavailable"> {
+		const exchange = await this.#spawnChildExchange({
+			sessionId: input.sessionId,
+			pinned: input.pinned,
+			frame: (id, row) =>
+				row.lifecycleRequestId
+					? {
+							type: "control_request",
+							id,
+							operation: "session.close",
+							input: { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: row.lifecycleRequestId },
+						}
+					: undefined,
+			responseType: "control_response",
+			timeoutMs: SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS,
+		});
+		return exchange.frame?.ok === true ? "accepted" : "unavailable";
+	}
+
+	/**
+	 * A headless host closes through its own endpoint first so it removes its endpoint
+	 * and disposes its session; on Windows a substrate signal is `TerminateProcess`,
+	 * which skips both. Returns the substrate verdict after the attempt; only an
+	 * acknowledged close earns the host's cleanup grace, measured on monotonic time.
+	 */
+	async #closeSpawnHostGracefully(
+		authority: SpawnAuthorityV1,
+		proof: SpawnSubstrateProof,
+		provider: SpawnSubstrateProvider,
+	): Promise<"verified" | "mismatch" | "gone"> {
+		const pinned = spawnPinFromAuthority(authority);
+		if (!pinned) return "verified";
+		let accepted = false;
+		try {
+			accepted = (await this.#spawnHostClose({ sessionId: pinned.sessionId, pinned })) === "accepted";
+		} catch {
+			accepted = false;
+		}
+		// Without an acknowledgement the escalation's own re-verification settles it.
+		if (!accepted) return "verified";
+		const graceMs = this.settings.spawnHostCloseGraceMs;
+		const started = performance.now();
+		for (;;) {
+			const verdict = await provider.verify(proof);
+			if (verdict !== "verified") return verdict;
+			const remaining = graceMs - (performance.now() - started);
+			if (remaining <= 0) return "verified";
+			await Bun.sleep(Math.min(50, remaining));
+		}
+	}
+
+	/**
 	 * Routes session.close for a spawn-created child through its claim/authority
 	 * record. Non-spawn sessions fall through to the generic lifecycle path.
 	 */
-	async #maybeCloseSpawnChild(input: Record<string, unknown>): Promise<BrokerResponse | undefined> {
+	async #maybeCloseSpawnChild(
+		input: Record<string, unknown>,
+		idleHostExited?: IndexedSession,
+	): Promise<BrokerResponse | undefined> {
 		const store = this.#spawnAuthority;
 		// This runs BEFORE generic normalization, so it must resolve the same
 		// `id` alias that normalizeBrokerInput accepts. Reading only `sessionId`
@@ -3575,7 +3782,7 @@ export class Broker {
 		if (!store || !sessionId) return undefined;
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
-		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity, idleHostExited);
 		if (outcome === "closed") {
 			await this.#observeManagedNative(claim.lifecycleIdentity, "closed").catch(() => undefined);
 			return { ok: true, result: { code: "spawn_child_closed", sessionId } };
@@ -3590,7 +3797,10 @@ export class Broker {
 	 * substrate; identity mismatch retains durable uncertainty and never falls
 	 * back to name-only or PID-only cleanup. Repeated close replays safely.
 	 */
-	async #closeSpawnAuthority(lifecycleIdentity: string): Promise<"closed" | "uncertain" | "retained"> {
+	async #closeSpawnAuthority(
+		lifecycleIdentity: string,
+		idleHostExited?: IndexedSession,
+	): Promise<"closed" | "uncertain" | "retained"> {
 		const store = this.#spawnAuthority;
 		if (!store) return "retained";
 		try {
@@ -3664,9 +3874,38 @@ export class Broker {
 				).authority!;
 			}
 			if (verdict === "verified" || verdict === "gone") {
-				const closedSubstrate = await provider.close(proof);
-				if (!closedSubstrate.ok) return "retained";
-				if ((await provider.verify(proof)) !== "gone") return "retained";
+				// A headless child is closed by the proven absence of its exact process, so one
+				// that exits on its own (after a lost acknowledgement, at the grace boundary,
+				// or before an earlier retained attempt) closes without any signal; its
+				// substrate close would refuse an already-gone identity. A managed substrate
+				// is closed only by its own successful close (the matching terminal verdict).
+				const headless = proof.substrateKind === "headless";
+				const pin = spawnPinFromAuthority(authority);
+				// Only the host-first idle-close path supplies this exact exit proof.
+				// Ordinary reap/close still requires the managed substrate's close verdict.
+				const exitedPinnedHost =
+					idleHostExited !== undefined &&
+					pin !== undefined &&
+					idleHostExited.sessionId === pin.sessionId &&
+					matchesSpawnPin(idleHostExited, pin);
+				let current =
+					verdict === "verified" && headless
+						? await this.#closeSpawnHostGracefully(authority, proof, provider)
+						: verdict;
+				if (current === "verified" || (!headless && current === "gone" && !exitedPinnedHost)) {
+					let closedSubstrate = false;
+					try {
+						closedSubstrate = (await provider.close(proof)).ok;
+					} catch (error) {
+						if (headless || !exitedPinnedHost) throw error;
+						// The managed owner can exit while close is running. Only this
+						// exact host-first proof permits reconciling a failed/throwing close.
+					}
+					if (!closedSubstrate && !headless && !exitedPinnedHost) return "retained";
+					current = await provider.verify(proof);
+					if (!closedSubstrate && current !== "gone") return "retained";
+				}
+				if (current !== "gone") return "retained";
 			} else return "retained";
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
 			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };
@@ -4237,7 +4476,7 @@ export class Broker {
 			await this.#spawnAuthority.open();
 			for (const claim of this.#spawnAuthority.claims()) {
 				const mirror = this.ledger.get(claim.lifecycleIdentity);
-				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac);
+				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac, { spawnAnchor: true });
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
@@ -4959,13 +5198,15 @@ export class Broker {
 			indexed.endpointMtimeMs === undefined ||
 			!Number.isFinite(indexed.endpointMtimeMs) ||
 			indexed.endpointMtimeMs <= 0 ||
-			typeof indexed.lifecycleRequestId !== "string" ||
-			indexed.lifecycleRequestId.length === 0 ||
-			indexed.lifecycleRequestId.length > 128 ||
-			!/^[A-Za-z0-9._-]+$/u.test(indexed.lifecycleRequestId) ||
 			endpointIncarnation(indexed, indexed.sessionId) === undefined
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const abortCapability = sessionAbortCapability(indexed);
+		// The endpoint itself is current; only its host never published operator
+		// authority (a gjc that predates the operator route). Retrying cannot help, so
+		// this must not read as a stale endpoint.
+		if (abortCapability === undefined)
+			return error("operator_control_unsupported", "session host does not publish operator control authority");
 		let endpointResponse: BrokerResponse;
 		try {
 			endpointResponse = await this.#readEndpoint(indexed, {});
@@ -4992,6 +5233,7 @@ export class Broker {
 			if (!endpointIdentity.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
 			return {
 				record: indexed,
+				abortCapability,
 				endpoint,
 				endpointIdentity: {
 					dev: endpointIdentity.dev,
@@ -5017,16 +5259,38 @@ export class Broker {
 			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const request = brokerSessionControlRequest(input);
 		if (isBrokerResponse(request)) return request;
-		const target = `session.control\u0000${request.sessionId}`;
+		return this.#dispatchSessionControl(request.sessionId, "turn.abort", request.abortInput, idempotencyKey);
+	}
+	async #sessionRevise(input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (
+			typeof idempotencyKey !== "string" ||
+			idempotencyKey.length === 0 ||
+			/[\u0000-\u001f\u007f]/u.test(idempotencyKey) ||
+			new TextEncoder().encode(idempotencyKey).length > 128
+		)
+			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
+		const request = brokerSessionRevisionRequest(input);
+		if (isBrokerResponse(request)) return request;
+		const { sessionId, ...revision } = request;
+		return this.#dispatchSessionControl(sessionId, "session.revise", revision, idempotencyKey);
+	}
+	async #dispatchSessionControl(
+		sessionId: string,
+		operation: "turn.abort" | "session.revise",
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<BrokerResponse> {
+		const target = `session.control\u0000${sessionId}`;
 		const previous = this.#chains.get(target) ?? Promise.resolve();
-		let release!: () => void;
-		const current = new Promise<void>(resolve => (release = resolve));
+		const { promise: current, resolve: release } = Promise.withResolvers<void>();
 		const chain = previous.then(() => current);
 		this.#chains.set(target, chain);
 		await previous;
 		try {
-			const authority = await this.#sessionControlAuthority(request.sessionId);
+			const authority = await this.#sessionControlAuthority(sessionId);
 			if (isBrokerResponse(authority)) return authority;
+			if (operation === "session.revise" && authority.record.lifecycleRequestId === undefined)
+				return error("operation_prohibited", "Prompt revisions require a Broker-owned lifecycle session.");
 			let client: SdkClient;
 			try {
 				client = await SdkClient.connect(authority.endpoint.url as string, authority.endpoint.token as string, {
@@ -5039,16 +5303,17 @@ export class Broker {
 					: error("unavailable", "session endpoint is unavailable");
 			}
 			try {
-				const currentAuthority = await this.#sessionControlAuthority(request.sessionId);
+				const currentAuthority = await this.#sessionControlAuthority(sessionId);
 				if (isBrokerResponse(currentAuthority)) return currentAuthority;
 				if (!sameSessionControlAuthority(authority, currentAuthority))
 					return error("endpoint_stale", "session endpoint changed before control dispatch");
+				const capabilityField =
+					operation === "session.revise"
+						? BROKER_RUNTIME_REVISE_CAPABILITY_FIELD
+						: BROKER_RUNTIME_ABORT_CAPABILITY_FIELD;
 				const response = await client.control(
-					"turn.abort",
-					{
-						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.record.lifecycleRequestId,
-					},
+					operation,
+					{ ...input, [capabilityField]: authority.abortCapability },
 					{
 						confirm: true,
 						idempotencyKey,
@@ -5139,7 +5404,9 @@ export class Broker {
 			sessions: (scope === undefined
 				? [...result.sessions]
 				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
-			).filter(session => resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			).filter(
+				session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
@@ -5148,10 +5415,20 @@ export class Broker {
 			...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
+		const spawnOwners = this.#spawnAuthority?.spawnOwnersByChild();
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
-			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			const {
+				lifecycleRequestId: _lifecycleRequestId,
+				abortCapability: _abortCapability,
+				...publicSession
+			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
+			const spawnOwner = spawnOwners?.get(session.sessionId);
+			return {
+				...publicSession,
+				...(incarnation === undefined ? {} : { endpointIncarnation: incarnation }),
+				...(spawnOwner === undefined ? {} : { spawnedBy: { masterSessionId: spawnOwner } }),
+			};
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);
@@ -5252,7 +5529,11 @@ export class Broker {
 			this.#fence("suspect-unpublished");
 			return error("unavailable", "broker lock ownership is not held");
 		}
-		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
+		if (operation === "broker.status")
+			return Promise.resolve({
+				ok: true,
+				result: { ...this.status(), capabilities: { ephemeralSessions: supportsEphemeralSessions(this) } },
+			});
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
 				result => result as BrokerResponse,
@@ -5308,16 +5589,21 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		if (operation !== "session.revise" && input.body !== undefined)
+			return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
 		if (operation === "task.dag") return this.#handleManagedTaskDag(input, idempotencyKey);
-		if (operation === "session.close") {
+		if (operation === "session.close" && input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return error("invalid_input", "ifIdle must be a boolean");
+		if (operation === "session.close" && input.ifIdle !== true) {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
 		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
+		if (operation === "session.revise") return this.#sessionRevise(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
 			if (isBrokerResponse(lookup)) return lookup;
@@ -5411,6 +5697,21 @@ export class Broker {
 							missingIdentityFields,
 						};
 					} else if (match.sessionId === resolveSessionId && nlink !== undefined && ctimeNs !== undefined) {
+						let recap: SessionListSavedSessionRecap | undefined;
+						try {
+							recap = sessionListSavedSessionRecap(
+								await SessionManager.readSessionRecapReadOnly(match.path, {
+									dev: match.identity.dev,
+									ino: match.identity.ino,
+									nlink,
+									size: match.identity.size,
+									mtimeNs: match.identity.mtimeNs,
+									ctimeNs,
+								}),
+							);
+						} catch {
+							recap = undefined;
+						}
 						savedSession = {
 							id: match.sessionId,
 							path: match.path,
@@ -5424,6 +5725,7 @@ export class Broker {
 								ctimeNs: ctimeNs.toString(),
 								sha256: match.identity.sha256,
 							},
+							...(recap === undefined ? {} : { recap }),
 						};
 					}
 				} else {
@@ -5492,17 +5794,17 @@ export class Broker {
 				? { closeAuthorityBound: true }
 				: {}),
 		};
+		// One key admits one request. Checked here and again atomically when the row is
+		// begun, because a concurrent request for another target holds another chain.
+		const conflictsWithKeyHolder = (holder: LifecycleLedgerEntry): boolean =>
+			!(
+				operation === "session.close" &&
+				(holder.intendedSessionId === input.sessionId || holder.resultSessionId === input.sessionId)
+			) &&
+			(holder.fingerprint !== fingerprint || holder.requestHash !== requestedRequestHash);
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
-			const sameCloseSession =
-				operation === "session.close" &&
-				(matchingOperation?.intendedSessionId === input.sessionId ||
-					matchingOperation?.resultSessionId === input.sessionId);
-			if (
-				matchingOperation &&
-				!sameCloseSession &&
-				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
-			)
+			if (matchingOperation && conflictsWithKeyHolder(matchingOperation))
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			const matchingLegacy = matchingOperation;
 			if (matchingLegacy) {
@@ -5599,7 +5901,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, metadata);
+			const begun = await this.ledger.begin(identity, requestHash, metadata, conflictsWithKeyHolder);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				// Proven errors are immutable even when their response carries cleanup
@@ -5696,7 +5998,15 @@ export class Broker {
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
-			const response = outcome.response;
+			let response = outcome.response;
+			if (operation === "session.close" && !response.ok && response.error.code === "busy") {
+				await this.ledger.retryCloseRefusal(identity);
+				return response;
+			}
+			if (operation === "session.close" && input.ifIdle === true && response.ok) {
+				const spawnClose = await this.#maybeCloseSpawnChild(input, outcome.idleHostExited);
+				if (spawnClose && !spawnClose.ok) response = spawnClose;
+			}
 			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			// Record the refusal's own target session so the fence it may leave
 			// is scoped to that session. Without this, a session.delete refusal
@@ -5751,7 +6061,6 @@ export class Broker {
 				});
 				return uncertain;
 			}
-			terminalPersistenceHooksForTest.get(this)?.();
 			await outcome.deferredArtifactCleanup?.();
 			return response;
 		} finally {
@@ -5759,12 +6068,6 @@ export class Broker {
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
 	}
-}
-
-/** Test-only hook for simulating a process crash after terminal persistence verification. */
-export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => void) | undefined): void {
-	if (hook) terminalPersistenceHooksForTest.set(broker, hook);
-	else terminalPersistenceHooksForTest.delete(broker);
 }
 
 /** Test-only hook for shortening the bounded ambiguity deadline. */

@@ -43,6 +43,7 @@ import {
 	type ChatEffectLease,
 	MAX_TERMINAL_CHAT_EFFECTS,
 } from "./chat-effect-journal";
+import { scrubReplayedProviderText } from "./engine";
 import { SlackProviderError } from "./slack-live-provider";
 import type {
 	SlackMessageSearchResult,
@@ -205,6 +206,39 @@ function nextRecord(record: SlackConversation, update: Partial<SlackConversation
 
 function replyableActionId(actionId: string | undefined): string | undefined {
 	return actionId?.startsWith("idle:") ? undefined : actionId;
+}
+
+type SlackProviderPayload = {
+	channel: string;
+	text: string;
+	threadTs?: string;
+	clientMsgId: string;
+	attachmentAuthorityId?: string;
+	egress?: "ask";
+	/** Present only for an explicit presentation redact opt-out. Absent keeps the safe scrub. */
+	literal?: true;
+};
+
+/** Frame and root bodies are scrubbed at dispatch. Asks stay literal. Other effects are unchanged. */
+function slackProviderPost(
+	id: string,
+	payload: SlackProviderPayload,
+	signal: AbortSignal,
+): Omit<SlackProviderPayload, "egress"> & { signal: AbortSignal } {
+	if (typeof payload.text !== "string")
+		throw new SlackEndpointBindingError("Slack provider text is not dispatchable.");
+	const frame = id.startsWith("notification:") || id.startsWith("root:");
+	const text = frame
+		? scrubReplayedProviderText(id, payload.text, payload.egress === "ask" || payload.literal === true)
+		: payload.text;
+	return {
+		channel: payload.channel,
+		text,
+		...(payload.threadTs === undefined ? {} : { threadTs: payload.threadTs }),
+		clientMsgId: payload.clientMsgId,
+		...(payload.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: payload.attachmentAuthorityId }),
+		signal,
+	};
 }
 
 /**
@@ -800,6 +834,8 @@ export class SlackNotificationDaemon {
 		body: string,
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
+		trustedAsk = false,
+		keepLiteral = false,
 	): Promise<SlackRootPublication> {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		const endpoint = await this.#resolveAttachment(sessionId);
@@ -876,6 +912,9 @@ export class SlackNotificationDaemon {
 					generation,
 					lifecycleGeneration,
 					endpoint.authorityId,
+					pending.clientMsgId,
+					trustedAsk,
+					keepLiteral,
 				),
 				created: false,
 			};
@@ -893,6 +932,8 @@ export class SlackNotificationDaemon {
 					text: body,
 					clientMsgId,
 					...(endpoint.authorityId === undefined ? {} : { attachmentAuthorityId: endpoint.authorityId }),
+					...(trustedAsk ? { egress: "ask" as const } : {}),
+					...(keepLiteral ? { literal: true as const } : {}),
 				});
 				createdRootEffect = !durable.existed;
 				posted = await this.#postDurable(effectId, sessionId, generation, durable.payload);
@@ -953,6 +994,9 @@ export class SlackNotificationDaemon {
 					generation,
 					lifecycleGeneration,
 					endpoint.authorityId,
+					pending.clientMsgId,
+					trustedAsk,
+					keepLiteral,
 				),
 				created: false,
 			};
@@ -966,8 +1010,9 @@ export class SlackNotificationDaemon {
 		actionId?: string,
 		endpointGeneration?: number,
 		publicationId?: string,
+		keepLiteral = false,
 	): Promise<SlackConversation> {
-		return await this.#track(this.#notify(sessionId, body, actionId, endpointGeneration, publicationId));
+		return await this.#track(this.#notify(sessionId, body, actionId, endpointGeneration, publicationId, keepLiteral));
 	}
 
 	async #notify(
@@ -976,6 +1021,7 @@ export class SlackNotificationDaemon {
 		actionId?: string,
 		endpointGeneration?: number,
 		publicationId?: string,
+		keepLiteral = false,
 	): Promise<SlackConversation> {
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
@@ -1002,10 +1048,18 @@ export class SlackNotificationDaemon {
 		if (usedExistingRoot) {
 			conversation = existing.record;
 		} else {
+			const askRoot = actionId !== undefined;
 			const publication =
 				existing?.record.state === "active"
-					? await this.#resumeWithRootPublication(sessionId, body, generation, rootPublication?.clientMsgId)
-					: await this.#postRoot(sessionId, body, generation, rootPublication?.clientMsgId);
+					? await this.#resumeWithRootPublication(
+							sessionId,
+							body,
+							generation,
+							rootPublication?.clientMsgId,
+							askRoot,
+							keepLiteral,
+						)
+					: await this.#postRoot(sessionId, body, generation, rootPublication?.clientMsgId, askRoot, keepLiteral);
 			conversation = publication.conversation;
 			this.#admitActivatedRoot(conversation);
 			bodyWasUsedAsRoot ||= publication.created;
@@ -1043,6 +1097,7 @@ export class SlackNotificationDaemon {
 				...(conversation.attachmentAuthorityId === undefined
 					? {}
 					: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
+				...(keepLiteral ? { literal: true as const } : {}),
 			});
 			return conversation;
 		}
@@ -1454,6 +1509,8 @@ export class SlackNotificationDaemon {
 		body: string,
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
+		trustedAsk = false,
+		keepLiteral = false,
 	): Promise<SlackRootPublication> {
 		const inFlight = this.#rollovers.get(sessionId);
 		if (inFlight) {
@@ -1463,9 +1520,23 @@ export class SlackNotificationDaemon {
 				return { conversation: publication.conversation, created: false };
 			if (endpointGeneration < activeGeneration)
 				throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
-			return await this.#resumeWithRootPublication(sessionId, body, endpointGeneration, requestedClientMsgId);
+			return await this.#resumeWithRootPublication(
+				sessionId,
+				body,
+				endpointGeneration,
+				requestedClientMsgId,
+				trustedAsk,
+				keepLiteral,
+			);
 		}
-		const rollover = this.#resumeRoot(sessionId, body, endpointGeneration, requestedClientMsgId);
+		const rollover = this.#resumeRoot(
+			sessionId,
+			body,
+			endpointGeneration,
+			requestedClientMsgId,
+			trustedAsk,
+			keepLiteral,
+		);
 		this.#rollovers.set(sessionId, rollover);
 		try {
 			return await rollover;
@@ -1479,6 +1550,8 @@ export class SlackNotificationDaemon {
 		body: string,
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
+		trustedAsk = false,
+		keepLiteral = false,
 	): Promise<SlackRootPublication> {
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
@@ -1494,7 +1567,8 @@ export class SlackNotificationDaemon {
 				previous = { key: previous.key, record: reconciled };
 				waitedForRollover = true;
 			}
-			if (!previous) return await this.#postRoot(sessionId, body, generation, requestedClientMsgId);
+			if (!previous)
+				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId, trustedAsk, keepLiteral);
 			if (previous.record.state !== "active") {
 				if (
 					previous.record.rootPublicationOwner !== this.#publicationOwnerId &&
@@ -1504,7 +1578,7 @@ export class SlackNotificationDaemon {
 					await Bun.sleep(10);
 					continue;
 				}
-				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId);
+				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId, trustedAsk, keepLiteral);
 			}
 			const previousGeneration = this.#requireEndpointGeneration(previous.record);
 			if (previousGeneration > generation)
@@ -1569,7 +1643,7 @@ export class SlackNotificationDaemon {
 				resumed.rootPublicationOwner === this.#publicationOwnerId &&
 				resumed.rootPublicationFence === fence
 			)
-				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId);
+				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId, trustedAsk, keepLiteral);
 			waitedForRollover = true;
 			await Bun.sleep(10);
 		}
@@ -2734,6 +2808,8 @@ export class SlackNotificationDaemon {
 					threadTs?: unknown;
 					clientMsgId?: unknown;
 					attachmentAuthorityId?: unknown;
+					egress?: unknown;
+					literal?: unknown;
 				};
 				if (
 					typeof payload.channel !== "string" ||
@@ -2750,6 +2826,8 @@ export class SlackNotificationDaemon {
 					...(typeof payload.attachmentAuthorityId === "string"
 						? { attachmentAuthorityId: payload.attachmentAuthorityId }
 						: {}),
+					...(payload.egress === "ask" ? { egress: "ask" as const } : {}),
+					...(payload.literal === true ? { literal: true as const } : {}),
 				});
 			} catch {
 				failed = true;
@@ -2920,13 +2998,7 @@ export class SlackNotificationDaemon {
 		id: string,
 		sessionId: string,
 		endpointGeneration: number,
-		expected: {
-			channel: string;
-			text: string;
-			threadTs?: string;
-			clientMsgId: string;
-			attachmentAuthorityId?: string;
-		},
+		expected: SlackProviderPayload,
 	): Promise<{
 		payload: typeof expected & { attachmentAuthorityId?: string };
 		existed: boolean;
@@ -2958,13 +3030,7 @@ export class SlackNotificationDaemon {
 		id: string,
 		sessionId: string,
 		endpointGeneration: number,
-		payload: {
-			channel: string;
-			text: string;
-			threadTs?: string;
-			clientMsgId: string;
-			attachmentAuthorityId?: string;
-		},
+		payload: SlackProviderPayload,
 	): Promise<SlackPostedMessage> {
 		if (!Number.isSafeInteger(endpointGeneration) || endpointGeneration <= 0)
 			throw new SlackEndpointBindingError("Slack provider effects require a positive endpoint generation.");
@@ -3057,14 +3123,14 @@ export class SlackNotificationDaemon {
 							)
 								return undefined;
 							return {
-								result: this.options.provider.postMessage({ ...effect!.payload, signal }),
+								result: this.options.provider.postMessage(slackProviderPost(id, effect!.payload, signal)),
 								dispatched: Promise.resolve(),
 							};
 						});
 						if (!sent) throw new SlackStaleEffectError();
 						return sent.value;
 					}
-					return await this.options.provider.postMessage({ ...effect!.payload, signal });
+					return await this.options.provider.postMessage(slackProviderPost(id, effect!.payload, signal));
 				},
 				workGeneration,
 			);
@@ -3251,6 +3317,8 @@ export class SlackNotificationDaemon {
 						text?: unknown;
 						threadTs?: unknown;
 						clientMsgId?: unknown;
+						egress?: unknown;
+						literal?: unknown;
 				  }>
 				| undefined = await this.#journal.read(`root:${current.sessionId}:${clientMsgId}`);
 			if (effect?.state === "terminal") {
@@ -3258,8 +3326,16 @@ export class SlackNotificationDaemon {
 				await Bun.sleep(10);
 				continue;
 			}
-			const payload: { channel?: unknown; text?: unknown; threadTs?: unknown; clientMsgId?: unknown } | undefined =
-				effect?.payload;
+			const payload:
+				| {
+						channel?: unknown;
+						text?: unknown;
+						threadTs?: unknown;
+						clientMsgId?: unknown;
+						egress?: unknown;
+						literal?: unknown;
+				  }
+				| undefined = effect?.payload;
 			if (
 				effect?.kind === "provider-post" &&
 				effect.transport === "slack" &&
@@ -3285,6 +3361,8 @@ export class SlackNotificationDaemon {
 						...(current.attachmentAuthorityId === undefined
 							? {}
 							: { attachmentAuthorityId: current.attachmentAuthorityId }),
+						...(payload.egress === "ask" ? { egress: "ask" as const } : {}),
+						...(payload.literal === true ? { literal: true as const } : {}),
 					});
 				} catch (error) {
 					if (!(error instanceof SlackStaleEffectError)) throw error;
@@ -3304,8 +3382,22 @@ export class SlackNotificationDaemon {
 		endpointGeneration: number,
 		lifecycleGeneration: number,
 		attachmentAuthorityId?: string,
+		requestedClientMsgId?: string,
+		trustedAsk = false,
+		keepLiteral = false,
 	): Promise<SlackConversation> {
 		// Another owner may renew this lease while provider work is active, so wait for the durable transition.
+		const publish = (resume: boolean) =>
+			resume
+				? this.#resumeWithRootPublication(
+						sessionId,
+						body,
+						endpointGeneration,
+						requestedClientMsgId,
+						trustedAsk,
+						keepLiteral,
+					)
+				: this.#postRoot(sessionId, body, endpointGeneration, requestedClientMsgId, trustedAsk, keepLiteral);
 		while (true) {
 			if (lifecycleGeneration !== this.#lifecycleGeneration)
 				throw new Error("Slack daemon stopped while waiting for root publication");
@@ -3333,7 +3425,7 @@ export class SlackNotificationDaemon {
 				}
 				if (currentGeneration > endpointGeneration)
 					throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
-				return await this.resume(sessionId, body, endpointGeneration);
+				return (await publish(true)).conversation;
 			}
 			if (current?.state === "closed_marker") {
 				const currentGeneration = this.#requireEndpointGeneration(current);
@@ -3357,14 +3449,14 @@ export class SlackNotificationDaemon {
 						!this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())
 					)
 						continue;
-					return await this.postRoot(sessionId, body, endpointGeneration);
+					return (await publish(false)).conversation;
 				}
 				if (
 					current.rootPublicationOwner !== undefined &&
 					!this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())
 				)
 					continue;
-				return await this.resume(sessionId, body, endpointGeneration);
+				return (await publish(true)).conversation;
 			}
 			if (current?.state === "resumed_root") {
 				const currentGeneration = this.#requireEndpointGeneration(current);
@@ -3374,7 +3466,7 @@ export class SlackNotificationDaemon {
 					current.rootPublicationOwner === undefined ||
 					this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())
 				)
-					return await this.resume(sessionId, body, endpointGeneration);
+					return (await publish(true)).conversation;
 			}
 			if (
 				current === undefined ||
@@ -3385,7 +3477,7 @@ export class SlackNotificationDaemon {
 					current.rootPublicationOwner !== undefined &&
 					this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now()))
 			) {
-				return await this.postRoot(sessionId, body, endpointGeneration);
+				return (await publish(false)).conversation;
 			}
 		}
 	}

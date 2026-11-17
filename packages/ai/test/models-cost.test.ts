@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { applyGeneratedModelPolicies } from "../src/model-thinking";
 import { calculateCost, getBundledModel } from "../src/models";
 import modelsJson from "../src/models.json" with { type: "json" };
 import { handleMetadata } from "../src/providers/amazon-bedrock";
@@ -208,6 +209,49 @@ describe("calculateCost", () => {
 		expect(aboveThreshold.cost.cacheRead).toBeCloseTo(0.001, 12);
 		expect(aboveThreshold.cost.cacheWrite).toBeCloseTo(0.000000625, 12);
 		expect(aboveThreshold.cost.total).toBeCloseTo(0.043500625, 12);
+	});
+
+	it.each([
+		["claude-fable-5-2", 8, 10, 16],
+		["claude-fable-5-1", 10, 12.5, 20],
+		["claude-fable-5", 10, 12.5, 20],
+	] as const)("bills %s 1-hour cache writes at twice the input rate", (id, input, fiveMinute, oneHour) => {
+		const model = getBundledModel("anthropic", id);
+		expect(model.cost.input).toBe(input);
+		expect(model.cost.cacheWrite).toBe(fiveMinute);
+		const usageWith = (cacheWrite: number, ephemeral1h?: number): Usage => ({
+			input: 1_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite,
+			...(ephemeral1h === undefined ? {} : { cttl: { ephemeral1h } }),
+			totalTokens: 1_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const allOneHour = usageWith(1_000_000, 1_000_000);
+		calculateCost(model, allOneHour);
+		expect(allOneHour.cost.cacheWrite).toBeCloseTo(oneHour, 12);
+		const mixed = usageWith(1_000_000, 250_000);
+		calculateCost(model, mixed);
+		expect(mixed.cost.cacheWrite).toBeCloseTo(0.75 * fiveMinute + 0.25 * oneHour, 12);
+		const unsplit = usageWith(1_000_000);
+		calculateCost(model, unsplit);
+		expect(unsplit.cost.cacheWrite).toBeCloseTo(fiveMinute, 12);
+	});
+
+	it("bills date-pinned Fable ids discovered at runtime at the 1-hour rate", () => {
+		const model = { ...getBundledModel("anthropic", "claude-fable-5-2"), id: "claude-fable-5-2-20261109" };
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 1_000_000,
+			cttl: { ephemeral1h: 1_000_000 },
+			totalTokens: 1_000_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		calculateCost(model, usage);
+		expect(usage.cost.cacheWrite).toBeCloseTo(16, 12);
 	});
 
 	it("bills Haiku 5.5 1-hour cache writes at the 1-hour rate in both prompt tiers", () => {
@@ -654,5 +698,60 @@ describe("calculateCost", () => {
 		});
 		expect(output.usage.input).toBe(10);
 		expect(output.usage.cacheWrite).toBe(0);
+	});
+
+	// Anthropic prices cache hits for Opus 5.5 and Sonnet 5.5 at 0.05x base input; Sonnet 5 stays at 0.1x.
+	// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+	it("prices Sonnet 5.5 cache reads at 0.05x input on the direct API and Bedrock", () => {
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const ids: [string, string][] = [
+			["anthropic", "claude-sonnet-5-5"],
+			...["", "au.", "eu.", "global.", "jp.", "us."].map((prefix): [string, string] => [
+				"amazon-bedrock",
+				`${prefix}anthropic.claude-sonnet-5-5`,
+			]),
+		];
+		for (const [provider, id] of ids) {
+			const cost = catalog[provider]?.[id]?.cost;
+			expect(cost, `${provider}/${id}`).toBeDefined();
+			expect(cost!.cacheRead, `${provider}/${id}`).toBeCloseTo(cost!.input * 0.05, 9);
+		}
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-5-5");
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 1_000_000,
+			cacheWrite: 0,
+			totalTokens: 1_000_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		expect(calculateCost(sonnet, usage).cacheRead).toBeCloseTo(0.1, 9);
+	});
+
+	// `generate-models` runs this policy, so the bundled rows must already be its fixed point.
+	it("derives Sonnet 5.5 cache reads from input in the generated-model policy", () => {
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const stale = (provider: string, id: string): Model => {
+			const row = catalog[provider]![id]!;
+			return { ...row, cost: { ...row.cost, cacheRead: 0.2 } };
+		};
+		// The policy replaces each array entry with a refreshed copy.
+		const policed = [
+			stale("anthropic", "claude-sonnet-5-5"),
+			stale("amazon-bedrock", "us.anthropic.claude-sonnet-5-5"),
+			stale("anthropic", "claude-sonnet-5"),
+			stale("openrouter", "anthropic/claude-sonnet-5.5"),
+		];
+		applyGeneratedModelPolicies(policed);
+		expect(policed.map(model => model.cost.cacheRead)).toEqual([0.1, 0.11, 0.2, 0.2]);
+
+		const bundled = [
+			catalog.anthropic!["claude-sonnet-5-5"]!,
+			...Object.values(catalog["amazon-bedrock"]!).filter(model => model.id.endsWith("anthropic.claude-sonnet-5-5")),
+		];
+		expect(bundled).toHaveLength(7);
+		const regenerated = bundled.map(model => ({ ...model, cost: { ...model.cost } }));
+		applyGeneratedModelPolicies(regenerated);
+		expect(regenerated.map(model => model.cost)).toEqual(bundled.map(model => model.cost));
 	});
 });

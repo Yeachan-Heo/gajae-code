@@ -67,10 +67,8 @@ function redactPemPrivateKeys(text: string): string {
 }
 
 const CREDENTIAL_KEY_SEPARATOR = "[._\\t -]*";
-const CREDENTIAL_KEY_LABELS = `api${CREDENTIAL_KEY_SEPARATOR}key|apikey|account${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}signature|access${CREDENTIAL_KEY_SEPARATOR}token|refresh${CREDENTIAL_KEY_SEPARATOR}token|id${CREDENTIAL_KEY_SEPARATOR}token|session${CREDENTIAL_KEY_SEPARATOR}key|session${CREDENTIAL_KEY_SEPARATOR}token|client${CREDENTIAL_KEY_SEPARATOR}secret|aws${CREDENTIAL_KEY_SEPARATOR}secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}key${CREDENTIAL_KEY_SEPARATOR}base|secret${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|encryption${CREDENTIAL_KEY_SEPARATOR}key|signing${CREDENTIAL_KEY_SEPARATOR}key|password${CREDENTIAL_KEY_SEPARATOR}(?:confirmation|confirm)|password|passwd|pwd|passphrase|auth|authorization|bearer|private${CREDENTIAL_KEY_SEPARATOR}token|token|secrets?|credentials?|private${CREDENTIAL_KEY_SEPARATOR}key|cookies?`;
-const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?`;
-const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
-const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
+const CREDENTIAL_KEY_LABELS = `api${CREDENTIAL_KEY_SEPARATOR}key|apikey|account${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}signature|access${CREDENTIAL_KEY_SEPARATOR}token|refresh${CREDENTIAL_KEY_SEPARATOR}token|id${CREDENTIAL_KEY_SEPARATOR}token|session${CREDENTIAL_KEY_SEPARATOR}key|session${CREDENTIAL_KEY_SEPARATOR}token|client${CREDENTIAL_KEY_SEPARATOR}secret|aws${CREDENTIAL_KEY_SEPARATOR}secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}key${CREDENTIAL_KEY_SEPARATOR}base|secret${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|encryption${CREDENTIAL_KEY_SEPARATOR}key|signing${CREDENTIAL_KEY_SEPARATOR}key|password${CREDENTIAL_KEY_SEPARATOR}(?:confirmation|confirm)|password|passwd|pwd|pw|passphrase|auth|authorization|bearer|private${CREDENTIAL_KEY_SEPARATOR}token|token|secrets?|credentials?|private${CREDENTIAL_KEY_SEPARATOR}key|cookies?`;
+const CREDENTIAL_KEY_LABELS_V1 = CREDENTIAL_KEY_LABELS.replace("|pw|", "|");
 /**
  * A complete value that an earlier redaction pass (this module or a caller's) already
  * replaced. The closing `]` is optional because unquoted values stop before `]`; the
@@ -82,67 +80,92 @@ const REDACTION_PLACEHOLDER_BOUNDARY_PATTERN = /^(?:$|[\s,;})"'`\\])/;
 const CREDENTIAL_CAMEL_COMPOUND_SUFFIXES =
 	"AccessToken|RefreshToken|IdToken|SessionToken|ClientSecret|EncryptionKey|SigningKey";
 const CREDENTIAL_CAMEL_SIMPLE_SUFFIXES =
-	"SecretAccessKey|Authorization|Credentials|Credential|AccountKey|ApiKey|SecretKey|PrivateKey|SessionKey|Passphrase|Password|Passwd|Pwd|Secrets|Secret|Bearer|Cookies|Cookie|Token|Auth";
+	"SecretAccessKey|Authorization|Credentials|Credential|AccountKey|ApiKey|SecretKey|PrivateKey|SessionKey|Passphrase|Password|Passwd|Pwd|Pw|Secrets|Secret|Bearer|Cookies|Cookie|Token|Auth";
+const CREDENTIAL_CAMEL_SIMPLE_SUFFIXES_V1 = CREDENTIAL_CAMEL_SIMPLE_SUFFIXES.replace("|Pw|", "|");
 const CREDENTIAL_CAMEL_PREFIX = "(?:[a-z0-9]+(?:[A-Z]{2,})?|[A-Z][a-z0-9]+(?:[A-Z]{2,})?|[A-Z]{2,})";
 const CREDENTIAL_CAMEL_COMPOUND_PREFIX = "(?:[a-z0-9]{2,}(?:[A-Z]{2,})?|[A-Z][a-z0-9]+(?:[A-Z]{2,})?|[A-Z]{2,})";
 const CREDENTIAL_CAMEL_MULTI_PREFIX_SEGMENT = "(?:[A-Z][a-z0-9]+|[A-Z]{2,}(?=[A-Z][a-z0-9]))";
 const CREDENTIAL_CAMEL_MULTI_PREFIX = `(?:[a-z0-9]{2,}|[A-Z][a-z0-9]+|[A-Z]{2,})(?:${CREDENTIAL_CAMEL_MULTI_PREFIX_SEGMENT})+(?:[A-Z]{2,})?`;
-const CREDENTIAL_CAMEL_KEY_PATTERN = `(?:(?:${CREDENTIAL_CAMEL_COMPOUND_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES})|(?:${CREDENTIAL_CAMEL_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES}))`;
-const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
-const CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
-	String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES})(?:\\*["'\x60]?\s*[=:]\s*)`,
-);
-const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_.-])((?:\\*["'\x60]?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["'\x60]?\s*[=:]\s*))`;
-const CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
-	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["'\x60]?\s*[=:]\s*)`,
-	"i",
-);
-const CREDENTIAL_CONTAINER_CANDIDATE_PATTERN = new RegExp(
-	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["'\x60]?\s*[=:]\s*[\[{])`,
-	"i",
-);
-const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["'\x60]?\s*[=:]\s*))`;
 const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["'\x60]?\s*:\s*))`;
 // Avoid splitting recognized multiword labels at their final component (e.g. `API Key`).
 const CREDENTIAL_COMPOUND_FIELD_PREFIX =
 	"(?:api|account|access|refresh|id|session|client|aws|secret|private|encryption|signing|key)";
-const CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN = String.raw`[ \t]+(?:${CREDENTIAL_KEY_LABELS}|(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*[=:]`;
-const CREDENTIAL_FOLLOWING_FIELD_PATTERN = String.raw`(?:[,;][ \t]*[A-Za-z][A-Za-z0-9_. \t-]{0,127}[ \t]*[=:]|${CREDENTIAL_WHITESPACE_FOLLOWING_FIELD_PATTERN})`;
-const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\s"'\x60}\]]))(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\r\n"'}\]]))*`;
 const CREDENTIAL_VALUE_QUOTED_BOUNDARY = String.raw`(?=$|[\s,;}):.\]]|/?>)`;
 const CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN = String.raw`[^\s,;}\]]*`;
-const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}`,
-	"gi",
-);
 const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«\x60]|\\+["'\x60]))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
-const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[^\r\n]|[^"\\\r\n])*?)(\\+")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[^\r\n]|[^"\\\r\n])*)(")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+')((?:\\[^\r\n]|[^'\\\r\n])*?)(\\+')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[^\r\n]|[^'\\\r\n])*)(')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*)(\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
-const CREDENTIAL_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?!\\+\x60)${CREDENTIAL_VALUE_PATTERN_BODY}`,
-	"gi",
+
+interface CredentialRedactionRules {
+	readonly keySuffix: RegExp;
+	readonly camelKeySuffix: RegExp;
+	readonly assignmentPrefix: string;
+	readonly camelAssignmentPrefix: string;
+	readonly assignmentCandidatePattern: RegExp;
+	readonly containerCandidatePattern: RegExp;
+	readonly camelAssignmentCandidatePattern: RegExp;
+	readonly authValuePattern: RegExp;
+	readonly valuePattern: RegExp;
+	readonly camelValuePattern: RegExp;
+	readonly escapedBacktickValuePattern: RegExp;
+	readonly camelEscapedBacktickValuePattern: RegExp;
+	readonly escapedBacktickUnclosedPattern: RegExp;
+	readonly camelEscapedBacktickUnclosedPattern: RegExp;
+}
+
+function createCredentialRedactionRules(keyLabels: string, camelSimpleSuffixes: string): CredentialRedactionRules {
+	const keyPattern = `(?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?(?:${keyLabels})`;
+	const camelKeyPattern = `(?:(?:${CREDENTIAL_CAMEL_COMPOUND_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES})|(?:${CREDENTIAL_CAMEL_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${camelSimpleSuffixes}))`;
+	const assignmentPrefix = String.raw`(?<![A-Za-z0-9_.-])((?:\\*["'\x60]?-*)(?:${keyPattern})(?:\\*["'\x60]?\s*[=:]\s*))`;
+	const camelAssignmentPrefix = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:${camelKeyPattern})(?:\\*["'\x60]?\s*[=:]\s*))`;
+	const whitespaceFollowingFieldPattern = String.raw`[ \t]+(?:${keyLabels}|(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*[=:]`;
+	const followingFieldPattern = String.raw`(?:[,;][ \t]*[A-Za-z][A-Za-z0-9_. \t-]{0,127}[ \t]*[=:]|${whitespaceFollowingFieldPattern})`;
+	const unquotedValuePatternBody = String.raw`(?:(?!\\+n|\\+r\\+n|${followingFieldPattern})(?:\\[^\r\n]|[^\s"'\x60}\]]))(?:(?!\\+n|\\+r\\+n|${followingFieldPattern})(?:\\[^\r\n]|[^\r\n"'}\]]))*`;
+	const valuePatternBody = String.raw`(?:(\\+")((?:\\[^\r\n]|[^"\\\r\n])*?)(\\+")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[^\r\n]|[^"\\\r\n])*)(")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+')((?:\\[^\r\n]|[^'\\\r\n])*?)(\\+')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[^\r\n]|[^'\\\r\n])*)(')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*)(\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${unquotedValuePatternBody}))`;
+	return {
+		keySuffix: new RegExp(`^${keyPattern}$`, "i"),
+		camelKeySuffix: new RegExp(`^${camelKeyPattern}$`),
+		assignmentPrefix,
+		camelAssignmentPrefix,
+		assignmentCandidatePattern: new RegExp(String.raw`(?:${keyLabels})(?:\\*["'\x60]?\s*[=:]\s*)`, "i"),
+		containerCandidatePattern: new RegExp(String.raw`(?:${keyLabels})(?:\\*["'\x60]?\s*[=:]\s*[\[{])`, "i"),
+		camelAssignmentCandidatePattern: new RegExp(
+			String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${camelSimpleSuffixes})(?:\\*["'\x60]?\s*[=:]\s*)`,
+		),
+		authValuePattern: new RegExp(
+			String.raw`${assignmentPrefix}(?:Bearer|Basic|Token)\s+${unquotedValuePatternBody}`,
+			"gi",
+		),
+		valuePattern: new RegExp(String.raw`${assignmentPrefix}(?!\\+\x60)${valuePatternBody}`, "gi"),
+		camelValuePattern: new RegExp(String.raw`${camelAssignmentPrefix}(?!\\+\x60)${valuePatternBody}`, "g"),
+		escapedBacktickValuePattern: new RegExp(
+			String.raw`${assignmentPrefix}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+			"gi",
+		),
+		camelEscapedBacktickValuePattern: new RegExp(
+			String.raw`${camelAssignmentPrefix}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+			"g",
+		),
+		escapedBacktickUnclosedPattern: new RegExp(
+			String.raw`${assignmentPrefix}(\\+\x60)((?:(?!\\+\x60)[^\r\n])*)(?=\r?\n|$)`,
+			"gi",
+		),
+		camelEscapedBacktickUnclosedPattern: new RegExp(
+			String.raw`${camelAssignmentPrefix}(\\+\x60)((?:(?!\\+\x60)[^\r\n])*)(?=\r?\n|$)`,
+			"g",
+		),
+	};
+}
+
+const CURRENT_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
+	CREDENTIAL_KEY_LABELS,
+	CREDENTIAL_CAMEL_SIMPLE_SUFFIXES,
 );
-const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(?!\\+\x60)${CREDENTIAL_VALUE_PATTERN_BODY}`,
-	"g",
-);
-const CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
-	"gi",
-);
-const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*?)(\\+\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
-	"g",
-);
-const CREDENTIAL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:(?!\\+\x60)[^\r\n])*)(?=\r?\n|$)`,
-	"gi",
-);
-const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:(?!\\+\x60)[^\r\n])*)(?=\r?\n|$)`,
-	"g",
+// Historical v1 fingerprints were computed before these two short aliases were recognized.
+const V1_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
+	CREDENTIAL_KEY_LABELS_V1,
+	CREDENTIAL_CAMEL_SIMPLE_SUFFIXES_V1,
 );
 const COOKIE_VALUE_PATTERN =
 	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
@@ -152,10 +175,17 @@ const YAML_BLOCK_SCALAR_HEADER_PATTERN =
 
 type YamlBlockScalarHeader = { indentation: number };
 
-function parseCredentialYamlBlockScalarHeader(line: string): YamlBlockScalarHeader | undefined {
+function isCredentialKeyWithRules(key: string, rules: CredentialRedactionRules): boolean {
+	return rules.keySuffix.test(key) || rules.camelKeySuffix.test(key);
+}
+
+function parseCredentialYamlBlockScalarHeader(
+	line: string,
+	rules: CredentialRedactionRules = CURRENT_CREDENTIAL_REDACTION_RULES,
+): YamlBlockScalarHeader | undefined {
 	const match = YAML_BLOCK_SCALAR_HEADER_PATTERN.exec(line);
 	const key = (match?.[2] ?? match?.[3] ?? match?.[4] ?? "").trim();
-	if (match === null || !isCredentialKey(key)) return undefined;
+	if (match === null || !isCredentialKeyWithRules(key, rules)) return undefined;
 	return { indentation: (match[1] ?? "").length };
 }
 
@@ -167,14 +197,14 @@ function lineBounds(text: string, start: number): { contentEnd: number; nextLine
 	return { contentEnd, nextLineStart };
 }
 
-function redactYamlBlockScalars(text: string): string {
+function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): string {
 	const output: string[] = [];
 	let copiedUntil = 0;
 	let lineStart = 0;
 
 	while (lineStart < text.length) {
 		const { contentEnd, nextLineStart } = lineBounds(text, lineStart);
-		const header = parseCredentialYamlBlockScalarHeader(text.slice(lineStart, contentEnd));
+		const header = parseCredentialYamlBlockScalarHeader(text.slice(lineStart, contentEnd), rules);
 		if (header === undefined) {
 			lineStart = nextLineStart;
 			continue;
@@ -280,7 +310,7 @@ function cookieDiagnosticSuffix(value: string): string {
 
 /** Whether a field name ends in a credential label recognized by the redactor. */
 export function isCredentialKey(key: string): boolean {
-	return CREDENTIAL_KEY_SUFFIX.test(key) || CREDENTIAL_CAMEL_KEY_SUFFIX.test(key);
+	return isCredentialKeyWithRules(key, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
 /**
@@ -360,9 +390,18 @@ function uniqueStructuredKey(
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	let redacted = redactCredentialContainers(text);
+	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
+}
+
+/** Historical redaction rules used only to validate v1 crash fingerprints. */
+export function redactCrashSecretsV1(text: string): string {
+	return redactCrashSecretsWithRules(text, V1_CREDENTIAL_REDACTION_RULES);
+}
+
+function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules): string {
+	let redacted = redactCredentialContainers(text, rules);
 	// Block scalar bodies span lines and must be masked before line-bounded rules handle the header.
-	redacted = redactYamlBlockScalars(redacted);
+	redacted = redactYamlBlockScalars(redacted, rules);
 	redacted = redacted.replace(
 		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
 		"«redacted-auth»",
@@ -422,7 +461,7 @@ export function redactCrashSecrets(text: string): string {
 			? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
 			: _match,
 	);
-	redacted = redacted.replace(CREDENTIAL_AUTH_VALUE_PATTERN, (_match, prefix: string) => `${prefix}«redacted»`);
+	redacted = redacted.replace(rules.authValuePattern, (_match, prefix: string) => `${prefix}«redacted»`);
 	redacted = redacted.replace(CREDENTIAL_AUTHORIZATION_VALUE_PATTERN, (_match: string, prefix: string) =>
 		parseCredentialYamlBlockScalarHeader(_match) === undefined ? `${prefix}«redacted»` : _match,
 	);
@@ -432,29 +471,29 @@ export function redactCrashSecrets(text: string): string {
 	// through the end of their line. Capture each complete key once and inspect
 	// its suffix; repeated compound-prefix groups backtrack quadratically on long
 	// attacker-controlled identifiers.
-	if (CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
+	if (rules.assignmentCandidatePattern.test(redacted)) {
 		redacted = redacted.replace(
-			CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN,
+			rules.escapedBacktickValuePattern,
 			(_match: string, prefix: string, open: string, _value: string, close: string) =>
 				`${prefix}${open}«redacted»${close}`,
 		);
 		redacted = redacted.replace(
-			CREDENTIAL_ESCAPED_BACKTICK_UNCLOSED_PATTERN,
+			rules.escapedBacktickUnclosedPattern,
 			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
 		);
-		redacted = redacted.replace(CREDENTIAL_VALUE_PATTERN, redactCredentialValue);
+		redacted = redacted.replace(rules.valuePattern, redactCredentialValue);
 	}
-	if (CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
+	if (rules.camelAssignmentCandidatePattern.test(redacted)) {
 		redacted = redacted.replace(
-			CREDENTIAL_CAMEL_ESCAPED_BACKTICK_VALUE_PATTERN,
+			rules.camelEscapedBacktickValuePattern,
 			(_match: string, prefix: string, open: string, _value: string, close: string) =>
 				`${prefix}${open}«redacted»${close}`,
 		);
 		redacted = redacted.replace(
-			CREDENTIAL_CAMEL_ESCAPED_BACKTICK_UNCLOSED_PATTERN,
+			rules.camelEscapedBacktickUnclosedPattern,
 			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
 		);
-		redacted = redacted.replace(CREDENTIAL_CAMEL_VALUE_PATTERN, redactCredentialValue);
+		redacted = redacted.replace(rules.camelValuePattern, redactCredentialValue);
 	}
 	// Keep dev's literal session-id cookie variants, which are not credential labels.
 	redacted = redacted.replace(
@@ -564,10 +603,10 @@ function redactCredentialValue(
 	return `${prefix}«redacted»`;
 }
 
-function redactCredentialContainers(text: string): string {
-	if (!CREDENTIAL_CONTAINER_CANDIDATE_PATTERN.test(text)) return text;
-	const assignment = new RegExp(String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?=[\[{])`, "gi");
-	const camelAssignment = new RegExp(String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(?=[\[{])`, "g");
+function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
+	if (!rules.containerCandidatePattern.test(text)) return text;
+	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
+	const camelAssignment = new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g");
 	return redactCredentialContainersWithPattern(
 		redactCredentialContainersWithPattern(text, assignment),
 		camelAssignment,

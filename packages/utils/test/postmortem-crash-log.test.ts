@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,8 +6,18 @@ import { computeHandledErrorFingerprint, NO_APP_FRAME } from "../src/crash-finge
 import { isCredentialKey, redactCrashSecrets } from "../src/crash-redaction";
 import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash, recordHandledError } from "../src/postmortem";
 
+const trackedTempDirs: string[] = [];
+function trackedTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(() => {
+	for (const dir of trackedTempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 function tempCrashLog(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-log-"));
+	const dir = trackedTempDir("gjc-crash-log-");
 	// Nested path proves the writer creates missing parent directories.
 	return path.join(dir, "agent", "gjc-crash.log");
 }
@@ -503,6 +513,13 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts suffixes after single-quoted password placeholders", () => {
+		for (const placeholder of ["«redacted»", "[REDACTED_TOKEN]"]) {
+			expect(redactCrashSecrets(`pw='${placeholder}'tail-secret-123`)).toBe("pw='«redacted»'");
+		}
+		expect(redactCrashSecrets("pw='[REDACTED_TOKEN]' note=keep")).toBe("pw='[REDACTED_TOKEN]' note=keep");
+	});
+
 	it("keeps a standalone redaction placeholder under a sensitive label", () => {
 		expect(redactCrashSecrets("+NPM_TOKEN=«redacted-npm-token»\n+x")).toBe("+NPM_TOKEN=«redacted-npm-token»\n+x");
 		expect(redactCrashSecrets("+token=[REDACTED_TOKEN]\n+x")).toBe("+token=[REDACTED_TOKEN]\n+x");
@@ -836,10 +853,14 @@ describe("recordFatalCrash", () => {
 	});
 
 	it("redacts abbreviated password credential fields", () => {
-		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
-		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(
-			"pwd=«redacted» dbPwd=«redacted» user_pwd=«redacted»",
-		);
+		for (const key of ["pw", "pwd", "dbPw", "dbPwd", "user_pw", "user_pwd"]) {
+			expect(isCredentialKey(key)).toBe(true);
+		}
+		expect(
+			redactCrashSecrets(
+				"pw=opaque-pw pwd=opaque-pwd dbPw=opaque-db-pw dbPwd=opaque-db-pwd user_pw=opaque-user-pw user_pwd=opaque-user-pwd",
+			),
+		).toBe("pw=«redacted» pwd=«redacted» dbPw=«redacted» dbPwd=«redacted» user_pw=«redacted» user_pwd=«redacted»");
 		expect(redactCrashSecrets('{"dbPwd":"opaque-db-pwd"}')).toBe('{"dbPwd":"«redacted»"}');
 	});
 
@@ -1294,7 +1315,7 @@ after=keep`;
 
 describe("fatal handler process fixtures", () => {
 	function runFatalFixture(body: string): { exitCode: number; stderr: string; crashLog: string } {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-fatal-fixture-"));
+		const dir = trackedTempDir("gjc-fatal-fixture-");
 		const script = path.join(dir, "fixture.ts");
 		fs.writeFileSync(script, `import ${JSON.stringify(POSTMORTEM_SOURCE)};\n${body}\n`);
 		const result = spawnBun(script, {

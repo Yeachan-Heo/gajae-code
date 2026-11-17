@@ -28,6 +28,7 @@ import {
 	type IrcArrivalSnapshot,
 	type TranscriptRebuildPolicy,
 } from "../../modes/types";
+import { BTW_HANDOFF_MESSAGE_TYPE, type BtwHandoffDetails } from "../../session/btw-contract";
 import {
 	type CustomMessage,
 	isSilentAbort,
@@ -41,6 +42,7 @@ import {
 	type SessionContext,
 } from "../../session/session-manager";
 import { formatBytes, formatDuration } from "../../tools/render-utils";
+import { imageReferenceNumbers } from "../../utils/pasted-image-path";
 import { buildAbortDisplayMessage } from "./abort-message";
 import {
 	formatIrcMessageBlock,
@@ -148,6 +150,27 @@ type ResumeProgressUiSurface = InteractiveModeContext["ui"] & {
 	waitForRenderCommit: (generation: number, timeoutMs?: number) => Promise<boolean>;
 	requestRender: (force?: boolean, source?: string) => void;
 };
+
+/**
+ * The transcript text of a user message: its text, plus a marker for each attached image the text does not
+ * reference. Prompts written in this TUI name their images (`[image 1]`); prompts from another client (ACP, SDK,
+ * a phone) carry image blocks only, which otherwise left no trace, and an image-only prompt left no message at all.
+ */
+function withUnreferencedImageMarkers(message: Message, text: string): string {
+	if (message.role !== "user" || typeof message.content === "string") return text;
+	const images = message.content.filter(block => block.type === "image");
+	const references = [...new Set(imageReferenceNumbers(text))];
+	// Numbers within the attached images name them (`[image 2]` is the second image). A number past them is taken
+	// to come from the editor, which sends the images of the placeholders left in the text, in text order, without
+	// renumbering: there the k-th distinct reference is the k-th image.
+	const byNumber = references.every(number => number <= images.length);
+	const unreferenced = byNumber
+		? images.filter((_, index) => !references.includes(index + 1))
+		: images.slice(references.length);
+	const markers = unreferenced.map(image => `[image: ${image.mimeType}]`);
+	if (markers.length === 0) return text;
+	return text ? `${text}\n\n${markers.join(" ")}` : markers.join(" ");
+}
 
 function canMountResumeProgressLease(ctx: Pick<InteractiveModeContext, "ui" | "statusContainer">): boolean {
 	const status = ctx.statusContainer as
@@ -592,6 +615,19 @@ export class UiHelpers {
 						}
 						break;
 					}
+					if (message.customType === BTW_HANDOFF_MESSAGE_TYPE) {
+						// The content is the model-facing nonce-framed handoff with the
+						// verbatim exchanges; show a compact marker instead.
+						const count = (message as CustomMessage<Partial<BtwHandoffDetails>>).details?.exchangeCount;
+						const countLabel =
+							typeof count === "number" ? ` (${count} ${count === 1 ? "exchange" : "exchanges"})` : "";
+						addChatChild(this.ctx, new Spacer(1));
+						addChatChild(
+							this.ctx,
+							new Text(`${theme.fg("accent", "Handed off /btw side chat")}${theme.fg("dim", countLabel)}`, 1, 0),
+						);
+						break;
+					}
 					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
@@ -672,15 +708,16 @@ export class UiHelpers {
 			case "user":
 			case "developer": {
 				const textContent = this.ctx.getUserMessageText(message);
-				if (textContent) {
+				const displayText = withUnreferencedImageMarkers(message, textContent);
+				if (displayText) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
 					const userComponent = new UserMessageComponent(
-						textContent,
+						displayText,
 						isSynthetic,
 						message.role === "user" && !isSynthetic ? this.#userViewportAnchorId(message) : undefined,
 					);
 					addChatChild(this.ctx, userComponent);
-					if (options?.populateHistory && message.role === "user" && !isSynthetic) {
+					if (options?.populateHistory && message.role === "user" && !isSynthetic && textContent) {
 						this.ctx.editor.addToHistory(textContent);
 					}
 				}

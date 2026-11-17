@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { type Component, visibleWidth } from "@gajae-code/tui";
 import { TwoColumnBody } from "../src/modes/components/two-column-body";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
+import { loadTestTheme } from "./helpers/test-theme";
 
 class StaticPane implements Component {
 	constructor(private readonly lines: string[]) {}
@@ -14,8 +15,7 @@ class StaticPane implements Component {
 }
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Failed to load red-claw theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

@@ -9,16 +9,11 @@
  * `unsupported_format` rather than falling back to a speculative parse.
  */
 
+import { isRecord } from "@gajae-code/utils";
 import { SessionImportError, type SessionImportFormatId, type SessionImportProviderId } from "./types";
 
 /** Leading bytes consulted for envelope sniffing. */
 const DETECTION_SAMPLE_BYTES = 256 * 1024;
-
-type JsonRecord = Record<string, unknown>;
-
-function isRecord(value: unknown): value is JsonRecord {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 export interface SessionImportDetection {
 	provider: SessionImportProviderId;

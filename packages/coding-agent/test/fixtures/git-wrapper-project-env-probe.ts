@@ -11,7 +11,12 @@ const cwd = process.cwd();
 try {
 	if (op === "commit") await git.commit(cwd, "probe");
 	else if (op === "push") await git.push(cwd, { remote: "origin", refspec: "HEAD:refs/heads/probe" });
-	else if (op === "read-tree") await git.readTree(cwd, "HEAD", { env: { GIT_INDEX_FILE: `${cwd}/.git/probe-index` } });
+	else if (op === "fetch-http") {
+		const remote = process.env.GJC_TEST_HTTP_REMOTE;
+		if (!remote) throw new Error("GJC_TEST_HTTP_REMOTE is required");
+		await git.fetch(cwd, remote, "HEAD", "refs/probe/head");
+	} else if (op === "read-tree")
+		await git.readTree(cwd, "HEAD", { env: { GIT_INDEX_FILE: `${cwd}/.git/probe-index` } });
 	else if (op === "gh") await git.github.run(cwd, ["search", "repos", "gjc-probe", "--limit", "1"]);
 	else throw new Error(`unknown op ${op}`);
 } catch {

@@ -860,4 +860,100 @@ describe("MCPConnectionPool", () => {
 		expect(health?.events.every(event => !event.message || event.message.length <= 512)).toBe(true);
 		await validLease.release();
 	});
+
+	test("shared apikey authorization tokens do not reuse one pool connection", async () => {
+		const opened: string[] = [];
+		const pool = new MCPConnectionPool({
+			sharedPoolIdleMs: 0,
+			connect: async (name, cfg) => {
+				opened.push(cfg.type === "http" || cfg.type === "sse" ? (cfg.headers?.Authorization ?? "") : "");
+				return connection(name, cfg, new FakeTransport());
+			},
+		});
+		const label: MCPServerConfig = {
+			type: "http",
+			url: "https://mcp.example.test/mcp",
+			sharing: "shared",
+			auth: { type: "apikey", credentialId: "tenant-scope" },
+			headers: { Authorization: "Bearer unresolved" },
+		};
+		const firstResolved: MCPServerConfig = { ...label, headers: { Authorization: "Bearer tenant-one" } };
+		const secondResolved: MCPServerConfig = { ...label, headers: { Authorization: "Bearer tenant-two" } };
+		const optionsFor = (resolved: MCPServerConfig) => ({
+			keyConfig: label,
+			sharingMode: "shared" as const,
+			effectiveHeaders: resolved.type === "http" || resolved.type === "sse" ? resolved.headers : undefined,
+		});
+		const first = await pool.acquire("srv", firstResolved, optionsFor(firstResolved));
+		const second = await pool.acquire("srv", secondResolved, optionsFor(secondResolved));
+		expect(first.key).not.toBe(second.key);
+		expect(first.connection).not.toBe(second.connection);
+		expect(opened).toEqual(["Bearer tenant-one", "Bearer tenant-two"]);
+		await first.release();
+		await second.release();
+		await pool.shutdown();
+	});
+
+	test("shared apikey leases keep one connection when the authorization token matches", async () => {
+		const opened: string[] = [];
+		const pool = new MCPConnectionPool({
+			sharedPoolIdleMs: 0,
+			connect: async (name, cfg) => {
+				opened.push(cfg.type === "http" || cfg.type === "sse" ? (cfg.headers?.Authorization ?? "") : "");
+				return connection(name, cfg, new FakeTransport());
+			},
+		});
+		const resolved: MCPServerConfig = {
+			type: "http",
+			url: "https://mcp.example.test/mcp",
+			sharing: "shared",
+			auth: { type: "apikey", credentialId: "tenant-scope" },
+			headers: { Authorization: "Bearer tenant-one" },
+		};
+		const options = {
+			keyConfig: resolved,
+			sharingMode: "shared" as const,
+			effectiveHeaders: resolved.headers,
+		};
+		const first = await pool.acquire("srv", resolved, options);
+		const second = await pool.acquire("srv", resolved, options);
+		expect(first.key).toBe(second.key);
+		expect(first.connection).toBe(second.connection);
+		expect(opened).toEqual(["Bearer tenant-one"]);
+		await first.release();
+		await second.release();
+		await pool.shutdown();
+	});
+
+	test("shared oauth rotation keeps one connection across authorization tokens", async () => {
+		const opened: string[] = [];
+		const pool = new MCPConnectionPool({
+			sharedPoolIdleMs: 0,
+			connect: async (name, cfg) => {
+				opened.push(cfg.type === "http" || cfg.type === "sse" ? (cfg.headers?.Authorization ?? "") : "");
+				return connection(name, cfg, new FakeTransport());
+			},
+		});
+		const label: MCPServerConfig = {
+			type: "http",
+			url: "https://mcp.example.test/mcp",
+			sharing: "shared",
+			auth: { type: "oauth", credentialId: "credential-a" },
+		};
+		const firstResolved: MCPServerConfig = { ...label, headers: { Authorization: "Bearer old-token" } };
+		const secondResolved: MCPServerConfig = { ...label, headers: { Authorization: "Bearer new-token" } };
+		const optionsFor = (resolved: MCPServerConfig) => ({
+			keyConfig: label,
+			sharingMode: "shared" as const,
+			effectiveHeaders: resolved.type === "http" || resolved.type === "sse" ? resolved.headers : undefined,
+		});
+		const first = await pool.acquire("srv", firstResolved, optionsFor(firstResolved));
+		const second = await pool.acquire("srv", secondResolved, optionsFor(secondResolved));
+		expect(first.key).toBe(second.key);
+		expect(first.connection).toBe(second.connection);
+		expect(opened).toEqual(["Bearer old-token"]);
+		await first.release();
+		await second.release();
+		await pool.shutdown();
+	});
 });

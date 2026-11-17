@@ -16,6 +16,7 @@ function envelopeInput(overrides: Partial<BuildCrashEnvelopeInput> = {}): BuildC
 	return {
 		eventId: EVENT_ID,
 		fingerprint: FINGERPRINT,
+		fpv: 1,
 		errorName: "Error",
 		messageClass: "shared topic authority unavailable",
 		frames: [
@@ -75,6 +76,7 @@ describe("buildCrashEnvelope", () => {
 		const header = JSON.parse(lines[0] ?? "") as Record<string, unknown>;
 		expect(itemHeader.length).toBe(Buffer.byteLength(lines[2] ?? "", "utf8"));
 		expect(payload.fingerprint).toEqual([FINGERPRINT]);
+		expect((payload.tags as Record<string, string>)["gjc.fpv"]).toBe("1");
 		expect(header).not.toHaveProperty("sent_at");
 		expect(payload.timestamp).toBe(Date.UTC(2026, 7, 11) / 1000);
 		expect(result.body).not.toMatch(/T\d{2}:\d{2}:\d{2}/);
@@ -82,6 +84,19 @@ describe("buildCrashEnvelope", () => {
 			expect(payload).not.toHaveProperty(forbidden);
 		const exception = payload.exception as { values: { stacktrace: { frames: { function: string }[] } }[] };
 		expect(exception.values[0]?.stacktrace.frames.map(frame => frame.function)).toEqual(["oldest", "newest"]);
+	});
+
+	it("includes the signature's fingerprint version in the Sentry tags", () => {
+		const result = buildCrashEnvelope(envelopeInput({ fpv: 2 }));
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		const payload = JSON.parse(result.body.split("\n")[2] ?? "") as { tags: Record<string, string> };
+		expect(payload.tags["gjc.fpv"]).toBe("2");
+	});
+
+	it.each([0, 1.5, 1000])("refuses invalid fingerprint version %s", fpv => {
+		const result = buildCrashEnvelope(envelopeInput({ fpv }));
+		expect(result).toEqual({ ok: false, reason: "invalid fingerprint version" });
 	});
 
 	it("refuses the complete event when a crash field cannot be sanitized", () => {

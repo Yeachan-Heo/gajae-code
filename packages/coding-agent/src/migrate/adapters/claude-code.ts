@@ -134,7 +134,8 @@ export const claudeCodeAdapter: Adapter = {
 		};
 
 		const configPath = path.join(homeDir, ".claude.json");
-		const read = await readSourceText(configPath, SOURCE, "mcp");
+		const sourceRoot = scope === "project" ? cwd : homeDir;
+		const read = await readSourceText(configPath, SOURCE, "mcp", homeDir);
 		if ("diagnostic" in read) {
 			result.diagnostics.push(read.diagnostic);
 		} else {
@@ -151,25 +152,25 @@ export const claudeCodeAdapter: Adapter = {
 			}
 		}
 
-		const skills = await collectSkillDir(path.join(homeDir, ".claude", "skills"), SOURCE);
+		const skills = await collectSkillDir(path.join(homeDir, ".claude", "skills"), SOURCE, homeDir);
 		result.skillCandidates.push(...skills.candidates);
 		result.diagnostics.push(...skills.diagnostics);
 
 		const commandsDir =
 			scope === "project" ? path.join(cwd, ".claude", "commands") : path.join(homeDir, ".claude", "commands");
-		const commands = await collectMarkdownCommands(commandsDir, SOURCE, { recursive: true });
+		const commands = await collectMarkdownCommands(commandsDir, SOURCE, { recursive: true, root: sourceRoot });
 		result.slashCommandCandidates.push(...commands.candidates);
 		result.diagnostics.push(...commands.diagnostics);
 
 		const agentsDir =
 			scope === "project" ? path.join(cwd, ".claude", "agents") : path.join(homeDir, ".claude", "agents");
-		const agents = await collectMarkdownAgents(agentsDir, SOURCE);
+		const agents = await collectMarkdownAgents(agentsDir, SOURCE, sourceRoot);
 		result.agentCandidates.push(...agents.candidates);
 		result.diagnostics.push(...agents.diagnostics);
 
 		const instructionsPath =
 			scope === "project" ? path.join(cwd, "CLAUDE.md") : path.join(homeDir, ".claude", "CLAUDE.md");
-		const instructions = await collectInstructionFile(instructionsPath, SOURCE);
+		const instructions = await collectInstructionFile(instructionsPath, SOURCE, sourceRoot);
 		result.instructionCandidates.push(...instructions.candidates);
 		result.diagnostics.push(...instructions.diagnostics);
 
@@ -178,7 +179,7 @@ export const claudeCodeAdapter: Adapter = {
 				? [path.join(cwd, ".claude", "settings.json"), path.join(cwd, ".claude", "settings.local.json")]
 				: [path.join(homeDir, ".claude", "settings.json")];
 		for (const file of settingsFiles) {
-			const settings = await readOptionalJson(file, SOURCE, "source");
+			const settings = await readOptionalJson(file, SOURCE, "source", sourceRoot);
 			if ("absent" in settings) continue;
 			if ("diagnostic" in settings) {
 				result.diagnostics.push(settings.diagnostic);

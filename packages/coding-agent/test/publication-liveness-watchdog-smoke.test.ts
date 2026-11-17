@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import * as path from "node:path";
+import { buildDevCompileArgs, buildReleaseCompileArgs } from "../scripts/compile-args";
 import { smokeTestPublicationLivenessWatchdog } from "../src/sdk/broker/publication-liveness-watchdog-smoke";
 
 const packageDir = path.resolve(import.meta.dir, "..");
@@ -26,16 +27,49 @@ test("publication liveness smoke initializes the compiled worker entrypoint", as
 }, 15_000);
 
 test("publication liveness smoke keeps the compiled literal on the CLI smoke path", async () => {
-	const [smokeSource, watchdogSource, compileArgsSource, cliSource] = await Promise.all([
+	const [smokeSource, watchdogSource, cliSource] = await Promise.all([
 		Bun.file(path.join(packageDir, "src/sdk/broker/publication-liveness-watchdog-smoke.ts")).text(),
 		Bun.file(path.join(packageDir, "src/sdk/broker/publication-liveness-watchdog.ts")).text(),
-		Bun.file(path.join(packageDir, "scripts/compile-args.ts")).text(),
 		Bun.file(path.join(packageDir, "src/cli-main.ts")).text(),
 	]);
-	for (const source of [smokeSource, watchdogSource, compileArgsSource]) {
+	for (const source of [smokeSource, watchdogSource]) {
 		expect(source).toContain(`"${compiledLiteral}"`);
 	}
 	expect(smokeSource).toContain("isEmbeddedCompiledModule()");
 	expect(watchdogSource).toContain("isEmbeddedCompiledModule()");
 	expect(cliSource).toContain("await smokeTestPublicationLivenessWatchdog()");
+});
+
+test("release and dev compile commands register the publication watchdog as an entrypoint", () => {
+	const outfile = "dist/watchdog-smoke";
+	const target = "bun-linux-arm64";
+	for (const { args, root, boundary, boundaryValue, worker } of [
+		{
+			args: buildReleaseCompileArgs(target, outfile),
+			root: ".",
+			boundary: "--target",
+			boundaryValue: target,
+			worker: compiledLiteral,
+		},
+		{
+			args: buildDevCompileArgs(outfile),
+			root: "../..",
+			boundary: "--root",
+			boundaryValue: "../..",
+			worker: "./src/sdk/broker/publication-liveness-watchdog-worker.ts",
+		},
+	]) {
+		const rootIndex = args.indexOf("--root");
+		const boundaryIndex = args.indexOf(boundary);
+		const outfileIndex = args.indexOf("--outfile");
+		expect(rootIndex).toBeGreaterThan(-1);
+		expect(args.slice(rootIndex, rootIndex + 2)).toEqual(["--root", root]);
+		expect(boundaryIndex).toBeGreaterThan(-1);
+		expect(args.slice(boundaryIndex, boundaryIndex + 2)).toEqual([boundary, boundaryValue]);
+		expect(outfileIndex).toBeGreaterThan(boundaryIndex + 2);
+		expect(args.slice(outfileIndex)).toEqual(["--outfile", outfile]);
+		const entrypoints = args.slice(boundaryIndex + 2, outfileIndex);
+		expect(entrypoints.every(arg => !arg.startsWith("-"))).toBe(true);
+		expect(entrypoints).toContain(worker);
+	}
 });

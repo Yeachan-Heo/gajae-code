@@ -1,14 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AgentContext, AgentLoopConfig, AgentTool } from "@gajae-code/agent-core/types";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createUserMessage, identityConverter } from "./helpers";
 
 function makeTool(name: string): AgentTool<z.ZodObject<Record<string, never>>, Record<string, never>> {
 	return {
@@ -34,7 +29,7 @@ async function collectToolResults(
 			{ content: ["recovered"] },
 		],
 	});
-	const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+	const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 	const toolResults: Array<{ isError?: boolean; text: string }> = [];
 	const stream = agentLoop([createUserMessage("do the thing")], context, config, undefined, mock.stream);

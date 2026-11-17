@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
+import type { ClipboardImage } from "@gajae-code/natives";
 import { type AutocompleteProvider, getKeybindings, matchesKey, type SlashCommand } from "@gajae-code/tui";
 import { $pickenv, logger, sanitizeText } from "@gajae-code/utils";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
@@ -22,7 +23,13 @@ import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/ag
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { copyToClipboard, pasteFromClipboard, readImageFromClipboard } from "../../utils/clipboard";
+import {
+	copyToClipboard,
+	pasteFromClipboard,
+	readImageFromClipboard,
+	readMacFileUrlsFromClipboard,
+	readTextFromClipboard,
+} from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
@@ -30,6 +37,8 @@ import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-
 import {
 	decodePastedPathCandidate,
 	formatPastedImageReference,
+	imageFilePathsFromList,
+	imageReferenceNumbers,
 	locatePastedImageReferenceAroundCursor,
 	parsePastedImagePaths,
 } from "../../utils/pasted-image-path";
@@ -78,16 +87,21 @@ export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
 
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
-const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const ITERM_PET_DRAG_PATH_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T\/iTerm2\.[A-Za-z0-9]+\.gajae-pet\.(?:png|gif)$/;
-const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
 function isItermPetDragPaste(text: string): boolean {
 	return ITERM_PET_DRAG_PATH_PATTERN.test(decodePastedPathCandidate(text) ?? "");
 }
 
+interface ClipboardReaders {
+	readImage: typeof readImageFromClipboard;
+	readText: typeof readTextFromClipboard;
+	readMacFileUrls: typeof readMacFileUrlsFromClipboard;
+}
+
 interface InputControllerDependencies {
 	loadPastedImageBatch?: typeof loadPastedImageBatch;
+	clipboard?: Partial<ClipboardReaders>;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -97,6 +111,7 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	readonly #clipboard: ClipboardReaders;
 	/** Session id with an automatic-title request pending, if any. */
 	#autoTitleInFlightSessionId: string | undefined;
 	#deferredSubmission?: {
@@ -115,6 +130,12 @@ export class InputController {
 		dependencies: InputControllerDependencies = {},
 	) {
 		this.#loadPastedImageBatch = dependencies.loadPastedImageBatch ?? loadPastedImageBatch;
+		this.#clipboard = {
+			readImage: readImageFromClipboard,
+			readText: readTextFromClipboard,
+			readMacFileUrls: readMacFileUrlsFromClipboard,
+			...dependencies.clipboard,
+		};
 		this.actionRegistry = new ActionRegistry({
 			context: undefined,
 			showError: actionId => this.ctx.showError(actionId),
@@ -668,6 +689,10 @@ export class InputController {
 				this.#resetEscapeGestures();
 				return;
 			}
+			if (this.ctx.promptSuggestion?.tryCancelOnEscape()) {
+				this.#resetEscapeGestures();
+				return;
+			}
 			if (this.#handlePendingSteerInterrupt()) return;
 			if (this.#handleCancellableWorkEscape({ maintenance: true, retry: "escape" })) {
 				this.#resetEscapeGestures();
@@ -967,13 +992,12 @@ export class InputController {
 			});
 		}
 
-		// Tab on an empty composer accepts the pending ghost-text prompt suggestion.
+		// Tab on an empty composer accepts the ghost-text next-prompt suggestion.
 		this.ctx.editor.onTab = (text: string) => this.ctx.promptSuggestion?.tryAcceptOnTab(text) === true;
 
 		this.ctx.editor.onUndo = text => this.#restorePendingImagesAfterPlaceholderUndo(text);
 		this.ctx.editor.onChange = (text: string) => {
 			this.#resetEscapeGestures();
-			this.ctx.promptSuggestion?.notifyEditorChanged(text);
 			const wasBashMode = this.ctx.isBashMode;
 			const wasBashNoContext = this.ctx.isBashNoContext;
 			const wasPythonMode = this.ctx.isPythonMode;
@@ -1009,6 +1033,8 @@ export class InputController {
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		this.#imagePlaceholderDeletionUndo = undefined;
 		text = text.trim();
+		// Any submission supersedes a pending or shown next-prompt suggestion.
+		if (text) this.ctx.promptSuggestion?.clear();
 		const submittedBashMode = this.ctx.isBashMode;
 		const submittedBashNoContext = this.ctx.isBashNoContext;
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
@@ -1416,6 +1442,8 @@ export class InputController {
 		}
 		if (outcome.reason === "compaction") {
 			this.ctx.showWarning("Cannot send immediately while compaction is in progress");
+		} else if (outcome.reason === "run_bound") {
+			this.ctx.showWarning("This queued message is bound to the current run and cannot be sent as a new prompt");
 		} else {
 			this.ctx.showStatus("Send already in progress");
 		}
@@ -1654,7 +1682,7 @@ export class InputController {
 		)
 			.then(async title => {
 				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
-				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+				const applied = await this.ctx.session.setSessionName(title, "auto");
 				if (applied) {
 					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
 					this.ctx.updateEditorBorderColor();
@@ -1986,19 +2014,32 @@ export class InputController {
 			return true;
 		}
 		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
+		// Cmd+V on an image-only clipboard arrives as an empty bracketed paste in some
+		// terminals: read the image from the clipboard instead of inserting nothing.
+		if (text.length === 0) return this.handleImagePaste();
 		const parsed = parsePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
 		if (!parsed) return false;
 		if (parsed.kind === "too-many") {
 			this.ctx.showStatus(`Cannot attach more than ${parsed.maxCandidates} pasted images.`);
 			return false;
 		}
-		return this.#attachPastedImagePaths(parsed.paths, parsed.requiresConfirmation, context);
+		return this.#attachPastedImagePaths(
+			parsed.paths,
+			parsed.requiresConfirmation ? "confirm" : "clipboard-temp",
+			context,
+		);
 	}
 
-	/** Return false on every failure so CustomEditor restores the exact paste. */
+	/**
+	 * Return false on every failure so CustomEditor restores the exact paste.
+	 *
+	 * `clipboard-temp` attaches one terminal-written temp image without asking; `confirm` asks
+	 * before reading any other pasted path; `user-selected` (files copied in Finder and pasted
+	 * with the image-paste key) is already an explicit choice and attaches without asking.
+	 */
 	async #attachPastedImagePaths(
 		imagePaths: readonly string[],
-		requiresConfirmation: boolean,
+		access: "clipboard-temp" | "confirm" | "user-selected",
 		context: PasteTextContext,
 	): Promise<boolean> {
 		const signal = context.signal;
@@ -2007,7 +2048,7 @@ export class InputController {
 		const pendingImages = this.ctx.pendingImages;
 		const pendingImageCount = pendingImages.length;
 		try {
-			if (requiresConfirmation) {
+			if (access === "confirm") {
 				const selection = await this.ctx.showHookSelector(
 					`Attach ${imagePaths.length} pasted images?\nOnly attach files you intend to send to the model.`,
 					["Attach images", "Paste paths literally"],
@@ -2020,7 +2061,7 @@ export class InputController {
 			const loaded = await this.#loadPastedImageBatch({
 				paths: imagePaths,
 				autoResize: this.ctx.settings.get("images.autoResize"),
-				sourcePolicy: requiresConfirmation ? "confirmed" : "automatic-temp",
+				sourcePolicy: access === "clipboard-temp" ? "automatic-temp" : "confirmed",
 				signal,
 			});
 			signal.throwIfAborted();
@@ -2128,10 +2169,7 @@ export class InputController {
 
 		const images: InteractiveModeContext["pendingImages"] = [];
 		const seenImageIndexes = new Set<number>();
-		for (const match of text.matchAll(IMAGE_PLACEHOLDER_PATTERN)) {
-			const placeholderNumberText = match[1];
-			if (!placeholderNumberText) continue;
-			const placeholderNumber = Number.parseInt(placeholderNumberText, 10);
+		for (const placeholderNumber of imageReferenceNumbers(text)) {
 			const imageIndex = placeholderNumber - 1;
 			if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length || seenImageIndexes.has(imageIndex)) {
 				continue;
@@ -2159,7 +2197,7 @@ export class InputController {
 	}
 
 	#clearPendingImagesIfPlaceholdersRemoved(text: string): void {
-		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
+		if (this.ctx.pendingImages.length === 0 || imageReferenceNumbers(text).length > 0) {
 			return;
 		}
 		// Editor clears its internal buffer before invoking onSubmit and emits
@@ -2181,54 +2219,83 @@ export class InputController {
 		this.ctx.pendingImages = [];
 	}
 
+	/**
+	 * Ctrl+V / Cmd+V smart paste. Order matters: macOS pasteboard file URLs first (a Finder-copied
+	 * image also carries a generic file-icon bitmap), then the bitmap, then clipboard text, inserted
+	 * verbatim.
+	 */
 	async handleImagePaste(): Promise<boolean> {
 		try {
-			const image = await readImageFromClipboard();
-			if (image) {
-				const base64Data = image.data.toBase64();
-				let imageData = await ensureSupportedImageInput({
-					type: "image",
-					data: base64Data,
-					mimeType: image.mimeType,
-				});
-				if (!imageData) {
-					this.ctx.showStatus(`Unsupported clipboard image format: ${image.mimeType}`);
-					return false;
-				}
-				if (this.ctx.settings.get("images.autoResize")) {
-					try {
-						const resized = await resizeImage({
-							type: "image",
-							data: imageData.data,
-							mimeType: imageData.mimeType,
-						});
-						imageData = { type: "image", data: resized.data, mimeType: resized.mimeType };
-					} catch {
-						// Keep the normalized image when resize fails.
-					}
-				}
+			const filePaths = imageFilePathsFromList(await this.#clipboard.readMacFileUrls());
+			if (filePaths.length > 0)
+				return await this.#attachPastedImagePaths(filePaths, "user-selected", this.#unguardedPasteContext());
 
-				this.ctx.pendingImages = [
-					...this.ctx.pendingImages,
-					{
-						type: "image",
-						data: imageData.data,
-						mimeType: imageData.mimeType,
-					},
-				];
-				this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
-				this.ctx.ui.requestRender();
-				return true;
-			}
-			this.ctx.showStatus(
-				"No image in clipboard. Use #paste-image, paste a copied image, or attach an image file with @path/to/image.png.",
+			// Start the text bridge alongside the image bridge: either can shell out, so serial awaits
+			// would stall an empty clipboard by their sum. Settle-mark it so an image-read throw that
+			// skips the text await can never become an unhandled rejection.
+			const textPromise = this.#clipboard.readText();
+			textPromise.then(
+				() => {},
+				() => {},
 			);
-			return false;
+			const image = await this.#clipboard.readImage();
+			if (image) return await this.#attachClipboardImage(image);
+
+			const text = await textPromise;
+			if (!text) {
+				this.ctx.showStatus("Clipboard is empty");
+				return false;
+			}
+			this.ctx.editor.insertText(text);
+			this.ctx.ui.requestRender();
+			return true;
 		} catch {
 			this.ctx.showStatus("Failed to read clipboard");
 			return false;
 		}
 	}
+
+	/** Paste context for keybinding-driven pastes, which have no editor transaction to abort or commit. */
+	#unguardedPasteContext(): PasteTextContext {
+		return { signal: new AbortController().signal, commit: commit => commit() };
+	}
+
+	async #attachClipboardImage(image: ClipboardImage): Promise<boolean> {
+		let imageData = await ensureSupportedImageInput({
+			type: "image",
+			data: image.data.toBase64(),
+			mimeType: image.mimeType,
+		});
+		if (!imageData) {
+			this.ctx.showStatus(`Unsupported clipboard image format: ${image.mimeType}`);
+			return false;
+		}
+		if (this.ctx.settings.get("images.autoResize")) {
+			try {
+				const resized = await resizeImage({
+					type: "image",
+					data: imageData.data,
+					mimeType: imageData.mimeType,
+				});
+				imageData = { type: "image", data: resized.data, mimeType: resized.mimeType };
+			} catch {
+				// Keep the normalized image when resize fails.
+			}
+		}
+
+		this.ctx.pendingImages = [
+			...this.ctx.pendingImages,
+			{
+				type: "image",
+				data: imageData.data,
+				mimeType: imageData.mimeType,
+			},
+		];
+		this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
 	/**
 	 * Explicit "Paste text from configured clipboard" action (P3-b v1). Only
 	 * meaningful when `clipboard.transport` is `ssh` — reads via `pbpaste` on
@@ -2275,7 +2342,7 @@ export class InputController {
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
 			moveCursorToLineStart: () => this.ctx.editor.moveToLineStart(),
 			moveCursorToLineEnd: () => this.ctx.editor.moveToLineEnd(),
-			getPromptSuggestion: () => this.ctx.promptSuggestion?.current ?? null,
+			getPromptSuggestion: () => this.ctx.promptSuggestion?.visible ?? null,
 		});
 	}
 
@@ -2411,8 +2478,8 @@ export class InputController {
 		);
 	}
 
-	cycleThinkingLevel(): void {
-		const newLevel = this.ctx.session.cycleThinkingLevel();
+	async cycleThinkingLevel(): Promise<void> {
+		const newLevel = await this.ctx.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.ctx.showStatus("Current model does not support thinking");
 		} else {

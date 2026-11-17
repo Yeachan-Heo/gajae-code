@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { type Component, Container, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 class CountingTranscript extends Container {
 	renderCount = 0;
@@ -29,14 +29,6 @@ class MutableComponent implements Component {
 	}
 }
 
-async function settle(term: VirtualTerminal): Promise<void> {
-	const tick = Promise.withResolvers<void>();
-	process.nextTick(tick.resolve);
-	await tick.promise;
-	await Bun.sleep(20);
-	await term.flush();
-}
-
 describe("revisioned subtree render cache", () => {
 	it("reuses an unchanged transcript while a local suffix changes", async () => {
 		const term = new VirtualTerminal(80, 12);
@@ -51,13 +43,13 @@ describe("revisioned subtree render cache", () => {
 
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 20);
 			expect(transcript.renderCount).toBe(1);
 
 			for (let index = 1; index <= 5; index++) {
 				suffix.setText(`status-${index}`);
 				tui.requestLayoutRender("revision-cache-test");
-				await settle(term);
+				await settle(term, 20);
 			}
 
 			expect(transcript.renderCount).toBe(1);
@@ -78,15 +70,15 @@ describe("revisioned subtree render cache", () => {
 
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 20);
 			expect(transcript.renderCount).toBe(1);
 
 			tui.setViewportOutputSource({ identity: "session:test", revision: 1n });
-			await settle(term);
+			await settle(term, 20);
 			expect(transcript.renderCount).toBe(2);
 
 			term.resize(100, 12);
-			await settle(term);
+			await settle(term, 20);
 			expect(transcript.renderCount).toBe(3);
 		} finally {
 			tui.stop();
@@ -105,10 +97,10 @@ describe("revisioned subtree render cache", () => {
 
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 20);
 			transcript.replaceChildren([new MutableComponent("after")]);
 			tui.requestLayoutRender("transcript-replacement");
-			await settle(term);
+			await settle(term, 20);
 
 			expect(transcript.renderCount).toBe(2);
 			expect(term.getViewport().join("\n")).toContain("after");
@@ -129,10 +121,10 @@ describe("revisioned subtree render cache", () => {
 
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 20);
 			line.setText("after");
 			tui.requestRender(true, "ordinary-mutation");
-			await settle(term);
+			await settle(term, 20);
 
 			expect(transcript.renderCount).toBe(2);
 			expect(term.getViewport().join("\n")).toContain("after");
@@ -153,11 +145,11 @@ describe("revisioned subtree render cache", () => {
 
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 20);
 			line.setText("after");
 			tui.requestLayoutRender("pending-layout");
 			tui.requestRender(false, "ordinary-mutation");
-			await settle(term);
+			await settle(term, 20);
 
 			expect(transcript.renderCount).toBe(2);
 			expect(term.getViewport().join("\n")).toContain("after");

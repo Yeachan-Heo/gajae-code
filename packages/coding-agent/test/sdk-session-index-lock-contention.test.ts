@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import * as lockModule from "../src/config/file-lock";
 import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
@@ -396,6 +397,7 @@ describe("SDK session index lock contention (#4544)", () => {
 		const seed = await new SessionIndex(dir).open();
 		await seed.append(event("acq-bound"));
 		const index = await new SessionIndex(dir).open();
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		// The FIRST bound (SESSION_INDEX_PROBE_FRESHNESS_MS = 50ms) fires at lock
 		// acquisition, before the replay: a probe batch that queues behind even a
 		// short legitimate holder is discarded. Stall EVERY acquisition so each
@@ -426,6 +428,20 @@ describe("SDK session index lock contention (#4544)", () => {
 			expect(stalls).toBeGreaterThanOrEqual(2);
 			expect(stalls).toBe(4);
 			expect(incarnationCalls).toBeGreaterThanOrEqual(stalls);
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith(
+				"sdk broker: skipped session heartbeat checkpoint after repeated stale observations",
+				{ indexPath: path.resolve(dir, "sdk", "sessions", "index.jsonl"), attempts: 4 },
+			);
+
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(stalls).toBe(8);
+			expect(warning).toHaveBeenCalledTimes(1);
+
+			offset += 60_000;
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(stalls).toBe(12);
+			expect(warning).toHaveBeenCalledTimes(2);
 			const rows = index.listSessions().sessions;
 			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
 		} finally {

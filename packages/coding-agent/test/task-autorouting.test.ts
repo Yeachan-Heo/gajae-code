@@ -130,8 +130,8 @@ describe("G001 foundation contract", () => {
 		expect(invalid.getSchemaReport().valid).toBe(false);
 	});
 });
-describe("T9 precedence and evidence parity", () => {
-	it("autorouting pin takes precedence over manual model sources", () => {
+describe("tier pinning and evidence parity", () => {
+	it("pins the selected fast-tier model", () => {
 		const effective = active({ fast: ["anthropic/claude-opus-5"] });
 		const routed = resolveTaskRouting({
 			effectiveAutorouting: effective,
@@ -139,7 +139,6 @@ describe("T9 precedence and evidence parity", () => {
 			availableModels: snapshot,
 		});
 		expect(routed).toMatchObject({ kind: "routed", pinnedSelector: "anthropic/claude-opus-5" });
-		expect(["task.agentModelOverrides", "frontmatter model", "parent model"]).toHaveLength(3);
 	});
 
 	it("keeps evidence model parity and ordered substitutions", () => {

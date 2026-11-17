@@ -488,7 +488,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				systemPrompt: ["prompt-one"],
 				tools: [alphaTool],
 				messages: [],
@@ -548,7 +548,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				tools: [alphaTool],
 				messages: [],
 			},
@@ -596,7 +596,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				thinkingLevel: ThinkingLevel.Low,
 				tools: [alphaTool],
 				messages: [],
@@ -617,6 +617,231 @@ describe("Agent", () => {
 
 		const reasoningPerCall: Array<SimpleStreamOptions["reasoning"]> = mock.calls.map(call => call.options?.reasoning);
 		expect(reasoningPerCall).toEqual([ThinkingLevel.Low, ThinkingLevel.High]);
+	});
+
+	it("waits for each canonical emission but not an asynchronous observer before dispatch", async () => {
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const completion = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const observer = Promise.withResolvers<void>();
+		const dispatched: string[] = [];
+		const tool: AgentTool = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe",
+			parameters: z.object({}),
+			execute: async () => {
+				dispatched.push("tool");
+				return { content: [{ type: "text", text: "ok" }], details: {} };
+			},
+		};
+		const agent = new Agent({ initialState: { model: mock, tools: [tool] }, streamFn: mock.stream });
+		agent.subscribeCanonicalEvents(event => {
+			if (event.type === "message_end" && event.message.role === "assistant" && dispatched.length === 0) {
+				entered.resolve();
+				return completion.promise;
+			}
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") return observer.promise;
+		});
+		const run = agent.prompt("run");
+		await entered.promise;
+		expect(dispatched).toEqual([]);
+		expect(mock.calls).toHaveLength(1);
+		completion.resolve();
+		await run;
+		expect(dispatched).toEqual(["tool"]);
+		expect(mock.calls).toHaveLength(2);
+		observer.resolve();
+	});
+
+	it("stops tool and provider progression when canonical publication rejects", async () => {
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] },
+				{ content: ["must not request"] },
+			],
+		});
+		const entered = Promise.withResolvers<void>();
+		const completion = Promise.withResolvers<void>();
+		let dispatches = 0;
+		const tool: AgentTool = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe",
+			parameters: z.object({}),
+			execute: async () => {
+				dispatches++;
+				return { content: [{ type: "text", text: "must not execute" }], details: {} };
+			},
+		};
+		const agent = new Agent({ initialState: { model: mock, tools: [tool] }, streamFn: mock.stream });
+		agent.subscribeCanonicalEvents(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some(block => block.type === "toolCall")
+			) {
+				entered.resolve();
+				return completion.promise;
+			}
+		});
+		const run = agent.prompt("run");
+		await entered.promise;
+		completion.reject(new Error("canonical publication refused"));
+		await run;
+		expect(dispatches).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+		expect(
+			agent.state.messages.some(
+				message =>
+					message.role === "toolResult" &&
+					message.content.some(
+						block => block.type === "text" && block.text.includes("canonical publication refused"),
+					),
+			),
+		).toBe(false);
+	});
+
+	it("logs the underlying cause when canonical publication aborts the run", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const failure = new Error("Shared session mutation requires transaction admission: append entry");
+			const mock = createMockModel({ responses: [{ content: ["must not continue"] }] });
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event =>
+				event.type === "message_end" && event.message.role === "assistant" ? Promise.reject(failure) : undefined,
+			);
+			await agent.prompt("run");
+			const call = warn.mock.calls.find(([message]) => message === "Agent run aborted with an underlying failure");
+			expect(call).toBeDefined();
+			expect(call?.[1]).toMatchObject({ code: "aborted", cause: expect.stringContaining(failure.message) });
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not log a run failure for a deliberate cancellation", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const mock = createMockModel({ responses: [{ content: ["cancelled"] }] });
+			const entered = Promise.withResolvers<void>();
+			const completion = Promise.withResolvers<void>();
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					entered.resolve();
+					return completion.promise;
+				}
+			});
+			const run = agent.prompt("run");
+			await entered.promise;
+			agent.abort();
+			completion.resolve();
+			await run;
+			const messages = warn.mock.calls.map(([message]) => message);
+			expect(messages).not.toContain("Agent run failed");
+			expect(messages).not.toContain("Agent run aborted with an underlying failure");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not report a forced abort as a run failure", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const mock = createMockModel({ responses: [{ content: ["forced"] }] });
+			const entered = Promise.withResolvers<void>();
+			const completion = Promise.withResolvers<void>();
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					entered.resolve();
+					return completion.promise;
+				}
+			});
+			const run = agent.prompt("run");
+			await entered.promise;
+			agent.forceAbort("Force aborted");
+			completion.resolve();
+			await run;
+			const messages = warn.mock.calls.map(([message]) => message);
+			expect(messages).not.toContain("Agent run failed");
+			expect(messages).not.toContain("Agent run aborted with an underlying failure");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not dispatch non-abortable tools after cancellation during canonical admission", async () => {
+		const mock = createMockModel({
+			responses: [{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] }],
+		});
+		const entered = Promise.withResolvers<void>();
+		const completion = Promise.withResolvers<void>();
+		let dispatches = 0;
+		const agent = new Agent({
+			initialState: {
+				model: mock,
+				tools: [
+					{
+						name: "probe",
+						label: "Probe",
+						description: "Probe",
+						parameters: z.object({}),
+						nonAbortable: true,
+						execute: async () => {
+							dispatches++;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		agent.subscribeCanonicalEvents(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				entered.resolve();
+				return completion.promise;
+			}
+		});
+		const run = agent.prompt("run");
+		await entered.promise;
+		agent.abort();
+		completion.resolve();
+		await run;
+		expect(dispatches).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("keeps unsubscribed external publication synchronous and admissions distinct for duplicate emissions", async () => {
+		const agent = new Agent();
+		const message: AgentMessage = { role: "user", content: "duplicate", timestamp: 1 };
+		const observed: AgentMessage[] = [];
+		agent.subscribe(event => {
+			if (event.type === "message_end") observed.push(event.message);
+		});
+		agent.emitExternalEvent({ type: "message_end", message });
+		expect(observed).toEqual([message]);
+		expect(agent.state.messages).toEqual([message]);
+		const completions = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		let index = 0;
+		agent.subscribeCanonicalEvents(event =>
+			event.type === "message_end" ? completions[index++].promise : undefined,
+		);
+		agent.emitExternalEvent({ type: "message_end", message });
+		agent.emitExternalEvent({ type: "message_end", message });
+		expect(index).toBe(2);
+		expect(agent.state.messages).toEqual([message, message, message]);
+		completions[0].resolve();
+		completions[1].resolve();
+		await Promise.all(completions.map(item => item.promise));
 	});
 
 	it("returns static metadata via the plain setter", () => {
@@ -683,7 +908,7 @@ describe("Agent", () => {
 			const streamFn = async () => {
 				throw Object.assign(new Error("transport failed"), { [property]: status });
 			};
-			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+			const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 			await agent.prompt("hello");
 
@@ -699,7 +924,7 @@ describe("Agent", () => {
 		const streamFn = async () => {
 			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
 		};
-		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+		const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 		await agent.prompt("hello");
 

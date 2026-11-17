@@ -1,5 +1,5 @@
 import type { encodeSixel as encodeSixelFn } from "@gajae-code/natives";
-import { $env, $pickenv } from "@gajae-code/utils";
+import { $env, $pickenv, sanitizeDisplayLine } from "@gajae-code/utils";
 import { writeTerminalOutput } from "./terminal-writer";
 
 type NativeEncodeSixel = typeof encodeSixelFn;
@@ -23,6 +23,9 @@ export enum NotifyProtocol {
 	Osc99 = "\x1b]99;;",
 	Osc9 = "\x1b]9;",
 }
+
+/** C0, DEL, and C1. A single character class, scanned once per message. */
+const NOTIFICATION_PARAM_CONTROLS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 export type TerminalId = "kitty" | "ghostty" | "wezterm" | "iterm2" | "vscode" | "alacritty" | "base" | "trueColor";
 
@@ -53,7 +56,10 @@ export class TerminalInfo {
 		if (this.notifyProtocol === NotifyProtocol.Bell) {
 			return NotifyProtocol.Bell;
 		}
-		return `${this.notifyProtocol}${message}\x1b\\`;
+		// BEL, ESC, and C1 ST (U+009C) end or abort an OSC string. Drop C0, DEL,
+		// and C1 before the parameter is interpolated so a session title cannot
+		// close this frame and start OSC 52, OSC 0, or OSC 8.
+		return `${this.notifyProtocol}${message.replace(NOTIFICATION_PARAM_CONTROLS, "")}\x1b\\`;
 	}
 
 	sendNotification(message: string): void {
@@ -890,8 +896,13 @@ export function renderImage(
 
 export function imageFallback(mimeType: string, dimensions?: ImageDimensions, filename?: string): string {
 	const parts: string[] = [];
-	if (filename) parts.push(filename);
-	parts.push(`[${mimeType}]`);
+	// Name and media type are untrusted display text. Callers add theme color after this returns.
+	if (typeof filename === "string") {
+		const safeName = sanitizeDisplayLine(filename);
+		if (safeName) parts.push(safeName);
+	}
+	const safeMime = typeof mimeType === "string" ? sanitizeDisplayLine(mimeType) : mimeType;
+	parts.push(`[${safeMime}]`);
 	if (dimensions) parts.push(`${dimensions.widthPx}x${dimensions.heightPx}`);
 	return `[Image: ${parts.join(" ")}]`;
 }

@@ -254,21 +254,25 @@ describe("SearXNG project endpoint credential boundary", () => {
 		return { captured, response };
 	}
 
+	async function expectProjectEndpointIgnored(searxng: Record<string, unknown>, query: string) {
+		const activeSettings = await projectSettings(searxng);
+		let calls = 0;
+		using _hook = hookFetch(() => {
+			calls += 1;
+			return new Response(JSON.stringify({ results: [] }), { status: 200 });
+		});
+		await expect(searchSearXNG({ query, settings: activeSettings })).rejects.toThrow(
+			"SearXNG endpoint not configured",
+		);
+		expect(calls).toBe(0);
+		expect(activeSettings.get("searxng.endpoint")).toBeUndefined();
+	}
+
 	it("does not send an operator env token to a project settings endpoint", async () => {
-		const activeSettings = await projectSettings({ endpoint: "https://attacker.example" });
 		process.env.SEARXNG_TOKEN = "operator-token";
 		process.env.SEARXNG_BASIC_USERNAME = "alice";
 		process.env.SEARXNG_BASIC_PASSWORD = "s3cret";
-
-		const { captured, response } = await captureSearch("project endpoint", activeSettings);
-
-		expect(captured.url?.origin).toBe("https://attacker.example");
-		expect(captured.url?.searchParams.get("q")).toBe("project endpoint");
-		expect(captured.headers?.get("Authorization")).toBeNull();
-		expect(response).toMatchObject({
-			provider: "searxng",
-			sources: [{ title: "Result", url: "https://example.com/result", snippet: "snippet" }],
-		});
+		await expectProjectEndpointIgnored({ endpoint: "https://attacker.example" }, "project endpoint");
 	});
 
 	it("still sends an operator env token to an operator env endpoint", async () => {
@@ -293,32 +297,19 @@ describe("SearXNG project endpoint credential boundary", () => {
 		expect(captured.headers?.get("Authorization")).toBe("Bearer operator-token");
 	});
 
-	it("still sends a credential that the project settings set themselves", async () => {
-		const activeSettings = await projectSettings({
-			endpoint: "https://attacker.example",
-			token: "project-token",
-		});
+	it("does not send a project token to a project settings endpoint", async () => {
 		process.env.SEARXNG_TOKEN = "operator-token";
-
-		const { captured, response } = await captureSearch("project credential", activeSettings);
-
-		expect(captured.url?.origin).toBe("https://attacker.example");
-		expect(captured.headers?.get("Authorization")).toBe("Bearer project-token");
-		expect(response.sources.length).toBeGreaterThan(0);
+		await expectProjectEndpointIgnored(
+			{ endpoint: "https://attacker.example", token: "project-token" },
+			"project credential",
+		);
 	});
 
-	it("still sends project basic auth and does not attach the operator env token", async () => {
-		const activeSettings = await projectSettings({
-			endpoint: "https://attacker.example",
-			basicUsername: "alice",
-			basicPassword: "project-secret",
-		});
+	it("does not send project basic auth to a project settings endpoint", async () => {
 		process.env.SEARXNG_TOKEN = "operator-token";
-
-		const { captured } = await captureSearch("project basic", activeSettings);
-
-		expect(captured.headers?.get("Authorization")).toBe(
-			`Basic ${Buffer.from("alice:project-secret", "utf-8").toString("base64")}`,
+		await expectProjectEndpointIgnored(
+			{ endpoint: "https://attacker.example", basicUsername: "alice", basicPassword: "project-secret" },
+			"project basic",
 		);
 	});
 
@@ -332,70 +323,53 @@ describe("SearXNG project endpoint credential boundary", () => {
 		expect(response).toMatchObject({ provider: "searxng", sources: [{ url: "https://example.com/result" }] });
 	});
 
-	it("does not send an environment password when the project sets only a basic username", async () => {
-		const activeSettings = await projectSettings({
-			endpoint: "https://attacker.example",
-			basicUsername: "alice",
-		});
+	it("does not send an environment password to a project endpoint that sets only a username", async () => {
 		process.env.SEARXNG_BASIC_PASSWORD = "env-only-password";
 		process.env.SEARXNG_BASIC_USERNAME = "env-user";
-
-		const { captured, response } = await captureSearch("project username only", activeSettings);
-
-		expect(captured.url?.origin).toBe("https://attacker.example");
-		expect(captured.headers?.get("Authorization")).toBeNull();
-		expect(response.sources.length).toBeGreaterThan(0);
+		await expectProjectEndpointIgnored(
+			{ endpoint: "https://attacker.example", basicUsername: "alice" },
+			"project username only",
+		);
 	});
 
-	it("does not send an environment username when the project sets only a basic password", async () => {
-		const activeSettings = await projectSettings({
-			endpoint: "https://attacker.example",
-			basicPassword: "project-secret",
-		});
+	it("does not send an environment username to a project endpoint that sets only a password", async () => {
 		process.env.SEARXNG_BASIC_USERNAME = "env-only-user";
 		process.env.SEARXNG_BASIC_PASSWORD = "env-only-password";
-
-		const { captured } = await captureSearch("project password only", activeSettings);
-
-		expect(captured.headers?.get("Authorization")).toBeNull();
+		await expectProjectEndpointIgnored(
+			{ endpoint: "https://attacker.example", basicPassword: "project-secret" },
+			"project password only",
+		);
 	});
 
-	it("uses the project bearer token when project basic auth is only half set", async () => {
-		const activeSettings = await projectSettings({
-			endpoint: "https://attacker.example",
-			basicUsername: "alice",
-			token: "project-token",
-		});
+	it("does not send a project bearer token to a project endpoint when basic auth is only half set", async () => {
 		process.env.SEARXNG_BASIC_PASSWORD = "env-only-password";
 		process.env.SEARXNG_TOKEN = "operator-token";
-
-		const { captured } = await captureSearch("project token over half basic", activeSettings);
-
-		expect(captured.headers?.get("Authorization")).toBe("Bearer project-token");
+		await expectProjectEndpointIgnored(
+			{ endpoint: "https://attacker.example", basicUsername: "alice", token: "project-token" },
+			"project token over half basic",
+		);
 	});
 
-	it("still sends a session auth-broker key to a project endpoint", async () => {
+	it("does not send a session auth-broker key to a project endpoint", async () => {
 		const activeSettings = await projectSettings({ endpoint: "https://attacker.example" });
 		process.env.SEARXNG_TOKEN = "operator-token";
-		const captured: { headers?: Headers } = {};
-		using _hook = hookFetch((_input, init) => {
-			captured.headers = new Headers(init?.headers);
-			return new Response(JSON.stringify({ results: [] }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
+		let calls = 0;
+		using _hook = hookFetch(() => {
+			calls += 1;
+			return new Response(JSON.stringify({ results: [] }), { status: 200 });
 		});
 
-		await searchSearXNG({
-			query: "stored key",
-			settings: activeSettings,
-			authStorage: {
-				async getApiKey(provider: string) {
-					return provider === "searxng" ? "stored-searxng-key" : undefined;
-				},
-			} as unknown as NonNullable<Parameters<typeof searchSearXNG>[0]["authStorage"]>,
-		});
-
-		expect(captured.headers?.get("Authorization")).toBe("Bearer stored-searxng-key");
+		await expect(
+			searchSearXNG({
+				query: "stored key",
+				settings: activeSettings,
+				authStorage: {
+					async getApiKey(provider: string) {
+						return provider === "searxng" ? "stored-searxng-key" : undefined;
+					},
+				} as unknown as NonNullable<Parameters<typeof searchSearXNG>[0]["authStorage"]>,
+			}),
+		).rejects.toThrow("SearXNG endpoint not configured");
+		expect(calls).toBe(0);
 	});
 });

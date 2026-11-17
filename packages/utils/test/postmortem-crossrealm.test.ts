@@ -1,12 +1,21 @@
-import { expect, it } from "bun:test";
+import { afterAll, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
 import { recordFatalCrash } from "../src/postmortem";
 
-const tempCrashLog = (): string =>
-	path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crossrealm-")), "gjc-crash.log");
+const trackedTempDirs: string[] = [];
+function trackedTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(() => {
+	for (const dir of trackedTempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const tempCrashLog = (): string => path.join(trackedTempDir("gjc-crossrealm-"), "gjc-crash.log");
 
 const record = (reason: unknown): string => {
 	const target = tempCrashLog();

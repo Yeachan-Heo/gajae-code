@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { ESCAPED_NONASCII_RECOVERY_PROMPT } from "@gajae-code/agent-core/agent-loop";
-import { getBundledModel, type Message, type Model } from "@gajae-code/ai";
+import { getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type { OpenAIResponsesHistoryPayload } from "@gajae-code/ai/types";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -12,14 +12,9 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { identityConverter } from "../../agent/test/helpers";
 
 const QUESTION = "C:\\Users\\최재필\\.gjc\\session.json";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
 
 function escapedTurn(id: string, providerPayload?: OpenAIResponsesHistoryPayload) {
 	return {
