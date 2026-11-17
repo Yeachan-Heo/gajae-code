@@ -1149,11 +1149,9 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 	});
 
 	// Fault injection: only the reminder publication is refused; the manager stays healthy.
-	it.each([
-		"stale",
-		"rejected",
-	] as const)("continues a shared TTSR retry in memory after a %s reminder refusal", async outcome =>
-		exerciseManagedRetry("discard", outcome === "stale" ? "shared-stale" : "shared-rejected"));
+	// Stale and unknown require session close per #7838; rejected can retry in memory.
+	it("continues a shared TTSR retry in memory after a rejected reminder refusal", async () =>
+		exerciseManagedRetry("discard", "shared-rejected"));
 
 	it.each([
 		["unknown", "once"],

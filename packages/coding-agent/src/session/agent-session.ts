@@ -6987,6 +6987,10 @@ export class AgentSession {
 			);
 		}
 		this.#ttsrManager = config.ttsrManager;
+		// Reconcile TTSR consumption from persisted custom messages. If ttsr_injection markers
+		// failed to publish but custom messages were persisted, we must mark those rules as consumed
+		// to prevent duplicate reminders on reopen (#7838).
+		this.#reconcileTtsrConsumptionFromMessages();
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
 		this.#agentRegistry = config.agentRegistry;
@@ -11043,6 +11047,28 @@ export class AgentSession {
 		return rules.filter((ruleName): ruleName is string => typeof ruleName === "string");
 	}
 
+	#reconcileTtsrConsumptionFromMessages(): void {
+		// If ttsr_injection markers failed to publish in a previous session but custom messages
+		// were persisted, reconcile the consumption state by checking the message history.
+		// This prevents duplicate reminders when the marker publication fails (#7838).
+		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
+			return;
+		}
+		const reconciledRuleNames = new Set<string>();
+		for (const message of this.agent.state.messages) {
+			if (message.role !== "custom" || message.customType !== "ttsr-injection") {
+				continue;
+			}
+			for (const ruleName of this.#extractTtsrRuleNames(message.details)) {
+				reconciledRuleNames.add(ruleName);
+			}
+		}
+		if (reconciledRuleNames.size > 0) {
+			// Mark the rules as injected based on custom messages in the history
+			this.#ttsrManager.markInjectedByNames(Array.from(reconciledRuleNames));
+		}
+	}
+
 	#markTtsrInjected(ruleNames: string[], persistMarker = true): void {
 		const uniqueRuleNames = Array.from(
 			new Set(ruleNames.map(ruleName => ruleName.trim()).filter(ruleName => ruleName.length > 0)),
@@ -11233,8 +11259,8 @@ export class AgentSession {
 							this.#releasePerToolTtsrInjections(id);
 					}
 				};
-				const injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
-				const details = injection ? { rules: injection.rules.map(rule => rule.name) } : undefined;
+				let injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
+				let details = injection ? { rules: injection.rules.map(rule => rule.name) } : undefined;
 				let publicationFailure: { error: unknown; outcome: SharedAppendFailureOutcome | undefined } | undefined;
 				if (injection && details) {
 					// Persist before any live mutation. A shared session refuses the legacy append,
@@ -11268,7 +11294,37 @@ export class AgentSession {
 				}
 				if (publicationFailure) {
 					const { error, outcome } = publicationFailure;
-					if (outcome?.kind !== "stale" && outcome?.kind !== "rejected") {
+					// Stale and unknown outcomes require different handling:
+					// - Stale: persistent conditions (latched persistence, rewrite debt, uncommitted cursor)
+					//   make later shared writes uncommittable, so retry must stop and reopen (#7838).
+					// - Unknown: may have committed; require session close to prevent duplicate (#7838).
+					// - Rejected: definite non-commit; safe to retry in memory.
+					if (outcome?.kind === "stale") {
+						logger.warn("TTSR retry requires session reopen after stale shared append", {
+							rules: details?.rules,
+							reason: outcome.reason,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						this.#ttsrAbortPending = false;
+						releaseCarriedTtsr();
+						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
+						// Stale conditions are persistent; shared writes will remain uncommittable.
+						// Require reopening to clear the persistent state.
+						void this.dispose().catch(() => {
+							logger.warn("Stale TTSR reminder teardown failed", {
+								code: "ttsr_stale_publication_teardown_failed",
+								reason: outcome.reason,
+							});
+						});
+						this.emitNotice(
+							"warning",
+							`TTSR reminder publication failed with ${outcome.reason}; session requires reopening to continue.`,
+							"ttsr",
+						);
+						return;
+					}
+					if (outcome?.kind !== "rejected") {
 						const attemptedId = outcome?.kind === "unknown" ? outcome.id : undefined;
 						logger.warn("TTSR injection publication may have committed; stopping retry", {
 							rules: details?.rules,
@@ -11294,7 +11350,7 @@ export class AgentSession {
 							"warning",
 							attemptedId
 								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped and the session was closed because the reminder may already be in the session transcript.`
-								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
+							: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
 							"ttsr",
 						);
 						return;
@@ -11316,7 +11372,34 @@ export class AgentSession {
 				this.#perToolTtsrFolded.clear();
 				this.#perToolTtsrClaims.clear();
 				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
+				// Extract TTSR reminders from discarded messages before truncating them.
+				// In a shared-concurrency batch, one tool can emit a folded reminder before another tool
+				// triggers an AST interrupt. Settlement removes it from pending/folded, but it's still present
+				// in the assistant message as a custom ttsr-injection. With contextMode=discard, we must preserve
+				// these settled reminders by extracting them before truncation (#7838).
 				if (this.#ttsrManager?.getSettings().contextMode === "discard" && targetAssistantIndex !== -1) {
+					const discardedContent: string[] = [];
+					for (let i = targetAssistantIndex; i < this.agent.state.messages.length; i++) {
+						const msg = this.agent.state.messages[i];
+						if (msg.role === "custom" && msg.customType === "ttsr-injection") {
+							for (const ruleName of this.#extractTtsrRuleNames(msg.details)) {
+								if (!carriedNames.has(ruleName)) {
+									carriedNames.add(ruleName);
+								}
+							}
+							// Preserve the custom message content that will be discarded
+							if (msg.content && typeof msg.content === "string") {
+								discardedContent.push(msg.content);
+							}
+						}
+					}
+					// Augment injection content with reminders that were settled but discarded
+					if (discardedContent.length > 0 && injection) {
+						injection = {
+							...injection,
+							content: injection.content + "\n\n" + discardedContent.join("\n\n"),
+						};
+					}
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
 						historyRewrite: { reason: "retry", preserveSeededPrefix: true },
 					});
