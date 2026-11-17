@@ -35529,7 +35529,7 @@ export class AgentSession {
 		const previousMessages = agent.state.messages.slice();
 		let ownedMessages = previousMessages;
 		let ownedTools = agent.state.tools;
-		let ownedSystemPrompt = agent.state.systemPrompt;
+		let ownedPromptRevision = agent.promptRevision;
 		let ownedHistoryRevision = agent.historyRevision;
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
@@ -35578,13 +35578,13 @@ export class AgentSession {
 		const current = () => {
 			// Prompt and tools are independently mutable; a concurrent publication is
 			// drift even while the view identity holds.
-			return historyIsOurs() && agent.state.tools === ownedTools && agent.state.systemPrompt === ownedSystemPrompt;
+			return historyIsOurs() && agent.state.tools === ownedTools && agent.promptRevision === ownedPromptRevision;
 		};
 		const fence: SessionViewRestoreFence = {
 			isCurrent: current,
 			onApplied: () => {
 				ownedTools = agent.state.tools;
-				ownedSystemPrompt = agent.state.systemPrompt;
+				ownedPromptRevision = agent.promptRevision;
 			},
 		};
 		this.#beginSessionTransition("navigate-tree");
@@ -35658,9 +35658,10 @@ export class AgentSession {
 						// discovered-selection staging this operation performed.
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 					}
-					if (historyIsOurs() && agent.state.systemPrompt === ownedSystemPrompt) {
+					if (historyIsOurs() && agent.promptRevision === ownedPromptRevision) {
 						this.#baseSystemPrompt = previousBaseSystemPrompt;
 						agent.setSystemPrompt(previousSystemPrompt);
+						ownedPromptRevision = agent.promptRevision;
 						promptReverted = true;
 						// Invalidate rebuilds authorized for the abandoned target tools;
 						// otherwise one may publish their guidance over the reverted prompt.

@@ -774,6 +774,41 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
+	it("does not overwrite prompt state published by a reentrant tool observer", async () => {
+		let publish: (() => void) | undefined;
+		const { previous } = await seedMcpBranches(() => {
+			const publishNow = publish;
+			publish = undefined;
+			publishNow?.();
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.agent.state.tools.slice();
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			// The observer publishes during the rollback's own tool revert.
+			publish = () => session.agent.setSystemPrompt(["observer prompt"]);
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(session.systemPrompt).toEqual(["observer prompt"]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(captureSessionView(session)).toEqual(target(previous));
+	});
+
+	it("counts a same-array prompt republication without touching history", async () => {
+		const prompt = session.agent.state.systemPrompt;
+		const history = session.agent.historyRevision;
+		const revision = session.agent.promptRevision;
+		session.agent.setSystemPrompt(prompt);
+		expect(session.agent.state.systemPrompt).toBe(prompt);
+		expect(session.agent.promptRevision).toBe(revision + 1);
+		expect(session.agent.historyRevision).toBe(history);
+	});
+
 	for (const interference of [
 		"append",
 		"selection-roundtrip",
