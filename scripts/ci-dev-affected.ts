@@ -494,7 +494,7 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	const normalizedPaths = normalizeChangedPaths(paths);
 	const packages = await getWorkspacePackages();
 	const legacy = resolvePlanMode() === "pr"
-		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true, loadReverseDependencyIndex(packages))
+		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true, await loadReverseDependencyIndex(packages))
 		: planTasks(normalizedPaths, packages, true);
 	if (normalizedPaths.length > 0 && normalizedPaths.every(isDocOrChangelogPath)) return legacy;
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
@@ -1542,19 +1542,24 @@ export function buildReverseDependencyIndex(
 }
 
 /** Index the checked-out workspace's package trees, never installed dependencies or build output. */
-export function loadReverseDependencyIndex(packages: readonly WorkspacePackage[], root: string = repoRoot): ReverseDependencyIndex {
+export async function loadReverseDependencyIndex(packages: readonly WorkspacePackage[], root: string = repoRoot): Promise<ReverseDependencyIndex> {
 	const files: string[] = [];
+	const fileContents = new Map<string, string>();
 	for (const workspacePackage of packages) {
 		const packageRoot = path.join(root, workspacePackage.dir);
 		if (!fsSync.existsSync(packageRoot)) continue;
 		for (const entry of new Bun.Glob("**/*").scanSync({ cwd: packageRoot, onlyFiles: true })) {
 			const segments = entry.split(path.sep);
 			if (segments.some(segment => DEPENDENCY_SCAN_EXCLUDED_DIRS.has(segment))) continue;
-			files.push(`${workspacePackage.dir}/${segments.join("/")}`);
+			const filePath = `${workspacePackage.dir}/${segments.join("/")}`;
+			files.push(filePath);
+			const fullPath = path.join(root, filePath);
+			const content = await Bun.file(fullPath).text();
+			fileContents.set(filePath, content);
 		}
 	}
 	files.sort();
-	return buildReverseDependencyIndex(packages, files, file => fsSync.readFileSync(path.join(root, file), "utf8"));
+	return buildReverseDependencyIndex(packages, files, file => fileContents.get(file) ?? "");
 }
 
 /** Test files that transitively load any changed path, in breadth-first then lexical order. */

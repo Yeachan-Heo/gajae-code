@@ -1703,7 +1703,7 @@ async function persistBootstrapMetadata(
 		? {
 				type: "model_change" as const,
 				model: `${model.provider}/${model.id}`,
-				role: "",
+				role: "default",
 				metadata: modelSubstitution
 					? {
 							previousModel: `${modelSubstitution.requestedModel.provider}/${modelSubstitution.requestedModel.id}`,

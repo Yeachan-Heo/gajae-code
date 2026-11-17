@@ -1284,7 +1284,7 @@ describe("shared publication admission split", () => {
 		const gate = Promise.withResolvers<void>();
 		const original = f.manager.appendMessageSharingSession.bind(f.manager);
 		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
-			if ((message as any).role === "bashExecution") {
+			if (message.role === "bashExecution") {
 				entered.resolve();
 				await gate.promise;
 			}

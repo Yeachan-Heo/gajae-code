@@ -19,7 +19,7 @@ import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, type SessionDestination } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -40,7 +40,15 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
-async function workspace() {
+interface Workspace {
+	cwd: string;
+	agentDir: string;
+	auth: AuthStorage;
+	destination: SessionDestination;
+	registry: ModelRegistry;
+}
+
+async function workspace(): Promise<Workspace> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-writer-admission-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -54,8 +62,6 @@ async function workspace() {
 	registries.push(registry);
 	return { cwd, agentDir, auth, destination: SessionManager.managedDestination(cwd, agentDir), registry };
 }
-
-type Workspace = Awaited<ReturnType<typeof workspace>>;
 
 function open(ws: Workspace, manager: SessionManager, rootInteractiveSharedAppend: boolean): AgentSession {
 	managers.push(manager);

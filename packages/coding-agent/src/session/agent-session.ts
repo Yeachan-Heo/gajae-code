@@ -229,6 +229,7 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
+	sanitizeDisplayLine,
 	Snowflake,
 	safeErrorDescription,
 } from "@gajae-code/utils";
@@ -993,12 +994,13 @@ export class SharedSessionClosedError extends Error {
 		readonly receipt: SharedSessionClosureReceipt,
 		publicationCause?: unknown,
 	) {
+		const sanitizedId = sanitizeDisplayLine(sessionId);
 		const what =
 			receipt.outcome.kind === "committed"
 				? `${operation} was saved to its shared history but could not be applied here`
 				: `${operation} could not be confirmed in its shared history`;
 		super(
-			`Session ${sessionId} is closed: ${what}. Its history on disk is authoritative. Restart with \`gjc --resume ${sessionId}\`, or pick it with /resume in another gjc session, to continue from the saved history.`,
+			`Session ${sanitizedId} is closed: ${what}. Its history on disk is authoritative. Restart with \`gjc --resume ${sanitizedId}\`, or pick it with /resume in another gjc session, to continue from the saved history.`,
 			{ cause: publicationCause ?? receipt.outcome },
 		);
 		this.name = "SharedSessionClosedError";
