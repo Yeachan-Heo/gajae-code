@@ -8,15 +8,23 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
-import { activateModelProfile } from "../src/config/model-profile-activation";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import type { ConfigHotReloadCandidate } from "../src/config/config-hot-reload";
+import { activateModelProfile, materializeActiveModelProfileAssignments } from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { CommandController } from "../src/modes/controllers/command-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
+import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
+import { type SessionInfo, SessionManager } from "../src/session/session-manager";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -63,7 +71,35 @@ afterEach(async () => {
 	if (failures.length > 0) throw new AggregateError(failures, "Shared root control fixture cleanup failed");
 });
 
-async function fixture(): Promise<Fixture> {
+/** The fixture catalog; `profileDefault` is the preset's DEFAULT chain. */
+function modelsConfig(profileDefault: readonly string[]): string {
+	return JSON.stringify({
+		providers: {
+			[provider]: {
+				baseUrl: "https://shared-root-control.invalid/v1",
+				api: "openai-completions",
+				apiKeyEnv: "GJC_TEST_SHARED_ROOT_CONTROL_API_KEY",
+				models: ["initial", "selected", "fallback"].map(id => ({
+					id,
+					reasoning: true,
+					thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
+					compat: { supportsReasoningEffort: true },
+					input: ["text"],
+					contextWindow: 32_000,
+					maxTokens: 4_000,
+				})),
+			},
+		},
+		profiles: {
+			[profileName]: {
+				required_providers: [provider],
+				model_mapping: { default: profileDefault, executor: fallbackSelector },
+			},
+		},
+	});
+}
+
+async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-root-control-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -81,33 +117,7 @@ async function fixture(): Promise<Fixture> {
 			task: { agentModelOverrides: { executor: initialSelector } },
 		}),
 	);
-	await Bun.write(
-		path.join(agentDir, "models.yml"),
-		JSON.stringify({
-			providers: {
-				[provider]: {
-					baseUrl: "https://shared-root-control.invalid/v1",
-					api: "openai-completions",
-					apiKeyEnv: "GJC_TEST_SHARED_ROOT_CONTROL_API_KEY",
-					models: ["initial", "selected", "fallback"].map(id => ({
-						id,
-						reasoning: true,
-						thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
-						compat: { supportsReasoningEffort: true },
-						input: ["text"],
-						contextWindow: 32_000,
-						maxTokens: 4_000,
-					})),
-				},
-			},
-			profiles: {
-				[profileName]: {
-					required_providers: [provider],
-					model_mapping: { default: defaultChain, executor: fallbackSelector },
-				},
-			},
-		}),
-	);
+	await Bun.write(path.join(agentDir, "models.yml"), modelsConfig(defaultChain));
 	const settings = await Settings.loadForScope({ cwd, agentDir });
 	settingsStores.push(settings);
 	const auth = await AuthStorage.create(path.join(root, "auth.db"));
@@ -138,9 +148,11 @@ async function fixture(): Promise<Fixture> {
 			tools: [],
 			messages: manager.buildSessionContext().messages,
 		},
-		streamFn: () => {
-			throw new Error("Shared root controls must not request a provider");
-		},
+		streamFn:
+			options.streamFn ??
+			(() => {
+				throw new Error("Shared root controls must not request a provider");
+			}),
 	});
 	const session = new AgentSession({
 		agent,
@@ -154,6 +166,15 @@ async function fixture(): Promise<Fixture> {
 	});
 	sessions.push(session);
 	await manager.flush();
+	if (options.streamFn) {
+		// A managed prompt resolves local:// synchronously; settle the legacy migration gate.
+		await initializeLocalRoot({
+			getSessionId: () => manager.getSessionId(),
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			isManagedDestination: () => manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
+		});
+	}
 	return { session, manager, registry, settings, file, cwd, agentDir };
 }
 
@@ -406,18 +427,6 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect(reopened.getSessionName()).toBe("Shared title");
 	});
 
-	it("refuses selector compensation before restoring the live model over an admitted write", async () => {
-		const f = await fixture();
-		await canonicalMessage(f);
-		const before = f.session.model;
-		const bytes = await Bun.file(f.file).text();
-		await expect(
-			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.Low),
-		).rejects.toThrow("Shared session mutation requires transaction admission: restore model selection");
-		expect(f.session.model).toBe(before);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
@@ -429,16 +438,505 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect(f.session.sessionId).toBe(sessionId);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
+});
 
-	it("refuses /clear before resetting the conversation", async () => {
+describe("#7824 profile assignment materialization in a shared root TUI session", () => {
+	const assignments = () => new Map([["executor" as const, selectedSelector]]);
+
+	it("materializes a role assignment over the active profile through shared publication", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		expect(
+			await materializeActiveModelProfileAssignments({
+				session: f.session,
+				settings: f.settings,
+				assignments: assignments(),
+			}),
+		).toBe(true);
+		expect(f.session.getActiveModelProfile()).toBeUndefined();
+		expect(f.settings.get("task.agentModelOverrides").executor).toBe(selectedSelector);
+		expect(f.manager.getLeafEntry()).toMatchObject({
+			type: "configured_model_chain",
+			parentId: leaf,
+			role: "default",
+			origin: "modelRoles",
+		});
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.configuredModelChains.default).toMatchObject({ origin: "modelRoles" });
+		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
+	});
+
+	it("fails closed without a legacy write when the chain publication is refused after the settings commit", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		const error = await materializeActiveModelProfileAssignments({
+			session: f.session,
+			settings: f.settings,
+			assignments: assignments(),
+		}).catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "ModelProfileApplyCommittedError" });
+		expect((error as Error).cause).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(String((error as Error).message)).not.toContain("rollback incomplete");
+		expect(f.session.sessionLifecycle.disposed).toBe(true);
+		// The live profile overrides were never touched and the transcript is unchanged.
+		expect(f.session.getActiveModelProfile()).toBe(profileName);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+});
+
+describe("#7824 configuration reload that changes the active profile in a shared root TUI session", () => {
+	const reloadedChain = [`${fallbackSelector}:high`];
+
+	async function reloadCandidate(f: Fixture, revision: number): Promise<ConfigHotReloadCandidate> {
+		const configPath = path.join(f.agentDir, "config.yml");
+		const modelsPath = path.join(f.agentDir, "models.yml");
+		const modelsText = modelsConfig(reloadedChain);
+		await Bun.write(modelsPath, modelsText);
+		return {
+			revision,
+			config: { path: configPath, text: await Bun.file(configPath).text(), identity: `config-${revision}` },
+			models: { path: modelsPath, text: modelsText, identity: `models-${revision}` },
+		};
+	}
+
+	it("publishes the reloaded profile chain and model additively before applying them", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const candidate = await reloadCandidate(f, 1);
+		await expect(f.session.reloadConfiguration(candidate, new AbortController().signal)).resolves.toMatchObject({
+			applied: true,
+			modelsChanged: true,
+		});
+		expect(f.session.model).toMatchObject({ provider, id: "fallback" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.session.getActiveModelProfile()).toBe(profileName);
+		expect(f.session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: reloadedChain,
+			origin: "profile-activation",
+			identity: profileName,
+		});
+		expect(f.manager.getBranch().find(entry => entry.parentId === leaf)).toMatchObject({
+			type: "configured_model_chain",
+		});
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models).toMatchObject({ default: fallbackSelector, temporary: fallbackSelector });
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(reopened.configuredModelChains.default).toMatchObject({ entries: reloadedChain });
+		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
+	});
+
+	it("rolls back only the staged catalog when the reload publication is refused", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		const candidate = await reloadCandidate(f, 1);
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		const error = await f.session
+			.reloadConfiguration(candidate, new AbortController().signal)
+			.catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "ConfigurationReloadError", code: "PUBLICATION_FAILED" });
+		expect((error as Error).cause).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(f.session.model).toMatchObject({ provider, id: "selected" });
+		expect(f.session.getConfiguredModelChainState("default")).toMatchObject({ entries: defaultChain });
+		expect(f.registry.getModelProfile(profileName)).toBeDefined();
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+});
+
+describe("#7824 default fallback resolution in a shared root TUI session", () => {
+	const missingSelector = `${provider}/missing`;
+	const streamFn: Agent["streamFn"] = (model, context, options) =>
+		createMockModel({ responses: [{ content: ["fallback reply"] }] }).stream(model, context, options);
+
+	it("publishes the thinking change of a fallback switch before switching the model", async () => {
+		const f = await fixture({ streamFn });
+		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.prompt("use the fallback");
+		await f.session.awaitSessionSettlement();
+		expect(f.session.model).toMatchObject({ provider, id: "fallback" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(publish).toHaveBeenCalledWith(
+			[{ type: "thinking_level_change", level: ThinkingLevel.High, operatorIntent: false }],
+			expect.any(Function),
+		);
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(reopened.messages.map(message => message.role)).toEqual(["user", "user", "user", "assistant"]);
+	});
+
+	it("leaves model and fallback state untouched when the thinking publication is refused", async () => {
+		const f = await fixture({ streamFn });
+		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
+		await canonicalMessage(f);
+		const fallbackState = f.session.getDefaultFallbackRuntimeState();
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "rejected",
+			error: new Error("refused"),
+		});
+		const error = await f.session.prompt("use the fallback").catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "SharedControlPublicationError", code: "rejected" });
+		expect(String((error as Error).message)).not.toContain("rollback");
+		expect(f.session.model).toMatchObject({ provider, id: "initial" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(f.session.getDefaultFallbackRuntimeState()).toEqual(fallbackState);
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
+	});
+});
+
+describe("#7824 /clear in a shared root TUI session", () => {
+	async function peerSibling(f: Fixture): Promise<string> {
+		const peer = await reopen(f);
+		const outcome = await peer.appendMessageSharingSession(user("unseen peer sibling"));
+		if (outcome.kind !== "committed") throw new Error(`peer append ${outcome.kind}`);
+		return outcome.id;
+	}
+
+	it("publishes a parentless context_clear root additively and keeps the unseen sibling", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const siblingId = await peerSibling(f);
+		const before = await Bun.file(f.file).text();
+		const sessionId = f.session.sessionId;
+		expect(await f.session.clearContext()).toBe(true);
+		expect(f.session.sessionId).toBe(sessionId);
+		expect(f.session.agent.state.messages).toEqual([]);
+		const after = await Bun.file(f.file).text();
+		// Additive publication: every committed byte, including the peer's sibling, survives.
+		expect(after.startsWith(before)).toBe(true);
+		const branch = f.manager.getBranch();
+		expect(branch[0]).toMatchObject({
+			type: "custom",
+			customType: "context_clear",
+			parentId: null,
+			data: { sessionId },
+		});
+		expect(branch.map(entry => entry.type)).toEqual([
+			"custom",
+			"thinking_level_change",
+			"model_change",
+			"service_tier_change",
+		]);
+		const reopened = await reopen(f);
+		expect(reopened.getEntry(siblingId)).toMatchObject({ type: "message" });
+		const context = reopened.buildSessionContext();
+		expect(context.messages).toEqual([]);
+		expect(context.models.default).toBe(initialSelector);
+		expect(context.thinkingLevel).toBe(ThinkingLevel.Low);
+
+		// The next canonical message descends from the shared root, not the old branch.
+		await canonicalMessage(f, "after clear");
+		const next = (await reopen(f)).buildSessionContext();
+		expect(next.messages.map(message => message.role === "user" && message.content)).toEqual(["after clear"]);
+	});
+
+	it("refuses /clear before resetting when the shared transcript moved", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
 		const messages = structuredClone(f.session.agent.state.messages);
 		const bytes = await Bun.file(f.file).text();
-		await expect(f.session.clearContext()).rejects.toThrow(
-			"Shared session mutation requires transaction admission: clear context",
-		);
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		const error = await f.session.clearContext().catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(String((error as Error).message)).not.toContain("rollback");
 		expect(f.session.agent.state.messages).toEqual(messages);
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("closes the session instead of resetting when the /clear outcome is unknown", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const messages = structuredClone(f.session.agent.state.messages);
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "unknown",
+			ids: ["clear-root"],
+			error: new Error("durability_unproven"),
+		});
+		await expect(f.session.clearContext()).rejects.toMatchObject({
+			name: "SharedControlPublicationError",
+			code: "unknown",
+		});
+		expect(f.session.agent.state.messages).toEqual(messages);
+		expect(f.session.sessionLifecycle.disposed).toBe(true);
+	});
+});
+
+describe("#7824 selector compensation in a shared root TUI session", () => {
+	it("publishes only the differing model and thinking before restoring them live", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		const fallback = f.registry.find(provider, "fallback")!;
+		await f.session.restoreModelSelectionForRollback(fallback, ThinkingLevel.High, {
+			resumeDefault: { selector: initialSelector },
+		});
+		// The resume default already matches the snapshot, so only model and thinking publish.
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.calls[0]![0]).toEqual([
+			{ type: "model_change", model: fallbackSelector, role: "temporary" },
+			{ type: "thinking_level_change", level: ThinkingLevel.High, operatorIntent: false },
+		]);
+		expect(f.session.model).toBe(fallback);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.manager.getBranch().find(entry => entry.parentId === leaf)).toMatchObject({ type: "model_change" });
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models).toMatchObject({ default: initialSelector, temporary: fallbackSelector });
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("restores a changed chain and resume default in the same publication", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const selected = f.registry.find(provider, "selected")!;
+		const initial = f.session.model;
+		const chain = f.session.getConfiguredModelChainState("default");
+		await f.session.setDefaultModelSelection(selected, ThinkingLevel.High);
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.restoreModelSelectionForRollback(initial, ThinkingLevel.Low, {
+			defaultChain: { state: chain },
+			resumeDefault: { selector: initialSelector },
+		});
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.calls[0]![0].map(entry => entry.type)).toEqual([
+			"configured_model_chain",
+			"model_change",
+			"model_change",
+			"thinking_level_change",
+		]);
+		expect(f.session.model).toBe(initial);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models).toMatchObject({ default: initialSelector, temporary: initialSelector });
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(reopened.configuredModelChains.default?.entries ?? []).toEqual(chain?.entries ?? []);
+	});
+
+	it("writes nothing when the captured state already matches", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.restoreModelSelectionForRollback(f.session.model, ThinkingLevel.Low, {
+			defaultChain: { state: f.session.getConfiguredModelChainState("default") },
+			resumeDefault: { selector: initialSelector },
+		});
+		expect(publish).not.toHaveBeenCalled();
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("leaves the live model untouched when the compensation publication is refused", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = f.session.model;
+		const bytes = await Bun.file(f.file).text();
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		await expect(
+			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.High),
+		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(f.session.model).toBe(before);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("closes the session instead of restoring when the compensation outcome is unknown", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = f.session.model;
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "unknown",
+			ids: ["compensation"],
+			error: new Error("durability_unproven"),
+		});
+		await expect(
+			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.High),
+		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "unknown" });
+		expect(f.session.model).toBe(before);
+		expect(f.session.sessionLifecycle.disposed).toBe(true);
+	});
+});
+
+describe("#7824 picker star after /new against a live shared predecessor", () => {
+	async function predecessorAfterNew(f: Fixture): Promise<{ peer: SessionManager; candidate: SessionInfo }> {
+		await canonicalMessage(f);
+		const predecessorId = f.session.sessionId;
+		const peer = await reopen(f);
+		expect((await peer.appendMessageSharingSession(user("peer before /new"))).kind).toBe("committed");
+		expect(await f.session.newSession()).toBe(true);
+		expect(f.session.sessionId).not.toBe(predecessorId);
+		const candidate = (await f.manager.listForResumePickerReadOnly()).find(info => info.id === predecessorId);
+		if (!candidate) throw new Error("missing predecessor picker candidate");
+		return { peer, candidate };
+	}
+
+	it("stars the predecessor append-only so its live peer keeps publishing", async () => {
+		const f = await fixture();
+		const { peer, candidate } = await predecessorAfterNew(f);
+		const before = await Bun.file(candidate.path).text();
+		await f.manager.setSessionStarredForPicker(candidate, true);
+		const after = await Bun.file(candidate.path).text();
+		expect(after).toBe(`${before}${JSON.stringify({ type: "header_patch", patch: { starred: true } })}\n`);
+		expect((await peer.appendMessageSharingSession(user("peer after star"))).kind).toBe("committed");
+		const reopened = await SessionManager.open(candidate.path, SessionManager.managedDestination(f.cwd, f.agentDir));
+		managers.push(reopened);
+		expect(reopened.isSessionStarred()).toBe(true);
+		expect(reopened.buildSessionContext().messages.at(-1)).toMatchObject({ content: "peer after star" });
+	});
+
+	it("waits for the predecessor's shared transaction lease before appending the star", async () => {
+		const f = await fixture();
+		const { candidate } = await predecessorAfterNew(f);
+		const before = await Bun.file(candidate.path).text();
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const lease = withManagedSessionTransaction(
+			{
+				locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(candidate.path)),
+				sessionId: candidate.id,
+			},
+			async () => {
+				held.resolve();
+				await release.promise;
+			},
+		);
+		await held.promise;
+		const star = f.manager.setSessionStarredForPicker(candidate, true);
+		await Bun.sleep(100);
+		// A peer holds the predecessor's transaction: the star must not write under it.
+		expect(await Bun.file(candidate.path).text()).toBe(before);
+		release.resolve();
+		await lease;
+		await star;
+		expect(await Bun.file(candidate.path).text()).toContain('"starred":true');
+	});
+
+	it("refuses a whole-transcript header upgrade of a shared predecessor", async () => {
+		const f = await fixture();
+		const { candidate } = await predecessorAfterNew(f);
+		// A predecessor header without the star-patch capability would need a whole-file rewrite.
+		const original = await Bun.file(candidate.path).text();
+		const newline = original.indexOf("\n");
+		const header = JSON.parse(original.slice(0, newline)) as Record<string, unknown>;
+		delete header.starredPatchVersion;
+		await Bun.write(candidate.path, `${JSON.stringify(header)}${original.slice(newline)}`);
+		const legacy = (await f.manager.listForResumePickerReadOnly()).find(info => info.id === candidate.id)!;
+		const bytes = await Bun.file(candidate.path).text();
+		await expect(f.manager.setSessionStarredForPicker(legacy, true)).rejects.toThrow(
+			"shared session star requires an append-only header patch",
+		);
+		expect(await Bun.file(candidate.path).text()).toBe(bytes);
+	});
+});
+
+describe("#7823/#7824 interactive TUI command path after a canonical shared message", () => {
+	/** The InteractiveMode surface the builtin TUI dispatcher and CommandController use. */
+	function tuiContext(f: Fixture) {
+		const errors: string[] = [];
+		const statuses: string[] = [];
+		const ctx: Record<string, unknown> = {
+			session: f.session,
+			sessionManager: f.session.sessionManager,
+			settings: f.settings,
+			isStopped: () => false,
+			showError: (message: string) => errors.push(message),
+			showStatus: (message: string) => statuses.push(message),
+			showWarning: (message: string) => errors.push(message),
+			editor: { setText() {}, addToHistory() {} },
+			statusLine: { invalidate() {}, setSessionStartTime() {} },
+			updateEditorBorderColor() {},
+			updateEditorTopBorder() {},
+			ui: { requestRender() {}, resetViewportAnchorIntent() {}, prepareViewportAnchorForTranscriptRebuild() {} },
+			chatContainer: { clear() {}, addChild() {} },
+			pendingMessagesContainer: { clear() {} },
+			pendingTools: new Map(),
+			compactionQueuedMessages: [],
+			resetAssistantTextPresentation() {},
+			reloadTodos: async () => {},
+			refreshSlashCommandState: async () => {},
+			notifyConfigChanged: async () => {},
+		};
+		const commands = new CommandController(ctx as unknown as InteractiveModeContext);
+		ctx.handleContextClearCommand = () => commands.handleContextClearCommand();
+		const run = async (text: string) => {
+			expect(await executeBuiltinSlashCommand(text, { ctx: ctx as never, handleBackgroundCommand: () => {} })).toBe(
+				true,
+			);
+			expect(errors).toEqual([]);
+		};
+		return { run, statuses };
+	}
+
+	it("drives preset, /fast, /effort and /clear through the TUI dispatcher additively", async () => {
+		setThemeInstance(await loadTestTheme());
+		const f = await fixture();
+		await canonicalMessage(f);
+		const { run, statuses } = tuiContext(f);
+		const sessionId = f.session.sessionId;
+
+		let bytes = await Bun.file(f.file).text();
+		await run(`/model ${profileName}`);
+		await expectPresetApplied(f);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+
+		bytes = await Bun.file(f.file).text();
+		await run("/fast on");
+		expect(f.session.isFastModeEnabled()).toBe(true);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+
+		bytes = await Bun.file(f.file).text();
+		await run("/effort medium");
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+
+		bytes = await Bun.file(f.file).text();
+		await run("/clear");
+		expect(f.session.sessionId).toBe(sessionId);
+		expect(f.session.agent.state.messages).toEqual([]);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+		expect(statuses).toEqual(
+			expect.arrayContaining([expect.stringContaining("Fast mode enabled"), expect.stringContaining("medium")]),
+		);
+
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.messages).toEqual([]);
+		expect(reopened.models.default).toBe(selectedSelector);
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(reopened.serviceTier).toBe("priority");
+		// The live session keeps every control across the clear.
+		expect(f.session.model).toMatchObject({ provider, id: "selected" });
+		expect(f.session.isFastModeEnabled()).toBe(true);
+		expect(f.session.getActiveModelProfile()).toBe(profileName);
 	});
 });

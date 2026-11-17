@@ -77,9 +77,10 @@ import {
 	type RoutingSettingsService,
 } from "../../sdk/routing-settings";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
-import type {
-	AgentSessionProfileInstalledOverrideState,
-	DefaultFallbackRuntimeState,
+import {
+	type AgentSessionProfileInstalledOverrideState,
+	type DefaultFallbackRuntimeState,
+	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
@@ -325,6 +326,18 @@ export class SelectorController {
 		restoreProfileState: boolean = true,
 	): Promise<never> {
 		if (!restoreLiveModel && !restoreProfileState) throw error;
+		// An unknown or committed-but-unapplied shared outcome already closed the session:
+		// its transcript may hold the forward write, so nothing is compensated over it (#7824).
+		if (
+			this.ctx.session.sessionLifecycle?.disposed ||
+			(error instanceof SharedControlPublicationError &&
+				(error.code === "unknown" || error.code === "committed_not_applied"))
+		)
+			throw error;
+		// A shared session restores the chain, resume default and live model as one admitted
+		// publication of only what actually differs, so a forward write known not to have
+		// happened leaves nothing to compensate.
+		const sharedCompensation = this.ctx.session.usesSharedControlPublication?.() === true;
 		// Validate the durable owner under the same lock as compensation: the
 		// in-memory settings may not have seen another process's winning commit.
 		try {
@@ -385,16 +398,32 @@ export class SelectorController {
 				? this.ctx.settings.clearOverride("modelProfile.default")
 				: this.ctx.settings.override("modelProfile.default", snapshot.profileOverride),
 		);
+		if (sharedCompensation) {
+			try {
+				await this.ctx.session.restoreModelSelectionForRollback(
+					restoreLiveModel ? snapshot.model : this.ctx.session.model,
+					restoreLiveModel ? snapshot.thinkingLevel : this.ctx.session.thinkingLevel,
+					{
+						defaultChain: restoreProfileState ? { state: snapshot.chain } : undefined,
+						resumeDefault: restoreLiveModel ? { selector: snapshot.resumeDefaultSelector } : undefined,
+					},
+				);
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		}
 		if (restoreProfileState) {
-			restore(() =>
-				this.ctx.session.setConfiguredModelChain(
-					"default",
-					snapshot.chain?.entries ?? [],
-					snapshot.chain?.origin ?? "rollback",
-					snapshot.chain?.identity,
-					snapshot.chain?.explicitHead ?? true,
-				),
-			);
+			if (!sharedCompensation) {
+				restore(() =>
+					this.ctx.session.setConfiguredModelChain(
+						"default",
+						snapshot.chain?.entries ?? [],
+						snapshot.chain?.origin ?? "rollback",
+						snapshot.chain?.identity,
+						snapshot.chain?.explicitHead ?? true,
+					),
+				);
+			}
 			restore(() => this.ctx.session.restoreDefaultFallbackRuntimeState(snapshot.fallbackRuntimeState));
 			restore(() => {
 				if (snapshot.canonicalVariant) {
@@ -407,7 +436,7 @@ export class SelectorController {
 				}
 			});
 		}
-		if (restoreLiveModel) {
+		if (restoreLiveModel && !sharedCompensation) {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
@@ -421,7 +450,7 @@ export class SelectorController {
 		} catch (rollbackError) {
 			rollbackErrors.push(rollbackError);
 		}
-		if (restoreLiveModel) {
+		if (restoreLiveModel && !sharedCompensation) {
 			try {
 				await this.ctx.session.restoreModelSelectionForRollback(snapshot.model, snapshot.thinkingLevel);
 			} catch (rollbackError) {
