@@ -2940,6 +2940,10 @@ describe("bash scanner quoting model", () => {
 			`bun --require=/tmp/payload.cjs script.ts`,
 			`bun --preload /tmp/payload.cjs script.ts`,
 			`bun --preload=/tmp/payload.cjs script.ts`,
+			// The shell concatenates quoted spans before Node/Bun sees the flag.
+			`node --im'port'=/tmp/payload.mjs -e 'process.stdout.write("status")'`,
+			`node --requi"re"=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`bun --pre"load"=/tmp/payload.cjs script.ts`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -2949,6 +2953,28 @@ describe("bash scanner quoting model", () => {
 			});
 			expect(decision.blocked, command).toBe(true);
 			expect(decision.reason, command).toBe("unknown-target");
+		}
+	});
+
+	it("allows Node/Bun argv after the -- option terminator", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		// `--` ends Node/Bun option parsing, so a token spelled like a preload flag
+		// after it is program argv and loads no module.
+		for (const command of [
+			`node -e 'console.log(process.argv)' -- --import=plain-text`,
+			`node -e 'console.log(process.argv)' -- --require=plain-text`,
+			`node -e 'console.log(process.argv)' -- -r plain-text`,
+			`node script.js -- --preload=plain-text`,
+			`bun script.ts -- --require=plain-text`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(false);
 		}
 	});
 

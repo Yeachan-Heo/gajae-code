@@ -2177,10 +2177,16 @@ function collectInterpreterOneLinerWrites(
 			}
 			// Node/Bun preload flags load a module the scanner never sees, so fail closed
 			// for every detached, attached, and equals-form spelling.
-			if (/^(?:node|bun)$/.test(binary) && NODE_PRELOAD_FLAG_RE.test(part)) {
-				targets.explicitMutation = true;
-				targets.unknown = true;
-				return;
+			if (/^(?:node|bun)$/.test(binary)) {
+				// `--` ends Node/Bun option parsing: later words are the program's own argv.
+				if (part === "--") break;
+				// The shell concatenates quoted spans, so `--im'port'=x` reaches Node as a
+				// preload flag while the raw word spells neither.
+				if (NODE_PRELOAD_FLAG_RE.test(part.replace(/['"]/g, ""))) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+					return;
+				}
 			}
 			let rawScript: string | undefined;
 			const option = options.find(
