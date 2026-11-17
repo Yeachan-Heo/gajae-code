@@ -977,27 +977,25 @@ export const BACKMERGE_CONFLICT_PATH = "packages/natives/native/diagnostic-artif
 const BACKMERGE_PUSH_ATTEMPTS = 3;
 
 /**
- * Resolve the known diagnostic-artifact backmerge conflict: adopt the released
- * `version` from main and keep the artifacts map from dev. Fails closed when either
- * side lacks the field the resolution depends on.
+ * Resolve the known diagnostic-artifact backmerge conflict by taking the release tag's
+ * manifest wholesale: its `version` and its `artifacts`. A version label may only cover
+ * the bytes that release built, so a digest dev built for another version is dropped
+ * instead of being relabelled under the released version. Fails closed when the released
+ * manifest lacks a field the resolution depends on.
  */
-export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string): string {
-	const oursManifest = JSON.parse(ours) as Record<string, unknown>;
-	const theirsManifest = JSON.parse(theirs) as { version?: unknown };
-	if (typeof theirsManifest.version !== "string") {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on main`);
+export function resolveDiagnosticArtifactBackmerge(released: string): string {
+	const manifest = JSON.parse(released) as Record<string, unknown>;
+	if (typeof manifest.version !== "string") {
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on the release tag`);
 	}
-	if (typeof oursManifest.schema !== "string") {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on dev`);
+	if (typeof manifest.schema !== "string") {
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on the release tag`);
 	}
-	const artifacts = oursManifest.artifacts;
+	const artifacts = manifest.artifacts;
 	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on dev`);
+		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on the release tag`);
 	}
-	// Start from dev's manifest so any top-level field the schema gains later survives the
-	// resolution instead of being dropped by a hand-built three-key object.
-	const resolved = { ...oursManifest, version: theirsManifest.version };
-	return `${JSON.stringify(resolved, null, 2)}\n`;
+	return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
 export type BackmergeOutcome =
@@ -1129,7 +1127,7 @@ export async function backmergeReleaseIntoDev(
 				title: `chore(release): backmerge v${version} into dev`,
 				body: `Sync the v${version} release commit from main into dev so this published version is included before a later release merge.
 
-The release consumed its changelog fragments; the history guard admits those deletions because the \`v${version}\` tag records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's version and dev's artifact digests.
+The release consumed its changelog fragments; the history guard admits those deletions because the \`v${version}\` tag records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's manifest wholesale — its version and its artifact digests — so no digest dev built for another version is relabelled under v${version}.
 
 Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of dev. Merging requires maintainer approval of this exact head.`,
 			});
@@ -1161,9 +1159,8 @@ Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of d
 			if (conflicted.length !== 1 || conflicted[0] !== BACKMERGE_CONFLICT_PATH) {
 				return { action: "blocked", detail: `unexpected conflict: ${conflicted.join(", ") || "unknown"}` };
 			}
-			const ours = await gitAt(dir, ["show", `:2:${BACKMERGE_CONFLICT_PATH}`]).text();
 			const theirs = await gitAt(dir, ["show", `:3:${BACKMERGE_CONFLICT_PATH}`]).text();
-			await Bun.write(path.join(dir, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
+			await Bun.write(path.join(dir, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(theirs));
 			await gitAt(dir, ["add", BACKMERGE_CONFLICT_PATH]).quiet();
 		}
 		await gitAt(dir, [

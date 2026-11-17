@@ -20,15 +20,6 @@ function recordingOpener(failure?: string) {
 	return { opened, openPullRequest };
 }
 
-const DEV = `{
-  "schema": "gjc.diagnostic-artifact",
-  "version": "0.18.6",
-  "artifacts": {
-    "pi_natives.darwin-arm64.node": "dev-digest"
-  }
-}
-`;
-
 const MAIN = `{
   "schema": "gjc.diagnostic-artifact",
   "version": "0.18.7",
@@ -39,36 +30,40 @@ const MAIN = `{
 `;
 
 describe("backmerge conflict resolution", () => {
-	test("keeps the released version and dev's artifact digests", () => {
-		const resolved = JSON.parse(resolveDiagnosticArtifactBackmerge(DEV, MAIN)) as Record<string, unknown>;
+	test("takes the release tag's version and artifacts, dropping dev's own digests", () => {
+		const resolved = JSON.parse(resolveDiagnosticArtifactBackmerge(MAIN)) as Record<string, unknown>;
 		expect(resolved).toEqual({
 			schema: "gjc.diagnostic-artifact",
 			version: "0.18.7",
-			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
+			artifacts: { "pi_natives.darwin-arm64.node": "main-digest" },
 		});
-		expect(resolveDiagnosticArtifactBackmerge(DEV, MAIN).endsWith("\n")).toBe(true);
+		expect(resolveDiagnosticArtifactBackmerge(MAIN).endsWith("\n")).toBe(true);
 	});
-	test("keeps top-level manifest fields it does not know about", () => {
-		// The manifest churns every release; a field added later must survive the resolution.
-		const future = `{"schema":"gjc.diagnostic-artifact","artifacts":{},"builtAt":"2026-01-01T00:00:00Z"}`;
-		const resolved = JSON.parse(resolveDiagnosticArtifactBackmerge(future, MAIN)) as Record<string, unknown>;
+
+	test("keeps every top-level field the released manifest carries", () => {
+		// The resolution emits the released manifest rather than a hand-built three-key object,
+		// so a field the schema gains later survives for the version that actually built it.
+		const released = `{"schema":"gjc.diagnostic-artifact","version":"0.18.7","artifacts":{},"builtAt":"2026-01-01T00:00:00Z"}`;
+		const resolved = JSON.parse(resolveDiagnosticArtifactBackmerge(released)) as Record<string, unknown>;
 		expect(resolved.builtAt).toBe("2026-01-01T00:00:00Z");
 		expect(resolved.version).toBe("0.18.7");
 		expect(resolved.schema).toBe("gjc.diagnostic-artifact");
 	});
 
-	test("fails closed on any manifest field the resolution depends on", () => {
-		expect(() => resolveDiagnosticArtifactBackmerge(DEV, `{"artifacts":{}}`)).toThrow(
-			new RegExp(`${BACKMERGE_CONFLICT_PATH} has no string version on main`),
+	test("fails closed on any released manifest field the resolution depends on", () => {
+		expect(() => resolveDiagnosticArtifactBackmerge(`{"artifacts":{}}`)).toThrow(
+			new RegExp(`${BACKMERGE_CONFLICT_PATH} has no string version on the release tag`),
 		);
-		expect(() => resolveDiagnosticArtifactBackmerge(`{"version":"0.18.6"}`, MAIN)).toThrow(/no string schema on dev/);
-		expect(() => resolveDiagnosticArtifactBackmerge(`{"schema":"gjc.diagnostic-artifact"}`, MAIN)).toThrow(
-			/no artifacts map on dev/,
+		expect(() => resolveDiagnosticArtifactBackmerge(`{"version":"0.18.7"}`)).toThrow(
+			/no string schema on the release tag/,
+		);
+		expect(() => resolveDiagnosticArtifactBackmerge(`{"schema":"gjc.diagnostic-artifact","version":"0.18.7"}`)).toThrow(
+			/no artifacts map on the release tag/,
 		);
 		// An array is `typeof "object"` too, but it is not the artifacts map.
 		expect(() =>
-			resolveDiagnosticArtifactBackmerge(`{"schema":"gjc.diagnostic-artifact","artifacts":[]}`, MAIN),
-		).toThrow(/no artifacts map on dev/);
+			resolveDiagnosticArtifactBackmerge(`{"schema":"gjc.diagnostic-artifact","version":"0.18.7","artifacts":[]}`),
+		).toThrow(/no artifacts map on the release tag/);
 	});
 });
 
@@ -122,7 +117,7 @@ function manifest(version: string, digest: string): string {
  * A bare origin whose `main` ships a release that `dev` has not seen, with a diverged
  * build-digest manifest — the shape every release backmerge has to merge.
  */
-async function backmergeFixture(options: { devManifest?: string; secondConflict?: boolean } = {}) {
+async function backmergeFixture(options: { releaseManifest?: string; secondConflict?: boolean } = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-backmerge-e2e-"));
 	tempRoots.push(root);
 	const origin = path.join(root, "origin.git");
@@ -143,7 +138,7 @@ async function backmergeFixture(options: { devManifest?: string; secondConflict?
 
 	// dev diverges first, so the release commit main ships afterwards is genuinely new to it.
 	await git(work, "checkout", "-b", "dev");
-	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), options.devManifest ?? manifest("0.18.6", "dev-digest"));
+	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.6", "dev-digest"));
 	if (options.secondConflict === true) await Bun.write(readme, "dev\n");
 	await Bun.write(path.join(work, "dev-only.txt"), "dev\n");
 	await git(work, "add", "-A");
@@ -151,7 +146,7 @@ async function backmergeFixture(options: { devManifest?: string; secondConflict?
 	await git(work, "push", "origin", "dev");
 
 	await git(work, "checkout", "main");
-	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.7", "main-digest"));
+	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), options.releaseManifest ?? manifest("0.18.7", "main-digest"));
 	if (options.secondConflict === true) await Bun.write(readme, "main\n");
 	await Bun.write(path.join(work, "released.txt"), "released\n");
 	await git(work, "add", "-A");
@@ -179,14 +174,17 @@ describe("backmerge orchestration", () => {
 			title: "chore(release): backmerge v0.18.7 into dev",
 		});
 
-		// The released version wins while dev's digests and its own work survive.
+		// The released manifest wins outright: dev's local-build digest and its own work survive
+		// only in the files the release did not author (see the dev-only.txt check below).
 		const branch = "backmerge/0.18.7";
 		const merged = JSON.parse(await git(origin, "show", `${branch}:${BACKMERGE_CONFLICT_PATH}`)) as Record<string, unknown>;
 		expect(merged).toEqual({
 			schema: "gjc.diagnostic-artifact",
 			version: "0.18.7",
-			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
+			artifacts: { "pi_natives.darwin-arm64.node": "main-digest" },
 		});
+		// dev built its digest for 0.18.6; it must never appear under the released version.
+		expect(JSON.stringify(merged)).not.toContain("dev-digest");
 		expect(await git(origin, "show", `${branch}:released.txt`)).toBe("released\n");
 		expect(await git(origin, "show", `${branch}:dev-only.txt`)).toBe("dev\n");
 		expect((await git(origin, "rev-parse", `${branch}^1`)).trim()).toBe(devBefore.trim());
@@ -237,7 +235,7 @@ describe("backmerge orchestration", () => {
 		expect(JSON.parse(await git(origin, "show", `backmerge/0.18.7:${BACKMERGE_CONFLICT_PATH}`))).toEqual({
 			schema: "gjc.diagnostic-artifact",
 			version: "0.18.7",
-			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
+			artifacts: { "pi_natives.darwin-arm64.node": "main-digest" },
 		});
 		expect((await gitCommand(origin, ["cat-file", "-e", "backmerge/0.18.7:later-release.txt"])).exitCode).not.toBe(0);
 		expect(await git(origin, "show", "main:later-release.txt")).toBe("later release\n");
@@ -262,9 +260,8 @@ describe("backmerge orchestration", () => {
 			.map(line => line.trim())
 			.filter(Boolean);
 		expect(conflicts).toEqual([BACKMERGE_CONFLICT_PATH]);
-		const ours = await git(work, "show", `:2:${BACKMERGE_CONFLICT_PATH}`);
 		const theirs = await git(work, "show", `:3:${BACKMERGE_CONFLICT_PATH}`);
-		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(theirs));
 		await git(work, "add", BACKMERGE_CONFLICT_PATH);
 		await git(work, "commit", "-m", "chore(release): sync the v0.18.7 release into dev");
 		await git(work, "push", "origin", "HEAD:refs/heads/backmerge/0.18.7");
@@ -307,16 +304,16 @@ describe("backmerge orchestration", () => {
 		expect(await git(origin, "rev-parse", "dev")).toBe(before);
 	});
 
-	test("fails closed when dev's own manifest cannot be resolved", async () => {
+	test("fails closed when the released manifest cannot be resolved", async () => {
 		const { origin, work } = await backmergeFixture({
-			devManifest: '{\n  "schema": "gjc.diagnostic-artifact",\n  "version": "0.18.6"\n}\n',
+			releaseManifest: '{\n  "schema": "gjc.diagnostic-artifact",\n  "version": "0.18.7"\n}\n',
 		});
 		const before = await git(origin, "rev-parse", "dev");
 
 		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: recordingOpener().openPullRequest });
 
 		expect(outcome.action).toBe("blocked");
-		expect(outcome.detail).toContain("no artifacts map on dev");
+		expect(outcome.detail).toContain("no artifacts map on the release tag");
 		expect(await git(origin, "rev-parse", "dev")).toBe(before);
 	});
 });
