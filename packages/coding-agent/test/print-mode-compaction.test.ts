@@ -252,4 +252,45 @@ describe("Print mode with message compaction", () => {
 		expect(stdoutOutput.join("")).toContain("resume response");
 		expect(process.exitCode ?? 0).toBe(0);
 	});
+
+	it("does not falsely report success when a slash command is handled without adding messages", async () => {
+		// Regression for probepark's finding: a resumed session with a historical assistant message
+		// receives a command that is handled without adding new messages (e.g., /help).
+		// The resolver should report failure (empty_response), not reuse the historical message.
+		const messages: Message[] = [
+			makeUserMessage("previous turn"),
+			makeAssistantMessage({ content: [{ type: "text", text: "previous response" }] }),
+		];
+
+		const session = createMockSession({
+			messages,
+			onPrompt: () => {
+				// Simulate a handled slash command: prompt returns without adding messages
+				// (simulating the early return in AgentSession.#promptInternal for extension/command handlers)
+			},
+		});
+
+		// Create a mock session that supports the slash-command consumption path
+		const originalSession = session as any;
+		originalSession.sessionManager.getCwd = () => import.meta.dir;
+
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+
+		// Test the resolver directly with the historical message scenario
+		const indexBeforeTurn = messages.length;
+
+		const disposition = resolvePrintTerminalDisposition(
+			messages,
+			true, // submittedPrompt
+			indexBeforeTurn,
+			undefined, // lastPromptUserMessage = undefined because no new user message was added
+		);
+
+		// Should report failure because no assistant response was generated for this turn
+		expect(disposition).toEqual({
+			status: "failure",
+			error: { code: "empty_response", message: "Turn completed without assistant text." },
+		});
+	});
 });

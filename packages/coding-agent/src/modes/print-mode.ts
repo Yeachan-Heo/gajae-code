@@ -357,12 +357,20 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			lastPromptMessageStart = session.state.messages.length;
 			await session.prompt(text, images ? { images } : undefined);
 			// Capture the user message that was just added, for compaction-robust turn tracking.
-			// Search from the end backward to find the most recent user message, handling the case
-			// where compaction shrinks the array and moves the new user message below lastPromptMessageStart.
+			// Search backward for a user message, but only capture it if it's part of the current turn
+			// (verified by the presence of an assistant message after it).
+			// This prevents capturing historical messages when no new user message is added
+			// (e.g., when a slash command is handled without appending messages).
 			for (let i = session.state.messages.length - 1; i >= 0; i--) {
 				if (session.state.messages[i]?.role === "user") {
-					lastPromptUserMessage = session.state.messages[i];
-					break;
+					// Verify this user message is part of the current turn by checking for a following assistant message
+					const hasFollowingAssistant = session.state.messages.some(
+						(msg, idx) => idx > i && msg.role === "assistant",
+					);
+					if (hasFollowingAssistant) {
+						lastPromptUserMessage = session.state.messages[i];
+						break;
+					}
 				}
 			}
 		};
