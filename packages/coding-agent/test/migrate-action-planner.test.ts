@@ -772,3 +772,4 @@ describe("executeActions — mcp destination safety", () => {
 		expect(written.mcpServers.alpha.command).toBe("new-bin");
 	});
 });
+
