@@ -3456,7 +3456,15 @@ function createControlSurface(
 		let submission: Promise<unknown> | undefined;
 		const cancelPreflight = (): boolean => {
 			preflightController.abort();
-			if (settled) return false; // Already settled, didn't cancel
+			// Issue #7853: an abort that lands after preflight acceptance but before
+			// execution completion should cancel it. Even if the preflight was already
+			// settled (accepted), aborting the signal is still a successful cancellation.
+			if (accepted) {
+				// The preflight was accepted (durable write succeeded). The signal is now
+				// aborted, which interrupts any execution. This is a successful cancellation.
+				return true;
+			}
+			if (settled) return false; // Already settled and not accepted, didn't cancel
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
@@ -3813,8 +3821,21 @@ function createControlSurface(
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
 		} finally {
-			requesterPreflights.delete(cancelPreflight);
-			if (requesterPreflights.size === 0) pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+			// Issue #7853: Keep the preflight in the set until the submission completes
+			// or is aborted, so that a terminal abort can still cancel an accepted preflight.
+			// Delete only happens after submission completes or abort successfully cancels it.
+			void submission?.then(
+				() => {
+					requesterPreflights.delete(cancelPreflight);
+					if (requesterPreflights.size === 0)
+						pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+				},
+				() => {
+					requesterPreflights.delete(cancelPreflight);
+					if (requesterPreflights.size === 0)
+						pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+				},
+			);
 		}
 	};
 	const terminalAbort = async (

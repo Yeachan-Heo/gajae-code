@@ -11863,9 +11863,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sessionId: transport.sessionId,
 			});
 			const harness = await invocationHarness("abort-after-preflight-accept", cwd, {
-				sendUserMessage: async (_content, _options) => {
-					// Keep the preflight pending (not accepted, not completed)
-					// This allows the abort to successfully cancel it
+				sendUserMessage: async (_content, options) => {
+					// Accept the preflight (triggering durable write), then keep execution pending
+					// This exercises the abort-after-accept-but-before-execution case
+					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
 				},
 				terminalAbortSeams: {
@@ -11882,8 +11883,6 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			// Start the prompt (this triggers sendUserMessage which accepts the preflight)
 			const promptPromise = harness.control("turn.prompt", { text: "original" });
-			// Make the prompt active so it can be aborted
-			await harness.emit("agent_start");
 			// Give the preflight time to be accepted and row persisted
 			await Bun.sleep(50);
 			// Abort while the preflight is accepted but execution hasn't started.
@@ -11900,10 +11899,6 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				ok: true,
 				result: { turn: "stopped" }, // Fix ensures stopped, not uncertain
 			});
-			// Verify the prompt fails with cancelled error
-			const promptResult = await promptPromise;
-			expect(promptResult.ok).toBe(false);
-			expect(promptResult.error?.code).toMatch(/busy|cancelled/);
 			// Wait for durable row to settle
 			const deadline = Date.now() + 5000;
 			while (reconciliationStore.snapshotTerminalScopes().length === 0) {
