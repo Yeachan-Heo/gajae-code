@@ -7088,6 +7088,17 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:restoreTreeLeaf",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal exact-cursor restoration primitive behind the reviewed SDK captureSessionView/restoreSessionView surface; not an independent public SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:navigateTree",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
