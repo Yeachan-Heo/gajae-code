@@ -15,6 +15,8 @@ import {
 import { PUBLIC_PACKAGE_DEFINITIONS, type PackageEvidenceRecord } from "./release-evidence";
 import {
 	assertAtomicPushRemoteState,
+	BACKMERGE_RECOVERY_WORKTREE,
+	backmergeRecoverySteps,
 	classifyStableReleaseFinalizationReceipt,
 	isStableReleaseVersion,
 	parseReleaseCli,
@@ -512,8 +514,10 @@ describe("immutable stable release contracts", () => {
 		expect(releaseScript).toContain("Cannot parse CI run query");
 		expect(releaseScript).toContain("headSha");
 		expect(releaseScript).toContain("await watchCI(`v${version}`)");
-		expect(releaseScript).toContain("git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}");
-		expect(releaseScript).not.toContain("git -C /tmp/gjc-backmerge merge origin/main");
+		expect(releaseScript).toContain("backmergeRecoverySteps(version)");
+		const recovery = backmergeRecoverySteps("0.18.7").map(step => step.argv.join(" "));
+		expect(recovery).toContain(`-C ${BACKMERGE_RECOVERY_WORKTREE} merge refs/remotes/origin/tags/v0.18.7`);
+		expect(recovery.some(command => command.includes("merge origin/main"))).toBe(false);
 		expect(assertionIndex).toBeGreaterThan(-1);
 		expect(assertionIndex).toBeLessThan(commitIndex);
 	});

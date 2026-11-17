@@ -5,6 +5,8 @@ import * as path from "node:path";
 import {
 	BACKMERGE_CONFLICT_PATH,
 	type BackmergePullRequest,
+	BACKMERGE_RECOVERY_WORKTREE,
+	backmergeRecoverySteps,
 	backmergeReleaseIntoDev,
 	classifyBackmergePushFailure,
 	resolveDiagnosticArtifactBackmerge,
@@ -155,6 +157,50 @@ async function backmergeFixture(options: { releaseManifest?: string; secondConfl
 	await git(work, "push", "origin", "main", "--tags");
 	return { origin, work };
 }
+
+describe("manual backmerge recovery recipe", () => {
+	test("the printed recipe publishes the merge, not the pre-merge dev commit", async () => {
+		const { origin, work } = await backmergeFixture();
+		const worktree = path.join(path.dirname(work), "recovery");
+		const devTip = (await git(origin, "rev-parse", "dev")).trim();
+		const releaseCommit = (await git(origin, "rev-parse", "v0.18.7^{commit}")).trim();
+
+		const steps = backmergeRecoverySteps("0.18.7", worktree);
+		const mergeIndex = steps.findIndex(step => step.argv.includes("merge"));
+		expect(mergeIndex).toBeGreaterThan(-1);
+		for (const [index, step] of steps.entries()) {
+			const result = await gitCommand(work, step.argv);
+			if (index === mergeIndex) {
+				// The recipe exists because this merge conflicts on the build-digest manifest.
+				expect(result.exitCode).not.toBe(0);
+				expect(`${result.stdout}${result.stderr}`).toContain(BACKMERGE_CONFLICT_PATH);
+				continue;
+			}
+			expect(result.exitCode).toBe(0);
+		}
+
+		// The branch the recipe pushes is the merge itself, with dev's tip and the release
+		// commit as parents. A recipe that resolves and pushes without completing the merge
+		// would publish dev's pre-merge commit instead, which this rejects.
+		const branch = "backmerge/0.18.7";
+		const tip = (await git(origin, "rev-list", "--parents", "-n", "1", branch)).trim().split(" ");
+		expect(tip).toHaveLength(3);
+		expect(tip[1]).toBe(devTip);
+		expect(tip[2]).toBe(releaseCommit);
+		// The conflict resolution is the released manifest, byte for byte.
+		expect(await git(origin, "show", `${branch}:${BACKMERGE_CONFLICT_PATH}`)).toBe(manifest("0.18.7", "main-digest"));
+	});
+
+	test("prints the completion step between the resolution and the push", () => {
+		const commands = backmergeRecoverySteps("0.18.7", BACKMERGE_RECOVERY_WORKTREE).map(step => `git ${step.argv.join(" ")}`);
+		const resolve = commands.findIndex(command => command.includes(`checkout refs/remotes/origin/tags/v0.18.7 -- ${BACKMERGE_CONFLICT_PATH}`));
+		const complete = commands.findIndex(command => command.endsWith("commit --no-edit"));
+		const push = commands.findIndex(command => command.includes("push origin HEAD:refs/heads/backmerge/0.18.7"));
+		expect(resolve).toBeGreaterThan(-1);
+		expect(complete).toBe(resolve + 1);
+		expect(push).toBe(complete + 1);
+	});
+});
 
 describe("backmerge orchestration", () => {
 	test("pushes the resolved merge to backmerge/<version> and opens a PR instead of touching dev", async () => {

@@ -919,16 +919,9 @@ async function cmdRelease(version: string): Promise<void> {
 	if (backmerge.action === "blocked") {
 		console.error(`  Backmerge blocked: ${backmerge.detail}`);
 		console.error(`  v${version} is already published; sync dev by hand:`);
-		console.error(
-			`    git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev +refs/tags/v${version}:refs/remotes/origin/tags/v${version} && git worktree add /tmp/gjc-backmerge origin/dev`,
-		);
-		console.error(
-			`    git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}`,
-		);
-		console.error(
-			`    git -C /tmp/gjc-backmerge checkout refs/remotes/origin/tags/v${version} -- ${BACKMERGE_CONFLICT_PATH}   # take the tag's manifest wholesale: its version and its artifacts, never dev's digests`,
-		);
-		console.error(`    git -C /tmp/gjc-backmerge push origin HEAD:refs/heads/backmerge/${version}`);
+		for (const step of backmergeRecoverySteps(version)) {
+			console.error(`    git ${step.argv.join(" ")}${step.note === undefined ? "" : `   # ${step.note}`}`);
+		}
 		console.error(`    gh pr create --head backmerge/${version} --base dev --title "chore(release): backmerge v${version} into dev"`);
 	} else {
 		console.log(`  ${backmerge.action}: ${backmerge.detail}`);
@@ -975,6 +968,54 @@ async function cmdRelease(version: string): Promise<void> {
  * branches carry a different build of the same file.
  */
 export const BACKMERGE_CONFLICT_PATH = "packages/natives/native/diagnostic-artifact.json";
+
+/** Directory the printed manual backmerge recipe works in. */
+export const BACKMERGE_RECOVERY_WORKTREE = "/tmp/gjc-backmerge";
+
+export interface BackmergeRecoveryStep {
+	/** `git` argv, run from the repository root. */
+	argv: string[];
+	/** Why the step exists, printed to the right of the command. */
+	note?: string;
+}
+
+/**
+ * The manual recovery sequence for a blocked backmerge, in the order a human runs it.
+ *
+ * Printed as instructions and driven directly by the recovery test, so the recipe a
+ * maintainer reads is exactly the sequence that test proves completes the merge. The
+ * checkout stages the resolution of the one known conflict; on its own it leaves `HEAD`
+ * at pre-merge `dev`, so the commit that closes the merge is a separate step and the
+ * push only ever publishes a real merge commit.
+ */
+export function backmergeRecoverySteps(
+	version: string,
+	worktree = BACKMERGE_RECOVERY_WORKTREE,
+): BackmergeRecoveryStep[] {
+	const tag = `refs/remotes/origin/tags/v${version}`;
+	return [
+		{
+			argv: [
+				"fetch",
+				"origin",
+				"+refs/heads/main:refs/remotes/origin/main",
+				"+refs/heads/dev:refs/remotes/origin/dev",
+				`+refs/tags/v${version}:${tag}`,
+			],
+		},
+		{ argv: ["worktree", "add", worktree, "origin/dev"] },
+		{ argv: ["-C", worktree, "merge", tag] },
+		{
+			argv: ["-C", worktree, "checkout", tag, "--", BACKMERGE_CONFLICT_PATH],
+			note: "take the tag's manifest wholesale: its version and its artifacts, never dev's digests",
+		},
+		{
+			argv: ["-C", worktree, "commit", "--no-edit"],
+			note: "completes the merge: the checkout only staged the resolution, so without this commit HEAD is still pre-merge dev and the push below would publish a branch that is not the merge",
+		},
+		{ argv: ["-C", worktree, "push", "origin", `HEAD:refs/heads/backmerge/${version}`] },
+	];
+}
 
 /** Attempts allowed before giving up on a `dev` that keeps moving under the merge. */
 const BACKMERGE_PUSH_ATTEMPTS = 3;
