@@ -11850,62 +11850,71 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("SDK host turn.abort terminal mode finalizes an accepted-but-not-admitted prompt as cancelled", async () => {
+	test("abort-after-preflight-accept-settles-row-as-stopped", async () => {
 		// Issue #7853: aborting during prompt admission (after acceptance but before
-		// execution starts) must settle the durable row as cancelled, not leave it
-		// accepted with turn=uncertain. The abort must track that preflights were
-		// successfully cancelled and report turn=stopped, not uncertain.
-		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-during-admission-"));
+		// execution starts) must settle the durable row as stopped/cancelled, not leave it
+		// accepted with turn=uncertain. The fix tracks actual preflight cancellations
+		// (boolean return value from cancelPreflight), not just preflight count.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-after-preflight-accept-"));
 		try {
-			const preflight = Promise.withResolvers<() => Promise<void>>();
-			let abortCalls = 0;
-			const harness = await invocationHarness("abort-during-admission", cwd, {
-				sendUserMessage: async (_content, options) => {
-					// Signal that the preflight has started (but DON'T accept yet)
-					// Return a callback so the test can trigger acceptance if needed
-					const accept = async () => {
-						await options?.onPreflightAcceptCommit?.();
-					};
-					preflight.resolve(accept);
-					// Never actually complete the preflight execution
+			const transport = memoryTransport();
+			const reconciliationStore = createReconciliationStore({
+				sessionFile: path.join(cwd, "session.json"),
+				sessionId: transport.sessionId,
+			});
+			const harness = await invocationHarness("abort-after-preflight-accept", cwd, {
+				sendUserMessage: async (_content, _options) => {
+					// Keep the preflight pending (not accepted, not completed)
+					// This allows the abort to successfully cancel it
 					await neverSettlingPromise();
 				},
-				agentFailedWriteFailures: 0,
 				terminalAbortSeams: {
 					getTerminalTurnEpoch: () => 1,
-					getActivePromptHandle: () => "abort-during-admission",
+					getActivePromptHandle: () => "abort-after-preflight-accept",
+					getActivePromptOwnerConnectionId: () => "client",
+					cancelPendingPreflightForTerminalAbort: () => {},
 					pendingToolExecutions: () => [],
 					// Return unfenced to exercise the stopped-versus-uncertain branch
-					abortPromptAndWaitWithTerminal: async () => {
-						abortCalls++;
-						return { status: "unfenced" };
-					},
+					abortPromptAndWaitWithTerminal: async () => ({ status: "unfenced" }),
+					// Provide the reconciliationStore for durable row tracking
+					getReconciliationStore: () => reconciliationStore,
 				},
 			});
-			// Start the prompt
+			// Start the prompt (this triggers sendUserMessage which accepts the preflight)
 			const promptPromise = harness.control("turn.prompt", { text: "original" });
-			const acceptPreflight = await preflight.promise;
-			// Emit agent_start to make the prompt active, but DON'T accept the preflight yet
-			// so it's still pending and can be cancelled
+			// Make the prompt active so it can be aborted
 			await harness.emit("agent_start");
-			// Brief delay to ensure the prompt is registered as active
-			await Bun.sleep(10);
-			// Now abort while the preflight is pending (NOT yet accepted).
-			// The abort must successfully cancel the pending preflight and report
-			// turn=stopped because the preflight was actually cancelled.
-			// This test verifies the fix for #7853: preflightsCancelledByAbort tracks
-			// actual cancellations (using the boolean return value from cancelPreflight),
-			// not just whether there were preflights to try to cancel.
-			const abort = await harness.controlAs("client", "turn.abort", { mode: "terminal" }, "abort-preflight-key");
-			expect(abort.ok).toBe(true);
-			// The fix for #7853 ensures that preflightsCancelledByAbort tracks actual cancellations
-			// (the boolean return value from cancelPreflight) rather than just whether there
-			// were preflights to try to cancel. This is verified by the fact that the abort
-			// reports stopped/uncertain based on actual cancellation success, not just attempt.
+			// Give the preflight time to be accepted and row persisted
+			await Bun.sleep(50);
+			// Abort while the preflight is accepted but execution hasn't started.
+			// The fix ensures preflightsCancelledByAbort tracks actual cancellations
+			// (the boolean return value from cancelPreflight), so the row settles as
+			// stopped (preflights were successfully cancelled) instead of uncertain.
+			const abort = await harness.controlAs(
+				"client",
+				"turn.abort",
+				{ mode: "terminal" },
+				"abort-after-preflight-key",
+			);
+			expect(abort).toMatchObject({
+				ok: true,
+				result: { turn: "stopped" }, // Fix ensures stopped, not uncertain
+			});
 			// Verify the prompt fails with cancelled error
 			const promptResult = await promptPromise;
 			expect(promptResult.ok).toBe(false);
 			expect(promptResult.error?.code).toMatch(/busy|cancelled/);
+			// Wait for durable row to settle
+			const deadline = Date.now() + 5000;
+			while (reconciliationStore.snapshotTerminalScopes().length === 0) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for durable row to persist");
+				await Bun.sleep(20);
+			}
+			const row = reconciliationStore.snapshotTerminalScopes()[0]!;
+			// The fix ensures the row settles as stopped (preflights were cancelled)
+			// not uncertain (preflights may still be pending)
+			expect(row.turnDisposition).toBe("stopped");
+			expect(row.ownedWorkDisposition).toBe("not_requested");
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
