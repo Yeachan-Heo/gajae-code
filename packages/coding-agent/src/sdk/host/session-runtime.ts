@@ -4226,9 +4226,11 @@ function createControlSurface(
 			// of this abort — only the callbacks present when it was admitted are
 			// its to cancel, mirroring the full-bus capture (review thread P1).
 			const admittedRequesterPreflights = new Set(requesterPreflights ?? []);
+			let preflightsCancelledByAbort = false;
 			const cancelRequesterPreflights = () => {
 				for (const cancel of [...admittedRequesterPreflights]) cancel();
 				if (admittedRequesterPreflights.size > 0) {
+					preflightsCancelledByAbort = true;
 					// Remove the admitted callbacks from the live set so a preflight
 					// added by a LATER submission is untouched by this abort (and the
 					// bucket cleanup below reflects what actually remains).
@@ -4570,16 +4572,23 @@ function createControlSurface(
 			steeringSnapshotConsumed = proof.status === "settled";
 			if (proof.status !== "settled" || proof.terminalScope === undefined) {
 				removeTerminalPublicationWaiter();
+				// Issue #7853: if preflights were successfully cancelled, the prompt never
+				// actually started execution, so the abort is effective. Settle as stopped
+				// instead of uncertain.
+				const turnValue = preflightsCancelledByAbort ? "stopped" : "uncertain";
+				const reason = preflightsCancelledByAbort ? "preflight_cancelled" : "worker_unsettled";
 				const result = {
 					ok: true,
 					selection: scope,
-					turn: "uncertain",
-					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					turn: turnValue,
+					ownedWork: scope === "turn" ? "left_running" : preflightsCancelledByAbort ? "stopped" : "uncertain",
 					automaticDelivery: scope === "turn" ? "enabled" : "none",
 					resumeOnOwnedCompletion: scope === "turn",
-					reason: "worker_unsettled",
+					reason,
 				};
-				const workerUnsettledPayloadHash = hashResult(result);
+				const payloadHash = hashResult(result);
+				const turnDisposition = preflightsCancelledByAbort ? "stopped" : "uncertain";
+				const ownedWorkDisposition = preflightsCancelledByAbort ? "not_requested" : "uncertain";
 				await transactBoundedTerminalScopes(scopes =>
 					scopes.map(record =>
 						(keyHash
@@ -4588,10 +4597,10 @@ function createControlSurface(
 						record.turnDisposition === "pending"
 							? {
 									...record,
-									turnDisposition: "uncertain",
-									ownedWorkDisposition: "uncertain",
-									responsePayloadHash: workerUnsettledPayloadHash,
-									replayPayloadHash: replayShapedHash(record, result, workerUnsettledPayloadHash),
+									turnDisposition,
+									ownedWorkDisposition,
+									responsePayloadHash: payloadHash,
+									replayPayloadHash: replayShapedHash(record, result, payloadHash),
 									terminalAt: Date.now(),
 								}
 							: record,

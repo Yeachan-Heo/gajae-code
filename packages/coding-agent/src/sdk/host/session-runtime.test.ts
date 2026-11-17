@@ -11850,6 +11850,52 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("SDK host turn.abort terminal mode finalizes an accepted-but-not-admitted prompt as cancelled", async () => {
+		// Issue #7853: aborting during prompt admission (after acceptance but before
+		// execution starts) must settle the durable row as cancelled, not leave it
+		// accepted with turn=uncertain.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-during-admission-"));
+		try {
+			const admissionStarted = Promise.withResolvers<void>();
+			const releaseAdmission = Promise.withResolvers<void>();
+			const harness = await invocationHarness("abort-during-admission", cwd, {
+				sendUserMessage: async (_content, options) => {
+					// Signal that preflight started, but don't complete it yet
+					admissionStarted.resolve();
+					// Wait for release signal before accepting or starting
+					await releaseAdmission.promise;
+					// Never actually complete the preflight
+					await neverSettlingPromise();
+				},
+			});
+			const original = await harness.control("turn.prompt", { text: "original" });
+			expect(original.ok).toBe(true);
+			const originalIds = {
+				commandId: original.result?.commandId,
+				turnId: original.result?.turnId,
+			};
+			// Wait for admission to start
+			await admissionStarted.promise;
+			// Now abort while still in admission phase (before execution starts)
+			const abort = await harness.control("turn.abort", { mode: "terminal" });
+			expect(abort.ok).toBe(true);
+			// Should report stopped, NOT uncertain
+			expect(abort.result).toMatchObject({
+				selection: "turn",
+				turn: "stopped",
+			});
+			// Verify the durable row is settled, not uncertain
+			const status = await harness.query("turn.prompt_status", originalIds);
+			expect(status.result?.status).not.toBe("uncertain");
+			// Should NOT be in uncertain/accepted state
+			expect(status.result?.status).not.toBe("accepted");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("abort_and_prompt with no started turn keeps both correlations recoverable", async () => {
 		// The issue observed both the original turn.prompt AND the replacement
 		// turn.abort_and_prompt accepted with permanently zero activity. Neither
