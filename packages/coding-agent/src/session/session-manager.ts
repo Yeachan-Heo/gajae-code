@@ -12917,13 +12917,12 @@ export class SessionManager {
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
-			if (this.persist && this.#sessionFile && hadSessionFile) {
+			if (this.persist && this.#sessionFile) {
+				// Update the cwd in the header. The append is sufficient; rewriting the transcript
+				// would be a separate transcript-mutating operation outside the scope of the move (#7856).
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
-				await this.#rewriteFile();
-			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
-				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
-				await this.#rewriteFile();
 			} else {
+				// Session not persisted; update header in memory only
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 			}
 		} catch (error) {
@@ -20544,16 +20543,10 @@ export class SessionManager {
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
-		// Allow cwd transition operations during exclusive cwd transitions (#7856), since the transition
-		// provides serialization for relocation-specific mutations (move session, append header patch, etc.).
-		// Other legacy mutations that could modify the shared transcript graph must still refuse.
-		const cwdTransitionAllowedOps = new Set([
-			"move session",
-			"append header patch",
-			"full transcript publication",
-			"rewrite transcript",
-			"persist patches",
-		]);
+		// Allow only the operations that the move itself performs (header/cwd relocation).
+		// Appending header patches and persisting them is necessary for the move; full rewrites
+		// of the transcript are not part of the move and should stay under shared admission (#7856).
+		const cwdTransitionAllowedOps = new Set(["move session", "append header patch", "persist patches"]);
 		if (this.#ownsCwdTransition() && cwdTransitionAllowedOps.has(operation)) return;
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
