@@ -2173,6 +2173,10 @@ function collectInterpreterOneLinerWrites(
 		let sawUnmodeledOption = false;
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
+			// The shell concatenates quoted spans, so `--im'port'=x` reaches Node as a preload
+			// flag, `-"-"` as the terminator, and `''--title` as that option: compare the
+			// dequoted word everywhere the shell's concatenation matters.
+			const flagWord = part.replace(/['"]/g, "");
 			// Module/debugger switches, including bundled -wM, run unscanned code.
 			if (binary === "perl" && /^-[^eEImMd]*[mMd]/.test(part)) {
 				targets.explicitMutation = true;
@@ -2182,9 +2186,6 @@ function collectInterpreterOneLinerWrites(
 			// Node/Bun preload flags load a module the scanner never sees, so fail closed
 			// for every detached, attached, and equals-form spelling.
 			if (/^(?:node|bun)$/.test(binary)) {
-				// The shell concatenates quoted spans, so `--im'port'=x` reaches Node as a
-				// preload flag and `-"-"` as the terminator itself: compare the dequoted word.
-				const flagWord = part.replace(/['"]/g, "");
 				// `--` ends Node/Bun option parsing and the remaining words are the program's
 				// own argv, unless an option this scanner cannot model came first.
 				if (flagWord === "--" && !sawUnmodeledOption) break;
@@ -2209,7 +2210,7 @@ function collectInterpreterOneLinerWrites(
 					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
 				);
 				if (!equalsFormOption) {
-					if (part.startsWith("-")) sawUnmodeledOption = true;
+					if (flagWord.startsWith("-")) sawUnmodeledOption = true;
 					continue;
 				}
 				rawScript = words[index]?.slice(equalsFormOption.length + 1);

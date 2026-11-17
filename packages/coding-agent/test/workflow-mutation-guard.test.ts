@@ -2949,6 +2949,9 @@ describe("bash scanner quoting model", () => {
 			`bun --conditions -- --preload=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
 			`bun --jsx-factory -- --preload=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
 			`node --conditions -- --require=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			// The shell strips the empty quoted prefix, so the option still consumes `--`.
+			`bun ''--title -- --require /tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`bun ""--conditions -- --preload=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
