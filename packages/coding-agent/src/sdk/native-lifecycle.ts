@@ -319,6 +319,21 @@ export function retainNativeRuntimeWork(session: AgentSession, completion: Promi
 	void completion.then(settled, settled);
 }
 
+/**
+ * A dispatch that appended transcript entries leaves this runtime's own published
+ * suffix unproven until something fsyncs it. That is a durability state of work we
+ * wrote, not evidence of a competing writer: `not_ready` already excludes the
+ * unknown/foreign cursor case, which reports `uncertain_cursor` and is never
+ * repaired. One cause-directed repair therefore keeps verification as the fast
+ * path without stranding every later dispatch behind an unproven own suffix.
+ */
+function ownPublishedSuffixNeedsRepair(refused: {
+	readonly reason: NativeRuntimeRefusal["reason"];
+	readonly reconciliation: ReconcileResult;
+}): boolean {
+	return refused.reason === "not_ready" && refused.reconciliation.receipt.durability.state === "unproven";
+}
+
 /** Internal closed-facade adapter; never exposed as a consumer callback API. */
 export async function invokeNativeRuntime<T>(
 	handle: NativeLifecycleHandle,
@@ -339,8 +354,8 @@ export async function invokeNativeRuntime<T>(
 		effectsStarted: false,
 	};
 	let reconciliation: ReconcileResult | undefined;
-	try {
-		const admitted = await serialized(member, async () => {
+	const admit = (mode: "verify" | "repairDurability") =>
+		serialized(member, async () => {
 			const op = binding.pending();
 			if (closeState(member) !== "none_started")
 				return {
@@ -348,24 +363,32 @@ export async function invokeNativeRuntime<T>(
 					reason: "manager_closed" as const,
 					reconciliation: await postReadonly(member, op, "RECON"),
 				};
-			return member.manager!.admitNativeRuntimeEffect(op, routing(member, "RECON", "RETAIN_LIVE"), result => {
-				reconciliation = result;
-				if (!invocationCurrent(invocation) || binding.session.sessionLifecycle.transitioning)
-					throw new NativeRuntimeRefusal("context_mismatch", result);
-				const checkpoint: RuntimeCheckpoint = { invocation, reconciliation: result, active: true };
-				return runtimeInvocation.run(invocation, () =>
-					runtimeCheckpoint.run(checkpoint, () => {
-						try {
-							const completion = Promise.resolve(start());
-							retainNativeRuntimeWork(binding.session, completion);
-							return { completion };
-						} finally {
-							checkpoint.active = false;
-						}
-					}),
-				);
-			});
+			return member.manager!.admitNativeRuntimeEffect(
+				op,
+				routing(member, "RECON", "RETAIN_LIVE"),
+				result => {
+					reconciliation = result;
+					if (!invocationCurrent(invocation) || binding.session.sessionLifecycle.transitioning)
+						throw new NativeRuntimeRefusal("context_mismatch", result);
+					const checkpoint: RuntimeCheckpoint = { invocation, reconciliation: result, active: true };
+					return runtimeInvocation.run(invocation, () =>
+						runtimeCheckpoint.run(checkpoint, () => {
+							try {
+								const completion = Promise.resolve(start());
+								retainNativeRuntimeWork(binding.session, completion);
+								return { completion };
+							} finally {
+								checkpoint.active = false;
+							}
+						}),
+					);
+				},
+				mode,
+			);
 		});
+	try {
+		let admitted = await admit("verify");
+		if (admitted.kind === "refused" && ownPublishedSuffixNeedsRepair(admitted)) admitted = await admit("repairDurability");
 		reconciliation = admitted.reconciliation;
 		if (admitted.kind === "refused") return admitted;
 		return { kind: "applied", value: await admitted.completion, reconciliation: admitted.reconciliation };
