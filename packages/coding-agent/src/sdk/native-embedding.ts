@@ -33,6 +33,9 @@ import {
 	createEmbeddedAgentSession,
 	type EmbeddedAgentSessionOptions,
 	type EmbeddedAgentSessionResult,
+	type EmbeddedRevisionInput,
+	type EmbeddedRevisionOptions,
+	type SdkRevisionResult,
 } from "./embedding";
 import { ExtensionInteractionService } from "./extension-interaction";
 import {
@@ -132,6 +135,33 @@ export interface NativeEmbeddedRuntime {
 	readonly composer: NativeMethods<Pick<SdkComposerObservation, "dispatch">>;
 	readonly diff: NativeMethods<Pick<SdkDiffObservation, "dispatch">>;
 	readonly side: NativeMethods<Pick<SideConversationControls, "control">>;
+	/**
+	 * Transcript and view work the session itself owns. Every entry point here mutates
+	 * the transcript or the execution view, so none may run outside admission.
+	 */
+	readonly session: {
+		readonly revise: (
+			input: EmbeddedRevisionInput,
+			options?: EmbeddedRevisionOptions,
+		) => Promise<NativeInvocationResult<SdkRevisionResult>>;
+		readonly branch: (
+			entryId: string,
+		) => Promise<NativeInvocationResult<{ selectedText: string; cancelled: boolean }>>;
+		readonly refreshCommands: () => Promise<NativeInvocationResult<void>>;
+		readonly refreshModels: (strategy: "online" | "offline") => Promise<NativeInvocationResult<void>>;
+	} & NativeMethods<
+		Pick<
+			AgentSession,
+			| "setSessionName"
+			| "setActiveToolsByName"
+			| "setThinkingLevelForControl"
+			| "reloadSkills"
+			| "compact"
+			| "retry"
+			| "generateAutoSessionTitle"
+			| "exportToHtml"
+		>
+	>;
 }
 
 export type NativeEmbeddedOpenResult =
@@ -605,6 +635,23 @@ function createNativeEmbeddedRuntime(
 		side: Object.freeze({
 			control: (...args) =>
 				invokeNativeRuntime(handle, "side", () => getSessionClientControls(session).side.control(...args)),
+		}),
+		session: Object.freeze({
+			revise: (input, options) => invokeNativeRuntime(handle, "session", () => result.revise(input, options)),
+			branch: entryId => invokeNativeRuntime(handle, "session", () => result.branch(entryId)),
+			refreshCommands: () => invokeNativeRuntime(handle, "session", () => result.refreshCommands()),
+			refreshModels: strategy => invokeNativeRuntime(handle, "session", () => result.refreshModels(strategy)),
+			setSessionName: (...args) => invokeNativeRuntime(handle, "session", () => session.setSessionName(...args)),
+			setActiveToolsByName: (...args) =>
+				invokeNativeRuntime(handle, "session", () => session.setActiveToolsByName(...args)),
+			setThinkingLevelForControl: (...args) =>
+				invokeNativeRuntime(handle, "session", () => session.setThinkingLevelForControl(...args)),
+			reloadSkills: (...args) => invokeNativeRuntime(handle, "session", () => session.reloadSkills(...args)),
+			compact: (...args) => invokeNativeRuntime(handle, "session", () => session.compact(...args)),
+			retry: () => invokeNativeRuntime(handle, "session", () => session.retry()),
+			generateAutoSessionTitle: (...args) =>
+				invokeNativeRuntime(handle, "session", () => session.generateAutoSessionTitle(...args)),
+			exportToHtml: (...args) => invokeNativeRuntime(handle, "session", () => session.exportToHtml(...args)),
 		}),
 	};
 	return Object.freeze(runtime);
