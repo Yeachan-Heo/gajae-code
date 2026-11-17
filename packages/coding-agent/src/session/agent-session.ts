@@ -11287,6 +11287,46 @@ export class AgentSession {
 				};
 				let injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
 				let details = injection ? { rules: injection.rules.map(rule => rule.name) } : undefined;
+				// In discard mode, pre-extract settled and custom reminders to gather the final rule set
+				// before publication. This ensures the persisted entry contains all rules for reopen reconciliation.
+				let preExtractedSettledRules: Rule[] = [];
+				let preExtractedContent: string[] = [];
+				if (this.#ttsrManager?.getSettings().contextMode === "discard" && injection && details) {
+					const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
+					if (targetAssistantIndex !== -1) {
+						if (this.#ttsrSettledGeneration === generation) {
+							for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
+								for (const rule of rules) {
+									if (!details.rules.includes(rule.name)) {
+										preExtractedSettledRules.push(rule);
+										details.rules.push(rule.name);
+									}
+								}
+								preExtractedContent.push(reminderText);
+							}
+						}
+						for (let i = targetAssistantIndex; i < this.agent.state.messages.length; i++) {
+							const msg = this.agent.state.messages[i];
+							if (msg.role === "custom" && msg.customType === "ttsr-injection") {
+								for (const ruleName of this.#extractTtsrRuleNames(msg.details)) {
+									if (!details.rules.includes(ruleName)) {
+										details.rules.push(ruleName);
+									}
+								}
+								if (msg.content && typeof msg.content === "string") {
+									preExtractedContent.push(msg.content);
+								}
+							}
+						}
+						// Augment injection with extracted content
+						if (preExtractedContent.length > 0) {
+							injection = {
+								...injection,
+								content: injection.content + "\n\n" + preExtractedContent.join("\n\n"),
+							};
+						}
+					}
+				}
 				let publicationFailure: { error: unknown; outcome: SharedAppendFailureOutcome | undefined } | undefined;
 				if (injection && details) {
 					// Persist before any live mutation. A shared session refuses the legacy append,

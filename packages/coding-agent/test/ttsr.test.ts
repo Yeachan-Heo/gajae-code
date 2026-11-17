@@ -1374,11 +1374,11 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			// history to maintain consistency with the shared store. This ensures the reminder
 			// is visible in the session and prevents duplicate interrupts while the rule remains
 			// in the transcript (#7838).
-			expect(
-				target.session.agent.state.messages.some(
-					message => message.role === "custom" && message.customType === "ttsr-injection",
-				),
-			).toBe(true);
+			const injectionMessage = target.session.agent.state.messages.find(
+				message => message.role === "custom" && message.customType === "ttsr-injection",
+			) as any;
+			expect(injectionMessage).toBeDefined();
+			expect(injectionMessage?.details?.rules).toContain("named-exports");
 			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
 			expect(target.modelMessages).toHaveLength(1);
 			expect(target.session.isTtsrAbortPending).toBe(false);
