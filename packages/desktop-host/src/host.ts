@@ -383,11 +383,16 @@ async function admitted<T>(
 	live: SessionCandidate,
 	raw: (sdk: AgentSession) => Promise<T>,
 	viaRuntime: (runtime: NonNullable<SessionCandidate["native"]>["runtime"]) => Promise<NativeInvocationResult<T>>,
+	operation = "mutation",
 ): Promise<T> {
 	if (!live.native) return raw(live.sdk);
+	const sessionId = live.sdk.sessionId;
+	const generation = live.sdk.sessionLifecycle.generation;
 	const result = await viaRuntime(live.native.runtime);
 	if (result.kind !== "applied") {
-		throw new Error(`Native runtime refused: ${result.reason}`);
+		throw new Error(
+			`Native runtime refused: ${result.reason} (${operation}; expected session ${sessionId}, generation ${generation})`,
+		);
 	}
 	return result.value;
 }
@@ -1468,8 +1473,12 @@ export class DesktopHost {
 		// TERM already disposed the native session under registry authorization, so a
 		// second dispose would be refused. Retiring is the whole teardown for that path.
 		if (candidate.native) {
-			if ((await candidate.native.disconnect()).kind !== "disconnected")
-				throw new Error("Native conversation could not be retired");
+			const outcome = await candidate.native.disconnect();
+			if (outcome.kind !== "disconnected") {
+				const detail =
+					outcome.kind === "blocked" ? `${outcome.state}: ${outcome.blockers.join(", ")}` : outcome.error;
+				throw new Error(`Native conversation could not be retired (disconnect; ${detail})`);
+			}
 			let nativeCompletion = this.#cleanupRuns.get(candidate);
 			if (!nativeCompletion) {
 				nativeCompletion = (async () => {
@@ -1618,6 +1627,7 @@ export class DesktopHost {
 					candidate,
 					() => candidate!.factory.branch(entryId),
 					runtime => runtime.session.branch(entryId),
+					"session.branch",
 				);
 				// The SDK may rotate identity even when later cleanup or hooks throw.
 				rememberOwnedFile(candidate.sdk.sessionManager.getSessionFile());
@@ -2736,7 +2746,7 @@ export class DesktopHost {
 			live.titleAbort?.abort();
 			try {
 				this.#cancelQuestions(live);
-				await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort());
+				await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort(), "queue.abort");
 				return await this.#deleteSession(live, metadata);
 			} finally {
 				live.gateMutation = false;
@@ -2760,7 +2770,7 @@ export class DesktopHost {
 			for (const tracked of live.queued.values()) {
 				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			}
-			await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort());
+			await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort(), "queue.abort");
 			this.#publish(live);
 			return null;
 		}
@@ -4027,7 +4037,13 @@ export class DesktopHost {
 		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
 		this.#managed.clear();
 		await attempt(() => this.#cancelQuestions());
-		await Promise.all([...this.#live.values()].map(live => attempt(() => admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort()))));
+		await Promise.all(
+			[...this.#live.values()].map(live =>
+				attempt(() =>
+					admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort(), "queue.abort"),
+				),
+			),
+		);
 		await Promise.allSettled([...this.#tasks]);
 		await Promise.all(
 			[...new Set([...this.#live.values(), ...this.#retiredLive])].map(async live => {

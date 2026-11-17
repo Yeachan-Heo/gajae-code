@@ -279,14 +279,19 @@ export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result
 	const service = new ExtensionInteractionService(manager.getSessionId());
 	const { connectionId } = service.connect();
 	const interaction = Object.freeze({ service, connectionId, ownership: "owned" as const });
-	const setToolUIContext = result.setToolUIContext;
-	result.setToolUIContext = (ui, hasUI) => {
-		if (ui !== service.ui || !hasUI) throw new Error("Native UI must use its registered interaction service");
-		setToolUIContext(ui, hasUI);
-	};
-	result.setToolUIContext(service.ui, true);
+	// Register ownership before UI binding, which is host code and may throw. Startup
+	// failure must still dispose this exact runtime under coordinator authorization.
 	owner.interaction = interaction;
 	owner.coordinator.recordRuntimeStarted({ result, interaction, asyncJobs: owner.options.asyncJobs });
+	const setToolUIContext = result.setToolUIContext;
+	let bound = false;
+	result.setToolUIContext = (ui, hasUI) => {
+		if (ui !== service.ui || !hasUI) throw new Error("Native UI must use its registered interaction service");
+		if (bound) return;
+		setToolUIContext(ui, hasUI);
+		bound = true;
+	};
+	result.setToolUIContext(service.ui, true);
 }
 /** Internal baseline-factory hook; ordinary callers retain their existing cleanup path. */
 export async function nativeEmbeddedStartupFailed(

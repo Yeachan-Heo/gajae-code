@@ -1,0 +1,9 @@
+compaction: 
+  enabled: false
+retry: 
+  enabled: false
+tools: 
+  discoveryMode: "off"
+modelRoles: 
+  default: anthropic/claude-sonnet-4-5
+configSchemaVersion: 2
