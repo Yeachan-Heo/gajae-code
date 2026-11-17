@@ -2810,7 +2810,14 @@ export class SelectorController {
 					providerId,
 					options.credentialsToRemoveAfterLogin,
 				);
-				if (removalResult.kind !== "removed") {
+				// Treat both "removed" (successfully deleted) and "conflict" (already purged)
+				// as successful cleanup. A conflict result means the disabled credentials were
+				// already removed by upsertAuthCredentialForProvider's purgeSupersededDisabledRows
+				// when re-logging into the same account identity, which is the desired state.
+				if (removalResult.kind === "conflict") {
+					// Already purged during upsert (same-account re-login); this is expected
+				} else if (removalResult.kind !== "removed") {
+					// This should never happen, but log it if it does
 					this.ctx.showError(
 						"Warning: Failed to remove old disabled credential after login. You may see duplicate accounts.",
 					);

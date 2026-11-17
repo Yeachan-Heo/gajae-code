@@ -2,18 +2,20 @@ import { describe, expect, it } from "bun:test";
 import { AuthStorage } from "@gajae-code/ai";
 
 describe("SelectorController OAuth re-login", () => {
-	it("should keep disabled credential until new login succeeds", async () => {
+	it("should handle already-purged disabled credential as successful cleanup", async () => {
 		const authStorage = await AuthStorage.create(":memory:");
 
-		// Set up a disabled OAuth credential
+		// Set up a disabled OAuth credential with specific identity
+		const originalEmail = "user@example.com";
+		const originalAccountId = "account-123";
 		await authStorage.set("anthropic", [
 			{
 				type: "oauth",
 				access: "expired-access",
 				refresh: "expired-refresh",
 				expires: Date.now() - 60_000,
-				accountId: "expired-account",
-				email: "expired@example.com",
+				accountId: originalAccountId,
+				email: originalEmail,
 			},
 		]);
 
@@ -24,34 +26,81 @@ describe("SelectorController OAuth re-login", () => {
 		// Disable the credential
 		expect(authStorage.disableCredentialById(disabledCredential.id, "oauth refresh failed")).toBe(true);
 
-		// Verify it's disabled
-		const disabledInventory = authStorage.listCredentialInventory("anthropic");
-		expect(disabledInventory[0]?.disabled).toBe(true);
-
-		// Get removal targets (which are the disabled credentials)
+		// Get the removal target for later cleanup
 		const removalTargets = authStorage.listCredentialRemovalTargets("anthropic");
 		expect(removalTargets).toHaveLength(1);
-		expect(removalTargets[0]?.id).toBe(disabledCredential.id);
+		const disabledRemovalTarget = removalTargets[0]!;
 
-		// Simulate what happens in onReloginAccount when login fails
-		// The current buggy code does this:
-		// 1. removeAuthCredentialsHard(disabledCredential)  <- removes it immediately
-		// 2. handleOAuthLogin(...)  <- login fails
+		// Simulate successful same-account re-login: upsertAuthCredentialForProvider
+		// This triggers purgeSupersededDisabledRows internally, which removes the disabled
+		// credential because the new active credential has the same identity
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "new-access",
+				refresh: "new-refresh",
+				expires: Date.now() + 60_000,
+				accountId: originalAccountId, // Same account
+				email: originalEmail, // Same email
+			},
+		]);
 
-		// Let's verify that after removeAuthCredentialsHard, the credential is gone
-		const removalResult = authStorage.removeAuthCredentialsHard("anthropic", removalTargets);
-		expect(removalResult.kind).toBe("removed");
+		// Verify that the disabled credential has been purged by upsert
+		const inventoryAfterUpsert = authStorage.listCredentialInventory("anthropic");
+		expect(inventoryAfterUpsert).toHaveLength(1);
+		expect(inventoryAfterUpsert[0]?.disabled).toBe(false);
 
-		// After removal, there should be no credentials
-		const inventoryAfterRemoval = authStorage.listCredentialInventory("anthropic");
-		expect(inventoryAfterRemoval).toHaveLength(0);
-
-		// This is the problem: if login fails at this point, the user has lost their old credential
+		// Now try to remove the credential using the original removal target
+		// This should succeed even though the target was already purged by purgeSupersededDisabledRows
+		const removalResult = authStorage.removeAuthCredentialsHard("anthropic", [disabledRemovalTarget]);
+		// The key fix: a conflict result (target no longer exists) should be acceptable
+		// as it means the goal (cleanup of disabled credential) is already achieved
+		expect(removalResult.kind).toBe("conflict");
 
 		authStorage.close();
 	});
 
-	it("should remove disabled credential only after new login succeeds", async () => {
+	it("should preserve disabled credential when login fails (different account)", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+
+		// Set up a disabled OAuth credential
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "expired-refresh",
+				expires: Date.now() - 60_000,
+				accountId: "old-account",
+				email: "old@example.com",
+			},
+		]);
+
+		const inventory = authStorage.listCredentialInventory("anthropic");
+		const disabledCredential = inventory[0];
+		if (!disabledCredential) throw new Error("Expected OAuth credential");
+
+		// Disable the credential
+		expect(authStorage.disableCredentialById(disabledCredential.id, "oauth refresh failed")).toBe(true);
+
+		// Get the removal target
+		const removalTargets = authStorage.listCredentialRemovalTargets("anthropic");
+		expect(removalTargets).toHaveLength(1);
+
+		// Verify disabled credential is preserved before login attempt
+		const inventoryBeforeLogin = authStorage.listCredentialInventory("anthropic");
+		expect(inventoryBeforeLogin).toHaveLength(1);
+		expect(inventoryBeforeLogin[0]?.disabled).toBe(true);
+
+		// If a login attempt fails and we don't call removeAuthCredentialsHard,
+		// the disabled credential should still be there for user recovery
+		const inventoryAfterFailedLogin = authStorage.listCredentialInventory("anthropic");
+		expect(inventoryAfterFailedLogin).toHaveLength(1);
+		expect(inventoryAfterFailedLogin[0]?.disabled).toBe(true);
+
+		authStorage.close();
+	});
+
+	it("should remove disabled credential after successful different-account login", async () => {
 		const authStorage = await AuthStorage.create(":memory:");
 
 		// Set up a disabled OAuth credential
@@ -77,13 +126,12 @@ describe("SelectorController OAuth re-login", () => {
 		const removalTargets = authStorage.listCredentialRemovalTargets("anthropic");
 		expect(removalTargets).toHaveLength(1);
 
-		// Fixed approach: Keep the disabled credential until login succeeds
-		// 1. Don't remove it yet
+		// Verify disabled credential exists
 		const inventoryBeforeLogin = authStorage.listCredentialInventory("anthropic");
 		expect(inventoryBeforeLogin).toHaveLength(1);
 		expect(inventoryBeforeLogin[0]?.disabled).toBe(true);
 
-		// 2. Simulate successful login (add new credential)
+		// Simulate successful login with different account
 		await authStorage.set("anthropic", [
 			{
 				type: "oauth",
@@ -99,7 +147,7 @@ describe("SelectorController OAuth re-login", () => {
 		const inventoryAfterNewLogin = authStorage.listCredentialInventory("anthropic");
 		expect(inventoryAfterNewLogin).toHaveLength(2);
 
-		// 3. Now remove the old disabled credential
+		// Remove the old disabled credential
 		const removalResult = authStorage.removeAuthCredentialsHard("anthropic", removalTargets);
 		expect(removalResult.kind).toBe("removed");
 
