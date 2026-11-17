@@ -1188,6 +1188,102 @@ describe("shared publication admission split", () => {
 		expect(await Bun.file(successorFile).text()).not.toContain("orphaned output");
 	});
 
+	it("does not publish a deferred result into a transcript adopted while its append was held", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo predecessor", shellResult("predecessor row"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") return await original(message);
+			publications++;
+			if (publications > 1) return await original(message);
+			entered.resolve();
+			await gate.promise;
+			// Durability is unprovable, so admission reconciles and may retry this row.
+			return { kind: "unknown", id: "predecessor-held-entry", error: new Error("transaction release failed") };
+		});
+		vi.spyOn(f.session.agent, "prompt").mockRejectedValue(new Error("stop after the flush"));
+		const flushing = f.session.prompt("flush deferred").catch((error: unknown) => error);
+		await entered.promise;
+
+		const successor = SessionManager.create(f.manager.getCwd(), f.destination);
+		managers.push(successor);
+		successor.appendMessage(user("successor root"));
+		await successor.ensureOnDisk();
+		await successor.flush();
+		const successorFile = successor.getSessionFile();
+		if (!successorFile) throw new Error("missing successor file");
+		await f.manager.setSessionFile(successorFile);
+
+		gate.resolve();
+		const outcome = await flushing;
+		expect(outcome).toBeInstanceOf(Error);
+		expect((outcome as Error).message).toBe("stop after the flush");
+		// Reconciliation runs against the successor now, so its proven-absent answer would have
+		// authorized the retry to append the predecessor row into that transcript.
+		expect(publications).toBe(1);
+		expect(persisted).not.toHaveBeenCalled();
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.flush();
+		expect(await Bun.file(successorFile).text()).not.toContain("predecessor row");
+	});
+
+	it("does not retry a proven-absent row into a transcript adopted during its reconciliation", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo predecessor", shellResult("predecessor row"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const originalAppend = f.manager.appendMessageSharingSession.bind(f.manager);
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") return await originalAppend(message);
+			publications++;
+			if (publications > 1) return await originalAppend(message);
+			return { kind: "unknown", id: "predecessor-absent-entry", error: new Error("transaction release failed") };
+		});
+		const originalReconcile = f.manager.reconcileUnknownSharedAppend.bind(f.manager);
+		const reconciling = Promise.withResolvers<void>();
+		const reconcileGate = Promise.withResolvers<void>();
+		vi.spyOn(f.manager, "reconcileUnknownSharedAppend").mockImplementation(async (entryId, error) => {
+			const outcome = await originalReconcile(entryId, error);
+			reconciling.resolve();
+			await reconcileGate.promise;
+			return outcome;
+		});
+		vi.spyOn(f.session.agent, "prompt").mockRejectedValue(new Error("stop after the flush"));
+		const flushing = f.session.prompt("flush deferred").catch((error: unknown) => error);
+		await reconciling.promise;
+
+		const successor = SessionManager.create(f.manager.getCwd(), f.destination);
+		managers.push(successor);
+		successor.appendMessage(user("successor root"));
+		await successor.ensureOnDisk();
+		await successor.flush();
+		const successorFile = successor.getSessionFile();
+		if (!successorFile) throw new Error("missing successor file");
+		await f.manager.setSessionFile(successorFile);
+
+		reconcileGate.resolve();
+		const outcome = await flushing;
+		expect(outcome).toBeInstanceOf(Error);
+		expect((outcome as Error).message).toBe("stop after the flush");
+		// The reconciliation read the predecessor and proved the row absent there; that answer
+		// cannot authorize an append into the transcript that replaced it.
+		expect(publications).toBe(1);
+		expect(persisted).not.toHaveBeenCalled();
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.flush();
+		expect(await Bun.file(successorFile).text()).not.toContain("predecessor row");
+	});
+
 	it("keeps the rest of a spliced batch when the same transcript is relocated", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
@@ -1289,6 +1385,108 @@ describe("shared publication admission split", () => {
 		snapshot.mockRestore();
 	});
 
+	it("reports a retained unresolved result once and keeps a second undecided outcome queued", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo undecided", shellResult("undecided output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		// Every attempt leaves an unprovable outcome and every reconciliation read fails, so
+		// neither admission can decide the row.
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") throw new Error("unexpected publication");
+			publications++;
+			return { kind: "unknown", id: `undecided-${publications}`, error: new Error("transaction release failed") };
+		});
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockRejectedValue(new Error("transcript read failed"));
+		const notice = vi.spyOn(f.session, "emitNotice");
+		const uncertaintyNotices = () =>
+			notice.mock.calls.filter(([level, , source]) => level === "warning" && source === "session-publication");
+		vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
+
+		await expect(f.session.prompt("first flush")).rejects.toThrow(
+			/Could not confirm persistence of 1 of 1 deferred bash/,
+		);
+		expect(uncertaintyNotices()).toHaveLength(1);
+		expect(f.session.hasPendingBashMessages).toBe(true);
+		expect(persisted).not.toHaveBeenCalled();
+
+		// The retained row is re-read, never resubmitted; the second undecided outcome stays
+		// queued and the operator is not told the same thing twice.
+		await expect(f.session.prompt("second flush")).rejects.toThrow(
+			/Could not confirm persistence of 1 of 1 deferred bash/,
+		);
+		expect(uncertaintyNotices()).toHaveLength(1);
+		expect(publications).toBe(1);
+		expect(f.session.hasPendingBashMessages).toBe(true);
+		expect(persisted).not.toHaveBeenCalled();
+	});
+
+	it("bounds a retained admission to two appends and three reconciliations", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo bounded", shellResult("bounded output"));
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const trace: Array<"append" | "reconcile"> = [];
+		const append = f.manager.appendMessageSharingSession.bind(f.manager);
+		let appends = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") return await append(message);
+			appends++;
+			trace.push("append");
+			return { kind: "unknown", id: `bounded-${appends}`, error: new Error("transaction release failed") };
+		});
+		const reconcile = f.manager.reconcileUnknownSharedAppend.bind(f.manager);
+		vi.spyOn(f.manager, "reconcileUnknownSharedAppend").mockImplementation(async (entryId, error) => {
+			trace.push("reconcile");
+			return await reconcile(entryId, error);
+		});
+		// Only the first reconciliation fails, so the first admission cannot decide the row while
+		// the later ones run with working reads.
+		let failReads = true;
+		const snapshot = f.manager.captureCommittedSnapshot.bind(f.manager);
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
+			if (failReads) throw new Error("transcript read failed");
+			return await snapshot();
+		});
+		vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
+
+		await expect(f.session.prompt("first flush")).rejects.toThrow(/Could not confirm persistence of 1 of 1/);
+		expect(appends).toBe(1);
+		expect(f.session.hasPendingBashMessages).toBe(true);
+
+		// With working reads the retained row is re-read, then spends the admission budget: two
+		// appends and two reconciliations after that read, the last one proving the final attempt
+		// absent so the row is refused instead of left undecided.
+		failReads = false;
+		await expect(f.session.prompt("second flush")).rejects.toThrow(/Failed to persist 1 of 1 deferred bash/);
+
+		// A drain admission opens with an append (fresh row) or with its retained re-read, and
+		// each reconcile is followed by an append or by returning, so two consecutive
+		// reconciliations separate admissions.
+		const admissions: Array<Array<"append" | "reconcile">> = [];
+		for (const op of trace) {
+			const current = admissions.at(-1);
+			if (!current || (op === "reconcile" && current.at(-1) === "reconcile")) admissions.push([op]);
+			else current.push(op);
+		}
+		for (const admission of admissions) {
+			expect(admission.filter(op => op === "append").length).toBeLessThanOrEqual(2);
+			expect(admission.filter(op => op === "reconcile").length).toBeLessThanOrEqual(3);
+		}
+		expect(admissions).toContainEqual(["reconcile", "append", "reconcile", "append", "reconcile"]);
+		expect(f.session.hasPendingBashMessages).toBe(true);
+	});
+
 	it("reconciles a proven-absent append before a publication queued behind it", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
@@ -1311,6 +1509,12 @@ describe("shared publication admission split", () => {
 			queued = f.session.appendModeChangeInBackground("plan");
 			return { kind: "unknown", id: "proven-absent-entry", error: new Error("transaction release failed") };
 		});
+		let reconciliations = 0;
+		const originalReconcile = f.manager.reconcileUnknownSharedAppend.bind(f.manager);
+		vi.spyOn(f.manager, "reconcileUnknownSharedAppend").mockImplementation(async (entryId, error) => {
+			reconciliations++;
+			return await originalReconcile(entryId, error);
+		});
 		// The turn itself is not the subject; stop right after the drain.
 		vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
 
@@ -1319,6 +1523,10 @@ describe("shared publication admission split", () => {
 		// Reconciliation proved the first attempt absent, so the retry ran in the same
 		// admission instead of waiting for a later drain.
 		expect(attempts).toBe(2);
+		// The retry committed, so only the first attempt needed reconciling. The documented bound
+		// for a fresh admission is at most two appends and two reconciliations; the retained-row
+		// bound test reaches the full budget.
+		expect(reconciliations).toBe(1);
 		expect(f.session.hasPendingBashMessages).toBe(false);
 		await f.session.awaitSessionSettlement();
 		await f.manager.flush();

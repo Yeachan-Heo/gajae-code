@@ -674,9 +674,10 @@ type SharedPublicationObstacle =
  *
  * The manager instance alone is not enough: session switches rotate the same manager, and
  * `setSessionFile` can adopt another file that carries the same logical session id. The
- * lineage id is the manager's supported identity for this: a verified same-owner storage
- * relocation of the same transcript preserves it, while adopting another transcript
- * advances it.
+ * lineage value is the manager's monotonic transcript incarnation: a verified same-owner
+ * storage relocation of the same transcript preserves it, while adopting another transcript
+ * advances it. Because it is an incarnation counter and not a derived id/path pair, a
+ * transcript that returns to a path the predecessor wrote cannot compare equal to it.
  */
 interface PublicationOrigin {
 	readonly manager: SessionManager;
@@ -17483,12 +17484,13 @@ export class AgentSession {
 	}
 
 	#isPublicationOriginCurrent(origin: PublicationOrigin): boolean {
-		// The lineage id, not the file path, is the transcript identity: a verified relocation
-		// of the same transcript changes `getSessionFile()` while preserving the lineage, so a
-		// path comparison would classify the manager's own supported relocation as a switch
-		// and drop queued state that still belongs to this transcript. Adopting a different
-		// transcript (including one that carries the same logical session id) advances the
-		// lineage, so a queued publication that survives that adoption is still refused.
+		// The lineage incarnation, not the file path, is the transcript identity: a verified
+		// relocation of the same transcript changes `getSessionFile()` while preserving the
+		// lineage, so a path comparison would classify the manager's own supported relocation as
+		// a switch and drop queued state that still belongs to this transcript. Adopting a
+		// different transcript (including one that carries the same logical session id, or that
+		// lands back on the predecessor's path) advances the incarnation, so a queued
+		// publication that survives that adoption is still refused.
 		return (
 			this.sessionManager === origin.manager &&
 			this.sessionManager.getTranscriptLineageId() === origin.lineageId
@@ -17507,11 +17509,23 @@ export class AgentSession {
 	 * Append, reconciliation, and a retry that reconciliation proved safe share ONE lane
 	 * admission. Releasing the lane between them would let a publication queued behind this
 	 * older row take the lease first, so newer state could reach the transcript before this
-	 * deferred result. Each admission is bounded to two appends and two reconciliations, so
-	 * an undecided row is retained for the next explicit drain instead of looping here.
+	 * deferred result. The bounds are explicit and differ by row state:
+	 *
+	 * - a fresh row: append, reconcile, retry, reconcile — at most two appends and two
+	 *   reconciliations;
+	 * - a retained row: retained-id read, append, reconcile, retry, reconcile — at most two
+	 *   appends and three reconciliations, because the retained re-read is spent before the
+	 *   admission's own budget starts.
+	 *
+	 * Either way the admission is bounded, so an undecided row is retained for the next
+	 * explicit drain instead of looping here.
 	 *
 	 * `retained` re-reads an attempted id from an earlier admission; it is never resubmitted
 	 * unless the transcript proves it absent.
+	 *
+	 * The admission revalidates its publication origin after every manager await, because a
+	 * retained row, an unprovable append, or a proven-absent reconciliation authorizes the
+	 * next step only while the transcript it read is still the one this row was queued for.
 	 */
 	async #persistExecutionMessage(
 		label: string,
@@ -17530,12 +17544,25 @@ export class AgentSession {
 		const alreadyReportedUncertain = retained !== undefined;
 		const result = await this.#trackBackgroundPublication(
 			this.#withCanonicalSchedulingLane(async (): Promise<DeferredPublicationOutcome> => {
-				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				// Every await below hands control back to the manager, and an adoption through
+				// `setSessionFile` or a session switch can commit inside it. The origin must be
+				// re-checked after EACH of those awaits, not only on entry: reconciliation reads
+				// whichever transcript is live when it runs, so a successor's proven-absent answer
+				// would otherwise authorize the retry to append a predecessor row into it.
+				// A verified relocation of the same transcript preserves the lineage, so this never
+				// refuses a publication that still belongs to the transcript it was queued for.
+				const assertOriginIsCurrent = (): void => {
+					if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				};
+				assertOriginIsCurrent();
 				if (retained) {
 					const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(
 						retained.entryId,
 						retained.error,
 					);
+					// Revalidate before the retry this reconcile authorizes: its answer describes the
+					// transcript it read, which is only this row's transcript while the origin holds.
+					assertOriginIsCurrent();
 					if (reconciled.kind === "committed") return { kind: "committed" };
 					if (reconciled.kind === "unresolved")
 						return {
@@ -17548,11 +17575,16 @@ export class AgentSession {
 					// graph, so publishing the row again cannot duplicate it.
 				}
 				const attempt = await this.#appendMessageAtAdmittedCursor(message);
+				// The unsuccessful append of this row produced an unprovable outcome; if the
+				// transcript changed while it ran, the row belongs to the predecessor and neither
+				// its reconciliation nor its retry may touch the successor.
+				assertOriginIsCurrent();
 				if (attempt.kind !== "unknown")
 					return attempt.kind === "committed" ? { kind: "committed" } : { kind: "refused", outcome: attempt };
 				const cause = describeSharedAppendFailure(attempt);
 				const reason = cause.reason ?? cause.outcome;
 				const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(attempt.id, attempt.error);
+				assertOriginIsCurrent();
 				if (reconciled.kind === "committed") return { kind: "committed" };
 				if (reconciled.kind === "unresolved")
 					return { kind: "unresolved", entryId: reconciled.id, reason, error: reconciled.error };
@@ -17560,10 +17592,12 @@ export class AgentSession {
 				// behind this row cannot commit newer state ahead of it. A second undecided outcome
 				// is reconciled and then left to the next explicit drain rather than looping here.
 				const retry = await this.#appendMessageAtAdmittedCursor(message);
+				assertOriginIsCurrent();
 				if (retry.kind !== "unknown")
 					return retry.kind === "committed" ? { kind: "committed" } : { kind: "refused", outcome: retry };
 				const retryCause = describeSharedAppendFailure(retry);
 				const afterRetry = await this.sessionManager.reconcileUnknownSharedAppend(retry.id, retry.error);
+				assertOriginIsCurrent();
 				if (afterRetry.kind === "committed") return { kind: "committed" };
 				if (afterRetry.kind === "unresolved")
 					return {
