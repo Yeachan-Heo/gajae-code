@@ -45,6 +45,11 @@ function dump(messages: AgentMessage[], systemPrompt?: readonly string[]): strin
 	});
 }
 
+/** Value of one rendered `<parameter>`, so a test can bind surviving text to its argument. */
+function parameterValue(dumped: string, name: string): string | undefined {
+	return new RegExp(`<parameter name="${name}">([\\s\\S]*?)</parameter>`).exec(dumped)?.[1];
+}
+
 const pem = (kind: string, edge: "BEGIN" | "END") => ["-----", edge, " ", kind, " PRIVATE", " KEY-----"].join("");
 
 describe("formatSessionDumpText credential scrub", () => {
@@ -161,6 +166,8 @@ describe("formatSessionDumpText credential scrub", () => {
 
 		expect(dumped).toContain("before");
 		expect(dumped).toContain("after");
+		expect(parameterValue(dumped, "first")).toBe("before «redacted-private-key»");
+		expect(parameterValue(dumped, "second")).toBe("«redacted-private-key» after");
 		expect(dumped).toContain("«redacted-private-key»");
 		expect(dumped).not.toContain(firstSecretPart);
 		expect(dumped).not.toContain(secondSecretPart);
@@ -189,6 +196,8 @@ describe("formatSessionDumpText credential scrub", () => {
 		] as AgentMessage[]);
 
 		expect(dumped).toContain("«redacted-private-key»");
+		expect(parameterValue(dumped, "body")).toBe("«redacted-private-key»");
+		expect(parameterValue(dumped, "private_key")).toBe("«redacted»");
 		expect(dumped).not.toContain(body);
 		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
 		expect(dumped).not.toContain(pem("RSA", "END"));
@@ -266,6 +275,109 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"src"');
 	});
 
+	it("keeps header-pair redaction for a known header collection", () => {
+		const secret = "opaque-header-secret";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-headers",
+						name: "http",
+						arguments: { headers: ["X-Api-Key", secret, "Accept", "application/json"] },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain('"X-Api-Key"');
+		expect(dumped).toContain('"application/json"');
+		expect(dumped).not.toContain(secret);
+	});
+
+	it("removes a private-key block split across a nested argument object", () => {
+		const body = "MIIEowIBAAKCAQEAxGZ0002";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-nested-private-key",
+						name: "request",
+						arguments: {
+							payload: { body: `${pem("RSA", "BEGIN")}\n${body}`, private_key: pem("RSA", "END") },
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("masks a schema default object that holds credential-named values", () => {
+		const tokenDefault = "SCHEMA_DEFAULT_SECRET";
+		const nestedDefault = "NESTED_SCHEMA_SECRET";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							config: {
+								type: "object",
+								default: { token: tokenDefault, nested: { password: nestedDefault }, host: "example.com" },
+							},
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain(tokenDefault);
+		expect(dumped).not.toContain(nestedDefault);
+		expect(dumped).toContain('"token": "«redacted»"');
+		expect(dumped).toContain('"host": "example.com"');
+	});
+
+	it("scrubs a schema default that only becomes a token after unescaping", () => {
+		const escaped = "\\u0073k-abcdefghijklmnop";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: { type: "object", properties: { value: { type: "string", default: escaped } } },
+				},
+			],
+		});
+
+		expect(dumped).not.toContain("sk-abcdefghijklmnop");
+		expect(dumped).toContain('"default": "«redacted-api-key»"');
+	});
+
+	it("keeps a container that closes after the scan budget is spent", () => {
+		const filler = "secret={\n".repeat(12);
+		const tail = 'secret={\n  "payload": "OPAQUE_TAIL_SECRET"\n}\nafter';
+		const dumped = dump([{ role: "user", content: `${filler}${tail}`, timestamp: 1 }] as AgentMessage[]);
+
+		expect(dumped).not.toContain("OPAQUE_TAIL_SECRET");
+		expect(dumped).toContain("after");
+	});
+
 	it("bounds unclosed credential containers in the session dump", () => {
 		const line = "secret={unclosed\n";
 		const measure = (lines: number): number => {
@@ -280,6 +392,33 @@ describe("formatSessionDumpText credential scrub", () => {
 		// Rescanning the remaining suffix per unclosed container grows with the square of the input;
 		// a work-bounded scan stays close to linear, so quadrupling the input must not cost 16x.
 		expect(large).toBeLessThan(small * 10 + 2_000);
+	});
+
+	it("removes a private-key block split between a string argument and a nested object argument", () => {
+		const firstSecretPart = "MIIEowIB";
+		const secondSecretPart = "AAKCAQEAxGZ0000";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-mixed-split-private-key",
+						name: "request",
+						arguments: {
+							a: `${pem("RSA", "BEGIN")}\n${firstSecretPart}`,
+							b: { data: `${secondSecretPart}\n${pem("RSA", "END")} after` },
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(parameterValue(dumped, "a")).toBe("«redacted-private-key»");
+		expect(parameterValue(dumped, "b")).toContain("«redacted-private-key» after");
+		expect(dumped).not.toContain(firstSecretPart);
+		expect(dumped).not.toContain(secondSecretPart);
+		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
 	it("keeps an ordinary sentence in the session dump", () => {

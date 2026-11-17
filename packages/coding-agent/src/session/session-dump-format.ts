@@ -7,6 +7,7 @@ import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import {
 	findPrivateKeySpans,
 	isCredentialKey,
+	isHeaderCollectionKey,
 	PRIVATE_KEY_REDACTION_MARKER,
 	type PrivateKeySpan,
 	redactCrashSecrets,
@@ -105,9 +106,9 @@ function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]):
 
 /**
  * Locate private-key blocks that span sibling argument values.
- * Fields are joined in output order without a separator so a banner split
+ * Leaves are joined in serialization order without a separator so a banner split
  * mid-token is still paired, and each block is mapped back to ranges of the
- * original values. Detection happens before any field-level credential masking
+ * original leaves. Detection happens before any field-level credential masking
  * can remove one of the two banners.
  */
 function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][] {
@@ -129,14 +130,48 @@ function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][
 	return spansByValue;
 }
 
+/** Collect every string leaf of a value tree in serialization order. */
+function collectStringLeaves(value: unknown, out: string[]): void {
+	if (typeof value === "string") {
+		out.push(value);
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectStringLeaves(item, out);
+		return;
+	}
+	if (value === null || typeof value !== "object") return;
+	for (const nested of Object.values(value)) collectStringLeaves(nested, out);
+}
+
+/** Apply the spans found for each leaf, in the order `collectStringLeaves` produced them. */
+function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][], cursor: { index: number }): unknown {
+	if (typeof value === "string") return redactPrivateKeyRanges(value, spans[cursor.index++] ?? []);
+	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor));
+	if (value === null || typeof value !== "object") return value;
+	const redacted = Object.create(null) as Record<string, unknown>;
+	for (const [key, nested] of Object.entries(value)) {
+		redacted[key] = applyPrivateKeySpans(nested, spans, cursor);
+	}
+	return redacted;
+}
+
+/** Redact private-key blocks that span sibling argument values, at any nesting depth. */
+function redactCrossFieldPrivateKeys(values: readonly unknown[]): unknown[] {
+	const leaves: string[] = [];
+	for (const value of values) collectStringLeaves(value, leaves);
+	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
+	const cursor = { index: 0 };
+	return values.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
+}
+
 function serializeParameterValue(value: unknown): string {
 	return typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
 }
 
 /** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
-function formatArgumentText(value: unknown, key: string, spans: readonly PrivateKeySpan[]): string {
-	const spanned = typeof value === "string" ? redactPrivateKeyRanges(value, spans) : value;
-	const structured = redactStructuredSecrets(spanned, key, { headerPairs: false });
+function formatArgumentText(value: unknown, key: string): string {
+	const structured = redactStructuredSecrets(value, key, { headerPairs: isHeaderCollectionKey });
 	return escapeXmlText(redactCrashSecrets(decodeUnicodeEscapeText(serializeParameterValue(structured))));
 }
 
@@ -144,14 +179,41 @@ function formatArgumentText(value: unknown, key: string, spans: readonly Private
 const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"]);
 
 /**
+ * Scrub a data value inside a schema (a `default`, `example`, or `const`).
+ * The value is data, not schema structure, so it is decoded before scrubbing and
+ * nested credential-named fields are masked the same way tool arguments are.
+ */
+function scrubSchemaData(value: unknown): unknown {
+	if (typeof value === "string") return redactCrashSecrets(decodeUnicodeEscapeText(value));
+	if (Array.isArray(value)) return value.map(scrubSchemaData);
+	if (value === null || typeof value !== "object") return value;
+	const scrubbed = Object.create(null) as Record<string, unknown>;
+	for (const [key, nested] of Object.entries(value)) {
+		scrubbed[redactCrashSecrets(key)] = isCredentialKey(key) ? "«redacted»" : scrubSchemaData(nested);
+	}
+	return scrubbed;
+}
+
+/** Replace every leaf of a data value with the marker, preserving its shape. */
+function maskSchemaData(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(maskSchemaData);
+	if (value === null || typeof value !== "object") return "«redacted»";
+	const masked = Object.create(null) as Record<string, unknown>;
+	for (const [key, nested] of Object.entries(value)) {
+		masked[redactCrashSecrets(key)] = maskSchemaData(nested);
+	}
+	return masked;
+}
+
+/**
  * Scrub a tool schema without destroying its definitions.
  * Property names are schema structure, not credential assignments, so they stay
- * readable; only string leaves and data-carrying keywords under a credential-named
- * property are redacted. The whole schema is sanitized at once so a property map
- * nested under `properties` keeps its property names as context.
+ * readable; only string leaves and data-carrying keywords are redacted. The whole
+ * schema is sanitized at once so a property map nested under `properties` keeps its
+ * property names as context.
  */
 function redactSchemaValue(value: unknown, propertyName?: string): unknown {
-	if (typeof value === "string") return redactCrashSecrets(value);
+	if (typeof value === "string") return redactCrashSecrets(decodeUnicodeEscapeText(value));
 	if (Array.isArray(value)) return value.map(item => redactSchemaValue(item, propertyName));
 	if (value === null || typeof value !== "object") return value;
 
@@ -161,13 +223,13 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const properties = Object.create(null) as Record<string, unknown>;
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
-				properties[name] = redactSchemaValue(schema, name);
+				properties[redactCrashSecrets(name)] = redactSchemaValue(schema, name);
 			}
 			redacted[field] = properties;
 			continue;
 		}
-		if (propertyName !== undefined && SCHEMA_VALUE_KEYWORDS.has(field) && isCredentialKey(propertyName)) {
-			redacted[field] = Array.isArray(nested) ? nested.map(() => "«redacted»") : "«redacted»";
+		if (propertyName !== undefined && SCHEMA_VALUE_KEYWORDS.has(field)) {
+			redacted[field] = isCredentialKey(propertyName) ? maskSchemaData(nested) : scrubSchemaData(nested);
 			continue;
 		}
 		redacted[field] = redactSchemaValue(nested, propertyName);
@@ -175,9 +237,9 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 	return redacted;
 }
 
-/** Text of one already-sanitized schema value: decoded, then escaped for XML. */
+/** Text of one already-sanitized schema value: escaped for XML. */
 function formatSchemaText(value: unknown): string {
-	return escapeXmlText(decodeUnicodeEscapeText(serializeParameterValue(value)));
+	return escapeXmlText(serializeParameterValue(value));
 }
 
 /**
@@ -193,10 +255,8 @@ function formatArgsAsXml(
 	indent = "\t",
 ): string {
 	const entries = Object.entries(args).filter(([key]) => key !== INTENT_FIELD);
-	const spansByEntry =
-		mode === "arguments"
-			? crossFieldPrivateKeySpans(entries.map(([, value]) => (typeof value === "string" ? value : "")))
-			: undefined;
+	const spannedValues =
+		mode === "arguments" ? redactCrossFieldPrivateKeys(entries.map(([, value]) => value)) : undefined;
 	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
 	const parts: string[] = [];
 	for (let index = 0; index < entries.length; index++) {
@@ -204,7 +264,7 @@ function formatArgsAsXml(
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
 		const text =
 			schema === undefined
-				? formatArgumentText(value, key, spansByEntry?.[index] ?? [])
+				? formatArgumentText(spannedValues?.[index] ?? value, key)
 				: formatSchemaText(schema[key]);
 		if (text.includes("\n")) {
 			const indentedText = text

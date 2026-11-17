@@ -332,15 +332,32 @@ export function isCredentialKey(key: string): boolean {
 	return isCredentialKeyWithRules(key, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
+/** Whether a field name holds a collection of header or cookie name-value pairs. */
+export function isHeaderCollectionKey(key: string | undefined): boolean {
+	return key !== undefined && HEADER_COLLECTION_KEYS.has(key.toLowerCase());
+}
+
+/** Field names whose value is a collection of header or cookie name-value pairs. */
+const HEADER_COLLECTION_KEYS = new Set([
+	"header",
+	"headers",
+	"headerrecords",
+	"header_records",
+	"cookies",
+	"cookie",
+	"setcookie",
+	"set_cookie",
+]);
+
 /** Context the caller established for a value tree. */
 export interface StructuredRedactionOptions {
 	/**
-	 * Treat flat `[name, value, ...]` string arrays as header pairs. Only set this
-	 * where the collection is known to hold header names and values; an ordinary
-	 * argument array such as `["auth", "src"]` is not a header pair, and reading it
-	 * as one would replace an unrelated search target.
+	 * Whether the value under `key` is a flat `[name, value, ...]` string array of
+	 * header pairs. `true` treats every such array as header pairs; a predicate keeps
+	 * the heuristic to the field names that really hold header collections, so an
+	 * ordinary argument array such as `["auth", "src"]` keeps its values.
 	 */
-	readonly headerPairs?: boolean;
+	readonly headerPairs?: boolean | ((key: string | undefined) => boolean);
 }
 
 /**
@@ -351,8 +368,10 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 	if (key !== undefined && isCredentialKey(key)) return "«redacted»";
 	if (typeof value === "string") return redactCrashSecrets(value);
 	if (Array.isArray(value)) {
+		const headerPairs =
+			typeof options?.headerPairs === "function" ? options.headerPairs(key) : options?.headerPairs === true;
 		const isFlatKeyValueArray =
-			options?.headerPairs === true &&
+			headerPairs &&
 			value.length > 0 &&
 			value.length % 2 === 0 &&
 			value.every((item, index) => index % 2 === 1 || typeof item === "string");
@@ -638,10 +657,17 @@ function redactCredentialValue(
  * Lookahead the nested-container scan may spend on one scrub call, in characters.
  * Proportional to the input so ordinary text always receives a complete scan while
  * repeated unterminated containers cannot force a quadratic rescan. Once spent,
- * later containers are bounded to their own line — the treatment an unterminated
- * container already receives.
+ * later containers are bounded to a fixed lookahead that still lets a nearby
+ * closing brace be found.
  */
 const CONTAINER_SCAN_BUDGET_FACTOR = 4;
+
+/**
+ * Characters a container scan may still examine once the shared budget is spent.
+ * A container that closes within this lookahead is still redacted in full, so
+ * pathological input degrades to a bounded scan instead of losing the close.
+ */
+const CONTAINER_SCAN_FLOOR = 1024;
 
 interface ContainerScanBudget {
 	remaining: number;
@@ -663,12 +689,13 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
 
 function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
 	const budget = createContainerScanBudget(text.length);
+	const lineScan: LineEndScan = { from: 0, end: -1 };
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
-		const scan = findCredentialContainerEnd(text, containerStart, budget);
+		const scan = findCredentialContainerEnd(text, containerStart, budget, lineScan);
 		budget.remaining -= scan.scanned;
 		const containerEnd = scan.value;
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
@@ -697,23 +724,46 @@ interface BoundedScan<T> {
 	readonly scanned: number;
 }
 
-function currentLineEnd(text: string, start: number): number {
-	const lineFeedIndex = text.indexOf("\n", start);
-	const carriageReturnIndex = text.indexOf("\r", start);
-	if (lineFeedIndex < 0) return carriageReturnIndex < 0 ? text.length : carriageReturnIndex;
-	return carriageReturnIndex < 0 ? lineFeedIndex : Math.min(lineFeedIndex, carriageReturnIndex);
+/**
+ * Forward-only line-end lookup shared by one container pass.
+ * Each terminator is examined once per pass, so looking up the line for many
+ * containers stays linear instead of rescanning the remaining text per container.
+ */
+interface LineEndScan {
+	/** Position the search resumes from. */
+	from: number;
+	/** Line end found for the last request, or -1 before the first request. */
+	end: number;
+}
+
+function currentLineEnd(text: string, start: number, scan: LineEndScan): number {
+	if (scan.end >= start) return scan.end;
+	const from = Math.max(scan.from, start);
+	const lineFeed = text.indexOf("\n", from);
+	// A lone CR only counts when no LF is left to stop at; CRLF is handled by trimming
+	// the LF, so an LF-only transcript never pays for a second full-suffix search.
+	const terminator =
+		lineFeed >= 0 ? (text[lineFeed - 1] === "\r" ? lineFeed - 1 : lineFeed) : text.indexOf("\r", from);
+	scan.end = terminator >= 0 ? terminator : text.length;
+	scan.from = scan.end + 1;
+	return scan.end;
 }
 
 /**
  * End of the container that opens at `start`.
- * The scan never looks past `start + budget.remaining`; once the budget is spent it
- * stops at the current line, which is also where an unterminated container ends.
+ * The scan never looks past `start + lookahead`; a container that has not closed
+ * there ends at its line, which is also where an unterminated container ends.
  */
-function findCredentialContainerEnd(text: string, start: number, budget: ContainerScanBudget): BoundedScan<number> {
-	// An unterminated container ends at its own line end, and always consumes at least
-	// its opening character so the caller's scan position strictly advances.
-	const unclosedEnd = Math.min(text.length, Math.max(currentLineEnd(text, start), start + 1));
-	const limit = budget.remaining > 0 ? Math.min(text.length, start + budget.remaining) : unclosedEnd;
+function findCredentialContainerEnd(
+	text: string,
+	start: number,
+	budget: ContainerScanBudget,
+	lineScan: LineEndScan,
+): BoundedScan<number> {
+	const limit = Math.min(text.length, start + Math.max(budget.remaining, CONTAINER_SCAN_FLOOR));
+	// An unterminated container always consumes at least its opening character so the
+	// caller's scan position strictly advances.
+	const unclosedEnd = Math.max(Math.min(currentLineEnd(text, start, lineScan), limit), start + 1);
 	const delimiterScan = findEscapedQuoteDelimiter(text, start, limit);
 	const escapedQuoteDelimiter = delimiterScan.value;
 	const closing = [text[start] === "[" ? "]" : "}"];
