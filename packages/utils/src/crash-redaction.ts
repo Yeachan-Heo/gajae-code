@@ -455,7 +455,7 @@ export function redactCrashSecretsV1(text: string): string {
 }
 
 function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules): string {
-	let redacted = redactCredentialContainers(text, rules);
+	let redacted = redactCredentialContainers(text, rules, rules !== V1_CREDENTIAL_REDACTION_RULES);
 	// Block scalar bodies span lines and must be masked before line-bounded rules handle the header.
 	redacted = redactYamlBlockScalars(redacted, rules);
 	redacted = redacted.replace(
@@ -677,22 +677,25 @@ interface ContainerScanBudget {
 	remaining: number;
 }
 
-function createContainerScanBudget(length: number): ContainerScanBudget {
-	return { remaining: length * CONTAINER_SCAN_BUDGET_FACTOR + 1024 };
+function createContainerScanBudget(length: number, bounded: boolean): ContainerScanBudget {
+	// The historical rules only ever see already-persisted crash text, and their output feeds
+	// fingerprint validation, so they keep the unbounded scan they were written against.
+	return { remaining: bounded ? length * CONTAINER_SCAN_BUDGET_FACTOR + 1024 : Number.POSITIVE_INFINITY };
 }
 
-function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
+function redactCredentialContainers(text: string, rules: CredentialRedactionRules, bounded: boolean): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
 	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
 	const camelAssignment = new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g");
 	return redactCredentialContainersWithPattern(
-		redactCredentialContainersWithPattern(text, assignment),
+		redactCredentialContainersWithPattern(text, assignment, bounded),
 		camelAssignment,
+		bounded,
 	);
 }
 
-function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
-	const budget = createContainerScanBudget(text.length);
+function redactCredentialContainersWithPattern(text: string, assignment: RegExp, bounded: boolean): string {
+	const budget = createContainerScanBudget(text.length, bounded);
 	const lineScan = createLineEndScan();
 	let output = "";
 	let copiedUntil = 0;

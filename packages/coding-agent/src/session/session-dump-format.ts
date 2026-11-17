@@ -112,25 +112,35 @@ function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]):
  * can remove one of the two banners.
  */
 function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][] {
+	const spansByValue: PrivateKeySpan[][] = values.map(() => []);
+	// Only the leaves between the first and the last banner can take part, so a lone banner
+	// in one place cannot pull unrelated structure into a span.
+	let first = -1;
+	let last = -1;
+	for (let index = 0; index < values.length; index++) {
+		if (!values[index].includes(PEM_MARKER_HINT)) continue;
+		if (first < 0) first = index;
+		last = index;
+	}
+	if (first < 0 || last === first) return spansByValue;
 	const offsets: number[] = [];
 	let joined = "";
-	for (const value of values) {
+	for (let index = first; index <= last; index++) {
 		offsets.push(joined.length);
-		joined += value;
+		joined += values[index];
 	}
-	const spansByValue: PrivateKeySpan[][] = values.map(() => []);
 	// Spans and leaves are both ordered, so the walk advances one leaf pointer instead of
 	// visiting every leaf for every span.
 	let leaf = 0;
 	for (const span of findPrivateKeySpans(joined)) {
-		while (leaf < values.length && offsets[leaf] + values[leaf].length <= span.start) leaf++;
-		for (let index = leaf; index < values.length; index++) {
+		while (leaf < offsets.length && offsets[leaf] + values[first + leaf].length <= span.start) leaf++;
+		for (let index = leaf; index < offsets.length; index++) {
 			const valueStart = offsets[index];
 			if (valueStart >= span.end) break;
-			const valueEnd = valueStart + values[index].length;
+			const valueEnd = valueStart + values[first + index].length;
 			const start = Math.max(span.start, valueStart) - valueStart;
 			const end = Math.min(span.end, valueEnd) - valueStart;
-			if (end > start) spansByValue[index].push({ start, end });
+			if (end > start) spansByValue[first + index].push({ start, end });
 		}
 	}
 	return spansByValue;
@@ -147,8 +157,15 @@ function collectStringLeaves(value: unknown, out: string[]): void {
 		return;
 	}
 	if (value === null || typeof value !== "object") return;
-	for (const nested of Object.values(value)) collectStringLeaves(nested, out);
+	// Field names take part too: a banner split between a value and a name is still a block.
+	for (const [key, nested] of Object.entries(value)) {
+		out.push(key);
+		collectStringLeaves(nested, out);
+	}
 }
+
+/** Part of both private-key banners; used to pick the leaves that can take part in a span. */
+const PEM_MARKER_HINT = "PRIVATE KEY-----";
 
 /** Apply the spans found for each leaf, in the order `collectStringLeaves` produced them. */
 function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][], cursor: { index: number }): unknown {
@@ -157,6 +174,9 @@ function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][]
 	if (value === null || typeof value !== "object") return value;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	for (const [key, nested] of Object.entries(value)) {
+		// Names locate a block but are never rewritten by it: a scrubbed name would destroy the
+		// argument identity the dump relies on, and a banner on its own is not secret material.
+		cursor.index++;
 		redacted[key] = applyPrivateKeySpans(nested, spans, cursor);
 	}
 	return redacted;
@@ -212,30 +232,6 @@ function scrubSchemaData(value: unknown, propertyName?: string): unknown {
  * Only data keywords take part, so a neighbour's type and description stay intact
  * while an opener in one definition's `default` and a footer in another's are paired.
  */
-function pairSiblingSchemaData(schemas: readonly unknown[]): unknown[] {
-	const owners: number[] = [];
-	const fields: string[] = [];
-	const values: unknown[] = [];
-	schemas.forEach((schema, index) => {
-		if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return;
-		for (const [field, nested] of Object.entries(schema as Record<string, unknown>)) {
-			if (!SCHEMA_VALUE_KEYWORDS.has(field)) continue;
-			owners.push(index);
-			fields.push(field);
-			values.push(nested);
-		}
-	});
-	if (values.length < 2) return [...schemas];
-	const paired = redactCrossFieldPrivateKeys(values);
-	return schemas.map((schema, index) => {
-		if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return schema;
-		const copy = { ...(schema as Record<string, unknown>) };
-		owners.forEach((owner, position) => {
-			if (owner === index) copy[fields[position]] = paired[position];
-		});
-		return copy;
-	});
-}
 
 /** Replace every leaf of a data value with the marker, preserving its shape. */
 function maskSchemaData(value: unknown): unknown {
@@ -276,30 +272,24 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	const scrubbedKeys = new Map<string, number>();
-	// Data-carrying keywords render as separate parameters, so a private-key block is paired
-	// across all of them before any credential-named field inside them is masked.
+	// A schema renders as one section, so a banner split between any two of its values —
+	// including a description and a nested definition — is paired across the whole object
+	// before credential-named fields are masked.
+	const pairedSource = redactCrossFieldPrivateKeys([source])[0] as Record<string, unknown>;
 	const dataFields = Object.keys(source).filter(field => SCHEMA_VALUE_KEYWORDS.has(field));
-	const dataValues =
-		dataFields.length === 0 ? [] : redactCrossFieldPrivateKeys(dataFields.map(field => source[field]));
-	for (const [field, nested] of Object.entries(source)) {
+	for (const [field, nested] of Object.entries(pairedSource)) {
 		const dataIndex = dataFields.indexOf(field);
 		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const properties = Object.create(null) as Record<string, unknown>;
 			const propertyKeys = new Map<string, number>();
-			const entries = Object.entries(nested as Record<string, unknown>);
-			const pairedDefinitions = pairSiblingSchemaData(entries.map(([, schema]) => schema));
-			for (let index = 0; index < entries.length; index++) {
-				const [name] = entries[index];
-				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = redactSchemaValue(
-					pairedDefinitions[index],
-					name,
-				);
+			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
+				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = redactSchemaValue(schema, name);
 			}
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = properties;
 			continue;
 		}
 		if (dataIndex >= 0) {
-			const paired = dataValues[dataIndex];
+			const paired = nested;
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] =
 				propertyName !== undefined && isCredentialKey(propertyName)
 					? maskSchemaData(paired)
@@ -331,17 +321,14 @@ function formatArgsAsXml(
 	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
 	// A scrubbed schema key no longer matches the original argument name, so the schema's own
 	// entries are used once it exists; the scrubbed title is already part of them.
-	const entries = (schema === undefined ? Object.entries(args) : Object.entries(schema)).filter(
-		([key]) => key !== INTENT_FIELD,
-	);
-	const spannedValues =
-		mode === "arguments" ? redactCrossFieldPrivateKeys(entries.map(([, value]) => value)) : undefined;
+	// Arguments are paired over the whole object — names included — and a scrubbed schema name
+	// no longer matches the original argument name, so each mode walks its own entries.
+	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
+	const entries = Object.entries(paired ?? args).filter(([key]) => key !== INTENT_FIELD);
 	const parts: string[] = [];
-	for (let index = 0; index < entries.length; index++) {
-		const [key, value] = entries[index];
+	for (const [key, value] of entries) {
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
-		const text =
-			schema === undefined ? formatArgumentText(spannedValues?.[index] ?? value, key) : formatSchemaText(value);
+		const text = schema === undefined ? formatArgumentText(value, key) : formatSchemaText(value);
 		if (text.includes("\n")) {
 			const indentedText = text
 				.split("\n")
