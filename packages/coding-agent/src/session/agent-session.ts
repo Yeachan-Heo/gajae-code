@@ -17473,10 +17473,15 @@ export class AgentSession {
 	 * The legacy form throws inline as before. The shared form publishes in the background:
 	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
 	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
-	 * `onCommitted` fires only when the entry is durable.
 	 *
-	 * The callback runs after the durable write, so its failure is neither a refusal nor a
-	 * reason to publish again. It is reported through the operator-notice seam and the
+	 * On the shared path `onCommitted` fires only after the entry committed, so it means the
+	 * entry is durable. On the legacy path it fires right after `SessionManager.appendMessage`,
+	 * which only admits the entry: `_persist` deliberately returns before writing a transcript
+	 * until the session is ensured on disk or holds its first assistant entry. A legacy
+	 * callback therefore means "recorded in this session's graph", not "durable after a reload".
+	 *
+	 * On the shared path the callback runs after the durable write, so its failure is neither
+	 * a refusal nor a reason to publish again. It is reported through the operator-notice seam and the
 	 * structured log, and the callback-bearing task is tracked: leaving it unobserved would
 	 * turn a throwing callback into an unhandled rejection after a successful append.
 	 */
@@ -33368,9 +33373,12 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortBash() still cancels all Bash executions.
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
-	 * @param options.onPersisted Called once the execution's message is durable: after the
+	 * @param options.onPersisted Called once the execution's message is persisted: after the
 	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
-	 *   unconfirmed publication never calls it.
+	 *   unconfirmed publication never calls it. Only a shared-transaction session guarantees
+	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
+	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
+	 *   so it does not by itself prove the entry survives a reload.
 	 */
 	async executeBash(
 		command: string,
@@ -33539,9 +33547,12 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortEval() still cancels all Python executions.
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
-	 * @param options.onPersisted Called once the execution's message is durable: after the
+	 * @param options.onPersisted Called once the execution's message is persisted: after the
 	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
-	 *   unconfirmed publication never calls it.
+	 *   unconfirmed publication never calls it. Only a shared-transaction session guarantees
+	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
+	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
+	 *   so it does not by itself prove the entry survives a reload.
 	 */
 	async executePython(
 		code: string,
@@ -33694,7 +33705,8 @@ export class AgentSession {
 			this.agent.appendMessage(pythonMessage);
 			// `onPersisted` is the durability signal: a shared append may be refused or end
 			// with an unknown outcome, and reporting success before the entry is committed
-			// would promise a reload survival that never happened (#7815).
+			// would promise a reload survival that never happened (#7815). A legacy session
+			// has no such guarantee: it fires the callback after the in-memory append.
 			void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
