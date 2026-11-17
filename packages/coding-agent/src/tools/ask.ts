@@ -1024,27 +1024,36 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				);
 			}
 			let result: AgentToolResult<AskToolDetails>;
+			let userAnswered = false;
 			try {
 				// Human-blocked asks must not be settled through remote/programmatic answer
 				// sources; only attended interactive UI is permitted. Mark this context so the
 				// ask handler can enforce it.
 				const humanBlockedContext = { ...context, isHumanBlockedAsk: true };
 				result = await this.#ask(_toolCallId, params, signal, _onUpdate, humanBlockedContext);
+				// Determine if the user provided input (not just timeout or clarification)
+				userAnswered = !(result.details?.timedOut === true || result.details?.clarificationQuestion !== undefined);
 			} catch (error) {
-				// No answer came back, so hand the admission back. If the release cannot
-				// be recorded the durable reservation keeps the admission closed.
-				try {
-					await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
-				} catch (releaseError) {
-					release = false;
-					logger.warn(`ask: releasing the human-blocked ask reservation failed: ${errorMessage(releaseError)}`);
+				// Distinguish between user cancellation and other errors:
+				// - ToolAbortError: user cancelled -> should release
+				// - Other errors: might be recorder failure after user answered -> should NOT release
+				if (error instanceof ToolAbortError) {
+					// User cancelled before or during questioning: hand the admission back
+					try {
+						await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
+					} catch (releaseError) {
+						release = false;
+						logger.warn(`ask: releasing the cancelled human-blocked ask failed: ${errorMessage(releaseError)}`);
+					}
 				}
+				// Either way, propagate the error so the caller knows asking failed
 				throw error;
 			}
-			if (result.details?.timedOut || result.details?.clarificationQuestion !== undefined) {
-				// Neither a timeout auto-selection nor a question about the choices is
-				// the user's answer: hand the admission back so the question can be
-				// asked again.
+
+			// Now we know the result. Determine if we should release or record as answered.
+			if (!userAnswered) {
+				// User didn't provide input (timeout or clarification): hand the admission back
+				// so the question can be asked again.
 				try {
 					await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
 				} catch (error) {
@@ -1053,6 +1062,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				}
 				return result;
 			}
+
+			// User answered: record the answer (even if recording fails, the answer was accepted)
 			try {
 				await recordUltragoalHumanBlockedAskAnswered({ cwd: this.session.cwd, ...receipt });
 			} catch (error) {

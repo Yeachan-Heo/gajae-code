@@ -408,17 +408,11 @@ export async function appendLedger(
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
-	// The activity marker is secondary; a failure to write it does not prevent the
-	// ledger entry from being durable. Failures do not reject the append so the
-	// caller can determine success/failure independently of the marker.
-	try {
-		await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
-	} catch (error) {
-		// Marker write failure is non-fatal; the ledger entry is durable.
-		logger.warn(
-			`ultragoal-runtime: failed to write activity marker after ledger append: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
+	// Write the activity marker to record the ledger update for implicit session resolution.
+	// If the marker write fails, callers that depend on marker freshness (e.g., implicit
+	// pause checks) need to know about it. Settlement paths that only need durable ledger
+	// rows can catch this error themselves if they need best-effort behavior.
+	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 	return entry;
 }
 
@@ -646,6 +640,9 @@ async function appendHumanBlockedAskEvent<T>(
 					// there, report the decision it committed, or the caller would act on
 					// the opposite of the durable state (a reservation it believes it
 					// does not hold, a release it believes was not recorded).
+					// For ask settlement, marker failures are non-fatal: the ledger row is
+					// durable and that is what matters for correctness. Only the marker is
+					// best-effort.
 					const committed = await readUltragoalLedger(cwd, sessionId).then(
 						ledger => ledger.some(row => row.eventId === eventId),
 						() => false,
