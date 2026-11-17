@@ -2958,6 +2958,8 @@ describe("bash scanner quoting model", () => {
 			// Command substitution hides the consuming option behind an opaque word too.
 			"bun `printf '\\055\\055title'` -- --require /tmp/payload.cjs -e 'process.stdout.write(\"status\")'",
 			"bun $(printf '\\055\\055title') -- --require /tmp/payload.cjs -e 'process.stdout.write(\"status\")'",
+			// A glob can expand to a consuming option too (`*` matching a file named `--title`).
+			`bun * -- --require /tmp/payload.cjs -e 'process.stdout.write("status")'`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,

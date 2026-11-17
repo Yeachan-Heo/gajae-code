@@ -2210,10 +2210,10 @@ function collectInterpreterOneLinerWrites(
 					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
 				);
 				if (!equalsFormOption) {
-					// Words the shell still expands or substitutes (`$'...'`, `$(...)`, backticks)
-					// stay opaque here: keep scanning past a later `--` instead of assuming the shell
-					// produced a plain operand.
-					if (flagWord.startsWith("-") || /[$`]/.test(flagWord) || shellWordHasExpansion(part)) {
+					// Words the shell still expands, substitutes, or globs (`$'...'`, `$(...)`,
+					// backticks, `*`, `?`, `[`) stay opaque here: keep scanning past a later `--`
+					// instead of assuming the shell produced a plain operand.
+					if (flagWord.startsWith("-") || /[$`*?[]/.test(flagWord) || shellWordHasExpansion(part)) {
 						sawUnmodeledOption = true;
 					}
 					continue;
