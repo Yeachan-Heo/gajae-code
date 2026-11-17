@@ -16944,6 +16944,10 @@ export class AgentSession {
 		if (this.#planReferenceSent) return null;
 
 		const planFilePath = this.#planReferencePath;
+		// Ensure local protocol is initialized before resolving local:// paths.
+		// Without this, managed destinations with legacy migration sources fail on
+		// synchronous resolution (issue #7815).
+		await initializeLocalRoot(this.#localProtocolOptions());
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, this.#localProtocolOptions());
 		let planContent: string;
 		try {
