@@ -64,13 +64,47 @@ function assistantText(message: AssistantMessage): string {
 		.join("");
 }
 
+/**
+ * Resolve the terminal disposition of a print-mode turn, robustly handling message
+ * compaction that may occur during or after the prompt.
+ *
+ * When compaction occurs during `session.prompt()`, it can remove messages from the
+ * array, making a pre-prompt index stale. This function handles that by using the
+ * turnStartUserMessage (if provided) to find assistant messages for this turn.
+ *
+ * @param messages Current message array (may have been compacted)
+ * @param submittedPrompt Whether a prompt was actually submitted
+ * @param turnStartIndex Index of the first message in this turn (before prompt). May be stale after compaction.
+ * @param turnStartUserMessage The user message that was submitted in this turn. If provided and found in the
+ *   current messages, it's used to find assistant messages that come after it, making lookup robust to compaction.
+ * @returns The terminal disposition, or undefined if no prompt was submitted or a silent abort occurred
+ */
 export function resolvePrintTerminalDisposition(
 	messages: readonly AgentMessage[],
 	submittedPrompt: boolean,
 	turnStartIndex?: number,
+	turnStartUserMessage?: AgentMessage,
 ): PrintTerminalDisposition | undefined {
 	if (!submittedPrompt) return undefined;
-	const turnMessages = turnStartIndex === undefined ? messages : messages.slice(turnStartIndex);
+
+	// Find assistant messages from this turn, handling compaction-induced index staleness.
+	// If turnStartUserMessage is provided, search for it in the current messages array
+	// to find assistant messages that came after it, making the lookup compaction-robust.
+	let startIndex = turnStartIndex ?? 0;
+	if (turnStartUserMessage !== undefined) {
+		// Find the user message in the current array by reference
+		const userMessageIndex = messages.indexOf(turnStartUserMessage);
+		if (userMessageIndex !== -1) {
+			// Search for assistant messages after this user message
+			startIndex = userMessageIndex + 1;
+		} else if (turnStartIndex !== undefined && turnStartIndex < messages.length) {
+			// Fallback: use the provided index if it's still valid
+			startIndex = turnStartIndex;
+		}
+		// If neither condition holds, startIndex defaults to turnStartIndex or 0
+	}
+
+	const turnMessages = messages.slice(startIndex);
 	const lastAssistant = turnMessages.findLast((message): message is AssistantMessage => message.role === "assistant");
 	if (!lastAssistant) return { status: "failure", error: EMPTY_TURN_ERROR };
 	if (
@@ -247,6 +281,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	let consumedCommand = false;
 	let jsonFailureObserved = false;
 	let lastPromptMessageStart: number | undefined;
+	let lastPromptUserMessage: AgentMessage | undefined;
 
 	try {
 		for (const warning of new Set(session.configWarnings)) {
@@ -321,6 +356,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			submittedPrompt = true;
 			lastPromptMessageStart = session.state.messages.length;
 			await session.prompt(text, images ? { images } : undefined);
+			// Capture the user message that was just added, for compaction-robust turn tracking.
+			// Search for a user message after lastPromptMessageStart.
+			for (let i = lastPromptMessageStart; i < session.state.messages.length; i++) {
+				if (session.state.messages[i]?.role === "user") {
+					lastPromptUserMessage = session.state.messages[i];
+					break;
+				}
+			}
 		};
 
 		// Send the initial input and remaining inputs, dispatching only commands
@@ -332,7 +375,12 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			await logger.time("print:prompt:next", () => submitInput(message));
 		}
 
-		const terminal = resolvePrintTerminalDisposition(session.state.messages, submittedPrompt, lastPromptMessageStart);
+		const terminal = resolvePrintTerminalDisposition(
+			session.state.messages,
+			submittedPrompt,
+			lastPromptMessageStart,
+			lastPromptUserMessage,
+		);
 		if (terminal?.status === "failure") {
 			if (!options.suppressProcessExit) process.exitCode = 1;
 			if (mode === "json" && !jsonFailureObserved) {
