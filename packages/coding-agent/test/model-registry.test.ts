@@ -11507,6 +11507,109 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+
+		test("discards discovered models when OAuth account changes during refresh (identity-less credentials)", async () => {
+			// Regression: for credentials without accountId, the original fix only compared accountId,
+			// which is undefined for both account A and B. This meant the check always passed even during
+			// a concurrent account switch. The fix now compares email, accountId, and organizationId to
+			// catch account switches even when accountId is absent.
+			const credentialSessionId = "switch-identity-less-account-test";
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "account-a-expired-access",
+					refresh: "account-a-refresh-token",
+					// Token is expired right now
+					expires: Date.now() - 1000,
+					email: "account-a@example.com",
+					// No accountId, simulating Google OAuth without it
+				},
+				{
+					type: "oauth",
+					access: "account-b-fresh-access",
+					refresh: "account-b-refresh-token",
+					// Token is fresh
+					expires: Date.now() + 60 * 60 * 1000,
+					email: "account-b@example.com",
+					// No accountId for this credential either
+				},
+			]);
+
+			// Pin to account A for this session
+			authStorage.setSessionCredentialSelector(credentialSessionId, "google-antigravity", {
+				kind: "email",
+				value: "account-a@example.com",
+			});
+
+			let discoveryFetches = 0;
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				// Simulate OAuth token refresh for account A
+				await authStorage.set("google-antigravity", [
+					{
+						type: "oauth",
+						access: "account-a-refreshed-access",
+						refresh: "account-a-refresh-token",
+						// New token is fresh
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "account-a@example.com",
+						// Still no accountId
+					},
+					{
+						type: "oauth",
+						access: "account-b-fresh-access",
+						refresh: "account-b-refresh-token",
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "account-b@example.com",
+						// Still no accountId
+					},
+				]);
+				// ALSO switch to account B during the refresh window
+				// This simulates a concurrent credential selection change that's NOT part of the OAuth refresh
+				authStorage.setSessionCredentialSelector(credentialSessionId, "google-antigravity", {
+					kind: "email",
+					value: "account-b@example.com",
+				});
+				return "account-a-refreshed-access";
+			});
+
+			using _hook = hookFetch((input, _init) => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					return new Response(
+						JSON.stringify({
+							models: { "account-a-discovered": { displayName: "Should Not Appear" } },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("google-antigravity", "online", credentialSessionId);
+
+				// Verify that getApiKey was called (meaning OAuth refresh was attempted)
+				expect(getApiKeySpy).toHaveBeenCalled();
+
+				// Verify that the discovery endpoint was NOT called
+				// because the account switch should cause the discovery to be discarded,
+				// even though both accounts lack accountId.
+				// Before the fix, discoveryFetches would be 1 because the code only compared accountId
+				// (which is undefined for both), missing the email change.
+				expect(discoveryFetches).toBe(0);
+
+				// Verify that the discovered model from account A is NOT in the registry
+				const model = registry.find("google-antigravity", "account-a-discovered");
+				expect(model).toBeUndefined();
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
 	});
 });
 

@@ -5449,18 +5449,20 @@ export class ModelRegistry {
 					this.#authStorageConfigOwner,
 				);
 				// Record pre-refresh state to detect unrelated concurrent credential changes.
-				// Capture both the credential type and OAuth account identity to detect if a different
+				// Capture both the credential type and OAuth credential identity to detect if a different
 				// account was selected during the refresh window.
 				const preRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
 					descriptor.providerId,
 					credentialSessionId,
 					{ owner: this.#authStorageConfigOwner },
 				);
-				// Capture the OAuth account identity to detect if a different OAuth account is selected during refresh.
+				// Capture the full OAuth credential identity to detect if a different OAuth account is selected during refresh.
 				// This catches the case where account A's refresh is awaiting network I/O while user switches to account B (also OAuth).
-				const preRefreshOAuthAccountId =
+				// We must use the full credential identity (email, accountId, organizationId) because some providers
+				// (Google, Kiro) may omit accountId, making a comparison on accountId alone insufficient.
+				const preRefreshOAuthCredential =
 					preRefreshCredentialType === "oauth"
-						? this.authStorage.getOAuthAccountId(descriptor.providerId, credentialSessionId, {
+						? this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
 								owner: this.#authStorageConfigOwner,
 							})
 						: undefined;
@@ -5496,20 +5498,27 @@ export class ModelRegistry {
 				// Always verify that the OAuth account didn't change during refresh, even if generation didn't bump.
 				// Session-scoped selector changes don't necessarily bump generation, but indicate a concurrent
 				// unrelated credential change that should cause discovery to be discarded.
-				if (refreshOAuth && preRefreshCredentialType === "oauth") {
+				if (refreshOAuth && preRefreshCredentialType === "oauth" && preRefreshOAuthCredential) {
 					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
 						descriptor.providerId,
 						credentialSessionId,
 						{ owner: this.#authStorageConfigOwner },
 					);
-					const postRefreshOAuthAccountId =
+					const postRefreshOAuthCredential =
 						postRefreshCredentialType === "oauth"
-							? this.authStorage.getOAuthAccountId(descriptor.providerId, credentialSessionId, {
+							? this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
 									owner: this.#authStorageConfigOwner,
 								})
 							: undefined;
-					// Discard if the OAuth account changed during refresh (indicates concurrent account switch)
-					if (preRefreshOAuthAccountId !== postRefreshOAuthAccountId) {
+					// Discard if the OAuth credential identity changed during refresh (indicates concurrent account switch).
+					// Compare email, accountId, and organizationId, as these form the identity tuple.
+					// accountId alone is insufficient because some providers omit it.
+					if (
+						!postRefreshOAuthCredential ||
+						preRefreshOAuthCredential.email !== postRefreshOAuthCredential.email ||
+						preRefreshOAuthCredential.accountId !== postRefreshOAuthCredential.accountId ||
+						preRefreshOAuthCredential.organizationId !== postRefreshOAuthCredential.organizationId
+					) {
 						return { apiKey: undefined, authGeneration: undefined };
 					}
 				}
