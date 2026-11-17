@@ -4,6 +4,13 @@ import type { OAuthPrompt } from "@gajae-code/ai/utils/oauth/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
 
+import {
+	assertNativeRuntimeEffect,
+	assertNativeRuntimeInvocation,
+	NativeRuntimeRefusal,
+	retainNativeRuntimeWork,
+	withNativeRuntimeEffect,
+} from "./native-lifecycle";
 import type { AuthorizationControlOperation } from "./protocol/client-control-contracts";
 
 export {
@@ -170,6 +177,7 @@ export class AuthorizationControls {
 	}
 
 	#assertCurrent(): void {
+		assertNativeRuntimeInvocation(this.#session);
 		if (this.#current()) return;
 		void this.close().catch(() => {});
 		throw new Error("Authorization service is no longer active");
@@ -260,6 +268,7 @@ export class AuthorizationControls {
 					throw new Error("Unknown authorization operation");
 			}
 		} catch (error) {
+			if (error instanceof NativeRuntimeRefusal) throw error;
 			// Reconstruct only our fixed contention error; never pass through dependency text or codes.
 			if (error instanceof AuthorizationBusyError) throw new AuthorizationBusyError();
 			// Neither provider/storage exception text nor request values cross this boundary.
@@ -354,33 +363,47 @@ export class AuthorizationControls {
 		flow.timer = setTimeout(() => this.#stop(flow, "error", "Authorization timed out"), this.#deadlineMs);
 		flow.task = Promise.resolve().then(async () => {
 			try {
-				if (!this.#live(flow)) return;
-				await this.#session.modelRegistry.authStorage.login(
-					provider,
-					{
-						signal: flow.abort.signal,
-						onAuth: info => {
-							if (!this.#live(flow)) throw new Error("Authorization stopped");
-							try {
-								flow.state.url = this.#safeUrl(flow, info.url);
-								delete flow.state.verificationCode;
-								if (["github-copilot", "kilo", "kimi-code", "kiro", "openai-codex-device"].includes(provider)) {
-									const match = /^Enter code: ([A-Z0-9]{3,8}(?:-[A-Z0-9]{3,8}){0,2})$/.exec(
-										info.instructions ?? "",
-									);
-									if (match?.[1] && !this.#containsSecret(flow, match[1]))
-										flow.state.verificationCode = match[1];
+				await withNativeRuntimeEffect(this.#session, "authorization", () => {
+					if (!this.#live(flow)) return;
+					return this.#session.modelRegistry.authStorage.login(
+						provider,
+						{
+							signal: flow.abort.signal,
+							onAuth: info => {
+								if (!this.#live(flow)) throw new Error("Authorization stopped");
+								try {
+									flow.state.url = this.#safeUrl(flow, info.url);
+									delete flow.state.verificationCode;
+									if (
+										["github-copilot", "kilo", "kimi-code", "kiro", "openai-codex-device"].includes(provider)
+									) {
+										const match = /^Enter code: ([A-Z0-9]{3,8}(?:-[A-Z0-9]{3,8}){0,2})$/.exec(
+											info.instructions ?? "",
+										);
+										if (match?.[1] && !this.#containsSecret(flow, match[1]))
+											flow.state.verificationCode = match[1];
+									}
+								} catch {
+									this.#stop(flow, "error", "Provider supplied an unsafe authorization URL");
+									throw new Error("Unsafe authorization URL");
 								}
-							} catch {
-								this.#stop(flow, "error", "Provider supplied an unsafe authorization URL");
-								throw new Error("Unsafe authorization URL");
-							}
+							},
+							onPrompt: prompt => this.#prompt(flow, prompt),
+							onManualCodeInput: () => this.#prompt(flow, { message: "Authorization answer required" }),
 						},
-						onPrompt: prompt => this.#prompt(flow, prompt),
-						onManualCodeInput: () => this.#prompt(flow, { message: "Authorization answer required" }),
-					},
-					{ manualCode },
-				);
+						{ manualCode },
+						{
+							withCredentialCommit: commit =>
+								withNativeRuntimeEffect(this.#session, "authorization", () => {
+									this.#assertCurrent();
+									if (!this.#live(flow)) throw new Error("Authorization stopped");
+									assertNativeRuntimeEffect(this.#session, "authorization");
+									return commit();
+								}),
+						},
+					);
+				});
+				assertNativeRuntimeInvocation(this.#session);
 				flow.state.stored = this.#status(provider).stored;
 				if (!this.#live(flow)) return;
 				if (!flow.state.stored) throw new Error("Provider did not store credentials");
@@ -389,8 +412,9 @@ export class AuthorizationControls {
 				flow.pending = undefined;
 				flow.state = { id: flow.state.id, provider, status: "stored", stored: true, catalogRefreshed: false };
 				flow.state.catalogRefreshed = await this.#refreshCatalog();
-			} catch {
+			} catch (error) {
 				this.#stop(flow, "error", "Authorization failed");
+				if (error instanceof NativeRuntimeRefusal) throw error;
 			} finally {
 				// Providers can persist before observing cancellation. Do not report rollback.
 				try {
@@ -405,6 +429,7 @@ export class AuthorizationControls {
 				if (this.#active === flow) this.#active = undefined;
 			}
 		});
+		retainNativeRuntimeWork(this.#session, flow.task);
 		return this.#snapshot(flow);
 	}
 
@@ -459,11 +484,16 @@ export class AuthorizationControls {
 	}
 
 	async #refreshCatalog(): Promise<boolean> {
+		assertNativeRuntimeInvocation(this.#session);
 		if (!this.#current()) return false;
 		try {
-			await this.#session.modelRegistry.refresh("offline", this.#session.credentialSessionId);
+			await withNativeRuntimeEffect(this.#session, "authorization", () => {
+				this.#assertCurrent();
+				return this.#session.modelRegistry.refresh("offline", this.#session.credentialSessionId);
+			});
 			return this.#current();
-		} catch {
+		} catch (error) {
+			if (error instanceof NativeRuntimeRefusal) throw error;
 			return false;
 		}
 	}
@@ -478,8 +508,21 @@ export class AuthorizationControls {
 		)
 			throw new Error("API key storage is unavailable");
 		const task = Promise.resolve().then(async (): Promise<AuthorizationKeyStored> => {
-			this.#assertCurrent();
-			await this.#session.modelRegistry.authStorage.set(provider, { type: "api_key", key });
+			await withNativeRuntimeEffect(this.#session, "authorization", () => {
+				this.#assertCurrent();
+				return this.#session.modelRegistry.authStorage.set(
+					provider,
+					{ type: "api_key", key },
+					{
+						withCredentialCommit: commit =>
+							withNativeRuntimeEffect(this.#session, "authorization", () => {
+								this.#assertCurrent();
+								assertNativeRuntimeEffect(this.#session, "authorization");
+								return commit();
+							}),
+					},
+				);
+			});
 			this.#assertCurrent();
 			const stored = this.#session.modelRegistry.authStorage.get(resolveOAuthStorageProvider(provider));
 			if (stored?.type !== "api_key" || stored.key !== key) throw new Error("API key was not stored");
@@ -488,6 +531,7 @@ export class AuthorizationControls {
 			return { provider, saved: true, catalogRefreshed };
 		});
 		this.#keyTask = task;
+		retainNativeRuntimeWork(this.#session, task);
 		try {
 			return await task;
 		} finally {

@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
-import type { ExternalStopAdmissionLease } from "../session/agent-session";
+import type { AgentSession, ExternalStopAdmissionLease } from "../session/agent-session";
 import type {
 	PendingResumeOp,
 	ReconcileResult,
@@ -15,11 +15,13 @@ import {
 	acquireEmbeddedStopAdmission,
 	cancelEmbeddedOwnedWork,
 	type EmbeddedOwnedWork,
+	type EmbeddedWorkCancellation,
 	type EmbeddedWorkConsent,
 	type EmbeddedWorkSource,
 	type EmbeddedWorkTarget,
 	getEmbeddedOwnedWork,
 } from "./embedded-work";
+import { stopSessionClientControlProducers } from "./session-client-controls";
 
 export type NativeReconcileMode = "verify" | "verifyReadOnly" | "repairDurability" | "complete";
 
@@ -111,6 +113,9 @@ interface Member {
 	closure?: ResumeClosureEvidence;
 	retirement?: ResumeRetirementEvidence;
 	lease?: ExternalStopAdmissionLease;
+	runtimeBinding?: NativeRuntimeBinding;
+	publicationEpoch: number;
+	readonly runtimeWork: Set<Promise<unknown>>;
 	pendingCalls: number;
 	tail: Promise<void>;
 }
@@ -119,6 +124,273 @@ const members = new WeakMap<NativeLifecycleHandle, Member>();
 const managers = new WeakMap<SessionManager, Member>();
 const preparations = new WeakMap<NativeDisconnectPreparation, Member>();
 const consents = new WeakMap<NativeTerminationConsent, ConsentRecord>();
+
+export type NativeRuntimeFamily =
+	| "prompt"
+	| "queue"
+	| "model"
+	| "workflow"
+	| "operator"
+	| "activity"
+	| "preferences"
+	| "authorization"
+	| "side"
+	| "composer"
+	| "diff"
+	| "session";
+
+export type NativeInvocationResult<T> =
+	| { readonly kind: "applied"; readonly value: T; readonly reconciliation: ReconcileResult }
+	| {
+			readonly kind: "refused";
+			readonly reason: "manager_closed" | "context_mismatch" | "uncertain_cursor" | "not_ready";
+			readonly reconciliation: ReconcileResult;
+	  };
+
+interface NativeRuntimeBinding {
+	readonly session: AgentSession;
+	readonly pending: () => PendingResumeOp;
+	readonly sameIdentity: () => boolean;
+}
+interface RuntimeInvocation {
+	readonly member: Member;
+	readonly binding: NativeRuntimeBinding;
+	readonly op: PendingResumeOp;
+	readonly epoch: number;
+	readonly family: NativeRuntimeFamily;
+	active: boolean;
+	owners: number;
+	effectsStarted: boolean;
+}
+interface RuntimeCheckpoint {
+	readonly invocation: RuntimeInvocation;
+	readonly reconciliation: ReconcileResult;
+	active: boolean;
+}
+const runtimeInvocation = new AsyncLocalStorage<RuntimeInvocation>();
+const runtimeCheckpoint = new AsyncLocalStorage<RuntimeCheckpoint>();
+const runtimeCancellation = new AsyncLocalStorage<{ member: Member; active: boolean }>();
+
+export class NativeRuntimeRefusal extends Error {
+	constructor(
+		readonly reason: "manager_closed" | "context_mismatch" | "uncertain_cursor" | "not_ready",
+		readonly reconciliation?: ReconcileResult,
+	) {
+		super(`Native runtime invocation refused: ${reason}`);
+		this.name = "NativeRuntimeRefusal";
+	}
+}
+
+function invocationCurrent(invocation: RuntimeInvocation): boolean {
+	const { member, binding } = invocation;
+	return (
+		invocation.active &&
+		members.get(member.handle) === member &&
+		member.runtimeBinding === binding &&
+		member.context === "runtime" &&
+		member.workSource?.result.session === binding.session &&
+		member.manager === binding.session.sessionManager &&
+		member.publicationEpoch === invocation.epoch &&
+		binding.pending() === invocation.op &&
+		binding.sameIdentity() &&
+		!member.intent &&
+		closeState(member) === "none_started"
+	);
+}
+
+/** Factory-only attachment, after the registry has published this exact runtime. */
+export function bindNativeRuntimeInvocation(handle: NativeLifecycleHandle, pending: () => PendingResumeOp): void {
+	const member = memberFor(handle);
+	const session = member.workSource?.result.session;
+	if (!session || member.context !== "runtime" || member.runtimeBinding)
+		throw new Error("Native runtime binding context mismatch");
+	const manager = session.sessionManager;
+	const sessionId = session.sessionId;
+	const identity = manager.getSessionIdentityGeneration();
+	const generation = session.sessionLifecycle.generation;
+	const agent = session.agent;
+	const settings = session.settings;
+	const registry = session.modelRegistry;
+	member.runtimeBinding = {
+		session,
+		pending,
+		sameIdentity: () =>
+			session.sessionManager === manager &&
+			session.sessionId === sessionId &&
+			manager.getSessionIdentityGeneration() === identity &&
+			session.sessionLifecycle.generation === generation &&
+			!session.sessionLifecycle.disposed &&
+			session.agent === agent &&
+			session.settings === settings &&
+			session.modelRegistry === registry,
+	};
+	member.publicationEpoch++;
+}
+
+/** Raw registered native sessions are not a second, unguarded consumer API. */
+export function assertNativeRuntimeInvocation(session: AgentSession, cancellation = false): void {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context === "owned_pre") return;
+	const stopping = runtimeCancellation.getStore();
+	if (cancellation && stopping?.active && stopping.member === member && member.workSource?.result.session === session)
+		return;
+	const disposing = disposalScope.getStore();
+	if (cancellation && disposing?.active && disposing.member === member) return;
+	const invocation = runtimeInvocation.getStore();
+	if (!invocation || invocation.binding.session !== session || !invocationCurrent(invocation))
+		throw new NativeRuntimeRefusal(closeState(member) === "none_started" ? "context_mismatch" : "manager_closed");
+}
+
+/** Synchronous producers can only borrow the currently active bounded checkpoint. */
+export function assertNativeRuntimeEffect(session: AgentSession, family: NativeRuntimeFamily): void {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context === "owned_pre") return;
+	assertNativeRuntimeInvocation(session);
+	const invocation = runtimeInvocation.getStore()!;
+	const checkpoint = runtimeCheckpoint.getStore();
+	if (!checkpoint?.active || checkpoint.invocation !== invocation || !familyAllowed(invocation.family, family))
+		throw new NativeRuntimeRefusal("context_mismatch", checkpoint?.reconciliation);
+	invocation.effectsStarted = true;
+}
+
+function familyAllowed(owner: NativeRuntimeFamily, effect: NativeRuntimeFamily): boolean {
+	return (
+		owner === effect ||
+		owner === "session" ||
+		owner === "preferences" ||
+		(owner === "prompt" && (effect === "queue" || effect === "model" || effect === "workflow")) ||
+		(owner === "queue" && effect === "prompt") ||
+		(owner === "workflow" && (effect === "prompt" || effect === "queue"))
+	);
+}
+
+/** Trusted producer hook. Only the synchronous start is covered by the publication lease. */
+export async function withNativeRuntimeEffect<T>(
+	session: AgentSession,
+	family: NativeRuntimeFamily,
+	start: () => T | Promise<T>,
+): Promise<T> {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context === "owned_pre") return start();
+	assertNativeRuntimeInvocation(session);
+	const invocation = runtimeInvocation.getStore()!;
+	if (!familyAllowed(invocation.family, family)) throw new NativeRuntimeRefusal("context_mismatch");
+	const checkpoint = runtimeCheckpoint.getStore();
+	if (checkpoint?.active && checkpoint.invocation === invocation) {
+		if (!invocationCurrent(invocation)) throw new NativeRuntimeRefusal("context_mismatch", checkpoint.reconciliation);
+		invocation.effectsStarted = true;
+		return start();
+	}
+	const admitted = await serialized(member, () =>
+		member.manager!.admitNativeRuntimeEffect(
+			invocation.op,
+			routing(member, "RECON", "RETAIN_LIVE"),
+			reconciliation => {
+				if (!invocationCurrent(invocation)) throw new NativeRuntimeRefusal("context_mismatch", reconciliation);
+				const current: RuntimeCheckpoint = { invocation, reconciliation, active: true };
+				return runtimeCheckpoint.run(current, () => {
+					try {
+						invocation.effectsStarted = true;
+						return { completion: Promise.resolve(start()) };
+					} finally {
+						current.active = false;
+					}
+				});
+			},
+			"repairDurability",
+		),
+	);
+	if (admitted.kind === "refused") throw new NativeRuntimeRefusal(admitted.reason, admitted.reconciliation);
+	return admitted.completion;
+}
+
+/** Register detached work synchronously, before an admission result can escape. */
+export function retainNativeRuntimeWork(session: AgentSession, completion: Promise<unknown>): void {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context === "owned_pre") return;
+	assertNativeRuntimeInvocation(session);
+	const invocation = runtimeInvocation.getStore()!;
+	invocation.owners++;
+	member.runtimeWork.add(completion);
+	const settled = () => {
+		member.runtimeWork.delete(completion);
+		if (--invocation.owners === 0) invocation.active = false;
+	};
+	void completion.then(settled, settled);
+}
+
+/** Internal closed-facade adapter; never exposed as a consumer callback API. */
+export async function invokeNativeRuntime<T>(
+	handle: NativeLifecycleHandle,
+	family: NativeRuntimeFamily,
+	start: () => T | Promise<T>,
+): Promise<NativeInvocationResult<T>> {
+	const member = memberFor(handle);
+	const binding = member.runtimeBinding;
+	if (!binding) throw new Error("Native runtime has not been published");
+	const invocation: RuntimeInvocation = {
+		member,
+		binding,
+		op: binding.pending(),
+		epoch: member.publicationEpoch,
+		family,
+		active: true,
+		owners: 1,
+		effectsStarted: false,
+	};
+	let reconciliation: ReconcileResult | undefined;
+	try {
+		const admitted = await serialized(member, async () => {
+			const op = binding.pending();
+			if (closeState(member) !== "none_started")
+				return {
+					kind: "refused" as const,
+					reason: "manager_closed" as const,
+					reconciliation: await postReadonly(member, op, "RECON"),
+				};
+			return member.manager!.admitNativeRuntimeEffect(op, routing(member, "RECON", "RETAIN_LIVE"), result => {
+				reconciliation = result;
+				if (!invocationCurrent(invocation) || binding.session.sessionLifecycle.transitioning)
+					throw new NativeRuntimeRefusal("context_mismatch", result);
+				const checkpoint: RuntimeCheckpoint = { invocation, reconciliation: result, active: true };
+				return runtimeInvocation.run(invocation, () =>
+					runtimeCheckpoint.run(checkpoint, () => {
+						try {
+							const completion = Promise.resolve(start());
+							retainNativeRuntimeWork(binding.session, completion);
+							return { completion };
+						} finally {
+							checkpoint.active = false;
+						}
+					}),
+				);
+			});
+		});
+		reconciliation = admitted.reconciliation;
+		if (admitted.kind === "refused") return admitted;
+		return { kind: "applied", value: await admitted.completion, reconciliation: admitted.reconciliation };
+	} catch (error) {
+		if (!(error instanceof NativeRuntimeRefusal) || invocation.effectsStarted) throw error;
+		const actual = error.reconciliation ?? reconciliation;
+		if (!actual) throw error;
+		return { kind: "refused", reason: error.reason, reconciliation: actual };
+	} finally {
+		if (--invocation.owners === 0) invocation.active = false;
+	}
+}
+
+/** Selection and its owner-current-op update share the same registry admission queue. */
+export function serializeNativeRuntimeSelection<T>(
+	handle: NativeLifecycleHandle,
+	select: () => Promise<T>,
+): Promise<T> {
+	const member = memberFor(handle);
+	return serialized(member, async () => {
+		const result = await select();
+		member.publicationEpoch++;
+		return result;
+	});
+}
 
 interface DisposalScope {
 	readonly member: Member;
@@ -137,8 +409,7 @@ export function assertNativeDisposalAuthorized(manager: SessionManager): void {
 	if (!member) return;
 	const scope = disposalScope.getStore();
 	if (
-		!scope ||
-		!scope.active ||
+		!scope?.active ||
 		scope.member !== member ||
 		members.get(member.handle) !== member ||
 		member.manager !== manager ||
@@ -560,7 +831,15 @@ async function terminateLive(
 			);
 		// This API validates the *whole* captured inventory, addresses and exact
 		// active run before cancelling the first draft. Rejected consent has no effects.
-		const cancelled = await cancelEmbeddedOwnedWork(source, work);
+		// TERM has a distinct exact-owner cancellation scope, never prompt authority.
+		member.publicationEpoch++;
+		const cancellation = { member, active: true };
+		let cancelled: EmbeddedWorkCancellation;
+		try {
+			cancelled = await runtimeCancellation.run(cancellation, () => cancelEmbeddedOwnedWork(source, work));
+		} finally {
+			cancellation.active = false;
+		}
 		if (cancelled.status === "rejected")
 			return refuse(
 				member,
@@ -604,6 +883,10 @@ async function terminateLive(
 	);
 	member.intent = authorization;
 	try {
+		if (source) {
+			stopSessionClientControlProducers(source.result.session);
+			while (member.runtimeWork.size > 0) await Promise.allSettled([...member.runtimeWork]);
+		}
 		if (observed.receipt.durability.state !== "proven") {
 			try {
 				await driver.reconcile(op, "repairDurability", routing(member, "TERM", "TERMINATE", { authorization }));
@@ -741,6 +1024,8 @@ export function createNativeOpenCoordinator(driver: NativeLifecycleDriver): Nati
 		openReady: false,
 		runtimeCleanupComplete: true,
 		epoch: 0,
+		publicationEpoch: 0,
+		runtimeWork: new Set(),
 		pendingCalls: 0,
 		tail: Promise.resolve(),
 	};
@@ -806,6 +1091,8 @@ export function createNativeReadonlyHandle(
 		openReady: false,
 		runtimeCleanupComplete: true,
 		epoch: 0,
+		publicationEpoch: 0,
+		runtimeWork: new Set(),
 		pendingCalls: 0,
 		tail: Promise.resolve(),
 	});

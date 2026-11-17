@@ -418,8 +418,7 @@ describe("session-bound SDK operator controls", () => {
 		expect(controls.cancel(ref)).toMatchObject({ status: "cancel_requested", terminal: false });
 		expect(signals[0]?.aborted).toBe(true);
 		expect(signals[1]?.aborted).toBe(false);
-		await settle();
-		expect(controls.read(ref).operation.status).toBe("cancelled");
+		expect((await terminalSnapshot(controls, ref.operationId)).status).toBe("cancelled");
 		failure(() => controls.cancel(ref), "already_terminal");
 		expect(signals[1]?.aborted).toBe(false);
 		session.abortBash();

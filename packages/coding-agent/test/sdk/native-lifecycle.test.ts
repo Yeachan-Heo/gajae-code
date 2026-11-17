@@ -709,7 +709,6 @@ describe("native disposal admission uses registry authority, never caller option
 			await f.coordinator.resumeOpen(f.op);
 			const source = await runtime(f.manager, f);
 			f.coordinator.recordRuntimeStarted(source);
-			if (context === "runtime") f.coordinator.publishRuntime();
 			const session = source.result.session;
 			const entered = Promise.withResolvers<void>();
 			const released = Promise.withResolvers<void>();
@@ -723,10 +722,11 @@ describe("native disposal admission uses registry authority, never caller option
 			session.agent.streamFn = mock.stream;
 			const run = session.agent.prompt("local active run");
 			await entered.promise;
-			const draft = await session.submitUserMessage("retain queued draft", {
+			await session.submitUserMessage("retain queued draft", {
 				deliverAs: "followUp",
 				trackSubmission: true,
 			});
+			if (context === "runtime") f.coordinator.publishRuntime();
 			const queued = session.getQueuedMessageEntries();
 			expect(queued).toHaveLength(1);
 			const controller = new AbortController();
@@ -791,9 +791,24 @@ describe("native disposal admission uses registry authority, never caller option
 				ask.close();
 				await ask.promise;
 				await request;
-				session.cancelQueuedInputSubmission(draft.submissionId!);
-				released.resolve();
-				await run;
+				try {
+					const preparation = await prepareNativeDisconnect(f.handle, f.op);
+					const inventory = preparation.inventory!;
+					const consent = recordNativeDisconnectConsent(f.handle, preparation, {
+						stopAndJoin: true,
+						work: {
+							inventory,
+							targets: inventory.blockers.flatMap(blocker => (blocker.target ? [blocker.target] : [])),
+						},
+					});
+					expect(consent).toBeDefined();
+					const stopping = terminateNativeHandle(f.handle, f.op, consent!);
+					released.resolve();
+					await stopping;
+				} finally {
+					released.resolve();
+					await run;
+				}
 			}
 		});
 
@@ -979,7 +994,6 @@ describe("actual runtime ownership boundary and exact work consent", () => {
 		await f.coordinator.resumeOpen(f.op);
 		const source = await runtime(f.manager, f);
 		f.coordinator.recordRuntimeStarted(source);
-		f.coordinator.publishRuntime();
 		const entered = Promise.withResolvers<void>();
 		const released = Promise.withResolvers<void>();
 		const mock = createMockModel({
@@ -1003,6 +1017,7 @@ describe("actual runtime ownership boundary and exact work consent", () => {
 			deliverAs: "followUp",
 			trackSubmission: true,
 		});
+		f.coordinator.publishRuntime();
 		const preparation = await prepareNativeDisconnect(f.handle, f.op);
 		const inventory = preparation.inventory!;
 		const actualAbort = source.result.session.abortPromptAndWait.bind(source.result.session);

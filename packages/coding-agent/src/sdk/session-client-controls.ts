@@ -3,6 +3,7 @@ import { ActivityControls } from "./activity-controls";
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
+import { assertNativeRuntimeInvocation } from "./native-lifecycle";
 import { createSdkOperatorControls, type SdkOperatorControls } from "./operator-controls";
 import {
 	createSdkPreferenceControls,
@@ -10,7 +11,6 @@ import {
 	type SdkPreferenceControls,
 } from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
-
 import { getSessionControlLifetime } from "./session-control-lifetime";
 import { SIDE_CONVERSATION_MUTATIONS, SIDE_CONVERSATION_QUERIES, SideConversationControls } from "./side-conversation";
 
@@ -42,6 +42,13 @@ export function bindSessionClientControlResources(
 	resources.set(result.session, result);
 	getSessionControlLifetime(result.session, preserve => controls.get(result.session)?.retire(preserve));
 }
+/** Internal TERM hook: stop existing exact-session producers, never construct borrowed controls. */
+export function stopSessionClientControlProducers(session: AgentSession): void {
+	const bound = controls.get(session);
+	bound?.operator.dispose();
+	bound?.side.dispose();
+}
+
 export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
 	const bound = resources.get(session);
 	return [
@@ -75,6 +82,20 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 			operation.startsWith("mcp.") ? bound?.mcpManager !== undefined : bound?.jobObservation !== undefined,
 		),
 	];
+}
+
+/** Check each dispatch, not just retrieval: retained service methods never retain native authority. */
+function nativeDispatchGuard<T extends object>(session: AgentSession, service: T, methods: readonly (keyof T)[]): T {
+	return new Proxy(service, {
+		get(target, property) {
+			const value: unknown = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			return (...args: unknown[]) => {
+				if (methods.some(method => method === property)) assertNativeRuntimeInvocation(session);
+				return Reflect.apply(value, target, args);
+			};
+		},
+	});
 }
 
 /** Internal SDK binding shared by interactive and nonvisual hosts. No caller-supplied session handles. */
@@ -111,7 +132,13 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
-		preferences: createSdkPreferenceControls(session),
+		preferences: nativeDispatchGuard(session, createSdkPreferenceControls(session), [
+			"handle",
+			"setRole",
+			"selectModel",
+			"selectProfile",
+			"patchConfig",
+		]),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
 			session.sessionManager === manager &&
@@ -124,12 +151,26 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.settings === settings &&
 			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
-		authorization: authorization ?? new AuthorizationControls(session),
-		operator: createSdkOperatorControls(session),
-		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
-		side: new SideConversationControls(session),
-		composer: createSdkComposerObservation(session, resources.get(session)),
-		diff: createSdkDiffObservation(session),
+		authorization: authorization ?? nativeDispatchGuard(session, new AuthorizationControls(session), ["execute"]),
+		operator: nativeDispatchGuard(session, createSdkOperatorControls(session), ["execute", "read", "cancel"]),
+		...(resources.get(session)
+			? {
+					activity: nativeDispatchGuard(session, new ActivityControls(resources.get(session)!), [
+						"control",
+						"getActivitySnapshot",
+						"getDetail",
+						"operateActivity",
+						"acknowledge",
+						"getMcpSnapshot",
+						"operateMcp",
+					]),
+				}
+			: {}),
+		side: nativeDispatchGuard(session, new SideConversationControls(session), ["control"]),
+		composer: nativeDispatchGuard(session, createSdkComposerObservation(session, resources.get(session)), [
+			"dispatch",
+		]),
+		diff: nativeDispatchGuard(session, createSdkDiffObservation(session), ["dispatch"]),
 		retired: false,
 		identityRejected: false,
 		authorizationPreserved: false,

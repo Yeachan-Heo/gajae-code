@@ -9,11 +9,18 @@ import {
 	attestEmbeddedLegacyTakeover,
 	consentEmbeddedDisconnect,
 	prepareEmbeddedDisconnect,
+	reconcileEmbeddedResumeCheckpoint,
 	resolveEmbeddedResumeCheckpoint,
+	resumeEmbeddedAgentSession,
 	terminateEmbeddedAgentSession,
 } from "../../src/sdk/native-embedding";
-import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../src/sdk/session";
+import {
+	type CreateAgentSessionOptions,
+	type CreateAgentSessionResult,
+	createAgentSession,
+} from "../../src/sdk/session";
 import { AuthStorage } from "../../src/session/auth-storage";
+import { FileSessionStorage } from "../../src/session/session-storage";
 
 const roots: string[] = [];
 const authStores: AuthStorage[] = [];
@@ -104,7 +111,14 @@ describe("readonly-first native SDK embedding", () => {
 			expect(manager.getStrictCloseState().kind).toBe("none_started");
 			const transport = createMockModel({ handler: { content: ["local native answer"] } });
 			opened.result.session.agent.streamFn = transport.stream;
-			await opened.result.session.prompt("native local prompt");
+			const beforePrompt = await Bun.file(f.file).text();
+			await expect(opened.result.session.prompt("blocked raw native prompt")).rejects.toMatchObject({
+				reason: "context_mismatch",
+			});
+			expect(transport.calls).toHaveLength(0);
+			expect(await Bun.file(f.file).text()).toBe(beforePrompt);
+			const prompt = await opened.runtime.prompt.prompt("native local prompt");
+			expect(prompt.kind).toBe("applied");
 			await opened.result.session.waitForIdle();
 			await opened.result.session.awaitSessionSettlement();
 			expect(transport.calls).toHaveLength(1);
@@ -133,6 +147,117 @@ describe("readonly-first native SDK embedding", () => {
 				closure?.mockRestore();
 			}
 		});
+	it("joins concurrent retained opens through actual held construction and publishes only one runtime", async () => {
+		const f = await fixture([user("a", null)]);
+		const expected = { snapshotDigest: f.resolution.checkpoint.snapshotDigest, resolved: f.resolution.checkpoint };
+		const auth = await AuthStorage.create(path.join(f.agentDir, "auth.db"));
+		authStores.push(auth);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Missing bundled test model");
+		auth.setRuntimeApiKey(model.provider, "test-only-key");
+		await Bun.write(
+			path.join(f.agentDir, "config.yml"),
+			JSON.stringify({
+				recipe: { enabled: false },
+				compaction: { enabled: false },
+				retry: { enabled: false },
+				tools: { discoveryMode: "off" },
+				modelRoles: { default: `${model.provider}/${model.id}` },
+			}),
+		);
+		const legacyAttestation = await attestEmbeddedLegacyTakeover({
+			...f,
+			snapshotDigest: expected.snapshotDigest,
+			acknowledged: true,
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let factories = 0;
+		let constructionAllowed = false;
+		const repair = spyOn(FileSessionStorage.prototype, "repairDurabilitySync").mockImplementation(() => {
+			throw new Error("injected initial durability failure");
+		});
+		const retained = await createEmbeddedAgentSession({
+			cwd: f.cwd,
+			agentDir: f.agentDir,
+			authStorage: auth,
+			model,
+			storage: { directory: f.root, file: f.file },
+			native: { expected, ownerPolicy: { kind: "exclusive_native", expected, legacyAttestation } },
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMcpAutoload: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			deferOptionalModelRefresh: true,
+			deferMemoryBackendStartup: true,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+			toolNames: ["read"],
+			createSession: async options => {
+				factories++;
+				if (!constructionAllowed) throw new Error("Factory ran before durability repair");
+				const result = await createAgentSession(options);
+				entered.resolve();
+				await release.promise;
+				return result;
+			},
+		}).finally(() => repair.mockRestore());
+		if (retained.kind !== "uncertain_cursor") throw new Error(`Expected retained open, got ${retained.kind}`);
+		expect(factories).toBe(0);
+		const repaired = await reconcileEmbeddedResumeCheckpoint(retained.handle, {
+			op: retained.op,
+			mode: "repairDurability",
+		});
+		expect(repaired.receipt.commitment.continueEligible).toBe(true);
+		constructionAllowed = true;
+		const first = resumeEmbeddedAgentSession(retained.handle);
+		void first.then(
+			() => entered.resolve(),
+			() => entered.resolve(),
+		);
+		await entered.promise;
+		const second = resumeEmbeddedAgentSession(retained.handle);
+		let published = false;
+		void first.then(
+			() => {
+				published = true;
+			},
+			() => {
+				published = true;
+			},
+		);
+		try {
+			// Joining the actual held flight must not enqueue another OPEN or factory.
+			expect(second).toBe(first);
+			expect(factories).toBe(1);
+			expect(published).toBe(false);
+		} finally {
+			release.resolve();
+		}
+		const [opened, joined] = await Promise.all([first, second]);
+		expect(joined).toBe(opened);
+		if (opened.kind !== "opened") throw new Error(`Expected actual native runtime, got ${opened.kind}`);
+		expect(opened.handle).toBe(retained.handle);
+		expect(opened.op).toBe(retained.op);
+		expect(factories).toBe(1);
+		const preparation = await prepareEmbeddedDisconnect(opened.handle, opened.op);
+		if (!preparation.inventory) throw new Error("Missing actual native inventory");
+		const consent = consentEmbeddedDisconnect(opened.handle, preparation, {
+			stopAndJoin: true,
+			work: { inventory: preparation.inventory, targets: [] },
+		});
+		if (!consent) throw new Error("Missing native termination consent");
+		const final = await terminateEmbeddedAgentSession(opened.handle, { op: opened.op, consent });
+		expect(final.receipt.routing.action).toBe("POST_READONLY");
+		expect(opened.result.session.sessionManager.getStrictCloseState().kind).toBe("closed");
+	});
+
 	it("requires interpretation of legacy branches without factory, writer, catalog or agentDir effects", async () => {
 		const f = await fixture([user("a", null), user("b", null)]);
 		const expected = { snapshotDigest: f.resolution.checkpoint.snapshotDigest, resolved: f.resolution.checkpoint };
@@ -221,6 +346,13 @@ describe("readonly-first native SDK embedding", () => {
 		expect(factories).toBe(1);
 		expect(result.op.plan.target).toBeNull();
 		const bytes = await Bun.file(f.file).text();
+		const retried = await resumeEmbeddedAgentSession(result.handle);
+		expect(retried.kind).toBe("selection_incomplete");
+		if (retried.kind !== "selection_incomplete") throw new Error("Expected closed retained handle");
+		expect(retried.handle).toBe(result.handle);
+		expect(retried.op).toBe(result.op);
+		expect(factories).toBe(1);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
 		const final = await terminateEmbeddedAgentSession(result.handle, { op: result.op });
 		expect(final.receipt.routing.action).toBe("POST_READONLY");
 		expect(await Bun.file(f.file).text()).toBe(bytes);

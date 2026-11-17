@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import * as util from "node:util";
+import type { AgentSession } from "../session/agent-session";
 import { captureNativeResumeTranscript } from "../session/native-resume";
 import {
 	admitOwnerMembershipWithAsyncEvidence,
@@ -23,6 +24,10 @@ import type {
 } from "../session/resume-operation";
 import { SessionManager } from "../session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
+import type { ActivityControlOperation, ActivityControlResult } from "./activity-controls";
+import type { AuthorizationControls } from "./authorization-controls";
+import type { SdkComposerObservation } from "./composer-observation";
+import type { SdkDiffObservation } from "./diff-observation";
 import type { EmbeddedWorkSource } from "./embedded-work";
 import {
 	createEmbeddedAgentSession,
@@ -31,9 +36,12 @@ import {
 } from "./embedding";
 import { ExtensionInteractionService } from "./extension-interaction";
 import {
+	bindNativeRuntimeInvocation,
 	createNativeOpenCoordinator,
+	invokeNativeRuntime,
 	type NativeDisconnectConsent,
 	type NativeDisconnectPreparation,
+	type NativeInvocationResult,
 	type NativeLifecycleHandle,
 	type NativeOpenCoordinator,
 	type NativeReconcileMode,
@@ -41,11 +49,16 @@ import {
 	prepareNativeDisconnect,
 	reconcileNativeHandle,
 	recordNativeDisconnectConsent,
+	serializeNativeRuntimeSelection,
 	terminateNativeHandle,
 } from "./native-lifecycle";
 import { createNativeOwnerInspectors } from "./native-ownership";
+import type { SdkOperatorControls } from "./operator-controls";
+import type { SdkPreferenceControls } from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
+import { getSessionClientControls } from "./session-client-controls";
 import type { ResumeSessionIdentity } from "./session-readonly/storage";
+import type { SideConversationControls } from "./side-conversation";
 
 export interface NativeEmbeddedOptions {
 	readonly expected: { readonly snapshotDigest: string; readonly resolved: SdkResumeCheckpoint };
@@ -63,10 +76,69 @@ export interface NativeEmbeddedAgentSessionOptions extends Omit<EmbeddedAgentSes
 export type EmbeddedResumeResolution =
 	| { readonly kind: "resolved"; readonly checkpoint: SdkResumeCheckpoint; readonly identity: ResumeSessionIdentity }
 	| { readonly kind: "error"; readonly reason: string };
+type NativeMethods<T> = {
+	readonly [K in keyof T]: T[K] extends (...args: infer A) => infer R
+		? (...args: A) => Promise<NativeInvocationResult<Awaited<R>>>
+		: never;
+};
+
+/** Closed consumer API. No callback, mutable service, manager or raw-session authority. */
+export interface NativeEmbeddedRuntime {
+	readonly prompt: NativeMethods<
+		Pick<
+			AgentSession,
+			"prompt" | "promptCustomMessage" | "sendUserMessage" | "submitUserMessage" | "continuePersistedHistory"
+		>
+	>;
+	readonly queue: NativeMethods<
+		Pick<
+			AgentSession,
+			| "steer"
+			| "followUp"
+			| "cancelAndSubmit"
+			| "cancelQueuedMessage"
+			| "cancelQueuedInputSubmission"
+			| "removeQueuedMessageForEditing"
+			| "moveQueuedMessageForEditing"
+			| "popLastQueuedMessage"
+			| "setSteeringMode"
+			| "setFollowUpMode"
+			| "setToolInterruptPolicy"
+			| "abort"
+		>
+	>;
+	readonly model: NativeMethods<
+		Pick<
+			AgentSession,
+			| "setModelTemporaryForControl"
+			| "setDefaultModelSelection"
+			| "activateModelProfileForControl"
+			| "cycleModel"
+			| "setSessionAgentModelSelection"
+			| "setThinkingLevel"
+			| "cycleThinkingLevel"
+		>
+	>;
+	readonly workflow: NativeMethods<Pick<AgentSession, "invokeSkill" | "setSdkPlanMode" | "operateGoal">>;
+	readonly operator: NativeMethods<Pick<SdkOperatorControls, "execute" | "read" | "cancel">>;
+	readonly activity: {
+		control(
+			operation: ActivityControlOperation,
+			input: Record<string, unknown>,
+		): Promise<NativeInvocationResult<ActivityControlResult>>;
+	};
+	readonly preferences: NativeMethods<Pick<SdkPreferenceControls, "handle">>;
+	readonly authorization: NativeMethods<Pick<AuthorizationControls, "execute">>;
+	readonly composer: NativeMethods<Pick<SdkComposerObservation, "dispatch">>;
+	readonly diff: NativeMethods<Pick<SdkDiffObservation, "dispatch">>;
+	readonly side: NativeMethods<Pick<SideConversationControls, "control">>;
+}
+
 export type NativeEmbeddedOpenResult =
 	| {
 			readonly kind: "opened";
 			readonly result: EmbeddedAgentSessionResult;
+			readonly runtime: NativeEmbeddedRuntime;
 			readonly handle: NativeLifecycleHandle;
 			readonly op: PendingResumeOp;
 			readonly selection: ReconcileResult;
@@ -151,6 +223,7 @@ interface NativeOwner {
 	cleanup?: () => Promise<void>;
 	interaction?: NonNullable<EmbeddedWorkSource["interaction"]>;
 	last?: ReconcileResult;
+	openFlight?: Promise<NativeEmbeddedOpenResult>;
 }
 const nativeOwners = new WeakMap<SessionManager, NativeOwner>();
 const handles = new WeakMap<NativeLifecycleHandle, NativeOwner>();
@@ -332,7 +405,7 @@ async function createFreshNative(options: NativeEmbeddedAgentSessionOptions): Pr
 	const expected = { snapshotDigest: target.snapshotDigest, resolved };
 	const membership = await admitOwnerMembershipWithAsyncEvidence(
 		target,
-		{ kind: "exclusive_native", expected },
+		{ kind: "exclusive_native", expected, freshCreation: manager.getFreshOwnerCreation() },
 		{ ...createNativeOwnerInspectors(options), runtime: "embedded_native", capabilities: ["native_resume"] },
 	);
 	manager.installOwnerMembership(membership);
@@ -370,45 +443,170 @@ function beginNativeFactory(
 	};
 	nativeOwners.set(manager, owner);
 	handles.set(coordinator.handle, owner);
-	return continueOpen(owner, admittedOptions);
+	return continueOpen(owner);
 }
 
-async function continueOpen(
+/** Selection, construction and runtime publication share one owner-bound admission. */
+function continueOpen(owner: NativeOwner): Promise<NativeEmbeddedOpenResult> {
+	if (owner.openFlight) return owner.openFlight;
+	const flight = constructNativeRuntime(owner, owner.options);
+	owner.openFlight = flight;
+	const settled = () => {
+		if (owner.openFlight === flight) owner.openFlight = undefined;
+	};
+	void flight.then(settled, settled);
+	return flight;
+}
+
+async function constructNativeRuntime(
 	owner: NativeOwner,
 	options: EmbeddedAgentSessionOptions,
 ): Promise<NativeEmbeddedOpenResult> {
-	const selection = await owner.coordinator.resumeOpen(owner.pending);
+	const pending = owner.pending;
+	const selection = await owner.coordinator.resumeOpen(pending);
 	owner.last = selection;
 	if (selection.receipt.routing.action !== "PROCEED")
 		return {
 			kind: selection.receipt.routing.action === "RETAIN_LIVE" ? "uncertain_cursor" : "selection_incomplete",
 			handle: owner.coordinator.handle,
-			op: owner.pending,
+			op: pending,
 			selection,
 		};
 	try {
 		const result = await createEmbeddedAgentSession(options);
 		if (!owner.interaction) throw new Error("native_interaction_not_registered");
 		owner.cleanup = () => result.releaseResources();
+		const handoff = await owner.coordinator.resumeOpen(pending);
+		owner.last = handoff;
+		if (handoff.receipt.routing.action !== "PROCEED") throw new Error("native_runtime_handoff_not_ready");
 		const handle = owner.coordinator.publishRuntime();
-		return { kind: "opened", result, handle, op: owner.pending, selection, interaction: owner.interaction };
+		bindNativeRuntimeInvocation(handle, () => owner.pending);
+		const runtime = createNativeEmbeddedRuntime(handle, result);
+		return {
+			kind: "opened",
+			result,
+			runtime,
+			handle,
+			op: pending,
+			selection: handoff,
+			interaction: owner.interaction,
+		};
 	} catch (error) {
-		const final = owner.last ?? (await owner.coordinator.startupFailed(owner.pending));
+		const final = await owner.coordinator.startupFailed(pending);
 		owner.last = final;
 		return {
 			kind: "startup_failed",
 			handle: owner.coordinator.handle,
-			op: owner.pending,
+			op: pending,
 			selection: final,
 			error: error instanceof Error ? error.message : String(error),
 		};
 	}
 }
 
+function createNativeEmbeddedRuntime(
+	handle: NativeLifecycleHandle,
+	result: EmbeddedAgentSessionResult,
+): NativeEmbeddedRuntime {
+	const session = result.session;
+	const runtime: NativeEmbeddedRuntime = {
+		prompt: Object.freeze({
+			prompt: (...args) => invokeNativeRuntime(handle, "prompt", () => session.prompt(...args)),
+			promptCustomMessage: (...args) =>
+				invokeNativeRuntime(handle, "prompt", () => session.promptCustomMessage(...args)),
+			sendUserMessage: (...args) => invokeNativeRuntime(handle, "prompt", () => session.sendUserMessage(...args)),
+			submitUserMessage: (...args) =>
+				invokeNativeRuntime(handle, "prompt", () => session.submitUserMessage(...args)),
+			continuePersistedHistory: (...args) =>
+				invokeNativeRuntime(handle, "prompt", () => session.continuePersistedHistory(...args)),
+		}),
+		queue: Object.freeze({
+			steer: (...args) => invokeNativeRuntime(handle, "queue", () => session.steer(...args)),
+			followUp: (...args) => invokeNativeRuntime(handle, "queue", () => session.followUp(...args)),
+			cancelAndSubmit: (...args) => invokeNativeRuntime(handle, "queue", () => session.cancelAndSubmit(...args)),
+			cancelQueuedMessage: (...args) =>
+				invokeNativeRuntime(handle, "queue", () => session.cancelQueuedMessage(...args)),
+			cancelQueuedInputSubmission: (...args) =>
+				invokeNativeRuntime(handle, "queue", () => session.cancelQueuedInputSubmission(...args)),
+			removeQueuedMessageForEditing: (...args) =>
+				invokeNativeRuntime(handle, "queue", () => session.removeQueuedMessageForEditing(...args)),
+			moveQueuedMessageForEditing: (...args) =>
+				invokeNativeRuntime(handle, "queue", () => session.moveQueuedMessageForEditing(...args)),
+			popLastQueuedMessage: (...args) =>
+				invokeNativeRuntime(handle, "queue", () => session.popLastQueuedMessage(...args)),
+			setSteeringMode: (...args) => invokeNativeRuntime(handle, "queue", () => session.setSteeringMode(...args)),
+			setFollowUpMode: (...args) => invokeNativeRuntime(handle, "queue", () => session.setFollowUpMode(...args)),
+			setToolInterruptPolicy: (...args) =>
+				invokeNativeRuntime(handle, "queue", () => session.setToolInterruptPolicy(...args)),
+			abort: (...args) => invokeNativeRuntime(handle, "queue", () => session.abort(...args)),
+		}),
+		model: Object.freeze({
+			setModelTemporaryForControl: (...args) =>
+				invokeNativeRuntime(handle, "model", () => session.setModelTemporaryForControl(...args)),
+			setDefaultModelSelection: (...args) =>
+				invokeNativeRuntime(handle, "model", () => session.setDefaultModelSelection(...args)),
+			activateModelProfileForControl: (...args) =>
+				invokeNativeRuntime(handle, "model", () => session.activateModelProfileForControl(...args)),
+			cycleModel: (...args) => invokeNativeRuntime(handle, "model", () => session.cycleModel(...args)),
+			setSessionAgentModelSelection: (...args) =>
+				invokeNativeRuntime(handle, "model", () => session.setSessionAgentModelSelection(...args)),
+			setThinkingLevel: (...args) => invokeNativeRuntime(handle, "model", () => session.setThinkingLevel(...args)),
+			cycleThinkingLevel: (...args) =>
+				invokeNativeRuntime(handle, "model", () => session.cycleThinkingLevel(...args)),
+		}),
+		workflow: Object.freeze({
+			invokeSkill: (...args) => invokeNativeRuntime(handle, "workflow", () => session.invokeSkill(...args)),
+			setSdkPlanMode: (...args) => invokeNativeRuntime(handle, "workflow", () => session.setSdkPlanMode(...args)),
+			operateGoal: (...args) => invokeNativeRuntime(handle, "workflow", () => session.operateGoal(...args)),
+		}),
+		operator: Object.freeze({
+			execute: (...args) =>
+				invokeNativeRuntime(handle, "operator", () => getSessionClientControls(session).operator.execute(...args)),
+			read: (...args) =>
+				invokeNativeRuntime(handle, "operator", () => getSessionClientControls(session).operator.read(...args)),
+			cancel: (...args) =>
+				invokeNativeRuntime(handle, "operator", () => getSessionClientControls(session).operator.cancel(...args)),
+		}),
+		activity: Object.freeze({
+			control: (operation, input) =>
+				invokeNativeRuntime(handle, "activity", () => {
+					const activity = getSessionClientControls(session).activity;
+					if (!activity) throw new Error("Native activity controls unavailable");
+					return activity.control(operation, input);
+				}),
+		}),
+		preferences: Object.freeze({
+			handle: (...args) =>
+				invokeNativeRuntime(handle, "preferences", () =>
+					getSessionClientControls(session).preferences.handle(...args),
+				),
+		}),
+		authorization: Object.freeze({
+			execute: (...args) =>
+				invokeNativeRuntime(handle, "authorization", () =>
+					getSessionClientControls(session).authorization.execute(...args),
+				),
+		}),
+		composer: Object.freeze({
+			dispatch: (...args) =>
+				invokeNativeRuntime(handle, "composer", () => getSessionClientControls(session).composer.dispatch(...args)),
+		}),
+		diff: Object.freeze({
+			dispatch: (...args) =>
+				invokeNativeRuntime(handle, "diff", () => getSessionClientControls(session).diff.dispatch(...args)),
+		}),
+		side: Object.freeze({
+			control: (...args) =>
+				invokeNativeRuntime(handle, "side", () => getSessionClientControls(session).side.control(...args)),
+		}),
+	};
+	return Object.freeze(runtime);
+}
+
 /** Resume only the retained coordinator-owned open, with the original factory inputs. */
 export function resumeEmbeddedAgentSession(handle: NativeLifecycleHandle): Promise<NativeEmbeddedOpenResult> {
 	const owner = ownerFor(handle);
-	return continueOpen(owner, owner.options);
+	return continueOpen(owner);
 }
 
 export async function reconcileEmbeddedResumeCheckpoint(
@@ -427,11 +625,13 @@ export async function selectEmbeddedExecutionBranch(
 	input: { readonly op: string },
 ): Promise<PendingResumeOp> {
 	const owner = ownerFor(handle);
-	if (owner.manager.getStrictCloseState().kind !== "none_started") throw new Error("manager_closed");
-	const pending = await owner.manager.appendResumeCursorDurably(targetLeafId, { op: input.op, reason: "explicit" });
-	owner.operations.add(pending);
-	owner.pending = pending;
-	return pending;
+	return serializeNativeRuntimeSelection(handle, async () => {
+		if (owner.manager.getStrictCloseState().kind !== "none_started") throw new Error("manager_closed");
+		const pending = await owner.manager.appendResumeCursorDurably(targetLeafId, { op: input.op, reason: "explicit" });
+		owner.operations.add(pending);
+		owner.pending = pending;
+		return pending;
+	});
 }
 export function recordEmbeddedResumeCheckpoint(
 	handle: NativeLifecycleHandle,

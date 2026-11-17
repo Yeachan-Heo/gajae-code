@@ -88,6 +88,7 @@ export {
 	type NativeEmbeddedAgentSessionOptions,
 	type NativeEmbeddedOpenResult,
 	type NativeEmbeddedOptions,
+	type NativeEmbeddedRuntime,
 	type NativeFreshEmbeddedOptions,
 	prepareEmbeddedDisconnect,
 	probeEmbeddedSessionOwnership,
@@ -101,6 +102,7 @@ export {
 export type {
 	NativeDisconnectConsent,
 	NativeDisconnectPreparation,
+	NativeInvocationResult,
 	NativeLifecycleHandle,
 	NativeReconcileMode,
 	NativeTerminationConsent,

@@ -217,6 +217,24 @@ host; reconstructing them from JSON does not restore authority. A selector is no
 permission to open a writer. Explicit selection supplies its original snapshot
 digest and a target entry or `null` (the empty root), plus a stable operation ID.
 
+Dispatch native controls through the closed `opened.runtime` facade, for example
+`await opened.runtime.prompt.prompt(text)`. Its methods return an `applied` value
+with reconciliation evidence or a typed `refused` result. A retained raw session or
+control service does not retain native invocation authority. Calling RECON and then
+mutating `opened.result.session` is not an alternative dispatch path. Producer hooks
+reacquire short publication checkpoints after asynchronous preflight; only the exact
+already-published owned suffix can receive a fresh durability repair before dispatch.
+The checkpoint does not remain held for a provider stream or other operation future.
+Termination stops the exact registered side/operator producers and joins their real
+executor and cleanup futures before closing the transcript writer.
+
+Fresh native creation uses an opaque, single-use allocation of an unpredictable new
+header identity, not a missing-file exemption or a legacy-takeover attestation.
+Cloned, reused and mismatched allocation claims cannot replace that authority;
+existing bytes, markers, live owners and independent uncertainty still refuse.
+Factory-created metadata is accounted for by the still-owned OPEN coordinator before
+runtime publication, without constructing another runtime or granting raw controls.
+
 `probeEmbeddedSessionOwnership` is read-only. An explicit, acknowledged
 `attestEmbeddedLegacyTakeover` receipt applies only to the bounded legacy takeover
 row; it cannot override enrolled owners, ambiguous history, unresolved authority

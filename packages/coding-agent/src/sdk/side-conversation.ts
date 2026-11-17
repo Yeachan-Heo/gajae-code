@@ -22,6 +22,7 @@ export {
 } from "./protocol/client-control-contracts";
 
 import { collectSdkStoredSecrets } from "./credential-secrets";
+import { assertNativeRuntimeEffect, assertNativeRuntimeInvocation, retainNativeRuntimeWork } from "./native-lifecycle";
 import type { SideConversationOperation } from "./protocol/client-control-contracts";
 export const SIDE_CONVERSATION_MAX_DELTA_CHUNKS = 256;
 export const SIDE_CONVERSATION_MAX_DELTA_CHARS = 32 * 1024;
@@ -52,6 +53,7 @@ interface ActiveTurn {
 	manager: AgentSession["sessionManager"];
 	identity: number;
 	cleanupSettled: boolean;
+	promise?: Promise<void>;
 	question: string;
 	answer: string;
 	observedBytes: number;
@@ -342,7 +344,7 @@ export class SideConversationControls {
 	async #run(conversation: Conversation, active: ActiveTurn): Promise<void> {
 		const turn = active.turn;
 		try {
-			const result = await this.#session.runEphemeralTurn({
+			const completion = this.#session.runEphemeralTurn({
 				purpose: "btw",
 				turn: { question: active.question, scope: conversation.scope },
 				contextExchanges: structuredClone(conversation.exchanges),
@@ -366,6 +368,8 @@ export class SideConversationControls {
 					if (active.redactor) this.#append(conversation, active, active.redactor.push(text));
 				},
 			});
+			retainNativeRuntimeWork(this.#session, completion);
+			const result = await completion;
 			if (this.#current(conversation, active)) {
 				const observedBytes = Math.max(active.observedBytes, utf8ByteLength(result.replyText));
 				// UTF-8 truncation may leave up to three bytes unused at a code-point boundary.
@@ -467,23 +471,27 @@ export class SideConversationControls {
 			redactor: new SideOutputRedactor(conversation.secrets),
 			abort: new AbortController(),
 		};
+		assertNativeRuntimeEffect(this.#session, "side");
 		conversation.active = active;
 		sideTurnOwners.set(this.#session, active);
 		conversation.dto.turns.push(turn);
 		conversation.dto.revision++;
 		this.#bound(conversation);
-		void this.#run(conversation, active);
+		active.promise = this.#run(conversation, active);
+		retainNativeRuntimeWork(this.#session, active.promise);
 	}
 	control(
 		operation: SideConversationOperation,
 		input: Record<string, unknown>,
 	): SideConversationSnapshot | { closed: true } {
+		assertNativeRuntimeInvocation(this.#session);
 		this.#live();
 		if (operation === "btw.open") {
 			fields(input, [], ["question"]);
 			if (this.#conversation) fail("busy", "Close the current side conversation before opening another.");
 			this.#assertAdmission();
 			const secrets = this.#storedSecrets();
+			assertNativeRuntimeEffect(this.#session, "side");
 			const scope = this.#session.createBtwConversationScope(btwUserPrompt);
 			const conversation: Conversation = {
 				dto: { id: randomUUID(), generation: this.#generation, revision: 0, turns: [] },
@@ -517,6 +525,7 @@ export class SideConversationControls {
 		);
 		const conversation = this.#resolve(input);
 		if (operation === "btw.close") {
+			assertNativeRuntimeEffect(this.#session, "side");
 			this.#clear();
 			return { closed: true };
 		}
@@ -525,6 +534,7 @@ export class SideConversationControls {
 			const active = conversation.active;
 			if (!active || active.turn.id !== input.turnId)
 				fail("resource_gone", "The specified side turn is not running.");
+			assertNativeRuntimeEffect(this.#session, "side");
 			active.abort.abort();
 			this.#finishStream(conversation, active);
 			if (active.turn.status !== "unknown_effect") active.turn.status = "cancelled";

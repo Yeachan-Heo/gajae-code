@@ -857,6 +857,9 @@ describe("SDK preference controls", () => {
 		});
 		expect(await Bun.file(target).text()).toBe("temperature: 0.2\n");
 		expect(await fs.readdir(outside)).toEqual(["config.yml"]);
+		// The session's final authenticated append must not inspect the deliberately
+		// malformed project root. Retire only this fixture's hostile entry first.
+		await fs.rm(directory, { recursive: true, force: true });
 	});
 
 	it("refuses scopes ignored by Settings and project targets that alias global storage", async () => {

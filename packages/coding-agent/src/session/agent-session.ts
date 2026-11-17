@@ -148,7 +148,14 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
-import { assertNativeDisposalAuthorized } from "../sdk/native-lifecycle";
+import {
+	assertNativeDisposalAuthorized,
+	assertNativeRuntimeEffect,
+	assertNativeRuntimeInvocation,
+	NativeRuntimeRefusal,
+	retainNativeRuntimeWork,
+	withNativeRuntimeEffect,
+} from "../sdk/native-lifecycle";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -5133,6 +5140,7 @@ export class AgentSession {
 		allowCancelAndSubmit?: boolean;
 		internal?: boolean;
 	}): void {
+		assertNativeRuntimeInvocation(this);
 		this.#assertSessionAdmissionOpen();
 		if (!options?.internal && this.#externalStopAdmissionHolders.size > 0) {
 			const current = this.externalAdmissionTarget;
@@ -5650,7 +5658,11 @@ export class AgentSession {
 							throw this.#sessionAdmissionBusyError();
 						}
 					}
-					return await body({ release });
+					return await withNativeRuntimeEffect(
+						this,
+						kind === "prompt" ? "prompt" : kind === "mcp-control" ? "activity" : "model",
+						() => body({ release }),
+					);
 				});
 			return await (options?.skipModelRegistryLease
 				? admittedBody()
@@ -13598,7 +13610,7 @@ export class AgentSession {
 				this.#beginSessionTransition("mcp-control");
 				entered = true;
 				try {
-					return await body();
+					return await withNativeRuntimeEffect(this, "activity", body);
 				} finally {
 					this.#endSessionTransition();
 				}
@@ -13668,7 +13680,7 @@ export class AgentSession {
 				transitionCompletion = this.#sessionTransitionCompletion;
 				try {
 					assertCurrent(true);
-					const result = await body(signal);
+					const result = await withNativeRuntimeEffect(this, "activity", () => body(signal));
 					assertCurrent(true);
 					return result;
 				} finally {
@@ -15633,6 +15645,7 @@ export class AgentSession {
 
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
+		assertNativeRuntimeInvocation(this);
 		this.#assertExternalSessionIngress();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
@@ -15928,6 +15941,7 @@ export class AgentSession {
 			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		assertNativeRuntimeInvocation(this);
 		const internalOptions = {
 			...options,
 			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
@@ -15987,6 +16001,7 @@ export class AgentSession {
 	}
 
 	async setSdkPlanMode(on: boolean): Promise<PlanModeState | undefined> {
+		assertNativeRuntimeInvocation(this);
 		if (typeof on !== "boolean")
 			throw Object.assign(new Error("mode.plan.set requires a boolean on value."), { code: "invalid_input" });
 		if (!this.#sdkPlanModeHandler) {
@@ -15994,29 +16009,33 @@ export class AgentSession {
 				code: "unavailable",
 			});
 		}
-		return this.#sdkPlanModeHandler(on);
+		return withNativeRuntimeEffect(this, "workflow", () => this.#sdkPlanModeHandler!(on));
 	}
 
 	async operateGoal(
 		op: "create" | "get" | "resume" | "pause" | "complete" | "drop",
 		objective?: string,
 	): Promise<unknown> {
+		assertNativeRuntimeInvocation(this);
 		try {
 			switch (op) {
 				case "create":
-					return await this.#goalRuntime.createGoal({ objective: objective ?? "" });
+					return await withNativeRuntimeEffect(this, "workflow", () =>
+						this.#goalRuntime.createGoal({ objective: objective ?? "" }),
+					);
 				case "get":
 					return this.getGoalModeState();
 				case "resume":
-					return await this.#goalRuntime.resumeGoal();
+					return await withNativeRuntimeEffect(this, "workflow", () => this.#goalRuntime.resumeGoal());
 				case "pause":
-					return await this.#goalRuntime.pauseGoal();
+					return await withNativeRuntimeEffect(this, "workflow", () => this.#goalRuntime.pauseGoal());
 				case "complete":
-					return await this.#goalRuntime.completeGoalFromTool();
+					return await withNativeRuntimeEffect(this, "workflow", () => this.#goalRuntime.completeGoalFromTool());
 				case "drop":
-					return await this.#goalRuntime.dropGoal();
+					return await withNativeRuntimeEffect(this, "workflow", () => this.#goalRuntime.dropGoal());
 			}
 		} catch (error) {
+			if (error instanceof NativeRuntimeRefusal) throw error;
 			throw Object.assign(new Error(error instanceof Error ? error.message : "Goal operation failed."), {
 				code: "invalid_input",
 			});
@@ -16576,6 +16595,7 @@ export class AgentSession {
 	}
 
 	async setSessionAgentModelSelection(role: SessionAgentModelRole, model: Model | null): Promise<void> {
+		assertNativeRuntimeInvocation(this);
 		if (role !== "executor" && role !== "planner" && role !== "critic" && role !== "architect") {
 			throw new Error(`Unsupported session agent role: ${role}`);
 		}
@@ -16958,6 +16978,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		assertNativeRuntimeInvocation(this);
 		this.#btwPrefixLedger.clear();
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		const observer = options?.onRunAccepted;
@@ -18086,10 +18107,14 @@ export class AgentSession {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this.#extensionRunner.createCommandContext();
 
+		const execution = await withNativeRuntimeEffect(this, "prompt", () => ({
+			completion: (async () => command.handler(args, ctx))(),
+		}));
 		try {
-			await command.handler(args, ctx);
+			await execution.completion;
 			return true;
 		} catch (err) {
+			if (err instanceof NativeRuntimeRefusal) throw err;
 			// Emit error via extension runner
 			this.#extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
@@ -18251,15 +18276,18 @@ export class AgentSession {
 			hasQueuedMessages: baseCtx.hasPendingMessages,
 		} as unknown as HookCommandContext;
 
-		try {
+		const args = parseCommandArgs(argsString);
+		const execution = await withNativeRuntimeEffect(this, "prompt", () => {
 			this.#markRetryReplayUnsafe();
-
-			const args = parseCommandArgs(argsString);
-			const result = await loaded.command.execute(args, ctx);
+			return { completion: (async () => loaded.command.execute(args, ctx))() };
+		});
+		try {
+			const result = await execution.completion;
 			// If result is a string, it's a prompt to send to LLM
 			// If void/undefined, command handled everything
 			return result ?? "";
 		} catch (err) {
+			if (err instanceof NativeRuntimeRefusal) throw err;
 			// Emit error via extension runner
 			if (this.#extensionRunner) {
 				this.#extensionRunner.emitError({
@@ -18279,6 +18307,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		assertNativeRuntimeInvocation(this);
 		const hasUsableImage =
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
@@ -18374,7 +18403,9 @@ export class AgentSession {
 			(expectedPromptHandle !== undefined && this.activePromptHandle !== expectedPromptHandle)
 		)
 			throw Object.assign(new Error("The expected run is not active."), { code: "turn_not_active" });
-		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		const admission = await withNativeRuntimeEffect(this, "queue", () =>
+			this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined),
+		);
 		if (!admission.admitted) {
 			if (options?.expectedSdkRunToken !== undefined || expectedPromptHandle !== undefined)
 				throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
@@ -18663,7 +18694,9 @@ export class AgentSession {
 				allowCancelAndSubmit: options?.allowCancelAndSubmit,
 				internal: options?.claimsGenuineUserIntent !== true,
 			});
-			return this.#queueFollowUpMessage(message, displayText, options);
+			return await withNativeRuntimeEffect(this, "queue", () =>
+				this.#queueFollowUpMessage(message, displayText, options),
+			);
 		} finally {
 			releaseReservation();
 		}
@@ -19743,6 +19776,7 @@ export class AgentSession {
 
 	/** Remove only a still-executable display identity; stale chips are not cancellation receipts. */
 	cancelQueuedMessage(id: string): QueuedInputCancelResult {
+		assertNativeRuntimeInvocation(this, true);
 		const row = this.getQueuedMessageEntries().find(entry => entry.id === id);
 		if (!row) return "unknown";
 		if (row.submissionId) return this.cancelQueuedInputSubmission(row.submissionId);
@@ -19761,6 +19795,7 @@ export class AgentSession {
 
 	/** Exact tracked cancellation; a delivered submission never authorizes aborting its run. */
 	cancelQueuedInputSubmission(submissionId: string): QueuedInputCancelResult {
+		assertNativeRuntimeInvocation(this, true);
 		const state = this.#trackedQueuedInputs.get(submissionId);
 		if (!state) return "unknown";
 		if (state.executionSettled || this.#trackedQueuedInputsAwaitingOwnRun.has(state)) return "already_executing";
@@ -19800,6 +19835,7 @@ export class AgentSession {
 	}
 
 	removeQueuedMessageForEditing(id: string): string | undefined {
+		assertNativeRuntimeInvocation(this, true);
 		const [mode, sequenceText] = id.split(":");
 		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return undefined;
 		const sequence = Number(sequenceText);
@@ -19864,6 +19900,7 @@ export class AgentSession {
 	}
 
 	moveQueuedMessageForEditing(id: string, direction: "up" | "down"): boolean {
+		assertNativeRuntimeEffect(this, "queue");
 		const [mode, sequenceText] = id.split(":");
 		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return false;
 		const sequence = Number(sequenceText);
@@ -19925,6 +19962,7 @@ export class AgentSession {
 	 * record — no orphan state can outlive the queue entry.
 	 */
 	popLastQueuedMessage(): string | undefined {
+		assertNativeRuntimeEffect(this, "queue");
 		const steeringEntry = this.#steeringMessages.at(-1);
 		const followUpEntry = this.#followUpMessages.at(-1);
 
@@ -20510,6 +20548,7 @@ export class AgentSession {
 		silent?: boolean;
 		preserveCompaction?: boolean;
 	}): Promise<void> {
+		assertNativeRuntimeInvocation(this, true);
 		this.#btwPrefixLedger.clear();
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
@@ -20948,6 +20987,7 @@ export class AgentSession {
 
 	/** Atomically interrupt the active run and make text the next prompt. */
 	async cancelAndSubmit(text: string, options?: { queuedEntryId?: string }): Promise<CancelAndSubmitOutcome> {
+		assertNativeRuntimeInvocation(this);
 		if (this.#cancelAndSubmitInProgress) return { kind: "refused", reason: "duplicate" };
 		if (this.isCompacting) return { kind: "refused", reason: "compaction" };
 
@@ -23390,8 +23430,9 @@ export class AgentSession {
 		// Waiting while selection owns admission deadlocks with a scheduled
 		// continuation queued behind it. Wait before acquiring the mutation lease.
 		await this.waitForIdle();
+		assertNativeRuntimeInvocation(this);
 		return this.#withSessionAdmission("selection", async () => {
-			return await body();
+			return await withNativeRuntimeEffect(this, "model", body);
 		});
 	}
 
@@ -24633,6 +24674,7 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		assertNativeRuntimeEffect(this, "model");
 		this.#applyThinkingLevel(level, persist, false);
 	}
 
@@ -25284,6 +25326,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
+		assertNativeRuntimeEffect(this, "queue");
 		this.#assertDurableSettingsWritable();
 		this.agent.setSteeringMode(mode);
 		this.settings.set("steeringMode", mode);
@@ -25294,6 +25337,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+		assertNativeRuntimeEffect(this, "queue");
 		this.#assertDurableSettingsWritable();
 		this.agent.setFollowUpMode(mode);
 		this.settings.set("followUpMode", mode);
@@ -25304,6 +25348,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setToolInterruptPolicy(policy: "abort_tools" | "finish_tools"): void {
+		assertNativeRuntimeEffect(this, "queue");
 		this.#assertDurableSettingsWritable();
 		this.agent.setToolInterruptPolicy(policy);
 		this.settings.set("toolInterruptPolicy", policy);
@@ -31391,7 +31436,7 @@ export class AgentSession {
 						if (acceptance !== undefined) await acceptance;
 						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 					}
-					await this.agent.prompt(messages, options);
+					await withNativeRuntimeEffect(this, "prompt", () => this.agent.prompt(messages, options));
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 					return;
 				} catch (error) {
@@ -31542,6 +31587,17 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
 	): Promise<BashResult> {
+		assertNativeRuntimeInvocation(this);
+		const completion = this.#executeNativeBoundBash(command, onChunk, options);
+		retainNativeRuntimeWork(this, completion);
+		return completion;
+	}
+
+	async #executeNativeBoundBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
+	): Promise<BashResult> {
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
 		const managerId = manager.getSessionId();
@@ -31575,12 +31631,14 @@ export class AgentSession {
 		try {
 			let result: BashResult | undefined;
 			if (!signal.aborted && ownsSession() && this.#extensionRunner?.hasHandlers("user_bash")) {
-				const hookResult = await this.#extensionRunner.emitUserBash({
-					type: "user_bash",
-					command,
-					excludeFromContext,
-					cwd,
-				});
+				const hookResult = await withNativeRuntimeEffect(this, "operator", () =>
+					this.#extensionRunner!.emitUserBash({
+						type: "user_bash",
+						command,
+						excludeFromContext,
+						cwd,
+					}),
+				);
 				result = hookResult?.result;
 			}
 
@@ -31598,23 +31656,26 @@ export class AgentSession {
 				};
 			}
 
-			result ??= await executeBashCommand(command, {
-				onChunk,
-				settings: this.settings,
-				signal,
-				sessionKey: sessionId,
-				cwd,
-				timeout: clampTimeout("bash") * 1000,
-				env: buildGjcRuntimeSessionEnv({
-					sessionFile: null,
-					sessionId,
+			result ??= await withNativeRuntimeEffect(this, "operator", () =>
+				executeBashCommand(command, {
+					onChunk,
+					settings: this.settings,
+					signal,
+					sessionKey: sessionId,
 					cwd,
+					timeout: clampTimeout("bash") * 1000,
+					env: buildGjcRuntimeSessionEnv({
+						sessionFile: null,
+						sessionId,
+						cwd,
+					}),
+					onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 				}),
-				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
-			});
+			);
 
 			if (ownsSession()) {
-				this.recordBashResult(command, result, options);
+				const completed = result;
+				await withNativeRuntimeEffect(this, "operator", () => this.recordBashResult(command, completed, options));
 				if (result.exitCode === 0 && !result.cancelled) {
 					await this.#activatePendingGjcGoalModeRequest();
 				}
@@ -31713,6 +31774,17 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
 	): Promise<PythonResult> {
+		assertNativeRuntimeInvocation(this);
+		const completion = this.#executeNativeBoundPython(code, onChunk, options);
+		retainNativeRuntimeWork(this, completion);
+		return completion;
+	}
+
+	async #executeNativeBoundPython(
+		code: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
+	): Promise<PythonResult> {
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
 		const managerId = manager.getSessionId();
@@ -31766,35 +31838,40 @@ export class AgentSession {
 			if (signal.aborted || !ownsSession()) return cancelledResult();
 			let result: PythonResult | undefined;
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
-				const hookResult = await this.#extensionRunner.emitUserPython({
-					type: "user_python",
-					code,
-					excludeFromContext,
-					cwd,
-				});
+				const hookResult = await withNativeRuntimeEffect(this, "operator", () =>
+					this.#extensionRunner!.emitUserPython({
+						type: "user_python",
+						code,
+						excludeFromContext,
+						cwd,
+					}),
+				);
 				if (operationSignal?.aborted) throw operationSignal.reason;
 				this.assertEvalExecutionAllowed();
 				if (signal.aborted || !ownsSession()) return cancelledResult();
 				result = hookResult?.result;
 			}
 
-			result ??= await executePythonCommand(code, {
-				cwd,
-				sessionId: kernelSessionId,
-				kernelOwnerId,
-				kernelMode,
-				settings,
-				onChunk: onChunk
-					? chunk => {
-							if (ownsSession()) onChunk(chunk);
-						}
-					: undefined,
-				signal,
-			});
+			result ??= await withNativeRuntimeEffect(this, "operator", () =>
+				executePythonCommand(code, {
+					cwd,
+					sessionId: kernelSessionId,
+					kernelOwnerId,
+					kernelMode,
+					settings,
+					onChunk: onChunk
+						? chunk => {
+								if (ownsSession()) onChunk(chunk);
+							}
+						: undefined,
+					signal,
+				}),
+			);
 			// Keep tracking the backend until it settles, but never publish its
 			// result into a successor session or expose stale completion output.
 			if (!ownsSession()) return cancelledResult();
-			this.recordPythonResult(code, result, options);
+			const completed = result;
+			await withNativeRuntimeEffect(this, "operator", () => this.recordPythonResult(code, completed, options));
 			return result;
 		});
 		return await this.trackEvalExecution(execution, abortController);
@@ -32635,7 +32712,7 @@ export class AgentSession {
 			this.#btwPrefixScopes.delete(scope);
 			throw new Error("The /btw conversation scope was scrubbed.");
 		}
-		const sideAttempt = this.agent.mintSideAttemptScope();
+		const sideAttempt = await withNativeRuntimeEffect(this, "side", () => this.agent.mintSideAttemptScope());
 		this.#attemptRecordStore.register(sideAttempt.scope);
 		this.#attemptRecordStore.establishClean(sideAttempt.scope);
 		const question = args.turn.question;
@@ -32699,13 +32776,14 @@ export class AgentSession {
 			}
 			return { kind: "incomplete" };
 		};
-		const runAttempt = (context: Context, options: SimpleStreamOptions): Promise<BtwAttemptEnd> => {
-			requestSignal.throwIfAborted();
-			const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
-			const consumption = consume(iterator);
-			attempts.push({ iterator, consumption });
-			return awaitEphemeralAbort(consumption, requestSignal);
-		};
+		const runAttempt = (context: Context, options: SimpleStreamOptions): Promise<BtwAttemptEnd> =>
+			withNativeRuntimeEffect(this, "side", () => {
+				requestSignal.throwIfAborted();
+				const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
+				const consumption = consume(iterator);
+				attempts.push({ iterator, consumption });
+				return awaitEphemeralAbort(consumption, requestSignal);
+			});
 		const runProjected = async (): Promise<void> => {
 			requestSignal.throwIfAborted();
 			replyText = "";
