@@ -40,12 +40,14 @@ export interface TurnPromptImageInput {
 	mimeType?: string;
 }
 
-/** Public input contract for ordered `turn.prompt`. */
-export interface TurnPromptInput {
+/** Public input contract for ordered `turn.prompt`; direct and staged images cannot be mixed. */
+export type TurnPromptInput = {
 	text: string;
-	images?: TurnPromptImageInput[];
 	clientRef?: string;
-}
+} & (
+	| { images?: TurnPromptImageInput[]; stagedImages?: never }
+	| { images?: never; stagedImages: Array<{ id: string }> }
+);
 
 /**
  * Terminal outcome is preserved exactly; active records never age into terminal. An

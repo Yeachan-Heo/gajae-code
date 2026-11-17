@@ -146,7 +146,8 @@ export interface RunResourceLedger {
 	pending(resourceRunId: string): RunResourceEntry[];
 	/** Seal a run after terminal event publication; only sealed empty runs settle. */
 	seal(resourceRunId: string): void;
-	waitForSettlement(resourceRunId: string, options: { graceMs: number }): Promise<RunSettlementProof>;
+	/** A null grace period waits for settlement or quarantine without a deadline timer. */
+	waitForSettlement(resourceRunId: string, options: { graceMs: number | null }): Promise<RunSettlementProof>;
 	/** Terminally detach a run; its bounded tombstone remains unfenced forever. */
 	quarantine(resourceRunId: string): RunResourceEntry[];
 }
@@ -237,6 +238,8 @@ export function isContinuingMidRunMaintenanceOutcome(outcome: unknown): boolean 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	/** Session policy owns context overflow; successful empty stops remain terminal. */
 	contextOverflowManaged?: boolean;
+	/** The event consumer awaits canonical message admission before requesting its next event. */
+	canonicalEventAcknowledgment?: boolean;
 	model: Model;
 	/**
 	 * Supplies a fresh opaque token at each concrete managed transport invocation.

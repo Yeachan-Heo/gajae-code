@@ -3,6 +3,7 @@
  *
  * Creates a .tar.gz archive with session data, logs, system info, and optional profiling data.
  */
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkProfile } from "@gajae-code/natives";
@@ -13,6 +14,7 @@ import {
 	getLogPath,
 	getLogsDir,
 	getReportsDir,
+	hasFsCode,
 	isEnoent,
 	redactCrashSecrets,
 	resolveEquivalentPath,
@@ -133,6 +135,72 @@ export interface DebugLogSource {
 	loadOlderLogs(limitDays?: number): Promise<string>;
 }
 
+/** Owner-only mode. umask cannot widen this, and fchmod repeats it after open. */
+const REPORT_BUNDLE_MODE = 0o600;
+
+/**
+ * Open the archive path without following a final symlink.
+ * A missing path is created with O_EXCL. An existing regular file is replaced.
+ * A symlink fails the open (ELOOP, or EEXIST on macOS with O_EXCL) and is left in place.
+ */
+async function openReportBundleForWrite(outputPath: string): Promise<fs.FileHandle> {
+	const noFollow = process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0);
+	const createFlags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow;
+	const replaceFlags = fsConstants.O_WRONLY | noFollow;
+
+	const openRegular = async (): Promise<fs.FileHandle> => {
+		const current = await fs.lstat(outputPath);
+		if (current.isSymbolicLink() || !current.isFile()) {
+			throw new Error("report bundle output is not a regular file");
+		}
+		try {
+			return await fs.open(outputPath, replaceFlags, REPORT_BUNDLE_MODE);
+		} catch (error) {
+			if (hasFsCode(error, "ELOOP")) throw new Error("report bundle output is not a regular file");
+			throw error;
+		}
+	};
+
+	let missing = false;
+	try {
+		await fs.lstat(outputPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		missing = true;
+	}
+	if (!missing) return openRegular();
+
+	try {
+		return await fs.open(outputPath, createFlags, REPORT_BUNDLE_MODE);
+	} catch (error) {
+		if (hasFsCode(error, "ELOOP")) throw new Error("report bundle output is not a regular file");
+		if (!hasFsCode(error, "EEXIST")) throw error;
+	}
+	return openRegular();
+}
+
+async function writeReportBundleFile(outputPath: string, bytes: Uint8Array): Promise<void> {
+	const handle = await openReportBundleForWrite(outputPath);
+	try {
+		const opened = await handle.stat();
+		const current = await fs.lstat(outputPath);
+		if (
+			current.isSymbolicLink() ||
+			!opened.isFile() ||
+			!current.isFile() ||
+			opened.dev !== current.dev ||
+			opened.ino !== current.ino
+		) {
+			throw new Error("report bundle output is not a regular file");
+		}
+		if (process.platform !== "win32") await handle.chmod(REPORT_BUNDLE_MODE);
+		await handle.truncate(0);
+		await handle.writeFile(bytes);
+	} finally {
+		await handle.close();
+	}
+}
+
 /**
  * Create a debug report bundle.
  *
@@ -237,8 +305,9 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 		data[archivePath] = redactCrashSecrets(content);
 	}
 
-	// Write archive
-	await Bun.Archive.write(outputPath, data, { compress: "gzip" });
+	// Write archive. Bytes are built in memory so the path open can refuse a symlink.
+	const archiveBytes = await new Bun.Archive(data, { compress: "gzip" }).bytes();
+	await writeReportBundleFile(outputPath, archiveBytes);
 
 	return { path: outputPath, files };
 }

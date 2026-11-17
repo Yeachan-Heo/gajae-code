@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
+	CRASH_FINGERPRINT_VERSION,
 	computeCrashFingerprint,
+	computeCrashFingerprintV1,
 	formatCrashRecordMarker,
 	NO_APP_FRAME,
 	normalizeCrashFrames,
@@ -119,8 +121,26 @@ describe("computeCrashFingerprint", () => {
 	it("emits 32 lowercase hex characters and records the algorithm version", () => {
 		const result = computeCrashFingerprint({ name: "Error", message: "boom", stack: "" }, OPTIONS);
 		expect(result.fingerprint).toMatch(/^[0-9a-f]{32}$/);
-		expect(result.version).toBe(1);
+		expect(result.version).toBe(CRASH_FINGERPRINT_VERSION);
 		expect(result.frames).toEqual([NO_APP_FRAME]);
+	});
+
+	it("keeps historical v1 normalization while the current version redacts pw aliases", () => {
+		const input = { name: "Error", message: "failed to authenticate pw=top-secret", stack: "" };
+		const historical = computeCrashFingerprintV1(input, OPTIONS);
+		const current = computeCrashFingerprint(input, OPTIONS);
+
+		expect(historical.messageClass).toBe("failed to authenticate pw=«redacted»");
+		expect(historical.messageClass).toBe(current.messageClass);
+		expect(historical.version).toBe(1);
+		expect(current.messageClass).toBe("failed to authenticate pw=«redacted»");
+		expect(current.version).toBe(CRASH_FINGERPRINT_VERSION);
+		expect(current.fingerprint).not.toBe(historical.fingerprint);
+
+		const unchanged = { name: "Error", message: "connection refused", stack: "" };
+		expect(computeCrashFingerprint(unchanged, OPTIONS).fingerprint).toBe(
+			computeCrashFingerprintV1(unchanged, OPTIONS).fingerprint,
+		);
 	});
 
 	it("never hashes raw path or secret text (only its normalized form)", () => {

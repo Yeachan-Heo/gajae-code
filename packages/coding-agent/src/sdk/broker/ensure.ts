@@ -4,6 +4,7 @@ import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
+import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import packageJson from "../../../package.json" with { type: "json" };
 import {
@@ -12,6 +13,7 @@ import {
 	type FileLockOptions,
 	withFileLock,
 } from "../../config/file-lock";
+import { trustedCoordinatorEnv } from "../../gjc-runtime/sidecar-bootstrap-env";
 import { SdkClient, SdkClientError } from "../client/client";
 import { type BrokerStartupExitRecord, clearBrokerStartupExitRecord, readBrokerStartupExitRecord } from "./broker-exit";
 import {
@@ -726,13 +728,64 @@ export interface BrokerStartupLockOptions {
 	onContended?: () => void;
 }
 
+const BROKER_TEST_SIGNAL_DIR_ENV = "GJC_SDK_TEST_BROKER_SIGNAL_DIR";
+/** Bound the project dotenv read. A FIFO or a larger file is incomplete and rejected. */
+const BROKER_SIGNAL_DOTENV_MAX_BYTES = 64 * 1024;
+
+/**
+ * Dotenv from the cwd that first loaded this module. `launch --worktree` changes
+ * cwd after Bun has already copied that file into `process.env`.
+ */
+const startupBrokerSignalSnapshot = projectEnvSnapshot(process.cwd(), {
+	maxFileBytes: BROKER_SIGNAL_DOTENV_MAX_BYTES,
+});
+
+function brokerSignalSnapshots(override?: readonly ProjectEnvSnapshot[]): readonly ProjectEnvSnapshot[] {
+	if (override) return override;
+	return [
+		projectEnvSnapshot(process.cwd(), { maxFileBytes: BROKER_SIGNAL_DOTENV_MAX_BYTES }),
+		startupBrokerSignalSnapshot,
+	];
+}
+
+/**
+ * Operator environment only. A directory declared by the project dotenv is
+ * ignored so startup cannot create a path the repository chose.
+ * No signal value means no later dotenv read, so an unused seam cannot stall startup.
+ * An incomplete startup or cwd snapshot rejects the value.
+ */
+function trustedBrokerTestSignalDirectory(
+	env: NodeJS.ProcessEnv,
+	snapshots?: readonly ProjectEnvSnapshot[],
+): string | undefined {
+	const raw = env[BROKER_TEST_SIGNAL_DIR_ENV];
+	if (!raw) return undefined;
+	let accepted: string | undefined;
+	for (const snapshot of brokerSignalSnapshots(snapshots)) {
+		if (snapshot.incomplete) return undefined;
+		const trusted = trustedCoordinatorEnv(BROKER_TEST_SIGNAL_DIR_ENV, env, snapshot);
+		if (trusted === undefined) return undefined;
+		accepted = trusted;
+	}
+	return accepted;
+}
+
+/** Drop a project-dotenv signal directory. Keep a trusted directory as the value that was accepted. */
+function scrubUntrustedBrokerTestSignalDirectory(environment: NodeJS.ProcessEnv): void {
+	const trusted = trustedBrokerTestSignalDirectory(environment);
+	for (const name of Object.keys(environment)) {
+		if (name.toUpperCase() === BROKER_TEST_SIGNAL_DIR_ENV) delete environment[name];
+	}
+	if (trusted !== undefined) environment[BROKER_TEST_SIGNAL_DIR_ENV] = trusted;
+}
+
 /**
  * Test-only phase observation for detached broker startup regressions. The
- * signal is opt-in through the child environment and never affects broker
- * ownership or error handling when the test seam is absent.
+ * directory is opt-in through a trusted operator environment and never affects
+ * broker ownership or error handling when the seam is absent.
  */
 export async function emitBrokerStartupTestSignal(signal: string): Promise<void> {
-	const directory = process.env.GJC_SDK_TEST_BROKER_SIGNAL_DIR;
+	const directory = trustedBrokerTestSignalDirectory(process.env);
 	if (!directory || !/^[a-z0-9-]+$/.test(signal)) return;
 	try {
 		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -915,6 +968,27 @@ export async function readBrokerSpawnLogTail(spawnLogPath: string): Promise<stri
 		return (await tail.text()).trim();
 	} catch {
 		return "";
+	}
+}
+
+/**
+ * A startup-failure marker can be published before the broker finishes writing
+ * its final stderr diagnostics. Wait for that exact process to exit before
+ * sampling the inherited log descriptor; cleanup reaps it if the bounded wait
+ * expires.
+ */
+async function waitForBrokerExitBeforeReadingSpawnLog(
+	pid: number | undefined,
+	incarnation: string | undefined,
+	timeoutMs: number,
+): Promise<void> {
+	if (pid === undefined || incarnation === undefined || timeoutMs <= 0) return;
+	try {
+		const brokerProcess = nativeProcessBindings().Process.fromPid(pid);
+		if (!brokerProcess || brokerProcess.incarnation !== incarnation) return;
+		await brokerProcess.waitForExit({ timeoutMs });
+	} catch {
+		// Diagnostic draining must not prevent the owned broker from being reaped.
 	}
 }
 
@@ -1270,6 +1344,7 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 		delete environment.PI_COMPILED;
 		delete environment.GJC_COMPILED;
 	}
+	scrubUntrustedBrokerTestSignalDirectory(environment);
 	return environment;
 }
 
@@ -1759,6 +1834,21 @@ async function ensureBrokerOnce(
 				await ensureBrokerTiming.sleep(50);
 			}
 		}
+		if (exitedBeforeDiscovery) {
+			await waitForBrokerExitBeforeReadingSpawnLog(
+				realBrokerPid,
+				childIncarnation,
+				Math.max(0, Math.floor(deadline - ensureBrokerTiming.now())),
+			);
+		}
+		let cleanupFailed = false;
+		let cleanupError: unknown;
+		try {
+			await owner.stop();
+		} catch (error) {
+			cleanupFailed = true;
+			cleanupError = error;
+		}
 		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
 		// A marker only wins over the generic fallback when it was written by the
 		// exact child this call just spawned and reaped. The pre-spawn clear
@@ -1779,9 +1869,7 @@ async function ensureBrokerOnce(
 				: discoveryError
 					? discoveryError
 					: new Error("Timed out waiting for detached SDK broker discovery.");
-		try {
-			await owner.stop();
-		} catch (cleanupError) {
+		if (cleanupFailed) {
 			throw new AggregateError(
 				[failure, cleanupError],
 				"SDK broker discovery and spawned broker cleanup both failed.",
@@ -1959,6 +2047,14 @@ export function signalDetachedBrokerProcessForTest(
 	platform: NodeJS.Platform,
 ): boolean {
 	return signalDetachedBrokerProcess(pid, brokerIncarnation, signal, platform);
+}
+/** Test hook: the signal directory accepted from this environment and snapshot. */
+export function trustedBrokerSignalDirectoryForTest(
+	env: NodeJS.ProcessEnv,
+	snapshot: ProjectEnvSnapshot | readonly ProjectEnvSnapshot[],
+): string | undefined {
+	const snapshots = Array.isArray(snapshot) ? snapshot : [snapshot];
+	return trustedBrokerTestSignalDirectory(env, snapshots);
 }
 /** Test hook: resolves the complete broker environment without spawning. */
 export function brokerSpawnEnvironmentForTest(

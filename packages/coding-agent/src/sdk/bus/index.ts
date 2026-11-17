@@ -20,7 +20,6 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -34,8 +33,12 @@ import {
 	type RunSettlementProof,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
+import { containsSecretConfigKey } from "../protocol/adapter-validation";
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
 let nativeSdkBusBindings: NativeSdkBusBindings | undefined;
@@ -53,7 +56,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 
 type NotificationServer = NativeNotificationServer;
 
-import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+import { $credentialEnv, isRecord, logger, postmortem, VERSION } from "@gajae-code/utils";
 
 import { AsyncJobManager } from "../../async";
 import {
@@ -71,7 +74,8 @@ import {
 	type WorkflowGateTerminalController,
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
+import type { BtwTextExchange } from "../../session/btw-contract";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
 	createSessionWorkLease,
@@ -107,7 +111,12 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
+import {
+	allocateSessionEventGeneration,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionIndexEvent,
+} from "../broker/session-index";
 import {
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
@@ -121,9 +130,22 @@ import {
 	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
-import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import {
+	type AbortScope,
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	createBtwAskHandler,
+	dispatchControl,
+	type EphemeralQuestionRunner,
+	TypedControlError,
+} from "../host/control";
+import {
+	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
+} from "../host/control/runtime-gate";
+import { ExternalPermissionRuntime } from "../host/external-permissions";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
+import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { RESPONSE_CEILING_BYTES } from "../host/query/handlers";
 import type { SdkFrame } from "../host/types";
@@ -192,7 +214,13 @@ import {
 	EXISTING_THREAD_BIND_ENV,
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
-import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import {
+	imageAttachmentsFromMessage,
+	messageContinuesToolLoop,
+	notificationActionPayload,
+	summaryFromMessage,
+	truncate,
+} from "./helpers";
 import {
 	createKindAwareReconciliation,
 	type KindAwareReconciliation,
@@ -1234,9 +1262,27 @@ export class PresentationArbiter {
 	}
 }
 
+/** One deferred lean receipt: the text a finalized turn would settle as. */
+interface SettlementReceipt {
+	text: string;
+	messageRef?: string;
+	origin: "user" | "autonomous" | "continuation";
+	/**
+	 * False for tool-loop narration: the turn requested tools, so the agent was
+	 * still working and the text is not an answer that may anchor a composition.
+	 */
+	settled: boolean;
+}
+
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	externalPermissions: ExternalPermissionRuntime;
+	clearPermissionProvider: () => void;
+	imageUploads: PromptImageUploadStore | undefined;
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
+	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
+	releaseAcceptedImages: () => void;
 	getJoinedPromptCorrelations: (owner: AgentTerminalOwnerContext) => Array<{ commandId: string; turnId: string }>;
 	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
 	retireJoinedPromptOwners: () => void;
@@ -1335,8 +1381,13 @@ interface SessionRuntime {
 	pendingPromptCorrelationsBySdkRunToken: Map<string, { commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
-	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
-	bindPromptExecutionHandle: (correlation: { commandId: string; turnId: string }, handle: string | undefined) => void;
+	/** Bind a start, or transfer its exact continuing lifecycle to a new Agent run. */
+	bindPromptLifecycle: (
+		correlation: { commandId: string; turnId: string },
+		handle: string | undefined,
+		scope: AttemptScope | undefined,
+		continuation: boolean,
+	) => void;
 	/** Reads the durable non-terminal claim for a correlated prompt, if any. */
 	peekPromptPendingOutcome: (correlation: {
 		commandId: string;
@@ -1397,7 +1448,7 @@ interface SessionRuntime {
 	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
 	pendingFinal?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
+		receipts: SettlementReceipt[];
 	};
 	/** Monotonic user-request boundary for deferred lean delivery. */
 	settlementWindow: number;
@@ -1409,12 +1460,13 @@ interface SessionRuntime {
 	 * Lean-mode deferred receipts for the current user-request settlement window.
 	 * Ordinary tool-loop turns retain latest-turn-wins behaviour. An autonomous
 	 * continuation has no new user request, so it appends instead of erasing the
-	 * prior receipt. The small fixed receipt bound prevents an unbounded idle wait
-	 * from retaining the full transcript.
+	 * prior settled receipt; tool-loop narration never anchors that composition.
+	 * The small fixed receipt bound prevents an unbounded idle wait from retaining
+	 * the full transcript.
 	 */
 	pendingSettled?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
+		receipts: SettlementReceipt[];
 	};
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
@@ -1433,6 +1485,8 @@ interface SessionRuntime {
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
 	abortEphemeralTurns: () => void;
+	/** Cancels connection-owned SDK BTW questions. */
+	abortBtwQuestions: () => void;
 }
 
 const SENSITIVE_MODEL_LABEL =
@@ -1828,10 +1882,6 @@ interface SafeUsageWindow {
 	resetsAt?: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function classifyUsageWindow(limit: Record<string, unknown>): "5h" | "7d" | undefined {
 	const window = isRecord(limit.window) ? limit.window : undefined;
 	const scope = isRecord(limit.scope) ? limit.scope : undefined;
@@ -1981,7 +2031,7 @@ async function executeNotificationControlCommandUnchecked(
 			const global = command.global === true;
 			if (command.action === "status") return { status: "ok", message: formatReasoningSettings(api) };
 			if (command.action === "cycle") {
-				const next = api.cycleThinkingLevel();
+				const next = await api.cycleThinkingLevel();
 				return next
 					? { status: "ok", message: formatReasoningSettings(api) }
 					: { status: "unavailable", message: "Reasoning effort unavailable for this session." };
@@ -2509,11 +2559,16 @@ function sdkQuerySurface(
 	}),
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	primaryControlSurface: "cli" | "sdk" = "sdk",
+	imageUploadsAvailable = false,
+	externalPermissions?: ExternalPermissionRuntime,
+	secureLocalAuthorityAvailable = false,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
 		id,
 		api,
+		imageUploadsAvailable,
+		secureLocalAuthorityAvailable,
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
@@ -2522,63 +2577,9 @@ function sdkQuerySurface(
 		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 		getRuntimeHost,
+		externalPermissions,
 		primaryControlSurface,
 	}).query;
-}
-
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
-	);
-}
-
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
 }
 
 /**
@@ -2662,6 +2663,19 @@ function sdkControlSurface(
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
 	gatePresentations: PresentationArbiter | undefined,
 	api: ExtensionAPI,
+	imageUploads: PromptImageUploadStore | undefined,
+	imageUploadsAvailable: boolean,
+	retainAcceptedImage: (
+		correlation: { commandId: string; turnId: string },
+		release: () => void,
+		preflightSignal: AbortSignal,
+		submissionSettled: Promise<void>,
+	) => {
+		accepted: () => void;
+		promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		refused: () => boolean;
+	},
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void,
 	isBusy: () => boolean,
 	onPromptAccepted: (
 		correlation: { commandId: string; turnId: string },
@@ -2676,6 +2690,12 @@ function sdkControlSurface(
 		correlation: { commandId: string; turnId: string },
 		error: unknown,
 	) => void | Promise<void> = () => {},
+	onQueuedRunStartFailed: (
+		correlation: { commandId: string; turnId: string },
+		failure: QueuedRunStartFailure,
+		sdkRunToken: string | undefined,
+		refuseImage: (() => boolean) | undefined,
+	) => boolean,
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	onPromptDiverted: (correlation: { commandId: string; turnId: string }) => void,
 	onPromptPromoted: (
@@ -2728,7 +2748,10 @@ function sdkControlSurface(
 					| "uncertain_replay";
 				stored?: { responseState: string; responsePayloadHash: string; terminalPublished: boolean };
 		  }
-		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" | "conflict" | "reservation_failed" }
+		| {
+				ok: false;
+				reason: "worker_unsettled" | "owned_unsettled" | "active_turn_changed" | "conflict" | "reservation_failed";
+		  }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
@@ -2748,6 +2771,7 @@ function sdkControlSurface(
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		reserveSteer?: KindAwareReconciliation["reserveSteer"];
 		settleSteer?: KindAwareReconciliation["settleSteer"];
+		lookupSteer?: KindAwareReconciliation["lookupSteer"];
 	},
 	terminalAbortSeams?: {
 		getTerminalTurnEpoch: () => number | undefined;
@@ -2764,6 +2788,20 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	// INTERNAL session-owned ephemeral side-question runner (`/btw`), threaded
+	// from the owning session (NOT on the public extension context).
+	askEphemeralQuestion?: EphemeralQuestionRunner,
+	externalPermissions?: ExternalPermissionRuntime,
+	// Whether `connectionId` may replace the active run: true when no run is
+	// active or the run belongs to that connection's accepted prompt. A run the
+	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
+	// `preflightInFlight` reports that the requester has a preflight pending or a
+	// cancelled one still unwinding.
+	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
+	secureLocalAuthorityAvailable = false,
+	// Durably claims the client-cancel outcome for `connectionId`'s active prompt
+	// without aborting it; the caller's abort then unwinds the run.
+	claimOwnedPromptCancellation: (connectionId: string | undefined) => Promise<void> = async () => {},
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2777,6 +2815,9 @@ function sdkControlSurface(
 		ctx,
 		id: ctx.sessionManager.getSessionId(),
 		api,
+		imageUploadsAvailable,
+		externalPermissions,
+		secureLocalAuthorityAvailable,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -2808,7 +2849,10 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string, clientRef?: string) => {
+	// expectedPromptHandle: undefined is an unbounded steer; a string binds the
+	// message to that exact captured run; null means no run was active at the
+	// fallback decision and the session must reject rather than follow a successor.
+	const sendSteer = async (text: string, clientRef?: string, expectedPromptHandle?: string | null) => {
 		// A steer is always queued: its handle is held from dispatch until the
 		// message leaves the session queue (consumed in-run, promoted to its own
 		// run, or removed), which is the only boundary bound to THIS message.
@@ -2817,6 +2861,7 @@ function sdkControlSurface(
 			deliverAs: "steer" as const,
 			onPreflightAcceptCommit: admission.accepted,
 			onPreflightAccepted: admission.accepted,
+			...(expectedPromptHandle === undefined ? {} : { expectedPromptHandle }),
 			...admission.hooks,
 		};
 		if (clientRef === undefined) {
@@ -2860,11 +2905,20 @@ function sdkControlSurface(
 			// dispatch resolved and the durable settlement failed afterwards, the
 			// steer is still queued in the session, so its handle stays held until
 			// the promotion or removal hook fires.
-			if (!dispatched) admission.abandon();
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
-			};
+			if (!dispatched) {
+				admission.abandon();
+				return {
+					sessionId: ctx.sessionManager.getSessionId(),
+					...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
+				};
+			}
+			// A delivered steer must not be recorded as rejected, which would invite
+			// a second delivery: record it as uncertain, or keep the in-flight
+			// dispatching record (which replays as uncertain) if that write fails too.
+			const uncertain = await skillRecon
+				.settleSteer(normalizedClientRef, "uncertain", error)
+				.catch(() => skillRecon.lookupSteer?.(normalizedClientRef) ?? reservation.result);
+			return { sessionId: ctx.sessionManager.getSessionId(), ...uncertain };
 		}
 	};
 	const resolveModel = (id: string) => {
@@ -2933,6 +2987,18 @@ function sdkControlSurface(
 		return ctx.sdkControl(operation, input);
 	};
 	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => Promise<void> }>();
+	// A cancelled preflight leaves its pending entry immediately, but the session
+	// stays non-idle until the cancelled submission unwinds. Each one is recorded
+	// by preflightKey with its requester until that submission/execution settles,
+	// so the requester's own replacement is not mistaken for foreign work.
+	const unwindingPreflights = new Map<string, string | undefined>();
+	const recordUnwindingPreflight = (key: string, connectionId: string | undefined, settled: Promise<void>) => {
+		unwindingPreflights.set(key, connectionId);
+		void settled.then(() => unwindingPreflights.delete(key));
+	};
+	const requesterPreflightInFlight = (connectionId: string): boolean =>
+		[...pendingPreflightCancellations.values()].some(entry => entry.connectionId === connectionId) ||
+		[...unwindingPreflights.values()].includes(connectionId);
 	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
 		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
 	const cancelPendingPreflights = async () => {
@@ -2946,8 +3012,25 @@ function sdkControlSurface(
 		);
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
-	const awaitAbortReady = async () => {
+	// turn.abort_and_prompt carries the same authority as turn.abort: a
+	// connection replaces only work it owns. Another connection's pending
+	// preflight or a run the requester did not start keeps running.
+	const mayReplaceActiveWork = (connectionId: string | undefined): boolean =>
+		connectionId === undefined ||
+		([...pendingPreflightCancellations.values()].every(entry => entry.connectionId === connectionId) &&
+			requesterOwnsActiveRun(connectionId, requesterPreflightInFlight(connectionId)));
+	const cancelPendingPreflightsForReplacement = async () => {
+		const requesterConnectionId = controlRequesterContext.getStore();
+		if (requesterConnectionId !== undefined && !mayReplaceActiveWork(requesterConnectionId))
+			await cancelPendingPreflightsForConnection(requesterConnectionId);
+		else await cancelPendingPreflights();
+	};
+	// The owner's replaced prompt ends as a client cancel, exactly like turn.abort:
+	// the outcome is durably claimed before the session-wide abort, so the aborted
+	// run's agent_end settles it as cancelled instead of as an agent failure.
+	const awaitAbortReady = async (requesterConnectionId: string | undefined) => {
 		await cancelPendingPreflights();
+		await claimOwnedPromptCancellation(requesterConnectionId);
 		await (ctx.abort as () => unknown)();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
@@ -2962,6 +3045,18 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation = false,
+		onCorrelation?: (
+			correlation: { commandId: string; turnId: string },
+			preflightSignal: AbortSignal,
+			submissionSettled: Promise<void>,
+		) =>
+			| {
+					accepted: () => void;
+					promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+					refused: () => boolean;
+			  }
+			| undefined,
+		resolveImages?: () => unknown,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -3007,6 +3102,8 @@ function sdkControlSurface(
 						code: "busy",
 					},
 				);
+			// Staged bytes are one-shot: reserve reconciliation before consuming them.
+			if (resolveImages) images = resolveImages();
 		} catch (error) {
 			admission.abandon();
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
@@ -3038,6 +3135,8 @@ function sdkControlSurface(
 		const submissionSettled = Promise.withResolvers<void>();
 		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		let queuedRunRefused = false;
+		const imageLifecycle = onCorrelation?.(correlation, preflightController.signal, submissionSettled.promise);
 		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
@@ -3052,6 +3151,7 @@ function sdkControlSurface(
 		};
 		const cancelPreflight = () => {
 			cancellation ??= (async () => {
+				recordUnwindingPreflight(key, requesterConnectionId, submissionSettled.promise);
 				preflightController.abort();
 				if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
 				const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
@@ -3088,6 +3188,8 @@ function sdkControlSurface(
 			admission.accepted();
 			accepting = false;
 			accepted = true;
+			// A late durable acceptance after direct abort cannot end image retention.
+			if (!preflightController.signal.aborted) imageLifecycle?.accepted();
 			if (effectiveDeliverAs !== undefined) onPromptDiverted(correlation);
 			// #4743: an accepted run owns a durable terminal publication when it
 			// settles; teardown joins it via this latch (never-accepted preflights
@@ -3115,12 +3217,21 @@ function sdkControlSurface(
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
 					onQueuedPromoted: promotion => {
+						if (queuedRunRefused) return;
+						if (promotion.startsOwnRun === true) imageLifecycle?.promoted(promotion);
 						admission.hooks.onQueuedPromoted(promotion);
 						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
+						if (promotion.startsOwnRun !== true) imageLifecycle?.promoted(promotion);
+						if (promotion.removed) releaseAcceptedImage(correlation);
 					},
 					onDispatchDisposition: disposition => {
+						if (queuedRunRefused) return;
 						admission.hooks.onDispatchDisposition(disposition);
 						if (!disposition.startsOwnRun) onPromptDiverted(correlation);
+					},
+					onQueuedRunStartFailed: failure => {
+						if (queuedRunRefused) return;
+						queuedRunRefused = onQueuedRunStartFailed(correlation, failure, sdkRunToken, imageLifecycle?.refused);
 					},
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
@@ -3129,7 +3240,7 @@ function sdkControlSurface(
 		} catch (error) {
 			submissionSettled.resolve();
 			admission.abandon();
-			if (accepted && !preflightController.signal.aborted)
+			if (accepted && !queuedRunRefused && !preflightController.signal.aborted)
 				trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 			else settlePreflight({ status: "rejected", error });
 		}
@@ -3151,7 +3262,7 @@ function sdkControlSurface(
 				},
 				error => {
 					admission.abandon();
-					if (accepted && !preflightController.signal.aborted)
+					if (accepted && !queuedRunRefused && !preflightController.signal.aborted)
 						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					else settlePreflight({ status: "rejected", error });
 					submissionSettled.resolve();
@@ -3174,8 +3285,52 @@ function sdkControlSurface(
 		cancelPendingPreflights(): Promise<void>;
 		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 	} = {
-		prompt: (text, images, clientRef) =>
-			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
+		prompt: async (text, images, clientRef, stagedImages) => {
+			if (stagedImages !== undefined && images !== undefined)
+				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
+			const requesterConnectionId = controlRequesterContext.getStore();
+			let reservation: { images: ImageContent[]; release: () => void } | undefined;
+			let correlation: { commandId: string; turnId: string } | undefined;
+			try {
+				return await submitPrompt(
+					text,
+					images,
+					false,
+					undefined,
+					true,
+					requesterConnectionId,
+					clientRef,
+					true,
+					(current, preflightSignal, submissionSettled) => {
+						correlation = current;
+						if (reservation)
+							return retainAcceptedImage(current, reservation.release, preflightSignal, submissionSettled);
+					},
+					stagedImages === undefined
+						? undefined
+						: () => {
+								if (!imageUploads)
+									throw Object.assign(new Error("Staged images are unavailable."), {
+										code: "image_upload_unavailable",
+									});
+								reservation = imageUploads.redeem(requesterConnectionId, stagedImages);
+								return reservation.images;
+							},
+				);
+			} catch (error) {
+				if (correlation) releaseAcceptedImage(correlation);
+				else reservation?.release();
+				throw error;
+			}
+		},
+		...(imageUploads
+			? {
+					imageBegin: (input: unknown) => imageUploads.begin(controlRequesterContext.getStore(), input),
+					imageAppend: (input: unknown) => imageUploads.append(controlRequesterContext.getStore(), input),
+					imageFinish: (input: unknown) => imageUploads.finish(controlRequesterContext.getStore(), input),
+					imageDiscard: (input: unknown) => imageUploads.discard(controlRequesterContext.getStore(), input),
+				}
+			: {}),
 		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
@@ -3374,11 +3529,37 @@ function sdkControlSurface(
 				...(outcome.stored ? { replay: outcome.stored } : {}),
 			};
 		},
-		abortAndPrompt: async text => {
-			await awaitAbortReady();
-			return await submitPrompt(text, undefined, true, undefined, false, controlRequesterContext.getStore());
+		abortAndPrompt: async (text, idempotencyKey) => {
+			const requesterConnectionId = controlRequesterContext.getStore();
+			// A retry of a request that already degraded to a steer replays that steer,
+			// even when the run it targeted has since ended: the text was delivered once
+			// and must neither be queued again nor start a replacement run.
+			const steerClientRef =
+				skillRecon?.reserveSteer && skillRecon.settleSteer && skillRecon.lookupSteer
+					? abortAndPromptSteerClientRef(idempotencyKey)
+					: undefined;
+			const queueAsSteer = async (expectedPromptHandle?: string | null) => {
+				const steer = await sendSteer(text, steerClientRef, expectedPromptHandle);
+				// A durable steer reports its reconciliation status; only an accepted
+				// one acknowledges delivery.
+				const accepted = "accepted" in steer ? steer.accepted : steer.status === "accepted";
+				return { ...steer, accepted, aborted: false, queuedAs: "steer" };
+			};
+			// The replay is fenced to no run: retention can evict the record between
+			// this lookup and the durable reservation, and a fresh reservation must then
+			// be refused at queue admission instead of reaching whatever run is current.
+			if (steerClientRef !== undefined && skillRecon?.lookupSteer?.(steerClientRef).status !== "unknown")
+				return await queueAsSteer(null);
+			// Capture the target synchronously before the durable reservation. A replay
+			// above uses only its retained outcome, never a successor's run identity.
+			if (!mayReplaceActiveWork(requesterConnectionId))
+				return await queueAsSteer(ctx.getActivePromptHandle() ?? null);
+			await awaitAbortReady(requesterConnectionId);
+			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},
-		cancelPendingPreflights,
+		// Dispatch cancels pending preflights before the replacement is
+		// serialized; a non-owner cancels only its own.
+		cancelPendingPreflights: cancelPendingPreflightsForReplacement,
 		cancelPendingPreflightsForConnection,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
@@ -3599,6 +3780,7 @@ function sdkControlSurface(
 			};
 			const cancelPreflight = () => {
 				cancellation ??= (async () => {
+					recordUnwindingPreflight(key, requesterConnectionId, executionSettled.promise);
 					preflightController.abort();
 					if (phase === "pending") {
 						releaseAdmission();
@@ -3749,13 +3931,40 @@ function sdkControlSurface(
 			return ctx.operateGoal(op as "create" | "get" | "resume" | "pause" | "complete" | "drop", objective);
 		},
 		replaceTodo: items => typed("todo.replace", { items }),
+		preferenceControl: (operation, input) => typed(operation, input),
+
+		authorizationControl: (operation, input) => typed(operation, input),
+		operatorControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
+
+		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, requestedThinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);
 			if (requestedThinkingLevel === undefined) {
-				// The extension seam is not admission-bound, so serialize it (and the
-				// Q13 shadow capture/reconcile) against config.patch through the
-				// session admission boundary.
+				if (bindings.has("sdkControl") && ctx.sdkControl) {
+					// The session selection admits itself; wrapping it in another admission
+					// is same-session reentrancy. Run the Q13 shadow capture/reconcile inside
+					// that selection admission through internal hooks instead.
+					let shadowBefore: Map<string, unknown> | undefined;
+					return await typed("model.set", {
+						id: `${model.provider}/${model.id}`,
+						...(settings
+							? {
+									onBeforeMutation: () => {
+										shadowBefore = captureConfigOverridesShadow(settings, configOverrides);
+									},
+									onAfterMutation: () => {
+										if (shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+									},
+								}
+							: {}),
+					});
+				}
+				// Hosts without a typed session seam expose only the extension seam, which
+				// is not admission-bound: serialize it (and the Q13 shadow capture/reconcile)
+				// against config.patch through the session admission boundary.
 				const run = async () => {
 					const shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
 					const changed = await api.setModel(model);
@@ -3806,10 +4015,10 @@ function sdkControlSurface(
 			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
-		cycleThinking: () => {
+		cycleThinking: async () => {
 			if (!bindings.has("cycleThinkingLevel"))
 				return unavailable("thinking.cycle", "no session thinking-cycle seam is installed")();
-			return { level: ctx.cycleThinkingLevel() };
+			return { level: await ctx.cycleThinkingLevel() };
 		},
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
 		setQueueMode: (kind, mode) => {
@@ -3838,11 +4047,11 @@ function sdkControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: capability =>
-			typed(
-				"session.close",
-				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
-			),
+		closeSession: (capability, ifIdle) =>
+			typed("session.close", {
+				...(capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability }),
+				...(ifIdle === true ? { ifIdle: true } : {}),
+			}),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -3908,6 +4117,7 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		askBtw: createBtwAskHandler(askEphemeralQuestion),
 		installedOperations: surfacePolicy.installedControls,
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
@@ -4374,6 +4584,8 @@ export function createNotificationsExtension(
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
+		/** Ephemeral session: no transcript, excluded from list, cannot be resumed. */
+		ephemeral?: boolean;
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
@@ -4385,8 +4597,18 @@ export function createNotificationsExtension(
 		masterAttestationEpoch?: string;
 		/** Stable master lineage identity retained across session switches/branches. */
 		masterOwnerSessionId?: string;
+		/** Called after each host broker registration, for every session this host serves across switches. */
+		onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
-		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+		/**
+		 * Runs one `/btw` side turn. `contextExchanges` are earlier side exchanges, oldest first, that
+		 * the SDK `btw.ask` control forwards for a stateless client; the notification ephemeral turn sends none.
+		 */
+		runBtwTurn?: (
+			question: string,
+			signal: AbortSignal,
+			contextExchanges?: readonly BtwTextExchange[],
+		) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
@@ -4398,6 +4620,10 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
+			/** Factory-owned identity shared with direct SDK image admission, never client supplied. */
+			getImageAdmissionSession?: () => object;
+			/** Definitive event-driven observation; never mutates the owning run. */
+			waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
 			getRunOwnerDomain?: (handle: string) => RunCancellationDomain | undefined;
 			getTerminalTurnEpoch: () => number | undefined;
@@ -4429,6 +4655,7 @@ export function createNotificationsExtension(
 	// declares itself ineligible, so nothing was ever delivered).
 	const telegramTopicsEnabled = (): boolean => isTelegramSessionEligible(resolveSettings(options.settings).cfg);
 	const runtimes = new Map<string, SessionRuntime>();
+	let permissionProviderOwner: symbol | undefined;
 	const controller =
 		options.controller ??
 		new NotificationSessionController({
@@ -4687,6 +4914,8 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.abortBtwQuestions();
+			requestedRuntime.imageUploads?.close();
 			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
 		}
@@ -4732,6 +4961,7 @@ export function createNotificationsExtension(
 			rt.pendingInteractive.clear();
 			return true;
 		}
+		rt.abortBtwQuestions();
 		// Keep this exact object authoritative for the full terminal release, including
 		// the interval before a failed owner can be recorded for a later retry.
 		cleanupRetries.set(id, rt);
@@ -4797,6 +5027,9 @@ export function createNotificationsExtension(
 			}
 		}
 		rt.host.reverse.dispose();
+		const pollingEnabled = rt.externalPermissions.enabled;
+		rt.externalPermissions.dispose();
+		if (pollingEnabled) rt.clearPermissionProvider();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
@@ -4865,6 +5098,7 @@ export function createNotificationsExtension(
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
 		}
+		rt.releaseAcceptedImages();
 		if (cleanupRetries.get(id) === rt) cleanupRetries.delete(id);
 		return true;
 	}
@@ -4954,6 +5188,8 @@ export function createNotificationsExtension(
 		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
 		if (lifecycleRequired && !lifecycleAgentDir)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
+		// The session index this host publishes to; it also owns the session's event-generation authority.
+		const brokerAgentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
@@ -5026,6 +5262,14 @@ export function createNotificationsExtension(
 		};
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
+		const externalPermissions = new ExternalPermissionRuntime(id);
+		const permissionOwner = Symbol(id);
+		const setPermissionProvider = (provider: ClientBridge["requestPermission"]): void => {
+			if (!ctx.setSdkPermissionProvider) return;
+			if (!provider && permissionProviderOwner !== permissionOwner) return;
+			ctx.setSdkPermissionProvider(provider);
+			permissionProviderOwner = provider ? permissionOwner : undefined;
+		};
 		let host: SessionSdkHost | undefined;
 		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
@@ -5044,7 +5288,11 @@ export function createNotificationsExtension(
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
+				setPermissionProvider(async (toolCall, permissionOptions, signal) => {
 					const result = await host!.reverse.request(
 						"permission",
 						"request",
@@ -5056,7 +5304,7 @@ export function createNotificationsExtension(
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
@@ -5065,6 +5313,7 @@ export function createNotificationsExtension(
 							...(typeof response.kind === "string"
 								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
 								: {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -5123,7 +5372,7 @@ export function createNotificationsExtension(
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(undefined);
+				setPermissionProvider(undefined);
 				permissionCapabilityActive = false;
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -5200,6 +5449,17 @@ export function createNotificationsExtension(
 			hostCapCache.delete(connectionId);
 			hostAttachedConnections.delete(connectionId);
 		};
+		const imageUploadsAvailable =
+			typeof terminalAbortSeams?.waitForRunSettlement === "function" &&
+			typeof terminalAbortSeams.getRunOwnerDomain === "function" &&
+			typeof terminalAbortSeams.getTerminalRunOwnerForEvent === "function" &&
+			typeof ctx.getActivePromptHandle === "function";
+		const imageUploads = imageUploadsAvailable
+			? new PromptImageUploadStore(connectionId => {
+					const incarnation = hostConnectionIncarnations.get(connectionId);
+					return incarnation !== undefined && !incarnation.closed;
+				}, terminalAbortSeams?.getImageAdmissionSession?.())
+			: undefined;
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -5215,6 +5475,115 @@ export function createNotificationsExtension(
 		const OWNED_SETTLEMENT_GRACE_MS = 500;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
+		type AcceptedImageReservation = {
+			release: () => void;
+			preflightSignal: AbortSignal;
+			/** The producer can still retain ImageContent until settlement or exact run adoption. */
+			submissionPending: boolean;
+			/** A promoted queue entry needs its own run's proof before release authority transfers. */
+			awaitingAdoption: boolean;
+			accepted: boolean;
+			releaseRequested: boolean;
+		};
+		const acceptedImages = new Map<string, AcceptedImageReservation>();
+		// Absence means never consumed; a present undefined owner means execution
+		// started without exact ownership evidence and must remain charged.
+		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext | undefined>();
+		const retiringImages = new Set<string>();
+		const retireAcceptedImage = (key: string): void => {
+			const reservation = acceptedImages.get(key);
+			if (!reservation) return;
+			if (reservation.submissionPending || reservation.awaitingAdoption) {
+				reservation.releaseRequested = true;
+				return;
+			}
+			if (retiringImages.has(key)) return;
+			const discard = (): void => {
+				if (acceptedImages.get(key) !== reservation) return;
+				acceptedImages.delete(key);
+				acceptedImageRunOwners.delete(key);
+				retiringImages.delete(key);
+				reservation.release();
+			};
+			const owner = acceptedImageRunOwners.get(key);
+			if (!owner) {
+				if (acceptedImageRunOwners.has(key)) {
+					retiringImages.add(key);
+					logger.warn("SDK image capacity retained for execution without an exact resource owner");
+					return;
+				}
+				discard();
+				return;
+			}
+			const waitForSettlement = terminalAbortSeams?.waitForRunSettlement;
+			if (!waitForSettlement) return;
+			retiringImages.add(key);
+			retirePromptImageReservation(
+				owner.resourceRunId,
+				waitForSettlement,
+				() => acceptedImages.get(key) === reservation,
+				discard,
+			);
+		};
+		const settleAcceptedImageSubmission = (key: string, reservation: AcceptedImageReservation): void => {
+			if (acceptedImages.get(key) !== reservation || !reservation.submissionPending) return;
+			reservation.submissionPending = false;
+			if (reservation.releaseRequested) retireAcceptedImage(key);
+		};
+		const retainAcceptedImage = (
+			correlation: { commandId: string; turnId: string },
+			release: () => void,
+			preflightSignal: AbortSignal,
+			submissionSettled: Promise<void>,
+		): {
+			accepted: () => void;
+			promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			refused: () => boolean;
+		} => {
+			const key = promptSubmissionKey(correlation);
+			const reservation: AcceptedImageReservation = {
+				release,
+				preflightSignal,
+				submissionPending: true,
+				awaitingAdoption: false,
+				accepted: false,
+				releaseRequested: false,
+			};
+			acceptedImages.set(key, reservation);
+			void submissionSettled.then(() => settleAcceptedImageSubmission(key, reservation));
+			return {
+				accepted: () => {
+					reservation.accepted = true;
+					if (reservation.preflightSignal.aborted) return;
+					if (acceptedImageRunOwners.get(key) && !reservation.awaitingAdoption) {
+						settleAcceptedImageSubmission(key, reservation);
+						if (reservation.releaseRequested) retireAcceptedImage(key);
+					}
+				},
+				promoted: promotion => {
+					reservation.awaitingAdoption = promotion.startsOwnRun === true && promotion.removed !== true;
+					if (!reservation.awaitingAdoption && reservation.releaseRequested) retireAcceptedImage(key);
+				},
+				refused: () => {
+					if (acceptedImages.get(key) !== reservation || acceptedImageRunOwners.has(key)) return false;
+					reservation.awaitingAdoption = false;
+					retireAcceptedImage(key);
+					return true;
+				},
+			};
+		};
+		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }): void =>
+			retireAcceptedImage(promptSubmissionKey(correlation));
+		const releaseAcceptedImagesForRun = (owner: AgentTerminalOwnerContext): void => {
+			for (const [key, runOwner] of acceptedImageRunOwners) {
+				if (!runOwner || runOwner.resourceRunId !== owner.resourceRunId || runOwner.domain !== owner.domain)
+					continue;
+				retireAcceptedImage(key);
+			}
+		};
+		const releaseAcceptedImages = (): void => {
+			for (const key of acceptedImages.keys()) retireAcceptedImage(key);
+		};
 		type PromptLifecycleFrame =
 			| {
 					type: "agent_start" | "agent_end";
@@ -5283,6 +5652,8 @@ export function createNotificationsExtension(
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
+			/** Exact public lifecycle lineage and the attempt currently executing it. */
+			lifecycleOwner?: { scope: AttemptScope; owner: AgentTerminalOwnerContext };
 			/** Cancels accepted skill preparation before an execution handle exists. */
 			preflightAbort?: () => void | Promise<void>;
 			/** Keeps the host alive from durable admission through terminal publication. */
@@ -5817,6 +6188,14 @@ export function createNotificationsExtension(
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
 				() => {
+					// A stopped runtime no longer owns the session's durable store: a
+					// successor instance may already have hydrated and written it, and
+					// this instance's stale record set would overwrite those rows. Leave
+					// the pending record for restart recovery, as a process exit would
+					// (#7342). The owner is captured here and re-checked after the
+					// boundary await below, because shutdown can stop it meanwhile.
+					const owner = runtime;
+					if (!owner || owner.stopping) return;
 					void (async () => {
 						const current = promptSubmissions.get(key);
 						// Identity fencing: a discarded, evicted or re-accepted submission is
@@ -5863,7 +6242,12 @@ export function createNotificationsExtension(
 											whenIdle: () => whenPromptToolsIdle(current),
 											graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
 										});
-							// Every pre-await fence is re-validated after the await, in order.
+							// Every pre-await fence is re-validated after the await, in order —
+							// runtime ownership first (#7342). `stopping` is set before the
+							// teardown drain starts and never cleared, so an expiry that
+							// passes this check is either complete before the drain or
+							// registered below as a producer the drain joins.
+							if (owner.stopping || runtime !== owner) return;
 							const after = promptSubmissions.get(key);
 							if (!after || after.deadlineLease !== lease) return;
 							if (after.terminal || after.phase !== "active") return;
@@ -5890,18 +6274,22 @@ export function createNotificationsExtension(
 							// boundary event may have bumped it and this attempt is
 							// deliberately the current one.
 							after.deadlineAttempt = { lease, generation: lease.generation };
-							void terminalizePrompt(
-								correlation,
-								{
-									kind: "failed",
-									code: "prompt_deadline_exceeded",
-									message: "Prompt deadline exceeded.",
-									provenance: "deadline",
-									phase: "submission",
-									category: "deadline",
-								},
-								{ fence: true },
-								{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+							// The durable claim is a reconciliation producer: shutdown's drain
+							// joins it instead of releasing the store while it is in flight.
+							trackReconciliationProducer(
+								terminalizePrompt(
+									correlation,
+									{
+										kind: "failed",
+										code: "prompt_deadline_exceeded",
+										message: "Prompt deadline exceeded.",
+										provenance: "deadline",
+										phase: "submission",
+										category: "deadline",
+									},
+									{ fence: true },
+									{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+								),
 							);
 						} finally {
 							// `finally` is safe here, and a bare clear before each `return` is
@@ -5953,14 +6341,11 @@ export function createNotificationsExtension(
 				}
 				deliverCorrelatedFrame(submission, frame);
 			}
-			// Broker-created hosts use this bus, not the SDK-only extension. Observers
-			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Broker-created hosts use this bus, not the SDK-only extension. Stream
+			// connections opt into turn_stream and receive no other client's correlation.
 			// Keep cumulative partialResult snapshots and authoritative final result
 			// intact, and off the durable lifecycle replay ring, like owner content.
-			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
-				TURN_STREAM_CAPABILITY,
-				SESSION_HOST_OBSERVER_CAPABILITY,
-			]) ?? []) {
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]) ?? []) {
 				if (owners.has(connectionId)) continue;
 				try {
 					sdkRuntime?.sendFrameTo(connectionId, {
@@ -6291,6 +6676,7 @@ export function createNotificationsExtension(
 					logger.warn(`sdk: failed to cancel fenced preflight: ${String(error)}`),
 				);
 			fencedConnections.add(submission.connectionId);
+			imageUploads?.disconnect(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
 			for (const [key, owned] of promptSubmissions)
 				if (owned.connectionId === submission.connectionId) {
@@ -6323,6 +6709,48 @@ export function createNotificationsExtension(
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
 			}
+			if (acceptedImages.has(key) && !acceptedImageRunOwners.has(key)) {
+				acceptedImageRunOwners.set(key, undefined);
+				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+				if (handle && domain) acceptedImageRunOwners.set(key, { resourceRunId: handle, domain });
+			}
+			const imageReservation = acceptedImages.get(key);
+			if (
+				imageReservation?.accepted &&
+				!imageReservation.preflightSignal.aborted &&
+				acceptedImageRunOwners.get(key)
+			) {
+				imageReservation.awaitingAdoption = false;
+				settleAcceptedImageSubmission(key, imageReservation);
+				if (imageReservation.releaseRequested) retireAcceptedImage(key);
+			}
+		};
+		const bindPromptLifecycle = (
+			correlation: { commandId: string; turnId: string },
+			handle: string | undefined,
+			scope: AttemptScope | undefined,
+			continuation: boolean,
+		): void => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || submission.terminal) return;
+			const predecessor = submission.lifecycleOwner;
+			// A retry can start a new resource run without ending the public prompt.
+			// Only the producer's immutable lifecycle scope authorizes that transfer;
+			// an unrelated start must never inherit the active prompt's correlation.
+			if (continuation && (!scope || predecessor?.scope !== scope)) return;
+			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+			if (continuation && (!handle || !domain)) return;
+			const joined = predecessor ? getJoinedPromptCorrelations(predecessor.owner) : [];
+			for (const entry of [correlation, ...joined]) {
+				const key = promptSubmissionKey(entry);
+				if (handle && domain) {
+					const owner = { resourceRunId: handle, domain };
+					if (joinedPromptOwners.has(key)) joinedPromptOwners.set(key, { correlation: entry, owner });
+					if (acceptedImageRunOwners.has(key)) acceptedImageRunOwners.set(key, owner);
+				}
+				bindPromptExecutionHandle(entry, handle);
+			}
+			if (scope && handle && domain) submission.lifecycleOwner = { scope, owner: { resourceRunId: handle, domain } };
 		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
@@ -6510,6 +6938,7 @@ export function createNotificationsExtension(
 					return;
 				}
 				if (capture) capture.proof = proof;
+				releaseAcceptedImage(correlation);
 			}
 			if (deadlineAttempt) {
 				// Durability BEFORE the durable terminal (#5583, #5623 review round 4).
@@ -6694,6 +7123,63 @@ export function createNotificationsExtension(
 				if (stranded?.terminal) expirePromptDelivery(failedKey, stranded);
 			}
 		};
+		/** The session's active run when no SDK submission owns it (operator abort target, #7566). */
+		const sessionRunWithoutSubmission = (): { handle: string; epoch: number } | undefined => {
+			const handle = ctx.getActivePromptHandle();
+			const epoch = terminalAbortSeams?.getTerminalTurnEpoch?.();
+			if (!handle || epoch === undefined) return undefined;
+			for (const submission of promptSubmissions.values())
+				if (submission.executionHandle === handle) return undefined;
+			return { handle, epoch };
+		};
+		/**
+		 * Fence and stop a session run that no SDK submission owns, through the same
+		 * bus-private abort seam terminalizePrompt uses. There is no prompt
+		 * reconciliation row to claim, and the run publishes its own agent_end through
+		 * the ordinary session lifecycle, so no correlated terminal event is emitted
+		 * here and `capture.published` stays unset. The epoch observed at admission
+		 * travels to the seam, which refuses to fence a successor turn.
+		 *
+		 * The caller awaits the durable pending marker between admission and this
+		 * call, so the run may have ended, or a same-turn continuation may have
+		 * installed a new handle without advancing the epoch, in the meantime. Both
+		 * captured values are revalidated immediately before the abort seam, as on
+		 * the SDK-only host: a mismatch returns `active_turn_changed` with no effect,
+		 * because the seam can return settled proof for the stale handle while the
+		 * current continuation keeps running.
+		 */
+		const terminalizeSessionRun = async (
+			run: { handle: string; epoch: number },
+			terminal: { scope: AbortScope; steeringSnapshotToken?: number },
+			capture: {
+				proof?: RunSettlementProof & {
+					terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+				};
+				terminalized?: boolean;
+			},
+		): Promise<"active_turn_changed" | undefined> => {
+			if (typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal !== "function") return;
+			if (ctx.getActivePromptHandle() !== run.handle || terminalAbortSeams.getTerminalTurnEpoch?.() !== run.epoch)
+				return "active_turn_changed";
+			if (terminal.steeringSnapshotToken !== undefined)
+				terminalAbortSeams.rebindTerminalAbortSteeringSnapshot?.(terminal.steeringSnapshotToken);
+			let proof: RunSettlementProof;
+			try {
+				proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(run.handle, {
+					graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
+					terminal: { ...terminal, expectedEpoch: run.epoch },
+				});
+			} catch (error) {
+				logger.warn(`sdk: session run fencing failed: ${String(error)}`);
+				return;
+			}
+			if (proof?.status !== "settled") {
+				logger.warn(`sdk: session run settlement unfenced: ${formatPromptSettlementDiagnostic(proof)}`);
+				return;
+			}
+			capture.proof = proof;
+			capture.terminalized = true;
+		};
 		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
 				commandId: correlation.commandId,
@@ -6728,7 +7214,8 @@ export function createNotificationsExtension(
 		};
 		const recordPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission) return;
+			if (!submission || submission.terminal || submission.failed) return;
+			releaseAcceptedImage(correlation);
 			submission.failed = true;
 			removePendingPromptCorrelation(correlation);
 			if (
@@ -6738,6 +7225,29 @@ export function createNotificationsExtension(
 				runtime.activePromptCorrelation = undefined;
 			await emitPromptFailure(correlation, error);
 		};
+		const recordQueuedRunStartFailure = (
+			correlation: { commandId: string; turnId: string },
+			failure: QueuedRunStartFailure,
+			sdkRunToken: string | undefined,
+			refuseImage: (() => boolean) | undefined,
+		): boolean => {
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
+			// A present undefined owner is already-started execution, not no-start evidence.
+			if (
+				failure.disposition !== "not-started" ||
+				(submission && submission.sdkRunToken !== sdkRunToken) ||
+				submission?.executionHandle !== undefined ||
+				acceptedImageRunOwners.has(key)
+			)
+				return false;
+			// Reservation proof outlives the mutable receipt. The captured lifecycle
+			// checks reservation identity and keeps the pending producer fenced.
+			if (refuseImage ? !refuseImage() : !submission) return false;
+			if (submission && !submission.terminal && !submission.failed)
+				trackReconciliationProducer(recordPromptFailure(correlation, failure.error));
+			return true;
+		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
 			const key = promptSubmissionKey(correlation);
 			const submission = promptSubmissions.get(key);
@@ -6746,6 +7256,7 @@ export function createNotificationsExtension(
 			flushPromptLifecycle(key, submission);
 		};
 
+		const secureLocalAuthority = brokerAgentDir ? await tryGetSecureLocalAuthority(brokerAgentDir) : undefined;
 		const cursors = new CursorRegistry(token, revisions);
 		const queryHandlers = new QueryHandlers(
 			sdkQuerySurface(
@@ -6770,6 +7281,9 @@ export function createNotificationsExtension(
 				selector => kindReconciliation.lookupSteer(selector),
 				() => host,
 				options.primaryControlSurface ?? "sdk",
+				imageUploadsAvailable,
+				externalPermissions,
+				Boolean(secureLocalAuthority),
 			),
 			id,
 			revisions,
@@ -6780,12 +7294,17 @@ export function createNotificationsExtension(
 			pendingInteractive,
 			gatePresentations,
 			api,
+			imageUploads,
+			imageUploadsAvailable,
+			retainAcceptedImage,
+			releaseAcceptedImage,
 			() =>
 				runtime?.busy === true ||
 				pendingPromptCorrelations.length > 0 ||
 				pendingPromptCorrelationsBySdkRunToken.size > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
+			recordQueuedRunStartFailure,
 			discardPromptAcceptance,
 			onPromptDiverted,
 			onPromptPromoted,
@@ -6849,6 +7368,7 @@ export function createNotificationsExtension(
 						await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
 							fence: hasExecutionHandle || !submission.preflightAbort,
 						});
+						if (!hasExecutionHandle && submission.preflightAbort) releaseAcceptedImage({ commandId, turnId });
 					}
 				}
 				return { aborted: true, disposition: "cancelled" as const };
@@ -6874,7 +7394,9 @@ export function createNotificationsExtension(
 					crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 				// The public uncertain disposition the client receives for an
 				// {ok:false, reason} outcome (single source for finalization hashes).
-				const hashPublicUncertain = (reason: "worker_unsettled" | "owned_unsettled"): string =>
+				const hashPublicUncertain = (
+					reason: "worker_unsettled" | "owned_unsettled" | "active_turn_changed",
+				): string =>
 					hashResult({
 						ok: true,
 						selection: scope,
@@ -7225,7 +7747,29 @@ export function createNotificationsExtension(
 				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
 					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
 				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-				if (!active) {
+				// For operator authority, verify that the found submission actually owns the
+				// currently active run. An unbound queued follow-up must not prevent the
+				// bus-host operator fallback from targeting the active turn (#7566).
+				const activeRunHandle = ctx.getActivePromptHandle();
+				if (operatorAuthorized && active && activeRunHandle) {
+					// Verify exact ownership of active run: executionHandle matches or
+					// lifecycleOwner is bound to this run. Unbound submissions (no
+					// executionHandle, no lifecycleOwner) don't own the active run.
+					const ownsActiveRun =
+						active[1].executionHandle === activeRunHandle ||
+						active[1].lifecycleOwner?.owner.resourceRunId === activeRunHandle;
+					if (!ownsActiveRun) {
+						active = undefined; // Fall through to host fallback
+					}
+				}
+				// Operator authority targets the session's active run, as on the SDK-only
+				// host, even when no SDK submission owns it (a turn typed at the terminal
+				// or started by the host). Only the run observed here, at admission, is
+				// addressed: its epoch travels to the abort seam, which refuses a
+				// successor turn (#7566). A run that an SDK submission owns stays on the
+				// submission path above.
+				const operatorHostRun = active || !operatorAuthorized ? undefined : sessionRunWithoutSubmission();
+				if (!active && !operatorHostRun) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
 					// or eviction a same-key retry while a later prompt is active
@@ -7255,6 +7799,16 @@ export function createNotificationsExtension(
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
 					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
+					// Verify operator ownership after the async write (same check as above).
+					const rescanActiveRunHandle = ctx.getActivePromptHandle();
+					if (operatorAuthorized && active && rescanActiveRunHandle) {
+						const ownsActiveRun =
+							active[1].executionHandle === rescanActiveRunHandle ||
+							active[1].lifecycleOwner?.owner.resourceRunId === rescanActiveRunHandle;
+						if (!ownsActiveRun) {
+							active = undefined; // Fall through to host fallback
+						}
+					}
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
@@ -7286,8 +7840,8 @@ export function createNotificationsExtension(
 						return no_active_turnResult;
 					}
 				}
-				const [commandId, turnId] = active[0].split(":", 2);
-				if (!commandId || !turnId) {
+				const [commandId, turnId] = active ? active[0].split(":", 2) : [];
+				if (active && (!commandId || !turnId)) {
 					const reservation = await reserveTerminalNoEffect();
 					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
 					if (reservation === "failed") {
@@ -7315,7 +7869,7 @@ export function createNotificationsExtension(
 				// fail-closed path would wrongly fence the SDK connection and leave
 				// reconciliation unfinalized for a prompt that will never run
 				// (review thread P2).
-				if (!active[1].executionHandle) {
+				if (active && !active[1].executionHandle) {
 					// Persist the durable no-effect reservation BEFORE cancelling the
 					// session preflight: a failed reservation must NOT leave the
 					// prompt cancelled with no durable row (a later same-key retry
@@ -7560,16 +8114,20 @@ export function createNotificationsExtension(
 					published?: boolean;
 					terminalized?: boolean;
 				} = {};
-				await terminalizePrompt(
-					{ commandId, turnId },
-					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-					{
-						fence: true,
-						terminal: { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) },
-					},
-					undefined,
-					captured,
-				);
+				const terminal = { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) };
+				let unsettledReason: "worker_unsettled" | "active_turn_changed" = "worker_unsettled";
+				if (commandId && turnId) {
+					await terminalizePrompt(
+						{ commandId, turnId },
+						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+						{ fence: true, terminal },
+						undefined,
+						captured,
+					);
+				} else if (operatorHostRun) {
+					if ((await terminalizeSessionRun(operatorHostRun, terminal, captured)) === "active_turn_changed")
+						unsettledReason = "active_turn_changed";
+				}
 				// Success is decided by the terminalizePrompt outcome, NOT by the
 				// submission record: an already-acknowledged prompt is finalized
 				// (deleted) during emission, so a lookup here can return undefined
@@ -7591,12 +8149,12 @@ export function createNotificationsExtension(
 										scopeRecord.selection === scope &&
 										scopeRecord.turnDisposition === "pending");
 								if (!isMarker) return scopeRecord;
-								const responsePayloadHash = hashPublicUncertain("worker_unsettled");
+								const responsePayloadHash = hashPublicUncertain(unsettledReason);
 								return {
 									...scopeRecord,
 									turnDisposition: "uncertain" as const,
 									ownedWorkDisposition: "uncertain" as const,
-									// Hash the public worker_unsettled disposition the client
+									// Hash the public uncertain disposition the client
 									// receives, or the response can never advance the row
 									// (review thread P2).
 									responsePayloadHash,
@@ -7629,7 +8187,7 @@ export function createNotificationsExtension(
 					} catch (error) {
 						logger.warn(`sdk: terminal losing-marker settle failed: ${String(error)}`);
 					}
-					return { ok: false as const, reason: "worker_unsettled" as const };
+					return { ok: false as const, reason: unsettledReason };
 				}
 				// For scope:"owned", stop the exact captured owned work and prove
 				// quiescence before claiming stopped. Exactness comes from the
@@ -7846,12 +8404,60 @@ export function createNotificationsExtension(
 				lookup: selector => kindReconciliation.lookup("skill", selector),
 				reserveSteer: kindReconciliation.reserveSteer,
 				settleSteer: kindReconciliation.settleSteer,
+				lookupSteer: kindReconciliation.lookupSteer,
 			},
 			terminalAbortSeams,
 			// #4743: join fire-and-forget reconciliation producers at teardown.
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			// The notification daemon already owns the `/btw` runner for this
+			// session; the SDK control answers through the same ephemeral seam.
+			options.runBtwTurn === undefined
+				? undefined
+				: async (question, exchanges, signal) => {
+						if (!signal) throw new Error("SDK BTW request has no lifetime signal.");
+						return (await options.runBtwTurn!(question, signal, exchanges)).replyText;
+					},
+			externalPermissions,
+			(connectionId, preflightInFlight) => {
+				const ownedBy = (correlation: { commandId: string; turnId: string }) =>
+					promptSubmissions.get(promptSubmissionKey(correlation))?.connectionId === connectionId;
+				// Another connection's accepted prompt that has not started yet is
+				// foreign work too: replacing would wait on, then preempt, it.
+				if (
+					!pendingPromptCorrelations.every(ownedBy) ||
+					![...pendingPromptCorrelationsBySdkRunToken.values()].every(ownedBy)
+				)
+					return false;
+				if (runtime?.busy !== true && ctx.isIdle?.() !== false) return true;
+				// Before any run starts, a non-idle session may only be unwinding the
+				// requester's own preflight (pending, or cancelled by this replacement).
+				if (runtime?.busy !== true && preflightInFlight) return true;
+				const active = runtime?.activePromptCorrelation;
+				if (active !== undefined) return ownedBy(active);
+				// An accepted direct prompt makes the session busy before its agent_start
+				// binds the active correlation; that next run is the requester's own
+				// work. Queued (run-token) follow-ups wait behind some other run instead.
+				return pendingPromptCorrelations.length > 0;
+			},
+			Boolean(secureLocalAuthority),
+			// The same submission turn.abort would cancel. A failed claim rejects the
+			// replacement before anything is aborted.
+			async connectionId => {
+				const active = [...promptSubmissions.entries()].find(
+					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
+				);
+				if (!active) return;
+				const [key, submission] = active;
+				const [commandId, turnId] = key.split(":", 2);
+				if (!commandId || !turnId) return;
+				await kindReconciliation.claimPendingOutcome(
+					submission.reconciliationKind,
+					{ commandId, turnId },
+					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				);
+			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -7871,6 +8477,10 @@ export function createNotificationsExtension(
 			if (!submission || submission.acknowledged || submission.connectionId !== connectionId) return;
 			abandonPrompt(submission);
 		};
+		// The person at this terminal did not stop the turn, so say who did.
+		const attributeOperatorTerminalAbort = createOperatorTerminalAbortAttribution(message =>
+			ctx.ui.notify(message, "warning"),
+		);
 
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>): "written" | "dropped" => {
 			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
@@ -7964,7 +8574,15 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			secureLocalAuthority,
 			masterOwnerSessionId: options.masterOwnerSessionId,
+			onBrokerRegistered: options.onBrokerRegistered,
+			...(brokerAgentDir === undefined
+				? {}
+				: {
+						allocateEventGeneration: (sessionId: string, floor: number) =>
+							allocateSessionEventGeneration(brokerAgentDir, sessionId, floor),
+					}),
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -8008,6 +8626,7 @@ export function createNotificationsExtension(
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
 			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
+				attributeOperatorTerminalAbort(request, response);
 				// Terminal abort: persist the monotonic response-state transition
 				// (AC 18) — pending -> sent on a written response, pending -> failed
 				// on a rejected/dropped write. A same-key retry then replays the
@@ -8197,7 +8816,7 @@ export function createNotificationsExtension(
 
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
-			control: async (connectionId, frame) => {
+			control: async (connectionId, frame, signal) => {
 				const request = frame as {
 					id?: unknown;
 					operation?: unknown;
@@ -8243,6 +8862,7 @@ export function createNotificationsExtension(
 								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
 							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
 							confirm: request.confirm === true,
+							signal,
 						},
 					),
 				);
@@ -8255,6 +8875,17 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				if (
+					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						type: "query_response",
+						id: request.id,
+						ok: false,
+						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -8268,6 +8899,9 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		externalPermissions.installControls(controlSurface, setPermissionProvider, () =>
+			Boolean(sdkRuntime?.host.reverse.getLease("permission")),
+		);
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
 
@@ -8279,6 +8913,12 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			externalPermissions,
+			clearPermissionProvider: () => setPermissionProvider(undefined),
+			imageUploads,
+			releaseAcceptedImage,
+			releaseAcceptedImagesForRun,
+			releaseAcceptedImages,
 			getJoinedPromptCorrelations,
 			isPromptRunOwner: (correlation, owner) => {
 				const handle = promptSubmissions.get(promptSubmissionKey(correlation))?.executionHandle;
@@ -8376,6 +9016,7 @@ export function createNotificationsExtension(
 			gatePresentations,
 			stopping: false,
 			inboundFenced: false,
+			abortBtwQuestions: () => sdkRuntime?.abortBtwQuestions(),
 			abortEphemeralTurns: () => {},
 			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
@@ -8397,7 +9038,7 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
-			bindPromptExecutionHandle,
+			bindPromptLifecycle,
 			peekPromptPendingOutcome: correlation => {
 				const kind =
 					promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const);
@@ -8538,6 +9179,10 @@ export function createNotificationsExtension(
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
+					if (typedFrame.type === "control_request" && !liveHostConnection(inbound.connectionId)) {
+						sendEndpointStale(inbound.connectionId, typedFrame);
+						return;
+					}
 					if (typedFrame.type === "event_replay") {
 						const capabilities = typedFrame.capabilities;
 						if (
@@ -8598,6 +9243,7 @@ export function createNotificationsExtension(
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				closeHostConnection(connectionId);
+				imageUploads?.disconnect(connectionId);
 				connectionCloseHandler?.(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)
@@ -9184,7 +9830,7 @@ export function createNotificationsExtension(
 				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
-			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
+			const agentDir = brokerAgentDir;
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
 			if (lifecycleRequired && !lifecycleRequestId)
 				throw new Error("Lifecycle SDK host requires a capability-bound request identity.");
@@ -9204,6 +9850,7 @@ export function createNotificationsExtension(
 					const direct = await reattestMasterSessionIdentity({
 						index,
 						locator,
+						ephemeral: options.ephemeral,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -9239,6 +9886,7 @@ export function createNotificationsExtension(
 								endpointMtimeMs,
 								endpointFileId,
 								...(masterRole ? { masterRole } : {}),
+								...(options.ephemeral ? { ephemeral: true } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
@@ -9983,14 +10631,17 @@ export function createNotificationsExtension(
 	const deferLeanReceipt = (
 		rt: SessionRuntime,
 		text: string,
+		settled: boolean,
 		messageRef?: string,
 		window: number = rt.currentTurnSettlementWindow ?? rt.settlementWindow,
 		origin: SettlementOrigin = rt.currentTurnSettlementOrigin ?? "continuation",
 	): void => {
 		if (window !== rt.settlementWindow) return;
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
+		const receipt: SettlementReceipt = { text, ...(messageRef ? { messageRef } : {}), origin, settled };
 		const pending = rt.pendingSettled;
-		if (!pending || pending.window !== window) {
+		// Tool-loop narration is superseded by any later receipt; only a settled
+		// answer may anchor the bounded composition with a later autonomous outcome.
+		if (!pending || pending.window !== window || !pending.receipts[0]?.settled) {
 			rt.pendingSettled = { window, receipts: [receipt] };
 			return;
 		}
@@ -10008,14 +10659,19 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
-	const deferProvisionalReceipt = (rt: SessionRuntime, text: string | undefined, messageRef?: string): void => {
+	const deferProvisionalReceipt = (
+		rt: SessionRuntime,
+		text: string | undefined,
+		settled: boolean,
+		messageRef?: string,
+	): void => {
 		if (!text) return;
 		const window = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
 		if (window !== rt.settlementWindow) return;
 		const origin = rt.currentTurnSettlementOrigin ?? "continuation";
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
+		const receipt: SettlementReceipt = { text, ...(messageRef ? { messageRef } : {}), origin, settled };
 		const pending = rt.pendingFinal;
-		if (!pending || pending.window !== window) {
+		if (!pending || pending.window !== window || !pending.receipts[0]?.settled) {
 			rt.pendingFinal = { window, receipts: [receipt] };
 			return;
 		}
@@ -10031,7 +10687,10 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
-	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
+	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => {
+		const anchor = rt.pendingSettled?.receipts[0];
+		return anchor?.origin === "user" && anchor.settled;
+	};
 	const composeSettlementText = (receipts: ReadonlyArray<{ text: string }>): string =>
 		receipts.map(receipt => receipt.text).join("\n\n");
 
@@ -10060,7 +10719,7 @@ export function createNotificationsExtension(
 			// activation emits one composed terminal receipt, not two messages.
 			if (rt.verbosity === "lean" && (rt.busy || rt.pendingSettled?.window === pending.window)) {
 				for (const receipt of pending.receipts)
-					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
+					deferLeanReceipt(rt, receipt.text, receipt.settled, receipt.messageRef, pending.window, receipt.origin);
 			} else {
 				const text = composeSettlementText(pending.receipts);
 				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
@@ -10131,7 +10790,8 @@ export function createNotificationsExtension(
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
 		beginAgentWork(rt);
-		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (correlation)
+			rt.bindPromptLifecycle(correlation, ctx.getActivePromptHandle(), event.lifecycleScope, continuation);
 		if (continuation) return;
 		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
@@ -10202,6 +10862,7 @@ export function createNotificationsExtension(
 		// The Agent's terminal owner is independent of delivery correlation. Never
 		// borrow a successor's run handle to settle a predecessor's SDK prompts.
 		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
+		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner);
 		const rootCorrelation = rt.activePromptCorrelation;
 		const correlations = terminalOwner ? rt.getJoinedPromptCorrelations(terminalOwner) : [];
 		if (
@@ -10218,6 +10879,7 @@ export function createNotificationsExtension(
 			// subsequent durable terminal claim fails. A fatal transport closure
 			// clears attribution, so an unrelated later agent_end cannot settle a
 			// predecessor's prompt correlation.
+			if (terminalOwner) rt.releaseAcceptedImage(correlation);
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
@@ -10606,8 +11268,9 @@ export function createNotificationsExtension(
 			: rt.redact
 				? undefined
 				: summaryFromMessage(event.message, turnTextMax());
+		const settled = !messageContinuesToolLoop(event.message);
 		if (rt.policySuspended) {
-			deferProvisionalReceipt(rt, text, rt.liveRef);
+			deferProvisionalReceipt(rt, text, settled, rt.liveRef);
 			rt.turnClosed = true;
 			return;
 		}
@@ -10622,7 +11285,7 @@ export function createNotificationsExtension(
 			} else if (text !== rt.preAskFlushedText) {
 				// Lean: hold the latest answer until agent_end. Skip when this turn
 				// already flushed the same text as an ask lead-in (no duplicate at idle).
-				deferLeanReceipt(rt, text, rt.liveRef);
+				deferLeanReceipt(rt, text, settled, rt.liveRef);
 			} else {
 				// Lead-in already flushed: drop any older deferred settled text so idle
 				// does not re-emit intermediate narration after the ask prompt (#2863).
@@ -10685,9 +11348,10 @@ export function createNotificationsExtension(
 				}
 				rt.pendingSettled = undefined;
 				rt.pendingFinal = undefined;
-			} else if (message.role !== "assistant") {
+			} else if (message.role !== "assistant" && message.role !== "toolResult") {
 				// The assembled direct prompt can contain framework context after its
-				// user message. A user boundary is authoritative for this turn.
+				// user message. A user boundary is authoritative for this turn. Tool
+				// results answer the turn's own tool calls and keep its provenance.
 				if (rt.currentTurnSettlementOrigin !== "user" || !isFrameworkPromptContext(message)) {
 					rt.currentTurnSettlementWindow = rt.settlementWindow;
 					rt.currentTurnSettlementOrigin = "autonomous";
@@ -10720,6 +11384,8 @@ export function createNotificationsExtension(
 
 	api.on("session_shutdown", async (_event, ctx) => {
 		extensionShuttingDown = true;
+		for (const runtime of runtimes.values()) runtime.abortBtwQuestions();
+		for (const runtime of cleanupRetries.values()) runtime.abortBtwQuestions();
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
 		const id = sessionId(ctx);

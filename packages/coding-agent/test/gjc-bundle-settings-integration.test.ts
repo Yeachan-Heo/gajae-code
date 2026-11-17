@@ -10,11 +10,12 @@ import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { bundleIdentity } from "../src/extensibility/gjc-plugins/lifecycle-reconciliation";
 import { GjcRuntimeSnapshotStore } from "../src/extensibility/gjc-plugins/runtime-quarantine";
 import { SettingsSelectorComponent } from "../src/modes/components/settings-selector";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
 import { createAgentSession } from "../src/sdk/session";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const sixSurfaceBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 
@@ -31,12 +32,15 @@ const sixSurfaceBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "
 
 beforeAll(async () => {
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Failed to load test theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 
-function baseContext(cwd: string): {
+function baseContext(
+	cwd: string,
+	settings: Settings,
+): {
+	settings: Settings;
 	availableThinkingLevels: [];
 	thinkingLevel: undefined;
 	availableThemes: string[];
@@ -44,6 +48,7 @@ function baseContext(cwd: string): {
 	cwd: string;
 } {
 	return {
+		settings,
 		availableThinkingLevels: [],
 		thinkingLevel: undefined,
 		availableThemes: ["red-claw"],
@@ -72,7 +77,11 @@ describe("GJC Bundles settings integration through the production selector", () 
 		);
 
 		const selector = new SettingsSelectorComponent(
-			{ ...baseContext("/tmp/does-not-need-to-exist"), gjcRuntimeSnapshot: store, gjcActivationGeneration: 7 },
+			{
+				...baseContext("/tmp/does-not-need-to-exist", Settings.instance),
+				gjcRuntimeSnapshot: store,
+				gjcActivationGeneration: 7,
+			},
 			{ onCancel: () => {}, onChange: () => {} },
 		);
 
@@ -100,7 +109,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-runtime-finding-"));
 			const hiddenCauseTail = "CAUSE_TAIL_NOT_DISPLAYED";
 			const primarySecret = "primary-secret-value";
-			const cause = `connection refused \u001b[31munsafe\u001b[0m\t detail\ncontinued ${"cause ".repeat(30)}api_key=${primarySecret} ${hiddenCauseTail}`;
+			const cause = `connection refused \u001b[31munsafe\u001b[0m\t detail\ncontinued ${"cause ".repeat(30)}api_key=${primarySecret} diagnostic=${hiddenCauseTail}`;
 			const failedTool = {
 				name: "mcp__domain_docs_false_success",
 				label: "domain_docs/false_success",
@@ -194,7 +203,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 
 				selector = new SettingsSelectorComponent(
 					{
-						...baseContext(cwd),
+						...baseContext(cwd, created.session.settings),
 						gjcRuntimeSnapshot: runtimeSnapshot,
 						gjcActivationGeneration: created.session.gjcActivationGeneration,
 					},
@@ -391,7 +400,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 	);
 
 	test("a missing provider degrades honestly instead of crashing", () => {
-		const selector = new SettingsSelectorComponent(baseContext("/tmp/does-not-need-to-exist"), {
+		const selector = new SettingsSelectorComponent(baseContext("/tmp/does-not-need-to-exist", Settings.instance), {
 			onCancel: () => {},
 			onChange: () => {},
 		});

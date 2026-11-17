@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import {
 	DEFAULT_SDK_PROMPT_DEADLINE_MS,
 	DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
@@ -13,6 +14,7 @@ import {
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
+import { closeSocket } from "./helpers/close-socket";
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -36,22 +38,8 @@ afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
 	for (const dir of dirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
-}
-
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(10);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10, label });
 
 function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): Settings {
 	return {
@@ -256,8 +244,6 @@ async function acceptPrompt(
 		prepareCwd?: (cwd: string) => Promise<void>;
 		/** Replace the settings double, e.g. to opt out of the autosave. */
 		settings?: (cwd: string) => Settings;
-		/** Widen the deadline-schedule capture beyond the default lease window. */
-		scheduleFilter?: (delayMs: number) => boolean;
 	} = {},
 ): Promise<BusSession> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
@@ -296,12 +282,13 @@ async function acceptPrompt(
 				delayMs?: number,
 				...rest: unknown[]
 			) => {
-				// The deadline is armed AFTER the awaited durable accept, so its
-				// remaining delay is the lease minus however long that write took.
-				// Match the whole upper half of the lease window: with the long lease
-				// these cases use, nothing else schedules anywhere near it.
-				const matches = options.scheduleFilter ?? ((delay: number) => delay > leaseMs / 2 && delay <= leaseMs);
-				if (delayMs !== undefined && matches(delayMs)) {
+				// Attribute the timer to its arming site, never to its delay. The bus
+				// starts the SDK broker for its agent dir concurrently with this window,
+				// and that startup arms its own discovery timers (`ensure.ts`
+				// `readBrokerDiscoveryBeforeDeadline`, ~35s out) whose delay overlaps
+				// any lease-shaped filter. Renaming `armPromptDeadline` fails loudly on
+				// the "captured deadline schedule" wait below.
+				if (delayMs !== undefined && /\bat armPromptDeadline \(/.test(new Error().stack ?? "")) {
 					scheduled.push(callback);
 					scheduledDelays.push(delayMs);
 				}
@@ -1486,8 +1473,6 @@ test("the bus arms its deadline at the schema default when the setting read miss
 		{
 			settings: settingsWithoutDeadlineValues,
 			captureSchedule: true,
-			// Nothing else in the accept path schedules anywhere near an hour out.
-			scheduleFilter: delayMs => delayMs > 1_000_000,
 		},
 	);
 	try {

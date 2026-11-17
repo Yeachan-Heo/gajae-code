@@ -1,3 +1,4 @@
+import { isRecord } from "@gajae-code/utils";
 export type ToolOutcomeKind = "timeout" | "success" | "other-error";
 
 export interface TimeoutToolOutcome {
@@ -10,10 +11,6 @@ export interface TimeoutHoldState {
 	heldSnapshotKey?: string;
 	fingerprint?: string;
 	streak: number;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function canonicalizeArgs(value: unknown): unknown {

@@ -7,7 +7,7 @@
  */
 import * as path from "node:path";
 import * as url from "node:url";
-import { getProjectDir, logger, withTimeout } from "@gajae-code/utils";
+import { getProjectDir, isRecord, logger, withTimeout } from "@gajae-code/utils";
 import {
 	buildXMcpParamHeaders,
 	classifyMcpProbeFailure,
@@ -67,9 +67,6 @@ const CLIENT_INFO = {
 	name: "gjc-coding-agent",
 	version: "1.0.0",
 };
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function decodeInitializeResult(value: unknown): MCPInitializeResult {
 	if (

@@ -1,4 +1,4 @@
-import { getMCPConfigPath } from "@gajae-code/utils";
+import { getMCPConfigPath, sanitizeDisplayLine } from "@gajae-code/utils";
 import { listPrompts, listResources, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
@@ -18,6 +18,14 @@ import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from
 import { commandConsumed, errorMessage, parseNamedScopeArgs, parseSubcommand, usage } from "./parse";
 
 type AcpMcpScope = "user" | "project";
+
+/**
+ * One terminal row for an untrusted MCP server or tool name.
+ * Ordinary names are unchanged. Controls, OSC, and line breaks are not.
+ */
+export function mcpTerminalLabel(value: string): string {
+	return sanitizeDisplayLine(value);
+}
 
 interface ParsedMcpAddArgs {
 	name?: string;
@@ -272,7 +280,7 @@ async function handleTestCommand(rest: string, runtime: SlashCommandRuntime): Pr
 		return await withPreparedMcpConnection(runtime, name, server.config, server.scope, async connection => {
 			const tools = await listTools(connection);
 			const lines = [`Server "${name}" connected (${tools.length} tools).`];
-			for (const tool of tools) lines.push(`  - ${tool.name}`);
+			for (const tool of tools) lines.push(`  - ${mcpTerminalLabel(tool.name)}`);
 			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		});
@@ -398,7 +406,7 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 					} else {
 						location = (config as { command: string }).command;
 					}
-					return `${name} | ${type} | ${status} | ${location ?? "(unknown)"} [${scope}]`;
+					return `${mcpTerminalLabel(name)} | ${type} | ${status} | ${location ?? "(unknown)"} [${scope}]`;
 				})
 				.join("\n"),
 		);

@@ -279,11 +279,27 @@ await runCli(${JSON.stringify(["daemon", ...argv])});`);
 	});
 
 	it("does not grant runtime bypass to malformed chat-daemon worker tokens", async () => {
+		for (const { argv, message } of [
+			{ argv: ["discord-internal"], message: "Missing required flag: --owner-id" },
+			{
+				argv: ["slack-internal", "--owner-id", "-bad", "--agent-dir", "/safe-fixture"],
+				message: "Invalid value for --owner-id",
+			},
+		]) {
+			const result = await child(
+				dispatchSource(
+					"daemon",
+					argv,
+					`setup:async()=>{throw new Error("runtime must remain inert")},load:async()=>{throw new Error("worker must not load")}`,
+				),
+			);
+			expect(result.code).toBe(2);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toContain(message);
+		}
 		for (const argv of [
-			["discord-internal"],
 			["slack-internal", "--owner-id", "1234-worker"],
 			["discord-internal", "--owner-id", "1234-worker", "--agent-dir", "relative-agent"],
-			["slack-internal", "--owner-id", "-bad", "--agent-dir", "/safe-fixture"],
 			["discord-internal", "--owner-id", "1234-worker", "--agent-dir", "/safe-fixture", "--help"],
 		]) {
 			const result = await child(

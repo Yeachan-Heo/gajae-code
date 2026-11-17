@@ -1,10 +1,24 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import { createShellSnapshotCacheForTesting } from "../src/utils/shell-snapshot";
 
 const BASH_PATH = "/bin/bash";
+const bashMissing = process.platform === "win32" || !existsSync(BASH_PATH);
+const SHELL_WORD_SEED = 328202610;
+
+function shellWordRoundTrips(quote: (value: string) => string, value: string): void {
+	const quoted = quote(value);
+	const proc = Bun.spawnSync([BASH_PATH, "-c", `printf %s ${quoted}`], {
+		env: { PATH: "/usr/bin:/bin", HOME: os.tmpdir(), USERPROFILE: os.tmpdir() },
+		stdin: "ignore",
+	});
+	expect(proc.exitCode).toBe(0);
+	expect(new TextDecoder().decode(proc.stdout)).toBe(value);
+}
 const temporaryRoots: string[] = [];
 async function makeHarness(platform: NodeJS.Platform = process.platform) {
 	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-shell-snapshot-test-"));
@@ -92,6 +106,56 @@ describe("shell snapshot private cache", () => {
 		expect((await fs.readdir(tempRoot)).filter(name => name.startsWith("gjc-shell-snapshots-"))).toEqual([]);
 		expect(await cache.getOrCreateSnapshot(wrapper, env)).not.toBeNull();
 		await cache.cleanup();
+	});
+	it.skipIf(bashMissing)("does not execute a command substitution in the rc file path", async () => {
+		const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-shell-snapshot-test-"));
+		temporaryRoots.push(tempRoot);
+		const marker = path.join(tempRoot, "pwned");
+		const home = path.join(tempRoot, 'bad$(touch "$MARKER")');
+		await fs.mkdir(home);
+		await Bun.write(path.join(home, ".bashrc"), "alias kept_alias=echo\n");
+		const cache = createShellSnapshotCacheForTesting({ tempRoot, home, platform: process.platform });
+		const snapshot = await cache.getOrCreateSnapshot(BASH_PATH, {
+			PATH: Bun.env.PATH,
+			HOME: home,
+			USERPROFILE: home,
+			MARKER: marker,
+		});
+		expect(await Bun.file(marker).exists()).toBe(false);
+		expect(snapshot).toBeString();
+		expect(await Bun.file(snapshot ?? "").text()).toContain("kept_alias");
+		await cache.cleanup();
+	});
+	it.skipIf(bashMissing)("still allows a home path with a space and an apostrophe", async () => {
+		const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-shell-snapshot-test-"));
+		temporaryRoots.push(tempRoot);
+		const home = path.join(tempRoot, "O'Brien Home");
+		await fs.mkdir(home);
+		await Bun.write(path.join(home, ".bashrc"), "alias kept_alias=echo\n");
+		const cache = createShellSnapshotCacheForTesting({ tempRoot, home, platform: process.platform });
+		const snapshot = await cache.getOrCreateSnapshot(BASH_PATH, {
+			PATH: Bun.env.PATH,
+			HOME: home,
+			USERPROFILE: home,
+		});
+		expect(snapshot).toBeString();
+		expect(await Bun.file(snapshot ?? "").text()).toContain("kept_alias");
+		await cache.cleanup();
+	});
+	it.skipIf(bashMissing)("property: posix shell word round-trips", async () => {
+		const mod = await import("../src/utils/shell-snapshot");
+		const quote = mod.quotePosixShell;
+		expect(typeof quote).toBe("function");
+		const word = fc
+			.string({ maxLength: 32 })
+			.filter(value => !value.includes("\0") && Buffer.from(value).toString() === value);
+		fc.assert(
+			fc.property(word, value => shellWordRoundTrips(quote, value)),
+			{
+				seed: SHELL_WORD_SEED,
+				numRuns: 64,
+			},
+		);
 	});
 	it("returns on Windows before creating any artifact", async () => {
 		const { tempRoot } = await makeHarness("win32");

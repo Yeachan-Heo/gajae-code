@@ -151,6 +151,8 @@ export async function createSdkWebSocketTransport(
 		sessionId: input.sessionId,
 		stateRoot: input.stateRoot,
 		token: input.token,
+		// Bun's WebSocket send has no directed-frame ceiling, so replays go out whole.
+		directedFrameCeilingBytes: null,
 		onFrame(handler) {
 			frameHandler = handler;
 			return () => {
@@ -167,6 +169,14 @@ export async function createSdkWebSocketTransport(
 			const socket = sockets.get(connectionId);
 			if (!socket) throw new Error("SDK connection is no longer available.");
 			socket.send(JSON.stringify(frame));
+		},
+		sendSerializedFrame(connectionId, serialized) {
+			const socket = sockets.get(connectionId);
+			if (!socket) throw new Error("SDK connection is no longer available.");
+			socket.send(serialized);
+		},
+		isConnectionOpen(connectionId) {
+			return sockets.has(connectionId);
 		},
 		start: async () => {
 			if (stopPromise) await stopPromise;

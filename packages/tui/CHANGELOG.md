@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Performance
+
+- Streaming a long paragraph with no blank line (pasted logs, hard-wrapped output) slows the terminal much less as the paragraph grows. The setext-heading rule scanned the whole paragraph on every re-lex before it could fail; the paragraph is now checked for an underline line first, and the rule runs only when one is present.
+
+## [0.20.0] - 2026-11-08
+
+### Added
+
+- `ProcessTerminal.setAppearancePolling(enabled)` turns the 2-second OSC 11 re-query on and off, and `GJC_TUI_DISABLE_OSC11_POLL=1` disables it for the whole session. The startup query and Mode 2031 notifications are unchanged.
+
+### Fixed
+
+- A cursor position report that an outer PTY proxy (for example ghost-complete) leaks into GJC is no longer taken as input, so it stops snapping a scrolled-up transcript back to the bottom. GJC never requests these reports. `CSI 1;<modifier> R` is still delivered as modified F3.
+
+- Image fallback text strips ANSI escapes, newlines, bidi marks, and other non-tab controls from the filename and media type before they are painted. Tab characters stay.
+
+## [0.19.3] - 2026-11-03
+
+### Fixed
+
+- On Unix, terminal probe replies no longer get echoed over the composer as `^[]11;rgb:…^G^[[?62c` after a screen lock, display sleep, or other stretch where the terminal stops reading output (#7373). Before every OSC 11 probe, raw mode was forced back on by cycling `setRawMode(false)` → `setRawMode(true)`. Each call waits in `tcsetattr(TCSADRAIN)` for queued output to drain. During the `false` step the tty sat in cooked mode with `ECHO` on, so replies that arrived while the backlog flushed were echoed by the kernel. The probe path now re-applies raw termios from the live tty state with `TCSANOW`, and only when a foreground child actually left it cooked. Windows still uses the `setRawMode` cycle.
+
+- Fuzzy search in the model selector, command palette, session selector, OAuth provider selector, and `gjc --list-models <search>` now scores the best alignment of the query instead of the first occurrence of each character, so an exact word later in the text (for example "model" in `src/modes/model-picker.ts`, or a model id behind a provider prefix) is no longer ranked below a scattered match.
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- File autocomplete labels and descriptions no longer send terminal control sequences from repository file or directory names. The inserted completion value stays the on-disk path.
+
+- Preserve text before a yanked combining character when cycling the kill ring in Input and SecretInput.
+
+- Markdown source is sanitized before parsing so code fences and inline text cannot emit terminal control sequences.
+
+- A mouse drag selection that starts after other text on a padded row now highlights only the selected cells. The copied text was already correct, but the drag-origin marker was spliced in by slicing the painted row twice, which pulled the reverse-video escape into the prefix and highlighted from the start of the row.
+
+- OSC 9 and OSC 99 notifications drop C0, DEL, and C1 characters before the message is placed in the parameter.
+
+- Settings list rows and text-field prefills no longer send terminal control sequences; an untouched confirm keeps the stored value, and an edit commits the submitted text.
+
+## [0.19.0] - 2026-10-22
+
+### Fixed
+
+- Kitty and iTerm2 image encoders now reject a payload that is not RFC 4648 base64 before writing the terminal escape, so an early APC or OSC terminator in the image data cannot inject further control sequences.
+
+- Normalize local Markdown links to absolute, percent-encoded `file://` OSC 8 destinations, resolving relative paths from the active working directory and `~/` paths from the home directory. Link destinations are read as URI references, so percent-escapes are decoded and `#fragment` / `?query` suffixes (for example `src/file.ts#L12`) stay URI components. Network-path references (`//host/path`) are left unchanged rather than read as local absolute paths. Targets containing control characters remain non-clickable.
+
+- The Gajae Pet sprite is uploaded as a single-escape lossless PNG instead of chunked kitty raw RGBA (`f=32`), and every kitty escape is bounded to the protocol's 4096-byte limit in both the pet and inline-image paths. A pet animation frame used to emit several ~4 KB raw-RGBA chunk continuations per tick; when the terminal dropped one mid-payload the remaining base64 was painted into the transcript as text and the frame desynchronized. A sprite frame now costs a few hundred payload characters inside one complete escape.
+
 ## [0.18.12] - 2026-10-16
 
 ### Added

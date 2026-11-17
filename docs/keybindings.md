@@ -77,14 +77,11 @@ In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcrip
 
 ## Auditing default-key collisions
 
-Some default chords are intentionally reused across different UI contexts, where the focused component disambiguates them at dispatch time. For example `Enter` maps to both input submit and selection confirm, and `Ctrl+C` maps to both input copy and selection cancel. These are not conflicts — only one context is active at a time.
+Some default chords are intentionally reused across different UI contexts, where the focused component disambiguates them at dispatch time. For example `Enter` maps to both input submit and selection confirm. These are not conflicts — only one context is active at a time.
 
 To audit the registry for keys whose default binding is claimed by more than one action, use `detectDefaultKeyCollisions(definitions)` from `@gajae-code/tui/keybindings`. It returns one entry per colliding key with the list of claiming action IDs, which is useful when adding new defaults or reviewing the surface. User-remap conflicts (multiple actions bound to the same chord in `keybindings.json`) continue to be reported separately by `KeybindingsManager.getConflicts()`.
 
-Two audit clarifications for the current surface:
-
-- `app.clipboard.copyLine` is registry-backed and dispatched through the input controller's custom key handlers, not hardcoded.
-- `tui.input.copy` is declared in the registry but is not currently dispatched by `Editor.handleInput`.
+`app.clipboard.copyLine` is registry-backed and dispatched through the input controller's custom key handlers, not hardcoded.
 
 The editor's configurable action defaults (including the platform-aware `app.clipboard.pasteImage` default) are derived directly from the central `KEYBINDINGS` registry, so there is a single source of truth for those defaults.
 
@@ -122,11 +119,10 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 
 | Action ID | Default | Notes |
 | --- | --- | --- |
-| `tui.input.newLine` | `Shift+Enter` | `Ctrl+Enter` and `Ctrl+Shift+Enter` are also accepted by the editor when the terminal encodes them distinctly |
+| `tui.input.newLine` | `Shift+Enter` | `Ctrl+Enter` and `Ctrl+Shift+Enter` also insert a newline when the terminal encodes them distinctly. A bare line feed (`Ctrl+J`, or a Shift+Enter→LF terminal mapping) is a newline in the composer (including while autocomplete is open) and in ask inputs |
 
 | `tui.input.submit` | `enter` | also `tui.select.confirm` (other context) |
 | `tui.input.tab` | `tab` | |
-| `tui.input.copy` | `ctrl+c` | declared but not dispatched by `Editor.handleInput` |
 
 ### Selection context (`tui.select.*`)
 
@@ -210,4 +206,4 @@ A few contexts still match chords directly instead of resolving through the regi
 
 - Tree selector (`tree-selector.ts`): up/down/left/right/enter, `ctrl+c`, filter cycling (`ctrl+o` / `ctrl+shift+o`), filter modes (`alt+d/t/u/l/a`), label edit (`shift+l`).
 - Parts of the model selector.
-- Composer editor (`editor.ts`): the kill-ring, word-delete and line-kill actions (`tui.editor.deleteToLineEnd`, `tui.editor.deleteToLineStart`, `tui.editor.deleteWordBackward`, `tui.editor.deleteWordForward`, `tui.editor.yank`, `tui.editor.yankPop`) now resolve through the registry and are fully remappable. Two exceptions remain: `tui.editor.cursorLineStart` and `tui.editor.cursorLineEnd` are matched by literal `ctrl+a` / `ctrl+e` branches placed ahead of their registry branches, so remapping those two actions elsewhere does **not** free `ctrl+a` / `ctrl+e` inside the composer. The `alt+enter` / `ctrl+j` / `ctrl+enter` submit and newline chords are likewise still literal.
+- Composer editor (`editor.ts`): the kill-ring, word-delete and line-kill actions (`tui.editor.deleteToLineEnd`, `tui.editor.deleteToLineStart`, `tui.editor.deleteWordBackward`, `tui.editor.deleteWordForward`, `tui.editor.yank`, `tui.editor.yankPop`) now resolve through the registry and are fully remappable. Two exceptions remain: `tui.editor.cursorLineStart` and `tui.editor.cursorLineEnd` are matched by literal `ctrl+a` / `ctrl+e` branches placed ahead of their registry branches, so remapping those two actions elsewhere does **not** free `ctrl+a` / `ctrl+e` inside the composer. The `alt+enter` / `ctrl+enter` chords and the bare line feed are likewise still literal.

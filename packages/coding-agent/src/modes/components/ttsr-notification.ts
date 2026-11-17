@@ -1,4 +1,5 @@
 import { Box, Container, Spacer, Text } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import type { Rule } from "../../capability/rule";
 import { theme } from "../../modes/theme/theme";
 
@@ -36,8 +37,10 @@ export class TtsrNotificationComponent extends Container {
 	#rebuild(): void {
 		this.#box.clear();
 
-		// Build header: warning symbol + rule name + rewind icon
-		const ruleNames = this.rules.map(r => theme.bold(r.name)).join(", ");
+		// Build header: warning symbol + rule name + rewind icon.
+		// Sanitize before theme styling and the two-line cut so a control
+		// sequence cannot reach the terminal, including one split by truncation.
+		const ruleNames = this.rules.map(r => theme.bold(sanitizeText(r.name))).join(", ");
 		const label = this.rules.length === 1 ? "rule" : "rules";
 		const header = `${theme.icon.warning} Injecting ${label}: ${ruleNames}`;
 
@@ -52,7 +55,7 @@ export class TtsrNotificationComponent extends Container {
 			if (desc) {
 				this.#box.addChild(new Spacer(1));
 
-				let displayText = desc.trim();
+				let displayText = sanitizeText(desc).trim();
 				if (!this.#expanded) {
 					// Truncate to first 2 lines
 					const lines = displayText.split("\n");
@@ -70,7 +73,7 @@ export class TtsrNotificationComponent extends Container {
 		if (!this.#expanded) {
 			const hasMoreContent = this.rules.some(r => {
 				const desc = r.description || r.content;
-				return desc && desc.split("\n").length > 2;
+				return !!desc && sanitizeText(desc).trim().split("\n").length > 2;
 			});
 			if (hasMoreContent) {
 				this.#box.addChild(new Text(theme.italic(" (ctrl+o to expand)"), 0, 0));

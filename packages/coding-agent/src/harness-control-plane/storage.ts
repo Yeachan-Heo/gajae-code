@@ -186,9 +186,32 @@ function socketBase(env: NodeJS.ProcessEnv, allowOverride: boolean): { base: str
 	return { base: path.join(os.tmpdir(), `gjch${process.getuid?.() ?? "u"}`), fromOverride: false };
 }
 
-function socketPathForBase(root: string, sessionId: string, base: string): string {
+/** A real directory (never a symlink); on POSIX also owned by this uid with mode 0700. */
+function privateSocketBase(base: string): boolean {
+	try {
+		const st = fsSync.lstatSync(base);
+		if (st.isSymbolicLink() || !st.isDirectory()) return false;
+		const uid = process.getuid?.();
+		return uid === undefined || (st.uid === uid && (st.mode & 0o777) === 0o700);
+	} catch {
+		return false;
+	}
+}
+
+/** One key per state root, so a symlinked and a real spelling share socket and record paths. */
+export function stableRootKey(root: string): string {
+	try {
+		return fsSync.realpathSync(root);
+	} catch {
+		return path.resolve(root);
+	}
+}
+
+/** `create` prepares the base and writes metadata; lookup only reads and returns null for an untrusted base. */
+function socketPathForBase(root: string, sessionId: string, base: string, create: boolean): string | null {
 	const digest = createHash("sha256").update(`${root}\0${sessionId}`).digest("hex");
-	ensurePrivateDirSync(base);
+	if (create) ensurePrivateDirSync(base);
+	else if (!privateSocketBase(base)) return null;
 	for (const len of [16, 24, 32, 48, 64]) {
 		const stem = `c-${digest.slice(0, len)}`;
 		const metadataPath = path.join(base, `${stem}.json`);
@@ -198,29 +221,57 @@ function socketPathForBase(root: string, sessionId: string, base: string): strin
 			if (existing.root === root && existing.sessionId === sessionId) return path.join(base, `${stem}.sock`);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, {
-				encoding: "utf8",
-				mode: 0o600,
-			});
+			if (create) {
+				fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+			}
 			return path.join(base, `${stem}.sock`);
 		}
 	}
 	throw new StorageError(`socket_path_collision:${sessionId}`, "socket_path_collision");
 }
 
-export function controlSocketPath(root: string, sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+function resolveControlSocketPath(
+	root: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv,
+	create: boolean,
+): string | null {
 	assertSafeSessionId(sessionId);
+	const rootKey = stableRootKey(root);
 	let { base, fromOverride } = socketBase(env, true);
-	let finalPath = socketPathForBase(root, sessionId, base);
-	if (Buffer.byteLength(finalPath) > MAX_UNIX_SOCKET_PATH_BYTES && fromOverride) {
+	let finalPath = socketPathForBase(rootKey, sessionId, base, create);
+	if (finalPath !== null && Buffer.byteLength(finalPath) > MAX_UNIX_SOCKET_PATH_BYTES && fromOverride) {
 		base = socketBase(env, false).base;
-		finalPath = socketPathForBase(root, sessionId, base);
+		finalPath = socketPathForBase(rootKey, sessionId, base, create);
 	}
+	if (finalPath === null) return null;
 	const finalBytes = Buffer.byteLength(finalPath);
 	if (finalBytes > MAX_UNIX_SOCKET_PATH_BYTES) {
 		throw new StorageError(`socket_path_too_long:${finalBytes}`, "socket_path_too_long");
 	}
 	return finalPath;
+}
+
+/** Owner setup: creates the private socket directory and its metadata. */
+export function controlSocketPath(root: string, sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+	const socketPath = resolveControlSocketPath(root, sessionId, env, true);
+	if (socketPath === null) throw new StorageError(`socket_dir_untrusted:${sessionId}`, "socket_dir_untrusted");
+	return socketPath;
+}
+
+/**
+ * Lookup-only twin of `controlSocketPath`: no mkdir, chmod, or metadata write.
+ * Null when the socket directory is a symlink, missing, or not private to this uid.
+ */
+export function controlSocketPathFor(
+	root: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv = process.env,
+): string | null {
+	return resolveControlSocketPath(root, sessionId, env, false);
 }
 
 export class StorageError extends Error {
@@ -293,11 +344,131 @@ export function sessionPaths(root: string, sessionId: string): SessionPaths {
 	};
 }
 
+const NO_FOLLOW = process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0);
+
+function errnoCode(error: unknown): string | undefined {
+	return error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+}
+
+function sameInode(left: fsSync.BigIntStats, right: fsSync.BigIntStats): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+}
+
+/**
+ * Leaf directory mode 0700. `lstat` plus `chmod` does not need read permission, so a
+ * mode 0300 directory stays writable. A symlink leaf is refused before chmod.
+ * This does not pin the directory against a later rename in a writable parent.
+ */
+async function ensureOwnerDirectory(dir: string): Promise<void> {
+	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+	let current: fsSync.Stats;
+	try {
+		current = await fs.lstat(dir);
+	} catch (error) {
+		const code = errnoCode(error);
+		if (code === "ELOOP" || code === "ENOTDIR") throw new Error("harness state directory is not a directory");
+		throw error;
+	}
+	if (current.isSymbolicLink() || !current.isDirectory())
+		throw new Error("harness state directory is not a directory");
+	if (process.platform === "win32" || (current.mode & 0o077) === 0) return;
+	await fs.chmod(dir, 0o700);
+	const tightened = await fs.lstat(dir);
+	if (tightened.isSymbolicLink() || !tightened.isDirectory() || (tightened.mode & 0o777) !== 0o700) {
+		throw new Error("harness state directory could not be tightened to mode 0700");
+	}
+}
+
+async function assertRegularOrMissing(file: string): Promise<void> {
+	try {
+		const existing = await fs.lstat(file);
+		if (existing.isSymbolicLink() || !existing.isFile()) throw new Error("harness state path is not a regular file");
+	} catch (error) {
+		if (errnoCode(error) !== "ENOENT") throw error;
+	}
+}
+
+/**
+ * Append like the workflow owner-only writer: mode 0600, `O_NOFOLLOW` when the file
+ * exists, `O_EXCL` when it does not, and chmod to 0600 when group or other bits are set.
+ */
+async function appendOwnerOnly(filePath: string, text: string): Promise<void> {
+	await ensureOwnerDirectory(path.dirname(filePath));
+	let handle: fs.FileHandle | undefined;
+	let initial: fsSync.BigIntStats | undefined;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		initial = undefined;
+		try {
+			initial = await fs.lstat(filePath, { bigint: true });
+			if (initial.isSymbolicLink() || !initial.isFile()) throw new Error("harness state path is not a regular file");
+		} catch (error) {
+			if (errnoCode(error) !== "ENOENT") throw error;
+		}
+		const flags = initial
+			? fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | NO_FOLLOW
+			: fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL;
+		try {
+			handle = await fs.open(filePath, flags, 0o600);
+			break;
+		} catch (error) {
+			const code = errnoCode(error);
+			if (code === "ELOOP") throw new Error("harness state path is not a regular file");
+			if (initial === undefined && code === "EEXIST" && attempt === 0) continue;
+			throw error;
+		}
+	}
+	if (!handle) throw new Error("harness state path identity changed before append");
+	try {
+		const opened = await handle.stat({ bigint: true });
+		const named = await fs.lstat(filePath, { bigint: true });
+		if (
+			opened.isSymbolicLink() ||
+			!opened.isFile() ||
+			named.isSymbolicLink() ||
+			!named.isFile() ||
+			(initial !== undefined && !sameInode(initial, opened)) ||
+			!sameInode(opened, named)
+		) {
+			throw new Error("harness state path identity changed before append");
+		}
+		if (process.platform !== "win32" && (Number(opened.mode) & 0o077) !== 0) {
+			await handle.chmod(0o600);
+			const tightened = await handle.stat({ bigint: true });
+			if ((Number(tightened.mode) & 0o777) !== 0o600) {
+				throw new Error("harness state path could not be tightened to mode 0600");
+			}
+		}
+		await handle.writeFile(text, "utf8");
+	} finally {
+		await handle.close();
+	}
+}
+
 async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true });
+	await ensureOwnerDirectory(path.dirname(file));
+	await assertRegularOrMissing(file);
 	const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
-	await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-	await fs.rename(tmp, file);
+	const flags = fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | NO_FOLLOW;
+	const handle = await fs.open(tmp, flags, 0o600);
+	try {
+		if (process.platform !== "win32") {
+			await handle.chmod(0o600);
+			const created = await handle.stat();
+			if (!created.isFile() || (created.mode & 0o777) !== 0o600) {
+				throw new Error("harness state path could not be tightened to mode 0600");
+			}
+		}
+		await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+	} finally {
+		await handle.close();
+	}
+	try {
+		await assertRegularOrMissing(file);
+		await fs.rename(tmp, file);
+	} catch (error) {
+		await fs.rm(tmp, { force: true }).catch(() => undefined);
+		throw error;
+	}
 }
 
 async function readJson<T>(file: string): Promise<T | null> {
@@ -396,7 +567,6 @@ export async function resolveHarnessSessionRoot(
 
 export async function writeSessionState(root: string, state: SessionState): Promise<void> {
 	const paths = sessionPaths(root, state.sessionId);
-	await fs.mkdir(paths.dir, { recursive: true });
 	await writeJsonAtomic(paths.state, state);
 }
 
@@ -407,8 +577,7 @@ export async function sessionExists(root: string, sessionId: string): Promise<bo
 /** Append a single severity envelope to events.jsonl. Single-writer discipline is the owner's job (M3). */
 export async function appendEvent(root: string, sessionId: string, envelope: EventEnvelope): Promise<void> {
 	const paths = sessionPaths(root, sessionId);
-	await fs.mkdir(paths.dir, { recursive: true });
-	await fs.appendFile(paths.events, `${JSON.stringify(envelope)}\n`, "utf8");
+	await appendOwnerOnly(paths.events, `${JSON.stringify(envelope)}\n`);
 }
 
 /** Read events from cursor (exclusive). Tail-only: never mutates the log. */

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Container, Text, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { VirtualTerminal, visible } from "./virtual-terminal";
 
 class AnchoredTranscript extends Container {
 	append(id: string, text = id): void {
@@ -12,10 +12,6 @@ class AnchoredTranscript extends Container {
 
 async function settle(term: VirtualTerminal): Promise<void> {
 	await term.waitForRender();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 function createTranscript(count = 30): AnchoredTranscript {

@@ -137,8 +137,37 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			toolNames: toolNames ?? undefined,
 		};
 	}
+	async function installPluginMcpCleanupFixture() {
+		// Authenticated plugin stdio capsules are Linux-only. These tests stub
+		// connectServers to exercise manager cleanup, not stdio launch admission.
+		// A public literal avoids DNS traffic; the stub prevents any connection.
+		const bundleRoot = path.join(tempDir, "network-plugin-bundle");
+		await fs.promises.cp(validSixSurfacePluginBundle, bundleRoot, { recursive: true });
+		const manifestPath = path.join(bundleRoot, "gajae-plugin.json");
+		const manifest = (await Bun.file(manifestPath).json()) as Record<string, unknown>;
+		manifest.mcps = [{ name: "domain_docs", transport: "http", url: "https://8.8.8.8/mcp" }];
+		await Bun.write(manifestPath, JSON.stringify(manifest));
+		return installGjcBundle({ cwd: tempDir }, "project", bundleRoot);
+	}
 	async function expectExactConfigLoadFailureWarning(configPath: string, sensitiveValues: string[]): Promise<void> {
-		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const warningOrigins: Array<{ category: string; argumentCount: number; frames: string[] }> = [];
+		const warning = vi.spyOn(logger, "warn").mockImplementation((...args) => {
+			// Attribute an unexpected second warning without publishing arbitrary messages,
+			// credential metadata or temporary config paths into the failing CI log.
+			const categories = new Map([
+				["MCP tools could not be loaded.", "exact-mcp-load-failure"],
+				["Model-host prewarm service failed", "model-host-prewarm-failure"],
+				["Startup scan exceeded deadline; deferring to system prompt fallback", "startup-scan-deadline"],
+			]);
+			warningOrigins.push({
+				category: categories.get(String(args[0])) ?? "other-warning",
+				argumentCount: args.length,
+				frames:
+					new Error("warning origin").stack?.match(
+						/packages\/coding-agent\/(?:src|test)\/[a-zA-Z0-9_./-]+:\d+:\d+/g,
+					) ?? [],
+			});
+		});
 		const { session, mcpManager } = await createAgentSession({
 			...createIsolatedSessionOptions(),
 			mcpConfigPath: configPath,
@@ -146,6 +175,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		try {
 			expect(mcpManager).toBeUndefined();
 			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
+			if (warning.mock.calls.length !== 1) {
+				process.stderr.write(`Exact MCP warning origins: ${JSON.stringify(warningOrigins)}\n`);
+			}
 			expect(warning).toHaveBeenCalledTimes(1);
 			expect(warning).toHaveBeenCalledWith("MCP tools could not be loaded.");
 			const warningText = warning.mock.calls.flat().join("\n");
@@ -1053,11 +1085,17 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it("surfaces owned MCP cleanup failure when no plugin server connects", async () => {
 		const cleanupError = new Error("plugin cleanup failed");
 		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
-		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue(createMcpLoadResult([], new Map(), []));
-		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		const connectServers = vi
+			.spyOn(MCPManager.prototype, "connectServers")
+			.mockResolvedValue(createMcpLoadResult([], new Map(), []));
+		const installed = await installPluginMcpCleanupFixture();
 		expect(installed.ok).toBe(true);
 		await expect(createAgentSession(createIsolatedSessionOptions())).rejects.toMatchObject({
 			code: "MCP_MANAGER_CLEANUP_FAILED",
+		});
+		expect(connectServers).toHaveBeenCalledTimes(1);
+		expect(connectServers.mock.calls[0]?.[0]).toMatchObject({
+			domain_docs: { type: "http", url: "https://8.8.8.8/mcp" },
 		});
 		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
@@ -1069,7 +1107,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			.spyOn(MCPManager.prototype, "disconnectAll")
 			.mockRejectedValueOnce(cleanupError)
 			.mockResolvedValue(undefined);
-		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		const installed = await installPluginMcpCleanupFixture();
 		expect(installed.ok).toBe(true);
 
 		let failure: unknown;
@@ -1087,19 +1125,20 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it("preserves plugin MCP cleanup diagnostics alongside a setup failure", async () => {
 		const startupError = new Error("plugin startup failed");
 		const cleanupError = new Error("plugin cleanup failed");
-		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+		const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
 		const disconnectAll = vi
 			.spyOn(MCPManager.prototype, "disconnectAll")
 			.mockRejectedValueOnce(cleanupError)
 			.mockResolvedValue(undefined);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		const installed = await installPluginMcpCleanupFixture();
 		expect(installed.ok).toBe(true);
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
 		try {
 			const cleanupWarning = warning.mock.calls.find(
 				([message]) => message === "Failed to wire GJC plugin MCP servers",
 			);
+			expect(connectServers).toHaveBeenCalledTimes(1);
 			expect(cleanupWarning?.[1]).toMatchObject({
 				error: "plugin startup failed",
 				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
@@ -1189,13 +1228,13 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			},
 		});
 		const cleanupError = new Error("plugin cleanup failed");
-		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+		const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
 		const disconnectAll = vi
 			.spyOn(MCPManager.prototype, "disconnectAll")
 			.mockRejectedValueOnce(cleanupError)
 			.mockResolvedValue(undefined);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		const installed = await installPluginMcpCleanupFixture();
 		expect(installed.ok).toBe(true);
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
 		try {
@@ -1203,6 +1242,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				([message]) => message === "Failed to wire GJC plugin MCP servers",
 			);
 			expect(cleanupWarning).toBeDefined();
+			expect(connectServers).toHaveBeenCalledTimes(1);
 			expect(cleanupWarning?.[1]).toMatchObject({
 				error: "<unprintable error>",
 				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
@@ -1607,6 +1647,119 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toEqual([
 				"mcp__github_create_issue",
 			]);
+
+			await session.newSession();
+			expect(session.getActiveToolNames()).toContain("mcp__local_inline_tool");
+			expect(session.getActiveToolNames()).not.toContain("mcp__github_create_issue");
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("does not infer MCP selection from an explicitly requested inline local name", async () => {
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(
+			createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]),
+		);
+		const { session } = await createAgentSession({
+			...createIsolatedSessionOptions(["mcp__local_inline_tool"]),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["exact"],
+			}),
+			mcpConfigPath: path.join(tempDir, "explicit-mcp.json"),
+			customTools: [createLocalCustomTool("mcp__local_inline_tool")],
+		});
+		try {
+			expect(session.getActiveToolNames()).toContain("mcp__local_inline_tool");
+			expect(session.getActiveToolNames()).toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__exact_lookup"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("does not treat a resolved inline tool as a deferred MCP selection", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-local-mcp-name.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		mockDeferredExactMcpLoad(discovery, { once: false });
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(["mcp__local_inline_tool"]),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["exact"],
+			}),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+			customTools: [createLocalCustomTool("mcp__local_inline_tool")],
+		});
+		try {
+			const startup = startDeferredMcpConfig!();
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getActiveToolNames()).toContain("mcp__local_inline_tool");
+			expect(session.getActiveToolNames()).toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__exact_lookup"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("honors live MCP selection authority during deferred catalog refresh", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-live-selection.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		mockDeferredExactMcpLoad(discovery, { once: false });
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(null),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["exact"],
+			}),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			const startup = startDeferredMcpConfig!();
+			await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getActiveToolNames()).not.toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("activates unresolved MCP names selected while deferred startup is pending", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-live-unresolved-selection.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		mockDeferredExactMcpLoad(discovery, { once: false });
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(["read"]),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": [],
+			}),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			const startup = startDeferredMcpConfig!();
+			await session.setActiveToolsByName(["read", "mcp__exact_lookup"]);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getActiveToolNames()).toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__exact_lookup"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 		} finally {
 			await session.dispose();
 		}

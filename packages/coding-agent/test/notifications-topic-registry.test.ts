@@ -781,7 +781,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 208 at serving epoch 88", () => {
+test("publishes exact durable authority generation 230 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -834,7 +834,17 @@ test("publishes exact durable authority generation 208 at serving epoch 88", () 
 	// queued or promoted work are stale.
 	// Generation 193 gates streamed content on negotiated observer capabilities,
 	// so existing owners do not retain the previous observer delivery contract.
-	expect(DAEMON_GENERATION).toBe(208);
+	// Generation 209 adds private image staging and exact execution quota ownership.
+	// Generation 216 reports the notifications host's broker registrations to the
+	// master owner-generation tracker (#7459).
+	// Generation 218 gates turn.abort_and_prompt on run ownership (#7534).
+	// Generation 224 settles an owner's replaced prompt as a client cancel (#7559).
+	// Generation 225 admits the retained suffix of a gapped event replay (#7582).
+	// Generation 226 lets an operator turn.abort stop a terminal-typed bus-host turn (#7566).
+	// Generation 228 restores the host console code page after shell commands and before Windows TUI frames (#7760).
+	// Generation 229 tracks completeness of ownership descent observations so transient identity resolution failures do not misclassify pre-existing processes as termination targets (#7765).
+	// Generation 230 composes that native ownership policy with retained replay and SDK notification-authority bindings.
+	expect(DAEMON_GENERATION).toBe(230);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {

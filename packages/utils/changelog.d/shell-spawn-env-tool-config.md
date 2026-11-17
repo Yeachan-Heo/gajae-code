@@ -1,3 +1,0 @@
-### Fixed
-
-- The bash tool's shell processes now also drop project-provided `PERLLIB`, `_JAVA_OPTIONS`, npm's `node-options` and `script-shell` (in any case, with `_` or `-`), `RIPGREP_CONFIG_PATH`, `TAR_OPTIONS`, `RSYNC_RSH`, `MAKEFLAGS`, `MAKEFILES`, `SHELLOPTS`, and `PS4` when the value comes from the project `.env`. A repository could previously use them to run its own program from `perl`, `java`, `npm`, `rg` (a config file adding `--pre`), `tar`, `rsync`, `make`, or any `bash -c` (xtrace with a `PS4` command substitution). Project dotenv keys Bun loads that are not shell identifiers (e.g. `npm_config_node-options`) now count as project-declared for provenance. Values the launching shell exported are still honored.

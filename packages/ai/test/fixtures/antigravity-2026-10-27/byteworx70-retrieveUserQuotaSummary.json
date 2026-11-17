@@ -1,0 +1,48 @@
+{
+  "description": "Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens. Thus, limits will last longer with shorter tasks or using more cost-effective models. The 5-hour limit smooths out aggregate demand to fairly distribute global capacity across all users, while your weekly limit is tied directly to your individual tier.",
+  "groups": [
+    {
+      "buckets": [
+        {
+          "bucketId": "gemini-weekly",
+          "description": "You have hit your weekly limit, it refreshes in 3 days, 5 hours. If on a supported paid plan, you can use AI credits in the interim or upgrade to a higher tier.",
+          "displayName": "Weekly Limit Remaining",
+          "remainingFraction": 0,
+          "resetTime": "2026-10-31T00:30:21Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "gemini-5h",
+          "description": "You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in 3 days, 5 hours.",
+          "disabled": true,
+          "displayName": "Five Hour Limit Remaining",
+          "remainingFraction": 0.9999967,
+          "resetTime": "2026-10-27T22:34:34Z",
+          "window": "5h"
+        }
+      ],
+      "description": "Models within this group: Gemini Flash, Gemini Pro",
+      "displayName": "Gemini Models"
+    },
+    {
+      "buckets": [
+        {
+          "bucketId": "3p-weekly",
+          "displayName": "Weekly Limit Remaining",
+          "remainingFraction": 1,
+          "resetTime": "2026-11-03T18:39:55Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "3p-5h",
+          "displayName": "Five Hour Limit Remaining",
+          "remainingFraction": 1,
+          "resetTime": "2026-10-27T23:39:55Z",
+          "window": "5h"
+        }
+      ],
+      "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+      "displayName": "Claude and GPT models"
+    }
+  ]
+}

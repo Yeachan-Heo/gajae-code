@@ -14,7 +14,6 @@ import {
 	resolveModelRoleValue,
 	resolveModelScope,
 	resolveSelector,
-	restoreModelFromSession,
 } from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 
@@ -1179,22 +1178,6 @@ describe("OpenAI Codex default resolution", () => {
 		expect(result.model?.thinking?.defaultLevel).toBe(Effort.XHigh);
 	});
 
-	test("restore fallback keeps visible fallback on gpt-5.5 instead of silently drifting to gpt-5.4", async () => {
-		const result = await restoreModelFromSession(
-			"openai-codex",
-			"missing-gpt",
-			undefined,
-			false,
-			codexDefaultRegistry,
-		);
-
-		expect(result.model?.provider).toBe("openai-codex");
-		expect(result.model?.id).toBe("gpt-5.5");
-		expect(result.fallbackMessage).toBe(
-			"Could not restore model openai-codex/missing-gpt (model no longer exists). Using openai-codex/gpt-5.5.",
-		);
-	});
-
 	test("does not replace an unavailable configured default with another provider's baseline", async () => {
 		const result = await findInitialModel({
 			defaultProvider: "opencode-go",
@@ -1223,16 +1206,6 @@ describe("OpenAI Codex default resolution", () => {
 	});
 });
 
-test("restores only an exact available provider/model candidate", async () => {
-	const fallback = mockModels[0];
-	const result = await restoreModelFromSession("openai", "saved", undefined, false, {
-		getAvailable: () => [fallback],
-		getApiKey: async () => "key",
-	});
-
-	expect(result.model).toBe(fallback);
-	expect(result.fallbackMessage).toContain("model no longer exists");
-});
 describe("expandRoleAlias", () => {
 	test("expands pi/default to the configured default role", () => {
 		const settings = Settings.isolated();
@@ -1470,4 +1443,49 @@ describe("preset-equivalent alias resolution", () => {
 		expect(result.model).toBe(aliasVariantModels[0]);
 		expect(result.warning).toBeUndefined();
 	});
+});
+
+test("filters out image-only models from chat role fallback chains", async () => {
+	const imageOnlyModel = { ...mockModels[0], output: ["image"] } as Model;
+	const chatModel = mockModels[1];
+	const resolution = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5", "openai/gpt-4o"],
+		{
+			getAvailable: () => [imageOnlyModel, chatModel],
+			isSelectorCircuitOpen: () => false,
+			getApiKey: async () => "test-key",
+			lookupAliasExists: () => false,
+		} as unknown as Parameters<typeof resolveModelChainWithAuth>[1],
+		undefined,
+		undefined,
+		{
+			managedFallback: true,
+			chatRoleFilter: "chat",
+		},
+	);
+	// Should skip the image-only model and resolve to the chat model
+	expect(resolution.model?.id).toBe("gpt-4o");
+	expect(resolution.skips).toContainEqual({ selector: "anthropic/claude-sonnet-4-5", reason: "image_only_model" });
+});
+
+test("allows image-only models for image role fallback chains", async () => {
+	const imageOnlyModel = { ...mockModels[0], output: ["image"] } as Model;
+	const resolution = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5"],
+		{
+			getAvailable: () => [imageOnlyModel],
+			isSelectorCircuitOpen: () => false,
+			getApiKey: async () => "test-key",
+			lookupAliasExists: () => false,
+		} as unknown as Parameters<typeof resolveModelChainWithAuth>[1],
+		undefined,
+		undefined,
+		{
+			managedFallback: true,
+			chatRoleFilter: "image",
+		},
+	);
+	// Should accept the image-only model when resolving for image role
+	expect(resolution.model?.output).toEqual(["image"]);
+	expect(resolution.skips).toHaveLength(0);
 });

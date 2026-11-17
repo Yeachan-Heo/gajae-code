@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, logger, Snowflake } from "@gajae-code/utils";
+import { $which, logger } from "@gajae-code/utils";
 import { $ } from "bun";
 
 export interface RecordingHandle {
@@ -212,10 +212,29 @@ if (Test-Path $outPath) {
 }
 `;
 
+async function writePowerShellRecordingScript(): Promise<{ tempDir: string; scriptPath: string }> {
+	// Random directory plus an exclusive create: a preexisting symlink under the
+	// shared temp directory is not opened, and the script is not left world-readable.
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-stt-record-"));
+	try {
+		if (process.platform !== "win32") await fs.chmod(tempDir, 0o700);
+		const scriptPath = path.join(tempDir, "record.ps1");
+		const handle = await fs.open(scriptPath, "wx", 0o600);
+		try {
+			await handle.writeFile(PS_RECORD_SCRIPT);
+		} finally {
+			await handle.close();
+		}
+		if (process.platform !== "win32") await fs.chmod(scriptPath, 0o600);
+		return { tempDir, scriptPath };
+	} catch (error) {
+		await fs.rm(tempDir, { recursive: true, force: true });
+		throw error;
+	}
+}
+
 async function startPowerShellRecording(outputPath: string): Promise<RecordingHandle> {
-	// Write script to temp file — avoids quoting/escaping issues with -Command
-	const scriptPath = path.join(os.tmpdir(), `gjc-stt-record-${Snowflake.next()}.ps1`);
-	await Bun.write(scriptPath, PS_RECORD_SCRIPT);
+	const { tempDir, scriptPath } = await writePowerShellRecordingScript();
 
 	const proc = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, outputPath], {
 		stdin: "pipe",
@@ -224,7 +243,7 @@ async function startPowerShellRecording(outputPath: string): Promise<RecordingHa
 	});
 
 	proc.exited.then(() => {
-		fs.unlink(scriptPath).catch(() => {});
+		fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 	});
 
 	// Wait for "RECORDING" on stdout to confirm it started
@@ -250,8 +269,7 @@ async function startPowerShellRecording(outputPath: string): Promise<RecordingHa
 		if (proc.stderr && typeof proc.stderr !== "number") {
 			stderrText = await new Response(proc.stderr as ReadableStream).text();
 		}
-		// Clean up temp script
-		fs.unlink(scriptPath).catch(() => {});
+		fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 		throw new Error(
 			`PowerShell audio recording failed to start: ${stderrText.trim() || output.trim() || "(no output)"}`,
 		);
@@ -269,8 +287,7 @@ async function startPowerShellRecording(outputPath: string): Promise<RecordingHa
 			const killTimer = setTimeout(() => proc.kill(), 8000);
 			await proc.exited;
 			clearTimeout(killTimer);
-			// Clean up temp script
-			fs.unlink(scriptPath).catch(() => {});
+			fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 		},
 	};
 }

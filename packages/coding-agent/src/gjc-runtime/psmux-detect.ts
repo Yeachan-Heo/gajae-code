@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 
 /**
  * Windows psmux detection and tmux-binary resolution.
@@ -133,7 +134,7 @@ function readSpawnRunner(): PsmuxSpawnRunner {
 				cmd: [command, ...args],
 				stdout: "pipe",
 				stderr: "pipe",
-				env: process.env,
+				env: projectSafeSpawnEnv(),
 			});
 			return {
 				exitCode: result.exitCode,

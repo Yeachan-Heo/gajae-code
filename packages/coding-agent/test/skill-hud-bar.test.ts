@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import fc from "fast-check";
 import { renderSkillHudBar } from "../src/modes/components/skill-hud/render";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
 import { theme } from "../src/modes/theme/theme";
@@ -297,5 +298,185 @@ describe("skill HUD bar renderer", () => {
 		const rendered = renderHudText([{ skill: "team", phase: "running", updated_at: "2000-01-01T00:00:00.000Z" }], 80);
 		expect(rendered).toContain("team:running");
 		expect(rendered).not.toContain("warn:stale");
+	});
+
+	it("keeps an internal double space in a summary", () => {
+		const rendered = renderHudText(
+			[{ skill: "team", phase: "run", hud: { version: 1, summary: "hello  world" } }],
+			240,
+		);
+		expect(rendered).toContain("hello  world");
+	});
+
+	it("keeps a clipboard-shaped label with no introducer", () => {
+		const rendered = renderHudText(
+			[{ skill: "team", phase: "run", hud: { version: 1, summary: "]52;c;QQ==" } }],
+			240,
+		);
+		expect(rendered).toContain("]52;c;QQ==");
+	});
+
+	it("keeps a tab as a space between skill words", () => {
+		const rendered = renderHudText([{ skill: "team\tred", phase: "run" }], 240);
+		expect(rendered).toContain("team red");
+		expect(rendered).not.toContain("\t");
+	});
+
+	it("keeps a carriage return as a space", () => {
+		const rendered = renderHudText([{ skill: "team\rred", phase: "run" }], 240);
+		expect(rendered).toContain("team red");
+	});
+
+	it("keeps letters around a color code", () => {
+		const rendered = renderHudText([{ skill: "team\u001b[31mred", phase: "run" }], 240);
+		expect(rendered).toContain("teamred");
+	});
+
+	it("keeps a bracketed note that is not a control", () => {
+		const rendered = renderHudText(
+			[{ skill: "team", phase: "run", hud: { version: 1, summary: "see [31m] later" } }],
+			240,
+		);
+		expect(rendered).toContain("see [31m] later");
+	});
+
+	it("keeps printable skill text, fc.property seed 70022, numRuns 64", () => {
+		fc.assert(
+			fc.property(
+				fc.stringMatching(/^[A-Za-z][A-Za-z0-9]{0,16}$/),
+				fc.stringMatching(/^[A-Za-z][A-Za-z0-9]{0,12}$/),
+				(skill, phase) => {
+					const plain = Bun.stripANSI((renderSkillHudBar([{ skill, phase }], 240) ?? []).join("\n"));
+					return plain.includes(`${skill}:${phase}`);
+				},
+			),
+			{ seed: 70022, numRuns: 64 },
+		);
+	});
+
+	it("keeps introducer-free clipboard text, fc.property seed 70023, numRuns 64", () => {
+		fc.assert(
+			fc.property(fc.stringMatching(/^[A-Za-z0-9+/=]{1,12}$/), payload => {
+				const summary = `]52;c;${payload}`;
+				const plain = Bun.stripANSI(
+					(renderSkillHudBar([{ skill: "team", phase: "run", hud: { version: 1, summary } }], 240) ?? []).join(
+						"\n",
+					),
+				);
+				return plain.includes(summary);
+			}),
+			{ seed: 70023, numRuns: 64 },
+		);
+	});
+});
+
+const STACKED_CLIPBOARD = "before \u001b\u001b\u001b]0;x\u0007]0;y\u0007]52;c;QQ==\u0007 after";
+
+function rawHud(entry: SkillActiveEntry, width = 240): string {
+	return (renderSkillHudBar([entry], width) ?? []).join("\n");
+}
+
+function entryForField(field: "skill" | "phase" | "summary" | "label" | "value", payload: string): SkillActiveEntry {
+	if (field === "skill") return { skill: payload, phase: "run" };
+	if (field === "phase") return { skill: "team", phase: payload };
+	if (field === "summary") return { skill: "team", phase: "run", hud: { version: 1, summary: payload } };
+	if (field === "label") {
+		return { skill: "team", phase: "run", hud: { version: 1, chips: [{ label: payload, value: "1" }] } };
+	}
+	return { skill: "team", phase: "run", hud: { version: 1, chips: [{ label: "exp", value: payload }] } };
+}
+
+describe("skill HUD terminal controls", () => {
+	for (const field of ["skill", "phase", "summary", "label", "value"] as const) {
+		it(`does not reassemble a clipboard sequence from stacked escapes in ${field}`, () => {
+			const rendered = rawHud(entryForField(field, STACKED_CLIPBOARD));
+			expect(rendered).toContain("before");
+			expect(rendered).toContain("after");
+			expect(rendered).not.toContain("\u001b]52;c;QQ==\u0007");
+			expect(rendered).not.toContain("\u001b]");
+			expect(rendered).not.toContain("\u0007");
+			expect(rendered).not.toContain("\u009d");
+		});
+	}
+
+	it("does not emit a window-title sequence from the skill field", () => {
+		const rendered = rawHud({ skill: "team\u001b]0;pwned\u0007", phase: "run" });
+		expect(rendered).toContain("team");
+		expect(rendered).not.toContain("\u001b]0");
+		expect(rendered).not.toContain("\u0007");
+	});
+
+	it("does not emit a hyperlink sequence from a summary", () => {
+		const rendered = rawHud({
+			skill: "team",
+			phase: "run",
+			hud: { version: 1, summary: "\u001b]8;;https://attacker.invalid\u0007click\u001b]8;;\u0007" },
+		});
+		expect(rendered).toContain("click");
+		expect(rendered).not.toContain("\u001b]8");
+		expect(rendered).not.toContain("\u0007");
+	});
+
+	it("does not emit an 8-bit OSC from a chip value", () => {
+		const rendered = rawHud({
+			skill: "team",
+			phase: "run",
+			hud: { version: 1, chips: [{ label: "exp", value: "\u009d52;c;QQ==\u009c" }] },
+		});
+		expect(rendered).not.toContain("\u009d");
+		expect(rendered).not.toContain("\u009c");
+		expect(rendered).toContain("exp");
+	});
+
+	it("does not emit a bell from a phase", () => {
+		const rendered = rawHud({ skill: "team", phase: "run\u0007ning" });
+		expect(rendered).toContain("running");
+		expect(rendered).not.toContain("\u0007");
+	});
+
+	it("does not reassemble a clipboard sequence across a removed color code", () => {
+		const rendered = rawHud({
+			skill: "team",
+			phase: "run",
+			hud: { version: 1, summary: "before \u001b\u001b[0m]52;c;QQ==\u0007 after" },
+		});
+		expect(rendered).toContain("before");
+		expect(rendered).toContain("after");
+		expect(rendered).not.toContain("\u001b]52");
+		expect(rendered).not.toContain("\u0007");
+	});
+
+	it("does not reassemble a clipboard sequence when the row is truncated", () => {
+		const rendered = rawHud({ skill: "team", phase: "run", hud: { version: 1, summary: STACKED_CLIPBOARD } }, 80);
+		expect(rendered).not.toContain("\u001b]");
+		expect(rendered).not.toContain("\u0007");
+		expect(rendered).not.toContain("\u009d");
+	});
+
+	it("does not reassemble terminal controls, fc.property seed 70021, numRuns 64", () => {
+		const terminator = fc.constantFrom("\u0007", "\u001b\\", "\u009c");
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 8 }),
+				fc.integer({ min: 0, max: 4 }),
+				fc.stringMatching(/^[A-Za-z0-9]{0,6}$/),
+				fc.stringMatching(/^[A-Za-z0-9+/=]{0,8}$/),
+				terminator,
+				fc.constantFrom("skill", "phase", "summary", "label", "value"),
+				(escCount, titles, title, payload, term, field) => {
+					let body = "\u001b".repeat(escCount);
+					for (let index = 0; index < titles; index += 1) body += `]0;${title}${term}`;
+					body += `]52;c;${payload}${term}`;
+					const rendered = rawHud(entryForField(field, `before ${body} after`));
+					const withoutCsi = rendered.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+					return (
+						!rendered.includes("\u001b]") &&
+						!rendered.includes("\u009d") &&
+						!/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(withoutCsi)
+					);
+				},
+			),
+			{ seed: 70021, numRuns: 64 },
+		);
 	});
 });

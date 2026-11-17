@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { kProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import {
 	asksFromAskInput,
 	idleDedupeKey,
 	imageAttachmentsFromMessage,
+	messageContinuesToolLoop,
 	notificationActionPayload,
 	summaryFromMessage,
 	summaryFromMessages,
@@ -103,6 +105,30 @@ describe("notifications helpers", () => {
 		expect(summaryFromMessage({ content: [] })).toBeUndefined();
 		expect(summaryFromMessage(undefined)).toBeUndefined();
 		expect(summaryFromMessage({ content: "   " })).toBeUndefined();
+	});
+
+	test("messageContinuesToolLoop detects only tool calls the agent loop dispatches", () => {
+		const dispatched = { type: "toolCall", id: "c1", name: "bash", arguments: {} };
+		const providerResolved = { ...dispatched, id: "c2", [kProviderResolvedToolCall]: true };
+		expect(
+			messageContinuesToolLoop({
+				content: [{ type: "text", text: "Checking." }, dispatched],
+				stopReason: "toolUse",
+			}),
+		).toBe(true);
+		expect(messageContinuesToolLoop({ content: [providerResolved, dispatched], stopReason: "toolUse" })).toBe(true);
+		expect(
+			messageContinuesToolLoop({
+				content: [{ type: "text", text: "Done." }, providerResolved],
+				stopReason: "stop",
+			}),
+		).toBe(false);
+		expect(messageContinuesToolLoop({ content: [dispatched], stopReason: "error" })).toBe(false);
+		expect(messageContinuesToolLoop({ content: [dispatched], stopReason: "aborted" })).toBe(false);
+		expect(messageContinuesToolLoop({ content: [{ type: "text", text: "Done." }] })).toBe(false);
+		expect(messageContinuesToolLoop({ content: "Done." })).toBe(false);
+		expect(messageContinuesToolLoop({ content: [null, "toolCall"] })).toBe(false);
+		expect(messageContinuesToolLoop(undefined)).toBe(false);
 	});
 
 	test("summaryFromMessage truncates long content", () => {

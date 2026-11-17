@@ -177,7 +177,9 @@ async function getDirectAccessToken(
 	gitlabAccessToken: string,
 	fetchImpl: FetchImpl = fetch,
 	onStreamCreated?: () => void,
+	signal?: AbortSignal,
 ): Promise<DirectAccessToken> {
+	signal?.throwIfAborted();
 	const cached = directAccessCache.get(gitlabAccessToken);
 	if (cached && cached.expiresAt > Date.now()) {
 		return cached;
@@ -186,6 +188,7 @@ async function getDirectAccessToken(
 	onStreamCreated?.();
 	const response = await fetchImpl(`${GITLAB_COM_URL}/api/v4/ai/third_party_agents/direct_access`, {
 		method: "POST",
+		signal,
 		headers: {
 			Authorization: `Bearer ${gitlabAccessToken}`,
 			"Content-Type": "application/json",
@@ -246,7 +249,12 @@ export function streamGitLabDuo(
 				throw new Error(`Unsupported GitLab Duo model: ${model.id}`);
 			}
 
-			const directAccess = await getDirectAccessToken(options.apiKey, options.fetch, options.onStreamCreated);
+			const directAccess = await getDirectAccessToken(
+				options.apiKey,
+				options.fetch,
+				options.onStreamCreated,
+				options.signal,
+			);
 			const headers = {
 				...directAccess.headers,
 				...options.headers,
@@ -275,6 +283,8 @@ export function streamGitLabDuo(
 								repetitionPenalty: options.repetitionPenalty,
 								maxTokens: options.maxTokens ?? Math.min(model.maxTokens, 32000),
 								signal: options.signal,
+								streamFirstEventTimeoutMs: options.streamFirstEventTimeoutMs,
+								streamIdleTimeoutMs: options.streamIdleTimeoutMs,
 								cacheRetention: options.cacheRetention,
 								headers,
 								maxRetryDelayMs: options.maxRetryDelayMs,
@@ -318,6 +328,8 @@ export function streamGitLabDuo(
 									repetitionPenalty: options.repetitionPenalty,
 									maxTokens: options.maxTokens ?? model.maxTokens,
 									signal: options.signal,
+									streamFirstEventTimeoutMs: options.streamFirstEventTimeoutMs,
+									streamIdleTimeoutMs: options.streamIdleTimeoutMs,
 									cacheRetention: options.cacheRetention,
 									headers,
 									maxRetryDelayMs: options.maxRetryDelayMs,
@@ -356,6 +368,8 @@ export function streamGitLabDuo(
 									repetitionPenalty: options.repetitionPenalty,
 									maxTokens: options.maxTokens ?? model.maxTokens,
 									signal: options.signal,
+									streamFirstEventTimeoutMs: options.streamFirstEventTimeoutMs,
+									streamIdleTimeoutMs: options.streamIdleTimeoutMs,
 									cacheRetention: options.cacheRetention,
 									headers,
 									maxRetryDelayMs: options.maxRetryDelayMs,
@@ -381,10 +395,11 @@ export function streamGitLabDuo(
 				stream.push(event);
 			}
 		} catch (err) {
+			const reason = options?.signal?.aborted ? "aborted" : "error";
 			stream.push({
 				type: "error",
-				reason: "error",
-				error: createProviderErrorMessage(model, err),
+				reason,
+				error: { ...createProviderErrorMessage(model, err), stopReason: reason },
 			});
 		}
 	})();

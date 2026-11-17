@@ -92,6 +92,7 @@ export function closeMemoryDb(db: Database): void {
 	db.close();
 }
 
+/** Delete every memory row and memory pipeline job. Not filtered by project cwd. */
 export function clearMemoryData(db: Database): void {
 	db.exec(`
 DELETE FROM stage1_outputs;

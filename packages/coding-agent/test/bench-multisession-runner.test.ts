@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { Context } from "@gajae-code/ai/core";
 import { TempDir } from "@gajae-code/utils";
@@ -11,6 +11,7 @@ import { REQUIRED_WORKLOAD_EVENTS, type RunnerEvent, type WorkloadEventKind } fr
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AuthStorage } from "../src/session/auth-storage";
+import * as systemPrompt from "../src/system-prompt";
 
 setDefaultTimeout(60_000);
 let tempDir: TempDir | undefined;
@@ -38,6 +39,22 @@ async function runOne(
 	return { evidenceDir, events };
 }
 
+async function withFixedProjectContextTime<T>(run: () => Promise<T>): Promise<T> {
+	const buildVolatileProjectContext = systemPrompt.buildVolatileProjectContext;
+	const now = new Date("2026-01-01T12:00:00.000Z");
+	// A minute rollover adds another retained reminder, changing the request's
+	// message count even after clock text is normalized. Fix only this rendered
+	// input; keep runtime clocks, workspace-tree refreshes, and deadlines real.
+	const clock = vi
+		.spyOn(systemPrompt, "buildVolatileProjectContext")
+		.mockImplementation(options => buildVolatileProjectContext({ ...options, now }));
+	try {
+		return await run();
+	} finally {
+		clock.mockRestore();
+	}
+}
+
 function parseJsonLines(text: string): Record<string, unknown>[] {
 	return parseJsonl(text, "evidence") as Record<string, unknown>[];
 }
@@ -63,8 +80,9 @@ describe("multi-session session runner", () => {
 	});
 	test("runs the complete workload and compares reproducibly normalized evidence", async () => {
 		tempDir = TempDir.createSync("@bench-multisession-runner-");
-		const first = await runOne("first");
-		const second = await runOne("second");
+		const [first, second] = await withFixedProjectContextTime(
+			async () => [await runOne("first"), await runOne("second")] as const,
+		);
 
 		const observed = new Set(
 			first.events

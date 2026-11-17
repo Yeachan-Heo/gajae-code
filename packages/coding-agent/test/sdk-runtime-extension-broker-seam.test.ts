@@ -72,7 +72,6 @@ function hasGuaranteedBrokerSeam(options: ObjectExpression, scope: Scope): boole
 	if (seam.type === "ObjectMethod") return seam.kind === "method";
 	return isGuaranteedBrokerFunction(seam.value, scope);
 }
-
 function missingBrokerSeams(source: string, filename: string): number[] {
 	const file = parse(source, { sourceFilename: filename, sourceType: "module", plugins: ["typescript"] });
 	const missing: number[] = [];

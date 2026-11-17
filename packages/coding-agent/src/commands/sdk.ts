@@ -12,7 +12,8 @@ import {
 } from "@gajae-code/natives";
 import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
-import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -65,6 +66,11 @@ import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
+import {
+	renderSpawnAnchorAttestation,
+	runSpawnAnchorAttestation,
+	SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE,
+} from "../sdk/cli/spawn-anchor-attestation-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
 	type CreateLifecycleAgentSessionResult,
@@ -72,6 +78,7 @@ import {
 	type SdkLifecycleStartupOwner,
 } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
+import type { ResumeSessionIdentity } from "../sdk/session-readonly/storage";
 import {
 	SdkStartupCapability,
 	type SdkStartupFailure,
@@ -81,11 +88,7 @@ import {
 } from "../sdk/startup-capability";
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
-import {
-	type CapturedSessionTranscriptSnapshot,
-	type ResumeSessionIdentity,
-	SessionManager,
-} from "../session/session-manager";
+import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
@@ -471,12 +474,14 @@ type OwnedMcpConfigDirectory = {
 	snapshot?: NativeDirectoryTreeSnapshot;
 };
 
-/** Opens lifecycle-authorized history without letting replacement content reach readiness. */
+/** Opens lifecycle-authorized history; prompt edits use the live session.revise path. */
 export async function openLifecycleSessionManager(
 	request: SessionLifecycleLaunchRequest,
 	cwd: string,
 	agentDir: string,
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
+	if ("body" in request && request.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
 	let sessionManager: SessionManager | undefined;
@@ -485,8 +490,20 @@ export async function openLifecycleSessionManager(
 	try {
 		const migrationPolicy =
 			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		// Reject ephemeral flag on non-create operations
+		if (
+			(request.operation === "session.resume" || request.operation === "session.fork") &&
+			request.ephemeral !== undefined
+		) {
+			throw new Error(`Ephemeral sessions cannot be created via ${request.operation} operations.`);
+		}
 		if (request.operation === "session.create") {
-			sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			if (request.ephemeral === true) {
+				// Ephemeral sessions keep transcripts in memory only
+				sessionManager = SessionManager.inMemory(cwd);
+			} else {
+				sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			}
 		} else {
 			const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
 			if (request.operation === "session.resume") {
@@ -508,6 +525,7 @@ export async function openLifecycleSessionManager(
 					SessionManager.managedDestination(cwd, agentDir),
 					migrationPolicy,
 					lifecycleSettings.get("sessionMemory.mode"),
+					request.sourceEntryId,
 				);
 				if (forked.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host forked it.");
@@ -561,6 +579,65 @@ export function startMemoryBackendAfterReadiness(start: () => Promise<void>): vo
 	});
 }
 
+const SDK_CWD_EQUALITY_TEST_SEAMS = [
+	"GJC_SDK_TEST_HANG_MODEL_PROFILE",
+	"GJC_SDK_TEST_FAIL_AFTER_REGISTRATION",
+	"GJC_SDK_TEST_EXIT_AFTER_READY",
+	"GJC_SDK_TEST_REJECT_AFTER_READY",
+] as const;
+
+type SdkCwdEqualityTestSeam = (typeof SDK_CWD_EQUALITY_TEST_SEAMS)[number];
+
+function isSdkCwdEqualityTestSeam(name: string): name is SdkCwdEqualityTestSeam {
+	return (SDK_CWD_EQUALITY_TEST_SEAMS as readonly string[]).includes(name);
+}
+
+function sdkCwdEqualitySnapshots(cwd: string): ProjectEnvSnapshot[] {
+	// The startup snapshot keeps a declaration Bun loaded before a later chdir.
+	return [projectEnvSnapshot(cwd), startupProjectEnvSnapshot()];
+}
+
+/**
+ * Cwd-equality test seams accept only an operator value. A project dotenv line,
+ * including one Bun expands from `$PWD`, never arms the seam.
+ */
+export function sdkCwdEqualityTestSeamActive(
+	name: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+	snapshots: readonly ProjectEnvSnapshot[] = sdkCwdEqualitySnapshots(cwd),
+): boolean {
+	if (!isSdkCwdEqualityTestSeam(name) || env[name] !== cwd) return false;
+	// Provenance only. trustedCoordinatorEnv trims, so a second compare to cwd
+	// would drop a trusted path that still matches exactly, including trailing space.
+	return snapshots.every(snapshot => trustedCoordinatorEnv(name, env, snapshot) !== undefined);
+}
+
+/** Copy `env` without project-dotenv values for the four cwd-equality seams. */
+export function omitUntrustedSdkCwdEqualitySeams(
+	env: NodeJS.ProcessEnv,
+	snapshots: readonly ProjectEnvSnapshot[],
+): NodeJS.ProcessEnv {
+	const denied: string[] = [];
+	for (const name of SDK_CWD_EQUALITY_TEST_SEAMS) {
+		const raw = env[name];
+		if (typeof raw !== "string" || raw.length === 0) continue;
+		if (snapshots.some(snapshot => trustedCoordinatorEnv(name, env, snapshot) === undefined)) denied.push(name);
+	}
+	if (denied.length === 0) return env;
+	const next: NodeJS.ProcessEnv = { ...env };
+	for (const name of denied) delete next[name];
+	return next;
+}
+
+function dropUntrustedSdkCwdEqualitySeams(env: NodeJS.ProcessEnv, snapshots: readonly ProjectEnvSnapshot[]): void {
+	const next = omitUntrustedSdkCwdEqualitySeams(env, snapshots);
+	if (next === env) return;
+	for (const name of SDK_CWD_EQUALITY_TEST_SEAMS) {
+		if (next[name] === undefined) delete env[name];
+	}
+}
+
 /** Runs the same persisted AgentSession bootstrap used by the production CLI. */
 export async function runSessionHost(
 	timing: {
@@ -592,6 +669,11 @@ export async function runSessionHost(
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();
+	const cwdSeamSnapshots = sdkCwdEqualitySnapshots(cwd);
+	// Drop rejected copies before startup work can spawn a child that inherits them.
+	dropUntrustedSdkCwdEqualitySeams(process.env, cwdSeamSnapshots);
+	const cwdEqualitySeam = (name: SdkCwdEqualityTestSeam): boolean =>
+		sdkCwdEqualityTestSeamActive(name, cwd, process.env, cwdSeamSnapshots);
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);
 	if (
@@ -819,6 +901,7 @@ export async function runSessionHost(
 	let sessionManagerTransferred = false;
 	let created: CreateLifecycleAgentSessionResult | undefined;
 	let mcpConfigDirectory: OwnedMcpConfigDirectory | undefined;
+	let mcpCleanupInFlight: Promise<void> | undefined;
 	let openedSessionManagerClosed = false;
 	const closeSessionManager = async (manager: SessionManager | undefined): Promise<void> => {
 		if (!manager || (manager === opened?.sessionManager && openedSessionManagerClosed)) return;
@@ -830,9 +913,10 @@ export async function runSessionHost(
 	};
 	const removeMcpConfigDirectory = async (): Promise<void> => {
 		const directory = mcpConfigDirectory;
-		if (!directory) return;
+		if (!directory || mcpCleanupInFlight) return;
 		let cleanupFailure: { error: unknown } | undefined;
-		const cleanupComplete = await runBoundedStartupCleanup(async () => {
+		let cleanupTimedOut = false;
+		const cleanup = Promise.resolve().then(async () => {
 			try {
 				const identity = directory.directoryIdentity;
 				const parentIdentity = directory.parentIdentity;
@@ -923,12 +1007,24 @@ export async function runSessionHost(
 			} catch (error) {
 				constructionCleanupComplete = false;
 				cleanupFailure = { error };
+				if (cleanupTimedOut) logger.warn("Deferred lifecycle MCP configuration cleanup failed.");
 				throw error;
 			}
 		});
+		mcpCleanupInFlight = cleanup;
+		void cleanup.then(
+			() => {
+				mcpCleanupInFlight = undefined;
+			},
+			() => {
+				mcpCleanupInFlight = undefined;
+			},
+		);
+		const cleanupComplete = await runBoundedStartupCleanup(() => cleanup);
 		if (!cleanupComplete) {
 			if (cleanupFailure) throw cleanupFailure.error;
-			throw new Error("Lifecycle MCP configuration cleanup did not complete.");
+			cleanupTimedOut = true;
+			logger.warn("Lifecycle MCP configuration cleanup is continuing in the background.");
 		}
 	};
 	const captureMcpConfigDirectoryIdentity = async (
@@ -1144,12 +1240,13 @@ export async function runSessionHost(
 		created = await beforeCutoff(
 			async () => {
 				sessionManagerTransferred = true;
-				const result = await createLifecycleSession(
+				return await createLifecycleSession(
 					{
 						cwd,
 						agentDir,
+						ephemeral: request.ephemeral,
 						sessionManager: opened?.sessionManager,
-						...(mcpConfigPath ? { mcpConfigPath } : {}),
+						...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),
@@ -1157,8 +1254,6 @@ export async function runSessionHost(
 					},
 					startupOwner,
 				);
-				if (mcpConfigDirectory) await removeMcpConfigDirectory();
-				return result;
 			},
 			async late => {
 				if ("failure" in late) {
@@ -1423,7 +1518,7 @@ export async function runSessionHost(
 	try {
 		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
 		await beforeCutoff(() =>
-			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
+			cwdEqualitySeam("GJC_SDK_TEST_HANG_MODEL_PROFILE")
 				? new Promise<void>(() => {})
 				: applyModelProfiles({
 						session,
@@ -1450,7 +1545,7 @@ export async function runSessionHost(
 		const startup = await beforeCutoff<SdkStartupResult>(() => capability.promise);
 		if (startup.status !== "started") throw startup.failure;
 		throwIfStartupInterrupted();
-		if (process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION === cwd)
+		if (cwdEqualitySeam("GJC_SDK_TEST_FAIL_AFTER_REGISTRATION"))
 			throw new Error("Lifecycle test failure after SDK host registration.");
 
 		await beforeCutoff(() => session.sessionManager.ensureOnDisk());
@@ -1519,11 +1614,11 @@ export async function runSessionHost(
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and
 	// its failure must never take the session down.
-	if (process.env.GJC_SDK_TEST_EXIT_AFTER_READY === cwd) {
+	if (cwdEqualitySeam("GJC_SDK_TEST_EXIT_AFTER_READY")) {
 		process.stderr.write("GJC_SDK_TEST_EXIT_AFTER_READY\n");
 		process.exit(7);
 	}
-	if (process.env.GJC_SDK_TEST_REJECT_AFTER_READY === cwd) {
+	if (cwdEqualitySeam("GJC_SDK_TEST_REJECT_AFTER_READY")) {
 		// Simulates the post-readiness liveness watcher rejecting. With the
 		// post-ready startup receipt removed, this unhandled rejection kills the
 		// host without writing any startup receipt; the broker must classify the
@@ -1623,6 +1718,25 @@ export default class Sdk extends Command {
 			if (flags["attach-only"] === true) process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 			const operation = scan.descriptor.command[1];
 			if (operation === "broker") {
+				if (scan.descriptor.command[2] === "attest-spawn-anchors") {
+					const result = await runSpawnAnchorAttestation({
+						agentDir: flags["agent-dir"] as string | undefined,
+						evidence: flags.evidence as string[],
+						write: flags.write === true,
+					});
+					try {
+						process.stdout.write(renderSpawnAnchorAttestation(result, flags.json === true));
+						if (flags.json && result.written)
+							process.stderr.write(`${SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE}\n`);
+					} catch {
+						throw new PublicCommandFailure({
+							kind: "operation_failed",
+							proof: result.written ? "completed" : "pre-effect",
+							diagnostics: ["spawn_anchor_output_failed"],
+						});
+					}
+					return;
+				}
 				const brokerAgentDir = path.resolve((flags["agent-dir"] as string | undefined) ?? getAgentDir());
 				if (!isSafeSdkInternalAgentDir(brokerAgentDir))
 					throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
@@ -1676,6 +1790,7 @@ export default class Sdk extends Command {
 					timeoutMs,
 					strict: Boolean(flags.strict),
 					untilIdle: Boolean(flags["until-idle"]),
+					ifIdle: Boolean(flags["if-idle"]),
 					allEvents: Boolean(flags["all-events"]),
 					page: Boolean(flags.page),
 					limit: flags.limit as number | undefined,
@@ -1768,6 +1883,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		const brokerEnvironment = { ...command.env };
 		delete brokerEnvironment.GJC_BROKER_TRAMPOLINE_RETAIN_UNTIL_PUBLICATION;
+		dropUntrustedSdkCwdEqualitySeams(brokerEnvironment, sdkCwdEqualitySnapshots(process.cwd()));
 		let child: ChildProcess;
 		try {
 			child = spawn(command.file, [...command.args, "--agent-dir", internal.agentDir], {
@@ -1817,7 +1933,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 	if (internal.action === "broker-internal" || internal.action === "session-host-internal")
 		usePostmortemSignalExitAuthority();
 	if (internal.action === "session-host-internal") {
-		await runSessionHost();
+		try {
+			await runSessionHost();
+		} catch {
+			// runSessionHost publishes its startup failure receipt when it has authority.
+			// The private SDK dispatcher does not have the public command error boundary.
+			logger.error("SDK session host failed.");
+			process.stderr.write("SDK session host failed.\n");
+			process.exitCode = 1;
+		}
 		return;
 	}
 	if (internal.action === "stderr-drain-internal") {

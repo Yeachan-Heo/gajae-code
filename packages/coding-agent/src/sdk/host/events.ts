@@ -81,6 +81,10 @@ export class SessionEventStream {
 	get sequence(): number {
 		return this.#seq;
 	}
+	/** Queries a client must re-run after a replay concedes events. */
+	get resyncQueries(): string[] {
+		return [...this.#resyncQueries];
+	}
 
 	/** Follow the session redaction bit. Replay then drops kinds emit sites already suppress. */
 	setOutboundRedact(enabled: boolean): void {
@@ -88,8 +92,16 @@ export class SessionEventStream {
 		if (this.#sessionId !== undefined) outboundRedactBySession.set(this.#sessionId, enabled);
 	}
 
-	restart(): number {
-		this.#generation += 1;
+	/**
+	 * Open the next event namespace. `floor` lets the owning host keep namespaces
+	 * distinct across host instances of one session; within one stream the
+	 * generation still only advances.
+	 */
+	restart(floor = 0): number {
+		if (!Number.isSafeInteger(floor)) throw new Error("SDK event generation floor must be a safe integer.");
+		const next = Math.max(this.#generation + 1, floor);
+		if (!Number.isSafeInteger(next)) throw new Error("SDK event generation is exhausted.");
+		this.#generation = next;
 		this.#seq = 0;
 		this.#frames = [];
 		return this.#generation;

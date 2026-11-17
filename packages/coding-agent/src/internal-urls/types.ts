@@ -21,6 +21,8 @@ export interface InternalResource {
 	size?: number;
 	/** Underlying filesystem path (for debugging, not exposed to agent) */
 	sourcePath?: string;
+	/** True when model-facing reads must wrap the selected content as untrusted. */
+	untrusted?: boolean;
 	/** Additional notes about resolution */
 	notes?: string[];
 	/**

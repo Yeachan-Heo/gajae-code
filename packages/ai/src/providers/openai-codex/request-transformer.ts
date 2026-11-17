@@ -2,6 +2,7 @@ import type { Effort } from "../../model-thinking";
 import { requireSupportedEffort } from "../../model-thinking";
 import type { Api, Model } from "../../types";
 import { sanitizeJsonStrings } from "../../utils";
+import { formatOrphanToolResultNote } from "../openai-responses-shared";
 
 export interface ReasoningConfig {
 	effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -165,13 +166,10 @@ export async function transformRequestBody(
 						} catch {
 							text = String(itemRecord.output ?? "");
 						}
-						if (text.length > 16000) {
-							text = `${text.slice(0, 16000)}\n...[truncated]`;
-						}
 						return {
 							type: "message",
-							role: "assistant",
-							content: `[Previous ${toolName} result; call_id=${callId}]: ${text}`,
+							role: "user",
+							content: formatOrphanToolResultNote(toolName, callId, text),
 						} as InputItem;
 					}
 				}

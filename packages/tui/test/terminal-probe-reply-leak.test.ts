@@ -137,6 +137,20 @@ describe("ProcessTerminal probe-reply leaks", () => {
 		await feed("\x1b", 1, 0);
 		expectNoLeak(["\x1b"]);
 	});
+
+	// GJC never sends CSI 6n; an outer PTY proxy (ghost-complete) forwards the cursor
+	// reports it cannot match to its own query, and each one snapped the viewport to live.
+	it("drops cursor position reports it never requested", async () => {
+		for (const sequence of ["\x1b[7;1R", "\x1b[46;132R", "x"]) process.stdin.emit("data", Buffer.from(sequence));
+		await sleep(50);
+		expectNoLeak(["x"]);
+	});
+
+	it("still delivers modified F3 in its row-1 cursor-report shape", async () => {
+		process.stdin.emit("data", Buffer.from("\x1b[1;5R"));
+		await sleep(50);
+		expectNoLeak(["\x1b[1;5R"]);
+	});
 });
 
 describe("Tui probe-reply leaks", () => {

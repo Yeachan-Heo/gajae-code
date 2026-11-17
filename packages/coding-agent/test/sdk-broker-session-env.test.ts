@@ -1,20 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import { Broker } from "../src/sdk/broker/broker";
 import {
 	lifecycleSessionEnv,
 	lifecycleSessionHostBaseEnv,
 	setLifecycleCommandResolverForTest,
 } from "../src/sdk/broker/lifecycle";
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
 
 function randomInt(random: () => number, max: number): number {
 	return Math.floor(random() * max);
@@ -83,7 +76,7 @@ describe("lifecycle per-session env validation (#6735)", () => {
 
 	test("holds generated validation and case-matching properties (seed 0x6735a11)", () => {
 		const seed = 0x6735a11;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 		const windows = process.platform === "win32";
 
 		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {
@@ -146,7 +139,7 @@ describe("lifecycle session host base env (#6735)", () => {
 
 	test("holds generated composition properties (seed 0x6735c0de)", () => {
 		const seed = 0x6735c0de;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 		const windows = process.platform === "win32";
 		const envKey = (name: string): string => (windows ? name.toUpperCase() : name);
 

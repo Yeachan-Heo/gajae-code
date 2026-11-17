@@ -467,6 +467,7 @@ test("ensureBroker surfaces the marker reason as a typed BrokerStartupError", as
 		expect(typed.reason).toContain("index.snapshot.json");
 		expect(typed.message).toContain("index.snapshot.json");
 		expect(typed.stderrExcerpt).toBeDefined();
+		expect(typed.stderrExcerpt).toContain("Unsupported SDK state version 99");
 
 		// The per-spawn diagnostic sink must not be retained after the failure.
 		const sdkEntries = await fs.readdir(path.join(agentDir, "sdk"));

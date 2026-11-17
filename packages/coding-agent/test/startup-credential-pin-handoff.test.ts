@@ -176,10 +176,19 @@ async function persistStalePinnedSession(
 	savedModel: string,
 	provider = fixture.provider,
 	pinnedRowId = fixture.paidRowId,
+	chain?: string[],
 ): Promise<{ sessionFile: string; credentialScope: string }> {
 	const savedManager = SessionManager.create(fixture.root, path.join(fixture.root, "sessions"));
 	const credentialScope = savedManager.getSessionId();
 	savedManager.appendModelChange(savedModel, "default");
+	if (chain) {
+		savedManager.appendConfiguredModelChain({
+			role: "default",
+			entries: chain,
+			origin: "model_selection",
+			explicitHead: true,
+		});
+	}
 	savedManager.appendCustomEntry("auth-credential-pin", {
 		v: 1,
 		scopeId: credentialScope,
@@ -514,6 +523,74 @@ describe("startup credential pin handoff", () => {
 		}
 	});
 
+	for (const mode of ["blocked", "runtime", "config", "missing-head", "unpinned-head"] as const) {
+		test(`saved multi-entry chain ${mode === "blocked" ? "does not bypass its unavailable pin" : `handles ${mode}`} before extensions`, async () => {
+			using tempDir = TempDir.createSync("@gjc-startup-pin-chain-");
+			const fixture = await createCredentialFixture(tempDir.path());
+			const head =
+				mode === "unpinned-head"
+					? "unregistered-provider/retired-model"
+					: `${fixture.provider}/${mode === "missing-head" ? "retired-model" : "entitled-model"}`;
+			const fallback = `${testModel.provider}/${testModel.id}`;
+			const resumed = await persistStalePinnedSession(fixture, head, fixture.provider, fixture.paidRowId, [
+				head,
+				fallback,
+			]);
+			fixture.authStorage.setRuntimeApiKey(testModel.provider, "other-provider-key");
+			if (mode === "runtime" || mode === "missing-head")
+				fixture.authStorage.setRuntimeApiKey(fixture.provider, "explicit-key");
+			if (mode === "config")
+				fixture.authStorage.setConfigApiKey(fixture.provider, "explicit-key", {
+					owner: fixture.modelRegistry.getAuthStorageOwner(),
+				});
+			let session: AgentSession | undefined;
+			try {
+				const result = await resumeStalePinnedSession(fixture, resumed, {
+					settings: settingsWithDefault(fallback),
+				});
+				session = result.session;
+				if (mode === "blocked") {
+					expect(session.model).toBeUndefined();
+					expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+				} else {
+					expect(`${session.model?.provider}/${session.model?.id}`).toBe(
+						mode === "missing-head" || mode === "unpinned-head" ? fallback : head,
+					);
+				}
+				expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, resumed.credentialScope)).toBe(
+					true,
+				);
+			} finally {
+				await disposeFixture(fixture, session);
+			}
+		});
+	}
+
+	for (const configuredDefault of [true, false]) {
+		test(`does not select another provider for a removed saved pin ${configuredDefault ? "with" : "without"} a settings default`, async () => {
+			using tempDir = TempDir.createSync("@gjc-startup-pin-no-fallback-");
+			const fixture = await createCredentialFixture(tempDir.path());
+			const resumed = await persistStalePinnedSession(fixture, `${fixture.provider}/entitled-model`);
+			fixture.authStorage.setRuntimeApiKey(testModel.provider, "other-provider-key");
+			let session: AgentSession | undefined;
+			try {
+				const result = await resumeStalePinnedSession(fixture, resumed, {
+					settings: configuredDefault
+						? settingsWithDefault(`${testModel.provider}/${testModel.id}`)
+						: Settings.isolated({ "marketplace.autoUpdate": "off" }),
+				});
+				session = result.session;
+				expect(session.model).toBeUndefined();
+				expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+				expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, resumed.credentialScope)).toBe(
+					true,
+				);
+			} finally {
+				await disposeFixture(fixture, session);
+			}
+		});
+	}
+
 	test("an explicit credential selector overrides the global paid pin", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-");
 		const fixture = await createCredentialFixture(tempDir.path());
@@ -663,13 +740,18 @@ describe("startup credential pin handoff", () => {
 				]);
 				const latePaidRow = fixture.authStorage.listCredentialInventory(lateProvider)[1];
 				if (!latePaidRow) throw new Error("Expected late provider credential rows");
+				const lateHead = `${lateProvider}/late-model`;
+				const fallback = `${testModel.provider}/${testModel.id}`;
 				const resumed = await persistStalePinnedSession(
 					fixture,
-					`${lateProvider}/late-model`,
+					lateHead,
 					lateProvider,
 					latePaidRow.id,
+					withRuntimeKey ? undefined : [lateHead, fallback],
 				);
 				if (withRuntimeKey) fixture.authStorage.setRuntimeApiKey(lateProvider, runtimeKey);
+				else fixture.authStorage.setRuntimeApiKey(testModel.provider, "other-provider-key");
+				let extensionLoaded = false;
 				let session: AgentSession | undefined;
 				try {
 					// The unresolvable default leaves the post-extension retry as the only restore path.
@@ -677,6 +759,7 @@ describe("startup credential pin handoff", () => {
 						settings: settingsWithDefault(`${fixture.provider}/missing-model`),
 						extensions: [
 							pi => {
+								extensionLoaded = true;
 								pi.registerProvider(lateProvider, {
 									baseUrl: "https://late-pin.example.test/v1",
 									api: "openai-completions",
@@ -705,12 +788,13 @@ describe("startup credential pin handoff", () => {
 						],
 					});
 					session = result.session;
+					expect(extensionLoaded).toBe(true);
 					if (withRuntimeKey) {
 						expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${lateProvider}/late-model`);
 						expect(result.modelFallbackMessage).toBeUndefined();
 					} else {
 						expect(session.model).toBeUndefined();
-						expect(result.modelFallbackMessage).toContain(`Could not restore model ${lateProvider}/late-model`);
+						expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
 						expect(
 							await fixture.authStorage.peekApiKey(lateProvider, {
 								sessionId: resumed.credentialScope,

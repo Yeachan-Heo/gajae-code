@@ -25,7 +25,7 @@ permissions:
 jobs:
   benchmark:
     name: Compare native benchmark on a quiet macOS host
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4

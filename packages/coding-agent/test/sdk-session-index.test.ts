@@ -382,6 +382,7 @@ describe("SDK session index", () => {
 	});
 	it("uses the native Windows process handle when signal-zero misreports a detached host", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-windows-live-"));
+		const index = new SessionIndex(dir);
 		const originalPlatform = process.platform;
 		const originalKill = process.kill;
 		const processRef = {
@@ -389,13 +390,15 @@ describe("SDK session index", () => {
 			status: () => "running" as const,
 		};
 		const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(processRef as never);
-		process.kill = (() => {
-			throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
-		}) as typeof process.kill;
-		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
-		pinWindowsLockRemoval();
 		try {
-			const index = await new SessionIndex(dir).open();
+			// Resolve the machine-specific lock identity before faking the platform;
+			// only the process-liveness branch below should see Windows here.
+			await index.open();
+			process.kill = (() => {
+				throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
+			}) as typeof process.kill;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			pinWindowsLockRemoval();
 			await index.append({
 				...event("windows-detached"),
 				hostIncarnation: processRef.incarnation,

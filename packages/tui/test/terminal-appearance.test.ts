@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { ProcessTerminal } from "@gajae-code/tui/terminal";
+import { __setReassertRawTtyForTests, ProcessTerminal } from "@gajae-code/tui/terminal";
 
 const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -7,6 +7,7 @@ const processPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "plat
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 const originalWslDistroName = Bun.env.WSL_DISTRO_NAME;
 const originalWslInterop = Bun.env.WSL_INTEROP;
+const originalDisableOsc11Poll = Bun.env.GJC_TUI_DISABLE_OSC11_POLL;
 
 function restoreProperty(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
@@ -40,6 +41,7 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		restoreProperty(process, "platform", processPlatformDescriptor);
 		restoreEnv("WSL_INTEROP", originalWslInterop);
 		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
+		restoreEnv("GJC_TUI_DISABLE_OSC11_POLL", originalDisableOsc11Poll);
 	});
 
 	function setupTerminal() {
@@ -215,6 +217,94 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		expect(queryCount()).toBe(afterInitial);
 
 		terminal.stop();
+	});
+
+	it("skips poll ticks while appearance polling is disabled and resumes when re-enabled", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const afterInitial = queryCount();
+
+			terminal.setAppearancePolling(false);
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(afterInitial);
+
+			terminal.setAppearancePolling(true);
+			vi.advanceTimersByTime(2000);
+			expect(queryCount()).toBe(afterInitial + 1);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("keeps appearance polling disabled across a stop()/start() cycle", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			terminal.setAppearancePolling(false);
+			terminal.stop();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const afterRestart = queryCount();
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(afterRestart);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("a new start() cycle polls again after Mode 2031 retired the previous one", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			process.stdin.emit("data", "\x1b[?997;1n");
+			vi.advanceTimersByTime(100);
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const retired = queryCount();
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(retired);
+
+			terminal.stop();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const restarted = queryCount();
+			expect(restarted).toBe(retired + 1);
+			vi.advanceTimersByTime(2000);
+			expect(queryCount()).toBe(restarted + 1);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("GJC_TUI_DISABLE_OSC11_POLL keeps only the startup query even when polling is requested", () => {
+		vi.useFakeTimers();
+		Bun.env.GJC_TUI_DISABLE_OSC11_POLL = "1";
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			expect(queryCount()).toBe(1);
+
+			terminal.setAppearancePolling(true);
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(1);
+		} finally {
+			terminal.stop();
+		}
 	});
 
 	it("partial OSC 11 buffer does not swallow unrelated input", () => {
@@ -530,6 +620,7 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+		__setReassertRawTtyForTests(undefined);
 		restoreProperty(process.stdin, "isTTY", stdinIsTtyDescriptor);
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
 		restoreProperty(process.stdin, "isRaw", stdinIsRawDescriptor);
@@ -539,13 +630,26 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
 	});
 
-	/** Models a real tty whose kernel mode can diverge from the stream's cached isRaw flag. */
+	/**
+	 * Models a real tty whose kernel mode can diverge from the stream's cached
+	 * isRaw flag. `events` records every kernel mode transition and every probe
+	 * write in order, so tests can see what mode the tty was in when a probe went out.
+	 */
 	function setupTerminal() {
 		let cachedRaw = false;
 		let kernelRaw = false;
 		let runtimeRequestedRaw = false;
 		const rawModeCalls: boolean[] = [];
 		const writes: string[] = [];
+		const events: string[] = [];
+		const reassertRawTtyMock = vi.fn((fd: number) => {
+			expect(fd).toBe(process.stdin.fd);
+			if (kernelRaw) return false;
+			kernelRaw = true;
+			events.push("kernel:raw");
+			return true;
+		});
+		__setReassertRawTtyForTests(reassertRawTtyMock);
 		Object.defineProperty(process.stdin, "isRaw", {
 			get: () => cachedRaw,
 			set: value => (cachedRaw = value),
@@ -559,6 +663,7 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 			runtimeRequestedRaw = value;
 			cachedRaw = value;
 			kernelRaw = value;
+			events.push(value ? "kernel:raw" : "kernel:cooked");
 			return process.stdin;
 		});
 		Object.defineProperty(process.stdin, "setRawMode", {
@@ -570,7 +675,9 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 		vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
 		vi.spyOn(process.stdin, "setEncoding").mockImplementation(() => process.stdin);
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
-			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+			const data = typeof chunk === "string" ? chunk : chunk.toString();
+			writes.push(data);
+			if (data === "\x1b]11;?\x07") events.push("probe:osc11");
 			return true;
 		});
 
@@ -584,12 +691,25 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 		return {
 			terminal,
 			writes,
+			events,
 			queryCount,
 			rawModeCalls,
 			setRawModeMock,
+			reassertRawTtyMock,
 			isKernelRaw: () => kernelRaw,
-			setKernelCooked: () => (kernelRaw = false),
+			// A child changes termios directly: neither isRaw nor the runtime's
+			// last requested mode observes it.
+			setKernelCooked: () => {
+				kernelRaw = false;
+				events.push("kernel:cooked-by-child");
+			},
 		};
+	}
+
+	/** Completes the in-flight OSC 11 cycle so the next poll tick issues a new query. */
+	function answerProbe(): void {
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
 	}
 
 	it("re-asserts raw mode when child termios changes leave isRaw stale", () => {
@@ -618,44 +738,75 @@ describe("ProcessTerminal probe writes and cooked-mode tty", () => {
 			setKernelCooked();
 			vi.advanceTimersByTime(2000);
 			expect(isKernelRaw()).toBe(true);
-			// The DA1 sentinel completes the cycle so the next poll issues a query.
-			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
-			process.stdin.emit("data", "\x1b[?1;2c");
+			answerProbe();
 		}
 
 		terminal.stop();
 	});
 
-	it("does not trust cached isRaw while the tty appears healthy", () => {
+	it("never passes the tty through cooked mode around a probe", () => {
 		vi.useFakeTimers();
-		const { terminal, rawModeCalls } = setupTerminal();
+		const { terminal, events, rawModeCalls, reassertRawTtyMock } = setupTerminal();
 		const afterStart = rawModeCalls.length;
+		answerProbe();
+		const eventsBefore = events.length;
+		reassertRawTtyMock.mockClear();
 
-		// Finish startup, then let the first poll issue another probe.
-		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
-		process.stdin.emit("data", "\x1b[?1;2c");
+		// Healthy tty: the poll re-checks the live termios, changes nothing, and
+		// never asks the runtime for cooked mode (#7373).
+		vi.advanceTimersByTime(2000);
+
+		expect(reassertRawTtyMock).toHaveBeenCalledTimes(1);
+		expect(rawModeCalls.slice(afterStart)).toEqual([]);
+		expect(events.slice(eventsBefore)).toEqual(["probe:osc11"]);
+
+		terminal.stop();
+	});
+
+	it("restores raw mode before the probe is written after a child left the tty cooked", () => {
+		vi.useFakeTimers();
+		const { terminal, events, setKernelCooked } = setupTerminal();
+		answerProbe();
+		const eventsBefore = events.length;
+
+		setKernelCooked();
+		vi.advanceTimersByTime(2000);
+
+		expect(events.slice(eventsBefore)).toEqual(["kernel:cooked-by-child", "kernel:raw", "probe:osc11"]);
+
+		terminal.stop();
+	});
+
+	it("keeps cycling setRawMode on Windows, where console mode changes do not wait for a drain", () => {
+		vi.useFakeTimers();
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		const { terminal, rawModeCalls, reassertRawTtyMock } = setupTerminal();
+		const afterStart = rawModeCalls.length;
+		answerProbe();
+
 		vi.advanceTimersByTime(2000);
 
 		expect(rawModeCalls.slice(afterStart)).toEqual([false, true]);
+		expect(reassertRawTtyMock).not.toHaveBeenCalled();
 
 		terminal.stop();
 	});
 
 	it("does not write a probe when raw-mode restoration fails", () => {
 		vi.useFakeTimers();
-		const { terminal, queryCount, setRawModeMock } = setupTerminal();
+		const { terminal, queryCount, reassertRawTtyMock } = setupTerminal();
+		answerProbe();
 		const baseline = queryCount();
-		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
-		process.stdin.emit("data", "\x1b[?1;2c");
-		setRawModeMock.mockImplementation(() => {
-			throw new Error("tty detached");
+		reassertRawTtyMock.mockClear();
+		reassertRawTtyMock.mockImplementation(() => {
+			throw new Error("reassertRawTty(0) failed: Inappropriate ioctl for device");
 		});
 
 		vi.advanceTimersByTime(2000);
 
+		expect(reassertRawTtyMock).toHaveBeenCalledTimes(1);
 		expect(queryCount()).toBe(baseline);
 
-		setRawModeMock.mockImplementation(() => process.stdin);
 		terminal.stop();
 	});
 });

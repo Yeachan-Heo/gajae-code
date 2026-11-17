@@ -1,4 +1,5 @@
 import { isEnoent, isKnownSinkPeerClosedError, logger, untilAborted } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -538,7 +539,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 		const owner = spawnOwnedProcess([command, ...args], {
 			cwd,
 			stdin: "pipe",
-			env: env ? { ...Bun.env, ...env } : undefined,
+			env: { ...projectSafeSpawnEnv(), ...env },
 			name: `lsp:${config.command}`,
 		});
 		const proc = owner.child;

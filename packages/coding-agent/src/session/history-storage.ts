@@ -1,6 +1,5 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { getHistoryDbPath, logger } from "@gajae-code/utils";
 
@@ -24,6 +23,155 @@ const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 // Matches the `ESCAPE '\\'` clause used by substring-search statements.
 function escapeLikePattern(text: string): string {
 	return text.replace(/[\\%_]/g, "\\$&");
+}
+
+const HISTORY_SUFFIXES = ["", "-wal", "-shm"] as const;
+let openingHistory: Database | undefined;
+
+function secureHistoryPath(pathname: string, kind: "directory" | "file"): void {
+	if (process.platform !== "win32") return;
+	const native = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, kind);
+	const verified = native.verifyOwnerOnlyPathSecurity(pathname, kind);
+	if (applied?.ok !== true || verified?.ok !== true) {
+		throw new Error("history database owner-only protection could not be established");
+	}
+}
+
+function historyErrno(error: unknown): string | undefined {
+	return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function historyLeaf(dbPath: string, suffix: string): fs.BigIntStats | undefined {
+	try {
+		return fs.lstatSync(`${dbPath}${suffix}`, { bigint: true });
+	} catch (error) {
+		if (historyErrno(error) !== "ENOENT") throw error;
+		return undefined;
+	}
+}
+
+function assertRegularHistoryLeaf(existing: fs.BigIntStats | undefined): void {
+	if (existing && (existing.isSymbolicLink() || !existing.isFile())) {
+		throw new Error("history database path is not a regular file");
+	}
+}
+
+function assertHistoryLeaves(dbPath: string): Set<string> {
+	const present = new Set<string>();
+	for (const suffix of HISTORY_SUFFIXES) {
+		const existing = historyLeaf(dbPath, suffix);
+		assertRegularHistoryLeaf(existing);
+		if (existing) present.add(suffix);
+	}
+	return present;
+}
+
+function removeNewHistoryLeaves(): void {
+	// A WAL reader can stay live while BEGIN EXCLUSIVE succeeds, so failure
+	// cleanup must not unlink a database another opener has adopted.
+	try {
+		openingHistory?.close();
+	} catch {
+		// The caller reports the original open failure.
+	}
+	openingHistory = undefined;
+}
+
+function readHistoryDirectory(dir: string): fs.Stats | undefined {
+	let existing: fs.Stats;
+	try {
+		existing = fs.lstatSync(dir);
+	} catch (error) {
+		if (historyErrno(error) !== "ENOENT") throw error;
+		return undefined;
+	}
+	if (existing.isSymbolicLink() || !existing.isDirectory()) {
+		throw new Error("history database directory is not a real directory");
+	}
+	return existing;
+}
+
+function tightenHistoryDirectory(dir: string): void {
+	let existing = readHistoryDirectory(dir);
+	if (!existing) {
+		try {
+			fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		} catch (error) {
+			if (historyErrno(error) !== "EEXIST") throw error;
+		}
+		existing = readHistoryDirectory(dir);
+		if (!existing) throw new Error("history database directory is not a real directory");
+	}
+	secureHistoryPath(dir, "directory");
+	if (process.platform === "win32") return;
+	// 0300/0700 are already owner-only. Sticky directories are shared and stay as they are.
+	// chmod(2) needs no read bit, so mode 0333 becomes 0700. A symlink swap is
+	// followed by chmod; the recheck then refuses and no database file is created.
+	if ((existing.mode & 0o077) === 0 || (existing.mode & 0o1000) !== 0) return;
+	try {
+		fs.chmodSync(dir, 0o700);
+	} catch (error) {
+		if (historyErrno(error) === "ELOOP") throw new Error("history database directory is not a real directory");
+		throw error;
+	}
+	const after = readHistoryDirectory(dir);
+	if (!after || (after.mode & 0o077) !== 0) {
+		throw new Error("history database directory could not be tightened to mode 0700");
+	}
+}
+
+function sameHistoryFile(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+}
+
+function restrictHistoryFiles(dbPath: string, createMissingDb: boolean): void {
+	const noFollow = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+	for (const suffix of HISTORY_SUFFIXES) {
+		const target = `${dbPath}${suffix}`;
+		let existing = historyLeaf(dbPath, suffix);
+		assertRegularHistoryLeaf(existing);
+		if (!existing && suffix === "" && createMissingDb) {
+			let created: number | undefined;
+			try {
+				created = fs.openSync(
+					target,
+					fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
+					0o600,
+				);
+				fs.fchmodSync(created, 0o600);
+			} catch (error) {
+				if (historyErrno(error) === "ELOOP") throw new Error("history database path is not a regular file");
+				if (historyErrno(error) !== "EEXIST") throw error;
+			} finally {
+				if (created !== undefined) fs.closeSync(created);
+			}
+			existing = historyLeaf(dbPath, suffix);
+			assertRegularHistoryLeaf(existing);
+			if (!existing) throw new Error("history database path is not a regular file");
+		}
+		if (!existing) continue;
+		secureHistoryPath(target, "file");
+		if (process.platform === "win32" || (Number(existing.mode) & 0o077) === 0) continue;
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(target, fs.constants.O_RDONLY | noFollow);
+			const opened = fs.fstatSync(fd, { bigint: true });
+			const again = historyLeaf(dbPath, suffix);
+			if (!again || !opened.isFile() || !sameHistoryFile(existing, opened) || !sameHistoryFile(opened, again)) {
+				throw new Error("history database path is not a regular file");
+			}
+			fs.fchmodSync(fd, 0o600);
+			if ((Number(fs.fstatSync(fd, { bigint: true }).mode) & 0o777) !== 0o600) {
+				throw new Error("history database path could not be tightened to mode 0600");
+			}
+		} catch (error) {
+			if (historyErrno(error) === "ELOOP") throw new Error("history database path is not a regular file");
+			throw error;
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
 }
 
 class AsyncDrain<T> {
@@ -83,6 +231,7 @@ export class HistoryStorage {
 
 	private constructor(dbPath: string) {
 		this.#db = new Database(dbPath);
+		openingHistory = this.#db;
 
 		const hasFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
 
@@ -137,12 +286,32 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 
 		const last = this.#lastPromptStmt.get() as { prompt?: string } | undefined;
 		this.#lastPromptCache = last?.prompt ?? null;
+		try {
+			restrictHistoryFiles(dbPath, false);
+		} catch (error) {
+			this.#db.close();
+			throw error;
+		}
+		openingHistory = undefined;
+	}
+
+	static #openNew(dbPath: string): HistoryStorage {
+		openingHistory = undefined;
+		assertHistoryLeaves(dbPath);
+		try {
+			tightenHistoryDirectory(path.dirname(dbPath));
+			assertHistoryLeaves(dbPath);
+			restrictHistoryFiles(dbPath, true);
+			return new HistoryStorage(dbPath);
+		} catch (error) {
+			removeNewHistoryLeaves();
+			throw error;
+		}
 	}
 
 	static open(dbPath: string = getHistoryDbPath()): HistoryStorage {
 		if (!HistoryStorage.#instance) {
-			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-			HistoryStorage.#instance = new HistoryStorage(dbPath);
+			HistoryStorage.#instance = HistoryStorage.#openNew(dbPath);
 		}
 		return HistoryStorage.#instance;
 	}
@@ -150,16 +319,17 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	static async openAsync(dbPath: string = getHistoryDbPath()): Promise<HistoryStorage> {
 		if (HistoryStorage.#instance) return HistoryStorage.#instance;
 		if (!HistoryStorage.#opening) {
-			HistoryStorage.#opening = (async () => {
-				await fsPromises.mkdir(path.dirname(dbPath), { recursive: true });
-				const storage = new HistoryStorage(dbPath);
-				HistoryStorage.#instance ??= storage;
-				return HistoryStorage.#instance;
-			})().finally(() => {
-				HistoryStorage.#opening = undefined;
-			});
+			HistoryStorage.#opening = Promise.resolve()
+				.then(() => {
+					const storage = HistoryStorage.#openNew(dbPath);
+					HistoryStorage.#instance ??= storage;
+					return HistoryStorage.#instance;
+				})
+				.finally(() => {
+					HistoryStorage.#opening = undefined;
+				});
 		}
-		return await HistoryStorage.#opening;
+		return HistoryStorage.#opening;
 	}
 
 	/** @internal Reset the singleton — test-only. */

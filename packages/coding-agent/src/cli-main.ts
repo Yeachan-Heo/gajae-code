@@ -5,7 +5,7 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
-import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
+import { Args, type CliConfig, CliParseError, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { time } from "@gajae-code/utils/logger";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
@@ -14,6 +14,7 @@ import {
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
+import { requireDaemonInternalOwnerId } from "./sdk/bus/daemon-internal-cli-args";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -157,12 +158,25 @@ function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
 	return argv[0] === "notify" && argv[1] === "daemon-internal";
 }
 
+function reportInternalDaemonUsageError(command: string, argv: readonly string[]): boolean {
+	try {
+		requireDaemonInternalOwnerId(argv);
+		return false;
+	} catch (error) {
+		if (!(error instanceof CliParseError)) throw error;
+		process.stderr.write(`${APP_NAME} ${command}: ${error.message}\n`);
+		process.exitCode = 2;
+		return true;
+	}
+}
+
 async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
 	const { parseNotifyArgs, runNotifyCommand } = await import("./cli/notify-cli");
 	const cmd = parseNotifyArgs(argv);
 	if (cmd?.action !== "daemon-internal") {
 		throw new Error("invalid notify daemon-internal fast path");
 	}
+	if (!cmd.smoke && reportInternalDaemonUsageError("notify daemon-internal", cmd.rawArgs)) return;
 	await runNotifyCommand(cmd);
 }
 
@@ -176,7 +190,9 @@ async function runChatDaemonInternalFastPath(argv: string[]): Promise<void> {
 		throw new Error("invalid chat daemon internal fast path");
 	}
 	const { runChatDaemonInternal } = await import("./sdk/bus/chat-daemon-cli");
-	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", argv.slice(2));
+	const daemonArgv = argv.slice(2);
+	if (reportInternalDaemonUsageError(`daemon ${action}`, daemonArgv)) return;
+	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", daemonArgv);
 }
 
 type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
@@ -324,15 +340,17 @@ function isSubcommand(first: string | undefined): boolean {
 }
 
 /**
- * Smoke-test entry. Spawns the stats sync worker and the browser tab worker, then verifies their protocol.
+ * Smoke-test entry. Spawns the stats sync worker, the browser tab worker, and
+ * the publication-liveness watchdog worker, then verifies their protocol.
  *
  * Purpose: catch silent compiled-worker load regressions (issues #1011,
- * #1027, and #2598). Neither `--version` nor `stats --summary` spawns both
+ * #1027, and #2598). Neither `--version` nor `stats --summary` spawns these
  * worker entries on a fresh install. This probe proves each bundled worker
  * module resolves and evaluates; the tab-worker probe also completes its
- * bootstrap/closed protocol without launching a browser. Wired into
- * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball installs
- * exercise it on every CI run.
+ * bootstrap/closed protocol without launching a browser. The publication
+ * watchdog probe waits for its ready message and does not arm a deadline.
+ * Wired into `scripts/install-tests/run-ci.sh` so binary / source-link /
+ * tarball installs exercise it on every CI run.
  */
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
@@ -341,8 +359,10 @@ async function runSmokeTest(): Promise<void> {
 	await runNativeSmokeTest();
 	const { smokeTestTabWorker } = await import("./tools/browser/tab-worker-smoke");
 	const { smokeTestIsolatedShell } = await import("./exec/isolated-shell");
+	const { smokeTestPublicationLivenessWatchdog } = await import("./sdk/broker/publication-liveness-watchdog-smoke");
 	await smokeTestTabWorker();
 	await smokeTestIsolatedShell();
+	await smokeTestPublicationLivenessWatchdog();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -440,9 +460,9 @@ export async function runCliAfterAdmission(argv: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (argv.length === 1 && argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(argv);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {

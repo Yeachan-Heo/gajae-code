@@ -676,6 +676,7 @@ export async function executeSelectedDoctorRepair(
 					state,
 					readiness: [],
 					reasonCode: result.reason ?? (success ? undefined : "installation_postcheck_unverified"),
+					...(result.diagnostic ? { diagnostic: result.diagnostic } : {}),
 					sideEffectStarted: result.sideEffectStarted,
 					...(success ? { outcome: { mutationVerified: true } } : {}),
 					restartRequired: result.state === "pending_activation",

@@ -278,6 +278,14 @@ export class AgentBusyError extends Error {
 		this.name = "AgentBusyError";
 	}
 }
+export type AgentQueuedRunStartDecision =
+	| { readonly consumedQueuedMessages: readonly AgentMessage[]; readonly disposition: "accepted" }
+	| {
+			readonly consumedQueuedMessages: readonly AgentMessage[];
+			readonly disposition: "not-started";
+			readonly error: Error;
+	  };
+
 export interface AgentOptions {
 	initialState?: Partial<AgentState>;
 
@@ -450,6 +458,8 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn (reassignable). */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Definitive start disposition for an exact dequeued own-run batch. */
+	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
 	/** Invoked with the steering messages dequeued mid-run for the current turn (reassignable). */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
@@ -528,6 +538,7 @@ export class Agent {
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#canonicalEventProcessor?: (event: AgentEvent) => Promise<void> | undefined;
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (
@@ -648,6 +659,7 @@ export class Agent {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn. Reassign at any time. */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
 	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
@@ -694,6 +706,7 @@ export class Agent {
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
+		this.onQueuedRunStartDecision = opts.onQueuedRunStartDecision;
 		this.onSteeringConsumed = opts.onSteeringConsumed;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
@@ -955,6 +968,15 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	/** Session-owned publication acknowledgment, separate from best-effort observers. */
+	subscribeCanonicalEvents(processor: (event: AgentEvent) => Promise<void> | undefined): () => void {
+		if (this.#canonicalEventProcessor) throw new Error("Canonical event processor is already subscribed");
+		this.#canonicalEventProcessor = processor;
+		return () => {
+			if (this.#canonicalEventProcessor === processor) this.#canonicalEventProcessor = undefined;
+		};
 	}
 
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
@@ -1922,6 +1944,18 @@ export class Agent {
 		throw new Error("No queued messages to continue");
 	}
 
+	#notifyQueuedRunStartDecision(
+		consumedQueuedMessages: readonly AgentMessage[] | undefined,
+		decision: { disposition: "accepted" } | { disposition: "not-started"; error: Error },
+	): void {
+		if (!consumedQueuedMessages?.length) return;
+		try {
+			this.onQueuedRunStartDecision?.({ ...decision, consumedQueuedMessages });
+		} catch (error) {
+			logger.warn("Queued run start decision callback failed", { error });
+		}
+	}
+
 	/**
 	 * Run the agent loop.
 	 * If messages are provided, starts a new conversation turn with those messages.
@@ -1935,11 +1969,17 @@ export class Agent {
 		},
 	) {
 		const model = this.#state.model;
-		if (!model) throw new Error("No model configured");
+		if (!model) {
+			const error = new Error("No model configured");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
+		}
 
 		const maintenanceContinuation = options?.maintenanceContinuation === true;
 		if (maintenanceContinuation && this.#managedLogicalRunOwner === undefined) {
-			throw new Error("Maintenance continuation ownership is unavailable");
+			const error = new Error("Maintenance continuation ownership is unavailable");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
 		}
 		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
 
@@ -1975,13 +2015,16 @@ export class Agent {
 			this.#runningPrompt = undefined;
 			this.#resolveRunningPrompt = undefined;
 			resolve();
-			throw new Error("Prompt resource cancellation domain is unavailable");
+			const error = new Error("Prompt resource cancellation domain is unavailable");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
 		}
 		const logicalRunId = managedLogicalRunOwner ?? runId;
 		const scope = this.#attemptAuthority.mintMain();
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
+		this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "accepted" });
 		options?.onRunAccepted?.(handle, {
 			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
 		});
@@ -2122,6 +2165,7 @@ export class Agent {
 			resourceRunId: this.#activeResourceRunId,
 			resourceCancellationDomain: this.#activeResourceCancellationDomain,
 			resourceSealOwner: "caller",
+			canonicalEventAcknowledgment: this.#canonicalEventProcessor !== undefined,
 			getApiKey: this.getApiKey,
 			getAuthCredentialType: this.getAuthCredentialType,
 			getToolContext: this.#getToolContext,
@@ -2289,7 +2333,12 @@ export class Agent {
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
 						if (event.message.role === "assistant" && this.#cursorToolResultBuffer.length > 0) {
-							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							try {
+								await this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							} catch (error) {
+								abortController.abort(error);
+								throw error;
+							}
 							continue; // Skip default emit - split method handles everything
 						}
 						this.#state.streamMessage = null;
@@ -2340,8 +2389,17 @@ export class Agent {
 						continue;
 				}
 
-				// Emit to listeners
-				this.#emit(event);
+				// Wait only for this emission's canonical append, not observer or extension delivery.
+				const completion = this.#emit(event);
+				if (completion) {
+					try {
+						await completion;
+					} catch (error) {
+						// A producer parked on a consumer drain must wake before this consumer unwinds.
+						abortController.abort(error);
+						throw error;
+					}
+				}
 			}
 
 			if (this.#activeRunId !== runId) {
@@ -2378,13 +2436,32 @@ export class Agent {
 				return;
 			}
 			const providerCode = providerFailureCode(err);
-			const runtimeFailureCode = abortController.signal.aborted
-				? "aborted"
-				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
+			const aborted = abortController.signal.aborted;
+			const abortReason = abortController.signal.reason;
+			// A publication rejection aborts the run with its own error. That is a
+			// failure to diagnose, not a caller cancellation, so keep the cause log.
+			// Only the DOMException our own `abort()` installs marks a caller cancellation.
+			// Keying on the name alone would also suppress a publication error that happens
+			// to be named "AbortError".
+			const cancelled = aborted && abortReason instanceof DOMException && abortReason.name === "AbortError";
+			const runtimeFailureCode = aborted ? "aborted" : (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			} else if (!cancelled) {
+				// The only in-band abort reason is a canonical publication rejection, which
+				// aborts with its own error. Report that cause under a distinct diagnostic
+				// instead of mislabeling it as a run failure. `forceAbort` clears the active
+				// run before this catch can observe it, so a deliberate forced abort never
+				// reaches here, and `abort()` takes the cancellation branch above.
+				logger.warn("Agent run aborted with an underlying failure", {
 					provider: model.provider,
 					model: model.id,
 					code: sanitized.code,
@@ -2407,7 +2484,7 @@ export class Agent {
 					totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
-				stopReason: abortController.signal.aborted ? "aborted" : "error",
+				stopReason: aborted ? "aborted" : "error",
 				errorMessage: sanitized.message,
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
@@ -2425,7 +2502,7 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				this.#emit({
 					type: "agent_failed",
 					// Only the identity-checked local staging diagnostic may assert a
@@ -2435,7 +2512,7 @@ export class Agent {
 				});
 			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
-				stopReason: abortController.signal.aborted ? "cancelled" : "error",
+				stopReason: aborted ? "cancelled" : "error",
 				messages: [errorMsg],
 			});
 		} finally {
@@ -2526,7 +2603,16 @@ export class Agent {
 		}
 	}
 
-	#emit(e: AgentEvent) {
+	#emit(e: AgentEvent): Promise<void> | undefined {
+		let completion: Promise<void> | undefined;
+		try {
+			completion = this.#canonicalEventProcessor?.(e);
+		} catch (error) {
+			completion = Promise.reject(error);
+		}
+		// External synchronous emissions and terminal events do not wait for effects;
+		// still observe failures even when there is no loop consumer awaiting them.
+		void completion?.catch(error => logger.warn("Canonical event publication failed", { error }));
 		for (const listener of this.#listeners) {
 			try {
 				listener(e);
@@ -2539,6 +2625,7 @@ export class Agent {
 				console.warn("[pi-agent] event listener threw; swallowing:", sanitizeAgentFailure(error));
 			}
 		}
+		return completion;
 	}
 
 	/** Calculate total text length from an assistant message's content blocks */
@@ -2619,7 +2706,7 @@ export class Agent {
 	 *
 	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
 	 */
-	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
+	async #emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): Promise<void> {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
@@ -2627,7 +2714,8 @@ export class Agent {
 			// No tool results, emit normally
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			const completion = this.#emit({ type: "message_end", message: assistantMessage });
+			if (completion) await completion;
 			return;
 		}
 
@@ -2648,13 +2736,15 @@ export class Agent {
 			// Emit assistant message first, then tool results (original behavior but with buffered results)
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			const completion = this.#emit({ type: "message_end", message: assistantMessage });
+			if (completion) await completion;
 
 			// Emit buffered tool results
 			for (const { toolResult } of buffer) {
 				this.#emit({ type: "message_start", message: toolResult });
 				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
+				const toolCompletion = this.#emit({ type: "message_end", message: toolResult });
+				if (toolCompletion) await toolCompletion;
 			}
 			return;
 		}
@@ -2678,13 +2768,15 @@ export class Agent {
 		// Emit preamble
 		this.#state.streamMessage = null;
 		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		const preambleCompletion = this.#emit({ type: "message_end", message: preambleMessage });
+		if (preambleCompletion) await preambleCompletion;
 
 		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
 			this.#emit({ type: "message_start", message: toolResult });
 			this.appendMessage(toolResult);
-			this.#emit({ type: "message_end", message: toolResult });
+			const toolCompletion = this.#emit({ type: "message_end", message: toolResult });
+			if (toolCompletion) await toolCompletion;
 		}
 
 		// Emit continuation message (text after tools) if non-empty
@@ -2707,7 +2799,8 @@ export class Agent {
 			};
 			this.#emit({ type: "message_start", message: continuationMessage });
 			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
+			const continuationCompletion = this.#emit({ type: "message_end", message: continuationMessage });
+			if (continuationCompletion) await continuationCompletion;
 		}
 	}
 }
