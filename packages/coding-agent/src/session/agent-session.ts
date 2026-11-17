@@ -35624,8 +35624,6 @@ export class AgentSession {
 					!this.#hasExplicitActiveToolSelectionForContext &&
 					this.#explicitMCPToolSelectionForContext === undefined &&
 					this.#explicitMCPToolSelectionPersistsForContext === true;
-				let toolsReverted = false;
-				let promptReverted = false;
 				try {
 					if (historyIsOurs()) {
 						if (previousLeaf === null) manager.resetLeaf();
@@ -35648,7 +35646,6 @@ export class AgentSession {
 						this.#baseSystemPrompt = previousBaseSystemPrompt;
 						agent.setSystemPrompt(previousSystemPrompt);
 						ownedContextRevision = agent.contextRevision;
-						promptReverted = true;
 						// Invalidate rebuilds authorized for the abandoned target tools;
 						// otherwise one may publish their guidance over the reverted prompt.
 						this.#reserveBaseSystemPromptGeneration();
@@ -35658,18 +35655,18 @@ export class AgentSession {
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 						this.#activeToolSelectionRevision++;
 						agent.setTools(previousTools);
-						toolsReverted = true;
 						ownedContextRevision = agent.contextRevision;
+						// Signatures describe the prompt and tools this rollback just
+						// restored. Publish them before any observer can read or replace
+						// the cached signature with its own selection.
+						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
 						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 						this.#invalidateDiscoveryCaches();
 					} else if (selectionOurs() && agent.contextRevision === ownedContextRevision) {
 						// The view moved on, so its live tools stand. Only undo the
 						// discovered-selection staging this operation performed.
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
-					}
-					if (toolsReverted && promptReverted) {
-						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
-						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
 					}
 					if (historyIsOurs()) {
 						agent.replaceMessages(previousMessages, {

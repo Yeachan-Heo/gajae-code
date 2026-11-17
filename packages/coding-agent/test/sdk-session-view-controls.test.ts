@@ -845,6 +845,43 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
+	it("keeps the tool signature consistent with a reentrant observer publication", async () => {
+		let publish: (() => void) | undefined;
+		const { previous } = await seedMcpBranches(() => {
+			const publishNow = publish;
+			publish = undefined;
+			publishNow?.();
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		let rebuilds = 0;
+		rebuild = async names => {
+			rebuilds++;
+			return { systemPrompt: [`tools:${[...names].sort().join(",")}`] };
+		};
+		let publishTask: Promise<void> | undefined;
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			publish = () => {
+				publishTask = session.setActiveToolsByName([], { persistMCPSelection: false });
+			};
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		// The observer's explicit selection supersedes the aborted restore.
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "resource_gone",
+			rollbackFailed: false,
+		});
+		await publishTask;
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.getActiveToolNames()).toEqual([]);
+		expect(session.systemPrompt).toEqual(["tools:"]);
+		// The observer's publication owns the live signature: a repeat selection must
+		// not rebuild a prompt the cache already describes.
+		const settled = rebuilds;
+		await session.setActiveToolsByName([], { persistMCPSelection: false });
+		expect(rebuilds).toBe(settled);
+	});
+
 	for (const interference of [
 		"append",
 		"selection-roundtrip",
