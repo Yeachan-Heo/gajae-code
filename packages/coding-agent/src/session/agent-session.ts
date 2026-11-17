@@ -3063,6 +3063,16 @@ type PreparedExactMcpRetirement = {
 };
 
 /**
+ * Ownership fence for an exact session-view restoration. `isCurrent` authorizes the
+ * next publication; `onApplied` re-anchors ownership after this operation publishes
+ * its own tools and prompt, so a foreign publication is still detected as drift.
+ */
+interface SessionViewRestoreFence {
+	isCurrent: () => boolean;
+	onApplied: () => void;
+}
+
+/**
  * An entry states its transport with `type`, or implies it: a `command` entry is
  * stdio and a `url` entry is http. Only the discriminator is read — the command
  * string and URL themselves stay inside the config.
@@ -14840,7 +14850,7 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
-			isCurrent?: () => boolean;
+			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
 		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
@@ -14852,7 +14862,7 @@ export class AgentSession {
 		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
-			(options?.isCurrent?.() ?? true) &&
+			(options?.fence?.isCurrent() ?? true) &&
 			(options?.expectedActiveToolSelectionRevision === undefined ||
 				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
 					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
@@ -14949,6 +14959,7 @@ export class AgentSession {
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
 				this.#setGuardedAgentTools(tools);
 				this.#invalidateDiscoveryCaches();
+				options?.fence?.onApplied();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
 				promote();
@@ -15043,6 +15054,7 @@ export class AgentSession {
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
 				this.#pendingAppliedToolSignature = undefined;
+				options?.fence?.onApplied();
 				break;
 			}
 		} else if (promptRelevantToolsChanged) {
@@ -15063,6 +15075,7 @@ export class AgentSession {
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
 		this.#setGuardedAgentTools(tools);
 		this.#invalidateDiscoveryCaches();
+		options?.fence?.onApplied();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
 				previousSelectedMCPToolNames,
@@ -15224,12 +15237,12 @@ export class AgentSession {
 
 	async #restoreMCPSelectionsForSessionContext(
 		sessionContext: SessionContext,
-		isCurrent?: () => boolean,
+		fence?: SessionViewRestoreFence,
 	): Promise<void> {
-		if (isCurrent && !isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
-			await this.#attachAskToolIfWorkflowActive(isCurrent);
+			await this.#attachAskToolIfWorkflowActive(fence);
 			return;
 		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
@@ -15253,11 +15266,11 @@ export class AgentSession {
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
 		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false, isCurrent },
+			{ persistMCPSelection: false, fence },
 		);
-		if (isCurrent && (applied === undefined || !isCurrent()))
+		if (fence && (applied === undefined || !fence.isCurrent()))
 			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
-		await this.#attachAskToolIfWorkflowActive(isCurrent);
+		await this.#attachAskToolIfWorkflowActive(fence);
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -16380,8 +16393,8 @@ export class AgentSession {
 		}
 	}
 
-	async #attachAskToolIfWorkflowActive(isCurrent?: () => boolean): Promise<void> {
-		if (this.#isDisposed || this.#sessionAdmissionClosing || (isCurrent && !isCurrent())) return;
+	async #attachAskToolIfWorkflowActive(fence?: SessionViewRestoreFence): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || (fence && !fence.isCurrent())) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -16416,7 +16429,7 @@ export class AgentSession {
 				});
 				retryHydration = true;
 			}
-			if (isCurrent && !isCurrent()) return;
+			if (fence && !fence.isCurrent()) return;
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
@@ -16439,7 +16452,7 @@ export class AgentSession {
 		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			if (isCurrent) {
+			if (fence) {
 				// Exact view restoration must join prompt rebuilding and fence its publication.
 				if (
 					!this.#explicitEmptyToolSelection &&
@@ -16448,9 +16461,9 @@ export class AgentSession {
 				) {
 					const applied = await this.#applyActiveToolsByName([...this.getActiveToolNames(), "ask"], {
 						persistMCPSelection: false,
-						isCurrent,
+						fence,
 					});
-					if (applied === undefined || !isCurrent())
+					if (applied === undefined || !fence.isCurrent())
 						throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 				}
 			} else {
@@ -35514,10 +35527,25 @@ export class AgentSession {
 		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
 		const previousMessages = agent.state.messages.slice();
 		let ownedMessages = previousMessages;
+		let ownedTools = agent.state.tools;
+		let ownedSystemPrompt = agent.state.systemPrompt;
+		let ownedContextRevision = agent.contextRevision;
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
 		let moved = false;
-		const current = () => {
+		// Identity only: the view may have moved on, but this session still owns the
+		// private selection-authority state this operation staged.
+		const sessionStillOurs = () =>
+			!this.#isDisposed &&
+			this.sessionManager === manager &&
+			this.agent === agent &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identity;
+		// View/history ownership: the leaf, transcript and transition identity this
+		// operation moved. Losing it means a foreign actor superseded the restoration.
+		const historyIsOurs = () => {
 			const now = manager.revisionSnapshot();
 			const messages = agent.state.messages;
 			return (
@@ -35543,6 +35571,24 @@ export class AgentSession {
 				!busy()
 			);
 		};
+		const current = () => {
+			// Prompt, tools and in-place history edits are independently mutable. A
+			// concurrent publication is drift even when the view identity holds.
+			return (
+				historyIsOurs() &&
+				agent.state.tools === ownedTools &&
+				agent.state.systemPrompt === ownedSystemPrompt &&
+				agent.contextRevision === ownedContextRevision
+			);
+		};
+		const fence: SessionViewRestoreFence = {
+			isCurrent: current,
+			onApplied: () => {
+				ownedTools = agent.state.tools;
+				ownedSystemPrompt = agent.state.systemPrompt;
+				ownedContextRevision = agent.contextRevision;
+			},
+		};
 		this.#beginSessionTransition("navigate-tree");
 		try {
 			if (!current()) throw gone();
@@ -35554,12 +35600,13 @@ export class AgentSession {
 			this.#commitSessionTransition();
 			if (!current()) throw gone();
 			const context = this.buildDisplaySessionContext();
-			await this.#restoreMCPSelectionsForSessionContext(context, current);
+			await this.#restoreMCPSelectionsForSessionContext(context, fence);
 			if (!current()) throw gone();
 			agent.replaceMessages(context.messages, {
 				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
 			});
 			ownedMessages = agent.state.messages.slice();
+			ownedContextRevision = agent.contextRevision;
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -35586,9 +35633,16 @@ export class AgentSession {
 					this.#activeToolSelectionRevision++;
 					agent.setTools(previousTools);
 					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+					ownedTools = agent.state.tools;
+					ownedContextRevision = agent.contextRevision;
 					if (!current()) throw gone();
 					this.#baseSystemPrompt = previousBaseSystemPrompt;
 					agent.setSystemPrompt(previousSystemPrompt);
+					// Invalidate prompt rebuilds authorized for the abandoned target tools;
+					// otherwise one may publish their guidance over the reverted prompt.
+					this.#reserveBaseSystemPromptGeneration();
+					ownedSystemPrompt = agent.state.systemPrompt;
+					ownedContextRevision = agent.contextRevision;
 					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
 					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
 					this.#invalidateDiscoveryCaches();
@@ -35597,6 +35651,7 @@ export class AgentSession {
 						historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
 					});
 					ownedMessages = agent.state.messages.slice();
+					ownedContextRevision = agent.contextRevision;
 					this.#resetInjectedContextSignatures();
 					this.#syncTodoPhasesFromBranch();
 					this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -35608,7 +35663,35 @@ export class AgentSession {
 					});
 				}
 			} else if (moved) {
-				throw gone();
+				// Either the live view moved on, or an independent publication owns the
+				// prompt/tools. Undo only independently-owned state that this operation
+				// staged and still owns, without reviving superseded tools.
+				if (sessionStillOurs()) {
+					try {
+						if (this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration) {
+							if (
+								!this.#hasExplicitActiveToolSelectionForContext &&
+								this.#explicitMCPToolSelectionForContext === undefined &&
+								this.#explicitMCPToolSelectionPersistsForContext === true
+							) {
+								this.#hasExplicitActiveToolSelectionForContext =
+									previousHasExplicitActiveToolSelectionForContext;
+								this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+								this.#explicitMCPToolSelectionPersistsForContext =
+									previousExplicitMCPToolSelectionPersistsForContext;
+								this.#commitExplicitMCPToolSelectionAuthority();
+							}
+							if (agent.state.tools === ownedTools)
+								this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+						}
+					} catch {
+						throw Object.assign(new Error("Session view rollback failed."), {
+							code: "revision_failed",
+							rollbackFailed: true,
+						});
+					}
+				}
+				if (!historyIsOurs()) throw gone();
 			}
 			throw error;
 		} finally {

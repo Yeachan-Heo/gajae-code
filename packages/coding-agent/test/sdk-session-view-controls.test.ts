@@ -615,6 +615,106 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
+	it("leaves an independently refreshed prompt in place when the view aborts afterwards", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let rebuilds = 0;
+		rebuild = async () => {
+			if (++rebuilds === 1) {
+				entered.resolve();
+				await release.promise;
+				throw new Error("target rebuild failed");
+			}
+			return { systemPrompt: ["independent refresh"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		await session.refreshBaseSystemPrompt();
+		expect(session.systemPrompt).toEqual(["independent refresh"]);
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "revision_failed", rollbackFailed: false });
+		expect(session.systemPrompt).toEqual(["independent refresh"]);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("rejects in-place history mutation instead of overwriting it", async () => {
+		const { old } = await seedMcpBranches();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(old));
+		void pending.catch(() => {});
+		await entered.promise;
+		const message = session.agent.state.messages[0];
+		if (message?.role !== "user") throw new Error("Expected user message");
+		message.content = "foreign in-place edit";
+		session.agent.touchContext();
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.agent.state.messages[0]).toMatchObject({ content: "foreign in-place edit" });
+	});
+
+	it("restores operation-owned explicit MCP authority when foreign history aborts the view", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const manager = session.sessionManager;
+		const entries = manager.getEntries();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		session.agent.appendMessage({ role: "user", content: "foreign agent work", timestamp: 3 });
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.agent.state.messages.at(-1)).toMatchObject({ content: "foreign agent work" });
+		// The aborted restore must not leave its cleared authority behind: catalog
+		// reconciliation has to keep the unpersisted live selection.
+		await session.refreshMCPTools([lookupTool]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		await manager.flush();
+		expect(manager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("invalidates a prompt rebuild authorized before rollback", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.getActiveToolNames();
+		const systemPrompt = session.systemPrompt.slice();
+		rebuild = async names => ({ systemPrompt: [`tools:${[...names].sort().join(",")}`] });
+		let pendingRefresh: Promise<void> | undefined;
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			// Target tools and prompt are already published; an independent refresh
+			// captures them and reserves the newest prompt generation.
+			pendingRefresh = session.refreshBaseSystemPrompt();
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		await pendingRefresh;
+		expect(session.getActiveToolNames()).toEqual(tools);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(model.calls).toHaveLength(0);
+	});
+
 	for (const interference of [
 		"append",
 		"selection-roundtrip",
