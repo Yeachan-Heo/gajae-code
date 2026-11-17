@@ -24,7 +24,13 @@ import type {
 } from "../session/resume-operation";
 import { SessionManager } from "../session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
-import type { ActivityControlOperation, ActivityControlResult } from "./activity-controls";
+import type {
+	ActivityControlOperation,
+	ActivityControlResult,
+	ActivityMcpResult,
+	ActivityMcpServer,
+	ActivityMcpSnapshot,
+} from "./activity-controls";
 import type { AuthorizationControls } from "./authorization-controls";
 import type { SdkComposerObservation } from "./composer-observation";
 import type { SdkDiffObservation } from "./diff-observation";
@@ -129,6 +135,13 @@ export interface NativeEmbeddedRuntime {
 			operation: ActivityControlOperation,
 			input: Record<string, unknown>,
 		): Promise<NativeInvocationResult<ActivityControlResult>>;
+	};
+	readonly mcp: {
+		snapshot(): Promise<NativeInvocationResult<ActivityMcpSnapshot>>;
+		operate(
+			ref: ActivityMcpServer["ref"],
+			action: ActivityMcpServer["controls"][number],
+		): Promise<NativeInvocationResult<ActivityMcpResult>>;
 	};
 	readonly preferences: NativeMethods<Pick<SdkPreferenceControls, "handle">>;
 	readonly authorization: NativeMethods<Pick<AuthorizationControls, "execute">>;
@@ -610,6 +623,20 @@ function createNativeEmbeddedRuntime(
 					const activity = getSessionClientControls(session).activity;
 					if (!activity) throw new Error("Native activity controls unavailable");
 					return activity.control(operation, input);
+				}),
+		}),
+		mcp: Object.freeze({
+			snapshot: () =>
+				invokeNativeRuntime(handle, "mcp", () => {
+					const activity = getSessionClientControls(session).activity;
+					if (!activity) throw new Error("Native activity controls unavailable");
+					return activity.getMcpSnapshot();
+				}),
+			operate: (ref, action) =>
+				invokeNativeRuntime(handle, "mcp", () => {
+					const activity = getSessionClientControls(session).activity;
+					if (!activity) throw new Error("Native activity controls unavailable");
+					return activity.operateMcp({ ref }, action);
 				}),
 		}),
 		preferences: Object.freeze({
