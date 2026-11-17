@@ -2,8 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { appendLedger, readUltragoalLedger } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
+import { GJC_SESSION_ACTIVITY_FILE, sessionRoot } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
+	appendLedger,
+	HUMAN_BLOCKED_ASK_ANSWERED_EVENT,
+	readUltragoalLedger,
+	recordUltragoalHumanBlockedAskAnswered,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -21,64 +26,59 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+/** Make the activity-marker write fail: a directory sits where the marker file goes. */
+async function breakActivityMarker(cwd: string): Promise<string> {
+	const markerPath = path.join(sessionRoot(cwd, TEST_SESSION_ID), GJC_SESSION_ACTIVITY_FILE);
+	await fs.mkdir(markerPath, { recursive: true });
+	return markerPath;
+}
+
 afterEach(async () => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
-describe("appendLedger activity marker resilience", () => {
-	it("succeeds despite activity marker write failure", async () => {
+describe("appendLedger activity marker contract", () => {
+	it("writes the row and advances the marker", async () => {
 		const dir = await tempDir();
-		const testEvent = { event: "test", data: "test-data" };
+		const entry = await appendLedger(dir, { event: "test", data: "test-data" }, TEST_SESSION_ID);
 
-		// Initialize ultragoal ledger directory
-		const sessionUltragoalPath = sessionUltragoalDir(dir, TEST_SESSION_ID);
-		await fs.mkdir(sessionUltragoalPath, { recursive: true });
-
-		// appendLedger should handle marker write failures gracefully
-		// (we can't easily inject a marker write failure, so we test the happy path
-		// to ensure the entry is written)
-		const entry = await appendLedger(dir, testEvent, TEST_SESSION_ID);
-
-		// Verify the entry was returned
-		expect(entry).toBeDefined();
 		expect(entry.event).toBe("test");
-		expect(entry.data).toBe("test-data");
-		expect(entry.eventId).toBeDefined();
-		expect(entry.timestamp).toBeDefined();
-
-		// Verify the ledger file contains the entry
 		const ledger = await readUltragoalLedger(dir, TEST_SESSION_ID);
-		expect(ledger.length).toBe(1);
-		expect(ledger[0].event).toBe("test");
-		expect(ledger[0].data).toBe("test-data");
+		expect(ledger.map(row => row.eventId)).toEqual([entry.eventId]);
+		const marker = JSON.parse(
+			await fs.readFile(path.join(sessionRoot(dir, TEST_SESSION_ID), GJC_SESSION_ACTIVITY_FILE), "utf-8"),
+		);
+		expect(marker.session_id).toBe(TEST_SESSION_ID);
+		expect(marker.writer).toBe("ultragoal-runtime");
 	});
 
-	it("appends multiple entries successfully", async () => {
+	it("fails a generic append when the marker write fails", async () => {
 		const dir = await tempDir();
+		await breakActivityMarker(dir);
 
-		// Initialize ultragoal ledger directory
-		const sessionUltragoalPath = sessionUltragoalDir(dir, TEST_SESSION_ID);
-		await fs.mkdir(sessionUltragoalPath, { recursive: true });
+		// State commands rely on this rejection: implicit session resolution reads the
+		// marker, so reporting success here would leave it stale.
+		await expect(appendLedger(dir, { event: "blocker_classified" }, TEST_SESSION_ID)).rejects.toThrow();
+	});
 
-		// Append multiple entries, all should succeed
-		const event1 = await appendLedger(dir, { event: "first", sequence: 1 }, TEST_SESSION_ID);
-		const event2 = await appendLedger(dir, { event: "second", sequence: 2 }, TEST_SESSION_ID);
-		const event3 = await appendLedger(dir, { event: "third", sequence: 3 }, TEST_SESSION_ID);
+	it("settles an ask whose row committed before the marker write failed", async () => {
+		const dir = await tempDir();
+		await breakActivityMarker(dir);
+		const receipt = { cwd: dir, sessionId: TEST_SESSION_ID, classificationEventId: "classification-1" };
 
-		expect(event1.event).toBe("first");
-		expect(event2.event).toBe("second");
-		expect(event3.event).toBe("third");
-
-		// Verify all three entries are in the ledger
+		// The row is durable, so settlement reports the decision it committed.
+		await expect(recordUltragoalHumanBlockedAskAnswered(receipt)).resolves.toBeUndefined();
 		const ledger = await readUltragoalLedger(dir, TEST_SESSION_ID);
-		expect(ledger.length).toBe(3);
-		expect(ledger[0].event).toBe("first");
-		expect(ledger[1].event).toBe("second");
-		expect(ledger[2].event).toBe("third");
-		// Verify eventIds are unique
-		const eventIds = new Set([event1.eventId, event2.eventId, event3.eventId]);
-		expect(eventIds.size).toBe(3);
+		expect(
+			ledger.filter(
+				row => row.event === HUMAN_BLOCKED_ASK_ANSWERED_EVENT && row.classificationEventId === "classification-1",
+			),
+		).toHaveLength(1);
+
+		// Settling again sees its own row and appends nothing.
+		await expect(recordUltragoalHumanBlockedAskAnswered(receipt)).resolves.toBeUndefined();
+		expect(await readUltragoalLedger(dir, TEST_SESSION_ID)).toHaveLength(1);
 	});
 });

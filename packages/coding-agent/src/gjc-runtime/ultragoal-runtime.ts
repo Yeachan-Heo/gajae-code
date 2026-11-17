@@ -408,16 +408,12 @@ export async function appendLedger(
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
-	// Write the activity marker to record the ledger update for implicit session resolution.
-	// The activity marker is best-effort: a failure to write it should not fail the durable
-	// ledger append. Log the error so it can be observed but do not throw, following the
-	// pattern of writeSessionActivityMarker's own contract (state-command callers MUST
-	// treat thrown errors as failures; non-critical writers may swallow them).
-	try {
-		await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
-	} catch (error) {
-		logger.warn(`Failed to write session activity marker for ledger append: ${error}`);
-	}
+	// Implicit session resolution (`gjc state doctor` without a session id) reads
+	// this marker, so a state command whose row landed but whose marker did not
+	// must fail rather than report success with a stale marker. Callers that can
+	// prove the row committed (ask settlement reads it back by event id) decide
+	// for themselves whether the marker failure is fatal.
+	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 	return entry;
 }
 
@@ -645,9 +641,8 @@ async function appendHumanBlockedAskEvent<T>(
 					// there, report the decision it committed, or the caller would act on
 					// the opposite of the durable state (a reservation it believes it
 					// does not hold, a release it believes was not recorded).
-					// For ask settlement, marker failures are non-fatal: the ledger row is
-					// durable and that is what matters for correctness. Only the marker is
-					// best-effort.
+					// This includes an activity-marker failure after the row: settlement
+					// is keyed by the session id it already holds, not by the marker.
 					const committed = await readUltragoalLedger(cwd, sessionId).then(
 						ledger => ledger.some(row => row.eventId === eventId),
 						() => false,
