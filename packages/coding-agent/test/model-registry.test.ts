@@ -11331,6 +11331,80 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+
+		test("discards discovered models when unrelated runtime override changes during OAuth refresh", async () => {
+			// Regression: while refreshOAuth is true, the generation check accepts ANY configuration-generation
+			// change during the refresh, including unrelated runtime API-key override changes.
+			// The fix ensures we only accept the generation bump caused by the OAuth token rotation,
+			// and discard if other concurrent changes happened (like a runtime override).
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "refresh-token",
+					// Token is expired right now
+					expires: Date.now() - 1000,
+					email: "antigravity@example.com",
+				},
+			]);
+
+			let discoveryFetches = 0;
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				// Simulate OAuth token refresh
+				await authStorage.set("google-antigravity", [
+					{
+						type: "oauth",
+						access: "refreshed-access",
+						refresh: "refresh-token",
+						// New token is fresh
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "antigravity@example.com",
+					},
+				]);
+				// ALSO change an unrelated runtime override during the same window
+				// This simulates a concurrent config change that's NOT part of the OAuth refresh
+				authStorage.setRuntimeApiKey("google-antigravity", "unrelated-override-key");
+				return "refreshed-access";
+			});
+
+			using _hook = hookFetch((input, _init) => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					return new Response(
+						JSON.stringify({
+							models: { "unrelated-override-discovered": { displayName: "Should Not Appear" } },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("google-antigravity", "online");
+
+				// Verify that getApiKey was called (meaning OAuth refresh was attempted)
+				expect(getApiKeySpy).toHaveBeenCalled();
+
+				// Verify that the discovery endpoint was NOT called
+				// because the unrelated runtime override change should cause the discovery to be discarded.
+				// Before the fix, discoveryFetches would be 1 because the code accepted any generation
+				// change while refreshOAuth was true.
+				expect(discoveryFetches).toBe(0);
+
+				// Verify that the discovered model is NOT in the registry
+				const model = registry.find("google-antigravity", "unrelated-override-discovered");
+				expect(model).toBeUndefined();
+			} finally {
+				getApiKeySpy.mockRestore();
+				authStorage.removeRuntimeApiKey("google-antigravity");
+			}
+		});
 	});
 });
 

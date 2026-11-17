@@ -5448,6 +5448,13 @@ export class ModelRegistry {
 					descriptor.providerId,
 					this.#authStorageConfigOwner,
 				);
+				// Record pre-refresh state to detect unrelated concurrent credential changes.
+				// Only the credential selector/override should matter; the token will change during refresh.
+				const preRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
+					descriptor.providerId,
+					credentialSessionId,
+					{ owner: this.#authStorageConfigOwner },
+				);
 				// When OAuth token is expired, refresh it so discovery can proceed with valid
 				// credentials. For fresh tokens, use cheap peek without refresh.
 				// Never refresh for offline strategy, which must not make network calls.
@@ -5472,19 +5479,27 @@ export class ModelRegistry {
 						credentialSessionId,
 						refreshOAuth,
 					}));
-				// If configuration generation changed but we did NOT trigger an OAuth refresh,
-				// it means a concurrent unrelated credential change happened (not our refresh).
-				// If we did trigger an OAuth refresh, allow the generation bump caused by the refresh,
-				// which may occur for identity-less credentials. Use the post-refresh generation.
-				if (
-					configurationGeneration !==
-						this.authStorage.getProviderConfigurationGeneration(
-							descriptor.providerId,
-							this.#authStorageConfigOwner,
-						) &&
-					!refreshOAuth
-				) {
-					return { apiKey: undefined, authGeneration: undefined };
+				// If configuration generation changed, check if the change was caused by the OAuth refresh
+				// or by an unrelated concurrent credential change (like a runtime override or selector change).
+				// If we did NOT trigger an OAuth refresh, any generation change is unexpected.
+				// If we DID trigger an OAuth refresh, only allow the generation change if the credential
+				// selector/type stayed the same (meaning only the token changed, not the credential source).
+				const generationAfter = this.authStorage.getProviderConfigurationGeneration(
+					descriptor.providerId,
+					this.#authStorageConfigOwner,
+				);
+				if (configurationGeneration !== generationAfter) {
+					// Generation bumped. Check if it was caused by the refresh or by something else.
+					// Verify the credential selector/type didn't change (which would indicate a concurrent
+					// unrelated credential change, not just the OAuth token rotation).
+					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
+						descriptor.providerId,
+						credentialSessionId,
+						{ owner: this.#authStorageConfigOwner },
+					);
+					if (!refreshOAuth || preRefreshCredentialType !== postRefreshCredentialType) {
+						return { apiKey: undefined, authGeneration: undefined };
+					}
 				}
 				return {
 					apiKey,
