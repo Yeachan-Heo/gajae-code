@@ -1332,9 +1332,7 @@ describe("shared publication admission split", () => {
 		await f.manager.flush();
 		const durable = await Bun.file(originalFile).text();
 		expect(durable.indexOf("first relocated output")).toBeGreaterThanOrEqual(0);
-		expect(durable.indexOf("second relocated output")).toBeGreaterThan(
-			durable.indexOf("first relocated output"),
-		);
+		expect(durable.indexOf("second relocated output")).toBeGreaterThan(durable.indexOf("first relocated output"));
 	});
 
 	it("recovers a retained unresolved deferred result by re-reading it, never resubmitting", async () => {
