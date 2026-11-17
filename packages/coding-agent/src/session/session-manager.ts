@@ -20544,9 +20544,17 @@ export class SessionManager {
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
-		// Allow mutations during exclusive cwd transitions (#7856), since the transition
-		// provides serialization for these non-transcript operations (move session, append header patch, etc.)
-		if (this.#ownsCwdTransition()) return;
+		// Allow cwd transition operations during exclusive cwd transitions (#7856), since the transition
+		// provides serialization for relocation-specific mutations (move session, append header patch, etc.).
+		// Other legacy mutations that could modify the shared transcript graph must still refuse.
+		const cwdTransitionAllowedOps = new Set([
+			"move session",
+			"append header patch",
+			"full transcript publication",
+			"rewrite transcript",
+			"persist patches",
+		]);
+		if (this.#ownsCwdTransition() && cwdTransitionAllowedOps.has(operation)) return;
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 

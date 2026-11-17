@@ -24084,7 +24084,7 @@ export class AgentSession {
 	async #setSharedSessionDefaultModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void },
+		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
 	): Promise<void> {
 		const operation = "set session model";
 		const assertMode = this.#controlPublicationModeFence(operation);
@@ -24152,12 +24152,13 @@ export class AgentSession {
 		const entries: SharedControlEntry[] = [{ type: "model_change", model: selector, role: "default" }];
 		if (effectiveLevel !== this.#thinkingLevel)
 			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
+		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 		entries.push({
 			type: "configured_model_chain",
 			chain: {
 				role: "default",
 				entries: [formatModelSelectorValue(selector, requestedLevel)],
-				origin: "model_selection",
+				origin,
 				explicitHead: true,
 				cleared: false,
 			},
@@ -24179,13 +24180,14 @@ export class AgentSession {
 		}
 		try {
 			assertCurrent();
-			this.markUserModelSelection();
+			const isUserSelection = options.cause !== "startup-override";
+			if (isUserSelection) this.markUserModelSelection();
 			this.#btwPrefixLedger.clear();
-			this.#setModelAuthoritatively(model, "user-selection");
+			this.#setModelAuthoritatively(model, isUserSelection ? "user-selection" : "startup-override");
 			this.#unavailableModelProfile = undefined;
-			this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+			if (isUserSelection) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 			this.#seedSessionCanonicalVariant(model);
-			this.#recordUserCanonicalVariantSelection();
+			if (isUserSelection) this.#recordUserCanonicalVariantSelection();
 			this.#applyThinkingLevel(requestedLevel, false, false, undefined, true);
 			this.#publishConcreteDefaultProfileState(materialized);
 			this.#defaultFallbackController = undefined;

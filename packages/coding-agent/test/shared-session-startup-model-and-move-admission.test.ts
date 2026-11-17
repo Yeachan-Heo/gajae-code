@@ -180,6 +180,8 @@ describe("#7856 setTemporaryModel in a shared root TUI session", () => {
 		const model = f.registry.find(provider, "selected");
 		if (!model) throw new Error(`Missing test model: ${provider}/selected`);
 
+		const entriesBeforeOverride = f.manager.getEntries().length;
+
 		// This should not throw SharedSessionMutationUnsupportedError
 		try {
 			await f.session.setModelTemporary(model, undefined, {
@@ -189,6 +191,16 @@ describe("#7856 setTemporaryModel in a shared root TUI session", () => {
 		} catch (error) {
 			throw new Error(`setModelTemporary failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+
+		// Verify that entries were published to the transcript
+		const entriesAfterOverride = f.manager.getEntries();
+		expect(entriesAfterOverride.length).toBeGreaterThan(entriesBeforeOverride);
+
+		// Verify that a model_change entry was added with the correct model selector
+		const modelChangeEntry = entriesAfterOverride.find(
+			e => e.type === "model_change" && e.model === `${provider}/selected`,
+		);
+		expect(modelChangeEntry).toBeDefined();
 	});
 });
 
@@ -197,6 +209,7 @@ describe("#7856 Move Session in a shared root TUI session", () => {
 		const f = await fixture();
 		await canonicalMessage(f);
 
+		const previousFile = f.manager.getSessionFile()!;
 		const targetDir = path.join(f.cwd, "..", "moved-session");
 		await fs.mkdir(targetDir, { recursive: true });
 
@@ -207,5 +220,13 @@ describe("#7856 Move Session in a shared root TUI session", () => {
 		} catch (error) {
 			throw new Error(`moveTo failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+
+		// Verify that the session file changed (indicating a successful move)
+		const newFile = f.manager.getSessionFile()!;
+		expect(newFile).not.toBe(previousFile);
+
+		// Verify that transcript entries are still accessible after move
+		const entries = f.manager.getEntries();
+		expect(entries.length).toBeGreaterThan(0);
 	});
 });
