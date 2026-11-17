@@ -371,11 +371,104 @@ describe("formatSessionDumpText credential scrub", () => {
 
 	it("keeps a container that closes after the scan budget is spent", () => {
 		const filler = "secret={\n".repeat(12);
-		const tail = 'secret={\n  "payload": "OPAQUE_TAIL_SECRET"\n}\nafter';
+		const longPayload = "A".repeat(1_500);
+		const tail = `secret={\n  "payload": "${longPayload}OPAQUE_TAIL_SECRET"\n}\nafter`;
 		const dumped = dump([{ role: "user", content: `${filler}${tail}`, timestamp: 1 }] as AgentMessage[]);
 
 		expect(dumped).not.toContain("OPAQUE_TAIL_SECRET");
 		expect(dumped).toContain("after");
+	});
+
+	it("keeps line-based redaction linear for carriage-return-only text", () => {
+		const line = "secret={unclosed\r";
+		const measure = (lines: number): number => {
+			const started = performance.now();
+			const dumped = dump([{ role: "user", content: line.repeat(lines), timestamp: 1 }] as AgentMessage[]);
+			expect(dumped).toContain("«redacted»");
+			return performance.now() - started;
+		};
+		measure(1_000);
+		const small = measure(4_000);
+		const large = measure(16_000);
+		expect(large).toBeLessThan(small * 10 + 2_000);
+	});
+
+	it("removes a private-key block split across a schema default object", () => {
+		const body = "SCHEMA_SPLIT_PEM_BODY";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							config: {
+								type: "object",
+								default: { body: `${pem("RSA", "BEGIN")}\n${body}`, private_key: pem("RSA", "END") },
+							},
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("removes a private-key block whose banner uses a unicode escape", () => {
+		const body = "UNICODE_PEM_BODY";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-unicode-banner",
+						name: "request",
+						arguments: { body: `\\u002d----BEGIN RSA PRIVATE KEY-----\n${body}`, private_key: pem("RSA", "END") },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("removes a private-key block split across bash output and its truncation notice", () => {
+		const body = "NOTICE_SPLIT_BODY";
+		const dumped = dump([
+			{
+				role: "bashExecution",
+				command: `export PRIVATE_KEY='${pem("RSA", "BEGIN")}`,
+				output: body,
+				exitCode: 0,
+				cancelled: false,
+				truncated: true,
+				meta: {
+					truncation: {
+						direction: "tail",
+						truncatedBy: "bytes",
+						totalLines: 1,
+						totalBytes: 100,
+						outputLines: 1,
+						outputBytes: 17,
+						artifactFailureDiagnostic: pem("RSA", "END"),
+					},
+				},
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
 	it("bounds unclosed credential containers in the session dump", () => {

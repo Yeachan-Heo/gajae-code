@@ -119,11 +119,17 @@ function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][
 		joined += value;
 	}
 	const spansByValue: PrivateKeySpan[][] = values.map(() => []);
+	// Spans and leaves are both ordered, so the walk advances one leaf pointer instead of
+	// visiting every leaf for every span.
+	let leaf = 0;
 	for (const span of findPrivateKeySpans(joined)) {
-		for (let index = 0; index < values.length; index++) {
-			const valueEnd = offsets[index] + values[index].length;
-			const start = Math.max(span.start, offsets[index]) - offsets[index];
-			const end = Math.min(span.end, valueEnd) - offsets[index];
+		while (leaf < values.length && offsets[leaf] + values[leaf].length <= span.start) leaf++;
+		for (let index = leaf; index < values.length; index++) {
+			const valueStart = offsets[index];
+			if (valueStart >= span.end) break;
+			const valueEnd = valueStart + values[index].length;
+			const start = Math.max(span.start, valueStart) - valueStart;
+			const end = Math.min(span.end, valueEnd) - valueStart;
 			if (end > start) spansByValue[index].push({ start, end });
 		}
 	}
@@ -156,13 +162,26 @@ function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][]
 	return redacted;
 }
 
+/** Decode `\u` escapes in every string leaf, so banner detection sees the text a reader sees. */
+function decodeValueStrings(value: unknown): unknown {
+	if (typeof value === "string") return decodeUnicodeEscapeText(value);
+	if (Array.isArray(value)) return value.map(decodeValueStrings);
+	if (value === null || typeof value !== "object") return value;
+	const decoded = Object.create(null) as Record<string, unknown>;
+	for (const [key, nested] of Object.entries(value)) {
+		decoded[key] = decodeValueStrings(nested);
+	}
+	return decoded;
+}
+
 /** Redact private-key blocks that span sibling argument values, at any nesting depth. */
 function redactCrossFieldPrivateKeys(values: readonly unknown[]): unknown[] {
+	const decoded = values.map(decodeValueStrings);
 	const leaves: string[] = [];
-	for (const value of values) collectStringLeaves(value, leaves);
+	for (const value of decoded) collectStringLeaves(value, leaves);
 	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
 	const cursor = { index: 0 };
-	return values.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
+	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
 }
 
 function serializeParameterValue(value: unknown): string {
@@ -170,13 +189,12 @@ function serializeParameterValue(value: unknown): string {
 }
 
 /**
- * Redact a private-key block that spans an execution message's command (or code)
- * and its output. The pair is located before field-level credential masking can
- * remove one of the two banners.
+ * Redact a private-key block that spans an execution message's command (or code),
+ * its output, and the notice text rendered after them. The block is located over the
+ * whole message before field-level credential masking can remove one of the banners.
  */
-function redactExecutionPrivateKey(head: string, tail: string): [string, string] {
-	const spans = crossFieldPrivateKeySpans([head, tail]);
-	return [redactPrivateKeyRanges(head, spans[0]), redactPrivateKeyRanges(tail, spans[1])];
+function redactExecutionPrivateKey<T extends object>(message: T): T {
+	return redactCrossFieldPrivateKeys([message])[0] as T;
 }
 
 /** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
@@ -238,8 +256,13 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 			redacted[field] = properties;
 			continue;
 		}
-		if (propertyName !== undefined && SCHEMA_VALUE_KEYWORDS.has(field)) {
-			redacted[field] = isCredentialKey(propertyName) ? maskSchemaData(nested) : scrubSchemaData(nested);
+		if (SCHEMA_VALUE_KEYWORDS.has(field)) {
+			// Schema data is handled like tool arguments: a private-key block is paired over
+			// the whole value before credential-named fields inside it are masked.
+			redacted[field] =
+				propertyName !== undefined && isCredentialKey(propertyName)
+					? maskSchemaData(nested)
+					: scrubSchemaData(redactCrossFieldPrivateKeys([nested])[0]);
 			continue;
 		}
 		redacted[field] = redactSchemaValue(nested, propertyName);
@@ -407,8 +430,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const bashMsg = msg as BashExecutionMessage;
 			if (!bashMsg.excludeFromContext) {
 				lines.push("## Bash Execution\n");
-				const [command, output] = redactExecutionPrivateKey(bashMsg.command, bashMsg.output);
-				const structured = redactStructuredSecrets({ ...bashMsg, command, output }) as BashExecutionMessage;
+				const structured = redactStructuredSecrets(redactExecutionPrivateKey(bashMsg)) as BashExecutionMessage;
 				lines.push(redactCrashSecrets(bashExecutionToText(structured)));
 				lines.push("\n");
 			}
@@ -416,8 +438,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const pythonMsg = msg as PythonExecutionMessage;
 			if (!pythonMsg.excludeFromContext) {
 				lines.push("## Python Execution\n");
-				const [code, output] = redactExecutionPrivateKey(pythonMsg.code, pythonMsg.output);
-				const structured = redactStructuredSecrets({ ...pythonMsg, code, output }) as PythonExecutionMessage;
+				const structured = redactStructuredSecrets(redactExecutionPrivateKey(pythonMsg)) as PythonExecutionMessage;
 				lines.push(redactCrashSecrets(pythonExecutionToText(structured)));
 				lines.push("\n");
 			}

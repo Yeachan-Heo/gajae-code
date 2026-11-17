@@ -664,21 +664,37 @@ function redactCredentialValue(
  * later containers are bounded to a fixed lookahead that still lets a nearby
  * closing brace be found.
  */
-const CONTAINER_SCAN_BUDGET_FACTOR = 4;
+const CONTAINER_SCAN_BUDGET_FACTOR = 16;
 
 /**
  * Characters a container scan may still examine once the shared budget is spent.
  * A container that closes within this lookahead is still redacted in full, so
  * pathological input degrades to a bounded scan instead of losing the close.
  */
-const CONTAINER_SCAN_FLOOR = 1024;
+const CONTAINER_SCAN_FLOOR = 8192;
 
 interface ContainerScanBudget {
+	/** Lookahead left for scans that still see ordinary nesting. */
 	remaining: number;
+	/** Lookahead left for scans that only get the floor treatment. */
+	floorRemaining: number;
 }
 
 function createContainerScanBudget(length: number): ContainerScanBudget {
-	return { remaining: length * CONTAINER_SCAN_BUDGET_FACTOR + 1024 };
+	const initial = length * CONTAINER_SCAN_BUDGET_FACTOR + 1024;
+	return { remaining: initial, floorRemaining: initial };
+}
+
+/**
+ * Lookahead for the next container scan.
+ * While the main budget lasts a scan may look at everything that is left. Once it is
+ * spent, each scan gets at most the floor, and the floor itself is spent down, so
+ * repeated unterminated containers cost a bounded amount each instead of a full text
+ * scan — while a container that closes just past its line is still found.
+ */
+function containerLookahead(budget: ContainerScanBudget): number {
+	if (budget.remaining > 0) return budget.remaining;
+	return Math.min(CONTAINER_SCAN_FLOOR, Math.max(budget.floorRemaining, 0));
 }
 
 function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
@@ -693,14 +709,16 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
 
 function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
 	const budget = createContainerScanBudget(text.length);
-	const lineScan: LineEndScan = { from: 0, end: -1 };
+	const lineScan = createLineEndScan(text);
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
-		const scan = findCredentialContainerEnd(text, containerStart, budget, lineScan);
-		budget.remaining -= scan.scanned;
+		const mainBudgetLeft = budget.remaining > 0;
+		const scan = findCredentialContainerEnd(text, containerStart, containerLookahead(budget), lineScan);
+		if (mainBudgetLeft) budget.remaining -= scan.scanned;
+		else budget.floorRemaining -= scan.scanned;
 		const containerEnd = scan.value;
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
 		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
@@ -734,20 +752,30 @@ interface BoundedScan<T> {
  * containers stays linear instead of rescanning the remaining text per container.
  */
 interface LineEndScan {
+	/** Whether the text contains a line feed at all. */
+	readonly hasLineFeed: boolean;
+	/** Whether the text contains a carriage return at all. */
+	readonly hasCarriageReturn: boolean;
 	/** Position the search resumes from. */
 	from: number;
 	/** Line end found for the last request, or -1 before the first request. */
 	end: number;
 }
 
+function createLineEndScan(text: string): LineEndScan {
+	return { hasLineFeed: text.includes("\n"), hasCarriageReturn: text.includes("\r"), from: 0, end: -1 };
+}
+
 function currentLineEnd(text: string, start: number, scan: LineEndScan): number {
 	if (scan.end >= start) return scan.end;
 	const from = Math.max(scan.from, start);
-	const lineFeed = text.indexOf("\n", from);
-	// A lone CR only counts when no LF is left to stop at; CRLF is handled by trimming
-	// the LF, so an LF-only transcript never pays for a second full-suffix search.
+	// Both terminators count, as they always have. A terminator the text does not contain
+	// at all is not searched for, because that search would scan the rest of the text for
+	// every container instead of stopping at the next line.
+	const lineFeed = scan.hasLineFeed ? text.indexOf("\n", from) : -1;
+	const carriageReturn = scan.hasCarriageReturn ? text.indexOf("\r", from) : -1;
 	const terminator =
-		lineFeed >= 0 ? (text[lineFeed - 1] === "\r" ? lineFeed - 1 : lineFeed) : text.indexOf("\r", from);
+		lineFeed < 0 ? carriageReturn : carriageReturn < 0 ? lineFeed : Math.min(lineFeed, carriageReturn);
 	scan.end = terminator >= 0 ? terminator : text.length;
 	scan.from = scan.end + 1;
 	return scan.end;
@@ -761,10 +789,10 @@ function currentLineEnd(text: string, start: number, scan: LineEndScan): number 
 function findCredentialContainerEnd(
 	text: string,
 	start: number,
-	budget: ContainerScanBudget,
+	lookahead: number,
 	lineScan: LineEndScan,
 ): BoundedScan<number> {
-	const limit = Math.min(text.length, start + Math.max(budget.remaining, CONTAINER_SCAN_FLOOR));
+	const limit = Math.min(text.length, start + lookahead);
 	// An unterminated container always consumes at least its opening character so the
 	// caller's scan position strictly advances.
 	const unclosedEnd = Math.max(Math.min(currentLineEnd(text, start, lineScan), limit), start + 1);
