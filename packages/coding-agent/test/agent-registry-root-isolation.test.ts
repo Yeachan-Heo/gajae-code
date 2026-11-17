@@ -11,7 +11,7 @@ import {
 	resolveLocalRoot,
 } from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry, MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
-import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { createAgentSession, planOccupiedAgentId } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { IrcTool } from "@gajae-code/coding-agent/tools/irc";
@@ -150,11 +150,6 @@ describe("root agent id claim", () => {
 	});
 
 	it("property: occupied id plan, fc.property seed 17091, numRuns 64", async () => {
-		const sdk = await import("@gajae-code/coding-agent/sdk");
-		const planOccupiedAgentId = sdk.planOccupiedAgentId;
-		if (typeof planOccupiedAgentId !== "function") {
-			throw new Error("planOccupiedAgentId missing");
-		}
 		fc.assert(
 			fc.property(fc.boolean(), fc.boolean(), (explicitAgentId, explicitRegistry) => {
 				const plan = planOccupiedAgentId({ explicitAgentId, explicitRegistry });
@@ -339,7 +334,6 @@ describe("createAgentSession root registry", () => {
 		const second = await openRoot();
 		let firstDisposed = false;
 		try {
-			expect(createAgentSession.name).toBe("createAgentSession");
 			const firstCwd = first.session.sessionManager.getCwd();
 			const secondCwd = second.session.sessionManager.getCwd();
 			const firstRoot = memoryRootFor(first.session.settings.getAgentDir(), firstCwd);
@@ -690,4 +684,30 @@ describe("createAgentSession root registry", () => {
 			await first.session.dispose();
 		}
 	}, 180_000);
+
+	it("does not unregister a successor that claims the id during a failed startup", async () => {
+		let successorId: string | undefined;
+		// The newcomer's own entry is already gone when cleanup runs (disposal
+		// released it) and a successor claimed the same id in between. Cleanup must
+		// leave that successor alone: it is not the identity this call claimed.
+		class SuccessorAttachRegistry extends AgentRegistry {
+			override attachSession(id: string): void {
+				successorId = id;
+				this.unregister(id);
+				this.claim({ id, displayName: "successor-root", kind: "main", session: null });
+				throw new Error("simulated late startup failure");
+			}
+		}
+		const registry = new SuccessorAttachRegistry();
+		registry.claim({ id: MAIN_AGENT_ID, displayName: "incumbent-root", kind: "main", session: null });
+
+		await expect(openRoot({ agentRegistry: registry })).rejects.toThrow(/simulated late startup failure/);
+
+		const newId = successorId ?? "";
+		expect(newId).not.toBe("");
+		expect(newId).not.toBe(MAIN_AGENT_ID);
+		expect(registry.get(MAIN_AGENT_ID)?.displayName).toBe("incumbent-root");
+		expect(registry.get(newId)?.displayName).toBe("successor-root");
+		expect(registry.list().map(ref => ref.id)).toEqual([MAIN_AGENT_ID, newId]);
+	}, 60_000);
 });

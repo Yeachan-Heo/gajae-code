@@ -12,11 +12,6 @@ function getMemoryRoot(agentDir: string, cwd: string): string {
 	return path.join(getMemoriesDir(agentDir), encodeProjectPath(cwd));
 }
 
-/** Memory root for one session's agent dir and project cwd. */
-export function memoryRootFor(agentDir: string, cwd: string): string {
-	return getMemoryRoot(agentDir, cwd);
-}
-
 function agentDirFromContext(settings: unknown): string | undefined {
 	if (!settings || typeof settings !== "object" || !("getAgentDir" in settings)) return undefined;
 	const getDir = (settings as { getAgentDir?: unknown }).getAgentDir;

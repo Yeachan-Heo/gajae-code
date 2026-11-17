@@ -152,7 +152,7 @@ import {
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createLazyService } from "../runtime/lazy-service";
 import {
 	createOptionalRuntimeServices,
@@ -1885,6 +1885,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let hasSession = false;
 	let processCwdClaimed = false;
 	let hasRegistered = false;
+	let claimedAgentRef: AgentRef | undefined;
 	let asyncJobManager: AsyncJobManager | undefined;
 	let asyncJobManagerOwned = false;
 	let asyncJobManagerAdmitted = false;
@@ -5504,7 +5505,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 			}
 		}
-		agentRegistry.claim({
+		claimedAgentRef = agentRegistry.claim({
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
 			rosterLabel: resolvedAgentRosterLabel,
@@ -6851,10 +6852,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// a later failure (e.g. attaching the live session to its ref) happens
 		// after registration but before the session's disposal cleanup is wired,
 		// and would otherwise strand the newcomer's entry next to the incumbent's.
-		// `unregister` is a no-op once disposal already removed it.
+		// Only the entry this call claimed may be removed: if disposal already
+		// released it and another session claimed the same id in between, that
+		// successor is not ours to unregister.
 		if (hasRegistered)
 			await attemptCleanup(() => {
-				agentRegistry.unregister(resolvedAgentId);
+				if (claimedAgentRef && agentRegistry.get(resolvedAgentId) === claimedAgentRef)
+					agentRegistry.unregister(resolvedAgentId);
 			});
 		if (!hasSession) {
 			// Admission happens before session construction. Any later startup failure
