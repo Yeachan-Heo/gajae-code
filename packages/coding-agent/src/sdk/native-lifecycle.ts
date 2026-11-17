@@ -801,6 +801,7 @@ function snapshotSource(source: EmbeddedWorkSource, manager: SessionManager): Em
 	if (source.result.session.sessionManager !== manager) throw new Error("Native runtime manager mismatch");
 	return Object.freeze({
 		result: source.result,
+		asyncJobs: source.asyncJobs,
 		interaction: source.interaction ? Object.freeze({ ...source.interaction }) : undefined,
 	});
 }
