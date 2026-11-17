@@ -357,8 +357,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			lastPromptMessageStart = session.state.messages.length;
 			await session.prompt(text, images ? { images } : undefined);
 			// Capture the user message that was just added, for compaction-robust turn tracking.
-			// Search for a user message after lastPromptMessageStart.
-			for (let i = lastPromptMessageStart; i < session.state.messages.length; i++) {
+			// Search from the end backward to find the most recent user message, handling the case
+			// where compaction shrinks the array and moves the new user message below lastPromptMessageStart.
+			for (let i = session.state.messages.length - 1; i >= 0; i--) {
 				if (session.state.messages[i]?.role === "user") {
 					lastPromptUserMessage = session.state.messages[i];
 					break;

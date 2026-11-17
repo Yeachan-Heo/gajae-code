@@ -115,12 +115,12 @@ describe("Print mode with message compaction", () => {
 		installImmediateStderrMock([]);
 		installImmediateStdoutMock(stdoutOutput);
 
-		await runPrintMode(session, { mode: "text" });
+		await runPrintMode(session, { mode: "text", initialMessage: "test prompt" });
 
 		// Should have printed the response text despite compaction
 		expect(stdoutOutput.join("")).toContain("test response");
-		// Should exit with success code, not error
-		expect(process.exitCode).toBe(0);
+		// Should exit with success code (0 or undefined), not error (1)
+		expect(process.exitCode ?? 0).toBe(0);
 	});
 
 	it("resolvePrintTerminalDisposition finds assistant text when messages are compacted before the user message", () => {
@@ -143,7 +143,8 @@ describe("Print mode with message compaction", () => {
 
 		// The old index (2) is now out of bounds or points to the new user message
 		// But resolvePrintTerminalDisposition should still find the assistant response
-		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction);
+		// by using the newUserMessage reference to find assistant messages that come after it
+		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction, newUserMessage);
 
 		expect(disposition).toEqual({ status: "success", assistantText: true });
 	});
@@ -182,10 +183,12 @@ describe("Print mode with message compaction", () => {
 		messages.splice(0, 2);
 
 		// Add current turn's user and assistant messages
-		messages.push(makeUserMessage("second prompt"));
+		const currentUserMessage = makeUserMessage("second prompt");
+		messages.push(currentUserMessage);
 		messages.push(makeAssistantMessage({ content: [{ type: "text", text: "new response" }] }));
 
-		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction);
+		// Use the current user message reference so we find the new response, not the old one
+		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction, currentUserMessage);
 
 		// Should find success (the new response exists)
 		expect(disposition).toEqual({ status: "success", assistantText: true });
@@ -199,7 +202,8 @@ describe("Print mode with message compaction", () => {
 
 		messages.splice(0, 2);
 
-		messages.push(makeUserMessage("new prompt"));
+		const currentUserMessage = makeUserMessage("new prompt");
+		messages.push(currentUserMessage);
 		messages.push(
 			makeAssistantMessage({
 				stopReason: "error",
@@ -208,7 +212,7 @@ describe("Print mode with message compaction", () => {
 			}),
 		);
 
-		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction);
+		const disposition = resolvePrintTerminalDisposition(messages, true, indexBeforeCompaction, currentUserMessage);
 
 		expect(disposition).toEqual({
 			status: "failure",
@@ -243,9 +247,9 @@ describe("Print mode with message compaction", () => {
 		installImmediateStderrMock([]);
 		installImmediateStdoutMock(stdoutOutput);
 
-		await runPrintMode(session, { mode: "text" });
+		await runPrintMode(session, { mode: "text", initialMessage: "resume prompt" });
 
 		expect(stdoutOutput.join("")).toContain("resume response");
-		expect(process.exitCode).toBe(0);
+		expect(process.exitCode ?? 0).toBe(0);
 	});
 });
