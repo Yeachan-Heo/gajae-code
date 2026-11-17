@@ -114,6 +114,8 @@ interface Member {
 	retirement?: ResumeRetirementEvidence;
 	lease?: ExternalStopAdmissionLease;
 	runtimeBinding?: NativeRuntimeBinding;
+	/** Dispatch currently awaiting its completion; adoption re-bases it instead of fencing it. */
+	currentInvocation?: RuntimeInvocation;
 	publicationEpoch: number;
 	readonly runtimeWork: Set<Promise<unknown>>;
 	pendingCalls: number;
@@ -151,12 +153,24 @@ interface NativeRuntimeBinding {
 	readonly session: AgentSession;
 	readonly pending: () => PendingResumeOp;
 	readonly sameIdentity: () => boolean;
+	/**
+	 * Re-pin the observed view generation after this binding's own admitted dispatch
+	 * settled. A tree navigation or revision moves the leaf without adopting another
+	 * transcript, so refusing every later dispatch would strand the runtime. Identity
+	 * parts (manager, session id, identity generation, agent, settings, registry) are
+	 * rechecked here and by `sameIdentity`, so a real identity change still fails closed.
+	 */
+	readonly settle: () => void;
+	/** Adopt a durable selection this runtime's own admitted work committed. */
+	readonly adoptSelection: (pending: PendingResumeOp) => void;
 }
 interface RuntimeInvocation {
 	readonly member: Member;
 	readonly binding: NativeRuntimeBinding;
-	readonly op: PendingResumeOp;
-	readonly epoch: number;
+	/** Mutable: an admitted durable selection replaces the operation this dispatch reconciles. */
+	op: PendingResumeOp;
+	/** Mutable: adoption re-bases the epoch so the selecting dispatch stays current. */
+	epoch: number;
 	readonly family: NativeRuntimeFamily;
 	active: boolean;
 	owners: number;
@@ -199,7 +213,11 @@ function invocationCurrent(invocation: RuntimeInvocation): boolean {
 }
 
 /** Factory-only attachment, after the registry has published this exact runtime. */
-export function bindNativeRuntimeInvocation(handle: NativeLifecycleHandle, pending: () => PendingResumeOp): void {
+export function bindNativeRuntimeInvocation(
+	handle: NativeLifecycleHandle,
+	pending: () => PendingResumeOp,
+	adopt: (pending: PendingResumeOp) => void,
+): void {
 	const member = memberFor(handle);
 	const session = member.workSource?.result.session;
 	if (!session || member.context !== "runtime" || member.runtimeBinding)
@@ -211,6 +229,7 @@ export function bindNativeRuntimeInvocation(handle: NativeLifecycleHandle, pendi
 	const agent = session.agent;
 	const settings = session.settings;
 	const registry = session.modelRegistry;
+	let observedGeneration = generation;
 	member.runtimeBinding = {
 		session,
 		pending,
@@ -218,11 +237,31 @@ export function bindNativeRuntimeInvocation(handle: NativeLifecycleHandle, pendi
 			session.sessionManager === manager &&
 			session.sessionId === sessionId &&
 			manager.getSessionIdentityGeneration() === identity &&
-			session.sessionLifecycle.generation === generation &&
+			session.sessionLifecycle.generation === observedGeneration &&
 			!session.sessionLifecycle.disposed &&
 			session.agent === agent &&
 			session.settings === settings &&
 			session.modelRegistry === registry,
+		settle: () => {
+			// Only a transition committed inside this runtime's own admitted dispatch may
+			// re-pin the view; a transition attempted from outside stays fenced.
+			if (!member.currentInvocation) return;
+			// Only the view generation may move here. Anything that adopts another
+			// transcript keeps `sameIdentity` false, so this cannot launder a takeover.
+			if (session.sessionManager !== manager || session.sessionId !== sessionId) return;
+			if (manager.getSessionIdentityGeneration() !== identity) return;
+			if (session.sessionLifecycle.disposed || session.agent !== agent) return;
+			if (session.settings !== settings || session.modelRegistry !== registry) return;
+			observedGeneration = session.sessionLifecycle.generation;
+		},
+		adoptSelection: selected => {
+			adopt(selected);
+			const current = member.currentInvocation;
+			if (!current || current.binding !== member.runtimeBinding) return;
+			// The selecting dispatch stays current; every other in-flight dispatch is fenced.
+			current.op = selected;
+			current.epoch = ++member.publicationEpoch;
+		},
 	};
 	member.publicationEpoch++;
 }
@@ -354,6 +393,13 @@ export async function invokeNativeRuntime<T>(
 		effectsStarted: false,
 	};
 	let reconciliation: ReconcileResult | undefined;
+	let deferredAdmission: ReconcileResult | undefined;
+	// The session family owns its own publication (revision, navigation, compaction,
+	// branch), so it must not execute while this admission still holds the publication
+	// freeze: its own quiesce would collide. Admission runs first, the freeze thaws, and
+	// only then does the work execute under the same invocation checkpoint.
+	const deferred = family === "session";
+	member.currentInvocation = invocation;
 	const admit = (mode: "verify" | "repairDurability") =>
 		serialized(member, async () => {
 			const op = binding.pending();
@@ -370,6 +416,11 @@ export async function invokeNativeRuntime<T>(
 					reconciliation = result;
 					if (!invocationCurrent(invocation) || binding.session.sessionLifecycle.transitioning)
 						throw new NativeRuntimeRefusal("context_mismatch", result);
+					if (deferred) {
+						deferredAdmission = result;
+						// Deferred work runs once this admission released its publication freeze.
+						return { completion: Promise.resolve<T>(undefined as unknown as T) };
+					}
 					const checkpoint: RuntimeCheckpoint = { invocation, reconciliation: result, active: true };
 					return runtimeInvocation.run(invocation, () =>
 						runtimeCheckpoint.run(checkpoint, () => {
@@ -388,18 +439,67 @@ export async function invokeNativeRuntime<T>(
 		});
 	try {
 		let admitted = await admit("verify");
-		if (admitted.kind === "refused" && ownPublishedSuffixNeedsRepair(admitted)) admitted = await admit("repairDurability");
+		if (admitted.kind === "refused" && ownPublishedSuffixNeedsRepair(admitted))
+			admitted = await admit("repairDurability");
 		reconciliation = admitted.reconciliation;
 		if (admitted.kind === "refused") return admitted;
-		return { kind: "applied", value: await admitted.completion, reconciliation: admitted.reconciliation };
+		try {
+			if (deferred) {
+				const admission = deferredAdmission ?? admitted.reconciliation;
+				if (!invocationCurrent(invocation)) throw new NativeRuntimeRefusal("context_mismatch", admission);
+				const checkpoint: RuntimeCheckpoint = { invocation, reconciliation: admission, active: true };
+				const completion = runtimeInvocation.run(invocation, () =>
+					runtimeCheckpoint.run(checkpoint, () => {
+						try {
+							const work: Promise<T> = Promise.resolve(start()) as Promise<T>;
+							retainNativeRuntimeWork(binding.session, work);
+							return work;
+						} finally {
+							checkpoint.active = false;
+						}
+					}),
+				);
+				return { kind: "applied", value: (await completion) as T, reconciliation: admission };
+			}
+			return { kind: "applied", value: await admitted.completion, reconciliation: admitted.reconciliation };
+		} finally {
+			// This dispatch's own admitted work may have moved the view; keep the
+			// binding pinned to the generation it actually reached.
+			binding.settle();
+		}
 	} catch (error) {
 		if (!(error instanceof NativeRuntimeRefusal) || invocation.effectsStarted) throw error;
 		const actual = error.reconciliation ?? reconciliation;
 		if (!actual) throw error;
 		return { kind: "refused", reason: error.reason, reconciliation: actual };
 	} finally {
+		if (member.currentInvocation === invocation) member.currentInvocation = undefined;
 		if (--invocation.owners === 0) invocation.active = false;
 	}
+}
+
+/**
+ * The session committed a view transition (tree navigation, revision, compaction).
+ * A native runtime keeps its binding only when the transition ran inside its own
+ * admitted dispatch and left the transcript identity untouched.
+ */
+export function noteNativeRuntimeViewTransition(session: AgentSession): void {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context !== "runtime") return;
+	member.runtimeBinding?.settle();
+}
+
+/**
+ * A durable execution selection committed inside an admitted native dispatch registers
+ * a new resume operation in the manager. Point this runtime at it, otherwise every later
+ * dispatch keeps reconciling the superseded cursor and reports an unknown suffix.
+ */
+export function adoptNativeRuntimeSelection(session: AgentSession, pending: PendingResumeOp): void {
+	const member = managers.get(session.sessionManager);
+	if (!member || member.context !== "runtime") return;
+	const binding = member.runtimeBinding;
+	if (!binding || binding.session !== session) return;
+	binding.adoptSelection(pending);
 }
 
 /** Selection and its owner-current-op update share the same registry admission queue. */

@@ -480,7 +480,14 @@ async function constructNativeRuntime(
 		owner.last = handoff;
 		if (handoff.receipt.routing.action !== "PROCEED") throw new Error("native_runtime_handoff_not_ready");
 		const handle = owner.coordinator.publishRuntime();
-		bindNativeRuntimeInvocation(handle, () => owner.pending);
+		bindNativeRuntimeInvocation(
+			handle,
+			() => owner.pending,
+			adopted => {
+				owner.operations.add(adopted);
+				owner.pending = adopted;
+			},
+		);
 		const runtime = createNativeEmbeddedRuntime(handle, result);
 		return {
 			kind: "opened",
@@ -632,6 +639,14 @@ export async function selectEmbeddedExecutionBranch(
 		owner.pending = pending;
 		return pending;
 	});
+}
+/**
+ * The operation this runtime currently reconciles. Durable selections committed by
+ * admitted work replace it, so a host that holds the original `op` from `opened`
+ * must re-read it before reconciling or disconnecting.
+ */
+export function currentEmbeddedResumeOperation(handle: NativeLifecycleHandle): PendingResumeOp {
+	return ownerFor(handle).pending;
 }
 export function recordEmbeddedResumeCheckpoint(
 	handle: NativeLifecycleHandle,

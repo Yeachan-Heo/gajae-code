@@ -84,6 +84,7 @@ export {
 	attestEmbeddedLegacyTakeover,
 	consentEmbeddedDisconnect,
 	createNativeEmbeddedAgentSession,
+	currentEmbeddedResumeOperation,
 	type EmbeddedResumeResolution,
 	type NativeEmbeddedAgentSessionOptions,
 	type NativeEmbeddedOpenResult,

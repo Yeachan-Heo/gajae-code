@@ -150,10 +150,12 @@ import {
 } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import {
+	adoptNativeRuntimeSelection,
 	assertNativeDisposalAuthorized,
 	assertNativeRuntimeEffect,
 	assertNativeRuntimeInvocation,
 	NativeRuntimeRefusal,
+	noteNativeRuntimeViewTransition,
 	retainNativeRuntimeWork,
 	withNativeRuntimeEffect,
 } from "../sdk/native-lifecycle";
@@ -5429,6 +5431,7 @@ export class AgentSession {
 		if (!this.#sessionTransitionCommitted) {
 			this.#sessionTransitionCommitted = true;
 			this.#sessionTransitionGeneration += 1;
+			noteNativeRuntimeViewTransition(this);
 			this.#discoveredToolActivationChain = Promise.resolve();
 			if (this.#sessionTransitionKind !== "mcp-control") this.#btwGeneration += 1;
 		}
@@ -32465,7 +32468,8 @@ export class AgentSession {
 			// However, enforce the concurrency Retry-After deadline before allowing
 			// same-selector rotation/retry: if a deadline exists for this selector,
 			// advance instead of retrying before the deadline.
-			const deadlineMs = failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			const deadlineMs =
+				failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
 			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
 				// Deadline not yet reached; advance instead of retrying
 				outcome = controller.advance() ? "advance" : "exhausted";
@@ -35938,6 +35942,9 @@ export class AgentSession {
 		const identity = manager.getSessionIdentityGeneration();
 		const priorRevisions = manager.revisionSnapshot();
 		const pending = await manager.selectExecutionBranch(targetLeafId, { op, beforeCommit });
+		// A native runtime owns this transcript: adopt the cursor it just committed so its
+		// next dispatch reconciles the selection instead of the superseded operation.
+		adoptNativeRuntimeSelection(this, pending);
 		const restoreOwnPresentation = (): void => {
 			const current = manager.revisionSnapshot();
 			if (
