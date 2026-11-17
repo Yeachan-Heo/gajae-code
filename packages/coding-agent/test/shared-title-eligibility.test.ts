@@ -1280,8 +1280,11 @@ describe("shared publication admission split", () => {
 		expect(enteredCommands).toBeUndefined();
 
 		gate.resolve();
-		await Bun.sleep(100);
-		await successor;
+		// A rejected successor otherwise surfaces only as a call-count miss, which hides
+		// the real cause (a preflight throw) behind an opaque assertion failure. The drain
+		// ordering claim below is meaningless if the run never reached submission.
+		const successorOutcome = await successor;
+		if (successorOutcome instanceof Error) throw successorOutcome;
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		// The successor invocation must not start while its result is still queued.
 		expect(enteredCommands).toEqual(["echo first-batch", "echo second-batch"]);
