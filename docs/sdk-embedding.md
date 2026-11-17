@@ -291,6 +291,18 @@ mutation receipt; permission alone is not a completed retirement. `close_unknown
 is terminal and read-only, including when a rewrite was pending. A retryable close
 is retried only under the existing authorized termination intent.
 
+`observeEmbeddedTranscript({ file, cwd, sessionId })` reads a strict,
+descriptor-revalidated snapshot without constructing a session or acquiring an
+owner. Its `observed` result includes the exact storage identity, checkpoint,
+resolved persisted messages and a total ordered `messageObservations` sequence.
+A moved or changed capture refuses rather than returning best-effort history.
+Legacy or ambiguous checkpoints report `selectionRequired` and do not guess a
+branch. Resident-backed messages that cannot be hydrated from this disk-only
+capture remain explicit `unresolved` entries with an `unresolvedCount`; consumers
+must not present the resolved subset as complete history. This observation says
+nothing about a running owner's state or permission to write. Opening still
+requires independent native admission and all ownership vetoes.
+
 `listEmbeddedProjectSessions` preserves display arrays and separately reports
 strict complete/incomplete inventory. `forkEmbeddedSession` copies captured history
 to independent destination membership and durably pins the selected execution

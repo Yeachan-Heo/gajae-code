@@ -102,7 +102,6 @@ export {
 	selectEmbeddedExecutionBranch,
 	terminateEmbeddedAgentSession,
 } from "./native-embedding";
-export { NativeRuntimeRefusal } from "./native-lifecycle";
 export type {
 	NativeDisconnectConsent,
 	NativeDisconnectPreparation,
@@ -111,6 +110,7 @@ export type {
 	NativeReconcileMode,
 	NativeTerminationConsent,
 } from "./native-lifecycle";
+export { NativeRuntimeRefusal } from "./native-lifecycle";
 export * from "./notification-setup";
 export * from "./notification-setup-contract";
 export * from "./operator-controls";
@@ -127,5 +127,6 @@ export * from "./session";
 export * from "./session-directory";
 export * from "./settings-catalog";
 export * from "./side-conversation";
+export * from "./transcript-observation";
 export * from "./turn-result";
 export * from "./workflow-gates";
