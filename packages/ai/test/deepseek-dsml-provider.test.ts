@@ -144,6 +144,15 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).toBe("");
 	});
 
+	it("does not expose an executable call for a parameter close with no parameter open", async () => {
+		const result = await response([
+			{
+				content: `${wrapperStart}<｜DSML｜invoke name="read"></｜DSML｜parameter></｜DSML｜invoke>${wrapperEnd}`,
+			},
+		]);
+		expect(tools(result).filter(call => !call.incompleteArguments)).toHaveLength(0);
+	});
+
 	it("does not expose an executable call when invoke closes with its parameter still open", async () => {
 		const result = await response([
 			{ content: `Before${wrapperStart}${invocationStart}src/` },

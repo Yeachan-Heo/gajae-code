@@ -574,6 +574,8 @@ export class DsmlToolCallHealer {
 			// parameter. Its invoke attributes describe that first parameter too.
 			this.#addArgument(this.#pendingName, this.#pendingValue, this.#pendingInvokeString);
 		} else {
+			// A close with no open parameter is malformed regardless of payload.
+			this.#incomplete = true;
 			this.#rejectUnassignedText();
 		}
 		this.#inParameter = false;

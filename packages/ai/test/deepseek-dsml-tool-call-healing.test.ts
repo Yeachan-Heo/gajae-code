@@ -71,6 +71,18 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(calls.map(call => call.incomplete)).toEqual([true, true]);
 	});
 
+	it("marks an invocation incomplete on a parameter close with no parameter open", () => {
+		for (const body of ["", "text"]) {
+			const healer = new DsmlToolCallHealer();
+			healer.feed(
+				`<｜DSML｜tool_calls><｜DSML｜invoke name="bash">${body}</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`,
+			);
+			const calls = healer.drainCompleted();
+			expect(calls).toHaveLength(1);
+			expect(calls[0].incomplete).toBe(true);
+		}
+	});
+
 	it("keeps an empty invocation and whitespace between parameters complete", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
