@@ -11276,17 +11276,27 @@ export class AgentSession {
 							attemptedId,
 							error: error instanceof Error ? error.message : String(error),
 						});
-						this.emitNotice(
-							"warning",
-							attemptedId
-								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped because the reminder may already be in the session transcript.`
-								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped because the reminder may already be in the session transcript.",
-							"ttsr",
-						);
 						this.#ttsrAbortPending = false;
 						releaseCarriedTtsr();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
+						// An unknown append may already be in the transcript, but it does not
+						// prove the model received the reminder. Do not persist consumption or
+						// let a later prompt bypass it through another match path or repeat gap.
+						// Close this live session instead; attempted-entry reconciliation on reopen is separate.
+						void this.dispose().catch(() => {
+							logger.warn("Uncertain TTSR reminder teardown failed", {
+								code: "ttsr_uncertain_publication_teardown_failed",
+								attemptedId,
+							});
+						});
+						this.emitNotice(
+							"warning",
+							attemptedId
+								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped and the session was closed because the reminder may already be in the session transcript.`
+								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
+							"ttsr",
+						);
 						return;
 					}
 					logger.warn("TTSR injection message could not be persisted", {
