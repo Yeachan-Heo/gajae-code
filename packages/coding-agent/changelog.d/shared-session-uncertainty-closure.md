@@ -1,0 +1,8 @@
+### Fixed
+
+- A shared session now closes after any shared publication whose outcome is unknown: canonical messages, custom messages, compaction, controls, titles, stars, and background exchanges. The next prompt or control refuses with a distinct `shared_session_closed` error. That error carries the exact receipt of the uncertain write and tells you to reopen with `gjc --resume <id>`. The session no longer reports `busy` or runs against a diverged history. Unknown multi-entry appends reconcile as complete or partial batches by id.
+- An admitted root interactive session refuses every legacy write once its transcript is published, including before its first shared publication. This covers resumed transcripts, `/resume`, and sessions after a title or control publication. Bootstrap writes now go through the shared lease: the resumed MCP selection prune, header-only explicit tool selections, and the CLI `--model`/`--thinking` startup override.
+- An SDK or print-mode opener whose write was fenced by another process refuses every later prompt and control with `ManagedAppendIdentityMismatchError` before the model runs.
+- MCP tool refreshes in a shared session publish the new selection before installing it. A blocked, rejected, or unknown publication leaves the previous tools live.
+- `branch()` on a shared session refuses a path-only branch before `session_before_branch` hooks, steering snapshots, or teardown run.
+- `setConfiguredModelChain` and `commitPreparedProfileModelSelection` refuse on a shared session before any live effect. Before this fix, the profile commit changed the live model and then had its legacy append refused.
