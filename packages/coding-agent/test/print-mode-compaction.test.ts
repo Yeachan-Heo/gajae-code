@@ -297,4 +297,61 @@ describe("Print mode with message compaction", () => {
 		// Should NOT contain the previous response
 		expect(stdoutOutput.join("")).not.toContain("previous response");
 	});
+
+	it("skips historical error when consumed command flag is set", () => {
+		// Regression: a resumed session ending in an assistant error should not report
+		// that error as a failure when resolvePrintTerminalDisposition is called with
+		// consumedLocalCommandWithoutPrompt = true (indicating only a consumed local command ran).
+		const messages: Message[] = [
+			makeUserMessage("previous turn"),
+			makeAssistantMessage({
+				stopReason: "error",
+				errorMessage: "Context overflow",
+				content: [],
+			}),
+		];
+
+		// When submittedPrompt is false and consumedLocalCommandWithoutPrompt is true,
+		// the function should skip historical error resolution
+		const disposition = resolvePrintTerminalDisposition(
+			messages,
+			false, // submittedPrompt - no prompt was submitted
+			undefined,
+			undefined,
+			true, // consumedLocalCommandWithoutPrompt - only a consumed command ran
+		);
+
+		// A consumed command should report success (undefined), not failure
+		expect(disposition).toBeUndefined();
+	});
+
+	it("reports historical error when no consumed command flag", () => {
+		// When submittedPrompt is false and consumedLocalCommandWithoutPrompt is false,
+		// the function should report historical errors (for resumed sessions with no new input)
+		const messages: Message[] = [
+			makeUserMessage("previous turn"),
+			makeAssistantMessage({
+				stopReason: "error",
+				errorMessage: "Context overflow",
+				content: [],
+			}),
+		];
+
+		const disposition = resolvePrintTerminalDisposition(
+			messages,
+			false, // submittedPrompt
+			undefined,
+			undefined,
+			false, // consumedLocalCommandWithoutPrompt is false
+		);
+
+		// Should report failure for the historical error
+		expect(disposition).toBeDefined();
+		if (disposition) {
+			expect(disposition.status).toBe("failure");
+			if (disposition.status === "failure") {
+				expect(disposition.error.code).toBe("assistant_error");
+			}
+		}
+	});
 });

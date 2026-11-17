@@ -77,6 +77,8 @@ function assistantText(message: AssistantMessage): string {
  * @param turnStartIndex Index of the first message in this turn (before prompt). May be stale after compaction.
  * @param turnStartUserMessage The user message that was submitted in this turn. If provided and found in the
  *   current messages, it's used to find assistant messages that come after it, making lookup robust to compaction.
+ * @param consumedLocalCommandWithoutPrompt Whether a local command was consumed without submitting a prompt.
+ *   When true, skips historical error resolution since the consumed command is a separate interaction.
  * @returns The terminal disposition, or undefined if no prompt was submitted or a silent abort occurred
  */
 export function resolvePrintTerminalDisposition(
@@ -84,11 +86,18 @@ export function resolvePrintTerminalDisposition(
 	submittedPrompt: boolean,
 	turnStartIndex?: number,
 	turnStartUserMessage?: AgentMessage,
+	consumedLocalCommandWithoutPrompt?: boolean,
 ): PrintTerminalDisposition | undefined {
 	// When no prompt was submitted, check only the final assistant message for errors.
 	// This handles resumed sessions with no new input, where we still need to report
 	// any terminal errors from the restored transcript.
+	// However, if a local command was consumed without a prompt, skip this check since
+	// the consumed command is a separate interaction and should not inherit errors from prior turns.
 	if (!submittedPrompt) {
+		if (consumedLocalCommandWithoutPrompt) {
+			// A consumed local command succeeded; don't report historical errors
+			return undefined;
+		}
 		const lastAssistant = messages.findLast((message): message is AssistantMessage => message.role === "assistant");
 		if (
 			(lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") &&
@@ -343,9 +352,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 						(event.message.stopReason === "error" || event.message.stopReason === "aborted"))
 				) {
 					jsonFailureObserved = true;
-					// Set failure status unconditionally when errors occur in JSON mode.
-					// Only suppress the duplicate JSON event emission in terminal resolution.
-					if (!options.suppressProcessExit) process.exitCode = 1;
+					// Track failure events for duplicate-event suppression in terminal resolution.
+					// Do NOT set exit code here; it must be set only from the final terminal disposition
+					// so that retryable errors that are later recovered don't leave a failed exit code.
 				}
 				stdout.write(`${JSON.stringify(event)}\n`);
 			});
@@ -433,11 +442,16 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			submittedPrompt,
 			lastPromptMessageStart,
 			lastPromptUserMessage,
+			!submittedPrompt && consumedCommand,
 		);
 		if (terminal?.status === "failure") {
-			if (mode === "json" && !jsonFailureObserved) {
+			if (mode === "json") {
+				if (!jsonFailureObserved) {
+					stdout.write(`${JSON.stringify({ type: "agent_failed", error: terminal.error })}\n`);
+				}
+				// Set failure exit code after terminal resolution, ensuring retried errors that are later
+				// recovered (success) don't leave a failed exit status from earlier attempts.
 				if (!options.suppressProcessExit) process.exitCode = 1;
-				stdout.write(`${JSON.stringify({ type: "agent_failed", error: terminal.error })}\n`);
 			} else if (mode === "text") {
 				// Handle terminal failure diagnostics and exit codes
 				if (terminal.error.code === EMPTY_TURN_ERROR.code) {
