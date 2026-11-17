@@ -636,6 +636,27 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
+	it("removes a private-key block split across adjacent tool-result blocks", () => {
+		const body = "ADJACENT_TOOL_RESULT_BODY";
+		const dumped = dump([
+			{
+				role: "toolResult",
+				toolName: "mcp_fetch",
+				toolCallId: "call-tool-result-split",
+				content: [
+					{ type: "text", text: "-----BEGIN RSA " },
+					{ type: "text", text: `PRIVATE KEY-----\n${body}\n${pem("RSA", "END")}` },
+					{ type: "text", text: "ordinary after" },
+				],
+				isError: false,
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).toContain("ordinary after");
+	});
+
 	it("pairs a private-key block split across sibling schema definitions", () => {
 		const body = "CROSS_PROPERTY_PEM_BODY";
 		const dumped = formatSessionDumpText({

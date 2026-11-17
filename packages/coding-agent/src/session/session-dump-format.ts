@@ -59,7 +59,10 @@ function stripTypeBoxFields(obj: unknown): unknown {
 
 function takeRedactedTextRun(parts: string[]): string | undefined {
 	if (parts.length === 0) return undefined;
-	const redacted = redactCrashSecrets(parts.join("\n"));
+	// Blocks are rendered with a newline between them, which would split a banner that straddles
+	// two blocks, so they are paired while still adjacent and only then joined for display.
+	const paired = redactCrossFieldPrivateKeys(parts) as string[];
+	const redacted = redactCrashSecrets(paired.join("\n"));
 	parts.length = 0;
 	return redacted;
 }
