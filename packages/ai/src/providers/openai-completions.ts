@@ -665,6 +665,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				);
 				if (replacementPayload !== undefined) {
 					params = replacementPayload as typeof params;
+					// Update effectiveToolChoice from the final params after onPayload replacement
+					effectiveToolChoice = (params as Record<string, unknown>).tool_choice as unknown;
 				}
 				// Capture the service tier for use in cost calculations
 				effectiveServiceTier = (params as Record<string, unknown>).service_tier as ServiceTier | undefined;
@@ -1062,7 +1064,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
 			const dsmlHealer =
 				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens
-					? new DsmlToolCallHealer(`dsml_${randomUUID().slice(0, 8)}`)
+					? new DsmlToolCallHealer(`dsml_${randomUUID().replace(/-/g, "").slice(0, 24)}`)
 					: undefined;
 			// Structured calls can follow leaked markup, so reconcile recovered calls
 			// only after the entire response has arrived.

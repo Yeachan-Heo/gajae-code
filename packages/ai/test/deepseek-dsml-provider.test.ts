@@ -250,4 +250,106 @@ describe("DeepSeek DSML provider streaming", () => {
 			global.fetch = originalFetchInner;
 		}
 	});
+
+	it("respects tool_choice replacement from onPayload hook", async () => {
+		const deltas: Delta[] = [
+			{ content: `${wrapperStart}${invocationStart}src/index.ts${invocationEnd}${wrapperEnd}` },
+		];
+		const events = [...deltas, {}].map((delta, index) => ({
+			id: "chatcmpl-dsml",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: model.id,
+			choices: [{ index: 0, delta, finish_reason: index === deltas.length ? "stop" : null }],
+		}));
+		const payload = `${events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")}		data: [DONE]\n\n`;
+		const originalFetchInner = global.fetch;
+		global.fetch = Object.assign(
+			async () => new Response(payload, { headers: { "content-type": "text/event-stream" } }),
+			{ preconnect: originalFetchInner.preconnect },
+		);
+		try {
+			const result = await streamOpenAICompletions(
+				model,
+				{
+					messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }],
+					tools: [
+						{
+							name: "read",
+							description: "Read a file",
+							parameters: { type: "object" as const, properties: {} },
+						},
+					],
+				},
+				{
+					apiKey: "test",
+					// Initial toolChoice is 'auto' (not constrained), but onPayload replaces it with 'none'
+					onPayload: payload => {
+						const params = payload as Record<string, unknown>;
+						return { ...params, tool_choice: "none" };
+					},
+				},
+			).result();
+			expect(result.stopReason).not.toBe("error");
+			// The final tool_choice from onPayload is 'none', so recovered calls should not be admitted
+			expect(tools(result)).toHaveLength(0);
+		} finally {
+			global.fetch = originalFetchInner;
+		}
+	});
+
+	it("respects tool_choice replacement to a different named tool from onPayload", async () => {
+		const deltas: Delta[] = [
+			{ content: `${wrapperStart}${invocationStart}src/index.ts${invocationEnd}${wrapperEnd}` },
+		];
+		const events = [...deltas, {}].map((delta, index) => ({
+			id: "chatcmpl-dsml",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: model.id,
+			choices: [{ index: 0, delta, finish_reason: index === deltas.length ? "stop" : null }],
+		}));
+		const payload = `${events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")}		data: [DONE]\n\n`;
+		const originalFetchInner = global.fetch;
+		global.fetch = Object.assign(
+			async () => new Response(payload, { headers: { "content-type": "text/event-stream" } }),
+			{ preconnect: originalFetchInner.preconnect },
+		);
+		try {
+			const result = await streamOpenAICompletions(
+				model,
+				{
+					messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }],
+					tools: [
+						{
+							name: "read",
+							description: "Read a file",
+							parameters: { type: "object" as const, properties: {} },
+						},
+						{
+							name: "write",
+							description: "Write a file",
+							parameters: { type: "object" as const, properties: {} },
+						},
+					],
+				},
+				{
+					apiKey: "test",
+					// onPayload changes tool_choice to request only 'write' tool
+					onPayload: payload => {
+						const params = payload as Record<string, unknown>;
+						return {
+							...params,
+							tool_choice: { type: "function", function: { name: "write" } },
+						};
+					},
+				},
+			).result();
+			expect(result.stopReason).not.toBe("error");
+			// The final tool_choice from onPayload only admits 'write', so the recovered 'read' call should not be admitted
+			expect(tools(result)).toHaveLength(0);
+		} finally {
+			global.fetch = originalFetchInner;
+		}
+	});
 });
