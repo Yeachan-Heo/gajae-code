@@ -384,8 +384,13 @@ describe("createAgentSession root registry", () => {
 			expect(foundText).toContain("review.txt");
 			const files = (found.details as { files?: string[] } | undefined)?.files ?? [];
 			const resolvedFiles = files.map(file => (path.isAbsolute(file) ? file : path.resolve(cwd, file)));
-			expect(resolvedFiles.some(file => file.includes(path.basename(paths.agentDir)))).toBe(true);
-			expect(foundText).not.toContain("process-root-sentinel");
+			// Compare the exact memory root, not a basename substring: "agent" also
+			// appears in the process fallback dir name "process-agent".
+			expect(resolvedFiles.map(file => path.resolve(file))).toContain(
+				path.join(memoryRootFor(agentDir, cwd), "review.txt"),
+			);
+			const processRoot = path.resolve(memoryRootFor(getAgentDir(), cwd)) + path.sep;
+			expect(resolvedFiles.some(file => path.resolve(file).startsWith(processRoot))).toBe(false);
 		} finally {
 			await opened.session.dispose();
 			setAgentDir(previousAgentDir);
