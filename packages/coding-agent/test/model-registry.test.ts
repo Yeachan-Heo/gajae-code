@@ -11610,6 +11610,163 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+
+		test("refreshes OAuth token within 60-second skew window", async () => {
+			// Regression: the original refresh logic only checked `Date.now() >= expires`,
+			// missing tokens in AuthStorage's 60-second skew window (Date.now() + 60_000 >= expires).
+			// Built-in discovery captures the key once and uses it directly without re-resolving,
+			// so it needs to trigger refresh for near-expiry tokens too.
+			const credentialSessionId = "skew-window-test";
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "near-expiry-access",
+					refresh: "near-expiry-refresh-token",
+					// Token expires in 30 seconds (within the 60-second skew)
+					expires: Date.now() + 30 * 1000,
+					email: "account@example.com",
+				},
+			]);
+
+			let refreshCalled = false;
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				// Simulate OAuth token refresh
+				refreshCalled = true;
+				await authStorage.set("google-antigravity", [
+					{
+						type: "oauth",
+						access: "refreshed-access",
+						refresh: "refreshed-refresh-token",
+						// New token is fresh
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "account@example.com",
+					},
+				]);
+				return "refreshed-access";
+			});
+
+			let discoveryFetches = 0;
+			using _hook = hookFetch((input, _init) => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					return new Response(JSON.stringify({ models: { "near-expiry-discovered": { displayName: "Model" } } }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("google-antigravity", "online", credentialSessionId);
+
+				// Verify that getApiKey was called (meaning OAuth refresh was attempted)
+				// Before the fix, this would be false because the token is not yet expired.
+				expect(refreshCalled).toBe(true);
+
+				// Verify that discovery proceeded with the refreshed token
+				// Before the fix, discoveryFetches would be 0 because refresh wouldn't be triggered.
+				expect(discoveryFetches).toBe(1);
+
+				// Verify that the discovered model is in the registry
+				const model = registry.find("google-antigravity", "near-expiry-discovered");
+				expect(model).toBeDefined();
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
+
+		test("discards discovered models when selected credential row changes during refresh", async () => {
+			// Regression: the original credential identity comparison uses only optional fields (email, accountId, etc.),
+			// which don't uniquely identify a credential row. For example, Kiro Builder ID credentials can lack
+			// all compared fields. The fix compares the actual selected credential row ID before and after refresh.
+			const credentialSessionId = "row-id-test";
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "account-a-expired-access",
+					refresh: "account-a-refresh-token",
+					// Token is expired
+					expires: Date.now() - 1000,
+				},
+				{
+					type: "oauth",
+					access: "account-b-fresh-access",
+					refresh: "account-b-refresh-token",
+					// Token is fresh
+					expires: Date.now() + 60 * 60 * 1000,
+				},
+			]);
+
+			// Get the credential row IDs
+			const credentials = authStorage.exportSnapshot().credentials.filter(e => e.provider === "google-antigravity");
+			const firstCredentialId = credentials[0]!.id;
+			const secondCredentialId = credentials[1]!.id;
+
+			// Pin to the first credential
+			authStorage.setSessionCredentialSelector(credentialSessionId, "google-antigravity", {
+				kind: "id",
+				value: String(firstCredentialId),
+			});
+
+			let discoveryFetches = 0;
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				// Simulate OAuth token refresh for the first credential
+				await authStorage.set("google-antigravity", [
+					{
+						type: "oauth",
+						access: "account-a-refreshed-access",
+						refresh: "account-a-refresh-token",
+						expires: Date.now() + 60 * 60 * 1000,
+					},
+					{
+						type: "oauth",
+						access: "account-b-fresh-access",
+						refresh: "account-b-refresh-token",
+						expires: Date.now() + 60 * 60 * 1000,
+					},
+				]);
+				// Switch to the second credential during the refresh
+				authStorage.setSessionCredentialSelector(credentialSessionId, "google-antigravity", {
+					kind: "id",
+					value: String(secondCredentialId),
+				});
+				return "account-a-refreshed-access";
+			});
+
+			using _hook = hookFetch((input, _init) => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					return new Response(JSON.stringify({ models: { "near-expiry-discovered": { displayName: "Model" } } }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("google-antigravity", "online", credentialSessionId);
+
+				// Verify that getApiKey was called (meaning OAuth refresh was attempted)
+				expect(getApiKeySpy).toHaveBeenCalled();
+
+				// Verify that the discovery endpoint was NOT called
+				// because the credential row changed during refresh should cause discovery to be discarded.
+				// Before the fix, discoveryFetches would be 1 because comparing optional fields wouldn't detect the row change.
+				expect(discoveryFetches).toBe(0);
+
+				// Verify that the discovered model from account A is NOT in the registry
+				const model = registry.find("google-antigravity", "account-a-discovered");
+				expect(model).toBeUndefined();
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
 	});
 });
 

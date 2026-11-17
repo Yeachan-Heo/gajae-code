@@ -5449,20 +5449,20 @@ export class ModelRegistry {
 					this.#authStorageConfigOwner,
 				);
 				// Record pre-refresh state to detect unrelated concurrent credential changes.
-				// Capture both the credential type and OAuth credential identity to detect if a different
-				// account was selected during the refresh window.
+				// Capture the credential type and selected credential row ID to detect if a different
+				// credential was selected during the refresh window.
 				const preRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
 					descriptor.providerId,
 					credentialSessionId,
 					{ owner: this.#authStorageConfigOwner },
 				);
-				// Capture the full OAuth credential identity to detect if a different OAuth account is selected during refresh.
-				// This catches the case where account A's refresh is awaiting network I/O while user switches to account B (also OAuth).
-				// We must use the full credential identity (email, accountId, organizationId) because some providers
-				// (Google, Kiro) may omit accountId, making a comparison on accountId alone insufficient.
-				const preRefreshOAuthCredential =
+				// Capture the selected OAuth credential row ID to detect if a different credential is selected during refresh.
+				// This is a stable identity that uniquely identifies the selected credential row, unlike optional fields
+				// (email, accountId, projectId, profileArn, organizationId) that don't uniquely identify a row.
+				// For example, Kiro Builder ID credentials can lack all these fields, making field-based comparison insufficient.
+				const preRefreshOAuthCredentialRowId =
 					preRefreshCredentialType === "oauth"
-						? this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
+						? this.authStorage.getSelectedOAuthCredentialRowId(descriptor.providerId, credentialSessionId, {
 								owner: this.#authStorageConfigOwner,
 							})
 						: undefined;
@@ -5474,9 +5474,11 @@ export class ModelRegistry {
 					const oauthCred = this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
 						owner: this.#authStorageConfigOwner,
 					});
-					// Only refresh if token is already expired; AuthStorage will refresh
-					// tokens within the skew window on the subsequent getApiKey calls.
-					if (oauthCred && Date.now() >= oauthCred.expires) {
+					// Refresh if token is already expired or within AuthStorage's 60-second skew window.
+					// AuthStorage refreshes at Date.now() + 60_000 >= expires, but built-in discovery captures
+					// the key once and uses it directly without re-resolving, so it must trigger refresh
+					// for near-expiry tokens too.
+					if (oauthCred && Date.now() + 60_000 >= oauthCred.expires) {
 						refreshOAuth = true;
 						logger.debug("built-in model discovery: OAuth token expired, triggering refresh", {
 							provider: descriptor.providerId,
@@ -5498,33 +5500,24 @@ export class ModelRegistry {
 				// Always verify that the OAuth account didn't change during refresh, even if generation didn't bump.
 				// Session-scoped selector changes don't necessarily bump generation, but indicate a concurrent
 				// unrelated credential change that should cause discovery to be discarded.
-				if (refreshOAuth && preRefreshCredentialType === "oauth" && preRefreshOAuthCredential) {
+				if (refreshOAuth && preRefreshCredentialType === "oauth" && preRefreshOAuthCredentialRowId !== undefined) {
 					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
 						descriptor.providerId,
 						credentialSessionId,
 						{ owner: this.#authStorageConfigOwner },
 					);
-					const postRefreshOAuthCredential =
+					const postRefreshOAuthCredentialRowId =
 						postRefreshCredentialType === "oauth"
-							? this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
+							? this.authStorage.getSelectedOAuthCredentialRowId(descriptor.providerId, credentialSessionId, {
 									owner: this.#authStorageConfigOwner,
 								})
 							: undefined;
-					// Discard if the OAuth credential identity changed during refresh (indicates concurrent account switch).
-					// Compare all identity fields (email, accountId, projectId, profileArn, organizationId)
-					// since they are all optional and vary by provider. For example:
-					// - Google/Kiro may omit accountId
-					// - Google uses projectId
-					// - Kiro uses profileArn
-					// - Some credentials use organizationId
-					if (
-						!postRefreshOAuthCredential ||
-						preRefreshOAuthCredential.email !== postRefreshOAuthCredential.email ||
-						preRefreshOAuthCredential.accountId !== postRefreshOAuthCredential.accountId ||
-						preRefreshOAuthCredential.projectId !== postRefreshOAuthCredential.projectId ||
-						preRefreshOAuthCredential.profileArn !== postRefreshOAuthCredential.profileArn ||
-						preRefreshOAuthCredential.organizationId !== postRefreshOAuthCredential.organizationId
-					) {
+					// Discard if the selected OAuth credential row changed during refresh (indicates concurrent selection change).
+					// Comparing row IDs is more reliable than comparing optional identity fields (email, accountId, projectId,
+					// profileArn, organizationId) since those fields don't uniquely identify a credential row. For example,
+					// Kiro Builder ID credentials can lack all these fields, and credentials with identical field values
+					// but different rows are distinct selections that must be distinguished.
+					if (postRefreshOAuthCredentialRowId !== preRefreshOAuthCredentialRowId) {
 						return { apiKey: undefined, authGeneration: undefined };
 					}
 				}
