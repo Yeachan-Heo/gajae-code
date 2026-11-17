@@ -5049,6 +5049,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:assertAdditiveMutationAllowed",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal pre-effect admission for in-process additive writers that persist through the shared publication seams, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:appendLabelChangeInBackground",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

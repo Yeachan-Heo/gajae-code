@@ -417,6 +417,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal shared-session mode-change publication for plan/goal mode persistence, not a user-facing SDK control seam",
 	"agent_session:assertConfiguredModelChainWritable":
 		"internal fail-closed guard before profile/fallback-chain writes on adopted shared sessions, not a user-facing SDK control seam",
+	"agent_session:assertAdditiveMutationAllowed":
+		"internal pre-effect admission for in-process additive writers that persist through the shared publication seams, not a user-facing SDK control seam",
 	"agent_session:usesSharedControlPublication":
 		"internal shared-publication eligibility query for in-process control paths, not a user-facing SDK control seam",
 	"agent_session:withModelProfilePublication":
