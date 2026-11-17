@@ -85,7 +85,25 @@ export function resolvePrintTerminalDisposition(
 	turnStartIndex?: number,
 	turnStartUserMessage?: AgentMessage,
 ): PrintTerminalDisposition | undefined {
-	if (!submittedPrompt) return undefined;
+	// When no prompt was submitted, check only the final assistant message for errors.
+	// This handles resumed sessions with no new input, where we still need to report
+	// any terminal errors from the restored transcript.
+	if (!submittedPrompt) {
+		const lastAssistant = messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+		if (
+			(lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") &&
+			!isSilentAbort(lastAssistant.errorMessage)
+		) {
+			return {
+				status: "failure",
+				error: {
+					code: "assistant_error",
+					message: sanitizeText(lastAssistant.errorMessage || `Request ${lastAssistant.stopReason}`),
+				},
+			};
+		}
+		return undefined;
+	}
 
 	// Find assistant messages from this turn, handling compaction-induced index staleness.
 	// If turnStartUserMessage is provided, search for it in the current messages array
@@ -325,14 +343,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 						(event.message.stopReason === "error" || event.message.stopReason === "aborted"))
 				) {
 					jsonFailureObserved = true;
+					// Set failure status unconditionally when errors occur in JSON mode.
+					// Only suppress the duplicate JSON event emission in terminal resolution.
+					if (!options.suppressProcessExit) process.exitCode = 1;
 				}
 				stdout.write(`${JSON.stringify(event)}\n`);
 			});
 		}
 		const submitInput = async (text: string, images?: ImageContent[]): Promise<void> => {
-			// Reset the captured user message reference before this prompt to avoid carrying over
-			// stale references from previous iterations when a command is handled without adding messages.
-			lastPromptUserMessage = undefined;
 			if (text.startsWith("/")) {
 				const command = await executeLocalHeadlessBuiltinSlashCommand(text, {
 					session,
@@ -356,23 +374,37 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				}
 				if (command !== false) text = command.prompt;
 			}
+			// Reset the captured user message reference only before submitting an actual prompt,
+			// not before slash-command dispatch. This preserves the reference when a consumed
+			// command returns without adding messages, allowing proper terminal resolution of the
+			// prior turn even if compaction occurred.
+			lastPromptUserMessage = undefined;
 			submittedPrompt = true;
-			// Track the last message before prompt to detect if anything changed.
-			// If nothing was added (e.g., command handled without appending messages),
-			// the last message will be the same, and we won't capture a user message.
-			const lastMessageBefore = session.state.messages[session.state.messages.length - 1];
-			lastPromptMessageStart = session.state.messages.length;
+			// Track the boundary before this prompt to detect new messages and restrict the
+			// user-message capture to only messages added in this turn. Store the message itself
+			// (by reference) so we can find it after compaction.
+			const messageBefore = session.state.messages[session.state.messages.length - 1];
+			const messageCountBefore = session.state.messages.length;
+			lastPromptMessageStart = messageCountBefore;
 			await session.prompt(text, images ? { images } : undefined);
 			// Capture the user message that was just added, for compaction-robust turn tracking.
 			// Only capture if the last message changed (indicating messages were added/modified).
 			// This prevents capturing historical messages when no new user message is added.
 			const currentLastMessage = session.state.messages[session.state.messages.length - 1];
-			if (currentLastMessage !== lastMessageBefore) {
-				// Messages were added in this turn. Search backward for the user message that prompted
-				// the latest assistant response. Start from the end, since the newest messages are there.
-				// Compaction may shift indices, so we don't rely on lastPromptMessageStart; instead,
-				// we search through the entire array from the end, but only capture on the first match.
-				for (let i = session.state.messages.length - 1; i >= 0; i--) {
+			if (currentLastMessage !== messageBefore) {
+				// Messages were added in this turn. Find the boundary to restrict the search to new messages.
+				// First, try to find the previous last message by reference to identify the boundary,
+				// handling the case where compaction may have removed or shifted messages.
+				let boundaryIndex = -1;
+				if (messageBefore !== undefined) {
+					boundaryIndex = session.state.messages.lastIndexOf(messageBefore);
+				}
+
+				// Search backward for the user message from this turn, restricting to new messages.
+				// If the boundary message is found, search after it. If boundary was compacted away,
+				// search from the end (all messages are potentially new).
+				const searchStart = boundaryIndex >= 0 ? boundaryIndex : -1;
+				for (let i = session.state.messages.length - 1; i > searchStart; i--) {
 					if (session.state.messages[i]?.role === "user") {
 						// Verify this user message has a following assistant message in this turn
 						const hasFollowingAssistant = session.state.messages.some(
