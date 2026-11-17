@@ -330,6 +330,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			});
 		}
 		const submitInput = async (text: string, images?: ImageContent[]): Promise<void> => {
+			// Reset the captured user message reference before this prompt to avoid carrying over
+			// stale references from previous iterations when a command is handled without adding messages.
+			lastPromptUserMessage = undefined;
 			if (text.startsWith("/")) {
 				const command = await executeLocalHeadlessBuiltinSlashCommand(text, {
 					session,
@@ -365,7 +368,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			// This prevents capturing historical messages when no new user message is added.
 			const currentLastMessage = session.state.messages[session.state.messages.length - 1];
 			if (currentLastMessage !== lastMessageBefore) {
-				// Messages were added in this turn. Search backward for a user message with a following assistant.
+				// Messages were added in this turn. Search backward for the user message that prompted
+				// the latest assistant response. Start from the end, since the newest messages are there.
+				// Compaction may shift indices, so we don't rely on lastPromptMessageStart; instead,
+				// we search through the entire array from the end, but only capture on the first match.
 				for (let i = session.state.messages.length - 1; i >= 0; i--) {
 					if (session.state.messages[i]?.role === "user") {
 						// Verify this user message has a following assistant message in this turn
@@ -397,11 +403,34 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			lastPromptUserMessage,
 		);
 		if (terminal?.status === "failure") {
-			if (!options.suppressProcessExit) process.exitCode = 1;
 			if (mode === "json" && !jsonFailureObserved) {
+				if (!options.suppressProcessExit) process.exitCode = 1;
 				stdout.write(`${JSON.stringify({ type: "agent_failed", error: terminal.error })}\n`);
-			} else if (mode === "text" && terminal.error.code === EMPTY_TURN_ERROR.code) {
-				await writeStderrAndQuiesce(`${terminal.error.message}\n`);
+			} else if (mode === "text") {
+				// Handle terminal failure diagnostics and exit codes
+				if (terminal.error.code === EMPTY_TURN_ERROR.code) {
+					if (!options.suppressProcessExit) process.exitCode = 1;
+					await writeStderrAndQuiesce(`${terminal.error.message}\n`);
+				} else if (terminal.error.code === "assistant_error") {
+					// Look up the assistant message to check for context overflow and get proper exit code
+					const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
+					if (lastMessage?.role === "assistant") {
+						const assistantMsg = lastMessage as AssistantMessage;
+						const isOverflow =
+							assistantMsg.stopReason === "error" &&
+							isContextOverflow(assistantMsg, session.model?.contextWindow);
+						const exitCode = isOverflow ? CONTEXT_OVERFLOW_EXIT_CODE : 1;
+						if (!options.suppressProcessExit) process.exitCode = exitCode;
+						const errorLine = isOverflow
+							? formatContextOverflowError(assistantMsg, session.autoCompactionEnabled)
+							: terminal.error.message;
+						await writeStderrAndQuiesce(`${errorLine}\n`);
+						if (!isOverflow) {
+							const safetyStopHint = resolveProviderSafetyStopHint(assistantMsg, session);
+							if (safetyStopHint) await writeStderrAndQuiesce(`${sanitizeText(safetyStopHint)}\n`);
+						}
+					}
+				}
 			}
 		}
 
@@ -410,28 +439,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
 			if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;
-				let printContent = true;
-
-				// Check for error/aborted — skip silent-abort (plan-mode compaction transition).
-				if (
-					(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
-					!isSilentAbort(assistantMsg.errorMessage)
-				) {
-					const isOverflow =
-						assistantMsg.stopReason === "error" && isContextOverflow(assistantMsg, session.model?.contextWindow);
-					const errorLine = isOverflow
-						? formatContextOverflowError(assistantMsg, session.autoCompactionEnabled)
-						: sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
-					const exitCode = isOverflow ? CONTEXT_OVERFLOW_EXIT_CODE : 1;
-
-					if (!options.suppressProcessExit) process.exitCode = exitCode;
-					await writeStderrAndQuiesce(`${errorLine}\n`);
-					if (!isOverflow) {
-						const safetyStopHint = resolveProviderSafetyStopHint(assistantMsg, session);
-						if (safetyStopHint) await writeStderrAndQuiesce(`${sanitizeText(safetyStopHint)}\n`);
-					}
-					printContent = false;
-				}
+				const printContent = true;
 
 				if (
 					assistantMsg.errorMessage &&

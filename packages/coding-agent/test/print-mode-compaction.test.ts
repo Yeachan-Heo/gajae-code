@@ -95,14 +95,13 @@ describe("Print mode with message compaction", () => {
 			onPrompt: currentMessages => {
 				// Simulate compaction during the prompt: remove old messages from the array
 				// but keep the new user message and assistant response that were just added
-				const userIndex = currentMessages.findIndex(
-					m =>
-						m.role === "user" &&
-						"content" in m &&
-						Array.isArray(m.content) &&
-						m.content[0]?.type === "text" &&
-						(m.content[0] as { type: "text"; text: string }).text === "test prompt",
-				);
+				const userIndex = currentMessages.findIndex(m => {
+					if (m.role === "user" && "content" in m && Array.isArray(m.content) && m.content[0]?.type === "text") {
+						const content = m.content[0];
+						return content.type === "text" && content.text === "test prompt";
+					}
+					return false;
+				});
 
 				if (userIndex > 0) {
 					// Remove all messages before the new user message
