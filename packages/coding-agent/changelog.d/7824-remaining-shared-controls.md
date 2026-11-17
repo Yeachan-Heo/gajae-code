@@ -1,8 +1,0 @@
-### Fixed
-
-- `/clear` now works in a shared root TUI session. It publishes a new parentless context-clear root, followed by the model, effort and service tier, as an append-only shared write. Sibling branches published by other openers are kept. A refused write leaves the conversation unchanged, and an uncertain write closes the session (#7824).
-- A default fallback that changes the thinking level now saves that level through admitted shared publication before switching the model, instead of refusing in a shared session (#7824).
-- Assigning a model role while a profile is active now saves the session's configured model chain through admitted shared publication after the settings commit. If that write is refused, the session closes and the message says the settings were saved but the session was not updated (#7824).
-- A configuration reload that changes the active profile or the live model now publishes the profile chain, model and effort as one shared write before applying anything. A refused write rolls back only the staged catalog. A failure after the transcript commit restores settings and the catalog and closes the session (#7824).
-- When a model selection fails in a shared session, the selector now undoes it with one shared write that contains only the values that actually changed. If nothing changed, nothing is written and no incomplete-rollback message is shown. The selector never undoes an uncertain or committed-but-unapplied write (#7824).
-- Starring a previous session from the picker after `/new` now appends the star under that session's transaction lease when this process published to it through shared admission. A star that would rewrite the whole transcript is refused instead of moving a live peer's transcript (#7824).
