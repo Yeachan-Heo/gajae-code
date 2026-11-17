@@ -320,6 +320,7 @@ export class DsmlToolCallHealer {
 	#offset = 0;
 	#inWrapper = false;
 	#inCall = false;
+	#nestingDepth = 0;
 	#inParameter = false;
 	#incomplete = false;
 	#pendingName = "";
@@ -349,6 +350,7 @@ export class DsmlToolCallHealer {
 	 */
 	#abandonCall(): void {
 		this.#inCall = false;
+		this.#nestingDepth = 0;
 		this.#inParameter = false;
 		this.#incomplete = false;
 		this.#pendingName = "";
@@ -500,6 +502,12 @@ export class DsmlToolCallHealer {
 				}
 				this.#inWrapper = false;
 			} else {
+				// Opening wrapper inside an invocation is malformed: the altered parameter
+				// text must not execute silently. Mark incomplete but don't activate wrapper.
+				if (this.#inCall) {
+					this.#incomplete = true;
+					return;
+				}
 				// Opening wrapper: begin accepting invoke tags.
 				this.#inWrapper = true;
 			}
@@ -509,18 +517,26 @@ export class DsmlToolCallHealer {
 		if (tag.kind === "invoke") {
 			if (tag.closing) {
 				if (this.#inCall) {
-					// Parse failures and nested parameters already marked the call.
-					this.#incomplete = this.#incomplete || this.#inParameter;
-					this.#finalizeCall();
+					if (this.#nestingDepth > 0) {
+						// Closing a nested invocation: decrement depth without finalizing.
+						this.#nestingDepth--;
+					} else {
+						// Closing the outermost invocation: finalize it.
+						// Parse failures and nested invocations already marked the call.
+						this.#incomplete = this.#incomplete || this.#inParameter;
+						this.#finalizeCall();
+					}
 				}
 				return;
 			}
-			// Reject nested invocations: mark incomplete instead of resetting state.
+			// Reject nested invocations: track nesting depth and mark incomplete.
 			if (this.#inCall) {
+				this.#nestingDepth++;
 				this.#incomplete = true;
 				return;
 			}
 			this.#inCall = true;
+			this.#nestingDepth = 0;
 			this.#inParameter = false;
 			this.#pendingName = tag.name?.trim() ?? "";
 			this.#pendingInvokeString = tag.string;

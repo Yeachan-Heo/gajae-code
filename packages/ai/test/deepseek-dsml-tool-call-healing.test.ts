@@ -347,4 +347,49 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0].incomplete).toBe(true);
 	});
+
+	it("suppresses two nested invocations through the matching outer close", () => {
+		const healer = new DsmlToolCallHealer();
+		// A malformed outer invocation containing two nested invocations.
+		// The first nested closing tag should NOT finalize the outer call.
+		// Both nested invocations should be suppressed.
+		healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="outer">' +
+				'<｜DSML｜parameter name="arg">data' +
+				// First nested invoke
+				'<｜DSML｜invoke name="inner1"><｜DSML｜parameter name="cmd">cmd1</｜DSML｜parameter></｜DSML｜invoke>' +
+				// Second nested invoke
+				'<｜DSML｜invoke name="inner2"><｜DSML｜parameter name="cmd">cmd2</｜DSML｜parameter></｜DSML｜invoke>' +
+				// Close outer
+				"</｜DSML｜invoke>" +
+				"</｜DSML｜tool_calls>",
+		);
+
+		const calls = healer.drainCompleted();
+		// Should have exactly one call: the outer one, marked incomplete
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("outer");
+		expect(calls[0].incomplete).toBe(true);
+		// The nested invocations (inner1, inner2) should NOT be emitted as separate calls
+	});
+
+	it("marks a call incomplete when wrapper opener appears inside a parameter", () => {
+		const healer = new DsmlToolCallHealer();
+		// A wrapper opener inside a parameter value indicates a malformed call.
+		const clean = healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="command" string="true">rm -rf /tmp/a<｜DSML｜tool_calls>b</｜DSML｜parameter>' +
+				"</｜DSML｜invoke>" +
+				"</｜DSML｜tool_calls>",
+		);
+
+		expect(clean).toBe("");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		// The leaked wrapper should not modify the argument silently
+		expect(calls[0].incomplete).toBe(true);
+		expect(calls[0].name).toBe("bash");
+	});
 });
