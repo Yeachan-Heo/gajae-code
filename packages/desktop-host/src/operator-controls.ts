@@ -7,6 +7,7 @@ import {
 	type SdkOperatorReadResult,
 	type SdkOperatorSnapshot,
 } from "@gajae-code/coding-agent/sdk";
+import { createNativeAdmission, type NativeAdmission } from "./native-admission";
 import type {
 	DesktopOperatorErrorCode,
 	DesktopOperatorEvent,
@@ -58,6 +59,7 @@ interface Operation {
 	privacyFailed: boolean;
 	terminal: boolean;
 	published?: string;
+	refresh?: Promise<void>;
 }
 
 function mapped(error: unknown): DesktopOperatorError {
@@ -100,6 +102,7 @@ export class DesktopOperatorController {
 	readonly #session: Session;
 	readonly #sdk: SdkOperatorControls;
 	readonly #options: DesktopOperatorOptions;
+	readonly #admit: NativeAdmission;
 	readonly #operations = new Map<string, Operation>();
 	// Only the foreground-fold capability gap needs a captured native identity.
 	readonly #generation: number;
@@ -110,7 +113,11 @@ export class DesktopOperatorController {
 	#folding = false;
 	#calling = false;
 
-	constructor(session: Session, options: DesktopOperatorOptions) {
+	constructor(
+		session: Session,
+		options: DesktopOperatorOptions,
+		admit: NativeAdmission = createNativeAdmission(undefined),
+	) {
 		if (
 			typeof options.connectionGeneration !== "string" ||
 			!options.connectionGeneration ||
@@ -121,6 +128,7 @@ export class DesktopOperatorController {
 		)
 			throw new DesktopOperatorError("invalid_input");
 		this.#session = session;
+		this.#admit = admit;
 		this.#options = { ...options };
 		this.#generation = session.sessionLifecycle.generation;
 		this.#sessionId = session.sessionId;
@@ -221,23 +229,35 @@ export class DesktopOperatorController {
 		}
 	}
 
-	#refresh(operation: Operation): void {
+	async #read(value: unknown): Promise<SdkOperatorReadResult> {
+		return this.#admit(rt => rt.operator.read(value), async () => this.#sdk.read(value));
+	}
+
+	#refresh(operation: Operation): Promise<void> {
+		// Polling and explicit reads share one delta cursor; never project a chunk twice.
+		return operation.refresh ??= this.#refreshOperation(operation).finally(() => {
+			operation.refresh = undefined;
+		});
+	}
+
+	async #refreshOperation(operation: Operation): Promise<void> {
 		if (operation.terminal) {
 			// Even cached terminal projections must pass the SDK's identity fence.
-			this.#sdk.read({ operationId: operation.dto.operationId });
+			await this.#read({ operationId: operation.dto.operationId });
 			return;
 		}
 		let read: SdkOperatorReadResult;
 		try {
-			read = this.#sdk.read({ operationId: operation.dto.operationId, cursor: operation.cursor });
+			read = await this.#read({ operationId: operation.dto.operationId, cursor: operation.cursor });
 		} catch (error) {
 			if (!(error instanceof SdkOperatorError) || error.code !== "stale_cursor") throw error;
 			// A missing chunk breaks host-secret overlap. Withhold live text until the authoritative final snapshot.
 			operation.stream = undefined;
 			operation.dto.output = "";
 			operation.dto.liveOutput = "withheld";
-			read = this.#sdk.read({ operationId: operation.dto.operationId });
+			read = await this.#read({ operationId: operation.dto.operationId });
 		}
+		this.#live();
 		if (read.deltasTruncated || read.operation.outputTruncated) {
 			operation.stream = undefined;
 			operation.dto.output = "";
@@ -268,7 +288,7 @@ export class DesktopOperatorController {
 			await Bun.sleep(25);
 			if (this.#disposed || this.#sdk.disposed) return;
 			try {
-				this.#refresh(operation);
+				await this.#refresh(operation);
 				this.#publish(operation);
 			} catch (error) {
 				if (error instanceof SdkOperatorError && error.code === "session_transitioning") continue;
@@ -277,7 +297,7 @@ export class DesktopOperatorController {
 		}
 	}
 
-	execute(value: unknown): DesktopOperatorOperation {
+	async execute(value: unknown): Promise<DesktopOperatorOperation> {
 		this.#live();
 		try {
 			let stream: DesktopOperatorStreamRedactor | undefined;
@@ -292,7 +312,11 @@ export class DesktopOperatorController {
 				throw new DesktopOperatorError("redaction_failed");
 			}
 			this.#live();
-			const snapshot = this.#sdk.execute(value).operation;
+			const snapshot = (await this.#admit(
+				rt => rt.operator.execute(value),
+				async () => this.#sdk.execute(value),
+			)).operation;
+			this.#live();
 			const operation: Operation = {
 				dto: {
 					operationId: snapshot.operationId,
@@ -329,17 +353,17 @@ export class DesktopOperatorController {
 		return this.#sdk.isBusy();
 	}
 
-	getOperation(value: unknown): DesktopOperatorOperation {
+	async getOperation(value: unknown): Promise<DesktopOperatorOperation> {
 		this.#live();
 		try {
 			const operationId = reference(value);
 			const operation = this.#operations.get(operationId);
 			if (!operation) {
 				// SDK identity errors take precedence over a missing local projection.
-				this.#sdk.read({ operationId });
+				await this.#read({ operationId });
 				throw new DesktopOperatorError("not_found");
 			}
-			this.#refresh(operation);
+			await this.#refresh(operation);
 			this.#live();
 			return copy(operation);
 		} catch (error) {
@@ -347,11 +371,15 @@ export class DesktopOperatorController {
 		}
 	}
 
-	abort(value: unknown): DesktopOperatorOperation {
+	async abort(value: unknown): Promise<DesktopOperatorOperation> {
 		this.#live();
 		try {
 			const operationId = reference(value);
-			const snapshot = this.#sdk.cancel({ operationId });
+			const snapshot = await this.#admit(
+				rt => rt.operator.cancel({ operationId }),
+				async () => this.#sdk.cancel({ operationId }),
+			);
+			this.#live();
 			const operation = this.#operations.get(operationId);
 			if (!operation) throw new DesktopOperatorError("not_found");
 			this.#project(operation, snapshot);
@@ -423,6 +451,7 @@ export class DesktopOperatorController {
 export function createDesktopOperatorController(
 	session: Session,
 	options: DesktopOperatorOptions,
+	admit?: NativeAdmission,
 ): DesktopOperatorController {
-	return new DesktopOperatorController(session, options);
+	return new DesktopOperatorController(session, options, admit);
 }

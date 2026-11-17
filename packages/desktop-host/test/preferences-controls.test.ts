@@ -128,7 +128,7 @@ describe("desktop SDK preferences delegation", () => {
 		});
 		expect(select).toHaveBeenLastCalledWith({ name: "desk-b", scope: "session" });
 		expect(session.getActiveModelProfile()).toBe("desk-b");
-		expect(controller.read().profiles.find(item => item.id === "desk-b")).toMatchObject({
+		expect((await controller.read()).profiles.find(item => item.id === "desk-b")).toMatchObject({
 			name: "Desktop B",
 			active: true,
 			group: "CUSTOM",
@@ -141,7 +141,7 @@ describe("desktop SDK preferences delegation", () => {
 		});
 		expect(select).toHaveBeenLastCalledWith({ name: "desk-a", scope: "global" });
 		expect(settings.getGlobal("modelProfile.default")).toBe("desk-a");
-		expect(controller.read().profiles.find(item => item.id === "desk-a")?.default).toBe(true);
+		expect((await controller.read()).profiles.find(item => item.id === "desk-a")?.default).toBe(true);
 	});
 
 	test("delegates nested default model identities and task-role ownership/clear", async () => {
@@ -153,7 +153,7 @@ describe("desktop SDK preferences delegation", () => {
 		expect(session.model?.id).toBe("nested/next");
 		await controller.apply({ type: "role.set", role: "planner", modelId: selector("base") });
 		expect(role).toHaveBeenLastCalledWith({ role: "planner", modelId: selector("base") });
-		expect(controller.read().roles.find(item => item.id === "planner")).toMatchObject({
+		expect((await controller.read()).roles.find(item => item.id === "planner")).toMatchObject({
 			configured: true,
 			model: { id: "base", provider },
 			scope: "session",
@@ -161,7 +161,7 @@ describe("desktop SDK preferences delegation", () => {
 		});
 		await controller.apply({ type: "role.set", role: "planner", modelId: null });
 		expect(role).toHaveBeenLastCalledWith({ role: "planner", modelId: null });
-		expect(controller.read().roles.find(item => item.id === "planner")?.canClear.available).toBe(false);
+		expect((await controller.read()).roles.find(item => item.id === "planner")?.canClear.available).toBe(false);
 	});
 
 	test("SDK role readback is authoritative, not a reconstructed settings override", async () => {
@@ -169,7 +169,7 @@ describe("desktop SDK preferences delegation", () => {
 		const readRoles = vi.spyOn(SdkPreferenceControls.prototype, "readRoles");
 		// A real role write exercises both SDK-owned source and effective-resolution mapping.
 		await controller.apply({ type: "role.set", role: "architect", modelId: selector("nested/next") });
-		const dto = controller.read();
+		const dto = (await controller.read());
 		expect(readRoles).toHaveBeenCalled();
 		expect(dto.roles.find(item => item.id === "architect")).toMatchObject({
 			configured: true,
@@ -177,7 +177,7 @@ describe("desktop SDK preferences delegation", () => {
 			canClear: { available: true },
 		});
 		dto.profiles[0]!.name = "caller mutation";
-		expect(controller.read().profiles[0]!.name).not.toBe("caller mutation");
+		expect((await controller.read()).profiles[0]!.name).not.toBe("caller mutation");
 		expect(JSON.stringify(dto)).not.toContain("fixture-key");
 		expect(JSON.stringify(dto)).not.toContain("example.invalid");
 	});
@@ -243,20 +243,36 @@ describe("desktop SDK preferences delegation", () => {
 
 	test("SDK admission rejects overlapping preference operations without desktop reservations", async () => {
 		const { controller, session } = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		cleanups.push(async () => release.resolve());
 		const available = vi.spyOn(session, "getAvailableModels");
+		const setRole = session.setSessionAgentModelSelection.bind(session);
+		vi.spyOn(session, "setSessionAgentModelSelection").mockImplementation(async (role, model) => {
+			entered.resolve();
+			await release.promise;
+			return setRole(role, model);
+		});
 		const pending = controller.apply({ type: "role.set", role: "executor", modelId: selector("base") });
-		// SDK admission is synchronous; its real model preflight yields before mutation.
+		await entered.promise;
 		expect(available).toHaveBeenCalled();
 		await expect(
 			controller.apply({ type: "profile.select", name: "desk-b", scope: "session" }),
 		).rejects.toMatchObject({ code: "preference_busy" });
+		release.resolve();
 		await expect(pending).resolves.toMatchObject({ applied: "role.set", role: "executor" });
 	});
 
 	test("disposing during SDK preflight fences late mutation", async () => {
 		const { controller, session } = await fixture();
-		const available = vi.spyOn(session, "getAvailableModels");
+		const entered = Promise.withResolvers<void>();
+		const getAvailableModels = session.getAvailableModels.bind(session);
+		const available = vi.spyOn(session, "getAvailableModels").mockImplementation(() => {
+			entered.resolve();
+			return getAvailableModels();
+		});
 		const pending = controller.apply({ type: "role.set", role: "planner", modelId: selector("base") });
+		await entered.promise;
 		expect(available).toHaveBeenCalled();
 		controller.dispose();
 		await expect(pending).rejects.toMatchObject({ code: "stale_preferences" });
@@ -296,7 +312,7 @@ describe("desktop SDK preferences delegation", () => {
 		} finally {
 			await reopened.close();
 		}
-		expect(() => controller.read()).toThrow("Session preferences have been closed.");
+		await expect(controller.read()).rejects.toThrow("Session preferences have been closed.");
 	});
 
 	test("post-application readback failures retain the native receipt without exposing backend errors", async () => {

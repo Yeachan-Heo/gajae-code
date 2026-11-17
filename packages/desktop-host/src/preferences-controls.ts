@@ -4,10 +4,18 @@ import {
 	getSettingsCatalog,
 	SdkPreferenceError,
 	type SdkPreferenceOutcome,
+	type SdkProfileCatalogEntry,
+	type SdkRoleModelPreferences,
+	type SdkSelectModelInput,
+	type SdkSelectModelResult,
+	type SdkSelectProfileInput,
+	type SdkSelectProfileResult,
+	type SdkSetRoleModelResult,
 	type SdkWriteConfigInput,
 	type SdkWriteConfigResult,
 	type SettingCatalogItem,
 } from "@gajae-code/coding-agent/sdk";
+import { createNativeAdmission, type NativeAdmission } from "./native-admission";
 import type {
 	DesktopModelProfile,
 	DesktopModelRoleId,
@@ -55,8 +63,8 @@ export class DesktopPreferenceError extends Error {
 }
 
 export interface DesktopPreferencesController {
-	listProfiles(): DesktopModelProfile[];
-	read(): DesktopPreferences;
+	listProfiles(): Promise<DesktopModelProfile[]>;
+	read(): Promise<DesktopPreferences>;
 	apply(action: unknown): Promise<DesktopPreferenceResult>;
 	/** Host-only scoped config seam; preserve SDK application/durability receipts verbatim. */
 	writeConfig(input: SdkWriteConfigInput): Promise<SdkWriteConfigResult>;
@@ -148,21 +156,38 @@ export function requireAppliedPreference(outcome: SdkPreferenceOutcome): "sessio
 }
 
 /** Read factory-owned data; all mutations, admission and lifecycle fencing belong to SDK controls. */
-export function createDesktopPreferencesController(session: Session): DesktopPreferencesController {
+export function createDesktopPreferencesController(
+	session: Session,
+	admit: NativeAdmission = createNativeAdmission(undefined),
+): DesktopPreferencesController {
 	const controls = createSdkPreferenceControls(session);
 	const settings = session.settings;
 	let disposed = false;
-	const assertCurrent = (): void => {
+	const assertOpen = (): void => {
 		if (disposed) throw new DesktopPreferenceError("stale_preferences", "Session preferences have been closed.");
+	};
+	const readRoles = async (): Promise<SdkRoleModelPreferences> =>
+		(await admit(
+			rt => rt.preferences.handle("model.roles.get", {}),
+			async () => controls.readRoles(),
+		)) as SdkRoleModelPreferences;
+	const assertCurrent = async (): Promise<void> => {
+		assertOpen();
 		// The SDK owns identity, transition and retirement checks, even for reads.
-		controls.readRoles();
+		await readRoles();
+		assertOpen();
 	};
 	const canPersist = (): boolean => settings.canPersistDurableConfig() && settings.canWriteDurableConfig();
-	const listProfiles = (): DesktopModelProfile[] => {
-		assertCurrent();
+	const listProfiles = async (): Promise<DesktopModelProfile[]> => {
+		await assertCurrent();
 		const active = session.getActiveModelProfile();
 		const defaultName = settings.getGlobal("modelProfile.default");
-		return controls.readProfiles().map(profile => {
+		const profiles = (await admit(
+			rt => rt.preferences.handle("model.profiles.get", {}),
+			async () => controls.readProfiles(),
+		)) as SdkProfileCatalogEntry[];
+		assertOpen();
+		return profiles.map(profile => {
 			return {
 				id: profile.id,
 				name: profile.displayName,
@@ -184,9 +209,9 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			};
 		});
 	};
-	const read = (): DesktopPreferences => {
-		assertCurrent();
-		const rolePreferences = controls.readRoles();
+	const read = async (): Promise<DesktopPreferences> => {
+		await assertCurrent();
+		const rolePreferences = await readRoles();
 		const catalog = new Map(getSettingsCatalog(settings).items.map(item => [item.path, item]));
 		const roles: DesktopModelRolePreference[] = ROLES.map(id => {
 			const task = rolePreferences.roles.find(role => role.role === id);
@@ -223,7 +248,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			};
 		});
 		return {
-			profiles: listProfiles(),
+			profiles: await listProfiles(),
 			roles,
 			sampling: SAMPLING_PARAMETERS.map(parameter => {
 				const item = catalog.get(parameter)!;
@@ -248,32 +273,39 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 		listProfiles,
 		read,
 		async writeConfig(input) {
-			assertCurrent();
-			return controls.patchConfig(input);
+			await assertCurrent();
+			return (await admit(
+				rt => rt.preferences.handle("config.write", { scope: input.scope, patch: input.patch }),
+				() => controls.patchConfig(input),
+			)) as SdkWriteConfigResult;
 		},
 		dispose: () => {
 			disposed = true;
 			controls.dispose();
 		},
-		async apply(input) {
+		async apply(value) {
 			let outcome: SdkPreferenceOutcome | undefined;
 			try {
-				assertCurrent();
-				const action = validateAction(input);
+				await assertCurrent();
+				const action = validateAction(value);
 				if (action.type === "sampling.set")
 					throw new DesktopPreferenceError("unsupported_preference", SAMPLING_GAP);
 				if (action.type === "profile.select") {
-					const result = await controls.selectProfile({
+					const input: SdkSelectProfileInput = {
 						name: action.name,
 						scope: action.scope === "default" ? "global" : "session",
-					});
+					};
+					const result = (await admit(
+						rt => rt.preferences.handle("model.profile.select", { ...input }),
+						() => controls.selectProfile(input),
+					)) as SdkSelectProfileResult;
 					outcome = result;
 					return {
 						applied: action.type,
 						profileId: result.profileId,
 						scope: action.scope,
 						durability: requireAppliedPreference(result),
-						preferences: read(),
+						preferences: await read(),
 						outcome: projectPreferenceOutcome(result),
 					};
 				}
@@ -284,29 +316,37 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 					const separator = action.modelId.indexOf("/");
 					if (separator < 1 || separator === action.modelId.length - 1)
 						throw new DesktopPreferenceError("invalid_input", "Invalid model identity.");
-					const result = await controls.selectModel({
+					const input: SdkSelectModelInput = {
 						provider: action.modelId.slice(0, separator),
 						modelId: action.modelId.slice(separator + 1),
 						scope: "global",
-					});
+					};
+					const result = (await admit(
+						rt => rt.preferences.handle("model.select", { ...input }),
+						() => controls.selectModel(input),
+					)) as SdkSelectModelResult;
 					outcome = result;
 					return {
 						applied: action.type,
 						role: action.role,
 						scope: "default",
 						durability: requireAppliedPreference(result),
-						preferences: read(),
+						preferences: await read(),
 						outcome: projectPreferenceOutcome(result),
 					};
 				}
-				const result = await controls.setRole({ role: action.role, modelId: action.modelId });
+				const input = { role: action.role, modelId: action.modelId };
+				const result = (await admit(
+					rt => rt.preferences.handle("model.role.set", input),
+					() => controls.setRole(input),
+				)) as SdkSetRoleModelResult;
 				outcome = result;
 				return {
 					applied: action.type,
 					role: action.role,
 					scope: "session",
 					durability: requireAppliedPreference(result),
-					preferences: read(),
+					preferences: await read(),
 					outcome: projectPreferenceOutcome(result),
 				};
 			} catch (error) {

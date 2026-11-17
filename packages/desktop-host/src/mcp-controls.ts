@@ -4,6 +4,7 @@ import {
 	createActivityControls,
 } from "@gajae-code/coding-agent/sdk";
 import { redactCrashSecrets } from "@gajae-code/utils/crash-redaction";
+import { createNativeAdmission, type NativeAdmission } from "./native-admission";
 import type {
 	DesktopMcpAction,
 	DesktopMcpErrorCode,
@@ -112,11 +113,16 @@ function failure(error: unknown): DesktopMcpError {
 /** Wire projection only. The public SDK owns references, admission and cancellation. */
 export class DesktopMcpController {
 	readonly #controls: ActivityControls;
+	readonly #admit: NativeAdmission;
 	readonly #scope: DesktopMcpScope;
 	readonly #redact: (text: string) => string;
 	#disposed = false;
 
-	constructor(result: FactoryResult, options: DesktopMcpOptions) {
+	constructor(
+		result: FactoryResult,
+		options: DesktopMcpOptions,
+		admit: NativeAdmission = createNativeAdmission(undefined),
+	) {
 		if (
 			!options ||
 			typeof options.connectionGeneration !== "string" ||
@@ -135,6 +141,7 @@ export class DesktopMcpController {
 			sessionGeneration: result.session.sessionLifecycle.generation,
 		};
 		this.#redact = options.redact;
+		this.#admit = admit;
 	}
 
 	#assertAttached(): void {
@@ -174,7 +181,7 @@ export class DesktopMcpController {
 		}
 	}
 
-	getSnapshot(): DesktopMcpSnapshot {
+	async getSnapshot(): Promise<DesktopMcpSnapshot> {
 		const base: DesktopMcpSnapshot = {
 			...this.#scope,
 			scope: "factory_manager_may_be_shared",
@@ -184,7 +191,8 @@ export class DesktopMcpController {
 		};
 		try {
 			this.#assertAttached();
-			const snapshot = this.#controls.getMcpSnapshot();
+			// Runtime operations must use references issued by the runtime's own controls.
+			const snapshot = await this.#admit(rt => rt.mcp.snapshot(), async () => this.#controls.getMcpSnapshot());
 			const servers: DesktopMcpServer[] = snapshot.servers.slice(0, DESKTOP_MCP_LIMITS.servers).map(server => ({
 				ref: { ...this.#scope, key: server.ref },
 				// Public SDK labels are display-only; opaque refs retain control authority.
@@ -197,7 +205,8 @@ export class DesktopMcpController {
 			}));
 			this.#assertAttached();
 			// Redaction is caller code: repeat the SDK read to fence reentrant lifecycle changes.
-			const current = this.#controls.getMcpSnapshot();
+			const current = await this.#admit(rt => rt.mcp.snapshot(), async () => this.#controls.getMcpSnapshot());
+			this.#assertAttached();
 			for (const server of servers) {
 				const live = current.servers.find(row => row.ref === server.ref.key);
 				if (!live) throw new DesktopMcpError("stale_target");
@@ -223,9 +232,12 @@ export class DesktopMcpController {
 			if (ref.connectionGeneration !== this.#scope.connectionGeneration)
 				throw new DesktopMcpError("stale_connection");
 			if (ref.sessionGeneration !== this.#scope.sessionGeneration) throw new DesktopMcpError("stale_session");
-			const result = await this.#controls.operateMcp({ ref: ref.key }, operation);
+			const result = await this.#admit(
+				rt => rt.mcp.operate(ref.key, operation),
+				() => this.#controls.operateMcp({ ref: ref.key }, operation),
+			);
 			this.#assertAttached();
-			return { status: result.status, cleanup: result.cleanup, snapshot: this.getSnapshot() };
+			return { status: result.status, cleanup: result.cleanup, snapshot: await this.getSnapshot() };
 		} catch (error) {
 			throw failure(error);
 		}
@@ -248,6 +260,10 @@ export class DesktopMcpController {
 	}
 }
 
-export function createDesktopMcpController(result: FactoryResult, options: DesktopMcpOptions): DesktopMcpController {
-	return new DesktopMcpController(result, options);
+export function createDesktopMcpController(
+	result: FactoryResult,
+	options: DesktopMcpOptions,
+	admit?: NativeAdmission,
+): DesktopMcpController {
+	return new DesktopMcpController(result, options, admit);
 }

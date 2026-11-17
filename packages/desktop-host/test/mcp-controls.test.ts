@@ -201,8 +201,8 @@ async function fixture(
 	};
 }
 
-function server(controller: DesktopMcpController, index = 0) {
-	const snapshot = controller.getSnapshot();
+async function server(controller: DesktopMcpController, index = 0) {
+	const snapshot = (await controller.getSnapshot());
 	if (!snapshot.available || !snapshot.servers[index]) throw new Error("Missing genuine MCP fixture snapshot");
 	return snapshot.servers[index]!;
 }
@@ -220,7 +220,7 @@ describe("desktop factory-bound MCP controls", () => {
 		const manager = f.result.mcpManager!;
 		expect({ managerPresent: Boolean(manager), requests: [...f.counts] }).toMatchObject({ managerPresent: true });
 		const beta = manager.getConnection("server1");
-		const snapshot = f.primary.getSnapshot();
+		const snapshot = (await f.primary.getSnapshot());
 		expect(snapshot).toMatchObject({ available: true, scope: "factory_manager_may_be_shared", truncated: false });
 		expect(snapshot.servers.map(row => row.label)).toEqual(["server0", "server1"]);
 		const serialized = JSON.stringify(snapshot);
@@ -234,15 +234,15 @@ describe("desktop factory-bound MCP controls", () => {
 		])
 			expect(serialized).not.toContain(privateValue);
 		const before = f.counts.get("server0")!.initializes;
-		const ref = server(f.primary).ref;
+		const ref = (await server(f.primary)).ref;
 		expect(await f.primary.operate(ref, "suspend")).toMatchObject({ status: "suspended", cleanup: "not_certified" });
 		expect(sdkSnapshot).toHaveBeenCalled();
 		expect(sdkOperation).toHaveBeenCalledWith({ ref: ref.key }, "suspend");
-		expect(server(f.primary)).toMatchObject({ state: "suspended", controls: ["resume"], toolCount: 0 });
+		expect((await server(f.primary))).toMatchObject({ state: "suspended", controls: ["resume"], toolCount: 0 });
 		expect(manager.getConnection("server0")).toBeUndefined();
-		expect((await f.primary.operate(server(f.primary).ref, "resume")).status).toBe("resumed");
-		expect(server(f.primary).state).toBe("connected");
-		expect((await f.primary.operate(server(f.primary).ref, "reconnect")).status).toBe("reconnected");
+		expect((await f.primary.operate((await server(f.primary)).ref, "resume")).status).toBe("resumed");
+		expect((await server(f.primary)).state).toBe("connected");
+		expect((await f.primary.operate((await server(f.primary)).ref, "reconnect")).status).toBe("reconnected");
 		expect(f.counts.get("server0")!.initializes).toBe(before + 2);
 		expect(manager.getConnection("server1")).toBe(beta);
 		expect(f.counts.get("server1")!.initializes).toBe(1);
@@ -258,7 +258,7 @@ describe("desktop factory-bound MCP controls", () => {
 			"Local\nfiles\tsearch",
 		];
 		const f = await fixture({ names });
-		const snapshot = f.primary.getSnapshot();
+		const snapshot = (await f.primary.getSnapshot());
 		expect(snapshot.available).toBe(true);
 		expect(snapshot.servers.map(row => row.label)).toEqual([
 			"GitHub production",
@@ -327,7 +327,7 @@ describe("desktop factory-bound MCP controls", () => {
 			const manager = f.result.mcpManager!;
 			const canonical = manager.getServerControlSnapshot();
 			const connections = names.map(name => manager.getConnection(name));
-			const snapshot = f.primary.getSnapshot();
+			const snapshot = (await f.primary.getSnapshot());
 			expect(snapshot.available).toBe(true);
 			expect(snapshot.servers.map(row => row.label)).toEqual([expected, "Public MCP server"]);
 			expect(redact).toHaveBeenCalledWith(source);
@@ -340,7 +340,7 @@ describe("desktop factory-bound MCP controls", () => {
 				expect(snapshot.servers[index]!.controls).toEqual([...canonical[index]!.controls]);
 				expect(snapshot.servers[index]!.ref.key).not.toBe(name);
 			}
-			expect(f.primary.getSnapshot().servers.map(row => row.ref)).toEqual(snapshot.servers.map(row => row.ref));
+			expect((await f.primary.getSnapshot()).servers.map(row => row.ref)).toEqual(snapshot.servers.map(row => row.ref));
 		}, 30_000);
 	}
 
@@ -353,7 +353,7 @@ describe("desktop factory-bound MCP controls", () => {
 		];
 		const redact = vi.fn((text: string) => text.replaceAll("private.example/shared private", "[redacted]"));
 		const f = await fixture({ names, redact });
-		const snapshot = f.primary.getSnapshot();
+		const snapshot = (await f.primary.getSnapshot());
 		expect(snapshot.available).toBe(true);
 		expect(snapshot.servers.map(row => row.label)).toEqual(["[redacted]", "[redacted]", "[redacted]", "[redacted]"]);
 		for (const text of [...names, ...names.map(name => name.replaceAll("\x00", " "))])
@@ -379,7 +379,7 @@ describe("desktop factory-bound MCP controls", () => {
 				}
 				return text;
 			});
-			expect(controller.getSnapshot()).toMatchObject({
+			expect((await controller.getSnapshot())).toMatchObject({
 				available: false,
 				servers: [],
 				error: { code: retirement === "controller disposal" ? "disposed" : "stale_session" },
@@ -393,7 +393,7 @@ describe("desktop factory-bound MCP controls", () => {
 			const prefix = "a".repeat(DESKTOP_MCP_LIMITS.fieldChars);
 			const names = collision === "redaction" ? ["Docs alpha", "Docs beta"] : [`${prefix}alpha`, `${prefix}beta`];
 			const f = await fixture({ names, redact: text => text.replace(/alpha|beta/g, "[redacted]") });
-			const [first, second] = f.primary.getSnapshot().servers;
+			const [first, second] = (await f.primary.getSnapshot()).servers;
 			expect(first!.label).toBe(second!.label);
 			expect(first!.label.length).toBeLessThanOrEqual(DESKTOP_MCP_LIMITS.fieldChars);
 			expect(first!.ref.key).not.toBe(second!.ref.key);
@@ -403,7 +403,7 @@ describe("desktop factory-bound MCP controls", () => {
 			await f.primary.operate(first!.ref, "suspend");
 			expect(manager.getConnection(names[0]!)).toBeUndefined();
 			expect(manager.getConnection(names[1]!)).toBe(other);
-			expect(f.primary.getSnapshot().servers[1]!.ref).toEqual(second!.ref);
+			expect((await f.primary.getSnapshot()).servers[1]!.ref).toEqual(second!.ref);
 			await f.primary.operate(second!.ref, "suspend");
 			expect(manager.getConnection(names[1]!)).toBeUndefined();
 		}, 30_000);
@@ -412,12 +412,12 @@ describe("desktop factory-bound MCP controls", () => {
 	test("unavailable is explicit and tools-only manager absence never becomes fake empty availability", async () => {
 		const f = await fixture({ disabled: true });
 		expect(f.result.mcpManager).toBeUndefined();
-		expect(f.primary.getSnapshot()).toMatchObject({ available: false, servers: [], error: { code: "unavailable" } });
+		expect((await f.primary.getSnapshot())).toMatchObject({ available: false, servers: [], error: { code: "unavailable" } });
 	}, 20_000);
 
 	test("strict unknown-JSON parsing rejects additional fields, getters, prototypes, foreign and guessed references", async () => {
 		const f = await fixture();
-		const ref = server(f.primary).ref;
+		const ref = (await server(f.primary)).ref;
 		const initializations = f.counts.get("server0")!.initializes;
 		for (const bad of [
 			null,
@@ -443,10 +443,10 @@ describe("desktop factory-bound MCP controls", () => {
 			f.primary.operate({ ...ref, sessionGeneration: ref.sessionGeneration + 1 }, "suspend"),
 		).rejects.toMatchObject({ code: "stale_session" });
 		const other = f.controller(ref.connectionGeneration);
-		other.getSnapshot();
+		(await other.getSnapshot());
 		await expect(other.operate(ref, "suspend")).rejects.toMatchObject({ code: "not_found" });
 		expect(f.counts.get("server0")!.initializes).toBe(initializations);
-		expect(server(f.primary).state).toBe("connected");
+		expect((await server(f.primary)).state).toBe("connected");
 	}, 20_000);
 
 	test("SDK target CAS catches config replacement and ABA even before adapter refresh", async () => {
@@ -454,7 +454,7 @@ describe("desktop factory-bound MCP controls", () => {
 		const manager = f.result.mcpManager!;
 		// The owned endpoints advertise distinct tool counts. Bind initial refs
 		// through those observed fixture facts, never row order or private names.
-		const initial = f.primary.getSnapshot();
+		const initial = (await f.primary.getSnapshot());
 		expect(initial.servers).toHaveLength(2);
 		const originals = initial.servers.filter(row => row.toolCount === 1);
 		const unrelatedServers = initial.servers.filter(row => row.toolCount === 2);
@@ -482,10 +482,10 @@ describe("desktop factory-bound MCP controls", () => {
 		await expect(f.primary.operate(original, "suspend")).rejects.toMatchObject({ code: "stale_target" });
 		// Only server0 was replaced. References remain opaque; select the
 		// changed target by excluding the captured unchanged server1 reference.
-		const replacements = f.primary.getSnapshot().servers.filter(row => row.ref.key !== unrelated.key);
+		const replacements = (await f.primary.getSnapshot()).servers.filter(row => row.ref.key !== unrelated.key);
 		expect(replacements).toHaveLength(1);
 		const replacement = replacements[0]!.ref;
-		expect(f.primary.getSnapshot().servers.find(row => row.ref.key === unrelated.key)?.ref).toEqual(unrelated);
+		expect((await f.primary.getSnapshot()).servers.find(row => row.ref.key === unrelated.key)?.ref).toEqual(unrelated);
 		expect(manager.getConnection("server1")).toBe(unrelatedConnection);
 		expect(f.counts.get("server1")).toEqual(unrelatedCounters);
 		expect(replacement.key).not.toBe(original.key);
@@ -508,13 +508,13 @@ describe("desktop factory-bound MCP controls", () => {
 				code: stale === original ? "not_found" : "stale_target",
 			});
 		}
-		const restoredServers = f.primary.getSnapshot().servers.filter(row => row.ref.key !== unrelated.key);
+		const restoredServers = (await f.primary.getSnapshot()).servers.filter(row => row.ref.key !== unrelated.key);
 		expect(restoredServers).toHaveLength(1);
 		const restoredServer = restoredServers[0]!;
 		expect(restoredServer.state).toBe("connected");
 		expect(restoredServer.ref.key).not.toBe(original.key);
 		expect(restoredServer.ref.key).not.toBe(replacement.key);
-		expect(f.primary.getSnapshot().servers.find(row => row.ref.key === unrelated.key)).toMatchObject({
+		expect((await f.primary.getSnapshot()).servers.find(row => row.ref.key === unrelated.key)).toMatchObject({
 			ref: unrelated,
 			state: "connected",
 		});
@@ -527,7 +527,7 @@ describe("desktop factory-bound MCP controls", () => {
 			state: "connected",
 		});
 		expect(manager.getConnection("server0")).toBeUndefined();
-		const suspendedServers = f.primary.getSnapshot().servers.filter(row => row.ref.key !== unrelated.key);
+		const suspendedServers = (await f.primary.getSnapshot()).servers.filter(row => row.ref.key !== unrelated.key);
 		expect(suspendedServers).toHaveLength(1);
 		const resumed = await f.primary.operate(suspendedServers[0]!.ref, "resume");
 		expect(resumed).toMatchObject({ status: "resumed", cleanup: "not_certified", snapshot: { available: true } });
@@ -547,18 +547,18 @@ describe("desktop factory-bound MCP controls", () => {
 		const owner = await fixture();
 		const shared = await fixture({ manager: owner.result.mcpManager! });
 		expect(shared.result.mcpManager).toBe(owner.result.mcpManager);
-		expect(shared.primary.getSnapshot().scope).toBe("factory_manager_may_be_shared");
-		await shared.primary.operate(server(shared.primary).ref, "suspend");
-		expect(server(owner.primary).state).toBe("suspended");
+		expect((await shared.primary.getSnapshot()).scope).toBe("factory_manager_may_be_shared");
+		await shared.primary.operate((await server(shared.primary)).ref, "suspend");
+		expect((await server(owner.primary)).state).toBe("suspended");
 		shared.primary.dispose();
-		expect(shared.primary.getSnapshot()).toMatchObject({ available: false, error: { code: "disposed" } });
-		await owner.primary.operate(server(owner.primary).ref, "resume");
-		expect(server(owner.primary).state).toBe("connected");
+		expect((await shared.primary.getSnapshot())).toMatchObject({ available: false, error: { code: "disposed" } });
+		await owner.primary.operate((await server(owner.primary)).ref, "resume");
+		expect((await server(owner.primary)).state).toBe("connected");
 	}, 30_000);
 
 	test("read-only status stays available during real prompt admission; mutation uses SDK exclusivity", async () => {
 		const f = await fixture();
-		const ref = server(f.primary).ref;
+		const ref = (await server(f.primary)).ref;
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const stopped = new Error("Owned fixture stopped before provider execution");
@@ -579,9 +579,9 @@ describe("desktop factory-bound MCP controls", () => {
 		try {
 			const checkpoint = await Promise.race([entered.promise.then(() => "entered" as const), outcome]);
 			expect(checkpoint).toBe("entered");
-			expect(f.primary.getSnapshot()).toMatchObject({ available: true });
+			expect((await f.primary.getSnapshot())).toMatchObject({ available: true });
 			await expect(f.primary.operate(ref, "suspend")).rejects.toMatchObject({ code: "busy" });
-			expect(server(f.primary).state).toBe("connected");
+			expect((await server(f.primary)).state).toBe("connected");
 		} finally {
 			release.resolve();
 		}
@@ -590,7 +590,7 @@ describe("desktop factory-bound MCP controls", () => {
 
 	test("notifications only wake; a genuine committed lifecycle invalidates old refs", async () => {
 		const f = await fixture();
-		const ref = server(f.primary).ref;
+		const ref = (await server(f.primary)).ref;
 		let wakes = 0;
 		f.primary.onChange(() => {
 			wakes++;
@@ -599,7 +599,7 @@ describe("desktop factory-bound MCP controls", () => {
 		f.result.session.emitNotice("info", "Uncommitted notification", "fixture");
 		expect(wakes).toBeGreaterThan(0);
 		expect(f.result.session.sessionLifecycle.generation).toBe(generation);
-		expect(server(f.primary).ref).toEqual(ref);
+		expect((await server(f.primary)).ref).toEqual(ref);
 		const committed = Promise.withResolvers<void>();
 		const releaseCleanup = Promise.withResolvers<void>();
 		const unregister = f.result.session.registerToolSessionTransitionCleanup(async () => {
@@ -616,7 +616,7 @@ describe("desktop factory-bound MCP controls", () => {
 			expect(checkpoint).toBe("committed");
 			expect(f.result.session.sessionLifecycle).toMatchObject({ transitioning: true });
 			expect(f.result.session.sessionLifecycle.generation).toBeGreaterThan(generation);
-			expect(f.primary.getSnapshot()).toMatchObject({ available: false, error: { code: "stale_session" } });
+			expect((await f.primary.getSnapshot())).toMatchObject({ available: false, error: { code: "stale_session" } });
 			await expect(f.primary.operate(ref, "reconnect")).rejects.toMatchObject({ code: "stale_session" });
 		} finally {
 			releaseCleanup.resolve();
@@ -624,7 +624,7 @@ describe("desktop factory-bound MCP controls", () => {
 		}
 		expect(await outcome).toEqual({ status: "fulfilled", value: true });
 		expect(f.result.session.sessionLifecycle.generation).toBeGreaterThan(generation);
-		expect(f.primary.getSnapshot()).toMatchObject({ available: false, error: { code: "stale_session" } });
+		expect((await f.primary.getSnapshot())).toMatchObject({ available: false, error: { code: "stale_session" } });
 		await expect(f.primary.operate(ref, "reconnect")).rejects.toMatchObject({ code: "stale_session" });
 	}, 30_000);
 
@@ -642,7 +642,7 @@ describe("desktop factory-bound MCP controls", () => {
 			});
 		};
 		const f = await fixture({ extensions: [extension] });
-		const original = server(f.primary).ref;
+		const original = (await server(f.primary)).ref;
 		const lifecycle = f.result.session.sessionLifecycle;
 		const connection = f.result.mcpManager!.getConnection("server0");
 		const preparation = f.result.session.newSession();
@@ -657,8 +657,8 @@ describe("desktop factory-bound MCP controls", () => {
 				generation: lifecycle.generation,
 				transitioning: true,
 			});
-			expect(f.primary.getSnapshot()).toMatchObject({ available: true });
-			expect(server(f.primary)).toMatchObject({ ref: original, controls: [] });
+			expect((await f.primary.getSnapshot())).toMatchObject({ available: true });
+			expect((await server(f.primary))).toMatchObject({ ref: original, controls: [] });
 			expect(() => f.controller("during-preparation")).toThrow(
 				expect.objectContaining({ code: "session_transitioning" }),
 			);
@@ -669,7 +669,7 @@ describe("desktop factory-bound MCP controls", () => {
 		}
 		expect(await outcome).toEqual({ status: "fulfilled", value: false });
 		expect(f.result.session.sessionLifecycle).toEqual(lifecycle);
-		expect(server(f.primary).ref).toEqual(original);
+		expect((await server(f.primary)).ref).toEqual(original);
 		expect(await f.primary.operate(original, "suspend")).toMatchObject({
 			status: "suspended",
 			cleanup: "not_certified",
@@ -695,7 +695,7 @@ describe("desktop factory-bound MCP controls", () => {
 			await release.promise;
 			throw new Error("controlled MCP preparation failure");
 		});
-		const original = server(f.primary).ref;
+		const original = (await server(f.primary)).ref;
 		const lifecycle = f.result.session.sessionLifecycle;
 		const preparation = f.result.session.newSession();
 		const outcome = preparation.then(
@@ -709,7 +709,7 @@ describe("desktop factory-bound MCP controls", () => {
 				generation: lifecycle.generation,
 				transitioning: true,
 			});
-			expect(server(f.primary)).toMatchObject({ ref: original, controls: [] });
+			expect((await server(f.primary))).toMatchObject({ ref: original, controls: [] });
 			await expect(f.primary.operate(original, "reconnect")).rejects.toMatchObject({
 				code: "session_transitioning",
 			});
@@ -721,7 +721,7 @@ describe("desktop factory-bound MCP controls", () => {
 			error: { message: "controlled MCP preparation failure" },
 		});
 		expect(f.result.session.sessionLifecycle).toEqual(lifecycle);
-		expect(server(f.primary).ref).toEqual(original);
+		expect((await server(f.primary)).ref).toEqual(original);
 		expect(await f.primary.operate(original, "suspend")).toMatchObject({
 			status: "suspended",
 			cleanup: "not_certified",
@@ -730,13 +730,13 @@ describe("desktop factory-bound MCP controls", () => {
 
 	test("same-ID clear permanently invalidates refs through committed generation, including repeated clear ABA", async () => {
 		const f = await fixture();
-		const original = server(f.primary).ref;
+		const original = (await server(f.primary)).ref;
 		const id = f.result.session.sessionId;
 		const generation = f.result.session.sessionLifecycle.generation;
 		expect(await f.result.session.clearContext()).toBe(true);
 		expect(f.result.session.sessionId).toBe(id);
 		expect(f.result.session.sessionLifecycle.generation).toBeGreaterThan(generation);
-		expect(f.primary.getSnapshot()).toMatchObject({ available: false, error: { code: "stale_session" } });
+		expect((await f.primary.getSnapshot())).toMatchObject({ available: false, error: { code: "stale_session" } });
 		await expect(f.primary.operate(original, "suspend")).rejects.toMatchObject({ code: "stale_session" });
 		expect(await f.result.session.clearContext()).toBe(true);
 		expect(f.result.session.sessionId).toBe(id);
@@ -745,40 +745,40 @@ describe("desktop factory-bound MCP controls", () => {
 
 	test("parallel mutations and backend errors do not produce false success or leak error text", async () => {
 		const f = await fixture();
-		const ref = server(f.primary).ref;
+		const ref = (await server(f.primary)).ref;
 		const gate = f.blockNextInitialize();
 		const operation = f.primary.operate(ref, "reconnect");
 		try {
 			await gate.entered;
-			expect(f.primary.getSnapshot()).toMatchObject({ available: true });
+			expect((await f.primary.getSnapshot())).toMatchObject({ available: true });
 			await expect(f.primary.operate(ref, "suspend")).rejects.toMatchObject({ code: "session_transitioning" });
 		} finally {
 			gate.release();
 		}
 		expect(await operation).toMatchObject({ status: "reconnected" });
 		f.failures.add("server0");
-		const error: unknown = await f.primary.operate(server(f.primary).ref, "reconnect").catch(value => value);
+		const error: unknown = await f.primary.operate((await server(f.primary)).ref, "reconnect").catch(value => value);
 		expect(error).toMatchObject({ code: "unknown_effect" });
 		expect(String(error)).not.toContain(secret);
-		expect(server(f.primary).state).not.toBe("connected");
+		expect((await server(f.primary)).state).not.toBe("connected");
 		expect(f.counts.get("server1")!.initializes).toBe(1);
 	}, 30_000);
 
 	test("redaction fails closed, reference retention is bounded, and disposal cancels without claiming settlement", async () => {
 		const f = await fixture({ count: DESKTOP_MCP_LIMITS.servers + 1 });
-		const snapshot = f.primary.getSnapshot();
+		const snapshot = (await f.primary.getSnapshot());
 		expect(snapshot.servers).toHaveLength(DESKTOP_MCP_LIMITS.servers);
 		expect(snapshot.truncated).toBe(true);
 		const closed = f.controller("closed-redactor", () => {
 			throw new Error(secret);
 		});
-		expect(closed.getSnapshot()).toMatchObject({
+		expect((await closed.getSnapshot())).toMatchObject({
 			available: false,
 			servers: [],
 			error: { code: "redaction_failed" },
 		});
-		expect(JSON.stringify(closed.getSnapshot())).not.toContain(secret);
-		const ref = server(f.primary).ref;
+		expect(JSON.stringify((await closed.getSnapshot()))).not.toContain(secret);
+		const ref = (await server(f.primary)).ref;
 		const gate = f.blockNextInitialize();
 		const pending = f.primary.operate(ref, "reconnect");
 		try {
@@ -788,6 +788,6 @@ describe("desktop factory-bound MCP controls", () => {
 			gate.release();
 		}
 		await expect(pending).rejects.toMatchObject({ code: "unknown_effect" });
-		expect(f.primary.getSnapshot()).toMatchObject({ available: false, error: { code: "disposed" } });
+		expect((await f.primary.getSnapshot())).toMatchObject({ available: false, error: { code: "disposed" } });
 	}, 60_000);
 });

@@ -85,9 +85,9 @@ async function fixture(options: Partial<DesktopOperatorOptions> = {}) {
 	return { session: created.session, controller, events, controllerOptions };
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
 	const deadline = Date.now() + 10_000;
-	while (!predicate()) {
+	while (!(await predicate())) {
 		if (Date.now() > deadline) throw new Error("Operator did not settle");
 		await Bun.sleep(10);
 	}
@@ -98,12 +98,12 @@ async function settled(
 	operation: DesktopOperatorOperation,
 ): Promise<DesktopOperatorOperation> {
 	await waitFor(
-		() =>
+		async () =>
 			!["running", "cancel_requested"].includes(
-				controller.getOperation({ operationId: operation.operationId }).status,
+				(await controller.getOperation({ operationId: operation.operationId })).status,
 			),
 	);
-	return controller.getOperation({ operationId: operation.operationId });
+	return (await controller.getOperation({ operationId: operation.operationId }));
 }
 
 function result(output = "", cancelled = false) {
@@ -126,11 +126,11 @@ function result(output = "", cancelled = false) {
 describe("desktop public SDK operator projection", () => {
 	test("real Bash SDK execution preserves prefixes, context flags, nonzero exits and event settlement", async () => {
 		const f = await fixture();
-		const included = f.controller.execute({ text: "! printf 'included\\n'" });
+		const included = (await f.controller.execute({ text: "! printf 'included\\n'" }));
 		expect(included).toMatchObject({ kind: "bash", status: "running", excludeFromContext: false, output: "" });
 		const first = await settled(f.controller, included);
 		expect(first).toMatchObject({ status: "completed", exitCode: 0, output: "included\n" });
-		const excluded = await settled(f.controller, f.controller.execute({ text: "!! printf 'excluded\\n'; exit 7" }));
+		const excluded = await settled(f.controller, (await f.controller.execute({ text: "!! printf 'excluded\\n'; exit 7" })));
 		expect(excluded).toMatchObject({
 			status: "completed",
 			exitCode: 7,
@@ -147,14 +147,33 @@ describe("desktop public SDK operator projection", () => {
 			),
 		);
 		first.output = "client mutation";
-		expect(f.controller.getOperation({ operationId: included.operationId }).output).toBe("included\n");
+		expect((await f.controller.getOperation({ operationId: included.operationId })).output).toBe("included\n");
 	}, 20_000);
+
+	test("concurrent reads share the SDK delta cursor without duplicating live output", async () => {
+		const f = await fixture({
+			createStreamRedactor: () => ({ push: chunk => chunk, finish: () => "" }),
+		});
+		const release = Promise.withResolvers<void>();
+		cleanups.push(() => release.resolve());
+		vi.spyOn(f.session, "executePython").mockImplementation(async (_source, chunk) => {
+			chunk?.("public-chunk");
+			await release.promise;
+			return result("public-chunk");
+		});
+		const running = await f.controller.execute({ text: "$ concurrent_reads()" });
+		const ref = { operationId: running.operationId };
+		const reads = await Promise.all([f.controller.getOperation(ref), f.controller.getOperation(ref)]);
+		expect(reads.map(read => read.output)).toEqual(["public-chunk", "public-chunk"]);
+		release.resolve();
+		expect((await settled(f.controller, running)).output).toBe("public-chunk");
+	});
 
 	test("SDK cancellation reaches real Bash and admission is shared across controllers", async () => {
 		const f = await fixture({ createStreamRedactor: () => createDesktopStreamRedactor([secret], text => text) });
-		const running = f.controller.execute({
+		const running = (await f.controller.execute({
 			text: "! printf 'ready-with-long-public-output-line\\n'; sleep 30; printf 'must-not-finish\\n'",
-		});
+		}));
 		await waitFor(() => f.events.some(event => event.operation.output.includes("ready")));
 		const replacement = createDesktopOperatorController(f.session, {
 			...f.controllerOptions,
@@ -162,19 +181,15 @@ describe("desktop public SDK operator projection", () => {
 		});
 		cleanups.push(() => replacement.dispose());
 		expect(replacement.isBusy()).toBe(true);
-		expect(() => replacement.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "busy" }));
-		expect(() => replacement.abort({ operationId: running.operationId })).toThrow(
-			expect.objectContaining({ code: "not_found" }),
-		);
-		expect(f.controller.abort({ operationId: running.operationId }).status).toBe("cancel_requested");
+		await expect(replacement.execute({ text: "! true" })).rejects.toThrow(expect.objectContaining({ code: "busy" }));
+		await expect(replacement.abort({ operationId: running.operationId })).rejects.toThrow(expect.objectContaining({ code: "not_found" }),);
+		expect((await f.controller.abort({ operationId: running.operationId })).status).toBe("cancel_requested");
 		const done = await settled(f.controller, running);
 		expect(done.status).toBe("cancelled");
 		expect(done.output).not.toContain("must-not-finish");
 		expect(f.controller.isBusy()).toBe(false);
 		expect(replacement.isBusy()).toBe(false);
-		expect(() => f.controller.abort({ operationId: running.operationId })).toThrow(
-			expect.objectContaining({ code: "already_terminal" }),
-		);
+		await expect(f.controller.abort({ operationId: running.operationId })).rejects.toThrow(expect.objectContaining({ code: "already_terminal" }),);
 	}, 20_000);
 
 	test("Python mapping delegates to SDK admission, context flags and operation-owned abort signal", async () => {
@@ -190,7 +205,7 @@ describe("desktop public SDK operator projection", () => {
 			return result("python-output", signal?.aborted);
 		});
 		const mainAbort = vi.spyOn(f.session, "abort");
-		const running = f.controller.execute({ text: "$$ print('python')" });
+		const running = (await f.controller.execute({ text: "$$ print('python')" }));
 		// Keep the executor's actual signal; spy call metadata need not preserve native object state.
 		const signal = await entered.promise;
 		if (!signal) throw new Error("SDK Python admission did not supply its operation-owned abort signal");
@@ -199,15 +214,15 @@ describe("desktop public SDK operator projection", () => {
 		expect(signal.aborted).toBe(false);
 		expect(execute.mock.calls[0]?.[0]).toBe("print('python')");
 		expect(execute.mock.calls[0]?.[2]).toMatchObject({ excludeFromContext: true, signal: expect.any(AbortSignal) });
-		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+		expect((await f.controller.getOperation({ operationId: running.operationId }))).toMatchObject({
 			kind: "python",
 			output: "",
 			liveOutput: "withheld",
 		});
-		expect(f.controller.abort({ operationId: running.operationId }).status).toBe("cancel_requested");
+		expect((await f.controller.abort({ operationId: running.operationId })).status).toBe("cancel_requested");
 		expect(signal.aborted).toBe(true);
 		expect(aborted).toHaveBeenCalledTimes(1);
-		expect(f.controller.getOperation({ operationId: running.operationId }).status).toBe("cancel_requested");
+		expect((await f.controller.getOperation({ operationId: running.operationId })).status).toBe("cancel_requested");
 		expect(mainAbort).not.toHaveBeenCalled();
 		expect(f.controller.isBusy()).toBe(true);
 		release.resolve();
@@ -222,7 +237,7 @@ describe("desktop public SDK operator projection", () => {
 			await release.promise;
 			return result("private");
 		});
-		const running = f.controller.execute({ text: "$ held()" });
+		const running = (await f.controller.execute({ text: "$ held()" }));
 		f.controller.dispose();
 		const replacement = createDesktopOperatorController(f.session, {
 			...f.controllerOptions,
@@ -230,14 +245,12 @@ describe("desktop public SDK operator projection", () => {
 		});
 		cleanups.push(() => replacement.dispose());
 		expect(replacement.isBusy()).toBe(true);
-		expect(() => replacement.execute({ text: "! true" })).toThrow(expect.objectContaining({ code: "busy" }));
-		expect(() => f.controller.getOperation({ operationId: running.operationId })).toThrow(
-			expect.objectContaining({ code: "disposed" }),
-		);
+		await expect(replacement.execute({ text: "! true" })).rejects.toThrow(expect.objectContaining({ code: "busy" }));
+		await expect(f.controller.getOperation({ operationId: running.operationId })).rejects.toThrow(expect.objectContaining({ code: "disposed" }),);
 		release.resolve();
 		await waitFor(() => !replacement.isBusy());
 		expect(f.events.every(event => event.operation.status === "running")).toBe(true);
-		expect((await settled(replacement, replacement.execute({ text: "! printf 'new-owner'" }))).output).toBe(
+		expect((await settled(replacement, (await replacement.execute({ text: "! printf 'new-owner'" })))).output).toBe(
 			"new-owner",
 		);
 	});
@@ -255,8 +268,8 @@ describe("desktop public SDK operator projection", () => {
 			await release.promise;
 			return result("final operator-private-\x1b[31mtokenEND\x1b[0m");
 		});
-		const running = f.controller.execute({ text: "$ private_code()" });
-		const live = f.controller.getOperation({ operationId: running.operationId });
+		const running = (await f.controller.execute({ text: "$ private_code()" }));
+		const live = (await f.controller.getOperation({ operationId: running.operationId }));
 		expect(live.output).toContain("public-prefix");
 		expect(live.output).not.toContain("operator-private-");
 		release.resolve();
@@ -293,12 +306,12 @@ describe("desktop public SDK operator projection", () => {
 				await release.promise;
 				return result(prefix + first + second + suffix);
 			});
-			const running = f.controller.execute({ text: "$ normalized_output()" });
+			const running = (await f.controller.execute({ text: "$ normalized_output()" }));
 			await waitFor(() => f.events.some(event => event.operation.output.includes("visible")));
-			expect(f.controller.getOperation({ operationId: running.operationId }).status).toBe("running");
+			expect((await f.controller.getOperation({ operationId: running.operationId })).status).toBe("running");
 			next.resolve();
 			await waitFor(() => f.events.some(event => event.operation.output.includes("[redacted]")));
-			const live = f.controller.getOperation({ operationId: running.operationId });
+			const live = (await f.controller.getOperation({ operationId: running.operationId }));
 			expect(live).toMatchObject({ status: "running", liveOutput: "redacted" });
 			expect(live.output).toContain(`${prefix}[redacted]`);
 			release.resolve();
@@ -320,10 +333,10 @@ describe("desktop public SDK operator projection", () => {
 		const execute = vi
 			.spyOn(f.session, "executePython")
 			.mockResolvedValue(result("alpha-\x1b[31msecret alpha-\x1b]title\x07secret alpha-\x00secret\n"));
-		const done = await settled(f.controller, f.controller.execute({ text: "$ final_only()" }));
+		const done = await settled(f.controller, (await f.controller.execute({ text: "$ final_only()" })));
 		expect(done).toMatchObject({ status: "completed", output: "[redacted] [redacted] [redacted]\n" });
 		execute.mockResolvedValue(result("alpha-\x1b]unfinished"));
-		expect(await settled(f.controller, f.controller.execute({ text: "$ incomplete_final()" }))).toMatchObject({
+		expect(await settled(f.controller, (await f.controller.execute({ text: "$ incomplete_final()" })))).toMatchObject({
 			status: "failed",
 			output: "",
 			liveOutput: "withheld",
@@ -356,8 +369,8 @@ describe("desktop public SDK operator projection", () => {
 				await release.promise;
 				return result(raw);
 			});
-			const running = f.controller.execute({ text: "$ raw_and_normalized_final()" });
-			expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+			const running = (await f.controller.execute({ text: "$ raw_and_normalized_final()" }));
+			expect((await f.controller.getOperation({ operationId: running.operationId }))).toMatchObject({
 				status: "running",
 				output: "",
 				liveOutput: "withheld",
@@ -397,14 +410,14 @@ describe("desktop public SDK operator projection", () => {
 			await release.promise;
 			return result(`\x1b[${key}`);
 		});
-		const running = f.controller.execute({ text: "$ raw_boundary()" });
-		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+		const running = (await f.controller.execute({ text: "$ raw_boundary()" }));
+		expect((await f.controller.getOperation({ operationId: running.operationId }))).toMatchObject({
 			status: "running",
 			output: "",
 		});
 		next.resolve();
 		await received.promise;
-		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+		expect((await f.controller.getOperation({ operationId: running.operationId }))).toMatchObject({
 			status: "running",
 			output: "",
 			liveOutput: "withheld",
@@ -435,8 +448,8 @@ describe("desktop public SDK operator projection", () => {
 				await release.promise;
 				return result(`alpha-${control}`);
 			});
-			const running = f.controller.execute({ text: "$ unsafe_controls()" });
-			expect(f.controller.getOperation({ operationId: running.operationId }).status).toBe("running");
+			const running = (await f.controller.execute({ text: "$ unsafe_controls()" }));
+			expect((await f.controller.getOperation({ operationId: running.operationId })).status).toBe("running");
 			expect(f.controller.isBusy()).toBe(true);
 			release.resolve();
 			expect(await settled(f.controller, running)).toMatchObject({
@@ -457,7 +470,7 @@ describe("desktop public SDK operator projection", () => {
 			chunk?.(output);
 			return { ...result(output), truncated: true };
 		});
-		const done = await settled(f.controller, f.controller.execute({ text: "$ huge_output()" }));
+		const done = await settled(f.controller, (await f.controller.execute({ text: "$ huge_output()" })));
 		expect(done).toMatchObject({
 			status: "completed",
 			exitCode: 0,
@@ -477,8 +490,8 @@ describe("desktop public SDK operator projection", () => {
 			await release.promise;
 			return result("authoritative final");
 		});
-		const running = f.controller.execute({ text: "$ callbacks()" });
-		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+		const running = (await f.controller.execute({ text: "$ callbacks()" }));
+		expect((await f.controller.getOperation({ operationId: running.operationId }))).toMatchObject({
 			status: "running",
 			output: "",
 			liveOutput: "withheld",
@@ -503,8 +516,8 @@ describe("desktop public SDK operator projection", () => {
 			await release.promise;
 			return result(secret);
 		});
-		const running = f.controller.execute({ text: "$ private()" });
-		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+		const running = (await f.controller.execute({ text: "$ private()" }));
+		expect((await f.controller.getOperation({ operationId: running.operationId }))).toMatchObject({
 			status: "running",
 			output: "",
 			liveOutput: "withheld",
@@ -534,11 +547,11 @@ describe("desktop public SDK operator projection", () => {
 			Object.defineProperty({}, "text", { get: getter }),
 			{ text: "! true", [Symbol()]: true },
 		]) {
-			expect(() => f.controller.execute(input)).toThrow(expect.objectContaining({ code: "invalid_input" }));
+			await expect(f.controller.execute(input)).rejects.toThrow(expect.objectContaining({ code: "invalid_input" }));
 		}
 		expect(getter).not.toHaveBeenCalled();
 		vi.spyOn(f.session, "executePython").mockRejectedValue(new Error(`PRIVATE_PROVIDER ${secret}`));
-		const done = await settled(f.controller, f.controller.execute({ text: "$ broken()" }));
+		const done = await settled(f.controller, (await f.controller.execute({ text: "$ broken()" })));
 		expect(done).toMatchObject({ status: "failed", error: { code: "backend_failure" } });
 		expect(JSON.stringify(f.events)).not.toContain("PRIVATE_PROVIDER");
 		expect(JSON.stringify(done)).not.toContain(secret);
@@ -546,20 +559,16 @@ describe("desktop public SDK operator projection", () => {
 
 	test("SDK generation fences old controls after committed session replacement", async () => {
 		const f = await fixture();
-		const done = await settled(f.controller, f.controller.execute({ text: "! true" }));
+		const done = await settled(f.controller, (await f.controller.execute({ text: "! true" })));
 		await f.session.newSession();
-		expect(() => f.controller.getOperation({ operationId: done.operationId })).toThrow(
-			expect.objectContaining({ code: "stale_session" }),
-		);
-		expect(() => f.controller.execute({ text: "! true" })).toThrow(
-			expect.objectContaining({ code: "stale_session" }),
-		);
+		await expect(f.controller.getOperation({ operationId: done.operationId })).rejects.toThrow(expect.objectContaining({ code: "stale_session" }),);
+		await expect(f.controller.execute({ text: "! true" })).rejects.toThrow(expect.objectContaining({ code: "stale_session" }),);
 		await expect(f.controller.fold({})).rejects.toMatchObject({ code: "stale_session" });
 	});
 
 	test("failed lifecycle preparation leaves SDK operation references current after the transition settles", async () => {
 		const f = await fixture();
-		const done = await settled(f.controller, f.controller.execute({ text: "! true" }));
+		const done = await settled(f.controller, (await f.controller.execute({ text: "! true" })));
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		vi.spyOn(f.session.sessionManager, "prepareNewSession").mockImplementation(async () => {
@@ -580,17 +589,13 @@ describe("desktop public SDK operator projection", () => {
 				throw new Error("Transition settled before its preparation checkpoint");
 			}),
 		]);
-		expect(() => f.controller.getOperation({ operationId: done.operationId })).toThrow(
-			expect.objectContaining({ code: "session_transitioning" }),
-		);
-		expect(() => f.controller.execute({ text: "! true" })).toThrow(
-			expect.objectContaining({ code: "session_transitioning" }),
-		);
+		await expect(f.controller.getOperation({ operationId: done.operationId })).rejects.toThrow(expect.objectContaining({ code: "session_transitioning" }),);
+		await expect(f.controller.execute({ text: "! true" })).rejects.toThrow(expect.objectContaining({ code: "session_transitioning" }),);
 		await expect(f.controller.fold({})).rejects.toMatchObject({ code: "session_transitioning" });
 		release.resolve();
 		expect(await outcome).toBeInstanceOf(Error);
 		expect(f.session.sessionLifecycle.generation).toBe(generation);
-		expect(f.controller.getOperation({ operationId: done.operationId })).toEqual(done);
+		expect((await f.controller.getOperation({ operationId: done.operationId }))).toEqual(done);
 	});
 
 	test("fold explicitly delegates to the factory-result foreground control until the SDK exposes it", async () => {
