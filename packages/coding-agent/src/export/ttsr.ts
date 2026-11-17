@@ -442,6 +442,11 @@ export class TtsrManager {
 
 	/** Mark rule names as injected (won't trigger again until conditions allow). */
 	markInjectedByNames(ruleNames: string[]): void {
+		this.markInjectedByNamesAt(ruleNames, this.#messageCount);
+	}
+
+	/** Mark rule names as injected at a specific message count (for reconciliation). */
+	markInjectedByNamesAt(ruleNames: string[], messageCount: number): void {
 		for (const rawName of ruleNames) {
 			const ruleName = rawName.trim();
 			if (ruleName.length === 0) {
@@ -449,7 +454,7 @@ export class TtsrManager {
 			}
 			const entry = this.#rules.get(ruleName);
 			const nextRecord: InjectionRecord = {
-				lastInjectedAt: this.#messageCount,
+				lastInjectedAt: messageCount,
 				repeatMode: entry?.rule.repeatMode ?? this.#settings.repeatMode,
 				repeatGap: entry?.rule.repeatGap ?? this.#settings.repeatGap,
 			};
@@ -457,7 +462,7 @@ export class TtsrManager {
 
 			logger.debug("TTSR rule marked as injected", {
 				ruleName,
-				messageCount: this.#messageCount,
+				messageCount,
 				repeatMode: nextRecord.repeatMode,
 			});
 		}

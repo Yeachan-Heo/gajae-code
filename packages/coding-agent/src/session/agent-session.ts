@@ -11069,13 +11069,16 @@ export class AgentSession {
 		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
 			return;
 		}
-		const reconciledRuleNames = new Set<string>();
+		const reconciledRuleNames = new Map<string, number>();
 		for (const message of this.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== "ttsr-injection") {
 				continue;
 			}
+			// Extract the message count at which this reminder was originally injected.
+			// This preserves the after-gap checkpoint for repeat-gap calculations.
+			const messageCount = (message.details as any)?.messageCount;
 			for (const ruleName of this.#extractTtsrRuleNames(message.details)) {
-				reconciledRuleNames.add(ruleName);
+				reconciledRuleNames.set(ruleName, messageCount ?? this.#ttsrManager.getMessageCount());
 			}
 		}
 		if (reconciledRuleNames.size > 0) {
@@ -11088,9 +11091,13 @@ export class AgentSession {
 			for (const record of this.#ttsrManager.getInjectedRecords()) {
 				existingRecords.add(record.name);
 			}
-			const namesToReconcile = Array.from(reconciledRuleNames).filter(name => !existingRecords.has(name));
+			const namesToReconcile = Array.from(reconciledRuleNames.keys()).filter(name => !existingRecords.has(name));
 			if (namesToReconcile.length > 0) {
-				this.#ttsrManager.markInjectedByNames(namesToReconcile);
+				// Use the original message count for each rule to preserve the after-gap checkpoint.
+				for (const name of namesToReconcile) {
+					const messageCount = reconciledRuleNames.get(name) ?? this.#ttsrManager.getMessageCount();
+					this.#ttsrManager.markInjectedByNamesAt([name], messageCount);
+				}
 			}
 		}
 	}
@@ -11358,12 +11365,13 @@ export class AgentSession {
 						// retry in memory; a committed append requires marking to suppress repeat-gap intervals,
 						// but we do not persist a marker since the session may be reopened without the
 						// in-memory appended message.
+						const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
 						this.agent.appendMessage({
 							role: "custom",
 							customType: "ttsr-injection",
 							content: injection.content,
 							display: false,
-							details,
+							details: { ...details, messageCount: ttsrMessageCount },
 							attribution: "agent",
 							timestamp: Date.now(),
 						});
@@ -11522,12 +11530,13 @@ export class AgentSession {
 					this.#settledToolTtsrReminders.clear();
 				}
 				if (injection && details) {
+					const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
 					this.agent.appendMessage({
 						role: "custom",
 						customType: "ttsr-injection",
 						content: injection.content,
 						display: false,
-						details,
+						details: { ...details, messageCount: ttsrMessageCount },
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
