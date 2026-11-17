@@ -213,10 +213,10 @@ describe("AuthStorage api-key login replacement", () => {
 			expect(local.listAuthCredentials(provider)).toEqual([]);
 			const dispatched = Promise.withResolvers<void>();
 			const pending = invoke({
-				async withCredentialCommit(commit) {
+				async withCredentialCommit<T>(commit: () => T | Promise<T>): Promise<T> {
 					events.push("admit");
 					const future = commit();
-					expect(future).toBe(response.promise);
+					expect(future).toBe(response.promise as unknown as T | Promise<T>);
 					dispatched.resolve();
 					const result = await future;
 					events.push("remote-settled");
