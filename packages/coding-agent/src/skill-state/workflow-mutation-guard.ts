@@ -2212,8 +2212,15 @@ function collectInterpreterOneLinerWrites(
 				if (!equalsFormOption) {
 					// Words the shell still expands, substitutes, or globs (`$'...'`, `$(...)`,
 					// backticks, `*`, `?`, `[`) stay opaque here: keep scanning past a later `--`
-					// instead of assuming the shell produced a plain operand.
-					if (flagWord.startsWith("-") || /[$`*?[]/.test(flagWord) || shellWordHasExpansion(part)) {
+					// instead of assuming the shell produced a plain operand. Check the original shell word
+					// `words[index]` for unquoted glob characters, not the dequoted `flagWord`, so that quoted
+					// globs like `--require="[a-z]"` are treated as literal strings, not glob patterns.
+					const originalWord = words[index] ?? part;
+					if (
+						flagWord.startsWith("-") ||
+						hasUnquotedGlobCharacters(originalWord) ||
+						shellWordHasExpansion(originalWord)
+					) {
 						sawUnmodeledOption = true;
 					}
 					continue;
@@ -2968,6 +2975,47 @@ function shellWordHasExpansion(word: string): boolean {
 		else if (character === "$" || character === "`") return true;
 	}
 	return quote !== null;
+}
+
+/**
+ * True when the word contains unquoted glob characters (`*`, `?`, `[`) that the shell
+ * would expand before the word reaches the binary. Quoted glob characters are literal
+ * and do not cause shell expansion.
+ */
+function hasUnquotedGlobCharacters(word: string): boolean {
+	let quote: "'" | '"' | null = null;
+	for (let index = 0; index < word.length; index++) {
+		const character = word[index] ?? "";
+		if (quote === "'") {
+			// Single-quoted strings: no escaping, everything is literal
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			// Double-quoted strings: backslash escaping applies
+			if (character === "\\") {
+				index++; // Skip the escaped character
+				continue;
+			}
+			if (character === '"') {
+				quote = null;
+			}
+			// Inside double quotes, glob chars are literal
+			continue;
+		}
+		// Outside quotes
+		if (character === "\\") {
+			index++; // Skip the escaped character
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+		} else if (character === "*" || character === "?" || character === "[") {
+			// Unquoted glob character
+			return true;
+		}
+	}
+	return false;
 }
 
 function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: boolean } {
