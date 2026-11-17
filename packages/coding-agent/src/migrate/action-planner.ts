@@ -244,6 +244,25 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	}
 
 	// 1b. Hook commands: one generated module per source that has importable events.
+	// Check if the hooks directory root is safe before attempting to generate modules.
+	interface HooksRootStatus {
+		unsafe: boolean;
+		isSymlink: boolean;
+		error?: unknown;
+	}
+	const hooksRootStatus: HooksRootStatus = { unsafe: false, isSymlink: false };
+	try {
+		const rootStat = await fs.lstat(input.destinations.hooksDir);
+		if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+			hooksRootStatus.unsafe = true;
+			hooksRootStatus.isSymlink = rootStat.isSymbolicLink();
+		}
+	} catch (error) {
+		if (!isEnoent(error)) {
+			hooksRootStatus.error = error;
+		}
+	}
+
 	for (const result of input.results) {
 		const importable = result.hookCandidates.filter(candidate => isSupportedHookEvent(candidate.event));
 		const unsupported = result.hookCandidates.filter(candidate => !isSupportedHookEvent(candidate.event));
@@ -260,27 +279,79 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		const source = importable[0]?.source;
 		if (importable.length === 0 || !source) continue;
 		const destination = path.join(input.destinations.hooksDir, `migrated-${source}.ts`);
-		const content = renderHookModule(source, importable);
-		let exists = false;
-		let unsafe = false;
-		try {
-			const stat = await fs.lstat(destination);
-			exists = true;
-			unsafe = !stat.isFile() || stat.isSymbolicLink();
-		} catch (error) {
-			if (!isEnoent(error)) {
+
+		// If the hooks root is unsafe, fail or skip based on force flag.
+		if (hooksRootStatus.unsafe) {
+			if (!input.force) {
+				actions.push({
+					source,
+					type: "hook",
+					name: path.basename(destination),
+					destination,
+					operation: "skip",
+					status: "skipped_exists",
+					reason: "hook destination root is not a real directory",
+				});
+			} else {
 				actions.push({
 					source,
 					type: "hook",
 					name: path.basename(destination),
 					destination,
 					operation: "fail",
-					status: "failed_io",
-					reason: `failed to inspect destination: ${(error as Error).message}`,
+					status: "failed_invalid_destination",
+					reason: "hook destination root is not a real directory; refusing to write",
 				});
-				continue;
+			}
+			continue;
+		}
+
+		// If we encountered a non-ENOENT error reading the hooks directory, report it.
+		if (hooksRootStatus.error) {
+			actions.push({
+				source,
+				type: "hook",
+				name: path.basename(destination),
+				destination,
+				operation: "fail",
+				status: "failed_io",
+				reason: `failed to inspect hooks directory: ${(hooksRootStatus.error as Error).message}`,
+			});
+			continue;
+		}
+
+		const content = renderHookModule(source, importable);
+		let exists = false;
+		let unsafe = false;
+		let destinationError: unknown;
+		try {
+			const stat = await fs.lstat(destination);
+			exists = true;
+			unsafe = !stat.isFile() || stat.isSymbolicLink();
+		} catch (error) {
+			if (!isEnoent(error)) {
+				destinationError = error;
 			}
 		}
+
+		// Distinguish between "file exists but isn't a regular file" and "can't write to parent directory."
+		if (destinationError) {
+			const errorMsg = (destinationError as Error).message;
+			const isParentProblem = errorMsg.includes("ENOTDIR") || errorMsg.includes("EACCES");
+			actions.push({
+				source,
+				type: "hook",
+				name: path.basename(destination),
+				destination,
+				operation: "fail",
+				status: isParentProblem ? "failed_invalid_destination" : "failed_io",
+				reason: isParentProblem
+					? "hook destination ancestor is not a directory"
+					: `failed to inspect destination: ${errorMsg}`,
+			});
+			continue;
+		}
+
 		if (unsafe) {
 			actions.push({
 				source,
