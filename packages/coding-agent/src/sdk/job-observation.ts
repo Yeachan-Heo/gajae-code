@@ -269,7 +269,10 @@ export class JobObservation {
 		const promise = this.#manager.getJobPromise(target.id, target.generation);
 		if (!promise) return undefined;
 		const execution: ObservedExecution = { promise, settled: false };
-		this.#executions.set(target.generation, { target: { ...target }, execution });
+		this.#executions.set(target.generation, {
+			target: { id: target.id, generation: target.generation },
+			execution,
+		});
 		void promise.then(
 			() => {
 				execution.settled = true;
