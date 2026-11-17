@@ -287,6 +287,12 @@ export class ToolCallHealer {
 	}
 }
 
+/**
+ * Upper bound for a recognized-but-unterminated DSML tag. Real tags carry only
+ * a short name plus `name="..."`/`string="..."` attributes.
+ */
+const MAX_DSML_TAG_HOLD = 512;
+
 const DSML_TAG_PREFIXES = [
 	{ prefix: "</｜DSML｜", closing: true },
 	{ prefix: "</|DSML|", closing: true },
@@ -390,29 +396,19 @@ export class DsmlToolCallHealer {
 			if (this.#buffer[this.#offset] === "<") {
 				const tag = this.#parseTag();
 				if (tag === "partial") {
-					// Check if this is a valid DSML tag prefix or malformed.
-					const remaining = this.#remaining();
-					let isValidPrefix = false;
-					for (const candidate of DSML_TAG_PREFIXES) {
-						if (remaining.startsWith(candidate.prefix)) {
-							isValidPrefix = true;
-							break;
-						}
-					}
-					// Only apply MAX_PARTIAL_HOLD to non-DSML prefixes (malformed tags).
-					// Valid DSML tags can legitimately be longer.
-					if (!isValidPrefix && remaining.length > MAX_PARTIAL_HOLD) {
-						// Malformed/unknown tag: emit the '<' as text.
-						const ch = this.#buffer[this.#offset]!;
-						this.#offset += 1;
-						if (this.#inCall) {
-							this.#pendingValue += ch;
-						} else {
-							clean += ch;
-						}
+					// A recognized DSML prefix may legitimately span chunks, but its tag
+					// body is short; an unterminated one must not hide the rest of the
+					// stream. Past the bound, outside an invocation the '<' is prose;
+					// inside one the call is malformed and must not execute.
+					const limit = this.#isRecognizedPrefix() ? MAX_DSML_TAG_HOLD : MAX_PARTIAL_HOLD;
+					if (this.#remaining().length <= limit) break;
+					const ch = this.#buffer[this.#offset]!;
+					this.#offset += 1;
+					if (this.#inCall) {
+						this.#incomplete = true;
+						this.#pendingValue += ch;
 					} else {
-						// Legitimate partial or valid DSML prefix: wait for more input.
-						break;
+						clean += ch;
 					}
 					continue;
 				}
@@ -440,6 +436,11 @@ export class DsmlToolCallHealer {
 		}
 
 		return clean;
+	}
+
+	#isRecognizedPrefix(): boolean {
+		const remaining = this.#remaining();
+		return DSML_TAG_PREFIXES.some(candidate => remaining.startsWith(candidate.prefix));
 	}
 
 	/** Returns "partial" when the remaining bytes could still become a DSML tag. */
@@ -531,7 +532,13 @@ export class DsmlToolCallHealer {
 			return;
 		}
 
-		if (tag.kind !== "parameter" || !this.#inCall) return;
+		if (tag.kind === "unknown") {
+			// Unknown DSML markup inside an invocation would otherwise vanish and splice
+			// the surrounding argument text; the altered call must not execute.
+			if (this.#inCall) this.#incomplete = true;
+			return;
+		}
+		if (!this.#inCall) return;
 		if (!tag.closing) {
 			// A parameter opening inside another is malformed: the call must not execute.
 			if (this.#inParameter) this.#incomplete = true;

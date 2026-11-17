@@ -300,4 +300,51 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(calls[0].name).toBe("bash");
 		expect(JSON.parse(calls[0].arguments)).toEqual({ command: "pwd" });
 	});
+
+	it("rejects a call whose argument contained unknown DSML markup", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="command" string="true">rm -rf /tmp/a<｜DSML｜note>b</｜DSML｜parameter>' +
+				"</｜DSML｜invoke>" +
+				"</｜DSML｜tool_calls>",
+		);
+
+		expect(clean).toBe("");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		// Without the marker the argument would silently become "rm -rf /tmp/ab".
+		expect(calls[0].incomplete).toBe(true);
+	});
+
+	it("keeps unknown DSML markup outside an invocation as visible text", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed("see <｜DSML｜note> here");
+		expect(clean).toBe("see <｜DSML｜note> here");
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("releases prose after an unterminated recognized DSML prefix without waiting for completion", () => {
+		const healer = new DsmlToolCallHealer();
+		const prose = "x".repeat(600);
+		const clean = healer.feed(`Intro <｜DSML｜${prose}`);
+		expect(clean.startsWith("Intro <｜DSML｜")).toBe(true);
+		expect(clean.length).toBeGreaterThan(600);
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("fails an invocation closed when a recognized prefix inside it never terminates", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="command" string="true">pwd' +
+				`<｜DSML｜${"y".repeat(600)}` +
+				"</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+		);
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].incomplete).toBe(true);
+	});
 });

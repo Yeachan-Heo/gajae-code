@@ -114,6 +114,7 @@ import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/t
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
+	requestedToolChoiceLevel,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
 import { ToolFenceStripper } from "../utils/tool-fence-strip";
@@ -1388,12 +1389,18 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (trailing.length > 0) appendTextDelta(trailing);
 				collectHealedToolCalls();
 
-				// Recovered calls obey the effective tool choice that was actually sent to the API,
-				// including any injected tool_choice from compat.extraBody. `none` admits nothing,
-				// a named choice admits only that tool.
-				const { requestLevel, targetToolName } = extractToolChoiceLevel(effectiveToolChoice);
+				// Recovered calls obey both the caller's logical tool choice and the choice
+				// actually sent. Hosts that cannot express tool_choice omit the wire field,
+				// so the logical request must still gate content-recovered calls. `none` on
+				// either side admits nothing; a named choice on either side admits only it.
+				const wireChoice = extractToolChoiceLevel(effectiveToolChoice);
+				const logicalChoice = requestedToolChoiceLevel(options?.toolChoice);
+				const allowedNames = [wireChoice.targetToolName, logicalChoice.targetToolName].filter(
+					(name): name is string => name !== undefined,
+				);
+				const rejectAll = wireChoice.requestLevel === "none" || logicalChoice.requestedLevel === "none";
 				const allowedRecoveredCalls = recoveredCalls.filter(
-					call => requestLevel !== "none" && (targetToolName === undefined || call.name === targetToolName),
+					call => !rejectAll && allowedNames.every(name => call.name === name),
 				);
 
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");

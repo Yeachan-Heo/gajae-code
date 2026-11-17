@@ -202,6 +202,48 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "read" } }))).toHaveLength(1);
 	});
 
+	it("applies the caller's tool choice to recovered calls when the host cannot express tool_choice", async () => {
+		const noToolChoiceModel: Model<"openai-completions"> = {
+			...model,
+			id: "deepseek-v4-no-tool-choice",
+			compat: { supportsToolChoice: false },
+		};
+		const deltas: Delta[] = [
+			{ content: `${wrapperStart}${invocationStart}src/index.ts${invocationEnd}${wrapperEnd}` },
+		];
+		const run = async (toolChoice: OpenAICompletionsOptions["toolChoice"]) => {
+			const events = [...deltas, {}].map((delta, index) => ({
+				id: "chatcmpl-dsml",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: noToolChoiceModel.id,
+				choices: [{ index: 0, delta, finish_reason: index === deltas.length ? "stop" : null }],
+			}));
+			const payload = `${events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+			let sentToolChoice: unknown = "unset";
+			global.fetch = Object.assign(
+				async (_input: unknown, init?: RequestInit) => {
+					sentToolChoice = JSON.parse(String(init?.body ?? "{}")).tool_choice;
+					return new Response(payload, { headers: { "content-type": "text/event-stream" } });
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+			const result = await streamOpenAICompletions(
+				noToolChoiceModel,
+				{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }] },
+				{ apiKey: "test", toolChoice },
+			).result();
+			expect(result.stopReason).not.toBe("error");
+			// The wire request omits tool_choice, so only the logical request can gate recovery.
+			expect(sentToolChoice).toBeUndefined();
+			return tools(result);
+		};
+		expect(await run("none")).toHaveLength(0);
+		expect(await run({ type: "tool", name: "write" })).toHaveLength(0);
+		expect(await run({ type: "tool", name: "read" })).toHaveLength(1);
+		expect(await run(undefined)).toHaveLength(1);
+	});
+
 	it("uses effective tool_choice from compat.extraBody when no explicit tool_choice is set", async () => {
 		// When compat.extraBody.tool_choice is 'none' and options.toolChoice is not set,
 		// the effective tool_choice becomes 'none', and recovered DSML calls should not be admitted.
