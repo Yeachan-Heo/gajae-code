@@ -39,7 +39,10 @@ const unavailableInteraction =
 export interface ManagedSessionOptions {
 	agentDir: string;
 	cwd: string;
+	/** Stable desktop catalog row identity. */
 	id: string;
+	/** Current transcript/router identity; native commits can rotate it without re-keying the row. */
+	sessionId?: string;
 	projectId: string;
 	title: string;
 	starred: boolean;
@@ -63,6 +66,7 @@ export interface ManagedSessionOptions {
 /** A demanding SDK client, never a transcript writer or an owner of the terminal process. */
 export class ManagedSession {
 	readonly #options: ManagedSessionOptions;
+	readonly #sessionId: string;
 	readonly #router: sdkRouter.SessionRouter;
 	#attachment?: sdkRouter.SessionAttachment;
 	#controlEpoch: number | null = null;
@@ -81,6 +85,7 @@ export class ManagedSession {
 
 	constructor(options: ManagedSessionOptions) {
 		this.#options = options;
+		this.#sessionId = options.sessionId ?? options.id;
 		this.#title = options.title;
 		const onFrame = (_attachment: sdkRouter.SessionAttachment, frame: sdkRouter.SessionRouterFrame) => {
 			if (!["query_response", "control_response", "hello", "pong", "protocol_error"].includes(frame.name ?? ""))
@@ -90,7 +95,7 @@ export class ManagedSession {
 			options.createRouter?.(onFrame) ??
 			new sdkRouter.SessionRouter({
 				agentDir: options.agentDir,
-				sessionIds: [options.id],
+				sessionIds: [this.#sessionId],
 				deps: {
 					onFrame,
 					onAttachmentReady: () => this.#scheduleRefresh(),
@@ -111,7 +116,8 @@ export class ManagedSession {
 	}
 
 	async open(): Promise<void> {
-		const { id, cwd, agentDir } = this.#options;
+		const { cwd, agentDir } = this.#options;
+		const id = this.#sessionId;
 		const lifecycle = this.#options.lifecycle ?? new sdkLifecycle.AgentDirSessionLifecycleService(agentDir);
 		const listed = await lifecycle.list({
 			actor,
@@ -158,7 +164,7 @@ export class ManagedSession {
 			this.#closed ||
 			this.#attachment !== attachment ||
 			!attachment.isCurrent() ||
-			this.#router.attachment(this.#options.id) !== attachment
+			this.#router.attachment(this.#sessionId) !== attachment
 		)
 			throw new sdkRouter.SessionRouterError(
 				"pre_send",
@@ -172,7 +178,7 @@ export class ManagedSession {
 			this.#controlEpoch === completion.desktopEpoch &&
 			this.#attachment === completion.attachment &&
 			completion.attachment.isCurrent() &&
-			this.#router.attachment(this.#options.id) === completion.attachment
+			this.#router.attachment(this.#sessionId) === completion.attachment
 		);
 	}
 
@@ -202,7 +208,7 @@ export class ManagedSession {
 		if (this.#closed) throw new Error("Desktop session is detached");
 		// Queries can synchronize a new binding. Writes belong to the exact snapshot
 		// the client saw, never whichever owner the router happens to find next.
-		const attachment = type === "control_request" ? this.#attachment : this.#router.attachment(this.#options.id);
+		const attachment = type === "control_request" ? this.#attachment : this.#router.attachment(this.#sessionId);
 		const controlEpoch = this.#controlEpoch;
 		if (!attachment) throw new Error("SDK owner is unavailable");
 		const assertAttachment = () => {
@@ -218,7 +224,7 @@ export class ManagedSession {
 		};
 		assertAttachment();
 		const response = await this.#router.request(
-			this.#options.id,
+			this.#sessionId,
 			{
 				type,
 				id: crypto.randomUUID(),
@@ -251,9 +257,9 @@ export class ManagedSession {
 		const cursors = new Set<string>();
 		let frame: Record<string, unknown> = { type: "query_request", query, input, id: crypto.randomUUID() };
 		for (let count = 0; count < 10_000; count++) {
-			const attachment = this.#router.attachment(this.#options.id);
+			const attachment = this.#router.attachment(this.#sessionId);
 			if (!attachment) throw new Error("SDK owner is unavailable");
-			const response = await this.#router.request(this.#options.id, frame, attachment.generation, attachment);
+			const response = await this.#router.request(this.#sessionId, frame, attachment.generation, attachment);
 			if (response.ok !== true)
 				throw new Error(`SDK ${query}: ${String(record(response.error)?.code ?? "invalid_response")}`);
 			const page = record(response.page);
@@ -319,7 +325,7 @@ export class ManagedSession {
 		try {
 			{
 				this.#dirty = false;
-				const attached = this.#router.attachment(this.#options.id);
+				const attached = this.#router.attachment(this.#sessionId);
 				if (!attached) throw new Error("SDK owner is unavailable");
 				const captured = record((await this.#request("query_request", "session.checkpoint")).result);
 				const checkpoint = record(captured?.checkpoint);
@@ -334,7 +340,7 @@ export class ManagedSession {
 				if (checkpoint.generation !== attached.generation) throw new Error("SDK checkpoint owner changed");
 				const entries = await this.#rows("transcript.list", { checkpointToken: captured.checkpointToken });
 				const metadata = record((await this.#rows("session.metadata"))[0]);
-				if (metadata?.sessionId !== this.#options.id) throw new Error("SDK metadata identity mismatch");
+				if (metadata?.sessionId !== this.#sessionId) throw new Error("SDK metadata identity mismatch");
 				const models = await this.#rows("models.list/current");
 				const gates = await this.#rows("workflow.gates.list");
 				if (!attached.isCurrent() || this.#closed) throw new Error("SDK owner changed during snapshot");
@@ -620,7 +626,7 @@ export class ManagedSession {
 			this.#controlEpoch === controlEpoch &&
 			controlEpoch === sessionGeneration &&
 			attachment.isCurrent() &&
-			this.#router.attachment(this.#options.id) === attachment;
+			this.#router.attachment(this.#sessionId) === attachment;
 		if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
 		await this.refresh();
 		if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
