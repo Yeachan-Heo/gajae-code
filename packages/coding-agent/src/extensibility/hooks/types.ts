@@ -560,6 +560,13 @@ export interface HookAPI {
 	 *
 	 * For messages that SHOULD be sent to the LLM, use sendMessage() instead.
 	 *
+	 * On a shared-append session the entry is published best-effort: the call returns
+	 * immediately and the write lands in the background in call order. A refused or
+	 * unconfirmed write is reported as a `session-publication` operator warning and is
+	 * never retried automatically, so a hook that needs a guarantee should re-read the
+	 * transcript or report the loss to the user. Deferred command results are the only
+	 * publications that keep a retry queue slot.
+	 *
 	 * @param customType - Identifier for your hook (used for filtering on reload)
 	 * @param data - Hook-specific data to persist (must be JSON-serializable)
 	 *

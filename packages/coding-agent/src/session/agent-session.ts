@@ -600,6 +600,7 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 	SharedAppendOutcome,
+	SharedAppendReconciliation,
 	SharedControlEntry,
 	SharedEntriesAppendOutcome,
 } from "./session-manager";
@@ -646,6 +647,55 @@ type SessionPersistedMessage =
 	| BashExecutionMessage
 	| PythonExecutionMessage
 	| FileMentionMessage;
+
+/** A deferred command result whose shared publication could not be proven durable or absent. */
+interface UnresolvedExecutionPublication {
+	readonly entryId: string;
+	readonly reason: string;
+	/** The failure that left the outcome undecided; kept for diagnostics, never retried. */
+	readonly error: unknown;
+}
+
+/**
+ * Stable operator-facing reason for a failed publication.
+ *
+ * Raw causes, internal stale-reason codes, and attempted entry ids stay in the structured
+ * log and the publication result; the user-facing notice names only what happened.
+ */
+type SharedPublicationObstacle =
+	| "session-switched"
+	| "transcript-changed"
+	| "write-refused"
+	| "write-failed"
+	| "transcript-limit"
+	| "unreadable-transcript";
+
+/**
+ * The transcript a queued publication was scheduled against.
+ *
+ * The manager instance alone is not enough: session switches rotate the same manager, and
+ * `setSessionFile` can adopt another file that carries the same logical session id.
+ */
+interface PublicationOrigin {
+	readonly manager: SessionManager;
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+}
+
+/**
+ * One command result waiting for a publication slot.
+ *
+ * `unresolved` is set after reconciliation could neither find the attempted entry in the
+ * transcript nor prove it absent. Such an entry is never resubmitted: its retained id is
+ * re-read on the next explicit drain, which either acknowledges it as durable, keeps it
+ * retained, or proves it absent so the ordinary retry path may run.
+ */
+type PendingExecutionMessage<T extends BashExecutionMessage | PythonExecutionMessage> = {
+	message: T;
+	onPersisted?: () => void;
+	appendedToAgent: boolean;
+	unresolved?: UnresolvedExecutionPublication;
+};
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -1477,6 +1527,28 @@ async function awaitPromptInvocationPreflight<T>(pending: Promise<T>, signal?: A
 
 function isPromptPreflightCancelledError(error: unknown): boolean {
 	return error instanceof Error && error.name === "PromptPreflightCancelledError";
+}
+
+/**
+ * Preflight identity a shared drain re-reads before claiming a successor batch.
+ * Cancellation flips either half: an abort advances the turn generation and fires
+ * the captured admission signal.
+ */
+interface PromptPreflightIdentity {
+	readonly generation: number;
+	readonly signal: AbortSignal;
+}
+
+/**
+ * Retained owner of the pending-message drain. Concurrent callers join `promise` instead
+ * of traversing the shared queues themselves. `preflights` collects the cancellation
+ * identity of every prompt preflight publishing through this owner: the owner re-reads
+ * all of them before each claimed batch, so one cancelled preflight cannot take
+ * ownership of rows the abort already disowned.
+ */
+interface PendingPromptDrain {
+	promise: Promise<void>;
+	preflights: PromptPreflightIdentity[];
 }
 
 /** Result from a handoff operation. */
@@ -4465,11 +4537,7 @@ export class AgentSession {
 
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
-	#pendingBashMessages: Array<{
-		message: BashExecutionMessage;
-		onPersisted?: () => void;
-		appendedToAgent: boolean;
-	}> = [];
+	#pendingBashMessages: Array<PendingExecutionMessage<BashExecutionMessage>> = [];
 	/**
 	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
 	 * own turn without pausing any later turn.
@@ -4625,13 +4693,12 @@ export class AgentSession {
 	/** MCP tool names skipped because a non-MCP tool already holds them. */
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
-	#pendingPythonMessages: Array<{
-		message: PythonExecutionMessage;
-		onPersisted?: () => void;
-		appendedToAgent: boolean;
-	}> = [];
-	/** The one in-flight deferred command-result drain; later drains join it first. */
-	#executionMessageDrain: Promise<void> | undefined;
+	#pendingPythonMessages: Array<PendingExecutionMessage<PythonExecutionMessage>> = [];
+	/**
+	 * Retained owner of the pending-message drain. Concurrent callers join this owner
+	 * instead of traversing the shared queues themselves.
+	 */
+	#pendingPromptDrain: PendingPromptDrain | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -5777,6 +5844,12 @@ export class AgentSession {
 		}
 	}
 
+	#throwIfPromptPreflightDrainCancelled(preflights: readonly PromptPreflightIdentity[]): void {
+		for (const preflight of preflights) {
+			this.#throwIfPromptPreflightCancelled(preflight.generation, preflight.signal);
+		}
+	}
+
 	async #awaitPromptPreflight<T>(generation: number, signal: AbortSignal, pending: Promise<T>): Promise<T> {
 		this.#throwIfPromptPreflightCancelled(generation, signal);
 		const cancellation = Promise.withResolvers<never>();
@@ -6146,6 +6219,12 @@ export class AgentSession {
 		this.#inFlightPromptTokens.delete(token);
 		this.#abandonedInFlightPrompts.delete(token);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+		// Dropping the token changes every liveness predicate a scoped waiter polls. The
+		// abnormal exits below resolve settlement themselves, but the normal path then
+		// awaits the drain, which can stay pending behind a slow publication while the abort
+		// that aborted this turn waits on {@link #awaitAbortedTurnTerminal}: wake the waiters
+		// on the drop itself instead of only after the flush.
+		this.#wakeScopedSettlementWaiters();
 		if (wasAbandoned) {
 			this.#resolveSessionSettlement();
 			return undefined;
@@ -6205,16 +6284,87 @@ export class AgentSession {
 		return false;
 	}
 
-	async #flushPendingPromptMessages(): Promise<void> {
+	/**
+	 * Join the retained drain owner, starting one when none is in flight.
+	 *
+	 * The pending queues are shared mutable state and their per-entry publications
+	 * await. A second drain traversing them concurrently would publish the same entry
+	 * twice or splice successors out of order, so there is exactly one owner and every
+	 * caller — prompt preflight, prompt finalization, and forced recovery — joins it.
+	 * The owner is cleared only after it settles, so a caller that arrives during
+	 * settlement starts the next drain instead of observing a stale promise.
+	 *
+	 * `preflight` is the caller's own cancellation identity. Every preflight publishing
+	 * through the owner attaches it, and the owner re-reads all attached identities
+	 * before each claimed batch, so a cancellation that lands while the drain awaits a
+	 * publication stops the very next claim — including a claim of a different kind in
+	 * the same drain. A cancelled preflight unwinds as a cancellation; joiners and
+	 * finalization still drain to quiescence so a preserved successor is published
+	 * exactly once.
+	 */
+	async #flushPendingPromptMessages(preflight?: PromptPreflightIdentity): Promise<void> {
+		for (;;) {
+			// Re-read cancellation before EVERY claim, not once before the loop. The drain
+			// is unbounded by design (it keeps claiming successor batches until quiescence),
+			// so a cancelled preflight that entered it would keep publishing rows the abort
+			// already disowned, and the abort itself waits on this turn's terminal with no
+			// timeout bound. Throwing here leaves the queued rows untouched for turn
+			// finalization and later drains, exactly like the unresolved rows the failed
+			// path retains: nothing is drained, nothing is discarded.
+			if (preflight) this.#throwIfPromptPreflightCancelled(preflight.generation, preflight.signal);
+			const owner = this.#pendingPromptDrain;
+			const drain = owner?.promise ?? this.#startPendingPromptDrain(preflight);
+			if (owner && preflight && !owner.preflights.includes(preflight)) owner.preflights.push(preflight);
+			try {
+				await drain;
+			} catch (error) {
+				if (!isPromptPreflightCancelledError(error)) throw error;
+				// The shared owner stopped claiming because a preflight attached to it was
+				// cancelled. Only that preflight unwinds as a cancellation; every other caller
+				// still owes the successor batches behind it a publication, so it joins the next
+				// drain below instead of inheriting someone else's disowned claim.
+				if (preflight && this.#isPromptPreflightCancelled(preflight.generation, preflight.signal)) throw error;
+			}
+			// Another caller may have started a successor drain while this one settled;
+			// it owns entries queued after this batch, so join that one too.
+			if (this.#pendingPromptDrain && this.#pendingPromptDrain.promise !== drain) continue;
+			// The owner's settlement clears #pendingPromptDrain before joiners resume, so a
+			// row queued while it awaited would otherwise be left for the next prompt and the
+			// successor invocation would start without it. A successful drain consumed its
+			// whole batch, so anything still queued is a successor batch: become the next
+			// owner and drain it before reporting completion. Failed or unresolved rows throw
+			// above, so this loop never retries them.
+			if (this.hasPendingBashMessages || this.hasPendingPythonMessages) continue;
+			return;
+		}
+	}
+
+	#startPendingPromptDrain(preflight?: PromptPreflightIdentity): Promise<void> {
+		// A fresh array per owner identifies the owner too, so the settlement callback needs
+		// no reference to the object it is clearing.
+		const preflights: PromptPreflightIdentity[] = preflight ? [preflight] : [];
+		const promise = this.#drainPendingPromptMessages(preflights).finally(() => {
+			if (this.#pendingPromptDrain?.preflights === preflights) this.#pendingPromptDrain = undefined;
+		});
+		this.#pendingPromptDrain = { promise, preflights };
+		return promise;
+	}
+
+	async #drainPendingPromptMessages(preflights: readonly PromptPreflightIdentity[]): Promise<void> {
 		const errors: unknown[] = [];
 		try {
-			await this.#flushPendingBashMessages();
+			await this.#flushPendingBashMessages(preflights);
 		} catch (error) {
+			// A cancellation is the owner's whole reason to stop, not a failed batch: it must
+			// not be merged into the aggregate below, which other callers treat as a real
+			// publication failure, and no later kind may be claimed for the cancelled preflight.
+			if (isPromptPreflightCancelledError(error)) throw error;
 			errors.push(error);
 		}
 		try {
-			await this.#flushPendingPythonMessages();
+			await this.#flushPendingPythonMessages(preflights);
 		} catch (error) {
+			if (isPromptPreflightCancelledError(error)) throw error;
 			errors.push(error);
 		}
 		try {
@@ -8394,6 +8544,28 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Run a durable publication inside the canonical scheduling lane.
+	 *
+	 * The reservation is synchronous, so the publication keeps the order of the call that
+	 * produced it rather than the order in which the cross-process lease happens to become
+	 * free. The managed lease is exclusion only: it cannot stop a newer publication from
+	 * acquiring it first and appending newer state ahead of an older queued entry. Joining
+	 * the lane's predecessor before the lease is acquired is what preserves call order;
+	 * the slot is released after the publication settles.
+	 */
+	#withCanonicalSchedulingLane<T>(body: () => Promise<T>): Promise<T> {
+		const { predecessor, release } = this.#reserveCanonicalSchedulingSlot();
+		return (async () => {
+			try {
+				if (!predecessor.released) await predecessor.promise;
+				return await body();
+			} finally {
+				release();
+			}
+		})();
+	}
+
 	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
 		this.#thinkingControlAdmissionGroup ??= {
 			...this.#reserveCanonicalSchedulingSlot(),
@@ -9203,10 +9375,10 @@ export class AgentSession {
 				try {
 					let appendedEntryId: string;
 					if (sharedAppend) {
-						const outcome = await this.sessionManager.appendMessageSharingSession(event.message);
+						const outcome = await this.#appendMessageAtAdmittedCursor(event.message);
 						if (outcome.kind !== "committed") {
 							throw new Error(
-								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 								{ cause: outcome },
 							);
 						}
@@ -9217,29 +9389,45 @@ export class AgentSession {
 					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
 					canonicalAdmission?.fail(error);
-					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
-					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
 					// structured tool-result outcome stating that and the exact
-					// continuation path instead of a generic fatal abort. The typed
-					// error already performed deterministic recovery, so the session is
-					// not poisoned and the turn ends with actionable state.
-					if (error instanceof SessionNearLimitAppendError) {
+					// continuation path instead of a generic fatal abort. A legacy append
+					// already performed deterministic recovery, so its session is not
+					// poisoned; a shared append could not run that rewrite, so the branch
+					// below states the uncertainty instead of promising persistence.
+					// A shared append reports this as an `unknown` outcome and wraps it in a
+					// generic publication error, so it must be recognised before the shared
+					// abort. A shared append must not enter the legacy todo recovery path or
+					// authorise a rewrite: the shared rewrite bar is what refused the recovery,
+					// so the typed error's "persists on the next successful write" promise does
+					// not hold there, and the retained receipt stays resident in this process
+					// only. A legacy append still runs that deterministic recovery, so its
+					// guidance keeps the original wording.
+					const nearLimit = sharedAppendNearLimitError(error);
+					if (nearLimit) {
 						this.agent.abort();
 						if (event.message.role === "toolResult") {
 							event.message.isError = true;
-							const committed = error.entryRetained
-								? "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
+							const committed = nearLimit.entryRetained
+								? sharedAppend
+									? "The edit committed and its receipt is retained only in this live session; it is not durable and is lost if the session ends before a later write succeeds."
+									: "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
 								: "The edit committed on disk but its receipt could not be retained in the live session.";
+							// A shared session is past its per-file cap and refuses the only rewrite that
+							// could reclaim room, so naming compaction or `/clear` here would be dead
+							// guidance: both need an append or rewrite this session refuses.
+							const guidance = sharedAppend
+								? "No in-session recovery is available: the transcript cannot grow, and both compaction and `/clear` need the shared publication this session refuses. Re-verify the edited file before relying on it."
+								: `To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`;
 							event.message.content = [
 								{
 									type: "text",
 									text: [
 										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
 										committed,
-										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`,
+										guidance,
 									].join("\n"),
 								},
 							];
@@ -9249,17 +9437,24 @@ export class AgentSession {
 									: {}),
 								failureKind: "persistence",
 								nearLimitAppend: {
-									code: error.code,
-									entryBytes: error.entryBytes,
-									liveBytes: error.liveBytes,
-									capBytes: error.capBytes,
-									entryRetained: error.entryRetained,
+									code: nearLimit.code,
+									entryBytes: nearLimit.entryBytes,
+									liveBytes: nearLimit.liveBytes,
+									capBytes: nearLimit.capBytes,
+									entryRetained: nearLimit.entryRetained,
 								},
 							};
 							this.agent.touchContext();
+							// The canonical block above is the only place this result is persisted, and
+							// the transcript refused it, so this emission is the operator's only view of
+							// the structured outcome. Returning without it delivers the guidance to the
+							// agent state and the model but never to session subscribers.
+							await this.#emitSessionEvent(event, eventLease);
 						}
 						return;
 					}
+					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
+					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					if (
 						event.message.role !== "toolResult" ||
 						event.message.toolName !== "todo_write" ||
@@ -11015,7 +11210,9 @@ export class AgentSession {
 			}
 			// This runs inside the synchronous agent listener entry: a failed record
 			// write must not abort canonical handling of the published result. The
-			// reminder was delivered, so the claim stays consumed in memory.
+			// reminder was delivered, so the claim stays consumed in memory. A shared
+			// session refuses the legacy append once admission is armed, so it publishes
+			// the marker through the admitted path instead of logging a routine failure.
 			try {
 				this.sessionManager.appendTtsrInjection(ruleNames, records, ttsrMessageCount);
 			} catch (error) {
@@ -16946,7 +17143,7 @@ export class AgentSession {
 		);
 		if (outcome.kind !== "committed") {
 			throw new Error(
-				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 				{ cause: outcome },
 			);
 		}
@@ -16963,17 +17160,60 @@ export class AgentSession {
 	 */
 	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
 		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendCustomEntry(customType, data);
-		const outcome = await this.sessionManager.appendCustomEntrySharingSession(customType, data);
+		const outcome = await this.#publishAtAwaitedOrigin(() =>
+			this.#appendCustomEntryAtAdmittedCursor(customType, data),
+		);
 		assertSharedAppendCommitted(`Shared ${customType} entry append`, outcome);
 		return outcome.id;
+	}
+
+	/**
+	 * Publish an additive entry from a producer that does not own the canonical lane.
+	 *
+	 * Slash commands, extension callbacks, and detached post-prompt tasks publish while
+	 * background producers may already be waiting behind a lane predecessor. The
+	 * cross-process lease is exclusion only, so without this reservation a newer awaited
+	 * publication acquires it while an older queued entry still waits and commits first.
+	 * Reserving here keeps the order of the call that produced the entry.
+	 *
+	 * Canonical handlers already own a lane admission and must call the
+	 * `*AtAdmittedCursor` helpers instead: reserving again from inside the lane would wait
+	 * for its own predecessor and deadlock. The origin is re-checked under the lane so a
+	 * publication that outlived a session switch is refused rather than appended to the
+	 * successor transcript.
+	 */
+	async #publishAtAwaitedOrigin<T>(publish: () => Promise<T>): Promise<T> {
+		const origin = this.#capturePublicationOrigin();
+		return await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(async () => {
+				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				return await publish();
+			}),
+		);
+	}
+
+	/** Publish at this opener's admitted cursor; the caller already owns the canonical lane. */
+	#appendCustomEntryAtAdmittedCursor<T = unknown>(customType: string, data?: T): Promise<SharedAppendOutcome> {
+		return this.sessionManager.appendCustomEntrySharingSession(customType, data);
+	}
+
+	/** Publish at this opener's admitted cursor; the caller already owns the canonical lane. */
+	#appendMessageAtAdmittedCursor(message: SessionPersistedMessage): Promise<SharedAppendOutcome> {
+		return this.sessionManager.appendMessageSharingSession(message);
+	}
+
+	/** Publish at this opener's admitted cursor; the caller already owns the canonical lane. */
+	#appendSessionRecapAtAdmittedCursor(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
+		return this.sessionManager.appendSessionRecapSharingSession(input);
 	}
 
 	/**
 	 * Publish a custom entry from a synchronous call site.
 	 *
 	 * A shared-append session publishes through its admitted path in the background and
-	 * logs a refusal, because such a caller cannot await a transaction and a refusal must
-	 * not abort its turn. The legacy form throws inline exactly as before.
+	 * reports a refusal or an unconfirmed outcome to the operator, because such a caller
+	 * cannot await a transaction and a refusal must not abort its turn. The legacy form
+	 * throws inline exactly as before.
 	 */
 	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
 		if (!this.#usesSharedSessionPublication()) {
@@ -16993,7 +17233,7 @@ export class AgentSession {
 	/** Publish a message at this opener's admitted branch cursor. */
 	async appendMessageForSession(message: SessionPersistedMessage): Promise<string> {
 		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendMessage(message);
-		const outcome = await this.sessionManager.appendMessageSharingSession(message);
+		const outcome = await this.#publishAtAwaitedOrigin(() => this.#appendMessageAtAdmittedCursor(message));
 		assertSharedAppendCommitted("Shared message append", outcome);
 		return outcome.id;
 	}
@@ -17001,7 +17241,21 @@ export class AgentSession {
 	/** Publish a session recap at this opener's admitted branch cursor. */
 	async appendSessionRecapForSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
 		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendSessionRecap(input);
-		return this.sessionManager.appendSessionRecapSharingSession(input);
+		return await this.#publishAtAwaitedOrigin(() => this.#appendSessionRecapAtAdmittedCursor(input));
+	}
+
+	/**
+	 * Admission for a caller whose only durable effect is an additive append.
+	 *
+	 * A shared-append session publishes these through the shared lease, so the permanent
+	 * legacy-append bar does not apply: the publication adds one entry at this opener's
+	 * admitted cursor and never rewrites the graph. Only a genuinely legacy session runs
+	 * the legacy preflight. Callers must still persist through the `*ForSession` or
+	 * `*InBackground` seam; this only decides whether the caller may start its side effects.
+	 */
+	assertAdditiveMutationAllowed(operation: string): void {
+		if (this.#usesSharedSessionPublication()) return;
+		this.sessionManager.assertLegacyMutationAllowed(operation);
 	}
 
 	/** Publish a label change from a synchronous call site. */
@@ -17029,29 +17283,65 @@ export class AgentSession {
 	/**
 	 * Run one background publication.
 	 *
-	 * Returns the real outcome: `false` means nothing was committed, and the caller must
-	 * treat the entry as not persisted. A refusal never throws into the turn (a synchronous
-	 * producer cannot await a transaction and must not abort the run), so the cause is
-	 * logged here with the operation and the promise is registered for settlement joining.
-	 */
+	 * The publication reserves the canonical scheduling lane synchronously, waits for its
+	 * predecessor, and only then acquires the cross-process lease, so an older queued entry
+	 * cannot be overtaken by a newer canonical append. A refusal never throws into the turn
+	 * (a synchronous producer cannot await a transaction and must not abort the run), so the
+	 * cause is reported here and the promise is registered for settlement joining.
+	 *
+	 * `unknown` is not a refusal: the entry may have been committed before the failure that
+	 * produced the outcome. It is reconciled against the transcript first and reported as
+	 * unconfirmed when reconciliation cannot decide.
+ */
 	#publishInBackground(
 		operation: string,
 		publish: () => Promise<SharedAppendOutcome>,
 	): Promise<BackgroundPublicationResult> {
-		const task = publish()
-			.then((outcome): BackgroundPublicationResult => {
+		// Capture the transcript this publication belongs to before the lane wait. A session
+		// switch rotates the same manager, so a queued closure that read `this.sessionManager`
+		// after the wait would publish predecessor state into the successor transcript.
+		const origin = this.#capturePublicationOrigin();
+		const task = this.#withCanonicalSchedulingLane(async (): Promise<BackgroundPublicationResult> => {
+			if (!this.#isPublicationOriginCurrent(origin)) {
+				const reason = "the session switched before the entry was published";
+				logger.warn("Shared session publication was superseded by a session switch", { operation, cause: reason });
+				this.#reportBackgroundRefusal(operation, "session-switched");
+				return { committed: false, cause: reason };
+			}
+			try {
+				const outcome = await publish();
 				if (outcome.kind === "committed") return { committed: true };
 				const cause = describeSharedAppendFailure(outcome);
+				if (outcome.kind === "unknown") {
+					const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
+					if (reconciled.kind === "committed") return { committed: true };
+					if (reconciled.kind === "unresolved") {
+						const reason = `${cause.reason ?? cause.outcome}; durability could not be confirmed or disproved`;
+						logger.warn(
+							"Shared session append has an unknown outcome; the entry may already be in the transcript",
+							{ operation, entryId: outcome.id, cause: reason },
+						);
+						this.#reportBackgroundUncertainty(operation, "unreadable-transcript");
+						return { committed: false, durability: "unknown", entryId: outcome.id, cause: reason };
+					}
+				}
 				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
-				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
+				this.#reportBackgroundRefusal(operation, sharedAppendObstacle(outcome));
 				return { committed: false, cause: cause.reason };
-			})
-			.catch((error: unknown): BackgroundPublicationResult => {
+			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);
-				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
-				this.#reportBackgroundRefusal(operation, reason);
-				return { committed: false, cause: reason };
-			});
+				// A throw here does not prove the entry was absent: the manager may have
+				// committed it before the failure, and this catch also covers a reconciliation
+				// attempt that itself failed. Report the outcome as unconfirmed rather than
+				// claiming a refusal the transcript cannot corroborate.
+				logger.warn("Shared session append failed; whether the entry persisted is unconfirmed", {
+					operation,
+					cause: reason,
+				});
+				this.#reportBackgroundUncertainty(operation, "write-failed");
+				return { committed: false, durability: "unknown", cause: reason };
+			}
+		});
 		return this.#trackBackgroundPublication(task);
 	}
 
@@ -17061,10 +17351,36 @@ export class AgentSession {
 	 * A log line alone is not enough: an extension entry, label, todo/goal update, or
 	 * command result that never reached the transcript must be visible where the user is
 	 * looking, or it silently disappears from the next reload.
+	 *
+	 * The notice carries stable wording, not the raw cause: internal stale-reason codes,
+	 * attempted entry ids, and provider or filesystem error text stay in the structured log
+	 * and in the publication result, where a caller can act on them.
 	 */
-	#reportBackgroundRefusal(operation: string, reason: string): void {
+	#reportBackgroundRefusal(operation: string, obstacle: SharedPublicationObstacle): void {
 		if (this.#isDisposed) return;
-		this.emitNotice("warning", `Could not save the ${operation} to this session: ${reason}`, "session-publication");
+		this.emitNotice(
+			"warning",
+			`Could not save the ${operation} to this session: ${sharedPublicationObstacleText(obstacle)}.`,
+			"session-publication",
+		);
+	}
+
+	/**
+	 * Surface an unconfirmed background publication to the operator.
+	 *
+	 * Reporting a refusal here would be a lie: the entry may already be durable. Say so
+	 * explicitly instead, so the operator re-reads the transcript rather than re-creating
+	 * an entry that might already exist. The notice keeps the unconfirmed-versus-refused
+	 * distinction in its opening clause and uses stable wording for the same reason as
+	 * {@link #reportBackgroundRefusal}.
+	 */
+	#reportBackgroundUncertainty(operation: string, obstacle: SharedPublicationObstacle): void {
+		if (this.#isDisposed) return;
+		this.emitNotice(
+			"warning",
+			`Could not confirm that the ${operation} was saved to this session: ${sharedPublicationObstacleText(obstacle)}. It may already be in the transcript.`,
+			"session-publication",
+		);
 	}
 
 	/** Join a background publication at settlement time; never leaves a rejection unobserved. */
@@ -17088,6 +17404,11 @@ export class AgentSession {
 	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
 	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
 	 * `onCommitted` fires only when the entry is durable.
+	 *
+	 * The callback runs after the durable write, so its failure is neither a refusal nor a
+	 * reason to publish again. It is reported through the operator-notice seam and the
+	 * structured log, and the callback-bearing task is tracked: leaving it unobserved would
+	 * turn a throwing callback into an unhandled rejection after a successful append.
 	 */
 	#publishMessageInBackground(
 		label: string,
@@ -17099,41 +17420,116 @@ export class AgentSession {
 			onCommitted?.();
 			return Promise.resolve({ committed: true });
 		}
-		return this.#publishInBackground(label, () => this.sessionManager.appendMessageSharingSession(message)).then(
-			result => {
-				if (result.committed) onCommitted?.();
+		const publication = this.#publishInBackground(label, () => this.#appendMessageAtAdmittedCursor(message));
+		return this.#trackBackgroundPublication(
+			publication.then(result => {
+				if (result.committed) {
+					try {
+						onCommitted?.();
+					} catch (error) {
+						this.#reportBackgroundFollowUpFailure(label, error);
+					}
+				}
 				return result;
-			},
+			}),
 		);
 	}
 
 	/**
-	 * Persist one deferred command result and throw when it was not committed.
+	 * Report a completion callback that threw after its entry was already durable.
 	 *
-	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
-	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
-	 * cannot express that, so this path awaits the lease and converts every non-committed
-	 * outcome into a throw carrying the cause. An `unknown` outcome may already be durable,
-	 * so it throws a {@link SharedControlPublicationError} with code `unknown` that carries
-	 * the attempted id: the caller must never re-append it under a new id.
+	 * The entry is saved and must not be published again, so this is neither a refusal nor
+	 * an uncertainty: the operator only needs to know the follow-up step did not run.
+	 */
+	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
+		logger.warn("A durable shared publication's completion callback failed", {
+			operation,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		if (this.#isDisposed) return;
+		this.emitNotice(
+			"warning",
+			`Saved the ${operation} to this session, but its completion step failed.`,
+			"session-publication",
+		);
+	}
+
+	/** The transcript a publication was scheduled against; compared after the lane wait. */
+	#capturePublicationOrigin(): PublicationOrigin {
+		return {
+			manager: this.sessionManager,
+			sessionId: this.sessionManager.getSessionId(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+	}
+
+	#isPublicationOriginCurrent(origin: PublicationOrigin): boolean {
+		// The session id alone is not the transcript identity: `setSessionFile` can adopt a
+		// different file that carries the same logical id, and a queued publication that
+		// survives that switch would append predecessor state to the adopted transcript.
+		return (
+			this.sessionManager === origin.manager &&
+			this.sessionManager.getSessionId() === origin.sessionId &&
+			this.sessionManager.getSessionFile() === origin.sessionFile
+		);
+	}
+
+	/**
+	 * Persist one deferred command result and throw when it was not confirmed durable.
+	 *
+	 * The deferred flush must be able to tell "durably persisted" apart from "not
+	 * persisted" so it can keep the entry queued for retry and withhold `onPersisted`. A
+	 * background publish cannot express that, so this path awaits the lease in the
+	 * canonical lane and converts every non-committed outcome into a throw carrying the
+	 * cause. An `unknown` outcome is reconciled first: the entry may already be durable,
+	 * and resubmitting it would duplicate it rather than retry it.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
 		if (!this.#usesSharedSessionPublication()) {
 			this.sessionManager.appendMessage(message);
 			return;
 		}
-		const outcome = await this.#trackBackgroundPublication(this.sessionManager.appendMessageSharingSession(message));
-		if (outcome.kind !== "committed") {
-			const cause = describeSharedAppendFailure(outcome);
-			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
+		// The flush batch was taken from the predecessor queue; the lane wait can span a
+		// session switch, so the origin is captured here and re-checked under the lane.
+		const origin = this.#capturePublicationOrigin();
+		const outcome = await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(async () => {
+				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				return await this.#appendMessageAtAdmittedCursor(message);
+			}),
+		);
+		if (outcome.kind === "committed") return;
+		const cause = describeSharedAppendFailure(outcome);
+		if (outcome.kind === "unknown") {
+			const reconciled = await this.#reconcileRetainedExecutionPublication(outcome.id, outcome.error, origin);
+			if (reconciled.kind === "committed") return;
+			const reason = cause.reason ?? cause.outcome;
+			if (reconciled.kind === "unresolved") {
+				this.#reportBackgroundUncertainty(label, "unreadable-transcript");
+				throw new UnresolvedExecutionPublicationError(outcome.id, reason, outcome.error);
+			}
 		}
-		if (outcome.kind === "unknown")
-			throw new SharedControlPublicationError(`record the ${label}`, {
-				kind: "unknown",
-				ids: [outcome.id],
-				error: outcome.error,
-			});
+		this.#reportBackgroundRefusal(label, sharedAppendObstacle(outcome));
 		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
+	}
+
+	/**
+	 * Re-read a retained deferred publication's attempted id under the ordering lane.
+	 *
+	 * The id is never resubmitted: only the transcript decides whether the earlier append is
+	 * durable (`committed`), provably absent (`absent`), or still undecided (`unresolved`).
+	 */
+	async #reconcileRetainedExecutionPublication(
+		entryId: string,
+		error: unknown,
+		origin: PublicationOrigin,
+	): Promise<SharedAppendReconciliation> {
+		return await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(async () => {
+				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				return await this.sessionManager.reconcileUnknownSharedAppend(entryId, error);
+			}),
+		);
 	}
 
 	/**
@@ -17938,7 +18334,7 @@ export class AgentSession {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
 			// Retry anything whose previous post-turn persistence failed before the new prompt.
-			await this.#flushPendingPromptMessages();
+			await this.#flushPendingPromptMessages({ generation, signal: preflightSignal });
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
@@ -20579,8 +20975,9 @@ export class AgentSession {
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
 		if (hadLivePrompt) this.#releasePowerAssertion();
-		// Recovery must not block on a shared publication; the flush keeps uncommitted
-		// entries queued for a later retry and logs its own failure here instead.
+		// Recovery must not block on a shared publication; the flush keeps failed entries
+		// queued for a later retry, holds entries whose durability is unconfirmed without
+		// resubmitting them, and logs its own failure here instead.
 		void this.#flushPendingPromptMessages().catch(error => {
 			logger.warn("Failed to flush deferred prompt messages during forced recovery", { error: String(error) });
 		});
@@ -32834,8 +33231,9 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortBash() still cancels all Bash executions.
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is durable: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it.
 	 */
 	async executeBash(
 		command: string,
@@ -32989,8 +33387,8 @@ export class AgentSession {
 	 * Flush pending bash messages to agent state and session.
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
-	async #flushPendingBashMessages(): Promise<void> {
-		await this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
+	async #flushPendingBashMessages(preflights: readonly PromptPreflightIdentity[]): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash", preflights);
 	}
 
 	// =========================================================================
@@ -33004,8 +33402,9 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortEval() still cancels all Python executions.
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is durable: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it.
 	 */
 	async executePython(
 		code: string,
@@ -33156,7 +33555,10 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			void this.#publishMessageInBackground("python result", pythonMessage);
+			// `onPersisted` is the durability signal: a shared append may be refused or end
+			// with an unknown outcome, and reporting success before the entry is committed
+			// would promise a reload survival that never happened (#7815).
+			void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -33164,7 +33566,6 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
-			options?.onPersisted?.();
 		}
 	}
 
@@ -33222,8 +33623,8 @@ export class AgentSession {
 	/**
 	 * Flush pending Python messages to agent state and session.
 	 */
-	async #flushPendingPythonMessages(): Promise<void> {
-		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
+	async #flushPendingPythonMessages(preflights: readonly PromptPreflightIdentity[]): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python", preflights);
 	}
 
 	/**
@@ -33236,36 +33637,95 @@ export class AgentSession {
 	 * only what the earlier one left queued, behind the entry that failed.
 	 */
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<PendingExecutionMessage<T>>,
 		kind: "bash" | "python",
+		preflights: readonly PromptPreflightIdentity[],
 	): Promise<void> {
-		while (this.#executionMessageDrain) {
-			// The owning caller observes the drain's failure; a joiner only waits for it.
-			await this.#executionMessageDrain.catch(() => {});
-		}
+		// The batch belongs to the transcript that was active when it was taken. A session
+		// switch rotates the same manager and clears these queues, so a batch survivor that
+		// outlived it must be dropped rather than published into the successor.
+		const batchOrigin = this.#capturePublicationOrigin();
 		if (pendingMessages.length === 0) return;
-		const drain = this.#drainPendingExecutionMessages(pendingMessages, kind);
-		this.#executionMessageDrain = drain;
-		try {
-			await drain;
-		} finally {
-			if (this.#executionMessageDrain === drain) this.#executionMessageDrain = undefined;
-		}
-	}
+		// Re-read cancellation at the claim itself, not only once per drain invocation: one
+		// drain claims the next kind after awaiting the previous kind's publication, so a
+		// preflight cancelled during that await would otherwise take ownership of rows the
+		// abort already disowned and hold its live token while publishing them.
+		this.#throwIfPromptPreflightDrainCancelled(preflights);
+		// Take exactly the entries queued now. Anything appended while this drain awaits
+		// belongs to a later batch and must stay behind the entries retained here; a
+		// length-indexed splice at the end would drop those successors.
+		const batch = pendingMessages.splice(0);
+		if (batch.length === 0) return;
 
-	async #drainPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
-		kind: "bash" | "python",
-	): Promise<void> {
-		const total = pendingMessages.length;
-		const remaining: typeof pendingMessages = [];
+		const total = batch.length;
+		const remaining: typeof batch = [];
 		const errors: unknown[] = [];
 		const persisted: string[] = [];
-		const unconfirmed: string[] = [];
 		let callbackFailureCount = 0;
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
-		for (const pending of pendingMessages) {
+		let unresolvedCount = 0;
+		let superseded = false;
+		for (const pending of batch) {
+			if (!this.#isPublicationOriginCurrent(batchOrigin)) {
+				// The switch already discarded the predecessor queue; nothing here may be
+				// re-queued or reported against the successor.
+				superseded = true;
+				break;
+			}
+			if (pending.unresolved) {
+				if (persistenceBlocked || agentAppendBlocked) {
+					// An earlier row still owns the queue head. This row's attempted id stays
+					// retained untried this drain; a later prompt re-reads it once the head clears.
+					remaining.push(pending);
+					continue;
+				}
+				// Reconciliation could not prove this entry durable or absent. Nothing may
+				// resubmit the append, but the retained attempted id must be re-read on every
+				// explicit drain: a transient read failure would otherwise hold the queue for the
+				// rest of the session even when the append is already durable.
+				let reconciled: SharedAppendReconciliation;
+				try {
+					reconciled = await this.#reconcileRetainedExecutionPublication(
+						pending.unresolved.entryId,
+						pending.unresolved.error,
+						batchOrigin,
+					);
+				} catch (error) {
+					if (error instanceof SessionPublicationSupersededError) {
+						superseded = true;
+						break;
+					}
+					reconciled = { kind: "unresolved", id: pending.unresolved.entryId, error };
+					errors.push(error);
+				}
+				if (reconciled.kind === "committed") {
+					// The append was durable all along. Acknowledge it once, drop the row, and never
+					// publish it again: the message is already in agent state and in the transcript.
+					persisted.push("command" in pending.message ? pending.message.command : pending.message.code);
+					try {
+						pending.onPersisted?.();
+					} catch (error) {
+						callbackFailureCount++;
+						errors.push(error);
+					}
+					continue;
+				}
+				if (reconciled.kind === "unresolved") {
+					// Still undecided: retain the row, surface the uncertainty, append nothing.
+					pending.unresolved = {
+						entryId: reconciled.id,
+						reason: pending.unresolved.reason,
+						error: reconciled.error,
+					};
+					persistenceBlocked = true;
+					unresolvedCount++;
+					remaining.push(pending);
+					continue;
+				}
+				// Proven absent, so a retry cannot duplicate it: fall through to the ordinary path.
+				pending.unresolved = undefined;
+			}
 			if (!pending.appendedToAgent) {
 				if (agentAppendBlocked) {
 					remaining.push(pending);
@@ -33291,17 +33751,20 @@ export class AgentSession {
 			try {
 				await this.#persistExecutionMessage("deferred command result", pending.message);
 			} catch (error) {
-				// Session entries form a leaf-linked transcript. Once one append fails,
-				// later entries must remain queued behind it or a retry would append the
-				// failed entry after messages that originally followed it.
+				if (error instanceof SessionPublicationSupersededError) {
+					superseded = true;
+					break;
+				}
+				// Session entries form a leaf-linked transcript. Once one append fails or its
+				// durability is unconfirmed, later entries must remain queued behind it or a
+				// retry would append the failed entry after messages that originally followed it.
 				persistenceBlocked = true;
+				if (error instanceof UnresolvedExecutionPublicationError) {
+					pending.unresolved = { entryId: error.entryId, reason: error.message, error: error.cause };
+					unresolvedCount++;
+				}
+				remaining.push(pending);
 				errors.push(error);
-				// An unknown outcome may already be durable under its attempted id. It is
-				// never queued for a retry that would append it again under a new id; the
-				// session closes below with that receipt instead.
-				if (error instanceof SharedControlPublicationError && error.outcome.kind === "unknown")
-					unconfirmed.push(...error.outcome.ids);
-				else remaining.push(pending);
 				continue;
 			}
 
@@ -33314,32 +33777,54 @@ export class AgentSession {
 			}
 		}
 
-		pendingMessages.splice(0, pendingMessages.length, ...remaining);
-		if (errors.length === 0) return;
+		if (!superseded && !this.#isPublicationOriginCurrent(batchOrigin)) {
+			// The switch can also land inside the manager awaits above, where the append
+			// returns stale/transcript_moved instead of raising the pre-lane sentinel. A row
+			// retained from that attempt still belongs to the predecessor transcript.
+			superseded = true;
+		}
+		if (superseded) {
+			// The predecessor transcript is gone, so its retained rows are dropped exactly
+			// like the switch's own queue clear; `onPersisted` never fires for them.
+			logger.warn("Deferred command results were dropped by a session switch", {
+				kind,
+				dropped: total,
+				persisted,
+			});
+			return;
+		}
+		if (remaining.length > 0) pendingMessages.unshift(...remaining);
+		if (errors.length === 0 && unresolvedCount === 0) return;
 
-		const persistedCount = total - remaining.length - unconfirmed.length;
-		const persistenceFailureCount = remaining.length + unconfirmed.length;
+		const persistedCount = total - remaining.length;
+		const failedCount = remaining.length - unresolvedCount;
 		const persistenceSummary =
-			unconfirmed.length > 0
-				? `Could not confirm ${unconfirmed.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"} (attempted ids: ${unconfirmed.join(", ")}); ${persistedCount} persisted, ${remaining.length} not written; the session was closed to protect its history`
-				: persistenceFailureCount > 0
-					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+			unresolvedCount > 0
+				? `Could not confirm persistence of ${unresolvedCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, ${failedCount} failed, and unconfirmed messages stay queued without retry to avoid duplicates`
+				: remaining.length > 0
+					? `Failed to persist ${remaining.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
 					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
 				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
 				: "";
 		const pending = remaining.map(item => ("command" in item.message ? item.message.command : item.message.code));
-		if (unconfirmed.length > 0) {
-			void this.dispose().catch(() => {
-				logger.warn("Deferred command result teardown failed", {
-					code: "shared_execution_result_teardown_failed",
-					attemptedIds: unconfirmed,
-				});
-			});
-		}
+		const reported =
+			errors.length > 0
+				? errors
+				: remaining.flatMap(item =>
+						item.unresolved
+							? [
+									new UnresolvedExecutionPublicationError(
+										item.unresolved.entryId,
+										item.unresolved.reason,
+										item.unresolved.error,
+									),
+								]
+							: [],
+					);
 		throw new AggregateError(
-			errors,
+			reported,
 			`${persistenceSummary}${callbackSummary}; persisted: ${JSON.stringify(persisted)}; pending: ${JSON.stringify(pending)}`,
 		);
 	}
@@ -36255,10 +36740,88 @@ export class AgentSession {
 	}
 }
 
-/** Outcome of a background publication: `false` means nothing reached the transcript. */
+/**
+ * Outcome of a background publication.
+ *
+ * `committed` is the only outcome that may be reported as persisted. `durability:
+ * "unknown"` means the append may have reached the transcript but reconciliation could
+ * neither find nor disprove it; it must be reported as unconfirmed, never as a refusal.
+ */
 interface BackgroundPublicationResult {
 	readonly committed: boolean;
+	/** Set when the entry may already be durable even though `committed` is false. */
+	readonly durability?: "unknown";
+	/** Attempted entry id when `durability` is `unknown`. */
+	readonly entryId?: string;
 	readonly cause?: string;
+}
+
+/** A deferred command result whose publication outcome could not be proven either way. */
+class UnresolvedExecutionPublicationError extends Error {
+	constructor(
+		readonly entryId: string,
+		reason: string,
+		cause?: unknown,
+	) {
+		super(
+			`Durability of the deferred command result (attempted id ${entryId}) is unknown: ${reason}`,
+			cause === undefined ? undefined : { cause },
+		);
+		this.name = "UnresolvedExecutionPublicationError";
+	}
+}
+
+/**
+ * Raised when a queued publication's transcript is no longer the active one.
+ *
+ * The switch already discarded the predecessor's queued rows, so the entry is neither
+ * retried nor reported: publishing it would attach predecessor state to the successor.
+ */
+class SessionPublicationSupersededError extends Error {
+	constructor() {
+		super("The session switched before the queued publication could be published");
+		this.name = "SessionPublicationSupersededError";
+	}
+}
+
+/** Map a non-committed shared outcome to stable operator wording. */
+function sharedAppendObstacle(outcome: Exclude<SharedAppendOutcome, { kind: "committed" }>): SharedPublicationObstacle {
+	if (outcome.kind === "stale") return "transcript-changed";
+	if (outcome.kind === "rejected")
+		return outcome.error instanceof SessionNearLimitAppendError ? "transcript-limit" : "write-refused";
+	return "write-failed";
+}
+
+function sharedPublicationObstacleText(obstacle: SharedPublicationObstacle): string {
+	switch (obstacle) {
+		case "session-switched":
+			return "the session switched before the entry could be published";
+		case "transcript-changed":
+			return "the transcript changed while the entry was being saved";
+		case "write-refused":
+			return "the session refused the write";
+		case "write-failed":
+			return "the write did not complete";
+		case "transcript-limit":
+			return "the transcript is at its size limit";
+		case "unreadable-transcript":
+			return "the transcript could not be read back";
+	}
+}
+
+/**
+ * The typed near-limit failure a shared append may have wrapped as its `unknown` cause.
+ *
+ * The canonical shared path throws a generic publication error whose `cause` is the
+ * `SharedAppendOutcome`, whose `error` is the typed failure. The operator mapping has to
+ * see through both layers or a near-limit transcript degrades into a generic run abort.
+ */
+function sharedAppendNearLimitError(error: unknown): SessionNearLimitAppendError | undefined {
+	if (error instanceof SessionNearLimitAppendError) return error;
+	const cause = error instanceof Error ? error.cause : undefined;
+	if (cause === null || typeof cause !== "object" || !("error" in cause)) return undefined;
+	const outcomeError = cause.error;
+	return outcomeError instanceof SessionNearLimitAppendError ? outcomeError : undefined;
 }
 
 /** Flatten a non-committed shared outcome into log/report fields. */
@@ -36269,7 +36832,11 @@ function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: s
 			outcome: outcome.kind,
 			reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
 		};
-	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
+	if (outcome.kind === "unknown")
+		return {
+			outcome: outcome.kind,
+			reason: `attempted id ${outcome.id}: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`,
+		};
 	return { outcome: outcome.kind };
 }
 
@@ -36285,7 +36852,7 @@ function assertSharedAppendCommitted(
 ): asserts outcome is Extract<SharedAppendOutcome, { kind: "committed" }> {
 	if (outcome.kind === "committed") return;
 	throw new Error(
-		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
 		{ cause: outcome },
 	);
 }

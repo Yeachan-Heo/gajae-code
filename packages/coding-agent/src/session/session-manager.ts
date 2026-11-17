@@ -2017,6 +2017,19 @@ export type SharedAppendOutcome =
 	| { readonly kind: "rejected"; readonly error: unknown };
 
 /**
+ * What reconciliation proved about an `unknown` shared append.
+ *
+ * `committed` means the attempted entry is durably in the transcript. `absent` means
+ * neither the transcript nor the resident graph holds it, so a retry cannot duplicate it.
+ * `unresolved` means the entry may already be durable and the transcript could not be
+ * read to decide; such an entry must not be resubmitted blindly.
+ */
+export type SharedAppendReconciliation =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unresolved"; readonly id: string; readonly error: unknown };
+
+/**
  * What a writable open did about pending migration.
  *
  * `stale` means the transcript changed after this process read it, so publishing now
@@ -19598,17 +19611,9 @@ export class SessionManager {
 				return retainUnknown(error);
 			}
 			if (result.kind === "committed") {
-				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-				if (header) {
-					applyHeaderPatch(header, patch);
-					this.#headerExportRevision++;
-				}
-				this.#sessionName = sanitized;
-				this.#titleSource = source;
-				if (receipt) {
-					this.#managedPersistExpectedIdentity = receipt.identity;
-					this.#openCommittedDigest = receipt.identity.sha256;
-				}
+				// Latch before any bookkeeping: the adoption is durable from here on, and a
+				// later throwing step must not leave the safety bar unset.
+				//
 				// The snapshot branch imported only the header. Rewrite authority stays barred
 				// only when the transcript already held a state this manager never committed:
 				// renaming a transcript this manager wrote itself keeps full authority.
@@ -19621,6 +19626,17 @@ export class SessionManager {
 				// `#managedPersistExpectedIdentity` on a non-committed title outcome.
 				if (predecessorIdentity && predecessorIdentity.sha256 !== priorCommittedDigest)
 					this.#latchSharedRewriteBar(sessionId);
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header) {
+					applyHeaderPatch(header, patch);
+					this.#headerExportRevision++;
+				}
+				this.#sessionName = sanitized;
+				this.#titleSource = source;
+				if (receipt) {
+					this.#managedPersistExpectedIdentity = receipt.identity;
+					this.#openCommittedDigest = receipt.identity.sha256;
+				}
 				if (!this.#flushed) {
 					this.#flushed = true;
 					this.#ensuredOnDisk = true;
@@ -20549,7 +20565,19 @@ export class SessionManager {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 
-	/** Additive legacy appends are safe once a control publication's transaction has settled. */
+	/**
+	 * Admission for an additive legacy append.
+	 *
+	 * The append bar is refusal policy, not the safety guarantee, so a one-shot control
+	 * publication that scopes its own admission does not bar later appends. Once a
+	 * canonical shared publication arms the permanent bar, every additive legacy append
+	 * of this logical session refuses here, before any graph mutation, with
+	 * {@link SharedSessionMutationUnsupportedError}. The check is reached from the live
+	 * write funnels only — {@link #appendEntry} for entry appends and
+	 * {@link appendMessage} for messages — plus {@link appendSessionRecap}, which plans
+	 * before it writes. Callers that must stay durable publish through the
+	 * `*SharingSession` methods instead.
+	 */
 	assertLegacyAppendAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, false);
 	}
@@ -21161,6 +21189,51 @@ export class SessionManager {
 		if (!file || !this.#storage.existsSync(file))
 			return { kind: "unknown", id, error: new Error("durability_unproven") };
 		return { kind: "committed", id };
+	}
+
+	/**
+	 * Decide an `unknown` shared append before anyone retries or reports it.
+	 *
+	 * `unknown` is not "not persisted": the entry can be committed before the failure that
+	 * produced the outcome (post-write snapshot verification, transaction release, a
+	 * superseded publication), and it can still be resident here unpublished. A blind retry
+	 * can therefore duplicate it, and a failure report can be wrong.
+	 *
+	 * `absent` is only returned once both the committed transcript and this manager's
+	 * resident graph are known not to hold the entry. Any read or publish failure after that
+	 * point is `unresolved`, which callers must hold rather than resubmit.
+	 */
+	async reconcileUnknownSharedAppend(id: string, error: unknown): Promise<SharedAppendReconciliation> {
+		const durable = (candidate: CommittedTranscriptRead): boolean =>
+			candidate.kind === "snapshot" &&
+			candidate.snapshot.sessionId === this.#sessionId &&
+			candidate.snapshot.entryIds.includes(id);
+		let read: CommittedTranscriptRead;
+		try {
+			read = await this.captureCommittedSnapshot();
+		} catch (cause) {
+			return { kind: "unresolved", id, error: cause };
+		}
+		if (durable(read)) return { kind: "committed", id };
+		if (this.#byId.has(id)) {
+			// The entry was staged in this process but its publication was not proven.
+			// Publish the pending bytes and re-verify; never append it a second time.
+			try {
+				await this.flush();
+			} catch (cause) {
+				return { kind: "unresolved", id, error: cause };
+			}
+			let after: CommittedTranscriptRead;
+			try {
+				after = await this.captureCommittedSnapshot();
+			} catch (cause) {
+				return { kind: "unresolved", id, error: cause };
+			}
+			return durable(after) ? { kind: "committed", id } : { kind: "unresolved", id, error };
+		}
+		if (read.kind === "absent") return { kind: "absent" };
+		if (read.kind === "snapshot" && read.snapshot.sessionId === this.#sessionId) return { kind: "absent" };
+		return { kind: "unresolved", id, error };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
