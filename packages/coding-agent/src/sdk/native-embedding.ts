@@ -170,6 +170,7 @@ export interface NativeEmbeddedRuntime {
 			| "setThinkingLevelForControl"
 			| "reloadSkills"
 			| "compact"
+			| "clearContext"
 			| "retry"
 			| "generateAutoSessionTitle"
 			| "exportToHtml"
@@ -675,6 +676,13 @@ function createNativeEmbeddedRuntime(
 				invokeNativeRuntime(handle, "session", () => session.setThinkingLevelForControl(...args)),
 			reloadSkills: (...args) => invokeNativeRuntime(handle, "session", () => session.reloadSkills(...args)),
 			compact: (...args) => invokeNativeRuntime(handle, "session", () => session.compact(...args)),
+			clearContext: (...args) =>
+				invokeNativeRuntime(handle, "session", async () => {
+					const cleared = await session.clearContext(...args);
+					// The parentless clear root must be selected durably before another dispatch.
+					if (cleared) await session.selectExecutionBranchDurably(session.sessionManager.getLeafId());
+					return cleared;
+				}),
 			retry: () => invokeNativeRuntime(handle, "session", () => session.retry()),
 			generateAutoSessionTitle: (...args) =>
 				invokeNativeRuntime(handle, "session", () => session.generateAutoSessionTitle(...args)),
