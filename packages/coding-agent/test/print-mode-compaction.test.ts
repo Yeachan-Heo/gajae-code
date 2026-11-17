@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage, Message, UserMessage } from "@gajae-code/ai";
 import { resolvePrintTerminalDisposition, runPrintMode } from "../src/modes/print-mode";
 import type { AgentSession } from "../src/session/agent-session";
+import type { CustomMessage } from "../src/session/messages";
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
 	return {
@@ -33,14 +34,14 @@ function makeUserMessage(text: string): UserMessage {
 	};
 }
 
-function makeCustomMessage(text: string): ReturnType<typeof makeUserMessage> & { role: "custom"; customType: string } {
+function makeCustomMessage(text: string): CustomMessage {
 	return {
 		role: "custom",
 		customType: "skill-prompt",
 		content: [{ type: "text", text }],
 		display: true,
 		timestamp: Date.now(),
-	} as unknown as ReturnType<typeof makeUserMessage> & { role: "custom"; customType: string };
+	};
 }
 
 function installImmediateStderrMock(output: string[]): void {
@@ -370,7 +371,7 @@ describe("Print mode with message compaction", () => {
 		// custom messages (role: 'custom'). When compaction removes earlier ordinary user messages
 		// while retaining the current custom prompt and its assistant response, the scan must
 		// include role === 'custom' to find the anchor.
-		const messages: Message[] = [
+		const messages: (Message | CustomMessage)[] = [
 			makeUserMessage("context message 1"),
 			makeAssistantMessage({ content: [{ type: "text", text: "context response 1" }] }),
 			makeUserMessage("context message 2"),
@@ -407,7 +408,7 @@ describe("Print mode with message compaction", () => {
 		// at print-mode.ts:417 will not capture a custom message, leaving lastPromptUserMessage undefined.
 		// Then resolvePrintTerminalDisposition falls back to the stale pre-compaction index,
 		// which may resolve as empty_response.
-		const messages: Message[] = [
+		const messages: (Message | CustomMessage)[] = [
 			makeUserMessage("context message 1"),
 			makeAssistantMessage({ content: [{ type: "text", text: "context response 1" }] }),
 		];
@@ -436,5 +437,63 @@ describe("Print mode with message compaction", () => {
 			status: "success",
 			assistantText: true,
 		});
+	});
+
+	it("exercises custom-message capture through runPrintMode", async () => {
+		// This test verifies that runPrintMode correctly captures and uses custom messages
+		// when scanning for the current turn's user message after compaction.
+		// The scanner at print-mode.ts:417 must recognize role === 'custom' to find skill prompts.
+		const messages: (Message | CustomMessage)[] = [
+			makeUserMessage("context message 1"),
+			makeAssistantMessage({ content: [{ type: "text", text: "context response 1" }] }),
+		];
+
+		const session = {
+			configWarnings: [],
+			state: { messages: messages as Message[] },
+			model: undefined,
+			autoCompactionEnabled: false,
+			sessionManager: {
+				getHeader: () => undefined,
+				getCwd: () => import.meta.dir,
+			},
+			setSlashCommands: () => {},
+			extensionRunner: undefined,
+			subscribe: () => () => {},
+			prompt: async () => {
+				// Add a custom message (skill prompt) and assistant response
+				const customMessage = makeCustomMessage("skill invocation prompt");
+				messages.push(customMessage);
+				messages.push(
+					makeAssistantMessage({
+						content: [{ type: "text", text: "skill response from custom message" }],
+					}),
+				);
+
+				// Simulate compaction during the prompt: remove old messages
+				// Keep only the new custom message and assistant response
+				const customIndex = messages.findIndex(
+					m => m.role === "custom" && "content" in m && Array.isArray(m.content),
+				);
+
+				if (customIndex > 0) {
+					// Remove all messages before the custom message
+					messages.splice(0, customIndex);
+				}
+			},
+			dispose: async () => {},
+		} as unknown as AgentSession;
+
+		const stdoutOutput: string[] = [];
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock(stdoutOutput);
+
+		await runPrintMode(session, { mode: "text", initialMessage: "skill invocation" });
+
+		// Should have captured and used the custom message, printing the response
+		expect(stdoutOutput.join("")).toContain("skill response from custom message");
+		// Should exit with success code (0 or undefined), not error (1)
+		expect(process.exitCode ?? 0).toBe(0);
 	});
 });
