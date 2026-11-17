@@ -1370,13 +1370,15 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			await published.promise;
 			await Bun.sleep(0);
 			await target.session.waitForIdle();
-			// The retry does not run, but the committed reminder is reconciled to prevent
-			// duplicate interrupts while the rule remains in the transcript (#7838).
+			// The retry does not run, but the committed reminder is added to the live session
+			// history to maintain consistency with the shared store. This ensures the reminder
+			// is visible in the session and prevents duplicate interrupts while the rule remains
+			// in the transcript (#7838).
 			expect(
 				target.session.agent.state.messages.some(
 					message => message.role === "custom" && message.customType === "ttsr-injection",
 				),
-			).toBe(false);
+			).toBe(true);
 			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
 			expect(target.modelMessages).toHaveLength(1);
 			expect(target.session.isTtsrAbortPending).toBe(false);

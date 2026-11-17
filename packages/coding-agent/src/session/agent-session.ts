@@ -11312,10 +11312,21 @@ export class AgentSession {
 					// committed reminder to prevent the rule from suppressing another interrupt while the
 					// reminder already exists in the transcript (#7838).
 					if (publicationFailure === undefined && injection && details) {
-						// The append committed; mark rules as consumed even though abort prevents full retry setup.
-						// A stale/rejected publication lets us retry in memory; a committed append requires
-						// marking to suppress repeat-gap intervals, but we do not persist a marker since the
-						// session may be reopened without the in-memory appended message.
+						// The append committed; add the reminder to live session history to maintain
+						// consistency between shared store and agent message state. Mark rules as consumed
+						// even though abort prevents full retry setup. A stale/rejected publication lets us
+						// retry in memory; a committed append requires marking to suppress repeat-gap intervals,
+						// but we do not persist a marker since the session may be reopened without the
+						// in-memory appended message.
+						this.agent.appendMessage({
+							role: "custom",
+							customType: "ttsr-injection",
+							content: injection.content,
+							display: false,
+							details,
+							attribution: "agent",
+							timestamp: Date.now(),
+						});
 						this.#markTtsrInjected(details.rules, false);
 					}
 					// A newer prompt owns the pending and per-tool state; the abort that preceded
