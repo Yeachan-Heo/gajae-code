@@ -5511,12 +5511,18 @@ export class ModelRegistry {
 								})
 							: undefined;
 					// Discard if the OAuth credential identity changed during refresh (indicates concurrent account switch).
-					// Compare email, accountId, and organizationId, as these form the identity tuple.
-					// accountId alone is insufficient because some providers omit it.
+					// Compare all identity fields (email, accountId, projectId, profileArn, organizationId)
+					// since they are all optional and vary by provider. For example:
+					// - Google/Kiro may omit accountId
+					// - Google uses projectId
+					// - Kiro uses profileArn
+					// - Some credentials use organizationId
 					if (
 						!postRefreshOAuthCredential ||
 						preRefreshOAuthCredential.email !== postRefreshOAuthCredential.email ||
 						preRefreshOAuthCredential.accountId !== postRefreshOAuthCredential.accountId ||
+						preRefreshOAuthCredential.projectId !== postRefreshOAuthCredential.projectId ||
+						preRefreshOAuthCredential.profileArn !== postRefreshOAuthCredential.profileArn ||
 						preRefreshOAuthCredential.organizationId !== postRefreshOAuthCredential.organizationId
 					) {
 						return { apiKey: undefined, authGeneration: undefined };
