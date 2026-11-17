@@ -14,6 +14,8 @@ export const DESKTOP_METHODS = [
 	"session.reorder",
 	"session.create",
 	"session.select",
+	"session.connect",
+	"session.disconnect",
 	"session.rename",
 	"session.delete",
 	"session.star",
@@ -214,6 +216,9 @@ export interface DesktopSession {
 	operatorRunning: boolean;
 	/** Display sequencing only; never authorizes an SDK control. */
 	controlGeneration: number | null;
+	/** Present only while this host holds SDK-admitted native ownership. */
+	ownership?: "native";
+	connectionState?: "connected" | "disconnecting" | "disconnected" | "release_failed" | "detach_unknown" | "uncertain_cursor" | "checkpoint_incomplete";
 	/** The host can rewind this conversation's tree to edit a prompt or show another revision. */
 	promptEditing?: true;
 	/** Present on host projections, including unavailable unopened/no-model sessions. */

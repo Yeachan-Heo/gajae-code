@@ -82,6 +82,7 @@ export type {
 } from "./models";
 export {
 	attestEmbeddedLegacyTakeover,
+	captureEmbeddedResumeIdentity,
 	consentEmbeddedDisconnect,
 	createNativeEmbeddedAgentSession,
 	currentEmbeddedInteraction,

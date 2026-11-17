@@ -73,6 +73,8 @@ import type { ResumeSessionIdentity } from "./session-readonly/storage";
 import type { SideConversationControls } from "./side-conversation";
 
 export interface NativeEmbeddedOptions {
+	/** Strict pre-resolution capture; hydration must consume this same transcript identity. */
+	readonly identity?: ResumeSessionIdentity;
 	readonly expected: { readonly snapshotDigest: string; readonly resolved: SdkResumeCheckpoint };
 	readonly ownerPolicy: Extract<SessionOwnerPolicy, { kind: "exclusive_native" }>;
 	readonly selection?: { readonly snapshotDigest: string; readonly targetLeafId: string | null; readonly op: string };
@@ -202,6 +204,19 @@ export type NativeEmbeddedOpenResult =
 			readonly error?: string;
 	  }
 	| { readonly kind: "refused"; readonly reason: string; readonly checkpoint?: SdkResumeCheckpoint };
+
+/** Capture identity before checkpoint interpretation, without hydrating or admitting a writer. */
+export function captureEmbeddedResumeIdentity(
+	file: string,
+): { readonly kind: "captured"; readonly identity: ResumeSessionIdentity } | { readonly kind: "error"; readonly reason: string } {
+	const captured = SessionManager.captureTranscriptStrict(file);
+	if (captured.kind !== "captured") return { kind: "error", reason: captured.reason };
+	try {
+		return { kind: "captured", identity: Object.freeze({ ...captured.snapshot.identity }) };
+	} finally {
+		captured.snapshot.close();
+	}
+}
 
 /** Descriptor-bound read-only interpretation. No writer, registry, factory, or catalog effects. */
 export function resolveEmbeddedResumeCheckpoint(
@@ -431,6 +446,7 @@ export async function createNativeEmbeddedAgentSession(
 	if (resolved.kind !== "resolved") return { kind: "refused", reason: resolved.reason };
 	const checkpoint = resolved.checkpoint;
 	if (
+		(native.identity !== undefined && !util.isDeepStrictEqual(native.identity, resolved.identity)) ||
 		checkpoint.snapshotDigest !== native.expected.snapshotDigest ||
 		!util.isDeepStrictEqual(checkpoint, native.expected.resolved) ||
 		!util.isDeepStrictEqual(native.ownerPolicy.expected, native.expected)
@@ -479,7 +495,7 @@ export async function createNativeEmbeddedAgentSession(
 				"managed" in storage
 					? SessionManager.managedDestination(options.cwd, options.agentDir)
 					: SessionManager.explicitDestination(storage.directory, options.agentDir);
-			const hydrated = await SessionManager.openExistingForRecoveryHydrationStrict(resolved.identity, destination);
+			const hydrated = await SessionManager.openExistingForRecoveryHydrationStrict(native.identity ?? resolved.identity, destination);
 			if (hydrated.kind !== "hydrated") return { kind: "refused", reason: "stale_snapshot", checkpoint };
 			manager = hydrated.manager;
 			manager.installOwnerMembership(membership);

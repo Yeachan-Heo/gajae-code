@@ -46,7 +46,7 @@ import {
 	type NativeInvocationResult,
 } from "@gajae-code/coding-agent/sdk";
 import { bridgeNativeInteraction, type NativeInteractionQuestion } from "./native-interaction-bridge";
-import { type NativeSession, type NativeUnresolvedOpen, openNativeSession } from "./native-session";
+import { type NativeOpenInput, type NativeOpenOutcome, type NativeSession, type NativeUnresolvedOpen, openNativeSession } from "./native-session";
 import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
@@ -491,6 +491,13 @@ interface PendingQuestion {
 	question: DesktopQuestion;
 	settle: (value: string | boolean | null) => void;
 }
+type NativeConnectInput = Pick<NativeOpenInput, "file" | "selection" | "legacyAttestation">;
+class NativeAdmissionError extends Error {
+	constructor(readonly outcome: Exclude<NativeOpenOutcome, { kind: "opened" }>) {
+		super(`Native open ${outcome.kind}${outcome.kind === "refused" ? `: ${outcome.reason}` : ""}`);
+	}
+}
+
 export interface HostOptions {
 	dataDir?: string;
 	emit: (frame: DesktopFrame) => void;
@@ -690,7 +697,7 @@ export class DesktopHost {
 				}
 				if (!projects.some(project => project.id === session.projectId)) throw new Error("Invalid session project");
 				if (item.managed !== undefined) {
-					if (item.managed !== true || item.file !== undefined)
+					if (item.managed !== true || (item.file !== undefined && item.scope !== "managed"))
 						throw new Error("Invalid managed session reference");
 					session.managed = true;
 				}
@@ -709,7 +716,7 @@ export class DesktopHost {
 				}
 				if (item.view !== undefined) {
 					const view = record(item.view);
-					if (!view || Object.keys(view).length !== 2 || session.managed || !session.file || !session.sessionId)
+					if (!view || Object.keys(view).length !== 2 || !session.file || !session.sessionId)
 						throw new Error("Invalid saved session view");
 					const sessionId = identifier(view, "sessionId");
 					if (sessionId !== session.sessionId)
@@ -952,9 +959,9 @@ export class DesktopHost {
 		return save;
 	}
 	#dto(metadata: SavedSession, messageBudget = 2_000_000): DesktopSession {
-		const managed = this.#managed.get(metadata.id);
-		if (managed) return managed.dto(messageBudget);
 		const live = this.#live.get(metadata.id);
+		const managed = this.#managed.get(metadata.id);
+		if (managed && !live) return managed.dto(messageBudget);
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
 		const awaitingGate = gates?.available && gates.pending.length > 0;
@@ -1010,6 +1017,7 @@ export class DesktopHost {
 			thinking: projectDesktopThinking(live?.sdk),
 			operatorRunning: live?.operator?.isBusy() ?? false,
 			controlGeneration: live?.sdk.sessionLifecycle.generation ?? null,
+			...(live?.native ? { ownership: "native" as const, connectionState: live.native.state } : {}),
 			...(live ? { promptEditing: true as const } : {}),
 			imageInput: live
 				? {
@@ -1102,13 +1110,7 @@ export class DesktopHost {
 			throw new Error("Workspace is closed. Open the folder again to use this conversation.");
 		return metadata;
 	}
-	async #open(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
-		// A discovered terminal conversation stays attach-only: inventory membership is not
-		// a writer lease, so only an SDK-owned lifecycle may admit that writer. A conversation
-		// this host created in the same store opens the way the terminal opens its own
-		// transcripts, with no exclusivity the terminal itself does not provide.
-		if (metadata.managed)
-			throw new Error("This terminal conversation requires SDK ownership admission before desktop resume.");
+	async #open(metadata: SavedSession, manager?: SessionManager, connect?: NativeConnectInput): Promise<LiveSession> {
 		const pending = this.#opening.get(metadata.id);
 		if (pending) return pending;
 		const existing = this.#live.get(metadata.id);
@@ -1116,7 +1118,9 @@ export class DesktopHost {
 			this.#refreshSessionServices(existing);
 			return existing;
 		}
-		const promise = this.#load(metadata, manager);
+		// Selecting a discovered row never acquires ownership implicitly.
+		if (metadata.managed && !connect) throw new Error("Connect this conversation before editing it.");
+		const promise = this.#load(metadata, manager, connect);
 		this.#opening.set(metadata.id, promise);
 		try {
 			return await promise;
@@ -1124,13 +1128,84 @@ export class DesktopHost {
 			this.#opening.delete(metadata.id);
 		}
 	}
-	async #load(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
+	async #connect(params: Record<string, unknown>): Promise<unknown> {
+		const metadata = this.#metadata(params);
+		const connected = this.#live.get(metadata.id);
+		if (connected) {
+			if (!connected.native) return { kind: "refused", reason: "policy_mismatch" };
+			if (connected.native.state !== "connected") return { kind: "refused", reason: connected.native.state };
+			return { kind: "connected", session: this.#dto(metadata) };
+		}
+		const connect: { file?: string; selection?: NativeOpenInput["selection"]; legacyAttestation?: NativeOpenInput["legacyAttestation"] } = {};
+		if (params.selection !== undefined) {
+			const selection = record(params.selection);
+			if (!selection || (selection.targetLeafId !== null && typeof selection.targetLeafId !== "string"))
+				throw new Error("Invalid execution selection");
+			connect.selection = {
+				snapshotDigest: requiredString(selection, "snapshotDigest", 128),
+				targetLeafId: selection.targetLeafId as string | null,
+			};
+		}
+		if (params.legacyAttestation !== undefined) {
+			const attestation = record(params.legacyAttestation);
+			if (!attestation || attestation.acknowledged !== true) throw new Error("Invalid legacy attestation");
+			connect.legacyAttestation = {
+				snapshotDigest: requiredString(attestation, "snapshotDigest", 128), acknowledged: true,
+			};
+		}
+		if (metadata.managed) {
+			const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
+			const inventory = await listEmbeddedProjectSessions({
+				cwd: project.path, agentDir: this.agentDir,
+				directory: path.join(this.dataDir, "sessions", project.id),
+			});
+			const matches = inventory.managed.filter(item => item.id === (metadata.sessionId ?? metadata.id));
+			if (matches.length !== 1) return { kind: "refused", reason: "transcript_identity_ambiguous" };
+			connect.file = matches[0]!.path;
+		}
+		try {
+			await this.#open(metadata, undefined, connect);
+			const attachment = this.#managed.get(metadata.id);
+			await attachment?.close();
+			this.#managed.delete(metadata.id);
+			this.#publishSnapshot();
+			return { kind: "connected", session: this.#dto(metadata) };
+		} catch (error) {
+			if (!(error instanceof NativeAdmissionError)) throw error;
+			const outcome = error.outcome;
+			if (outcome.kind === "unresolved") return { kind: "unresolved", state: outcome.state, error: outcome.error };
+			return outcome;
+		}
+	}
+	async #disconnect(params: Record<string, unknown>): Promise<unknown> {
+		const metadata = this.#metadata(params);
+		await this.#opening.get(metadata.id);
+		const live = this.#live.get(metadata.id);
+		if (!live?.native) return { kind: "blocked", blockers: ["native_owner_missing"] };
+		// Persist the current transcript identity before TERM releases resident state.
+		// Active work is left to the SDK's owned stop/join admission, never aborted raw.
+		if (live.native.state === "connected" && !live.busy && !live.sdk.isStreaming)
+			await this.#persistLive(live);
+		const outcome = await live.native.disconnect();
+		if (outcome.kind !== "disconnected") {
+			this.#publish(live);
+			return outcome;
+		}
+		// The retired SDK interaction service cannot answer host dialogs anymore.
+		live.nativeBridge?.dispose();
+		// Controllers and dependencies are released only after SDK-authorized retirement.
+		await this.#disposeLive(live);
+		this.#live.delete(metadata.id);
+		this.#publishSnapshot();
+		return outcome;
+	}
+	async #load(metadata: SavedSession, manager?: SessionManager, connect?: NativeConnectInput): Promise<LiveSession> {
 		// A conversation this load creates has no catalog transcript yet; if it never
 		// publishes, its transcript must not survive as a conversation the user never got.
-		const createdHere = metadata.file === undefined;
+		const createdHere = metadata.file === undefined && !connect?.file;
 		let candidate: SessionCandidate;
 		try {
-			candidate = await this.#constructCandidate(metadata, manager);
+			candidate = await this.#constructCandidate(metadata, manager, connect);
 		} catch (error) {
 			// An AggregateError means the candidate's disposal is unproven; the SDK may still
 			// own that transcript, so it must be left alone.
@@ -1227,13 +1302,13 @@ export class DesktopHost {
 		return null;
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
-	async #constructCandidate(metadata: SavedSession, manager?: SessionManager): Promise<SessionCandidate> {
+	async #constructCandidate(metadata: SavedSession, manager?: SessionManager, connect?: NativeConnectInput): Promise<SessionCandidate> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
 		if (!project || !(await fs.stat(project.path)).isDirectory()) throw new Error("Project directory unavailable");
 		const directory = await this.#sessionDirectory(project.path, metadata);
-		if (metadata.scope !== "managed") await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-		let existingFile: string | undefined;
-		if (metadata.file) {
+		if (metadata.scope !== "managed" && !metadata.managed) await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		let existingFile: string | undefined = connect?.file;
+		if (metadata.file && !existingFile) {
 			// A recorded transcript that is gone must fail rather than let the SDK
 			// initialize a fresh session at the same reserved path.
 			existingFile = await fs.realpath(this.#sessionPath(metadata.file, metadata.scope));
@@ -1255,16 +1330,17 @@ export class DesktopHost {
 			asyncJobs: "none" as const,
 		};
 		const native =
-			!existingFile && !manager && this.#nativeCreation
+			connect || (!existingFile && !manager && this.#nativeCreation)
 				? await openNativeSession({
 						options: openOptions,
-						storage: metadata.scope === "managed" ? { managed: true } : { directory },
+						storage: metadata.scope === "managed" || metadata.managed ? { managed: true } : { directory },
+						...(connect ? { ...connect, file: existingFile } : {}),
 					})
 				: undefined;
 		if (native && native.kind !== "opened") {
 			// This result, not a candidate, exclusively owns unpublished native cleanup.
 			if (native.kind === "unresolved") this.#unresolvedNative.add(native);
-			throw new Error(`Native open ${native.kind}`);
+			throw new NativeAdmissionError(native);
 		}
 		const result =
 			native?.kind === "opened"
@@ -1302,7 +1378,7 @@ export class DesktopHost {
 				});
 			// Restore before publication or metadata reconciliation. A stale/foreign cursor
 			// must leave the saved intent intact, not silently publish the file's latest branch.
-			if (metadata.view) await restoreSessionView(result.session, metadata.view);
+			if (metadata.view && !connect) await restoreSessionView(result.session, metadata.view);
 			// Materialization remains behind the SDK factory's owned manager.
 			await result.session.sessionManager.ensureOnDisk();
 			await this.#flushSession(candidate);
@@ -1934,7 +2010,7 @@ export class DesktopHost {
 			if (live.metadata.file) throw new Error("Persisted session file unavailable");
 			return;
 		}
-		const scope: SessionScope = live.metadata.scope ?? "desktop";
+		const scope: SessionScope = live.metadata.managed ? "managed" : (live.metadata.scope ?? "desktop");
 		const root = await fs.realpath(this.#storageRoot(scope)).catch(() => this.#storageRoot(scope));
 		const parent = await fs.realpath(path.dirname(file)).catch(() => path.dirname(file));
 		const relative = path.relative(root, path.join(parent, path.basename(file)));
@@ -2453,11 +2529,13 @@ export class DesktopHost {
 			await this.close();
 			return null;
 		}
+		if (method === "session.connect") return this.#connect(params);
+		if (method === "session.disconnect") return this.#disconnect(params);
 		if (method === "composer.complete") return this.#complete(params);
 		if (method === "message.copyText") return this.#copyText(request);
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
-			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
+			if (metadata?.managed && !this.#live.has(metadata.id)) return this.#dispatchManaged(request, this.#metadata(params));
 		}
 		if (method === "auth.providers") {
 			const statuses = await this.#authorizationProviders();
@@ -3334,7 +3412,7 @@ export class DesktopHost {
 			!project.closed &&
 			project.path === cwd;
 		let rawText: string;
-		if (metadata.managed) {
+		if (metadata.managed && !this.#live.has(metadata.id)) {
 			const session = this.#managed.get(metadata.id);
 			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
 			const current = () =>
@@ -3394,7 +3472,7 @@ export class DesktopHost {
 	async #complete(params: Record<string, unknown>): Promise<DesktopCompletionResult> {
 		const input = readDesktopCompletionInput(params);
 		const metadata = this.#metadata(params);
-		if (metadata.managed) {
+		if (metadata.managed && !this.#live.has(metadata.id)) {
 			// A read of suggestions never opens/reconnects an owner on behalf of an old draft.
 			const session = this.#managed.get(metadata.id);
 			const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
@@ -3442,6 +3520,7 @@ export class DesktopHost {
 			agentDir: this.agentDir,
 			cwd: project.path,
 			id: metadata.id,
+			sessionId: metadata.sessionId ?? metadata.id,
 			projectId: metadata.projectId,
 			title: metadata.title,
 			starred: metadata.starred,

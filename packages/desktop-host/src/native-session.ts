@@ -1,4 +1,7 @@
+import * as util from "node:util";
 import {
+	attestEmbeddedLegacyTakeover,
+	captureEmbeddedResumeIdentity,
 	consentEmbeddedDisconnect,
 	createEmbeddedAgentSession,
 	currentEmbeddedInteraction,
@@ -48,7 +51,7 @@ export type NativeOpenOutcome =
 	  }
 	/** Recovery stayed unresolved. The handle is retained so the caller can reconcile, not reopen. */
 	| NativeUnresolvedOpen
-	| { readonly kind: "refused"; readonly reason: string };
+	| { readonly kind: "refused"; readonly reason: string; readonly checkpoint?: SdkResumeCheckpoint };
 
 type NativeOpenHandle = Extract<NativeEmbeddedOpenResult, { kind: "opened" }>["handle"];
 
@@ -99,6 +102,8 @@ export interface NativeOpenInput {
 	readonly file?: string;
 	/** Exact execution selection when the caller already resolved a branch. */
 	readonly selection?: { readonly snapshotDigest: string; readonly targetLeafId: string | null };
+	/** Explicit acknowledgement bound to this row and exact captured legacy checkpoint. */
+	readonly legacyAttestation?: { readonly snapshotDigest: string; readonly acknowledged: true };
 }
 
 /**
@@ -215,21 +220,50 @@ export async function openNativeSession(input: NativeOpenInput): Promise<NativeO
 			}),
 		);
 	}
+	const capture = captureEmbeddedResumeIdentity(input.file);
+	if (capture.kind === "error") return { kind: "refused", reason: capture.reason };
 	const resolution = resolveEmbeddedResumeCheckpoint(input.file);
 	if (resolution.kind === "error") return { kind: "refused", reason: resolution.reason };
 	const { checkpoint } = resolution;
-	// A legacy multi-branch tail has no recorded cursor, so continuing from it would be a
-	// guess. The SDK reports that as `selector`; anything ambiguous is surfaced, not resolved here.
+	if (!util.isDeepStrictEqual(capture.identity, resolution.identity))
+		return { kind: "refused", reason: "stale_snapshot" };
+	if (checkpoint.kind === "legacy_tail" &&
+		(input.legacyAttestation?.acknowledged !== true || input.legacyAttestation.snapshotDigest !== checkpoint.snapshotDigest))
+		return { kind: "refused", reason: "legacy_attestation_required", checkpoint };
+	if (checkpoint.kind === "invalid" ||
+		(!input.selection && (checkpoint.kind === "ambiguous" || checkpoint.kind === "legacy_tail")))
+		return { kind: "selector_required", checkpoint, candidates: checkpoint.candidates ?? [] };
+	// Only the SDK can issue a row-four takeover proof. An acknowledgement for another
+	// row/digest is never reused, and other ownership rows keep their independent vetoes.
+	let legacyAttestation;
+	if (input.legacyAttestation?.acknowledged === true &&
+		input.legacyAttestation.snapshotDigest === checkpoint.snapshotDigest) {
+		try {
+			legacyAttestation = await attestEmbeddedLegacyTakeover({
+				file: input.file,
+				cwd: input.options.cwd,
+				agentDir: input.options.agentDir,
+				snapshotDigest: checkpoint.snapshotDigest,
+				acknowledged: true,
+			});
+		} catch (error) {
+			return { kind: "refused", reason: error instanceof Error ? error.message : "unknown_ownership" };
+		}
+	}
+	// The SDK re-captures after resolution/attestation and carries this identity into
+	// strict recovery hydration. This check is not authority to open the path raw.
 	const opened = await createEmbeddedAgentSession({
 		...input.options,
 		storage: { ...input.storage, ...(input.file ? { file: input.file } : {}) },
 		native: {
+			identity: capture.identity,
 			expected: { snapshotDigest: checkpoint.snapshotDigest, resolved: checkpoint },
 			// The policy must carry the same evidence it was admitted with, or the SDK
 			// treats the snapshot as stale before any effect.
 			ownerPolicy: {
 				kind: "exclusive_native",
 				expected: { snapshotDigest: checkpoint.snapshotDigest, resolved: checkpoint },
+				...(legacyAttestation ? { legacyAttestation } : {}),
 			},
 			...(input.selection ? { selection: { ...input.selection, op: crypto.randomUUID() } } : {}),
 		},
