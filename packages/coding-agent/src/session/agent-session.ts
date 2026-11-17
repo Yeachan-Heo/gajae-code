@@ -13571,27 +13571,8 @@ export class AgentSession {
 				nextSelectedDiscoveredBuiltinToolNames,
 			);
 		if (!mcpSelectionChanged && !discoveredBuiltinSelectionChanged) return;
-		// Internal refreshes (MCP catalog, /ssh, plugin/subskill tools) are synchronous
-		// producers: in a shared session their selection is published through admitted
-		// background publication instead of the refused legacy append (#7824).
-		if (this.#usesSharedSessionPublication()) {
-			const manager = this.sessionManager;
-			const identityGeneration = manager.getSessionIdentityGeneration();
-			void this.#publishInBackground("tool selection", async () => {
-				const outcome = await manager.appendToolSelectionsSharingSession(
-					mcpSelectionChanged ? nextSelectedMCPToolNames : undefined,
-					discoveredBuiltinSelectionChanged ? nextSelectedDiscoveredBuiltinToolNames : undefined,
-					() =>
-						!this.#isDisposed &&
-						this.sessionManager === manager &&
-						manager.getSessionIdentityGeneration() === identityGeneration,
-				);
-				if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids.at(-1) ?? "" };
-				if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids.join(","), error: outcome.error };
-				return outcome;
-			});
-			return;
-		}
+		// Shared sessions never reach here: #applyActiveToolsByName stages their selection
+		// and publishes it before promotion.
 		const mutationCorrelationId =
 			mcpSelectionChanged && discoveredBuiltinSelectionChanged ? crypto.randomUUID() : undefined;
 		if (mcpSelectionChanged) {
@@ -14745,7 +14726,6 @@ export class AgentSession {
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
-					sharedPublication: true,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
 					persistedMCPToolNames:
 						activatedMCPToolNames.length > 0
@@ -15068,7 +15048,6 @@ export class AgentSession {
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
-			sharedPublication?: boolean;
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
@@ -15078,9 +15057,13 @@ export class AgentSession {
 			explicitActiveToolSelectionGeneration?: number;
 		},
 	): Promise<number | undefined> {
-		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
+		// Every selection a shared session may persist - explicit or an internal refresh -
+		// is staged and published first; live tools change only after the commit. A
+		// non-persisting update (restore, rollback) writes nothing and installs directly.
+		const sharedPublication = this.#usesSharedSessionPublication();
+		const sharedDiscovery = sharedPublication && options?.persistMCPSelection !== false;
 		const assertControlMutationAllowed = () => {
-			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedDiscovery) {
+			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedPublication) {
 				this.sessionManager.assertLegacyMutationAllowed("select active tools");
 			}
 		};
@@ -15184,7 +15167,7 @@ export class AgentSession {
 				this.#setGuardedAgentTools(tools);
 				this.#invalidateDiscoveryCaches();
 			};
-			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
+			if (!mcpChanged && !builtinChanged) {
 				promote();
 			} else {
 				const operation = "select active tools";
@@ -15391,7 +15374,6 @@ export class AgentSession {
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
-				sharedPublication,
 			});
 			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
 				if (sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
@@ -15421,7 +15403,6 @@ export class AgentSession {
 							sessionTransitionGeneration,
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
-							sharedPublication,
 						},
 					);
 					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {

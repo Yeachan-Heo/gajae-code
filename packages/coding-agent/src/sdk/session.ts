@@ -6511,7 +6511,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				wireOwnedMcpToolSync();
 			} else if (!ownsMcpManager) {
 				mcpManager.setOnToolsChanged(tools => {
-					void session.refreshMCPTools(tools.map(tool => tool as CustomTool));
+					// A shared session publishes the refreshed selection before installing it; a
+					// refused publication leaves the previous tools live and is reported here.
+					session.refreshMCPTools(tools.map(tool => tool as CustomTool)).catch((error: unknown) => {
+						logger.warn("MCP tool refresh was not applied", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
 				});
 			}
 			wireOwnedMcpManagerLifecycle();
