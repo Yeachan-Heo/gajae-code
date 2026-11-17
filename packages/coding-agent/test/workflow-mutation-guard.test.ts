@@ -2967,6 +2967,9 @@ describe("bash scanner quoting model", () => {
 			`node -e 'console.log(process.argv)' -- -r plain-text`,
 			`node script.js -- --preload=plain-text`,
 			`bun script.ts -- --require=plain-text`,
+			// The shell concatenates quoted spans, so these words are the terminator too.
+			`node -e 'console.log(process.argv)' -"-" --require=plain-text`,
+			`node -e 'console.log(process.argv)' --'' --import=plain-text`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
