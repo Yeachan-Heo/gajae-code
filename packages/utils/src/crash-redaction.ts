@@ -662,17 +662,16 @@ function redactCredentialValue(
 /**
  * Lookahead the nested-container scan may spend on one scrub call, in characters.
  * Proportional to the input so ordinary text always receives a complete scan while
- * repeated unterminated containers cannot force a quadratic rescan. Once spent,
- * later containers are treated as unterminated and end at their line.
+ * repeated unterminated containers cannot force a quadratic rescan.
  */
 const CONTAINER_SCAN_BUDGET_FACTOR = 16;
 
 interface ContainerScanBudget {
 	/**
-	 * Lookahead left for container scans. Once it is spent, later containers are treated as
-	 * unterminated and end at their line: a run of malformed containers must not cost a full
-	 * text scan each. The give-up point is reachable only by a text that is already dominated
-	 * by unclosed containers.
+	 * Lookahead left for container scans. A container is only examined when the whole remaining
+	 * text fits in the budget, so a scan is never cut short and a later complete container can
+	 * never expose its contents. When it does not fit, the rest of the text is redacted: the
+	 * give-up point is reachable only by text already dominated by unclosed containers.
 	 */
 	remaining: number;
 }
@@ -702,7 +701,16 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp,
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
-		const scan = findCredentialContainerEnd(text, containerStart, Math.max(budget.remaining, 0), lineScan);
+		const suffixLength = text.length - containerStart;
+		if (budget.remaining < suffixLength) {
+			// The remaining lookahead cannot prove where this container ends, and a partial scan
+			// could leave a later closed container's contents behind. Redact the rest instead of
+			// guessing.
+			output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+			copiedUntil = text.length;
+			break;
+		}
+		const scan = findCredentialContainerEnd(text, containerStart, suffixLength, lineScan);
 		budget.remaining -= scan.scanned;
 		const containerEnd = scan.value;
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a

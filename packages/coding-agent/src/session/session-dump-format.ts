@@ -61,7 +61,8 @@ function takeRedactedTextRun(parts: string[]): string | undefined {
 	if (parts.length === 0) return undefined;
 	// Blocks are rendered with a newline between them, which would split a banner that straddles
 	// two blocks, so they are paired while still adjacent and only then joined for display.
-	const paired = redactCrossFieldPrivateKeys(parts) as string[];
+	// Message text is literal, not encoded JSON, so its `\u` escapes are evidence and stay.
+	const paired = redactCrossFieldPrivateKeys(parts, { decodeEscapes: false }) as string[];
 	const redacted = redactCrashSecrets(paired.join("\n"));
 	parts.length = 0;
 	return redacted;
@@ -188,9 +189,16 @@ function decodeValueStrings(value: unknown): unknown {
  * rewritten name would destroy the argument identity the dump relies on. A banner split
  * across two values with another value in between is therefore not paired; each half is
  * still scrubbed on its own where it forms a complete block.
+ * `decodeEscapes` is for encoded values (tool arguments and schema data); literal message
+ * text opts out so its own `\u` spelling survives.
  */
-function redactCrossFieldPrivateKeys(values: readonly unknown[]): unknown[] {
-	const decoded = values.map(decodeValueStrings);
+interface CrossFieldPrivateKeyOptions {
+	readonly decodeEscapes?: boolean;
+}
+
+function redactCrossFieldPrivateKeys(values: readonly unknown[], options?: CrossFieldPrivateKeyOptions): unknown[] {
+	const decodeEscapes = options?.decodeEscapes ?? true;
+	const decoded = decodeEscapes ? values.map(decodeValueStrings) : [...values];
 	const leaves: string[] = [];
 	for (const value of decoded) collectStringLeaves(value, leaves);
 	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
@@ -213,12 +221,12 @@ const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"
 
 /**
  * Scrub a data value inside a schema (a `default`, `example`, or `const`).
- * The value is data, not schema structure, so it is decoded first and then scrubbed with
- * the same rules as tool arguments: credential-named fields are masked, text is scrubbed,
- * and a known header collection keeps its value redaction.
+ * The value is data, not schema structure, so it is scrubbed with the same rules as tool
+ * arguments: credential-named fields are masked, text is scrubbed, and a known header
+ * collection keeps its value redaction. The schema entry prepass already decoded it.
  */
 function scrubSchemaData(value: unknown, propertyName?: string): unknown {
-	return redactStructuredSecrets(decodeValueStrings(value), propertyName, { headerPairs: isHeaderCollectionKey });
+	return redactStructuredSecrets(value, propertyName, { headerPairs: isHeaderCollectionKey });
 }
 
 /** Replace every leaf of a data value with the marker, preserving its shape. */
@@ -246,45 +254,49 @@ function uniqueScrubbedKey(target: Record<string, unknown>, key: string, nextSuf
 }
 
 /**
- * Scrub a tool schema without destroying its definitions.
- * Property names are schema structure, not credential assignments, so they stay
- * readable; only string leaves and data-carrying keywords are redacted. The whole
- * schema is sanitized at once so a property map nested under `properties` keeps its
- * property names as context.
+ * Entry point for one tool schema: pair a private-key block that spans any two of its
+ * values once, then sanitize the paired tree. Recursion below never rescans a subtree.
  */
-function redactSchemaValue(value: unknown, propertyName?: string): unknown {
-	if (typeof value === "string") return redactCrashSecrets(decodeUnicodeEscapeText(value));
-	if (Array.isArray(value)) return value.map(item => redactSchemaValue(item, propertyName));
+function redactSchemaEntry(value: Record<string, unknown>): Record<string, unknown> {
+	const paired = redactCrossFieldPrivateKeys([value])[0] as Record<string, unknown>;
+	return sanitizeSchemaValue(paired) as Record<string, unknown>;
+}
+
+/**
+ * Scrub a paired tool schema without destroying its definitions.
+ * Property names are schema structure, not credential assignments, so they stay
+ * readable; only string leaves and data-carrying keywords are redacted. The entry
+ * pairing already covered every value, so a property map nested under `properties`
+ * keeps its property names as context without another pass.
+ */
+function sanitizeSchemaValue(value: unknown, propertyName?: string): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (Array.isArray(value)) return value.map(item => sanitizeSchemaValue(item, propertyName));
 	if (value === null || typeof value !== "object") return value;
 
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	const scrubbedKeys = new Map<string, number>();
-	// A schema renders as one section, so a banner split between any two of its values —
-	// including a description and a nested definition — is paired across the whole object
-	// before credential-named fields are masked.
-	const pairedSource = redactCrossFieldPrivateKeys([source])[0] as Record<string, unknown>;
 	const dataFields = Object.keys(source).filter(field => SCHEMA_VALUE_KEYWORDS.has(field));
-	for (const [field, nested] of Object.entries(pairedSource)) {
+	for (const [field, nested] of Object.entries(source)) {
 		const dataIndex = dataFields.indexOf(field);
 		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const properties = Object.create(null) as Record<string, unknown>;
 			const propertyKeys = new Map<string, number>();
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
-				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = redactSchemaValue(schema, name);
+				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = sanitizeSchemaValue(schema, name);
 			}
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = properties;
 			continue;
 		}
 		if (dataIndex >= 0) {
-			const paired = nested;
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] =
 				propertyName !== undefined && isCredentialKey(propertyName)
-					? maskSchemaData(paired)
-					: scrubSchemaData(paired, propertyName);
+					? maskSchemaData(nested)
+					: scrubSchemaData(nested, propertyName);
 			continue;
 		}
-		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = redactSchemaValue(nested, propertyName);
+		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitizeSchemaValue(nested, propertyName);
 	}
 	return redacted;
 }
@@ -306,7 +318,7 @@ function formatArgsAsXml(
 	mode: "arguments" | "schema" = "arguments",
 	indent = "\t",
 ): string {
-	const schema = mode === "schema" ? (redactSchemaValue(args) as Record<string, unknown>) : undefined;
+	const schema = mode === "schema" ? redactSchemaEntry(args) : undefined;
 	// A scrubbed schema key no longer matches the original argument name, so each mode walks its
 	// own entries: arguments over the value-paired tree, schemas over the sanitized schema.
 	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;

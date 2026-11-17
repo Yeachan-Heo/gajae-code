@@ -389,6 +389,41 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain("after");
 	});
 
+	it("does not expose a closed container after the scan budget is exhausted", () => {
+		// Every unclosed container forces a scan of the remaining text, so enough of them spend
+		// the whole lookahead budget before the real container is reached.
+		const filler = "secret={\n".repeat(40);
+		const longPayload = "A".repeat(20_000);
+		const tail = `secret={\n  "payload": "${longPayload}EXHAUSTED_BUDGET_SECRET"\n}\nafter`;
+		const dumped = dump([{ role: "user", content: `${filler}${tail}`, timestamp: 1 }] as AgentMessage[]);
+
+		expect(dumped).not.toContain("EXHAUSTED_BUDGET_SECRET");
+		expect(dumped).not.toContain(longPayload);
+		expect(dumped).toContain("«redacted»");
+	});
+
+	it("keeps literal unicode escapes in message text while decoding argument values", () => {
+		const literal = 'const s = "\\u0041";';
+		const dumped = dump([
+			{ role: "user", content: literal, timestamp: 1 },
+			assistant([{ type: "text", text: literal }], 2),
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-escaped-argument",
+						name: "read",
+						arguments: { pattern: "\\u0041" },
+					},
+				],
+				3,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped.split(literal).length - 1).toBe(2);
+		expect(dumped).toContain('name="pattern">A</parameter>');
+	});
+
 	it("keeps line-based redaction linear for carriage-return-only text", () => {
 		const line = "secret={unclosed\r";
 		const measure = (lines: number): number => {
