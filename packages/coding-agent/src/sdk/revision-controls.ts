@@ -3,7 +3,7 @@ import type { ImageContent } from "@gajae-code/ai/core";
 import type { AgentSession } from "../session/agent-session";
 import { getSessionMessageEntryId, type SessionManager } from "../session/session-manager";
 import { PromptImageUploadStore, retirePromptImageReservation } from "./host/prompt-image-upload";
-import { normalizeSdkRevisionInput, type SdkRevisionResult } from "./protocol/revision-contracts";
+import { normalizeSdkRevisionInput, type SdkRevisionResult, validRevisionEntryId } from "./protocol/revision-contracts";
 
 export { SDK_REVISION_MAX_BODY_CHARS, type SdkRevisionResult } from "./protocol/revision-contracts";
 
@@ -45,6 +45,95 @@ export interface SdkRevisionRuntimeOptions {
 // Retain admission across navigation, normal prompt execution, and persistence.
 // A replacement Host control object must not admit a second revision of this session.
 const revisions = new WeakSet<AgentSession>();
+
+/** Presentation metadata only; never authority to discover or open a transcript. */
+export interface SdkSessionView {
+	sessionId: string;
+	leafEntryId: string | null;
+}
+
+function validSessionView(value: unknown): value is SdkSessionView {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	const fields = Reflect.ownKeys(value);
+	if (
+		fields.length !== 2 ||
+		!fields.includes("sessionId") ||
+		!fields.includes("leafEntryId") ||
+		!Object.hasOwn(Object.getOwnPropertyDescriptor(value, "sessionId") ?? {}, "value") ||
+		!Object.hasOwn(Object.getOwnPropertyDescriptor(value, "leafEntryId") ?? {}, "value")
+	)
+		return false;
+	const view = value as Record<string, unknown>;
+	return (
+		validRevisionEntryId(view.sessionId) &&
+		/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(view.sessionId) &&
+		(view.leafEntryId === null || validRevisionEntryId(view.leafEntryId))
+	);
+}
+
+/** Capture only an idle, live cursor. Hosts persist this DTO, not inferred chronology. */
+export function captureSessionView(session: AgentSession): SdkSessionView {
+	if (revisions.has(session)) throw new SdkRevisionError("busy");
+	idle(session);
+	const manager = session.sessionManager;
+	const view = { sessionId: session.sessionId, leafEntryId: manager.getLeafId() };
+	if (!validSessionView(view) || (view.leafEntryId !== null && !manager.getEntry(view.leafEntryId)))
+		throw new SdkRevisionError("resource_gone");
+	return view;
+}
+
+/** Restore only within the supplied live session; never open, fork, append, or select a fallback. */
+export async function restoreSessionView(session: AgentSession, view: SdkSessionView): Promise<SdkSessionView> {
+	if (!validSessionView(view)) throw new SdkRevisionError("invalid_input");
+	const { sessionId, leafEntryId } = view;
+	if (session.sessionId !== sessionId) throw new SdkRevisionError("resource_gone");
+	if (revisions.has(session)) throw new SdkRevisionError("busy");
+	idle(session);
+	const manager = session.sessionManager;
+	const agent = session.agent;
+	const file = manager.getSessionFile();
+	const identity = manager.getSessionIdentityGeneration();
+	const generation = session.sessionLifecycle.generation;
+	const previousLeaf = manager.getLeafId();
+	const managerId = manager.getSessionId();
+	const before = manager.revisionSnapshot();
+	if (leafEntryId !== null && !manager.getEntry(leafEntryId)) throw new SdkRevisionError("resource_gone");
+	const changes = previousLeaf === leafEntryId ? 0 : 1;
+	revisions.add(session);
+	try {
+		await session.restoreTreeLeaf(leafEntryId);
+		const after = manager.revisionSnapshot();
+		if (
+			session.sessionLifecycle.disposed ||
+			session.sessionManager !== manager ||
+			session.agent !== agent ||
+			session.sessionId !== sessionId ||
+			manager.getSessionId() !== managerId ||
+			manager.getSessionFile() !== file ||
+			manager.getSessionIdentityGeneration() !== identity ||
+			session.sessionLifecycle.generation !== generation + changes ||
+			session.sessionLifecycle.transitioning ||
+			manager.getLeafId() !== leafEntryId ||
+			(leafEntryId !== null && !manager.getEntry(leafEntryId)) ||
+			after.entry !== before.entry ||
+			after.leaf !== before.leaf + changes ||
+			after.headerExport !== before.headerExport ||
+			after.label !== before.label ||
+			after.replayMetadata !== before.replayMetadata
+		)
+			throw new SdkRevisionError("resource_gone");
+		idle(session);
+		return { sessionId, leafEntryId };
+	} catch (error) {
+		const rollbackFailed =
+			!!error && typeof error === "object" && "rollbackFailed" in error && error.rollbackFailed === true;
+		throw new SdkRevisionError(failure(error).code, rollbackFailed);
+	} finally {
+		revisions.delete(session);
+	}
+}
 
 // Manager ownership prevents a successor session from inheriting remembered branches.
 const rememberedLeaves = new WeakMap<SessionManager, { identity: number; leaves: Map<string, string> }>();
