@@ -2,15 +2,15 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ResumeSessionIdentity } from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	RESUME_TRANSCRIPT_MAX_BYTES,
-	type ResumeSessionIdentity,
 	SessionManager,
 	SessionTranscriptOversizedError,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
-import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/session/internal/managed-session-storage";
+import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/sdk/session-readonly/inspection";
 
 const tempDirs: string[] = [];
 

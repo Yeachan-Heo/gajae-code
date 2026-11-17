@@ -5,8 +5,9 @@ import {
 } from "../../../session/default-model-selection";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
-
+import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
+import { SdkSideConversationError } from "../../side-conversation";
 import {
 	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
 	type ControlInput,
@@ -368,6 +369,28 @@ function invoke(
 			return surface.setAutoRetry(input.on as boolean);
 		case "retry.abort":
 			return surface.abortRetry();
+
+		case "operator.execute":
+		case "operator.cancel":
+			if (!surface.operatorControl) throw new TypedControlError("unavailable", "Operator controls are unavailable.");
+			return surface.operatorControl(operation, input);
+		case "activity.cancel":
+		case "activity.pause":
+		case "activity.resume":
+		case "activity.delete":
+		case "activity.acknowledge":
+		case "mcp.suspend":
+		case "mcp.resume":
+		case "mcp.reconnect":
+			if (!surface.activityControl)
+				throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
+			return surface.activityControl(operation, input);
+		case "btw.open":
+		case "btw.submit":
+		case "btw.cancel":
+		case "btw.close":
+			if (!surface.sideControl) throw new TypedControlError("unavailable", "Side conversations unavailable.");
+			return surface.sideControl(operation, input);
 		case "session.revise":
 			if (!surface.reviseSession) throw new TypedControlError("unavailable", "Revision runtime unavailable.");
 			return surface.reviseSession(input);
@@ -388,7 +411,13 @@ function invoke(
 			return surface.reloadRuntime(input.components);
 		case "auth.login":
 			return surface.login(text(input, "provider"));
-
+		case "auth.start":
+		case "auth.answer":
+		case "auth.cancel":
+		case "auth.apiKey.store":
+			if (!surface.authorizationControl)
+				throw new TypedControlError("unavailable", "Authorization controls are unavailable.");
+			return surface.authorizationControl(operation, input);
 		case "host_tools.register":
 			return surface.registerHostTools(input.defs);
 		case "host_uri.register":
@@ -426,6 +455,14 @@ function invoke(
 }
 
 function errorResponse(id: string, row: Operation, error: unknown): ControlResponse {
+	if (row.sdkId === "btw.open" || row.sdkId === "btw.submit") {
+		if (
+			(error instanceof SdkSideConversationError || error instanceof TypedControlError) &&
+			(row.errorCodes.includes(error.code) || SHARED_ERROR_CODES.has(error.code))
+		)
+			return failure(id, error.code, error.message);
+		return failure(id, "internal", "Control operation failed.");
+	}
 	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown; handoffDocument?: unknown };
 	const code = typeof candidate?.code === "string" ? candidate.code : undefined;
 	const message = typeof candidate?.message === "string" ? candidate.message : "Control operation failed.";
@@ -545,7 +582,10 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
-
+	if (isSecureLocalOperation(row.sdkId) && request.idempotencyKey !== undefined)
+		return Promise.resolve(
+			failure(request.id, "invalid_input", "Authorization controls do not accept idempotency keys."),
+		);
 	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
 	const brokerReviseAuthorized = row.sdkId === "session.revise" && hasBrokerRuntimeReviseCapability(request.input);
 	const brokerAbortInput = row.sdkId === "turn.abort" && isInput(request.input) ? request.input : undefined;
@@ -648,7 +688,19 @@ export function dispatchControl(
 	// Active feedback must reach the worker even while an earlier ordered control
 	// waits for that worker. Correlated steer admission remains deduplicated by
 	// the runtime reconciliation store, independently of this dispatch chain.
-	return row.idempotency === "ordered" && row.sdkId !== "retry.now" && row.sdkId !== "turn.steer"
+	//
+	// An ask answer is the same kind of feedback: the turn waits for the pending
+	// ask, so an ordered control that waits for the turn (model.set during a run
+	// waits at the session admission boundary) would otherwise hold the chain
+	// while the turn waits for the answer queued behind it. The answer is
+	// addressed by ask id and the pending-ask registry refuses a stale id, so it
+	// needs no ordering against other controls. Unlike turn.steer it does not
+	// wait for a pending replacement barrier: a replacement queued behind that
+	// same control would hold the answer in the same way.
+	return row.idempotency === "ordered" &&
+		row.sdkId !== "retry.now" &&
+		row.sdkId !== "turn.steer" &&
+		row.sdkId !== "ask.answer"
 		? serialize(surface, work)
 		: work();
 }

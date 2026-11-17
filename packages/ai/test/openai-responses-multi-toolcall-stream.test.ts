@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { processResponsesStream } from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai/types";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
+import { createResponsesOutput } from "./helpers";
 
 // Regression coverage for multi-tool-call stream correlation: when a single
 // Responses API stream emits multiple tool-call items, each item's streamed
@@ -24,26 +25,6 @@ function makeModel(): Model<"openai-responses"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 8192,
-	};
-}
-
-function makeOutput(): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [],
-		timestamp: Date.now(),
-		provider: "test-provider",
-		model: "test-model",
-		api: "openai-responses",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
 	};
 }
 
@@ -121,7 +102,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -166,7 +147,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "beta_tool", arguments: '{"y":2}' },
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -203,7 +184,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 			item: { type: "function_call", id: s.id, call_id: s.call, name: s.name, arguments: JSON.stringify(s.args) },
 		}));
 		const events = [...added, ...deltas, ...dones];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -270,7 +251,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -303,7 +284,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -355,7 +336,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -405,7 +386,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -443,7 +424,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -479,7 +460,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -515,7 +496,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -550,7 +531,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -588,7 +569,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -618,7 +599,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -653,7 +634,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -681,7 +662,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -715,7 +696,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 					},
 				},
 			];
-			const output = makeOutput();
+			const output = createResponsesOutput();
 			const { emitted, stream } = makeCapture();
 			await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -744,7 +725,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 

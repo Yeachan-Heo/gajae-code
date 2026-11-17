@@ -25,6 +25,10 @@
 						"type": "string",
 						"minLength": 1
 					},
+					"credential": {
+						"type": "string",
+						"const": "store"
+					},
 					"api": {
 						"type": "string",
 						"enum": [

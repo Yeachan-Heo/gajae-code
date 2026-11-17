@@ -5,6 +5,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import type { BashResult } from "../src/exec/bash-executor";
 import { AgentRegistry } from "../src/registry/agent-registry";
 import { createAgentSession } from "../src/sdk/session";
 import { getSessionClientControls } from "../src/sdk/session-client-controls";
@@ -1269,6 +1270,51 @@ test("detected immutable owner mismatch during a pending move stays poisoned aft
 		release.resolve();
 		remove();
 		await moving;
+		await env.dispose();
+	}
+});
+
+test("retiring moved operator views cannot release an unsettled native execution or revive its opaque ID", async () => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-control-move-execution-");
+	type Operator = { execute(input: unknown): { operation: { operationId: string } }; read(input: unknown): unknown };
+	const old = record(getSessionClientControls(env.session)).operator as Operator | undefined;
+	const pending = Promise.withResolvers<BashResult>();
+	const execute = spyOn(env.session, "executeBash").mockImplementation(() => pending.promise);
+	try {
+		if (!old) throw new Error("Expected session operator controls to be installed.");
+		const accepted = old.execute({ text: "!! held" });
+		await env.session.sessionManager.moveTo(destination.path());
+		const next = record(getSessionClientControls(env.session)).operator as Operator;
+		expect(() => old.read({ operationId: accepted.operation.operationId })).toThrow();
+		expect(() => next.execute({ text: "!! overlapping" })).toThrow(expect.objectContaining({ code: "busy" }));
+		pending.resolve({
+			output: "settled",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 7,
+			outputLines: 1,
+			outputBytes: 7,
+		});
+		for (let i = 0; i < 50; i++) await Promise.resolve();
+		expect(() => next.read({ operationId: accepted.operation.operationId })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		expect(next.execute({ text: "!! fresh" }).operation.operationId).not.toBe(accepted.operation.operationId);
+	} finally {
+		pending.resolve({
+			output: "settled",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 7,
+			outputLines: 1,
+			outputBytes: 7,
+		});
+		execute.mockRestore();
 		await env.dispose();
 	}
 });

@@ -1,20 +1,10 @@
 import { expect, test } from "bun:test";
 import { selectAppendSystemPromptFile } from "../src/cli/append-system-prompt";
+import { mulberry32 } from "./helpers/seeded-random";
 
 const PROPERTY_SEED = 444;
 const PROPERTY_COUNT = 64;
 const LEVELS = ["user", "project"] as const;
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) | 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 test("selectAppendSystemPromptFile keeps the first user path across seeded inputs", () => {
 	const rng = mulberry32(PROPERTY_SEED);
 	for (let i = 0; i < PROPERTY_COUNT; i++) {

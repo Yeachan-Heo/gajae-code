@@ -432,3 +432,8 @@ export function locatePastedImageReferenceAroundCursor(
 		if (cursorCol === placeholderEnd) return { imageIndex, startCol, endCol: placeholderEnd };
 	}
 }
+
+/** Image files among absolute paths (macOS pasteboard file list), in order. */
+export function imageFilePathsFromList(paths: readonly string[]): string[] {
+	return paths.filter(candidate => path.posix.isAbsolute(candidate) && IMAGE_FILE_EXTENSION_PATTERN.test(candidate));
+}

@@ -4,10 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { captureManagedFileNoFollow } from "../src/sdk/session-readonly/inspection";
+import type { ManagedScope } from "../src/sdk/session-readonly/scope";
 import {
 	bindManagedGcSessionRetirementTarget,
 	type ManagedGcProtocolScopeInput,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
@@ -15,9 +16,7 @@ import {
 } from "../src/session/internal/managed-session-scope";
 import {
 	acquireManagedLock,
-	captureManagedFileNoFollow,
 	isManagedLockQuarantineName,
-	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
 } from "../src/session/internal/managed-session-storage";
@@ -39,6 +38,7 @@ import {
 	type TaskArtifactOwnerStorageContext,
 } from "../src/session/task-artifact-owner-codec";
 import { retireTaskArtifactOwner } from "../src/session/task-artifact-owner-retirement";
+import { expectedDirectoryRoot } from "./helpers/managed-directory-root";
 
 interface Fixture {
 	readonly root: string;
@@ -62,17 +62,6 @@ afterEach(() => {
 	vi.restoreAllMocks();
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-
-function expectedDirectoryRoot(pathname: string): ManagedDirectoryRoot {
-	const stat = fs.lstatSync(pathname, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("fixture_directory_invalid");
-	return {
-		canonicalPath: path.resolve(pathname),
-		dev: BigInt.asUintN(64, stat.dev),
-		ino: BigInt.asUintN(64, stat.ino),
-	};
-}
-
 function makeManagedScope(fixture: Pick<Fixture, "profileAgentDir" | "sessionsRoot" | "context">, cwd: string) {
 	const resolved = resolveManagedScopeForWrite({
 		cwd,

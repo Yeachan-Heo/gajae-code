@@ -46,12 +46,10 @@ import {
 import {
 	artifactTreePayloadAbsent,
 	type ManagedGcProtocolScopeInspector,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
 } from "../../session/internal/managed-session-scope";
-import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
 import {
 	hasSiblingTaskArtifactOwnerTranscript,
@@ -61,7 +59,6 @@ import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
@@ -87,6 +84,9 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { validateManagedArtifactTree } from "../session-readonly/inspection";
+import type { ManagedScope } from "../session-readonly/scope";
+import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,
@@ -105,9 +105,11 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	observeProcess,
 	observeProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
+	type ProcessObservation,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 } from "./process-incarnation";
@@ -1810,51 +1812,6 @@ function hasProcessIncarnationAuthority(): boolean {
 	return processIncarnation(process.pid) !== undefined;
 }
 
-type ProcessObservation = "alive" | "exited" | "uncertain";
-
-/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
-function observeProcess(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	if (process.platform === "win32") {
-		try {
-			const reference = nativeLifecycle().Process.fromPid(pid);
-			if (reference?.status() !== "running") return "exited";
-		} catch {
-			return "uncertain";
-		}
-		if (!expectedIncarnation) return "uncertain";
-		const actualIncarnation = readIncarnation(pid);
-		if (!actualIncarnation) return "uncertain";
-		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-	}
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
-	}
-	if (process.platform === "linux") {
-		const probe = probeLinuxProcPidSync(pid);
-		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
-			return "exited";
-	}
-	if (!expectedIncarnation) return "uncertain";
-	const actualIncarnation = readIncarnation(pid);
-	if (!actualIncarnation) return "uncertain";
-	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-}
-
-/** Test seam for the lifecycle-owned process observation boundary. */
-export function observeProcessForTest(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	return observeProcess(pid, expectedIncarnation, readIncarnation);
-}
-
 function hasObservedProcessExit(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -2445,6 +2402,7 @@ type LifecycleFailureArtifact = EffectMarker &
 		transcript?: LifecycleTranscriptEvidence;
 	};
 
+/** Lifecycle artifact digests: byte-stable; `undefined`-valued keys are kept (unlike ./canonical-json.ts, which omits them). */
 function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

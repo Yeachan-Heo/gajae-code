@@ -20,7 +20,7 @@ import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
 } from "../../session/task-artifact-owner-codec";
-import { SdkClient, SdkClientError } from "../client";
+import { lifecycleFingerprint, lifecycleRequestIdentity, SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
@@ -49,6 +49,7 @@ import {
 	type BrokerStopRequest,
 	writeBrokerExitRecord,
 } from "./broker-exit";
+import { canonicalJson } from "./canonical-json";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -88,6 +89,7 @@ import {
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 	type TerminalReadBack,
@@ -452,20 +454,6 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.delete",
 	"session.reconcile_uncertain",
 ]);
-
-/** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
-function lifecycleRequestIdentity(input: Record<string, unknown>): Record<string, unknown> {
-	const identity = { ...input };
-	delete identity.coordinatorSidecarSigningKey;
-	delete identity.coordinatorSidecarKeyId;
-	return identity;
-}
-
-function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
-		.digest("hex");
-}
 
 function publicLifecycleLookupInput(
 	input: Record<string, unknown>,
@@ -871,7 +859,7 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 		const request = brokerSessionRevisionRequest(input);
 		return isBrokerResponse(request) ? request : { input: { ...request } };
 	}
-	if (LIFECYCLE_OPERATIONS.has(operation) && input.body !== undefined)
+	if (operation !== "session.revise" && input.body !== undefined)
 		return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 	const normalized: Record<string, unknown> = { ...input };
 	if (
@@ -986,17 +974,6 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	}
 	return { input: normalized };
 }
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 type TerminalPersistenceVerification =
 	| { kind: "unverified" }
 	| { kind: "verified" }
@@ -1707,7 +1684,6 @@ type BrokerPublicationState =
 	| "heartbeat-ambiguous"
 	| "stopping";
 
-const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
@@ -5613,7 +5589,7 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
-		if (LIFECYCLE_OPERATIONS.has(operation) && input.body !== undefined)
+		if (operation !== "session.revise" && input.body !== undefined)
 			return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
@@ -5818,17 +5794,17 @@ export class Broker {
 				? { closeAuthorityBound: true }
 				: {}),
 		};
+		// One key admits one request. Checked here and again atomically when the row is
+		// begun, because a concurrent request for another target holds another chain.
+		const conflictsWithKeyHolder = (holder: LifecycleLedgerEntry): boolean =>
+			!(
+				operation === "session.close" &&
+				(holder.intendedSessionId === input.sessionId || holder.resultSessionId === input.sessionId)
+			) &&
+			(holder.fingerprint !== fingerprint || holder.requestHash !== requestedRequestHash);
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
-			const sameCloseSession =
-				operation === "session.close" &&
-				(matchingOperation?.intendedSessionId === input.sessionId ||
-					matchingOperation?.resultSessionId === input.sessionId);
-			if (
-				matchingOperation &&
-				!sameCloseSession &&
-				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
-			)
+			if (matchingOperation && conflictsWithKeyHolder(matchingOperation))
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			const matchingLegacy = matchingOperation;
 			if (matchingLegacy) {
@@ -5925,7 +5901,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, metadata);
+			const begun = await this.ledger.begin(identity, requestHash, metadata, conflictsWithKeyHolder);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				// Proven errors are immutable even when their response carries cleanup
@@ -6085,7 +6061,6 @@ export class Broker {
 				});
 				return uncertain;
 			}
-			terminalPersistenceHooksForTest.get(this)?.();
 			await outcome.deferredArtifactCleanup?.();
 			return response;
 		} finally {
@@ -6093,12 +6068,6 @@ export class Broker {
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
 	}
-}
-
-/** Test-only hook for simulating a process crash after terminal persistence verification. */
-export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => void) | undefined): void {
-	if (hook) terminalPersistenceHooksForTest.set(broker, hook);
-	else terminalPersistenceHooksForTest.delete(broker);
 }
 
 /** Test-only hook for shortening the bounded ambiguity deadline. */

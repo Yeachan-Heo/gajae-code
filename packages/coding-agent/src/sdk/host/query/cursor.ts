@@ -98,6 +98,7 @@ function canonicalise(value: unknown): unknown {
 	return value;
 }
 
+/** Cursor MAC basis: localeCompare key order, then JSON.stringify (drops undefined properties, array holes become null). */
 function canonicalJson(value: unknown): string {
 	return JSON.stringify(canonicalise(value));
 }

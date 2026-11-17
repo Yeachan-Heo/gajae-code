@@ -27,13 +27,13 @@ function verifyOwnerOnlyPathSecurityNative(
 }
 
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
-import { FileSessionStorage, type SessionStorageSnapshot } from "../../session/session-storage";
 import {
 	type LogicalSessionCandidate,
 	listManagedSessionCandidates,
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { FileSessionReader, type SessionStorageSnapshot } from "../session-readonly/storage";
 
 /** One ranked recent-session entry surfaced to the picker. */
 export interface RecentSessionEntry {
@@ -99,7 +99,7 @@ function readCandidateInitialLines(
 	}
 	let snapshot: SessionStorageSnapshot;
 	try {
-		snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
+		snapshot = new FileSessionReader().readSnapshotSync(candidate.path);
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR")
@@ -254,7 +254,7 @@ export async function resolveRecentSessionScopes(
 				for (const file of files) {
 					if (!file.isFile() || file.isSymbolicLink() || !file.name.endsWith(".jsonl")) continue;
 					try {
-						const snapshot = new FileSessionStorage().readSnapshotSync(
+						const snapshot = new FileSessionReader().readSnapshotSync(
 							path.join(sessionsRoot, directory.name, file.name),
 						);
 						const newline = snapshot.bytes.indexOf(0x0a);

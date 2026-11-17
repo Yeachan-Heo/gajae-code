@@ -137,10 +137,28 @@ const controls = [
 	["C58", "permission.channel.set", "Enable or disable session-owned external permission polling."],
 	["C59", "permission.respond", "Answer a pending external permission request."],
 	["C60", "btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
+	["C69", "operator.execute", "Admit session-owned Bash or Python execution with observable terminal results."],
+	["C70", "operator.cancel", "Request cancellation of one exact operator execution."],
+	["C72", "activity.cancel", "Cancel an exact owner-scoped activity when its backend supports cancellation."],
+	["C73", "activity.pause", "Pause an exact resumable detached task."],
+	["C74", "activity.resume", "Resume an exact detached task, optionally with a message."],
+	["C75", "activity.delete", "Delete an exact activity when its backend supports deletion."],
+	["C76", "activity.acknowledge", "Acknowledge the failure latch for an exact observed activity snapshot."],
+	["C77", "mcp.suspend", "Suspend an exact factory-manager MCP server target."],
+	["C78", "mcp.resume", "Resume an exact factory-manager MCP server target."],
+	["C79", "mcp.reconnect", "Reconnect an exact factory-manager MCP server target."],
+	["C80", "btw.open", "Capture frozen side context and optionally admit its first question."],
+	["C81", "btw.submit", "Admit a follow-up in an exact frozen side conversation."],
+	["C82", "btw.cancel", "Request cancellation of an exact side turn."],
+	["C83", "btw.close", "Retire an exact side conversation without touching the main transcript."],
 	["C61", "model.role.set", "Set or clear a session-owned task-role model selection."],
 	["C62", "model.select", "Select a concrete model with explicit session or global default scope."],
 	["C63", "model.profile.select", "Select a profile with explicit session or global default scope."],
 	["C64", "config.write", "Validate and write configuration with explicit session, global, or project scope."],
+	["C65", "auth.start", "Start a secure-local provider authorization flow."],
+	["C66", "auth.answer", "Answer an exact secure-local authorization challenge."],
+	["C67", "auth.cancel", "Cancel an exact secure-local authorization flow."],
+	["C68", "auth.apiKey.store", "Store a provider API key through secure-local authority."],
 	["C84", "session.revise", "Broker-authorized same-session revision executor; not a public endpoint control."],
 ] as const;
 
@@ -210,6 +228,24 @@ const queries = [
 	["Q33", "permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
+	[
+		"Q36",
+		"auth.providers.status",
+		"Read enrollment support and credential-free provider status under secure-local authority.",
+	],
+	["Q37", "auth.status", "Read one provider enrollment status under secure-local authority."],
+	["Q38", "auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
+	["Q39", "operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
+	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
+	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
+	["Q42", "mcp.snapshot", "Read bounded MCP states and supported controls with opaque target references."],
+	["Q46", "btw.read", "Read bounded side history and cursor-scoped streamed deltas."],
+	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
+	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
+	["Q45", "session.info", "Read a bounded selected-session information projection."],
+	["Q47", "diff.scopes", "List installed SDK diff observation scopes."],
+	["Q48", "diff.summary", "Capture a bounded working-tree diff snapshot including staged and untracked files."],
+	["Q49", "diff.file", "Read a bounded file patch by its frozen snapshot reference."],
 ] as const;
 
 const queryAliases: Readonly<Record<string, readonly string[]>> = {
@@ -226,7 +262,7 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (id === "C84")
+	if (["C38", "C65", "C66", "C67", "C68", "C84"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -235,17 +271,16 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "prohibited",
 			daemonCli: "prohibited",
 		});
-
-	if (id === "C38")
+	if (["C80", "C81", "C82", "C83"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
 			slack: "prohibited",
 			mcp: "prohibited",
-			acp: "provider_only",
+			acp: "prohibited",
 			daemonCli: "machine_only",
 		});
-	if (["C61", "C62", "C63", "C64"].includes(id))
+	if (["C61", "C62", "C63", "C64", "C69", "C70", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -286,6 +321,49 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
+	if (["C69", "C70"].includes(id))
+		return [
+			"invalid_input",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"not_found",
+			"already_terminal",
+			"stale_cursor",
+			"backend_failure",
+		];
+	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
+		return [
+			"invalid_input",
+			"invalid_owner",
+			"disposed",
+			"not_found",
+			"stale_generation",
+			"read_only",
+			"already_terminal",
+			"no_live_job",
+			"control_in_progress",
+			"not_running",
+			"no_live_handle",
+			"already_running",
+			"already_queued",
+			"context_unavailable",
+			"no_runner",
+			"resume_failed",
+			"owner_shutdown_in_progress",
+			"stale_session",
+			"session_transitioning",
+			"stale_target",
+			"busy",
+			"unavailable",
+			"unsupported",
+			"unknown_effect",
+			"backend_failure",
+		];
+	if (["C80", "C81"].includes(id))
+		return ["invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed"];
+	if (["C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
 	if (id === "C84")
 		return [
 			"invalid_input",
@@ -378,7 +456,16 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q33"].includes(id))
+	if (["Q36", "Q37", "Q38"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
+	if (["Q44", "Q45", "Q33", "Q39", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -400,6 +487,24 @@ function queryErrors(id: string): string[] {
 		"operation_not_session_owned",
 		"response_too_large",
 	];
+	if (["Q36", "Q37", "Q38"].includes(id)) return [...common, "operation_prohibited", "internal"];
+	if (id === "Q39") return [...common, ...controlErrors("C69")];
+	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
+	if (id === "Q46") return [...common, "busy"];
+	if (["Q43", "Q44", "Q45"].includes(id))
+		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
+	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
+		return [
+			...common,
+			"not_git_repository",
+			"diff_too_large",
+			"git_failure",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"stale_ref",
+		];
 	if (id === "Q35") return [...common, "stale_preferences", "preference_busy", "preference_failed"];
 	return id === "Q29"
 		? ["invalid_request", "resource_gone", "internal"]
@@ -419,7 +524,25 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52", "C59", "C60"] as string[]).includes(id)
+				: (
+							[
+								"C25",
+								"C52",
+								"C59",
+								"C60",
+								"C38",
+								"C65",
+								"C66",
+								"C67",
+								"C68",
+								"C69",
+								"C70",
+								"C80",
+								"C81",
+								"C82",
+								"C83",
+							] as string[]
+						).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

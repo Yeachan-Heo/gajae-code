@@ -108,7 +108,29 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	"composer.complete": "invalid_input",
+
 	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
+	"operator.execute": "invalid_input",
+	"operator.cancel": "invalid_input",
+	"operator.read": "invalid_input",
+	"activity.cancel": "invalid_input",
+	"activity.pause": "invalid_input",
+	"activity.resume": "invalid_input",
+	"activity.delete": "invalid_input",
+	"activity.acknowledge": "invalid_input",
+	"activity.detail": "invalid_input",
+	"mcp.snapshot": "operation_not_session_owned",
+	"mcp.suspend": "operation_not_session_owned",
+	"mcp.resume": "operation_not_session_owned",
+	"mcp.reconnect": "operation_not_session_owned",
+	"btw.open": "invalid_input",
+	"btw.submit": "invalid_input",
+	"btw.cancel": "invalid_input",
+	"btw.close": "invalid_input",
+	"btw.read": "invalid_input",
+	"diff.summary": "invalid_input",
+	"diff.file": "invalid_input",
 	"model.role.set": "invalid_input",
 	"model.select": "invalid_input",
 	"model.profile.select": "invalid_input",
@@ -161,8 +183,7 @@ export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.fork": "invalid_input",
 	"session.resume": "invalid_input",
 	"session.close": "invalid_input",
-	// The real directly hosted fixture has no Broker lifecycleRequestId.
-	"session.revise": "operation_prohibited",
+	"session.revise": "operation_failed",
 };
 export function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
@@ -291,6 +312,8 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-session" };
 		case "session.branch":
 			return { entryId: "missing-entry" };
+		case "btw.open":
+			return { unexpected: true };
 		case "session.rename":
 			return { name: "adapter disposition" };
 		case "session.handoff":

@@ -71,7 +71,12 @@ import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
-import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
+import {
+	formatClampedModelSelector,
+	getThinkingLevelMetadata,
+	modelSupportsThinkingOff,
+	parseThinkingLevel,
+} from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 import type { SmartRoutingIntent } from "./smart-routing-panel";
@@ -3147,7 +3152,7 @@ export class ModelSelectorComponent extends Container {
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {
-	const levels: ThinkingLevel[] = [ThinkingLevel.Off];
+	const levels: ThinkingLevel[] = modelSupportsThinkingOff(model) ? [ThinkingLevel.Off] : [];
 	let efforts: readonly string[];
 	try {
 		efforts = getSupportedEfforts(model);

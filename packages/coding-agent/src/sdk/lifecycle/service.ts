@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import {
 	resolvedScopeV1,
 	resolveScopeRequest,
@@ -44,6 +45,25 @@ export type SessionLifecycleOperation =
 
 export type SessionLifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
 export type SessionLifecycleLookupOperation = "session.create";
+
+/** Lifecycle mutations exposed by transport adapters; session.revise stays daemon-CLI only. */
+export type SessionLifecycleTransportMutationOperation = Exclude<SessionLifecycleMutationOperation, "session.revise">;
+
+const SESSION_LIFECYCLE_MUTATION_OPERATIONS: ReadonlySet<string> = new Set([
+	"session.create",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.delete",
+	"session.reconcile_uncertain",
+] satisfies SessionLifecycleTransportMutationOperation[]);
+
+/** Excludes session.revise, which only the local daemon CLI composes on top of this predicate. */
+export function isSessionLifecycleMutationOperation(
+	operation: string,
+): operation is SessionLifecycleTransportMutationOperation {
+	return SESSION_LIFECYCLE_MUTATION_OPERATIONS.has(operation);
+}
 
 export interface SessionLifecycleActor {
 	readonly id: string;
@@ -442,10 +462,7 @@ const RETRYABLE_BROKER_ERRORS = new Set([
 	"startup_admission_timeout",
 ]);
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
+/** Lifecycle idempotency digests: sorted keys, omits undefined-valued keys, and stringifies non-record values (undefined becomes the string "undefined"). */
 function canonicalJson(value: unknown): string {
 	if (value === null) return "null";
 	if (typeof value === "string" || typeof value === "boolean" || typeof value === "number")

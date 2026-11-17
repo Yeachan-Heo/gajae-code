@@ -106,7 +106,7 @@ type SemVer = {
 	patch: number;
 };
 
-type GeminiKind = "pro" | "flash" | "argon";
+type GeminiKind = "pro" | "flash" | "argon" | "carbon";
 type AnthropicKind = "opus" | "sonnet" | "fable" | "haiku";
 type OpenAIVariant =
 	| "astra"
@@ -563,11 +563,25 @@ export function requiresAnthropicThinkingDisableWhenOff(modelId: string): boolea
 }
 
 /**
- * Haiku 5+ and Opus 4.7+ reject sampling parameters on the Anthropic Messages API.
- * https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide#remove-sampling-parameters
+ * Fable 5.2+ thinks adaptively whenever `thinking` is omitted and rejects an explicit
+ * `type: "disabled"`, so a user-facing Off choice cannot be honored. Selectors must not
+ * offer Off for these models; requests keep omitting the provider-rejected field.
+ */
+export function isAnthropicThinkingAlwaysOn(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	return parsed?.kind === "fable" && semverGte(parsed.version, "5.2");
+}
+
+function isAnthropicFableModel(modelId: string): boolean {
+	return parseAnthropicModel(getCanonicalModelId(modelId))?.kind === "fable";
+}
+
+/**
+ * Fable 5+, Haiku 5+, and Opus 4.7+ reject sampling parameters on the Anthropic Messages API.
+ * https://platform.claude.com/docs/en/build-with-claude/thinking#sampling-parameters
  */
 export function hasAnthropicModelSamplingRestrictions(modelId: string): boolean {
-	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId);
+	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId) || isAnthropicFableModel(modelId);
 }
 
 /**
@@ -1080,9 +1094,17 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 			return ANTHROPIC_HAIKU_5_5_EFFORTS;
 		}
 		if (parsedModel.kind === "fable") {
-			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
-			// Converse lacks it (same split as Opus 4.7+ below).
-			return model.api === "anthropic-messages" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
+			// Fable 5.2+ on Anthropic Messages supports both xhigh and max per docs.
+			// Fable 5.0 and 5.1 support only xhigh on Messages.
+			// Bedrock Converse lacks xhigh but AWS documents `max` for Fable 5+.
+			// https://platform.claude.com/docs/en/build-with-claude/effort#effort-levels
+			// https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+			if (model.api === "anthropic-messages") {
+				return semverGte(parsedModel.version, "5.2")
+					? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
+					: DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+			}
+			return DEFAULT_REASONING_EFFORTS_WITH_MAX;
 		}
 		if (anthropicModelHasRealXHighEffort(model)) {
 			// Opus 4.7+ and Sonnet 5 expose both Anthropic's real xhigh and
@@ -1186,7 +1208,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 	if (modelId.endsWith(GEMINI_SUFFIX)) {
 		modelId = modelId.slice(0, -GEMINI_SUFFIX.length);
 	}
-	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon)\b/.exec(modelId);
+	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon|carbon)\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}

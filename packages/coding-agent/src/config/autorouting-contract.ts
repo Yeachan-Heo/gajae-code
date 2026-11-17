@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
+import { isRecord } from "@gajae-code/utils";
 
 /**
- * Dependency-free autorouting vocabulary and settings validators.
+ * Autorouting vocabulary and settings validators.
  *
- * This module deliberately does not import Settings, task code, or model
- * profiles.  It is the shared contract used by settings and (later) routing
- * policy code.
+ * Apart from the shared @gajae-code/utils type guards, this module deliberately
+ * does not import Settings, task code, or model profiles. It is the shared
+ * contract used by settings and (later) routing policy code.
  */
 
 export const AUTOROUTING_TIERS = ["fast", "balanced", "strong"] as const;
@@ -98,10 +99,6 @@ function effectiveIssue(
 	detail: string,
 ): AutoroutingEffectiveIssue {
 	return { code, reason: code, detail };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /**

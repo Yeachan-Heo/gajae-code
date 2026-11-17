@@ -35,12 +35,14 @@ export type {
 export { getSessionMessageEntryId } from "../session/session-manager";
 export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";
+export * from "./activity-controls";
 
+export * from "./authorization-controls";
 export * as btw from "./btw";
 export * as bus from "./bus";
-
+export * from "./composer-observation";
 export * from "./diagnostics/observe-broker";
-
+export * from "./diff-observation";
 export * from "./extension-interaction";
 export * as host from "./host";
 export type {
@@ -62,9 +64,9 @@ export type {
 } from "./models";
 export * from "./notification-setup";
 export * from "./notification-setup-contract";
+export * from "./operator-controls";
 
 export * from "./preference-controls";
-export * from "./prompt-status";
 export * from "./prompt-status";
 export * from "./protocol/client-control-contracts";
 
@@ -74,6 +76,6 @@ export * from "./routing-settings";
 export * from "./session";
 export * from "./session-directory";
 export * from "./settings-catalog";
-
+export * from "./side-conversation";
 export * from "./turn-result";
 export * from "./workflow-gates";

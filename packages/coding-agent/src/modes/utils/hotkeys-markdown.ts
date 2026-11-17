@@ -80,7 +80,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		`| ${displayAppKey("app.tool.backgroundFold")} twice | Fold supported foreground bash into a background job |`,
 		`| ${displayAppKey("app.thinking.toggle")} | Toggle thinking block visibility |`,
 		`| ${displayAppKey("app.editor.external")} | Edit message in external editor |`,
-		`| ${displayAppKey("app.clipboard.pasteImage")} | Paste image from clipboard |`,
+		`| ${displayAppKey("app.clipboard.pasteImage")} | Paste image or text from clipboard |`,
 		`| ${displayAppKey("app.stt.toggle")} | Toggle speech-to-text recording |`,
 		`| ${displayAppKey("app.irc.sidebar.toggle")} | Toggle IRC sidebar |`,
 		"| `?` | Show help / shortcuts |",

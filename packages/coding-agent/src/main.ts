@@ -86,12 +86,12 @@ import {
 	SessionIndex,
 	type SessionLocatorV2,
 } from "./sdk/broker/session-index";
+import type { ResumeSessionIdentity } from "./sdk/session-readonly/storage";
 import type { AgentSession } from "./session/agent-session";
 import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
-	type ResumeSessionIdentity,
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,

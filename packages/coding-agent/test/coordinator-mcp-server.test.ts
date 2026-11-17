@@ -1922,6 +1922,90 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(3);
 	});
 
+	it("does not seal a retirement refused by the broker legacy-history fence", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const creationKey = "legacy-fenced-retirement";
+		const remoteCreateKey = `remote_${createHash("sha256")
+			.update(`gjc_coordinator_start_session\0${creationKey}`)
+			.digest("hex")}`;
+		let fenced = true;
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: (operation, input) => {
+				if (operation === "session.create") return { ok: true, result: { cwd: root } };
+				if (operation !== "session.reconcile_uncertain") return undefined;
+				if (fenced)
+					return {
+						ok: false,
+						error: {
+							code: "legacy_lifecycle_ambiguous",
+							message: "legacy lifecycle request has an ambiguous target",
+						},
+					};
+				return {
+					ok: true,
+					result: {
+						sessionId: input.sessionId,
+						retired: true,
+						ledgerState: "terminal_error",
+						indexType: "session_closed",
+						stateRoot: input.stateRoot,
+						endpointGeneration: input.endpointGeneration,
+						endpointMtimeMs: input.endpointMtimeMs,
+						processIncarnation: input.processIncarnation,
+						hostIncarnation: input.hostIncarnation,
+						lifecycleRequestId: input.lifecycleRequestId,
+						remoteCreateKey: input.remoteCreateKey,
+					},
+				};
+			},
+		});
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: creationKey,
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: false });
+		const original = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update(creationKey).digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as { request_digest: string };
+		const retirementArgs = {
+			cwd: root,
+			session_id: "retired-session",
+			state_root: path.join(root, ".gjc", "state"),
+			endpoint_generation: 2,
+			endpoint_mtime_ms: 1,
+			process_incarnation: "linux:123",
+			host_incarnation: "host:123",
+			lifecycle_request_id: "retire-effect",
+			remote_create_key: remoteCreateKey,
+			creation_idempotency_key: creationKey,
+			request_digest: original.request_digest,
+			idempotency_key: "legacy-fenced-retirement-key",
+			allow_mutation: true,
+		};
+		await expect(server.callTool("gjc_coordinator_retire_start_session", retirementArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "legacy_lifecycle_ambiguous" },
+		});
+		// The broker refused before admission, so the same retirement key runs again.
+		fenced = false;
+		await expect(server.callTool("gjc_coordinator_retire_start_session", retirementArgs)).resolves.toMatchObject({
+			ok: true,
+			session_id: "retired-session",
+			retired: true,
+		});
+		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(2);
+	});
+
 	it("rejects missing or wrong retirement proof before broker mutation", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -4903,6 +4987,70 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const retried = await server.callTool("gjc_delegate_plan", retryArgs);
 		expect(retried).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
 		expect(await server.callTool("gjc_delegate_plan", retryArgs)).toEqual(retried);
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+	}, 20_000);
+	it("does not seal a reused delegate refused with legacy_lifecycle_ambiguous before its prompt claim", async () => {
+		// Pins the delegate classifier: the code is public now, so it no longer reaches
+		// it as `unavailable`. The failure is injected at the same pre-claim boundary as
+		// the canonicalization test above.
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		await fs.mkdir(worktree, { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let fence = false;
+		const canonicalizePath = async (value: string): Promise<string> => {
+			if (fence && value === worktree)
+				throw new SdkClientError("legacy_lifecycle_ambiguous", "legacy lifecycle request has an ambiguous target");
+			return fs.realpath(value);
+		};
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{ canonicalizePath },
+		);
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-legacy-fence",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after a legacy-history fence",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-legacy-fence",
+			allow_mutation: true,
+		};
+		fence = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "legacy_lifecycle_ambiguous" },
+		});
+		const receipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(receipt.state).toBe("in_progress");
+		expect(receipt.response).toBeUndefined();
+		fence = false;
+		const retried = await server.callTool("gjc_delegate_plan", retryArgs);
+		expect(retried).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
 		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
 	}, 20_000);
 	it("keeps a marker-less in-progress reused-delegate receipt uncertain on same-key retry", async () => {

@@ -21,6 +21,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
@@ -97,7 +98,12 @@ import {
 	TURN_STREAM_CAPABILITY,
 } from "../src/sdk/host";
 import { abortAndPromptSteerClientRef } from "../src/sdk/host/control";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	setBrokerRuntimeAbortCapabilityForTest,
+} from "../src/sdk/host/control/runtime-gate";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import type { QueryResponse } from "../src/sdk/host/query";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
@@ -146,6 +152,7 @@ function captureInternalSend(
 }
 
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { closeSocket } from "./helpers/close-socket";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
@@ -174,13 +181,8 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 });
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = performance.now() + 15_000;
-	while (!predicate()) {
-		if (performance.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(20);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 15_000, { intervalMs: 20, label, clock: () => performance.now() });
 function pauseNextReconciliationCommit(
 	sessionFile: string,
 	sessionId: string,
@@ -322,15 +324,6 @@ async function awaitSocketOpen(socket: WebSocket): Promise<void> {
 	socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	await promise;
 }
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
-}
-
 async function removeTempDir(dir: string): Promise<void> {
 	for (let attempt = 0; ; attempt++) {
 		try {
@@ -493,6 +486,7 @@ function context(
 		getThinkingLevel: () => "low",
 		getActivePromptHandle: () => undefined,
 		modelRegistry: {
+			authStorage: { getAll: () => ({}) },
 			getAll: () => [
 				{
 					provider: "fixture-provider",
@@ -8406,6 +8400,382 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+/**
+ * A notifications-enabled TUI session (#7566): `createAgentSession` wires the bus
+ * host with its own session seams, and the turn is typed at the terminal through
+ * `session.prompt` — no SDK connection submitted it. The provider blocks until the
+ * run is aborted, so the turn stays active until something stops it.
+ */
+async function startTerminalTypedBusTurn(prefix: string, typeTurn = true) {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	dirs.push(cwd);
+	const notices: Array<{ message: string; type: string | undefined }> = [];
+	const host = await startProductionSdkHost(cwd, {
+		sessionWiredNotificationsHost: true,
+		onNotify: (message, type) => notices.push({ message, type }),
+	});
+	const providerEntered = Promise.withResolvers<void>();
+	// Lets a test end the run on its own, without any abort.
+	const providerFinished = Promise.withResolvers<void>();
+	host.session.modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
+	host.session.agent.streamFn = createMockModel({
+		handler: async (_context, options) => {
+			providerEntered.resolve();
+			const signal = options?.signal;
+			if (signal && !signal.aborted) {
+				const aborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				await Promise.race([aborted.promise, providerFinished.promise]);
+			}
+			return { content: ["interrupted"] };
+		},
+	}).stream;
+	const typedTurn = typeTurn ? host.session.prompt("typed at the terminal") : Promise.resolve();
+	void typedTurn.catch(() => {});
+	if (typeTurn) {
+		await providerEntered.promise;
+		expect(host.session.activePromptHandle).toBeString();
+	}
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+	const control = async (request: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", operation: "turn.abort", ...request }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === request.id),
+			`${String(request.id)} response`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === request.id) as {
+			ok: boolean;
+			result?: Record<string, unknown>;
+			error?: { code?: string };
+		};
+	};
+	return { host, notices, typedTurn, control, finishTurn: () => providerFinished.resolve() };
+}
+
+/**
+ * Run `during` inside the durable write of the operator abort's pending marker:
+ * the marker's atomic rename is held until `during` resolves, so whatever it
+ * changes lands after the abort captured the run and before the abort seam.
+ */
+function duringPendingTerminalMarkerWrite(during: () => Promise<void>): {
+	restore: () => void;
+	entered: () => boolean;
+} {
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let entered = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!entered && String(from).endsWith(".tmp")) {
+			let pendingMarker = false;
+			try {
+				const document = (await Bun.file(String(from)).json()) as {
+					terminalScopes?: Array<{ turnDisposition?: string }>;
+				};
+				pendingMarker = document.terminalScopes?.some(scope => scope.turnDisposition === "pending") === true;
+			} catch {}
+			if (pendingMarker) {
+				entered = true;
+				await during();
+			}
+		}
+		return await realRename(from, to);
+	});
+	return { restore: () => rename.mockRestore(), entered: () => entered };
+}
+
+const operatorAbortRequest = (capability: string, id: string) => ({
+	id,
+	input: {
+		mode: "terminal",
+		scope: "turn",
+		operator: true,
+		[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+	},
+	confirm: true,
+	idempotencyKey: `${id}-key`,
+});
+
+/** The safe uncertainty the bus reports when the captured run is gone before the abort seam. */
+const ACTIVE_TURN_CHANGED_RESULT = {
+	ok: true,
+	selection: "turn",
+	turn: "uncertain",
+	ownedWork: "left_running",
+	automaticDelivery: "enabled",
+	resumeOnOwnedCompletion: true,
+	reason: "active_turn_changed",
+};
+
+test("notifications TUI host: operator turn.abort does not stop a same-epoch continuation installed during the marker write", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-operator-continuation-");
+	const capturedHandle = host.session.activePromptHandle;
+	const epoch = host.session.getTerminalTurnEpoch();
+	expect(capturedHandle).toBeString();
+	expect(epoch).toBeNumber();
+	// A same-turn continuation installs a new active handle while the marker is
+	// being written; the terminal turn epoch does not advance.
+	const continuationHandle = `continuation-${crypto.randomUUID()}`;
+	const write = duringPendingTerminalMarkerWrite(async () => {
+		Object.defineProperty(host.session, "activePromptHandle", { configurable: true, get: () => continuationHandle });
+	});
+	try {
+		const request = operatorAbortRequest(capability, "operator-continuation-abort");
+		const response = await control(request);
+		expect(write.entered()).toBe(true);
+		expect(host.session.getTerminalTurnEpoch()).toBe(epoch);
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual(ACTIVE_TURN_CHANGED_RESULT);
+		// The abort seam never ran: the captured run was not stopped on the stale pair.
+		expect(host.session.isStreaming).toBe(true);
+		expect(host.session.agent.activeResourceRunId).toBe(capturedHandle);
+		// Nothing durable says stopped: a same-key retry replays the uncertainty.
+		const replayed = await control({ ...request, id: "operator-continuation-abort-replay" });
+		expect(replayed.ok).toBe(true);
+		expect(replayed.result?.turn).toBe("uncertain");
+		await Bun.sleep(50);
+		expect(notices).toEqual([]);
+	} finally {
+		write.restore();
+		delete (host.session as { activePromptHandle?: string }).activePromptHandle;
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: operator turn.abort reports uncertainty when the run ends during the marker write", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control, finishTurn } = await startTerminalTypedBusTurn("gjc-bus-operator-ended-");
+	const write = duringPendingTerminalMarkerWrite(async () => {
+		finishTurn();
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+	});
+	try {
+		const request = operatorAbortRequest(capability, "operator-ended-abort");
+		const response = await control(request);
+		expect(write.entered()).toBe(true);
+		expect(host.session.activePromptHandle).toBeUndefined();
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual(ACTIVE_TURN_CHANGED_RESULT);
+		const replayed = await control({ ...request, id: "operator-ended-abort-replay" });
+		expect(replayed.ok).toBe(true);
+		expect(replayed.result?.turn).toBe("uncertain");
+		await Bun.sleep(50);
+		expect(notices).toEqual([]);
+	} finally {
+		write.restore();
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: operator turn.abort stops a turn typed at the terminal (#7566)", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-operator-abort-");
+	try {
+		const request = {
+			id: "operator-abort",
+			input: {
+				mode: "terminal",
+				scope: "turn",
+				operator: true,
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+			},
+			confirm: true,
+			idempotencyKey: "operator-abort-key",
+		};
+		const response = await control(request);
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		});
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		expect(host.session.isStreaming).toBe(false);
+		expect(host.session.activePromptHandle).toBeUndefined();
+		await waitFor(() => notices.length > 0, "operator abort notice");
+		expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
+
+		// A same-key retry replays the stored stop without stopping or announcing again.
+		const replayed = await control({ ...request, id: "operator-abort-replay" });
+		expect(replayed.ok).toBe(true);
+		expect(replayed.result?.turn).toBe("stopped");
+		await Bun.sleep(50);
+		expect(notices).toHaveLength(1);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: turn.abort without operator authority cannot stop a terminal-typed turn", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-peer-abort-");
+	try {
+		const handle = host.session.activePromptHandle;
+		// An SDK peer that did not submit the turn has no authority over it.
+		const peer = await control({
+			id: "peer-abort",
+			input: { mode: "terminal", scope: "turn" },
+			idempotencyKey: "peer-abort-key",
+		});
+		expect(peer.ok).toBe(true);
+		expect(peer.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
+		});
+		// Claiming operator authority without the Broker's marker is refused.
+		const forged = await control({
+			id: "forged-operator-abort",
+			input: { mode: "terminal", scope: "turn", operator: true, [BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: "forged" },
+			confirm: true,
+			idempotencyKey: "forged-operator-abort-key",
+		});
+		expect(forged.ok).toBe(false);
+		expect(forged.error?.code).toBe("operation_prohibited");
+		expect(host.session.isStreaming).toBe(true);
+		expect(host.session.activePromptHandle).toBe(handle);
+		expect(notices).toEqual([]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: operator turn.abort with no active turn reports no_active_turn", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, control } = await startTerminalTypedBusTurn("gjc-bus-operator-idle-", false);
+	try {
+		expect(host.session.activePromptHandle).toBeUndefined();
+		const response = await control({
+			id: "operator-idle-abort",
+			input: {
+				mode: "terminal",
+				scope: "turn",
+				operator: true,
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+			},
+			confirm: true,
+			idempotencyKey: "operator-idle-abort-key",
+		});
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
+		});
+		expect(notices).toEqual([]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		await host.stop();
+	}
+}, 60_000);
+
+test("operator turn.abort selects target by active-run ownership; bus fallback not skipped by queued SDK follow-up (#7566)", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	// Set up: terminal turn, SDK submission queued but not owning the active run
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-operator-queued-");
+	try {
+		const terminalRunHandle = host.session.activePromptHandle;
+		expect(terminalRunHandle).toBeString();
+
+		// Queue an SDK submission through a different connection that matches
+		// addressing criteria (same connection, right scope) but doesn't own the active run.
+		// This simulates a follow-up submission waiting in the queue.
+		const sdkSocket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+		sockets.push(sdkSocket);
+		const sdkFrames: Record<string, unknown>[] = [];
+		sdkSocket.addEventListener("message", event => sdkFrames.push(JSON.parse(String(event.data))));
+		await awaitSocketOpen(sdkSocket);
+
+		// Send a turn.follow_up that will be queued (not accepted immediately)
+		const queuedFollowUpId = crypto.randomUUID();
+		sdkSocket.send(
+			JSON.stringify({
+				type: "control_request",
+				operation: "turn.follow_up",
+				id: queuedFollowUpId,
+				input: { text: "follow-up question" },
+			}),
+		);
+
+		// Wait for the follow-up to be accepted into the queue
+		await waitFor(
+			() => sdkFrames.some(frame => frame.type === "control_response" && frame.id === queuedFollowUpId),
+			"follow-up acceptance",
+		);
+		const followUpAck = sdkFrames.find(frame => frame.type === "control_response" && frame.id === queuedFollowUpId)!;
+		expect(followUpAck).toMatchObject({ ok: true, result: { accepted: true } });
+
+		// Now the operator sends an abort targeting the terminal-typed turn.
+		// This should succeed because the operator can target runs no SDK submission owns.
+		const abortResponse = await control({
+			id: "operator-abort-with-queued",
+			input: {
+				mode: "terminal",
+				scope: "turn",
+				operator: true,
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+			},
+			confirm: true,
+			idempotencyKey: "operator-abort-with-queued-key",
+		});
+
+		// The operator should successfully stop the terminal turn
+		expect(abortResponse.ok).toBe(true);
+		expect(abortResponse.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		});
+
+		// The terminal-typed run is the one stopped: its prompt settles and its handle is retired.
+		const settled = await Promise.race([
+			typedTurn.then(
+				() => "settled",
+				() => "settled",
+			),
+			Bun.sleep(5_000).then(() => "timeout"),
+		]);
+		expect(settled).toBe("settled");
+		expect(host.session.activePromptHandle).not.toBe(terminalRunHandle);
+		// automaticDelivery is enabled, so the queued follow-up then starts its own successor run.
+		await waitFor(() => sdkFrames.some(frame => frame.type === "agent_start"), "queued follow-up delivery");
+
+		// Operator abort notice should be delivered
+		await waitFor(() => notices.length > 0, "operator abort notice");
+		expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await host.stop();
+	}
+}, 60_000);
+
 test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
 	dirs.push(cwd);
@@ -9848,6 +10218,186 @@ test("diff queries return a bounded error for oversized diffs", async () => {
 	expect(JSON.parse(String(message))).toMatchObject({ ok: false, error: { code: "diff_too_large" } });
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, context(cwd, sessionId));
 });
+
+interface LegacyDiffWireResponse extends QueryResponse {
+	type: "query_response";
+}
+
+async function queryLegacyDiffFixture(
+	cwd: string,
+	sessionId: string,
+	sessionContext: Record<string, unknown> = context(cwd, sessionId),
+): Promise<LegacyDiffWireResponse[]> {
+	const handlers = start(sessionContext);
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		const frames: Record<string, unknown>[] = [];
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		const opened = Promise.withResolvers<void>();
+		socket.addEventListener("open", () => opened.resolve(), { once: true });
+		socket.addEventListener("error", () => opened.reject(new Error("WS error")), { once: true });
+		await opened.promise;
+		const responses: LegacyDiffWireResponse[] = [];
+		for (const query of ["Q06", "Q07", "Q08"]) {
+			socket.send(
+				JSON.stringify({
+					type: "control_command",
+					sessionId,
+					token: endpoint.token,
+					requestId: query,
+					command: { type: "query_request", id: query, query },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === query),
+				`${query} legacy diff response`,
+			);
+			const message = frames.find(
+				frame => frame.type === "control_command_result" && frame.requestId === query,
+			)?.message;
+			const response = JSON.parse(String(message)) as LegacyDiffWireResponse;
+			expect(response.id).toBe(query);
+			responses.push(response);
+		}
+		return responses;
+	} finally {
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+	}
+}
+
+function legacyDiffGit(cwd: string, ...args: string[]): string {
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	expect(result.exitCode, result.stderr.toString()).toBe(0);
+	return result.stdout.toString();
+}
+
+async function legacyDiffRepository(prefix: string): Promise<string> {
+	const cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), prefix));
+	dirs.push(cwd);
+	legacyDiffGit(cwd, "init", "-q");
+	legacyDiffGit(cwd, "config", "user.email", "sdk-fixture@example.invalid");
+	legacyDiffGit(cwd, "config", "user.name", "SDK fixture");
+	legacyDiffGit(cwd, "config", "status.showUntrackedFiles", "no");
+	await Bun.write(path.join(cwd, ".git/info/exclude"), ".gjc/\n");
+	return cwd;
+}
+
+test("legacy Q06-Q08 expose only tracked unstaged patches without reading cached or untracked bodies", async () => {
+	const cwd = await legacyDiffRepository("gjc-sdk-legacy-selection-");
+	await Bun.write(path.join(cwd, "tracked.txt"), "TRACKED_BASE\n");
+	await Bun.write(path.join(cwd, "draft.txt"), "STAGED_BASE_PRIVATE_SENTINEL\n");
+	await Bun.write(path.join(cwd, "both.txt"), "BOTH_BASE_PRIVATE_SENTINEL\n");
+	legacyDiffGit(cwd, "add", "--", "tracked.txt", "draft.txt", "both.txt");
+	legacyDiffGit(cwd, "-c", "commit.gpgsign=false", "commit", "-qm", "baseline");
+	await Bun.write(path.join(cwd, "tracked.txt"), "TRACKED_UNSTAGED_PUBLIC\n");
+	await Bun.write(path.join(cwd, "draft.txt"), "STAGED_INDEX_PRIVATE_SENTINEL\n");
+	await Bun.write(path.join(cwd, "both.txt"), "BOTH_INDEX\n");
+	legacyDiffGit(cwd, "add", "--", "draft.txt", "both.txt");
+	await Bun.write(path.join(cwd, "both.txt"), "BOTH_WORKTREE\n");
+	await Bun.write(path.join(cwd, "notes.txt"), "UNTRACKED_PRIVATE_SENTINEL\n");
+	// Verify the real repository has all three classes even when ordinary status hides untracked files.
+	expect(legacyDiffGit(cwd, "status", "--porcelain=v1")).not.toContain("notes.txt");
+	expect(legacyDiffGit(cwd, "ls-files", "--others", "--exclude-standard")).toContain("notes.txt");
+	const indexBefore = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+	const configBefore = await Bun.file(path.join(cwd, ".git/config")).text();
+	const spawn = spyOn(Bun, "spawn");
+	try {
+		const responses = await queryLegacyDiffFixture(cwd, `legacy-selection-${Date.now()}`);
+		for (const response of responses) {
+			// Bun's asymmetric array matcher replaces matched items; retain the
+			// original wire payload before asserting its projected shape.
+			const serialized = JSON.stringify(response);
+			expect(response).toMatchObject({
+				ok: true,
+				page: {
+					complete: true,
+					items: [
+						expect.objectContaining({ path: "both.txt", body: expect.stringContaining("+BOTH_WORKTREE") }),
+						expect.objectContaining({
+							path: "tracked.txt",
+							body: expect.stringContaining("+TRACKED_UNSTAGED_PUBLIC"),
+						}),
+					],
+				},
+			});
+			expect(serialized).toContain("-BOTH_INDEX"); // This removal belongs to the legitimate unstaged patch.
+			for (const forbidden of [
+				"draft.txt",
+				"notes.txt",
+				"STAGED_BASE_PRIVATE_SENTINEL",
+				"STAGED_INDEX_PRIVATE_SENTINEL",
+				"UNTRACKED_PRIVATE_SENTINEL",
+				"BOTH_BASE_PRIVATE_SENTINEL",
+				"+BOTH_INDEX",
+			])
+				expect(serialized).not.toContain(forbidden);
+		}
+		const commands = spawn.mock.calls.map(([command]) => Array.from(command as string[]));
+		for (const command of commands.filter(args => args[0] === "git" && args.includes("diff"))) {
+			expect(command).not.toContain("--cached");
+			expect(command).not.toContain("--no-index");
+		}
+	} finally {
+		spawn.mockRestore();
+	}
+	expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
+	expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
+}, 30_000);
+
+for (const kind of ["plain", "code/message/details"] as const) {
+	test(`legacy Q06-Q08 contain ${kind} credential collector failures as fixed git_failure`, async () => {
+		const cwd = await legacyDiffRepository("gjc-sdk-legacy-collector-");
+		const sessionId = `legacy-collector-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const registry = sessionContext.modelRegistry as { authStorage: { getAll: () => Record<string, never> } };
+		const error =
+			kind === "plain"
+				? new Error("COLLECTOR_PRIVATE_SENTINEL")
+				: {
+						code: "collector_private_code",
+						message: "COLLECTOR_PRIVATE_SENTINEL",
+						details: { token: "COLLECTOR_PRIVATE_DETAILS" },
+					};
+		registry.authStorage.getAll = () => {
+			throw error;
+		};
+		for (const response of await queryLegacyDiffFixture(cwd, sessionId, sessionContext)) {
+			expect(response).toEqual({
+				type: "query_response",
+				id: response.id,
+				ok: false,
+				error: { code: "git_failure", message: "The Git diff could not be read." },
+			});
+			expect(JSON.stringify(response)).not.toContain("COLLECTOR_PRIVATE");
+			expect(JSON.stringify(response)).not.toContain("collector_private_code");
+		}
+	}, 30_000);
+}
+
+test("legacy Q06-Q08 fail closed on 101 small tracked edits instead of publishing an incomplete snapshot", async () => {
+	const cwd = await legacyDiffRepository("gjc-sdk-legacy-omission-");
+	const names = Array.from({ length: 101 }, (_, index) => `tracked-${String(index).padStart(3, "0")}.txt`);
+	for (const name of names) await Bun.write(path.join(cwd, name), "baseline\n");
+	legacyDiffGit(cwd, "add", "--", ...names);
+	legacyDiffGit(cwd, "-c", "commit.gpgsign=false", "commit", "-qm", "baseline");
+	for (const name of names) await Bun.write(path.join(cwd, name), "small unstaged edit\n");
+	expect(legacyDiffGit(cwd, "diff", "--name-only").trim().split("\n")).toHaveLength(101);
+	const indexBefore = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+	const configBefore = await Bun.file(path.join(cwd, ".git/config")).text();
+	for (const response of await queryLegacyDiffFixture(cwd, `legacy-omission-${Date.now()}`))
+		expect(response).toEqual({
+			type: "query_response",
+			id: response.id,
+			ok: false,
+			error: { code: "diff_too_large", message: "The diff exceeds its read or time budget." },
+		});
+	expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
+	expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
+}, 30_000);
 
 test("SDK host honors disable opt-out and excludes subagent sessions", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-gate-"));

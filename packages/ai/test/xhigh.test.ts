@@ -3,6 +3,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
 import { stream } from "@gajae-code/ai/stream";
 import type { Context, Model, OpenAICompat } from "@gajae-code/ai/types";
+import { createAbortedSignal } from "./helpers";
 import { e2eApiKey } from "./oauth";
 
 function makeContext(): Context {
@@ -73,12 +74,6 @@ describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("xhigh reasoning", () => {
 const testContext: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: 0 }],
 };
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
 
 function captureResponsesPayload(
 	model: Model<"openai-responses">,

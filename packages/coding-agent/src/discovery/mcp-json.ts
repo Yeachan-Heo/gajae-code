@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { logger, tryParseJson } from "@gajae-code/utils";
+import { isRecord, logger, tryParseJson } from "@gajae-code/utils";
 import { registerProvider } from "../capability";
 import { type ReadFileOptions, readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
@@ -60,9 +60,6 @@ interface MCPConfigFile {
 }
 export interface MCPJsonLoadResult extends LoadResult<MCPServer> {
 	disabledServers: string[];
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === "string");
