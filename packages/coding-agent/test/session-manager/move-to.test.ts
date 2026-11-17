@@ -9,6 +9,7 @@ import {
 	SessionManager,
 	syncSessionMoveDirectory,
 } from "@gajae-code/coding-agent/session/session-manager";
+import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { stripOuterDoubleQuotes } from "@gajae-code/coding-agent/tools/path-utils";
 import * as native from "@gajae-code/natives";
 import { getConfigRootDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
@@ -418,6 +419,10 @@ describe("SessionManager.moveTo", () => {
 		const session = await SessionManager.open(explicitPath);
 		const identity = session.getSessionIdentityGeneration();
 		const lineage = session.getTranscriptLineageId();
+		const moves: string[] = [];
+		session.registerAfterMoveListener(move => {
+			moves.push(move.newCwd);
+		});
 
 		await session.moveTo(cwdB);
 
@@ -430,6 +435,8 @@ describe("SessionManager.moveTo", () => {
 		await session.setSessionFile(session.getSessionFile()!);
 		expect(session.getTranscriptLineageId()).toBe(moved);
 		expect(session.getSessionIdentityGeneration()).toBe(identity);
+		// One committed move, one after-move notification.
+		expect(moves).toEqual([path.resolve(cwdB)]);
 	});
 
 	it("advances the transcript incarnation when a metadata failure retains a managed destination", async () => {
@@ -441,6 +448,10 @@ describe("SessionManager.moveTo", () => {
 		// re-selecting the retained file look like an adoption of a different transcript.
 		const identity = session.getSessionIdentityGeneration();
 		const lineage = session.getTranscriptLineageId();
+		const moves: string[] = [];
+		session.registerAfterMoveListener(move => {
+			moves.push(move.newCwd);
+		});
 		const destinationCwd = path.resolve(cwdB);
 		let injected = false;
 		const injection = injectManagedAppendPreCommit((_file, data) => {
@@ -469,6 +480,75 @@ describe("SessionManager.moveTo", () => {
 		await session.setSessionFile(retainedFile);
 		expect(session.getSessionIdentityGeneration()).toBe(identity);
 		expect(session.getTranscriptLineageId()).toBe(moved);
+		// Retaining the published destination is still exactly one committed move.
+		expect(moves).toEqual([destinationCwd]);
+	});
+
+	it("advances the transcript incarnation when a non-persisting manager commits a cwd move", async () => {
+		// `setSessionFile` adoption is not gated by `persist`, but the destination file assignment in
+		// `moveTo` is. A manager built without persistence can therefore hold an explicit transcript
+		// and commit a cwd transition while its session file keeps the predecessor path, so the
+		// outcome predicate must read the committed cwd alone.
+		const seed = SessionManager.create(cwdA, path.join(cwdA, "seed-sessions"));
+		seed.appendMessage({ role: "user", content: "adopted transcript", timestamp: 1 });
+		seed.appendMessage(makeAssistantMessage());
+		await seed.flush();
+		const explicitPath = seed.getSessionFile();
+		if (!explicitPath) throw new Error("Expected the seeded session file");
+		await seed.close();
+
+		const session = SessionManager.inMemory(cwdA, new FileSessionStorage());
+		const moves: string[] = [];
+		session.registerAfterMoveListener(move => {
+			moves.push(move.newCwd);
+		});
+		await session.setSessionFile(explicitPath);
+		const lineage = session.getTranscriptLineageId();
+		expect(session.getSessionFile()).toBe(path.resolve(explicitPath));
+
+		await session.moveTo(cwdB);
+
+		expect(session.getCwd()).toBe(path.resolve(cwdB));
+		// The non-persisting path deliberately assigns no destination file; the cwd commit still
+		// abandons the predecessor incarnation.
+		expect(session.getSessionFile()).toBe(path.resolve(explicitPath));
+		expect(session.getTranscriptLineageId()).not.toBe(lineage);
+		// ... and still notifies after-move surface rebinding exactly once.
+		expect(moves).toEqual([path.resolve(cwdB)]);
+	});
+
+	it("keeps the predecessor incarnation when a managed move rolls back", async () => {
+		const session = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, testAgentDir));
+		session.appendMessage({ role: "user", content: "before failed move", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const identity = session.getSessionIdentityGeneration();
+		const lineage = session.getTranscriptLineageId();
+		const moves: string[] = [];
+		session.registerAfterMoveListener(move => {
+			moves.push(move.newCwd);
+		});
+		const destinationCwd = path.resolve(cwdB);
+		let injected = false;
+		const injection = injectManagedAppendPreCommit((_file, data) => {
+			if (injected || !Buffer.from(data).toString("utf8").includes(destinationCwd)) return "passthrough";
+			injected = true;
+			return { ok: false, code: "io_error" };
+		});
+		try {
+			await expect(session.moveTo(cwdB)).rejects.toThrow("io_error");
+		} finally {
+			injection.restore();
+		}
+		injection.assertHit();
+
+		// A rolled-back attempt restored the source cwd, so the predecessor transcript is still the
+		// one this manager writes and its queued state still belongs to it.
+		expect(session.getCwd()).toBe(path.resolve(cwdA));
+		expect(session.getTranscriptLineageId()).toBe(lineage);
+		expect(session.getSessionIdentityGeneration()).toBe(identity);
+		// A restored attempt is not a committed move, so no surface is rebound for it.
+		expect(moves).toEqual([]);
 	});
 
 	it("moves artifact dir independently when session file does not exist", async () => {

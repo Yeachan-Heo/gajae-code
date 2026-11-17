@@ -13008,17 +13008,22 @@ export class SessionManager {
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
 
-		// The move is adopted whenever cwd and the transcript location ended in the destination: a
-		// successful metadata patch is not the only such outcome, because a failed one keeps the
-		// already-published destination instead of moving it back. An adopted destination must
-		// advance the incarnation, since state queued against the predecessor location must not
-		// publish into it; only a rolled-back attempt restored every field, and only it keeps the
-		// predecessor lineage current. Reading the outcome back from that state instead of flagging
-		// the success path means a retention outcome cannot skip the commit and a restore outcome
-		// cannot inherit it. The recorded identity then follows the new path without an identity
-		// change: a cwd move adopts no other transcript, so the next no-op re-selection must not
-		// read as one.
-		if (this.cwd === resolvedCwd && this.#sessionFile === nextSessionFile) {
+		// The move is adopted whenever the committed cwd ended in the destination: a successful
+		// metadata patch is not the only such outcome, because a failed one keeps the already-
+		// published destination instead of moving it back. An adopted destination must advance the
+		// incarnation, since state queued against the predecessor location must not publish into it;
+		// only a rolled-back attempt restored every field, and only it keeps the predecessor lineage
+		// current. Reading the outcome back from that state instead of flagging the success path
+		// means a retention outcome cannot skip the commit and a restore outcome cannot inherit it.
+		// Cwd alone is the sufficient and correct signal: the same-cwd no-op returns before
+		// publication and every restoring path puts the predecessor cwd back before throwing, so a
+		// committed cwd naming the destination can only mean this attempt adopted it. The transcript
+		// path is deliberately not part of the test -- a non-persisting manager commits the cwd
+		// transition without ever assigning a destination session file, and gating on that
+		// assignment would leave its committed move on the predecessor incarnation. The recorded
+		// identity then follows the new path without an identity change: a cwd move adopts no other
+		// transcript, so the next no-op re-selection must not read as one.
+		if (this.cwd === resolvedCwd) {
 			this.#transcriptLineageIncarnation++;
 			this.#rebaseCommittedIdentity();
 		}
