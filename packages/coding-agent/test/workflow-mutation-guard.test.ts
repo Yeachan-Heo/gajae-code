@@ -2944,6 +2944,11 @@ describe("bash scanner quoting model", () => {
 			`node --im'port'=/tmp/payload.mjs -e 'process.stdout.write("status")'`,
 			`node --requi"re"=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
 			`bun --pre"load"=/tmp/payload.cjs script.ts`,
+			// Bun consumes a literal `--` as the detached value of an option this scanner
+			// does not model, and still loads the preload flag after it.
+			`bun --conditions -- --preload=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`bun --jsx-factory -- --preload=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`node --conditions -- --require=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,

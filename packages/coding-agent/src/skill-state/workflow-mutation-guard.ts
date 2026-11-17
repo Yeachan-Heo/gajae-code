@@ -2167,6 +2167,10 @@ function collectInterpreterOneLinerWrites(
 			}
 		}
 		const options = interpreterCodeOptions(binary);
+		// An option-shaped word this scanner does not model may consume the next word as its
+		// value, including a literal `--` (Bun `--conditions --`), so a later `--` is not
+		// proof that option parsing ended.
+		let sawUnmodeledOption = false;
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
 			// Module/debugger switches, including bundled -wM, run unscanned code.
@@ -2181,8 +2185,9 @@ function collectInterpreterOneLinerWrites(
 				// The shell concatenates quoted spans, so `--im'port'=x` reaches Node as a
 				// preload flag and `-"-"` as the terminator itself: compare the dequoted word.
 				const flagWord = part.replace(/['"]/g, "");
-				// `--` ends Node/Bun option parsing: later words are the program's own argv.
-				if (flagWord === "--") break;
+				// `--` ends Node/Bun option parsing and the remaining words are the program's
+				// own argv, unless an option this scanner cannot model came first.
+				if (flagWord === "--" && !sawUnmodeledOption) break;
 				if (NODE_PRELOAD_FLAG_RE.test(flagWord)) {
 					targets.explicitMutation = true;
 					targets.unknown = true;
@@ -2203,7 +2208,10 @@ function collectInterpreterOneLinerWrites(
 				const equalsFormOption = options.find(
 					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
 				);
-				if (!equalsFormOption) continue;
+				if (!equalsFormOption) {
+					if (part.startsWith("-")) sawUnmodeledOption = true;
+					continue;
+				}
 				rawScript = words[index]?.slice(equalsFormOption.length + 1);
 			}
 			if (rawScript === undefined) continue;
