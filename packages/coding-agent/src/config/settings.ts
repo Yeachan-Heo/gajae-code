@@ -46,6 +46,7 @@ import {
 	type AtomicYamlConfigTransaction,
 	AtomicYamlConflictError,
 	type AtomicYamlPatch,
+	type AtomicYamlPatchOptions,
 	AtomicYamlRetargetError,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
@@ -1478,7 +1479,10 @@ export class Settings implements NotificationSettingsReader {
 	 * Persist a tagged batch as one atomic YAML replacement. Unlike ordinary
 	 * {@link set}, canonical state and hooks change only after the rename succeeds.
 	 */
-	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
+	async commitAtomicBatch(
+		patches: readonly SettingsAtomicPatch[],
+		options: AtomicYamlPatchOptions = {},
+	): Promise<CasReceipt> {
 		this.#assertDurableConfigWritable();
 		const admissionRevision = this.#nextRevision;
 		const admissionRuntimeGeneration = this.#runtimeGeneration;
@@ -1487,6 +1491,9 @@ export class Settings implements NotificationSettingsReader {
 			throw new Error("Settings changed while the atomic batch was preparing; build it again.");
 		}
 		assertNonOverlappingAtomicYamlPatches(stagedPatches);
+		if (options.withCommit && this.#persist && this.#configPath) {
+			return this.commitAtomicBatchWithCurrent(() => stagedPatches, options);
+		}
 		if (!this.#persist || !this.#configPath) {
 			const applyMemoryBatch = (
 				stagedPatches: readonly SettingsAtomicPatch[],
@@ -1626,6 +1633,14 @@ export class Settings implements NotificationSettingsReader {
 				};
 				return receipt;
 			};
+			if (options.withCommit && stagedPatches.length > 0) {
+				return options.withCommit(() => {
+					if (this.#nextRevision !== admissionRevision || this.#runtimeGeneration !== admissionRuntimeGeneration) {
+						throw new Error("Settings changed while the atomic batch was preparing; build it again.");
+					}
+					return applyMemoryBatch(stagedPatches);
+				});
+			}
 			return applyMemoryBatch(stagedPatches);
 		}
 
@@ -1639,11 +1654,16 @@ export class Settings implements NotificationSettingsReader {
 		const revisions = this.#reserveDurableBatch(durablePatches);
 
 		const commit = applyAtomicYamlPatches(this.#configPath, durablePatches, {
-			validateRoot: (root, currentPatches) =>
-				this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
-			restoreConflicts: () => this.#atomicRestoreConflicts(revisions),
-			onRestored: restoredPatches =>
-				this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
+			...options,
+			validateRoot: async (root, currentPatches) => {
+				this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root);
+				await options.validateRoot?.(root, currentPatches);
+			},
+			restoreConflicts: () => [...this.#atomicRestoreConflicts(revisions), ...(options.restoreConflicts?.() ?? [])],
+			onRestored: async restoredPatches => {
+				this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard);
+				await options.onRestored?.(restoredPatches);
+			},
 		});
 		const failureRefresh = this.#reserveAtomicFailureRefresh(commit);
 		try {
@@ -1674,6 +1694,7 @@ export class Settings implements NotificationSettingsReader {
 		buildPatches: (
 			current: Readonly<RawSettings>,
 		) => Promise<readonly SettingsAtomicPatch[]> | readonly SettingsAtomicPatch[],
+		options: AtomicYamlPatchOptions = {},
 	): Promise<CasReceipt> {
 		this.#assertDurableConfigWritable();
 		const admissionRevision = this.#nextRevision;
@@ -1695,11 +1716,17 @@ export class Settings implements NotificationSettingsReader {
 			) {
 				throw changedWhilePreparing();
 			}
-			return this.commitAtomicBatch(patches);
+			return this.commitAtomicBatch(patches, options);
 		}
 
 		this.#releasePendingSaveSlot();
 		let revisions: DurableBatchRevision[] = [];
+		let commitRevision = this.#nextRevision;
+		let commitRuntime = structuredClone(this.#overrides);
+		let preparedPatches: readonly AtomicYamlPatch[] = [];
+		let reserved = false;
+		let preparing = true;
+		const withCommit = options.withCommit;
 		const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 		const commit = applyAtomicYamlPatchesWithCurrent(
 			this.#configPath,
@@ -1729,15 +1756,49 @@ export class Settings implements NotificationSettingsReader {
 					throw changedWhilePreparing();
 				assertNonOverlappingAtomicYamlPatches(patches);
 				const durablePatches: AtomicYamlPatch[] = patches;
-				revisions = this.#reserveDurableBatch(durablePatches);
+				if (withCommit) {
+					preparedPatches = durablePatches;
+					commitRevision = builderRevision;
+					commitRuntime = runtimeBefore;
+				} else {
+					revisions = this.#reserveDurableBatch(durablePatches);
+				}
 				return durablePatches;
 			},
 			{
-				validateRoot: (root, currentPatches) =>
-					this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
-				restoreConflicts: () => this.#atomicRestoreConflicts(revisions),
-				onRestored: restoredPatches =>
-					this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
+				...options,
+				withCommit: withCommit
+					? commit =>
+							withCommit(() => {
+								if (preparing) {
+									if (
+										this.#nextRevision !== commitRevision ||
+										this.#runtimeGeneration !== admissionRuntimeGeneration ||
+										!util.isDeepStrictEqual(commitRuntime, this.#overrides)
+									)
+										throw changedWhilePreparing();
+									if (!reserved) {
+										revisions = this.#reserveDurableBatch(preparedPatches);
+										commitRevision = this.#nextRevision;
+										reserved = true;
+									}
+								}
+								// No await separates revision admission from the actual native commit.
+								return commit();
+							})
+					: undefined,
+				validateRoot: async (root, currentPatches) => {
+					this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root);
+					await options.validateRoot?.(root, currentPatches);
+				},
+				restoreConflicts: () => [
+					...this.#atomicRestoreConflicts(revisions),
+					...(options.restoreConflicts?.() ?? []),
+				],
+				onRestored: async restoredPatches => {
+					this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard);
+					await options.onRestored?.(restoredPatches);
+				},
 			},
 		);
 		const failureRefresh = this.#reserveAtomicFailureRefresh(commit);
@@ -1754,6 +1815,8 @@ export class Settings implements NotificationSettingsReader {
 			await failureRefresh;
 			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 			throw error;
+		} finally {
+			preparing = false;
 		}
 	}
 
