@@ -3006,6 +3006,7 @@ describe("bash scanner quoting model", () => {
 				args: { command },
 			});
 			expect(decision.blocked, command).toBe(blocked);
+			expect(decision.reason ?? null, command).toBe(blocked ? "unknown-target" : null);
 		}
 	});
 
