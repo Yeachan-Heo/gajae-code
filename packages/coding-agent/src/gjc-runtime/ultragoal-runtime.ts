@@ -636,7 +636,26 @@ async function appendHumanBlockedAskEvent<T>(
 		getUltragoalPaths(cwd, sessionId).ledgerPath,
 		async () => {
 			const decision = await decide(await readUltragoalLedger(cwd, sessionId));
-			if ("event" in decision) await appendLedger(cwd, { event: decision.event, classificationEventId }, sessionId);
+			if ("event" in decision) {
+				const eventId = crypto.randomUUID();
+				try {
+					await appendLedger(cwd, { eventId, event: decision.event, classificationEventId }, sessionId);
+				} catch (error) {
+					// The audit entry is written after the row, so a failure can leave the
+					// row behind. The row is what every later decision reads: when it is
+					// there, report the decision it committed, or the caller would act on
+					// the opposite of the durable state (a reservation it believes it
+					// does not hold, a release it believes was not recorded).
+					const committed = await readUltragoalLedger(cwd, sessionId).then(
+						ledger => ledger.some(row => row.eventId === eventId),
+						() => false,
+					);
+					if (!committed) throw error;
+					logger.warn(
+						`ultragoal-runtime: ${decision.event} was written but its append reported a failure: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
 			return decision.result;
 		},
 		{ cwd },

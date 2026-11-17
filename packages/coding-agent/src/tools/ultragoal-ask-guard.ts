@@ -7,11 +7,14 @@ import {
 	type UltragoalAskBlockDiagnostic,
 } from "../gjc-runtime/ultragoal-guard";
 import { isBuiltinAskTool } from "./ask";
+import { LazyAgentTool } from "./descriptors";
 import { ToolError } from "./tool-errors";
 
-const ULTRAGOAL_ASK_GUARD = Symbol.for("gajae-code.ultragoalAskGuard");
-
-type GuardedTool = AgentTool & { [ULTRAGOAL_ASK_GUARD]?: true };
+/**
+ * The wrappers this module built. A property on the tool could be set by the
+ * tool itself, and a tool that claims to be guarded would be returned unwrapped.
+ */
+const guardedTools = new WeakSet<object>();
 
 export interface UltragoalAskGuardContext {
 	/**
@@ -124,11 +127,9 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 	getSessionAgentDir: () => string | undefined = () => undefined,
 ): T {
 	if (tool.name !== "ask") return tool;
-	const candidate = tool as GuardedTool;
-	if (candidate[ULTRAGOAL_ASK_GUARD]) return tool;
+	if (guardedTools.has(tool)) return tool;
 	const wrapped = new Proxy(tool, {
 		get(target, prop) {
-			if (prop === ULTRAGOAL_ASK_GUARD) return true;
 			if (prop !== "execute") return Reflect.get(target, prop);
 			return async (...args: unknown[]): Promise<unknown> => {
 				// The wrapper runs BEFORE AskTool.execute(): resolve the nudge
@@ -137,10 +138,11 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 				// durable run can never gate this ask.
 				const admission = await assertUltragoalAskAllowed(getCwd(), getContext(), getSessionAgentDir(), args[1]);
 
-				// Issue 2: Enforce one-question settlement for custom ask tools.
-				// Only the built-in AskTool writes proper reservation/answer/release events
-				// for human-blocked asks. Custom extensions must not bypass this accounting.
-				if (admission?.humanBlockedReceipt && !isBuiltinAskTool(target)) {
+				// Only the built-in AskTool reserves, records and releases the single
+				// human-blocked ask, so nothing else may run on that admission. The
+				// registry hands out the built-in behind a lazy facade: judge the
+				// implementation the facade dispatches to, not the facade.
+				if (admission?.humanBlockedReceipt && !isBuiltinAskTool(await LazyAgentTool.implementationOf(target))) {
 					throw new ToolError(
 						"Ultragoal ask guard: custom ask tools are not permitted for human-blocked admits. Only the built-in AskTool supports durable one-question settlement.",
 					);
@@ -149,7 +151,7 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 				return Reflect.apply(target.execute, target, args);
 			};
 		},
-	}) as T & GuardedTool;
-	wrapped[ULTRAGOAL_ASK_GUARD] = true;
-	return wrapped as T;
+	});
+	guardedTools.add(wrapped);
+	return wrapped;
 }

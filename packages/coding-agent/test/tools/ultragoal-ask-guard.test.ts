@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import {
 	activeSnapshotPath,
+	auditPath,
 	modeStatePath,
 	sessionActivityPath,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -23,6 +25,9 @@ import {
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool, isBuiltinAskTool } from "@gajae-code/coding-agent/tools/ask";
+import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "@gajae-code/coding-agent/tools/descriptors";
+import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
+import { listPendingAsks } from "@gajae-code/coding-agent/tools/pending-asks";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import {
 	guardToolForUltragoalAsk,
@@ -313,6 +318,40 @@ describe("ultragoal ask guard", () => {
 
 		expect(result.content[0]).toMatchObject({ type: "text", text: "asked" });
 		expect(tool.executeArgs).toEqual(["call", { foo: 1 }, undefined, undefined, undefined]);
+	});
+
+	it("keeps guarding a tool that carries the guard marker of earlier versions", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		const execute = vi.fn(async () => {});
+		const claimsToBeGuarded = Object.assign(stubAskTool(execute), {
+			[Symbol.for("gajae-code.ultragoalAskGuard")]: true,
+		});
+		const guarded = guardToolForUltragoalAsk(
+			claimsToBeGuarded,
+			() => cwd,
+			() => ({ sessionId: TEST_SESSION_ID }),
+		);
+
+		await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(ToolError);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("guards a tool again when the same tool is wrapped a second time", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		const execute = vi.fn(async () => {});
+		const tool = stubAskTool(execute);
+		const context = () => ({ sessionId: TEST_SESSION_ID });
+		// The session builder and the session each wrap the registry entry.
+		guardToolForUltragoalAsk(tool, () => cwd, context);
+		const second = guardToolForUltragoalAsk(tool, () => cwd, context);
+
+		expect(second).not.toBe(tool);
+		await expect(second.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(ToolError);
+		expect(execute).not.toHaveBeenCalled();
 	});
 
 	it("preserves private-field metadata getters and avoids double-guarding", () => {
@@ -607,8 +646,10 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 
 	const QUESTION = { questions: [{ id: "q", question: "Which credentials?", options: [{ label: "Vault" }] }] };
 
-	function askTool(cwd: string): AskTool {
-		return new AskTool(createSession(cwd, { getSessionId: () => TEST_SESSION_ID }));
+	function askTool(cwd: string, overrides: Partial<ToolSession> = {}): AskTool {
+		const tool = AskTool.createIf(createSession(cwd, { getSessionId: () => TEST_SESSION_ID, ...overrides }));
+		if (!tool) throw new Error("AskTool.createIf returned null");
+		return tool;
 	}
 
 	async function answeredAskRows(cwd: string): Promise<number> {
@@ -1220,5 +1261,224 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		await expect(guarded.execute("call-1", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow(
 			/custom ask tools are not permitted/,
 		);
+	});
+
+	function guardedFor(cwd: string, tool: unknown): AgentTool {
+		return guardToolForUltragoalAsk(
+			tool as AgentTool,
+			() => cwd,
+			() => ({ sessionId: TEST_SESSION_ID }),
+		);
+	}
+
+	/** A dialog that reports the `ask.timeout` expiry and returns the auto-selected option. */
+	function timedOutContext(): AgentToolContext {
+		return {
+			hasUI: true,
+			ui: {
+				select: async (
+					_prompt: string,
+					options: string[],
+					dialogOptions?: { initialIndex?: number; onTimeout?: () => void },
+				) => {
+					dialogOptions?.onTimeout?.();
+					return options[dialogOptions?.initialIndex ?? 0];
+				},
+				editor: async () => undefined,
+			},
+			abort: () => {},
+		} as unknown as AgentToolContext;
+	}
+
+	it("admits the built-in ask behind the registry's lazy facade", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const session = createSession(cwd, { getSessionId: () => TEST_SESSION_ID });
+		const descriptor = BUILTIN_TOOL_DESCRIPTORS.ask;
+		// Deferred and notice-wrapped, as discovery mode registers it: nothing is loaded before the call.
+		const facade = wrapToolWithMetaNotice(
+			new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session),
+		);
+		const guarded = guardedFor(cwd, facade);
+		const select = vi.fn(async () => "Vault");
+
+		const result = await guarded.execute("call-1", QUESTION, undefined, undefined, createContext(select));
+
+		expect(result.content).toEqual([{ type: "text", text: "User selected: Vault" }]);
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await answeredAskRows(cwd)).toBe(1);
+	});
+
+	it("refuses a lazy facade whose implementation is not the built-in ask", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const execute = vi.fn(async () => {});
+		const facade = new LazyAgentTool(BUILTIN_TOOL_DESCRIPTORS.ask, undefined, () => stubAskTool(execute));
+
+		await expect(
+			guardedFor(cwd, facade).execute(
+				"call-1",
+				QUESTION,
+				undefined,
+				undefined,
+				createContext(async () => "Vault"),
+			),
+		).rejects.toThrow(/custom ask tools are not permitted/);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("refuses a tool that names a built-in ask as its implementation", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const execute = vi.fn(async () => {});
+		const builtin = askTool(cwd);
+		const lookAlike = Object.assign(stubAskTool(execute), {
+			materialize: async () => builtin,
+			getIsBuiltinAskTool: () => true,
+		});
+
+		await expect(
+			guardedFor(cwd, lookAlike).execute(
+				"call-1",
+				QUESTION,
+				undefined,
+				undefined,
+				createContext(async () => "Vault"),
+			),
+		).rejects.toThrow(/custom ask tools are not permitted/);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("refuses an AskTool subclass that replaces execute", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const execute = vi.fn(async () => {});
+		class UnsettledAskTool extends AskTool {
+			override async execute(): Promise<never> {
+				await execute();
+				throw new Error("the subclass ran");
+			}
+		}
+		const subclass = new UnsettledAskTool(createSession(cwd, { getSessionId: () => TEST_SESSION_ID }));
+
+		expect(isBuiltinAskTool(subclass)).toBe(false);
+		expect(isBuiltinAskTool(askTool(cwd))).toBe(true);
+		await expect(
+			guardedFor(cwd, subclass).execute(
+				"call-1",
+				QUESTION,
+				undefined,
+				undefined,
+				createContext(async () => "Vault"),
+			),
+		).rejects.toThrow(/custom ask tools are not permitted/);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("answers a human-blocked ask on the attended UI only", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const awaitAnswer = vi.fn(async () => "Vault");
+		const tool = askTool(cwd, { getAskAnswerSource: () => ({ awaitAnswer }) });
+		const publishedWhileOpen: number[] = [];
+		const context = {
+			hasUI: true,
+			ui: {
+				select: async () => {
+					publishedWhileOpen.push(listPendingAsks(TEST_SESSION_ID).length);
+					return "Other (type your own)";
+				},
+				editor: async () => {
+					publishedWhileOpen.push(listPendingAsks(TEST_SESSION_ID).length);
+					return "The staging vault";
+				},
+			},
+			abort: () => {},
+		} as unknown as AgentToolContext;
+
+		const result = await tool.execute("call-1", QUESTION, undefined, undefined, context);
+
+		expect(result.content).toEqual([{ type: "text", text: "User provided custom input: The staging vault" }]);
+		// Neither the selector nor the custom-input editor was offered to a remote responder.
+		expect(publishedWhileOpen).toEqual([0, 0]);
+		expect(awaitAnswer).not.toHaveBeenCalled();
+		expect(await answeredAskRows(cwd)).toBe(1);
+	});
+
+	it("reports a timeout as no answer and records no interview round for it", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const recorder = vi
+			.spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound")
+			.mockResolvedValue(undefined as never);
+		try {
+			const tool = askTool(cwd, {
+				getDeepInterviewAskStage: () => "post-topology",
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+			});
+			const question = {
+				questions: [
+					{
+						...QUESTION.questions[0],
+						deepInterview: { round: 2, component: "Scope", dimension: "Constraints", ambiguity: 0.42 },
+					},
+				],
+			};
+
+			const timedOut = await tool.execute("call-1", question, undefined, undefined, timedOutContext());
+
+			expect(timedOut.content).toEqual([{ type: "text", text: "Ask timed out without user response" }]);
+			expect(recorder).not.toHaveBeenCalled();
+
+			// The user's own answer to the same question is still recorded.
+			await tool.execute(
+				"call-2",
+				question,
+				undefined,
+				undefined,
+				createContext(async () => "Vault"),
+			);
+
+			expect(recorder).toHaveBeenCalledTimes(1);
+		} finally {
+			recorder.mockRestore();
+		}
+	});
+
+	it("settles the ask on the rows that were written when their audit entry fails", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		// Every ledger append from here on writes its row and then fails its audit entry.
+		const audit = auditPath(cwd, TEST_SESSION_ID);
+		await fs.rm(audit, { force: true });
+		await fs.mkdir(audit, { recursive: true });
+		const tool = askTool(cwd, { settings: Settings.isolated({ "ask.timeout": 0.001 }) });
+
+		// Reserved and released: the question opened, and the release was not lost.
+		const timedOut = await tool.execute("call-1", QUESTION, undefined, undefined, timedOutContext());
+		expect(timedOut.details?.timedOut).toBe(true);
+		const afterTimeout = (await readUltragoalLedger(cwd, TEST_SESSION_ID)).map(event => event.event);
+		expect(afterTimeout.slice(-2)).toEqual(["human_blocked_ask_reserved", "human_blocked_ask_released"]);
+
+		// The same tool can ask again, and the answer spends the admission.
+		const select = vi.fn(async () => "Vault");
+		await tool.execute("call-2", QUESTION, undefined, undefined, createContext(select));
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await answeredAskRows(cwd)).toBe(1);
+		expect((await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID })).askSpent).toBe(true);
 	});
 });

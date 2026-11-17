@@ -88,15 +88,17 @@ import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
-/** Unforgeable registry of built-in AskTool instances. */
+/**
+ * AskTool instances built by `AskTool.createIf`. Membership is the only proof of
+ * a built-in `ask`: the set is module-private, so no property, method, or name a
+ * tool carries can claim it.
+ */
 const builtinAskTools = new WeakSet<AskTool>();
 
-/** Mark an AskTool instance as the built-in implementation (not a custom/extension replacement). */
-function markBuiltinAskTool(tool: AskTool): void {
-	builtinAskTools.add(tool);
-}
-
-/** Check if a tool is the built-in AskTool implementation. */
+/**
+ * Whether `tool` is the built-in AskTool implementation itself. A facade must be
+ * resolved to its implementation first (`LazyAgentTool.implementationOf`).
+ */
 export function isBuiltinAskTool(tool: unknown): boolean {
 	return tool instanceof AskTool && builtinAskTools.has(tool);
 }
@@ -848,13 +850,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
-		markBuiltinAskTool(this);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
-		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
-			? new AskTool(session)
-			: null;
+		if (!(session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.())) return null;
+		const tool = new AskTool(session);
+		// Only this factory vouches for an instance. The constructor is public, so
+		// vouching there would also cover a subclass that overrides `execute` and
+		// skips the durable one-question settlement.
+		builtinAskTools.add(tool);
+		return tool;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -1177,7 +1182,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const extensionUi = context?.ui;
 		const logicalQuestionIds = params.questions.map(() => randomUUID());
 		let logicalQuestionId: string | undefined;
-		const publicSessionId = hasInteractiveUi ? this.session.getSessionId?.() : undefined;
+		// A human-blocked ask is answered on the attended UI only: it publishes no
+		// pending ask for the session and races no answer source against the dialog,
+		// for the selector and for the custom-input and clarification editors alike.
+		const localOnly = context?.isHumanBlockedAsk === true;
+		const publicSessionId = hasInteractiveUi && !localOnly ? this.session.getSessionId?.() : undefined;
 		const invokeLocal = <T>(work: () => Promise<T>): Promise<T> => {
 			try {
 				return work();
@@ -1224,7 +1233,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				let pendingAsk: PendingAskHandle | undefined;
 				const selectorRequest = activeRemoteRequest;
 				let inlineMode: "custom_editor" | "clarification_editor" | undefined;
-				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
+				if (localOnly || (!publicSessionId && !this.session.getAskAnswerSource?.())) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 					return extensionUi.select(prompt, options, dialogOptions);
 				}
@@ -1417,7 +1426,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
-				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
+				if (localOnly || (!publicSessionId && !this.session.getAskAnswerSource?.())) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 					return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
 				}
@@ -1864,8 +1873,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
+			// An ordinary ask keeps the `ask.timeout` auto-selection as its result. A
+			// human-blocked ask exists to get the user's own answer, so there a timeout
+			// is no answer: nothing is recorded as a round or reported as a selection.
+			const unanswered = timedOut && context?.isHumanBlockedAsk === true;
 			if (
 				clarificationQuestion === undefined &&
+				!unanswered &&
 				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
 			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
@@ -1899,9 +1913,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						: `User asked a clarification question about the choices: ${clarificationQuestion}`,
 				);
 			}
-			// For ordinary asks: show auto-selected options even during timeout.
-			// For human-blocked asks: suppress the selection text to let it fall through to the timeout message.
-			if (selectedOptions.length > 0 && (!timedOut || context?.isHumanBlockedAsk !== true)) {
+			if (selectedOptions.length > 0 && !unanswered) {
 				responseParts.push(
 					q.multi ? `User selected: ${selectedOptions.join(", ")}` : `User selected: ${selectedOptions[0]}`,
 				);
@@ -1919,7 +1931,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const responseText =
 				responseParts.length > 0
 					? responseParts.join("\n")
-					: timedOut
+					: unanswered
 						? "Ask timed out without user response"
 						: "User cancelled the selection";
 
