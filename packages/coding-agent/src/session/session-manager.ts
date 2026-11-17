@@ -12579,7 +12579,7 @@ export class SessionManager {
 			this.#sessionFile !== previousSessionFile ||
 			this.destination !== previousDestination
 		)
-			 throw new Error("Session cwd move admission changed during validation; retry after it settles.");
+			throw new Error("Session cwd move admission changed during validation; retry after it settles.");
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
@@ -20549,8 +20549,6 @@ export class SessionManager {
 		if (this.#ownsCwdTransition()) return;
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
-
-
 
 	/** Additive legacy appends are safe once a control publication's transaction has settled. */
 	assertLegacyAppendAllowed(operation: string): void {

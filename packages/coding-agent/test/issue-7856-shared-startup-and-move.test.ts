@@ -7,12 +7,12 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { type SessionInfo, SessionManager } from "../src/session/session-manager";
-import { ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
+import { SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -23,9 +23,6 @@ const authStores: AuthStorage[] = [];
 
 const provider = "issue-7856-fixture";
 const initialSelector = `${provider}/initial`;
-const selectedSelector = `${provider}/selected`;
-const fallbackSelector = `${provider}/fallback`;
-const defaultChain = [`${selectedSelector}:high`, `${fallbackSelector}:low`];
 const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
 
 interface Fixture {
@@ -59,7 +56,7 @@ afterEach(async () => {
 	if (failures.length > 0) throw new AggregateError(failures, "Fixture cleanup failed");
 });
 
-function modelsConfig(profileDefault: readonly string[]): string {
+function modelsConfig(): string {
 	return JSON.stringify({
 		providers: {
 			[provider]: {
@@ -99,7 +96,7 @@ async function fixture(): Promise<Fixture> {
 			task: { agentModelOverrides: { executor: initialSelector } },
 		}),
 	);
-	await Bun.write(path.join(agentDir, "models.yml"), modelsConfig(defaultChain));
+	await Bun.write(path.join(agentDir, "models.yml"), modelsConfig());
 
 	const settings = await Settings.loadForScope({ cwd, agentDir });
 	settingsStores.push(settings);
@@ -168,7 +165,10 @@ async function fixture(): Promise<Fixture> {
 async function canonicalMessage(f: Fixture): Promise<void> {
 	f.session.agent.emitExternalEvent({ type: "message_end", message: user("canonical shared user") });
 	await f.session.awaitSessionSettlement();
-	expect(f.manager.getLeafEntry()).toMatchObject({ type: "message", message: { role: "user", content: "canonical shared user" } });
+	expect(f.manager.getLeafEntry()).toMatchObject({
+		type: "message",
+		message: { role: "user", content: "canonical shared user" },
+	});
 	expect(await Bun.file(f.file).text()).toContain(JSON.stringify("canonical shared user"));
 }
 
@@ -178,7 +178,7 @@ describe("#7856 setTemporaryModel in a shared root TUI session", () => {
 		await canonicalMessage(f);
 
 		const model = f.registry.find(provider, "selected");
-		if (!model) throw new Error(`Missing test model: ${selectedSelector}`);
+		if (!model) throw new Error(`Missing test model: ${provider}/selected`);
 
 		// This should not throw SharedSessionMutationUnsupportedError
 		try {
