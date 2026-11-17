@@ -2210,7 +2210,9 @@ function collectInterpreterOneLinerWrites(
 					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
 				);
 				if (!equalsFormOption) {
-					if (flagWord.startsWith("-")) sawUnmodeledOption = true;
+					// `$'...'` words stay opaque to this splitter, so keep scanning past a later
+					// `--` instead of assuming the shell produced a plain operand.
+					if (flagWord.startsWith("-") || flagWord.startsWith("$")) sawUnmodeledOption = true;
 					continue;
 				}
 				rawScript = words[index]?.slice(equalsFormOption.length + 1);
