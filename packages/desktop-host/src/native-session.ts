@@ -88,13 +88,18 @@ export class NativeSession {
 	#state: NativeConnectionState = "connected";
 	#epoch = 0;
 	readonly #handle: NativeOpenHandle;
-	readonly sdk: EmbeddedAgentSessionResult["session"];
+	/** The full SDK result: the host's controllers and factory paths read from it. */
+	readonly result: EmbeddedAgentSessionResult;
 	readonly runtime: NativeEmbeddedRuntime;
 
 	constructor(handle: NativeOpenHandle, result: EmbeddedAgentSessionResult, runtime: NativeEmbeddedRuntime) {
 		this.#handle = handle;
-		this.sdk = result.session;
+		this.result = result;
 		this.runtime = runtime;
+	}
+
+	get sdk(): EmbeddedAgentSessionResult["session"] {
+		return this.result.session;
 	}
 
 	get state(): NativeConnectionState {
