@@ -11124,6 +11124,80 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+
+		test("discovers built-in OAuth provider models after refreshing expired token", async () => {
+			// Regression: google-antigravity discovered models vanish once OAuth token expires.
+			// collectBuiltInModelManagerOptions used peekApiKey (no OAuth refresh), so expired
+			// token returned undefined and discovery was skipped. The fix checks if OAuth token
+			// is expired/expiring and refreshes it before discovery.
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "refresh-token",
+					// Token is expired right now
+					expires: Date.now() - 1000,
+					email: "antigravity@example.com",
+				},
+			]);
+
+			let discoveryFetches = 0;
+			let discoveryAuthHeaders: string | undefined;
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
+				// Simulate OAuth token refresh
+				await authStorage.set("google-antigravity", [
+					{
+						type: "oauth",
+						access: "refreshed-access",
+						refresh: "refresh-token",
+						// New token is fresh
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "antigravity@example.com",
+					},
+				]);
+				return "refreshed-access";
+			});
+
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					discoveryAuthHeaders = new Headers(init?.headers).get("Authorization") ?? undefined;
+					return new Response(
+						JSON.stringify({
+							models: { "gemini-discovery-after-refresh": { displayName: "Discovered After Refresh" } },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("google-antigravity", "online");
+
+				// Verify that getApiKey was called (meaning OAuth refresh was attempted)
+				expect(getApiKeySpy).toHaveBeenCalled();
+
+				// Verify that the discovery endpoint was called
+				expect(discoveryFetches).toBe(1);
+
+				// Verify that the discovery request used the refreshed token
+				expect(discoveryAuthHeaders).toBe("Bearer refreshed-access");
+
+				// Verify that the discovered model is in the registry
+				const model = registry.find("google-antigravity", "gemini-discovery-after-refresh");
+				expect(model).toBeDefined();
+				// google-antigravity appends provider suffix to display names
+				expect(model?.name).toContain("Discovered After Refresh");
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
 	});
 });
 
