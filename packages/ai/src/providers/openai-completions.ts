@@ -1069,9 +1069,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					: undefined;
 			// Structured calls can follow leaked markup, so reconcile recovered calls
 			// only after the entire response has arrived.
-			const recoveredCalls: HealedToolCall[] = [];
+			// Each recovered call remembers how many structured calls preceded it, so
+			// reconciliation can tell whether emitting it at end-of-stream would move it
+			// behind a structured call that the model issued after it.
+			const recoveredCalls: { call: HealedToolCall; structuredBefore: number }[] = [];
+			const countStructuredCalls = (): number => output.content.filter(block => block.type === "toolCall").length;
 			let healedToolCallEmitted = false;
-			const emitHealedToolCall = (call: HealedToolCall): void => {
+			const emitHealedToolCall = (call: HealedToolCall, conflicting = false): void => {
 				finishCurrentBlock(currentBlock);
 				const block: ToolCall & { partialArgs: string } = {
 					type: "toolCall",
@@ -1084,6 +1088,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (call.incomplete) {
 					block.incompleteArguments = true;
 					block.incompleteArgumentsReason = "malformed";
+				} else if (conflicting) {
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "conflicting";
 				}
 				// The healer already normalized `call.arguments`, decoding any escapes away,
 				// so the signal has to come from its pre-round-trip sample of the raw payload.
@@ -1112,7 +1119,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				for (const call of kimiHealer?.drainCompleted() ?? []) emitHealedToolCall(call);
 			};
 			const collectHealedToolCalls = (): void => {
-				recoveredCalls.push(...(dsmlHealer?.drainCompleted() ?? []));
+				const structuredBefore = countStructuredCalls();
+				for (const call of dsmlHealer?.drainCompleted() ?? []) recoveredCalls.push({ call, structuredBefore });
 			};
 			let providerSafetyStop = false;
 			let hasExplicitUsageReport = false;
@@ -1403,7 +1411,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				// request did not offer (or any name when no tools were offered) is dropped.
 				const offeredToolNames = new Set((context.tools ?? []).map(tool => tool.name));
 				const allowedRecoveredCalls = recoveredCalls.filter(
-					call => !rejectAll && offeredToolNames.has(call.name) && allowedNames.every(name => call.name === name),
+					({ call }) =>
+						!rejectAll && offeredToolNames.has(call.name) && allowedNames.every(name => call.name === name),
 				);
 
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
@@ -1411,7 +1420,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				// Each structured call suppresses at most one identical recovered call.
 				const matchedStructuredCallIndices = new Set<number>();
 
-				for (const call of allowedRecoveredCalls) {
+				for (const { call, structuredBefore } of allowedRecoveredCalls) {
 					const recoveredArguments = parseStreamingJson(call.arguments);
 
 					let foundMatchIndex = -1;
@@ -1437,7 +1446,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 						continue;
 					}
 
-					emitHealedToolCall(call);
+					// Content order is execution order. A recovered call that preceded a
+					// structured call would now run after it, so a later read could observe
+					// state from before an earlier write. Already-streamed content indices
+					// cannot be renumbered, so the out-of-order call fails closed instead.
+					emitHealedToolCall(call, structuredCalls.length > structuredBefore);
 				}
 			}
 

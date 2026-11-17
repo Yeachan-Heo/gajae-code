@@ -207,6 +207,31 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(callsByName.read).toBeDefined();
 	});
 
+	it("does not let a recovered call that preceded a distinct structured call run after it", async () => {
+		const write =
+			wrapperStart +
+			'<｜DSML｜invoke name="write"><｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter></｜DSML｜invoke>' +
+			wrapperEnd;
+		const result = await response([{ content: write }, { tool_calls: structured('{"path":"out.txt"}') }]);
+		const executable = tools(result).filter(call => !call.incompleteArguments);
+		expect(executable.map(call => call.name)).toEqual(["read"]);
+		const blocked = tools(result).find(call => call.name === "write");
+		expect(blocked?.incompleteArgumentsReason).toBe("conflicting");
+	});
+
+	it("keeps a recovered call executable when it follows every structured call", async () => {
+		const write =
+			wrapperStart +
+			'<｜DSML｜invoke name="write"><｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter></｜DSML｜invoke>' +
+			wrapperEnd;
+		const result = await response([{ tool_calls: structured('{"path":"in.txt"}') }, { content: write }]);
+		expect(
+			tools(result)
+				.filter(call => !call.incompleteArguments)
+				.map(call => call.name),
+		).toEqual(["read", "write"]);
+	});
+
 	it("matches structured calls one-to-one with recovered calls", async () => {
 		// Two identical recovered calls followed by one structured call
 		// The structured call should suppress exactly one recovered call
