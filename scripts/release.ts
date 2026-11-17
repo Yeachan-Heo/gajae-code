@@ -923,7 +923,10 @@ async function cmdRelease(version: string): Promise<void> {
 			`    git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev +refs/tags/v${version}:refs/remotes/origin/tags/v${version} && git worktree add /tmp/gjc-backmerge origin/dev`,
 		);
 		console.error(
-			`    git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}   # keep v${version}'s version and dev's artifacts map`,
+			`    git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}`,
+		);
+		console.error(
+			`    git -C /tmp/gjc-backmerge checkout refs/remotes/origin/tags/v${version} -- ${BACKMERGE_CONFLICT_PATH}   # take the tag's manifest wholesale: its version and its artifacts, never dev's digests`,
 		);
 		console.error(`    git -C /tmp/gjc-backmerge push origin HEAD:refs/heads/backmerge/${version}`);
 		console.error(`    gh pr create --head backmerge/${version} --base dev --title "chore(release): backmerge v${version} into dev"`);
@@ -1127,7 +1130,7 @@ export async function backmergeReleaseIntoDev(
 				title: `chore(release): backmerge v${version} into dev`,
 				body: `Sync the v${version} release commit from main into dev so this published version is included before a later release merge.
 
-The release consumed its changelog fragments; the history guard admits those deletions because the \`v${version}\` tag records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's manifest wholesale — its version and its artifact digests — so no digest dev built for another version is relabelled under v${version}.
+The release consumed its changelog fragments; the history guard admits those deletions because their notes are already under the released \`## [${version}]\` section (a \`v${version}\` tag that deleted them counts as evidence too). The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's manifest wholesale — its version and its artifact digests — so no digest dev built for another version is relabelled under v${version}.
 
 Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of dev. Merging requires maintainer approval of this exact head.`,
 			});

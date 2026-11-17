@@ -81,6 +81,14 @@ function insert(content: string, entry: string): string {
 	return content.replace("### Fixed\n\n", `### Fixed\n\n${entry}\n`);
 }
 
+function releasedNoteBlock(version: string, notes: readonly string[]): string {
+	return `## [${version}] - 2026-02-01\n\n### Fixed\n\n${notes.map(note => `- ${note}`).join("\n")}\n\n`;
+}
+
+function insertRelease(content: string, block: string): string {
+	return content.replace("## [1.0.0]", `${block}## [1.0.0]`);
+}
+
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
@@ -195,6 +203,61 @@ describe("pull request guards", () => {
 		await git(root, ["checkout", "-q", "frag-a"]);
 		expect((await git(root, ["merge", "--no-edit", "frag-b"])).exitCode).toBe(0);
 		expect((await git(root, ["diff", "--name-only", "--diff-filter=U"])).stdout.trim()).toBe("");
+	});
+});
+
+async function deleteFragment(root: string, fragment: string): Promise<void> {
+	await fs.rm(path.join(root, fragment));
+	await commit(root, "drop the fragment");
+}
+
+async function deletedFragmentRange(content: string): Promise<{ root: string; base: string; fragment: string }> {
+	const root = await tempDir();
+	await init(root);
+	const fragment = "packages/coding-agent/changelog.d/note.md";
+	await put(root, fragment, content);
+	await commit(root, "add a fragment");
+	const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+	return { root, base, fragment };
+}
+
+describe("release fold evidence", () => {
+	test("excuses a deleted fragment whose notes sit inside a released section this import adds", async () => {
+		const { root, base, fragment } = await deletedFragmentRange("### Fixed\n\n- Web   search  picked a provider.\n");
+		await put(
+			root,
+			"packages/coding-agent/CHANGELOG.md",
+			insertRelease(CHANGELOG, releasedNoteBlock("1.0.1", ["Web search picked a provider."])),
+		);
+		await deleteFragment(root, fragment);
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.stderr).toBe("");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("rejects a deleted fragment when one of its notes is missing from the imported section", async () => {
+		const { root, base, fragment } = await deletedFragmentRange("### Fixed\n\n- Shipped note.\n\n### Added\n\n- Missing note.\n");
+		await put(root, "packages/coding-agent/CHANGELOG.md", insertRelease(CHANGELOG, releasedNoteBlock("1.0.1", ["Shipped note."])));
+		await deleteFragment(root, fragment);
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`${fragment}::is deleted by this pull request`);
+	});
+
+	test("does not treat [Unreleased] text as shipped evidence", async () => {
+		const { root, base, fragment } = await deletedFragmentRange("### Fixed\n\n- An older fix.\n");
+		await deleteFragment(root, fragment);
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`${fragment}::is deleted by this pull request`);
+	});
+
+	test("does not treat a released section that already existed at base as evidence", async () => {
+		const { root, base, fragment } = await deletedFragmentRange("### Added\n\n- Something shipped.\n");
+		await deleteFragment(root, fragment);
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`${fragment}::is deleted by this pull request`);
 	});
 });
 
