@@ -11198,6 +11198,67 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+
+		test("handles OAuth token refresh failure gracefully in batch discovery", async () => {
+			// Regression: if peekApiKeyForProvider throws during one provider's refresh,
+			// the entire Promise.all batch would abort and other peekKey calls wouldn't complete.
+			// The fix catches errors within peekKey and returns undefined for the failed provider.
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "refresh-token",
+					// Token is expired, will trigger refresh attempt
+					expires: Date.now() - 1000,
+					email: "antigravity@example.com",
+				},
+			]);
+
+			// Make getApiKey fail to simulate OAuth refresh error
+			const getApiKeySpy = vi
+				.spyOn(authStorage, "getApiKey")
+				.mockRejectedValue(new Error("OAuth refresh unavailable"));
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				// Refresh provider with expired token that will fail to refresh.
+				// Key point: this should not throw. Before the fix, peekKey would propagate
+				// the error and abort the entire batch. After the fix, peekKey catches it.
+				await expect(registry.refreshProvider("google-antigravity", "online")).resolves.toBeUndefined();
+
+				// Verify getApiKey was called (attempting refresh for expired token)
+				expect(getApiKeySpy).toHaveBeenCalled();
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
+
+		test("does not refresh OAuth tokens in offline strategy", async () => {
+			// Offline strategy must not make network calls, including OAuth refresh.
+			await authStorage.set("google-antigravity", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "refresh-token",
+					// Token is expired; would trigger refresh in online mode
+					expires: Date.now() - 1000,
+					email: "antigravity@example.com",
+				},
+			]);
+
+			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey");
+
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				// Refresh in offline mode; should not call getApiKey or make network requests
+				await registry.refreshProvider("google-antigravity", "offline");
+
+				// getApiKey should not have been called for offline refresh
+				expect(getApiKeySpy).not.toHaveBeenCalled();
+			} finally {
+				getApiKeySpy.mockRestore();
+			}
+		});
 	});
 });
 

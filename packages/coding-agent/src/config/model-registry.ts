@@ -5443,43 +5443,54 @@ export class ModelRegistry {
 		// discovery can proceed with valid credentials. The token is only needed if the
 		// dynamic fetch fires (cache miss), and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
-			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
-				descriptor.providerId,
-				this.#authStorageConfigOwner,
-			);
-			// When OAuth token is expired, refresh it so discovery can proceed with valid
-			// credentials. For fresh tokens, use cheap peek without refresh.
-			let refreshOAuth = false;
-			if (this.authStorage.hasOAuth(descriptor.providerId)) {
-				const oauthCred = this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
-					owner: this.#authStorageConfigOwner,
-				});
-				// Only refresh if token is already expired; AuthStorage will refresh
-				// tokens within the skew window on the subsequent getApiKey calls.
-				if (oauthCred && Date.now() >= oauthCred.expires) {
-					refreshOAuth = true;
-					logger.debug("built-in model discovery: OAuth token expired, triggering refresh", {
-						provider: descriptor.providerId,
-						expiresAt: oauthCred.expires,
+			try {
+				const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+					descriptor.providerId,
+					this.#authStorageConfigOwner,
+				);
+				// When OAuth token is expired, refresh it so discovery can proceed with valid
+				// credentials. For fresh tokens, use cheap peek without refresh.
+				// Never refresh for offline strategy, which must not make network calls.
+				let refreshOAuth = false;
+				if (strategy !== "offline" && this.authStorage.hasOAuth(descriptor.providerId)) {
+					const oauthCred = this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
+						owner: this.#authStorageConfigOwner,
 					});
+					// Only refresh if token is already expired; AuthStorage will refresh
+					// tokens within the skew window on the subsequent getApiKey calls.
+					if (oauthCred && Date.now() >= oauthCred.expires) {
+						refreshOAuth = true;
+						logger.debug("built-in model discovery: OAuth token expired, triggering refresh", {
+							provider: descriptor.providerId,
+							expiresAt: oauthCred.expires,
+						});
+					}
 				}
-			}
-			const apiKey =
-				(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
-				(await this.#peekApiKeyForProvider(descriptor.providerId, {
-					credentialSessionId,
-					refreshOAuth,
-				}));
-			if (
-				configurationGeneration !==
-				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
-			) {
+				const apiKey =
+					(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
+					(await this.#peekApiKeyForProvider(descriptor.providerId, {
+						credentialSessionId,
+						refreshOAuth,
+					}));
+				if (
+					configurationGeneration !==
+					this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
+				) {
+					return { apiKey: undefined, authGeneration: undefined };
+				}
+				return {
+					apiKey,
+					authGeneration: this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey),
+				};
+			} catch (error) {
+				// Log but don't propagate provider-specific failures.
+				// Other providers in the batch should continue discovery.
+				logger.warn("built-in model discovery: failed to peek API key for provider", {
+					provider: descriptor.providerId,
+					error: error instanceof Error ? error.message : String(error),
+				});
 				return { apiKey: undefined, authGeneration: undefined };
 			}
-			return {
-				apiKey,
-				authGeneration: this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey),
-			};
 		};
 		const [standardProviderCredentials, specialProviderCredentials] = await Promise.all([
 			Promise.all(standardProviderDescriptors.map(peekKey)),
