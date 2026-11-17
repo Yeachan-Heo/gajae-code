@@ -695,6 +695,16 @@ export async function selectEmbeddedExecutionBranch(
 export function currentEmbeddedResumeOperation(handle: NativeLifecycleHandle): PendingResumeOp {
 	return ownerFor(handle).pending;
 }
+/**
+ * The registered interaction bridge this runtime presents questions through. A native
+ * runtime refuses every other UI context, so a host that renders dialogs itself answers
+ * these requests with `service.respond` and cancels them with `service.cancel`.
+ */
+export function currentEmbeddedInteraction(handle: NativeLifecycleHandle): NonNullable<EmbeddedWorkSource["interaction"]> {
+	const interaction = ownerFor(handle).interaction;
+	if (!interaction) throw new Error("context_mismatch");
+	return interaction;
+}
 export function recordEmbeddedResumeCheckpoint(
 	handle: NativeLifecycleHandle,
 	input: { readonly op: string },

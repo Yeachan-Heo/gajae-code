@@ -84,6 +84,7 @@ export {
 	attestEmbeddedLegacyTakeover,
 	consentEmbeddedDisconnect,
 	createNativeEmbeddedAgentSession,
+	currentEmbeddedInteraction,
 	currentEmbeddedResumeOperation,
 	type EmbeddedResumeResolution,
 	type NativeEmbeddedAgentSessionOptions,
@@ -100,6 +101,7 @@ export {
 	selectEmbeddedExecutionBranch,
 	terminateEmbeddedAgentSession,
 } from "./native-embedding";
+export { NativeRuntimeRefusal } from "./native-lifecycle";
 export type {
 	NativeDisconnectConsent,
 	NativeDisconnectPreparation,
