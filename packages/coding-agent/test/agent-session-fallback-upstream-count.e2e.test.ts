@@ -1541,7 +1541,6 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(selectors).toEqual([selector(primary), selector(fallback)]);
 
 		// Critical: verify no same-entry request before Retry-After deadline
-		const deadline = firstAttemptTime + retryAfterMs;
 		for (const { selector: sel, timestampMs } of requestLog) {
 			if (sel === selector(primary)) {
 				// All primary requests should be at or after the initial attempt
@@ -1659,7 +1658,7 @@ describe("AgentSession fallback upstream request counts", () => {
 			return successfulStream(model);
 		};
 
-		const { primary: p, fallback: f } = createSession(5, streamFn, {
+		const { fallback: f } = createSession(5, streamFn, {
 			"fallback.concurrencyWaitMs": 5_000, // Budget 5s, Retry-After 10s (exceeds for primary)
 		});
 
@@ -1761,7 +1760,7 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(fallbackAttempts).toBeGreaterThan(0);
 		// Final model should be fallback (which succeeded)
 		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
-		
+
 		// When deadline is recorded on budget exhaustion, we should quickly advance to fallback
 		// rather than retry the primary many times (each would add ~100ms Retry-After to deadline).
 		// With a 100ms budget, we expect a small number of primary attempts before advancing.
