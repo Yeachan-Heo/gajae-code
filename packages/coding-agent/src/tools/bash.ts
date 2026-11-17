@@ -1478,7 +1478,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			cwd: this.session.cwd,
 			settings: this.session.settings,
 			signal,
-			localOptions: {
+			localOptions: this.session.getLocalProtocolOptions?.() ?? {
 				getArtifactsDir: this.session.getArtifactsDir,
 				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,

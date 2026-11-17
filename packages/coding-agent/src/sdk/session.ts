@@ -3662,8 +3662,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		toolSession.getArtifactsDir = getArtifactsDir;
 		// `local://` authority follows the CALLING session. Tools thread this into
 		// the router so a second root's reads never resolve against the first
-		// root's artifacts/local or managed /tmp/gjc-local scratch tree.
-		toolSession.getLocalProtocolOptions = () => session?.getLocalProtocolOptions() ?? localProtocolOptions;
+		// root's artifacts/local or managed /tmp/gjc-local scratch tree. This is
+		// the same binding `initializeLocalRoot` just used, so an explicitly
+		// shared binding (a subagent inheriting its parent's root) is preserved
+		// instead of being re-derived from this session's own managers.
+		toolSession.getLocalProtocolOptions = () => localProtocolOptions;
 		toolSession.getAgentModelOverrides = () =>
 			session?.getAgentModelOverrides() ?? settings.get("task.agentModelOverrides");
 		toolSession.hasSessionAgentModelOverride = role => session?.hasSessionAgentModelOverride(role) ?? false;
@@ -5501,7 +5504,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 			}
 		}
-		agentRegistry.register({
+		agentRegistry.claim({
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
 			rosterLabel: resolvedAgentRosterLabel,
@@ -6842,11 +6845,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			});
 			await attemptCleanup(() => startupPythonCleanup);
-		} else {
-			if (hasRegistered)
-				await attemptCleanup(() => {
-					agentRegistry.unregister(resolvedAgentId);
-				});
+		}
+		// Release this construction's own registry identity whenever it was
+		// claimed, not only when construction stopped before the session existed:
+		// a later failure (e.g. attaching the live session to its ref) happens
+		// after registration but before the session's disposal cleanup is wired,
+		// and would otherwise strand the newcomer's entry next to the incumbent's.
+		// `unregister` is a no-op once disposal already removed it.
+		if (hasRegistered)
+			await attemptCleanup(() => {
+				agentRegistry.unregister(resolvedAgentId);
+			});
+		if (!hasSession) {
 			// Admission happens before session construction. Any later startup failure
 			// must release this manager's endpoint mapping; a failed restoration cannot
 			// prevent disposal of the owned manager or other startup resources.

@@ -430,6 +430,32 @@ describe("createAgentSession root registry", () => {
 			);
 			expect(foundBeta).toContain("review.txt");
 			expect(foundBeta).toContain(path.basename(agentBeta));
+			// AST search resolves the same caller-scoped memory path.
+			writeMemoryFile(
+				first.session.settings.getAgentDir(),
+				cwd,
+				"ast.ts",
+				"function alphaSentinel() { return 1 }\n",
+			);
+			writeMemoryFile(
+				second.session.settings.getAgentDir(),
+				cwd,
+				"ast.ts",
+				"function betaSentinel() { return 2 }\n",
+			);
+			const ast = async (session: AgentSession) =>
+				textOf(
+					await runSessionTool(session, "ast_grep", {
+						pat: "function $NAME() { return $VALUE }",
+						paths: ["memory://root/ast.ts"],
+					}),
+				);
+			const alphaAst = await ast(first.session);
+			const betaAst = await ast(second.session);
+			expect(alphaAst).toContain("alphaSentinel");
+			expect(alphaAst).not.toContain("betaSentinel");
+			expect(betaAst).toContain("betaSentinel");
+			expect(betaAst).not.toContain("alphaSentinel");
 			await first.session.dispose();
 			firstDisposed = true;
 			const betaAfter = await readSearch(second.session);
@@ -550,6 +576,50 @@ describe("createAgentSession root registry", () => {
 		}
 	}, 120_000);
 
+	it("keeps an explicitly shared local binding across sessions", async () => {
+		const parent = await openRoot();
+		const parentRoot = localRootOf(parent.session);
+		writeLocalFile(parentRoot, "review.txt", "shared-parent-local\n");
+		writeLocalFile(parentRoot, "only-parent.txt", "only-parent-local\n");
+		// Exactly what a subagent receives from the task executor: the parent's
+		// binding, explicitly, rather than a root derived from its own managers.
+		const sharedBinding: LocalProtocolOptions = {
+			getArtifactsDir: () => parent.session.sessionManager.getArtifactsDir(),
+			isManagedDestination: () => parent.session.sessionManager.isManagedDestination(),
+			getSessionId: () => parent.session.sessionManager.getSessionId(),
+		};
+		const child = await openRoot({ localProtocolOptions: sharedBinding });
+		try {
+			expect(path.resolve(localRootOf(child.session))).not.toBe(path.resolve(parentRoot));
+			const readLocal = async (session: AgentSession, name: string) =>
+				textOf(await runSessionTool(session, "read", { path: `local://${name}` }));
+			expect(await readLocal(child.session, "review.txt")).toContain("shared-parent-local");
+			expect(await readLocal(child.session, "only-parent.txt")).toContain("only-parent-local");
+			expect(await readLocal(parent.session, "review.txt")).toContain("shared-parent-local");
+			// The shared root is deliberate: a file that exists only in the child's
+			// own derived root is not reachable through the shared binding.
+			const childOnlyRoot = localRootOf(child.session);
+			writeLocalFile(childOnlyRoot, "only-child.txt", "only-child-local\n");
+			await expect(readLocal(child.session, "only-child.txt")).rejects.toThrow(/not found/i);
+		} finally {
+			await child.session.dispose();
+			await parent.session.dispose();
+		}
+	}, 120_000);
+
+	it("fails closed for a memory caller that names no agent dir", async () => {
+		const opened = await openRoot();
+		try {
+			const cwd = opened.session.sessionManager.getCwd();
+			writeMemoryFile(opened.session.settings.getAgentDir(), cwd, "review.txt", "caller-memory\n");
+			await expect(InternalUrlRouter.instance().resolve("memory://root/review.txt", { cwd })).rejects.toThrow(
+				/supplied no memory root/i,
+			);
+		} finally {
+			await opened.session.dispose();
+		}
+	}, 120_000);
+
 	it("fails closed when a caller supplies no local binding", async () => {
 		const opened = await openRoot();
 		try {
@@ -598,6 +668,24 @@ describe("createAgentSession root registry", () => {
 			} finally {
 				await sharedFirst.session.dispose();
 			}
+
+			// A failure AFTER the newcomer claimed its id (attachSession runs once the
+			// session exists) must release only the newcomer's own entry.
+			class FailingAttachRegistry extends AgentRegistry {
+				override attachSession(): void {
+					throw new Error("simulated late startup failure");
+				}
+			}
+			const lateRegistry = new FailingAttachRegistry();
+			lateRegistry.claim({
+				id: MAIN_AGENT_ID,
+				displayName: "incumbent-root",
+				kind: "main",
+				session: null,
+			});
+			await expect(openRoot({ agentRegistry: lateRegistry })).rejects.toThrow(/simulated late startup failure/);
+			expect(lateRegistry.list().map(ref => ref.id)).toEqual([MAIN_AGENT_ID]);
+			expect(lateRegistry.get(MAIN_AGENT_ID)?.displayName).toBe("incumbent-root");
 		} finally {
 			await first.session.dispose();
 		}
