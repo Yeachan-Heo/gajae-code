@@ -6,6 +6,7 @@ import { planMigration } from "../src/migrate/action-planner";
 import { executeActions } from "../src/migrate/executor";
 import type {
 	AdapterResult,
+	HookCandidate,
 	McpCandidate,
 	MigrateDestinations,
 	SkillCandidate,
@@ -39,6 +40,9 @@ function skill(slug: string, content = `---\ndescription: d\n---\nbody`): SkillC
 }
 function slashCommand(name: string, content = "Review $ARGUMENTS."): SlashCommandCandidate {
 	return { source: "claude-code", name, content };
+}
+function hook(event: string, command: string, matcher?: string): HookCandidate {
+	return { source: "claude-code", event, command, matcher };
 }
 function instruction(content: string, source: "claude-code" | "codex" = "claude-code") {
 	return { source, name: source === "codex" ? "AGENTS.md" : "CLAUDE.md", content };
@@ -592,6 +596,49 @@ describe("planMigration — diagnostics", () => {
 	});
 });
 
+describe("planMigration — hooks", () => {
+	test("fresh import is `imported`", async () => {
+		const { actions } = await planMigration({
+			results: [result({ hookCandidates: [hook("PreToolUse", "echo hook", "read")] })],
+			destinations: dest,
+			force: false,
+		});
+		expect(actions).toHaveLength(1);
+		expect(actions[0]).toMatchObject({
+			type: "hook",
+			name: "migrated-claude-code.ts",
+			operation: "create",
+			status: "imported",
+		});
+	});
+
+	test("existing hook: skip without force, update with force", async () => {
+		await fs.mkdir(dest.hooksDir, { recursive: true });
+		const destination = path.join(dest.hooksDir, "migrated-claude-code.ts");
+		await fs.writeFile(destination, "// existing hook", "utf-8");
+		const candidate = result({ hookCandidates: [hook("PreToolUse", "echo new hook")] });
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({ operation: "skip", status: "skipped_exists" });
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({ operation: "update", status: "updated" });
+	});
+
+	test("unsupported hook event is skipped", async () => {
+		const { actions } = await planMigration({
+			results: [result({ hookCandidates: [hook("UnsupportedEvent", "echo hook")] })],
+			destinations: dest,
+			force: false,
+		});
+		expect(actions).toHaveLength(1);
+		expect(actions[0]).toMatchObject({
+			type: "hook",
+			name: "UnsupportedEvent",
+			operation: "skip",
+			status: "skipped_unmappable",
+		});
+	});
+});
+
 describe("executeActions — instruction destination safety", () => {
 	test("does not follow a symlinked project .gjc directory", async () => {
 		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-instructions-executor-outside-"));
@@ -770,5 +817,90 @@ describe("executeActions — mcp destination safety", () => {
 			mcpServers: { alpha: { command: string } };
 		};
 		expect(written.mcpServers.alpha.command).toBe("new-bin");
+	});
+});
+
+describe("planMigration — hook destination safety during planning", () => {
+	test("hook root is not safe (symlink): skip without force, fail with force", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-hook-planner-outside-"));
+		try {
+			const hooksSymlink = path.join(tmp, ".gjc", "hooks");
+			await fs.mkdir(path.join(tmp, ".gjc"), { recursive: true });
+			await fs.symlink(outside, hooksSymlink, "dir");
+
+			const candidate = result({ hookCandidates: [hook("PreToolUse", "echo hook")] });
+			const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+			expect(skipped.actions[0]).toMatchObject({
+				operation: "skip",
+				status: "skipped_exists",
+				reason: "hook destination root is not a real directory",
+			});
+
+			const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+			expect(forced.actions[0]).toMatchObject({
+				operation: "fail",
+				status: "failed_invalid_destination",
+				reason: "hook destination root is not a real directory; refusing to write",
+			});
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("hook destination ancestor is a file, not a directory: skip without force, fail with force", async () => {
+		await fs.mkdir(path.join(tmp, ".gjc"), { recursive: true });
+		// Create a file where the hooks directory should be
+		await fs.writeFile(path.join(tmp, ".gjc", "hooks"), "not a directory", "utf-8");
+
+		const candidate = result({ hookCandidates: [hook("PreToolUse", "echo hook")] });
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({
+			operation: "skip",
+			status: "skipped_exists",
+			reason: "hook destination root is not a real directory",
+		});
+
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({
+			operation: "fail",
+			status: "failed_invalid_destination",
+			reason: "hook destination root is not a real directory; refusing to write",
+		});
+	});
+});
+
+describe("executeActions — hook destination safety", () => {
+	test("does not follow a symlinked hooks directory", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-executor-hooks-outside-"));
+		try {
+			const hooksSymlink = path.join(tmp, ".gjc", "hooks");
+			await fs.mkdir(path.join(tmp, ".gjc"), { recursive: true });
+			await fs.symlink(outside, hooksSymlink, "dir");
+
+			const [action] = await executeActions(
+				[
+					{
+						source: "claude-code",
+						type: "hook",
+						name: "migrated-claude-code.ts",
+						destination: path.join(hooksSymlink, "migrated-claude-code.ts"),
+						operation: "create",
+						status: "imported",
+						hook: { content: "export default () => {};" },
+					},
+				],
+				{ project: true },
+			);
+
+			expect(action).toMatchObject({ operation: "fail", status: "failed_io" });
+			expect(
+				await fs.access(path.join(outside, "migrated-claude-code.ts")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
 	});
 });

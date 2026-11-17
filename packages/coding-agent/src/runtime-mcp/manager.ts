@@ -8,7 +8,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
-import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai/core";
+import {
+	isCanonicalMCPOAuthBinding,
+	isMCPOAuthBindingTransportAdmitted,
+	resolveMCPOAuthResourceOrigin,
+	type TSchema,
+} from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { SourceMeta } from "../capability/types";
 import * as configValue from "../config/resolve-config-value";
@@ -3782,10 +3787,19 @@ export class MCPManager {
 			let credential = this.#authStorage.get(credentialId);
 			const binding = credential?.type === "oauth" ? credential.mcpBinding : undefined;
 			const endpointOrigin = resolveMCPOAuthResourceOrigin(config.url);
+			if (binding && !isMCPOAuthBindingTransportAdmitted(binding)) {
+				// The credential is persisted and readable, but using it would send its
+				// refresh token and client secret to an insecure token endpoint. Refuse
+				// MCP dispatch rather than silently taking the cleartext path.
+				const reason = isCanonicalMCPOAuthBinding(binding)
+					? `token endpoint ${binding.tokenEndpoint} is not HTTPS and is not loopback`
+					: "binding is not a canonical http(s) URL";
+				logger.warn(`MCP OAuth credential ${credentialId} refused: stored ${reason}`);
+				throw new MCPExpectedFailure();
+			}
 			if (
 				credential?.type !== "oauth" ||
 				!binding ||
-				!isCanonicalMCPOAuthBinding(binding) ||
 				binding.resourceOrigin !== endpointOrigin ||
 				(auth.tokenUrl !== undefined && auth.tokenUrl !== binding.tokenEndpoint)
 			) {

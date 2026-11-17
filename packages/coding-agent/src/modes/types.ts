@@ -1,6 +1,12 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai/core";
+import type {
+	AssistantMessage,
+	CredentialRemovalTarget,
+	ImageContent,
+	Message,
+	UsageReport,
+} from "@gajae-code/ai/core";
 import type { Component, Container, EditorTheme, Loader, SlashCommand, Spacer, Text, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
@@ -538,4 +544,9 @@ export interface OAuthSelectorOptions {
 	 * cannot reach this machine.
 	 */
 	manualCode?: boolean;
+	/**
+	 * Credentials to remove after successful OAuth login. Used when re-logging in
+	 * to keep the disabled credential until the new login succeeds.
+	 */
+	credentialsToRemoveAfterLogin?: readonly CredentialRemovalTarget[];
 }
