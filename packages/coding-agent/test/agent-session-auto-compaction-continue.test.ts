@@ -117,17 +117,34 @@ describe("AgentSession auto-compaction continuation", () => {
 		session.setTodoPhases([{ name: "Test", tasks: [{ content: "Keep working", status: "in_progress" }] }]);
 	}
 
+	// Disposes the current fixture's session, ModelRegistry (owns the background catalog refresh), and
+	// AuthStorage in that order. Every step runs even if one fails; failures are rethrown, never swallowed.
+	async function disposeFixture(): Promise<void> {
+		const errors: unknown[] = [];
+		for (const step of [() => session.dispose(), () => modelRegistry.dispose(), () => authStorage.close()]) {
+			try {
+				await step();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Fixture cleanup failed");
+	}
+
 	beforeEach(async () => {
 		await createSession();
 	});
 
 	afterEach(async () => {
-		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
-		vi.useRealTimers();
-		getRuntimeSignals().length = 0;
-		vi.restoreAllMocks();
+		try {
+			await disposeFixture();
+		} finally {
+			tempDir.removeSync();
+			vi.useRealTimers();
+			getRuntimeSignals().length = 0;
+			vi.restoreAllMocks();
+		}
 	});
 
 	async function driveCompaction(message = assistantMessage()) {
@@ -228,8 +245,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	it.skipIf(process.platform !== "darwin")(
 		"persists repeated disk-backed compactions through native exact replacement",
 		async () => {
-			await session.dispose();
-			authStorage.close();
+			await disposeFixture();
 			tempDir.removeSync();
 			await createSession({ "compaction.keepRecentTokens": 1 }, "", true);
 
@@ -325,8 +341,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("resumable overflow retry stays parked for a paused human-wait goal", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.keepRecentTokens": 1 });
 		session.setGoalModeState({
@@ -388,8 +403,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("overflow with compaction disabled skips compaction and starts one synthetic auto-continue prompt", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.enabled": false });
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
@@ -410,8 +424,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("overflow with autoContinue false and non-resumable tail logs disabled skip reason", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.autoContinue": false });
 		const warnSpy = vi.spyOn(logger, "warn");
@@ -444,8 +457,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("overflow with resumable rebuilt tail strips failed turn and continues once", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.keepRecentTokens": 1 });
 		const warnSpy = vi.spyOn(logger, "warn");
@@ -501,8 +513,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("drains a queued follow-up through continueQueuedMessages after an overflow no-op would replay", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		// A tiny history inside the keep-recent window leaves nothing to summarize,
 		// so prepareCompaction returns undefined and overflow recovery takes the
@@ -548,8 +559,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("drains a queued steer through continueQueuedMessages after an overflow no-op would replay", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.keepRecentTokens": 100_000 });
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
@@ -667,8 +677,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("autoContinue false without queue does not continue", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.autoContinue": false });
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
@@ -681,8 +690,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	});
 
 	it("handoff threshold path schedules hardened auto-continue prompt", async () => {
-		await session.dispose();
-		authStorage.close();
+		await disposeFixture();
 		tempDir.removeSync();
 		await createSession({ "compaction.strategy": "handoff" });
 		vi.spyOn(session, "handoff").mockResolvedValue({ document: "handoff", savedPath: "handoff.md" });
@@ -1127,5 +1135,49 @@ describe("AgentSession auto-compaction continuation", () => {
 		}
 
 		expect(promptError, "prompt should succeed after overflow compaction").toBeUndefined();
+	});
+
+	it("issue #7826: prompting after threshold compaction does not re-trigger with stale usage", async () => {
+		// After a threshold auto-compaction completes, the user prompts again.
+		// Before the fix, the stale assistant message (from before compaction) would have
+		// pre-compaction usage stats, causing re-entry into runAutoCompaction("threshold")
+		// and an AgentBusyError for the user prompt. This kept the session busy for 30s
+		// waiting for the second compaction (which was a no-op) to complete.
+		// With the fix, the errorIsFromBeforeCompaction guard prevents the re-trigger.
+
+		// Use default settings and messages to trigger threshold compaction naturally
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const compactionEvents: { type: string; reason?: string }[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start") {
+				compactionEvents.push({ type: event.type, reason: event.reason });
+			}
+		});
+
+		// First compaction with default message (191K tokens)
+		await driveCompaction();
+		await advancePostPrompt(50);
+		await session.waitForIdle();
+
+		// Verify at least one compaction was triggered
+		expect(compactionEvents.length, "at least one compaction should have been triggered").toBeGreaterThan(0);
+
+		// Now prompt again with a timeout to detect hanging
+		let promptError: Error | undefined;
+		const mockPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		try {
+			await Promise.race([
+				session.prompt("continue working"),
+				new Promise<void>((_, reject) =>
+					setTimeout(() => reject(new Error("Timed out waiting for prompt - session may be wedged")), 3000),
+				),
+			]);
+		} catch (error) {
+			promptError = error instanceof Error ? error : new Error(String(error));
+		}
+
+		// The prompt should succeed without timing out
+		expect(promptError, "prompt should succeed after compaction without 30s hang").toBeUndefined();
+		expect(mockPrompt).toHaveBeenCalled();
 	});
 });

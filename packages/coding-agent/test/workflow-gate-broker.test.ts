@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { questionToGate } from "../src/modes/shared/agent-wire/deep-interview-gate";
@@ -17,6 +17,9 @@ import {
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { RESERVED_WORKFLOW_STAGES } from "../src/modes/shared/agent-wire/workflow-gate-types";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 function liveContinuation(): GateContinuation {
 	let live = true;
@@ -163,7 +166,7 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("preserves acknowledgement policy updates made before advance", async () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-ack-policy-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-ack-policy-"));
 		const file = path.join(dir, "gates.json");
 		const store = new FileGateStore(file);
 		let broker: WorkflowGateBroker;
@@ -288,7 +291,7 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("quarantines prior-process pending gates so they cannot be answered", async () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-store-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-store-"));
 		const file = path.join(dir, "gates.json");
 		const b1 = new WorkflowGateBroker("run-xyz", new FileGateStore(file));
 		const gate = b1.openGate(
@@ -309,7 +312,7 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("projects durable Q12 metadata and links a reminted gate after persistence", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-query-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-query-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker("run-query", new FileGateStore(file), { advance: () => {} });
 		const stale = first.openGate(
@@ -372,7 +375,7 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("quarantines an accepted-unadvanced gate at the process boundary without replaying it", async () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-recover-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-recover-"));
 		const file = path.join(dir, "gates.json");
 		const b1 = new WorkflowGateBroker("run-rec", new FileGateStore(file), {
 			terminalizeAccepted: () => "not_published",
@@ -458,7 +461,7 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("fails closed on a malformed but valid FileGateStore document before exposure", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-invalid-document-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-invalid-document-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker("run-invalid-document", new FileGateStore(file), { advance: () => {} });
 		const gate = first.openGate(
@@ -502,14 +505,14 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("fails closed on a corrupt FileGateStore instead of silently resetting", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-corrupt-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-corrupt-"));
 		const file = path.join(dir, "gates.json");
 		writeFileSync(file, "{ not valid json");
 		expect(() => new FileGateStore(file)).toThrow(/corrupt gate store/);
 	});
 
 	it("fails closed when the startup quarantine directory fsync fails", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-fsync-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-fsync-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker("run-fsync", new FileGateStore(file));
 		first.openGate({ stage: "deep-interview", kind: "question", schema: { type: "string" } }, liveContinuation());
@@ -526,7 +529,7 @@ describe("WorkflowGateBroker", () => {
 		).toThrow(/directory fsync failed/);
 	});
 	it("quarantines a disk-accepted record after post-rename fsync uncertainty instead of reissuing it", async () => {
-		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-uncertain-accepted-")), "gates.json");
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-uncertain-accepted-")), "gates.json");
 		let syncs = 0;
 		const store = new FileGateStore(file, () => {
 			syncs++;
@@ -547,7 +550,7 @@ describe("WorkflowGateBroker", () => {
 		});
 	});
 	it("does not mkdir at construction on a fresh empty store under a non-writable cwd (#4568)", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-fresh-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-unwritable-fresh-"));
 		const storePath = path.join(dir, "workspace", ".gjc", "_session-s1", "state", "workflow-gates.json");
 		const broker = new WorkflowGateBroker(
 			"run-4568-fresh",
@@ -569,7 +572,7 @@ describe("WorkflowGateBroker", () => {
 		});
 	});
 	it("surfaces an unwritable directory as a typed GateStoreWriteError instead of a raw errno (#4568)", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-write-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-unwritable-write-"));
 		const storePath = path.join(dir, "workspace", ".gjc", "_session-s2", "state", "workflow-gates.json");
 		const broker = new WorkflowGateBroker(
 			"run-4568-write",
@@ -595,7 +598,7 @@ describe("WorkflowGateBroker", () => {
 		expect(new FileGateStore(storePath).get(gate.gate_id)).toMatchObject({ status: "quarantined" });
 	});
 	it("keeps quarantining prior-instance records at construction once state exists (#4568)", () => {
-		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-restart-"));
+		const dir = tempDirs.mkdtempSync(path.join(tmpdir(), "gate-unwritable-restart-"));
 		const file = path.join(dir, "gates.json");
 		const first = new WorkflowGateBroker(
 			"run-4568-restart",
@@ -636,7 +639,7 @@ describe("WorkflowGateBroker", () => {
 		// symptom set: `ok:true status:"accepted"` with a real `resolved_at`, an
 		// empty `workflow.gates.list`, and an original prompt stuck `in_flight` /
 		// `receiptState:"absent"` for hours.
-		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-5599-")), "gates.json");
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-5599-")), "gates.json");
 		const store = new FileGateStore(file);
 		const continuationLost: PersistedGate[] = [];
 		const broker = new WorkflowGateBroker("run-5599", store, {
@@ -734,7 +737,7 @@ describe("WorkflowGateBroker", () => {
 		// accepted-record idempotency branch that returned `record.resolution` directly. A
 		// caller retrying through the broker API rather than the SDK lookup bypassed the
 		// provenance check entirely and got the same false success.
-		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-5599-replay-")), "gates.json");
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-5599-replay-")), "gates.json");
 		const broker = new WorkflowGateBroker("run-replay", new FileGateStore(file), {
 			advance: () => {},
 			terminalizeAccepted: () => "not_published",

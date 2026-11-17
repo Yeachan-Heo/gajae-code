@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type AuthStorage, resolveOAuthStorageProvider } from "@gajae-code/ai/core";
+import {
+	type AuthStorage,
+	isStoredApiKeyCredentialForProvider,
+	resolveOAuthStorageProvider,
+} from "@gajae-code/ai/core";
 import {
 	isSafeCatalogModelId,
 	MODELS_LIST_REQUEST_TIMEOUT_MS,
@@ -10,11 +14,74 @@ import {
 import { getAgentDbPath, getAgentDir, logger } from "@gajae-code/utils";
 import { $rotatingCredentialEnv } from "@gajae-code/utils/env";
 import { YAML } from "bun";
+import type { LoadResult } from "../config/config-file";
 import { withFileLock } from "../config/file-lock";
-import { type ModelsConfig, ModelsConfigSchema, type ProviderDiscovery } from "../config/models-config-schema";
+import {
+	type ModelsConfig,
+	ModelsConfigSchema,
+	PROVIDER_CREDENTIAL_STORE,
+	type ProviderDiscovery,
+} from "../config/models-config-schema";
 import { compareRankedProviders, famousProviderIndex } from "../config/provider-ranking";
 import { AuthStorage as AuthStorageImpl } from "../session/auth-storage";
 import providerPresets from "./provider-presets.json";
+
+// Setup writes YAML, and the models reader parses JSON only for `.json`/`.jsonc`.
+// Accepting those extensions here would rename YAML into a path the reader
+// then rejects, after the config and credential were already committed.
+const MODELS_CONFIG_PATH_EXTENSIONS = [".yml", ".yaml"] as const;
+
+interface ModelsConfigFileLike {
+	relocate(configPath?: string): { invalidate(): void; tryLoad(): LoadResult<ModelsConfig> };
+}
+
+interface ModelRegistryModule {
+	validateModelsConfig(config: ModelsConfig): void;
+	ModelsConfigFile: ModelsConfigFileLike;
+}
+
+interface ConfigValueResolverModule {
+	resolveConfigValue(config: string, cacheScope?: string): Promise<string | undefined>;
+}
+
+// The models-config validator and loader live in model-registry, which is
+// deliberately kept out of the eager `gjc setup <component>` module graph
+// (#5949). Setup pays for it only when it validates or re-reads a provider
+// config.
+let modelRegistryModule: Promise<ModelRegistryModule> | undefined;
+function loadModelRegistryModule(): Promise<ModelRegistryModule> {
+	if (!modelRegistryModule) {
+		const loading = import("../config/model-registry");
+		modelRegistryModule = loading;
+		// A rejected import must not memoize: a wizard retry after the environment
+		// is fixed has to be able to load the module again.
+		loading.catch(() => {
+			if (modelRegistryModule === loading) modelRegistryModule = undefined;
+		});
+	}
+	return modelRegistryModule;
+}
+
+// Stored credential values may be `!<command>` or env-name references. The
+// runtime resolves them with this module's resolver, and setup must resolve
+// them the same way before any value can reach a discovery request. Kept
+// dynamic for the same eager-graph reason as the models registry.
+let configValueResolverModule: Promise<ConfigValueResolverModule> | undefined;
+function loadConfigValueResolverModule(): Promise<ConfigValueResolverModule> {
+	if (!configValueResolverModule) {
+		const loading = import("../config/resolve-config-value");
+		configValueResolverModule = loading;
+		loading.catch(() => {
+			if (configValueResolverModule === loading) configValueResolverModule = undefined;
+		});
+	}
+	return configValueResolverModule;
+}
+
+function assertModelsConfigPath(modelsPath: string): void {
+	if (MODELS_CONFIG_PATH_EXTENSIONS.some(extension => modelsPath.endsWith(extension))) return;
+	throw new Error(`Models config path must end with ${MODELS_CONFIG_PATH_EXTENSIONS.join(" or ")}: ${modelsPath}`);
+}
 
 export type ProviderCompatibility = "openai" | "anthropic";
 export type ProviderSetupApi = "openai-responses" | "openai-completions" | "anthropic-messages";
@@ -77,12 +144,43 @@ export interface ProviderSetupResult {
 	discoveryType?: string;
 	preset?: string;
 	presetName?: string;
+	/**
+	 * Set only when a forced env replacement disabled stored API-key rows the
+	 * replaced entry declared via `credential: store`. Present so setup can
+	 * report the destructive half instead of silently dropping a credential.
+	 * Rows are soft-disabled, not deleted: `gjc accounts list` shows them as
+	 * `disabled` and `gjc accounts logout <provider> --all` removes them.
+	 */
+	credentialCleanup?: { disabledApiKeys: number; envName: string };
+	/**
+	 * Set when an env-source add succeeds while stored api_key rows for the
+	 * provider remain. They outrank `apiKeyEnv` at runtime and are not removed
+	 * by setup (the replaced entry never declared `credential: store`), so the
+	 * success output must say the environment variable is being shadowed.
+	 */
+	storedCredentialShadow?: { storedApiKeys: number; envName: string };
+	/**
+	 * Set when an env-source add succeeds but the credential store could not be
+	 * inspected, so setup cannot say whether stored api_key rows shadow the env
+	 * var. Present so the success output discloses the unverified risk instead
+	 * of reporting unconditional success.
+	 */
+	storedCredentialShadowUnverified?: { envName: string };
 }
 
 type ProviderConfig = NonNullable<NonNullable<ModelsConfig["providers"]>[string]>;
 type ProviderCompatConfig = NonNullable<ProviderConfig["compat"]>;
-type ProviderSetupCredentialStore = Pick<AuthStorage, "set" | "remove" | "exportSnapshot"> & {
-	peekApiKey?: (provider: string) => Promise<string | undefined>;
+type ProviderSetupCredentialStore = Pick<
+	AuthStorage,
+	"set" | "remove" | "exportSnapshot" | "disableCredentialById" | "reload"
+> & {
+	/**
+	 * Resolves a stored api_key value the way the runtime does: a
+	 * `!<command>` value is executed and an env-name value is read from the
+	 * environment. Optional so test doubles can omit it; the probe then uses
+	 * the raw stored value, refusing a command-backed reference it cannot run.
+	 */
+	peekApiKey?: AuthStorage["peekApiKey"];
 };
 
 interface ProviderPreset {
@@ -162,6 +260,198 @@ export function parseModelList(values: readonly string[]): string[] {
 	return [...new Set(models)];
 }
 
+export function redactSecret(_secret: string): string {
+	return "***";
+}
+
+/**
+ * Raised when setup committed a config that replaces a `credential: store`
+ * declaration with an `apiKeyEnv` reference but could not disable the stored
+ * api_key rows. The config is rolled back before this reaches the caller, so
+ * the message always states both the failure and the recovery.
+ */
+class CredentialCleanupError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "CredentialCleanupError";
+	}
+}
+
+/**
+ * Recovery guidance shared by every cleanup failure. The add commands reject a
+ * raw `--api-key`, so a literal key can only be re-entered through the
+ * interactive wizard, while the command form re-adds the provider with an env
+ * reference.
+ */
+function providerCredentialRecoveryHint(providerId: string): string {
+	return (
+		`Restore a working credential by running \`/provider\` with no arguments in the interactive TUI and pasting a literal key, ` +
+		`or by re-adding the provider with an env reference: ` +
+		`\`/provider add --compat <openai|anthropic> --provider ${providerId} --base-url <url> --api-key-env <ENV> (--model <id> | --discover) --force\` ` +
+		`(the same flags work on \`gjc setup provider\`).`
+	);
+}
+
+/**
+ * Disable this provider's stored api_key rows when setup replaces a
+ * `credential: store` entry with an `apiKeyEnv` reference. A stored api_key
+ * outranks the env indirection, so leaving it behind would keep resolving the
+ * old literal key. OAuth rows are never touched, and rows are soft-disabled
+ * (`gjc accounts list` shows them as `disabled`) rather than deleted.
+ *
+ * Only a confirmed disable (`disableCredentialById` returning `true`) counts:
+ * the store can swallow errors, and this count is what the user reasons about
+ * in a path that cannot restore the rows. Persistence is verified by
+ * re-reading the store, because remote (broker-owned) stores reject disables
+ * outright and a reload is the only proof the rows no longer resolve.
+ */
+async function removeStoredApiKeyCredentials(store: ProviderSetupCredentialStore, providerId: string): Promise<number> {
+	const selectApiKeyRows = () =>
+		store.exportSnapshot().credentials.filter(entry => isStoredApiKeyCredentialForProvider(entry, providerId));
+	const apiKeyIds = selectApiKeyRows().map(entry => entry.id);
+	let disabledCount = 0;
+	for (const id of apiKeyIds) {
+		try {
+			if (
+				store.disableCredentialById(id, "provider setup switched to an environment-variable credential") === true
+			) {
+				disabledCount += 1;
+			}
+		} catch (error) {
+			// Only this path proves the store refused the disable. A reload failure
+			// below has a different diagnosis and must not borrow this one.
+			throw new CredentialCleanupError(
+				`Provider '${providerId}' could not disable its stored API key credentials ` +
+					`(disabled ${disabledCount} of ${apiKeyIds.length} before the failure; disabled rows cannot be restored). ` +
+					`The credential store raised an error while disabling the rows (read-only, broker-owned, or a failure after a removal). ` +
+					`If a broker owns the credentials, disable them on the broker host with ` +
+					`\`gjc auth-broker logout ${providerId}\`, which applies to every credential type stored for this provider on the broker host, including OAuth rows; ` +
+					`for a local store, finish with \`gjc accounts logout ${providerId} --all\`, which removes every stored credential for this provider, including OAuth logins, and confirm with \`gjc accounts list\`. ` +
+					`The previous provider settings were restored; rows already disabled stay disabled, and rows not confirmed disabled still resolve and remain the provider's credential. ` +
+					providerCredentialRecoveryHint(providerId),
+				{ cause: error },
+			);
+		}
+	}
+	try {
+		await store.reload();
+	} catch (error) {
+		// The disables were attempted; only the confirmation read failed. Rows may
+		// in fact be disabled, so this message must not claim a rejected disable.
+		throw new CredentialCleanupError(
+			`Provider '${providerId}': the store reported ${disabledCount} of ${apiKeyIds.length} stored API key credential(s) disabled, ` +
+				`but the confirmation read failed because the credential store could not be re-read. ` +
+				`Those rows may in fact be disabled. Confirm with \`gjc accounts list\` (disabled rows are listed as \`disabled\`), ` +
+				`then delete them with \`gjc accounts logout ${providerId} --all\`, which removes every stored credential for this provider, including OAuth logins. ` +
+				`The previous provider settings were restored; rows already disabled stay disabled, and rows whose disable was not confirmed may still resolve and remain the provider's credential. ` +
+				providerCredentialRecoveryHint(providerId),
+			{ cause: error },
+		);
+	}
+	const remaining = selectApiKeyRows();
+	if (remaining.length > 0) {
+		throw new CredentialCleanupError(
+			`Provider '${providerId}' kept ${remaining.length} stored API key credential(s) after cleanup: ` +
+				`the store accepted the request but they still resolve. Delete them with ` +
+				`\`gjc accounts logout ${providerId} --all\`, which removes every stored credential for this provider, including OAuth logins, and confirm with \`gjc accounts list\`. ` +
+				`The previous provider settings were restored; rows already disabled stay disabled, and the surviving rows above still resolve and remain the provider's credential. ` +
+				providerCredentialRecoveryHint(providerId),
+		);
+	}
+	return disabledCount;
+}
+
+async function countStoredApiKeyCredentials(store: ProviderSetupCredentialStore, providerId: string): Promise<number> {
+	// Read persisted state: the in-memory snapshot can be ahead of the store.
+	await store.reload();
+	return store.exportSnapshot().credentials.filter(entry => isStoredApiKeyCredentialForProvider(entry, providerId))
+		.length;
+}
+
+/**
+ * A credential value may reach the network only when the runtime resolver has
+ * produced it: empty values and values that are still `!` references are
+ * unresolved and must be treated as absent.
+ */
+function sanitizeResolvedCredentialValue(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed.startsWith("!")) return undefined;
+	return trimmed;
+}
+
+/**
+ * Resolve the stored api_key value a discovery probe may send. The invariant:
+ * a stored value reaches the network only when it was resolved by the same
+ * resolver the runtime uses. Presence is decided by the shared predicate; the
+ * value comes from the store's resolver when it has one, otherwise from the
+ * runtime's env-name-or-literal rule. Anything that is still a `!` reference
+ * after resolution is unresolved and is treated as absent.
+ *
+ * This is the only resolution path for both a caller-supplied store and the
+ * store setup opens itself.
+ */
+async function resolveStoredApiKeyValue(
+	store: ProviderSetupCredentialStore,
+	providerId: string,
+): Promise<string | undefined> {
+	const rows = store
+		.exportSnapshot()
+		.credentials.filter(entry => isStoredApiKeyCredentialForProvider(entry, providerId));
+	if (rows.length === 0) return undefined;
+	let resolved: string | undefined;
+	if (store.peekApiKey) {
+		try {
+			resolved = await store.peekApiKey(providerId);
+		} catch {
+			// The stored value could not be resolved (for example its command failed).
+			return undefined;
+		}
+	} else {
+		const raw = rows[0]!.credential.key.trim();
+		// A command reference needs the store's resolver, which this store does not
+		// have; the remaining shape is the runtime's env-name-or-literal rule.
+		resolved = raw.startsWith("!") ? undefined : process.env[raw] || raw;
+	}
+	const value = resolved?.trim();
+	// Defense in depth for every store provenance: a resolver that returns the
+	// reference unchanged has not resolved it.
+	return sanitizeResolvedCredentialValue(value);
+}
+
+/**
+ * One construction for every store setup opens itself. The runtime resolver is
+ * injected so stored values and pasted literals resolve exactly as they do at
+ * request time (the default resolver treats a `!<command>` value as a literal).
+ */
+async function createOwnedCredentialStore(): Promise<AuthStorageImpl> {
+	const { resolveConfigValue } = await loadConfigValueResolverModule();
+	return AuthStorageImpl.create(getAgentDbPath(), { configValueResolver: resolveConfigValue });
+}
+
+/**
+ * Resolve a pasted literal for the pre-write discovery probe. The value is
+ * stored verbatim and resolved by the same resolver at request time, so the
+ * probe must resolve it now: a `!<command>` or env-name-shaped paste otherwise
+ * diverges from what the runtime would send. Returns `undefined` when the
+ * reference cannot be resolved.
+ */
+async function resolveLiteralApiKeyForProbe(value: string): Promise<string | undefined> {
+	const { resolveConfigValue } = await loadConfigValueResolverModule();
+	try {
+		return sanitizeResolvedCredentialValue(await resolveConfigValue(value));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Pick the store a discovery probe resolves through. A caller-supplied store
+ * keeps the session's credential ranking (mode and preferences), so it resolves
+ * the same row a request would. The store setup opens itself has no session
+ * preferences: with multiple active rows it uses the store's default order,
+ * which can differ from a session that pins a preferred account. Setup never
+ * picks a row itself.
+ */
 async function resolveStoredApiKeyForProbe(
 	providerId: string,
 	inputStore: ProviderSetupCredentialStore | undefined,
@@ -169,28 +459,22 @@ async function resolveStoredApiKeyForProbe(
 	let store = inputStore;
 	let ownedStore: AuthStorageImpl | undefined;
 	if (!store) {
-		ownedStore = await AuthStorageImpl.create(getAgentDbPath());
+		ownedStore = await createOwnedCredentialStore();
 		store = ownedStore;
 	}
 	try {
-		const storageProvider = resolveOAuthStorageProvider(providerId);
-		const snapshot = store.exportSnapshot();
-		const hasStoredApiKey = snapshot.credentials.some(
-			entry => entry.provider === storageProvider && entry.credential.type === "api_key",
-		);
-		if (!hasStoredApiKey) return undefined;
-		if (store.peekApiKey) return (await store.peekApiKey(providerId))?.trim() || undefined;
-		const entry = snapshot.credentials.find(
-			candidate => candidate.provider === storageProvider && candidate.credential.type === "api_key",
-		);
-		return entry?.credential.type === "api_key" ? entry.credential.key.trim() || undefined : undefined;
+		return await resolveStoredApiKeyValue(store, providerId);
 	} finally {
 		ownedStore?.close();
 	}
 }
 
-export function redactSecret(_secret: string): string {
-	return "***";
+function assertReplacementEnvResolves(providerId: string, envName: string): void {
+	if ($rotatingCredentialEnv(envName)?.trim()) return;
+	throw new Error(
+		`Cannot replace provider '${providerId}' with apiKeyEnv '${envName}': ${envName} is not set, so its stored API key would still take precedence. ` +
+			`Set ${envName} in the trusted environment, then re-run with --force. Nothing was changed.`,
+	);
 }
 
 function apiForCompatibility(compatibility: ProviderCompatibility): ProviderSetupApi {
@@ -365,11 +649,15 @@ function validateSetupInput(input: ProviderSetupInput): {
 }
 
 async function readModelsConfig(modelsPath: string): Promise<ModelsConfig> {
+	// The guard and the parse mode stay coupled: setup only writes YAML, and
+	// this reader only parses YAML, so an unsupported extension fails here
+	// before either half can drift.
+	assertModelsConfigPath(modelsPath);
 	const file = Bun.file(modelsPath);
 	if (!(await file.exists())) return {};
 	const text = (await file.text()).trim();
 	if (!text) return {};
-	const parsed = modelsPath.endsWith(".json") || modelsPath.endsWith(".jsonc") ? JSON.parse(text) : YAML.parse(text);
+	const parsed = YAML.parse(text);
 	const checked = ModelsConfigSchema.safeParse(parsed);
 	if (!checked.success) {
 		const first = checked.error.issues[0];
@@ -379,12 +667,29 @@ async function readModelsConfig(modelsPath: string): Promise<ModelsConfig> {
 	return checked.data;
 }
 
-async function writeModelsConfig(modelsPath: string, config: ModelsConfig, signal?: AbortSignal): Promise<void> {
+async function writeModelsConfig(
+	modelsPath: string,
+	config: ModelsConfig,
+	signal?: AbortSignal,
+	options: { bypassSemanticValidation?: boolean } = {},
+): Promise<void> {
 	const checked = ModelsConfigSchema.safeParse(config);
 	if (!checked.success) {
 		const first = checked.error.issues[0];
 		const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 		throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+	}
+	// The runtime loader applies semantic rules the zod schema cannot express.
+	// Run the loader's own validator before the atomic rename so setup never
+	// commits a file the product itself rejects. Restores bypass that check:
+	// after pre-rename validation the only reachable restore follows a
+	// concurrent external write, and restoring the prior document's semantics
+	// must not be refused merely because that document is already unloadable.
+	// The restore is re-serialized from the parsed config like every write, so
+	// comments and key order from the previous file are not preserved.
+	if (!options.bypassSemanticValidation) {
+		const { validateModelsConfig } = await loadModelRegistryModule();
+		validateModelsConfig(checked.data);
 	}
 	const directory = path.dirname(modelsPath);
 	await fs.mkdir(directory, { recursive: true });
@@ -418,10 +723,23 @@ async function writeModelsConfig(modelsPath: string, config: ModelsConfig, signa
 export async function addApiCompatibleProvider(input: ProviderSetupInput): Promise<ProviderSetupResult> {
 	const validated = validateSetupInput(input);
 	const modelsPath = input.modelsPath ?? getDefaultModelsPath();
+	assertModelsConfigPath(modelsPath);
+	// Evaluate the lazily imported registry module before taking the file lock:
+	// module evaluation has nothing to do with the config transaction and must
+	// not extend cross-process lock hold time.
+	await loadModelRegistryModule();
 	const existing = await readModelsConfig(modelsPath);
 	if (existing.providers?.[validated.providerId] && !input.force) {
 		throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
 	}
+	// Cleanup only exists for a store-declared entry being switched to an env
+	// reference; anything else keeps its stored credential. The replacement env
+	// must also resolve, otherwise deleting the key would leave no credential.
+	const willRemoveStoredKey =
+		validated.credentialSource === "env" &&
+		input.force === true &&
+		existing.providers?.[validated.providerId]?.credential === PROVIDER_CREDENTIAL_STORE;
+	if (willRemoveStoredKey) assertReplacementEnvResolves(validated.providerId, validated.apiKey);
 	// P2: a discovery-only add with no manual models must prove the endpoint
 	// serves a catalog before config is written — otherwise an unreachable
 	// endpoint or rejected credential would be recorded as configured while
@@ -437,14 +755,28 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	if (validated.discovery?.type === "openai-models-list" && validated.models.length === 0 && !validated.preset) {
 		const probe = input.probeDiscovery ?? probeOpenAIModelsList;
 		const credentialSource = validated.credentialSource;
+		// Probe with the credential the runtime will resolve after this write. A
+		// stored api_key is dropped only for the store->env replacement above;
+		// otherwise it survives and outranks the env indirection (#5387).
 		const storedApiKey =
-			credentialSource === "env" && input.force
+			credentialSource === "env" && !willRemoveStoredKey
 				? await resolveStoredApiKeyForProbe(validated.providerId, input.authStorage)
 				: undefined;
+		// A pasted literal is stored verbatim and resolved by the runtime resolver
+		// at request time, so the probe must resolve it now instead of sending a
+		// `!<command>` or env-name reference.
+		const literalApiKey =
+			credentialSource === "literal" ? await resolveLiteralApiKeyForProbe(validated.apiKey) : undefined;
+		if (credentialSource === "literal" && literalApiKey === undefined) {
+			throw new Error(
+				`Provider '${validated.providerId}' credential could not be resolved for model discovery: the pasted value is a command or environment reference that does not resolve. ` +
+					`Paste the key value itself, or pass \`--api-key-env <ENV>\` instead. No config or credential was written.`,
+			);
+		}
 		const probed = await probe({
 			baseUrl: validated.baseUrl,
 			apiKeyEnv: credentialSource === "env" && !storedApiKey ? validated.apiKey : undefined,
-			apiKey: credentialSource === "literal" ? validated.apiKey : storedApiKey,
+			apiKey: credentialSource === "literal" ? literalApiKey : storedApiKey,
 			signal: input.discoverySignal,
 		});
 		// The caller (wizard revision/cancel) may have aborted while the probe
@@ -478,6 +810,11 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	if (validated.discovery) provider.discovery = validated.discovery;
 	if (validated.credentialSource === "env") {
 		provider.apiKeyEnv = validated.apiKey;
+	} else {
+		// The literal key is published to the credential store below; the config
+		// only declares that the credential lives there. Without the declaration
+		// the loader rejects this brand-new provider as credential-less.
+		provider.credential = PROVIDER_CREDENTIAL_STORE;
 	}
 	// Serialize config merging under the file lock. Credential storage is a
 	// separate authority, not an atomic transaction with models.yml. Publish the
@@ -500,13 +837,22 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 			await fn(input.authStorage);
 			return;
 		}
-		const authStorage = await AuthStorageImpl.create(getAgentDbPath());
+		// Same construction as the probe path. Today no write-path call resolves a
+		// stored value, but sharing the construction keeps value resolution in one
+		// place if one ever does.
+		const authStorage = await createOwnedCredentialStore();
 		try {
 			await fn(authStorage);
 		} finally {
 			authStorage.close();
 		}
 	};
+	const credentialUpdate =
+		validated.credentialSource === "env" ? "disable the previous stored API key" : "publish credentials";
+	let credentialCleanup: ProviderSetupResult["credentialCleanup"];
+	let storedCredentialShadow: ProviderSetupResult["storedCredentialShadow"];
+	let storedCredentialShadowUnverified: ProviderSetupResult["storedCredentialShadowUnverified"];
+	let replacementCleanedStoredKeys = false;
 	await withFileLock(modelsPath, async () => {
 		if (input.discoverySignal?.aborted) {
 			throw cancelledError();
@@ -516,6 +862,15 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		if (current.providers?.[validated.providerId] && !input.force) {
 			throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
 		}
+		// Cleanup only exists for one case: the entry being replaced declared
+		// `credential: store` and is now switched to an env reference. A provider
+		// that was env-pinned or hand-configured keeps its stored credential.
+		const replacedEntry = current.providers?.[validated.providerId];
+		const replacingStoreBackedEntry =
+			validated.credentialSource === "env" &&
+			input.force === true &&
+			replacedEntry?.credential === PROVIDER_CREDENTIAL_STORE;
+		if (replacingStoreBackedEntry) assertReplacementEnvResolves(validated.providerId, validated.apiKey);
 		if (validated.credentialSource !== "env" && input.discoverySignal) {
 			await withCredentialStore(async store => {
 				if (hasUnrestorableCredentials(store)) {
@@ -541,6 +896,11 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 				input.discoverySignal,
 			);
 			configCommitted = true;
+			// Verify the just-written config through the loader before touching the
+			// credential authority: a disagreement rolls back cleanly with no
+			// credential change instead of stranding a committed config whose stored
+			// key was already disabled.
+			await assertWrittenModelsConfigLoads(modelsPath, validated.providerId);
 			// Cancellation after the atomic config rename cannot undo the saved
 			// provider. Finish publishing the matching literal credential even if
 			// the caller dismissed the wizard during the rename.
@@ -548,27 +908,71 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 				await withCredentialStore(store =>
 					store.set(validated.providerId, { type: "api_key", key: validated.apiKey }),
 				);
+			} else if (replacingStoreBackedEntry) {
+				replacementCleanedStoredKeys = true;
+				// A stored api_key outranks an apiKeyEnv indirection, so replacing a
+				// store-backed provider with an env-backed one must disable the old
+				// literal rows; OAuth rows are never touched. The cleanup re-reads the
+				// store and fails loudly if the rows still resolve.
+				await withCredentialStore(async store => {
+					const disabledApiKeys = await removeStoredApiKeyCredentials(store, validated.providerId);
+					credentialCleanup = disabledApiKeys > 0 ? { disabledApiKeys, envName: validated.apiKey } : undefined;
+				});
 			}
 		} catch (error) {
 			if (configCommitted) {
 				try {
-					if (configExistedBeforeCommit) await writeModelsConfig(modelsPath, current);
+					if (configExistedBeforeCommit)
+						await writeModelsConfig(modelsPath, current, undefined, { bypassSemanticValidation: true });
 					else await fs.rm(modelsPath, { force: true });
 				} catch {
 					// Store/config errors can contain credentials; never log or
 					// interpolate them. Log independently of the wizard, which may
 					// already be dismissed.
-					const message = `Provider '${validated.providerId}' setup failed while publishing credentials and could not restore the previous config; credential recovery is required.`;
+					const message = `Provider '${validated.providerId}' setup failed while updating credentials and could not restore the previous provider settings; credential recovery is required.`;
 					logger.error(message);
 					throw new Error(message, { cause: error });
 				}
+				// A cleanup failure already explains rollback and recovery; do not
+				// replace it with the generic credential-update message.
+				if (error instanceof CredentialCleanupError) throw error;
+				// The written config never loaded, so nothing credential-related ran;
+				// keep the loader's detail and add the rollback outcome.
+				if (error instanceof WrittenModelsConfigLoadError) {
+					throw new WrittenModelsConfigLoadError(
+						`${error.message} Setup restored the previous provider settings and did not change any credential. ` +
+							`Fix the config, then re-run setup (adding --force if the provider already exists).`,
+					);
+				}
 				throw new Error(
-					`Provider '${validated.providerId}' setup could not publish credentials; the previous config was restored.`,
+					`Provider '${validated.providerId}' setup could not ${credentialUpdate}; the previous provider settings were restored.`,
 				);
 			}
 			throw error;
 		}
 	});
+	// An env reference only supplies the key when nothing else outranks it. If
+	// cleanup did not run (the replaced entry never declared credential: store),
+	// disclose any stored api_key rows instead of claiming the env var wins.
+	if (validated.credentialSource === "env" && !replacementCleanedStoredKeys) {
+		try {
+			await withCredentialStore(async store => {
+				const storedApiKeys = await countStoredApiKeyCredentials(store, validated.providerId);
+				if (storedApiKeys > 0) {
+					storedCredentialShadow = { storedApiKeys, envName: validated.apiKey };
+				}
+			});
+		} catch (error) {
+			// Never fail the add for this: the provider and its env reference are
+			// already committed and valid. Disclose the unverified risk instead of
+			// reporting unconditional success, since a stored key would still win.
+			storedCredentialShadowUnverified = { envName: validated.apiKey };
+			logger.warn("could not inspect stored credentials after provider setup", {
+				provider: validated.providerId,
+				error: error instanceof Error ? error.name : typeof error,
+			});
+		}
+	}
 	return {
 		providerId: validated.providerId,
 		compatibility: validated.compatibility,
@@ -582,7 +986,70 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		discoveryType: validated.discovery?.type,
 		preset: validated.preset?.id,
 		presetName: validated.preset?.name,
+		...(credentialCleanup ? { credentialCleanup } : {}),
+		...(storedCredentialShadow ? { storedCredentialShadow } : {}),
+		...(storedCredentialShadowUnverified ? { storedCredentialShadowUnverified } : {}),
 	};
+}
+
+/**
+ * Raised when the provider setup just wrote does not load through the
+ * runtime's own loader. Thrown before any credential mutation, so the caller
+ * can roll the config back without a credential change.
+ */
+class WrittenModelsConfigLoadError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "WrittenModelsConfigLoadError";
+	}
+}
+
+/**
+ * Reload the just-written models config through the same loader the runtime
+ * uses. Setup must never report success for a file the product rejects, even
+ * if every pre-write check passed. This runs before the credential mutation,
+ * so a failure can be rolled back without leaving a stored key behind.
+ */
+async function assertWrittenModelsConfigLoads(modelsPath: string, providerId: string): Promise<void> {
+	const { ModelsConfigFile } = await loadModelRegistryModule();
+	const configFile = ModelsConfigFile.relocate(modelsPath);
+	// For the default agent path `relocate` returns the process-wide singleton a
+	// live session already loaded (commonly `not-found` before the first add).
+	// Drop that snapshot so the verdict reads the bytes just committed.
+	configFile.invalidate();
+	const loaded = configFile.tryLoad();
+	if (loaded.status === "ok") return;
+	const detail = loaded.status === "error" ? String(loaded.error) : `the file does not exist at ${modelsPath}`;
+	throw new WrittenModelsConfigLoadError(
+		`Provider '${providerId}' was written to ${modelsPath}, but the models config does not load: ${detail}.`,
+	);
+}
+
+/**
+ * Post-refresh guard for setup callers that reload through a live registry.
+ * `refresh` re-reads the written config, so a loader error there means the
+ * provider is unusable even though setup wrote it.
+ */
+export function assertProviderConfigLoaded(
+	registry: { getError(): { id: string; message: string } | undefined },
+	providerId: string,
+	modelsPath: string,
+	credentialSource: ProviderSetupResult["credentialSource"],
+): void {
+	const error = registry.getError();
+	// getError() also reports accepted model-preset registry failures. Only a
+	// models-config failure makes the provider setup itself unusable.
+	if (error?.id !== "models") return;
+	// The credential is not in models.yml either way; say which location applies
+	// instead of claiming a credential was written there.
+	const credentialLocation =
+		credentialSource === "literal"
+			? "its API key was written to the credential store, not to models.yml"
+			: "its apiKeyEnv reference is in models.yml and the key itself stays in the environment";
+	throw new Error(
+		`Provider '${providerId}' was written to ${modelsPath} (${credentialLocation}), but the models config did not load: ${error.message}. ` +
+			`Fix the config, then re-run setup with --force to replace the provider.`,
+	);
 }
 
 function isLocalHttpHost(hostname: string): boolean {
@@ -760,6 +1227,12 @@ export async function reloadAndRefreshDiscoveryCatalog(
 	);
 }
 
+/**
+ * Render the success banner. Only call this after the written config has been
+ * verified to load: `addApiCompatibleProvider` re-reads the file it wrote, and
+ * registry-backed callers re-check `modelRegistry.getError()` after their
+ * post-write refresh. On any load failure the setup path must throw instead.
+ */
 export function formatProviderSetupResult(result: ProviderSetupResult): string {
 	return [
 		`Provider '${result.providerId}' configured as ${result.compatibility}-compatible.`,
@@ -774,6 +1247,21 @@ export function formatProviderSetupResult(result: ProviderSetupResult): string {
 			: []),
 		`Base URL: ${result.baseUrl}`,
 		`API key: ${result.credentialSource === "env" ? `${result.redactedApiKey} (environment variable)` : result.redactedApiKey}`,
+		...(result.credentialCleanup
+			? [
+					`Stored API key: disabled ${result.credentialCleanup.disabledApiKeys} stored credential(s) for this provider; they no longer resolve and ${result.credentialCleanup.envName} now supplies the key. Delete them permanently with: gjc accounts logout ${result.providerId} --all (removes every stored credential for this provider, including OAuth logins)`,
+				]
+			: []),
+		...(result.storedCredentialShadow
+			? [
+					`Warning: ${result.storedCredentialShadow.storedApiKeys} stored API key credential(s) for this provider take precedence over ${result.storedCredentialShadow.envName}. Remove them with: gjc accounts logout ${result.providerId} --all (removes every stored credential for this provider, including OAuth logins); with a broker configuration run gjc auth-broker logout ${result.providerId} on the broker host instead (same breadth)`,
+				]
+			: []),
+		...(result.storedCredentialShadowUnverified
+			? [
+					`Warning: setup could not check the credential store for stored API key credentials; if any exist they would still take precedence over ${result.storedCredentialShadowUnverified.envName}. Verify with: gjc accounts list`,
+				]
+			: []),
 		`Config: ${result.modelsPath}`,
 	].join("\n");
 }

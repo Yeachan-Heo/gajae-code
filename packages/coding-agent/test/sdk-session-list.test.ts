@@ -6,7 +6,12 @@ import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import * as sessionDirectory from "../src/sdk/session-directory";
-import { SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES, traverseSessionList } from "../src/sdk/session-list";
+import {
+	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
+	type SessionListSavedSessionRecap,
+	sessionListSavedSessionRecap,
+	traverseSessionList,
+} from "../src/sdk/session-list";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -79,4 +84,78 @@ test.each([
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
+});
+
+const validSavedRecap = (): SessionListSavedSessionRecap => ({
+	schemaVersion: 1,
+	source: "model",
+	text: "Fixed the login bug",
+	sourceEntryId: "entry-2",
+	requestEntryId: "entry-1",
+	model: { provider: "anthropic", id: "claude-x" },
+	generatedAt: "2026-01-02T03:04:05.678Z",
+	entryId: "recap-1",
+});
+
+test("saved-session recap validator returns a detached exact copy", () => {
+	const input = validSavedRecap();
+	const out = sessionListSavedSessionRecap(input);
+	expect(out).toEqual(input);
+	expect(out).not.toBe(input);
+	expect(out?.model).not.toBe(input.model);
+	input.model.id = "mutated";
+	expect(out?.model.id).toBe("claude-x");
+});
+
+test("saved-session recap validator rejects every boundary violation", () => {
+	const bad: Record<string, unknown>[] = [];
+	const mutate = (fn: (r: Record<string, unknown>) => void) => {
+		const r: Record<string, unknown> = { ...validSavedRecap() };
+		fn(r);
+		bad.push(r);
+	};
+	mutate(r => delete r.source);
+	mutate(r => {
+		r.source = "user";
+	});
+	mutate(r => {
+		r.extra = 1;
+	});
+	mutate(r => delete r.entryId);
+	mutate(r => {
+		r.text = "x".repeat(121);
+	});
+	mutate(r => {
+		r.text = "line1\nline2";
+	});
+	mutate(r => {
+		r.schemaVersion = 2;
+	});
+	mutate(r => {
+		r.entryId = "-bad";
+	});
+	mutate(r => {
+		r.entryId = `a${"b".repeat(128)}`;
+	});
+	mutate(r => {
+		r.entryId = "has/slash";
+	});
+	mutate(r => {
+		r.model = { provider: "anthropic", id: "x", extra: true };
+	});
+	mutate(r => {
+		r.model = { provider: "", id: "x" };
+	});
+	mutate(r => {
+		r.generatedAt = "2026-01-02";
+	});
+	mutate(r => {
+		r.generatedAt = "2026-02-30T00:00:00.000Z";
+	});
+	mutate(r => {
+		r.requestEntryId = r.sourceEntryId;
+	});
+	for (const value of bad) expect(sessionListSavedSessionRecap(value)).toBeUndefined();
+	for (const value of [undefined, null, "x", 1, [], [validSavedRecap()]])
+		expect(sessionListSavedSessionRecap(value)).toBeUndefined();
 });

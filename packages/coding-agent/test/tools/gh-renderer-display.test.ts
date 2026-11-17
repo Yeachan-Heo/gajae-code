@@ -1,9 +1,10 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import fc from "fast-check";
 import type { Theme } from "../../src/modes/theme/theme";
-import { getThemeByName } from "../../src/modes/theme/theme";
+
 import type { GhRunWatchViewDetails } from "../../src/tools/gh";
 import { githubToolRenderer } from "../../src/tools/gh-renderer";
+import { loadTestTheme } from "../helpers/test-theme";
 
 const ESC = "\u001b";
 const BEL = "\u0007";
@@ -64,7 +65,7 @@ function noRawControls(rendered: string): boolean {
 
 describe("githubToolRenderer display", () => {
 	beforeAll(async () => {
-		const loaded = await getThemeByName("red-claw");
+		const loaded = await loadTestTheme();
 		expect(loaded).toBeDefined();
 		uiTheme = loaded!;
 	});

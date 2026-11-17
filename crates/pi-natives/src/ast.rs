@@ -92,6 +92,8 @@ pub struct AstFindOptions<'env> {
 	pub signal:       Option<Unknown<'env>>,
 	/// Wall-clock timeout for the worker task in milliseconds.
 	pub timeout_ms:   Option<u32>,
+	/// When true, `path` was already checked and is not trimmed.
+	pub literal_path: Option<bool>,
 }
 
 /// One ast-grep match with source range and optional meta-variables.
@@ -320,6 +322,8 @@ pub struct AstReplaceOptions<'env> {
 	pub signal:              Option<Unknown<'env>>,
 	/// Wall-clock timeout for the worker task in milliseconds.
 	pub timeout_ms:          Option<u32>,
+	/// When true, `path` was already checked and is not trimmed.
+	pub literal_path:        Option<bool>,
 }
 
 /// One textual replacement applied to a file (before/after slice and
@@ -460,7 +464,9 @@ fn infer_single_replace_lang(
 }
 fn normalize_search_path(path: Option<String>) -> Result<PathBuf> {
 	let raw = path.unwrap_or_else(|| ".".to_string());
-	let candidate = PathBuf::from(raw.trim());
+	// Do not trim here. The exports trim a raw path once. A literal path is
+	// the one the tool already checked; trimming `dir ` selects sibling `dir`.
+	let candidate = PathBuf::from(&raw);
 	let absolute = if candidate.is_absolute() {
 		candidate
 	} else {
@@ -564,6 +570,16 @@ fn collect_candidates(
 
 	files.sort_by(|a, b| a.display_path.cmp(&b.display_path));
 	Ok(files)
+}
+
+/// Trim a raw `astEdit` / `astGrep` path once, with the same `str::trim` the
+/// pre-fix normalizer used (Unicode `White_Space`: ASCII space, VT, FF, NBSP).
+/// `literal_path` keeps a path the tool already checked.
+fn export_search_path(path: Option<String>, literal_path: Option<bool>) -> Option<String> {
+	if literal_path == Some(true) {
+		return path;
+	}
+	path.map(|raw| raw.trim().to_string())
 }
 
 fn has_parse_error(ast: &AstGrep<StrDoc<SupportLang>>) -> bool {
@@ -761,7 +777,9 @@ pub fn ast_grep(options: AstFindOptions<'_>) -> task::Promise<AstFindResult> {
 		context: _,
 		signal,
 		timeout_ms,
+		literal_path,
 	} = options;
+	let path = export_search_path(path, literal_path);
 
 	let ct = task::CancelToken::new(timeout_ms, signal);
 	let normalized_limit = limit.unwrap_or(DEFAULT_FIND_LIMIT).max(1);
@@ -1033,7 +1051,9 @@ pub fn ast_edit(options: AstReplaceOptions<'_>) -> task::Promise<AstReplaceResul
 		fail_on_parse_error,
 		signal,
 		timeout_ms,
+		literal_path,
 	} = options;
+	let path = export_search_path(path, literal_path);
 
 	let ct = task::CancelToken::new(timeout_ms, signal);
 	task::blocking("ast_edit", ct, move |ct| {

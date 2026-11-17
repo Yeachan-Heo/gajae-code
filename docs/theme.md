@@ -197,6 +197,8 @@ Auto theme slot selection uses terminal appearance in this order:
 3. macOS appearance fallback only for the known-broken macOS/Zellij OSC 11 path
 4. dark slot fallback
 
+Terminals that never send Mode 2031 notifications are re-queried with OSC 11 every 2 seconds, but only while the answer can change the theme: auto-detection is active, `theme.dark` and `theme.light` differ, and the macOS/Zellij fallback is not in use. `GJC_TUI_DISABLE_OSC11_POLL=1` turns the re-query off entirely.
+
 Built-in theme note: `red-claw` is the default dark GJC theme, and `blue-crab` is the default light-slot theme. Both are crustacean brand themes with separate semantic error/warning/diff-removal tokens and crab-oriented symbol overrides. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration. All three are dark-classified and recommended for `theme.dark`, but are selectable in either slot; they keep GJC's default symbol identity (no crab-symbol overrides).
 
 Current defaults from settings schema:

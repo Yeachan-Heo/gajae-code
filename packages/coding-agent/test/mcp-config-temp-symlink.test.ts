@@ -1,12 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { writeMCPConfigFile } from "../src/runtime-mcp/config-writer";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 describe("writeMCPConfigFile", () => {
 	it("writes a normal config", async () => {
-		const dir = await mkdtemp(path.join(tmpdir(), "mcp-config-"));
+		const dir = await tempDirs.mkdtemp(path.join(tmpdir(), "mcp-config-"));
 		const configPath = path.join(dir, "mcp.json");
 		await writeMCPConfigFile(configPath, { mcpServers: { local: { command: "echo" } } });
 		const written = JSON.parse(await readFile(configPath, "utf8")) as { mcpServers: { local: { command: string } } };
@@ -14,7 +17,7 @@ describe("writeMCPConfigFile", () => {
 	});
 
 	it("does not follow a planted .tmp symlink", async () => {
-		const dir = await mkdtemp(path.join(tmpdir(), "mcp-config-"));
+		const dir = await tempDirs.mkdtemp(path.join(tmpdir(), "mcp-config-"));
 		const secret = path.join(dir, "secret.txt");
 		await writeFile(secret, "keep");
 		const configPath = path.join(dir, "mcp.json");

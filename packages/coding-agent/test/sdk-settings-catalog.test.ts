@@ -113,7 +113,7 @@ describe("portable settings catalog", () => {
 		const theme = item(first, "theme.dark");
 		expect(theme.choices).toEqual({ source: "runtime", status: "host-required" });
 		expect(theme.application).toEqual({ kind: "unclassified" });
-		expect(theme.mutation).toMatchObject({ provided: false });
+		expect(theme.mutation).toEqual({ provided: false, owner: "unspecified" });
 		if (!theme.ui) throw new Error("Missing theme metadata");
 		theme.ui.label = "changed by renderer";
 		theme.resolution.allowedLayers.length = 0;

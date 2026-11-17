@@ -904,6 +904,99 @@ describe("current-value atomic batch local ownership", () => {
 	}
 });
 
+describe("failed durable reservation ownership", () => {
+	for (const count of [2, 3]) {
+		it(`preserves the last valid receipt after ${count} concurrent rejected batches`, async () => {
+			const temp = TempDir.createSync("@gjc-failed-batch-owner-");
+			const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+			try {
+				settings.set("temperature", 0.2);
+				await settings.flushOrThrow();
+				await settings.commitAtomicBatch([{ path: "modelRoles", op: "set", value: { custom: "scalar" } }]);
+				const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.4 }]);
+				const configPath = settings.getGlobalConfigPath()!;
+				const before = await Bun.file(configPath).text();
+				const outcomes = await Promise.allSettled(
+					Array.from({ length: count }, (_, index) =>
+						settings.commitAtomicBatch([
+							{ path: "temperature", op: "set", value: 0.6 + index / 10 },
+							{ path: "modelRoles.custom.child", op: "set", value: "invalid ancestor" },
+						]),
+					),
+				);
+				expect(outcomes.map(outcome => outcome.status)).toEqual(Array(count).fill("rejected"));
+				expect(await Bun.file(configPath).text()).toBe(before);
+				expect(settings.get("temperature")).toBe(0.4);
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(settings.get("temperature")).toBe(0.2);
+				expect(YAML.parse(await Bun.file(configPath).text())).toMatchObject({ temperature: 0.2 });
+			} finally {
+				await settings.close();
+				temp.removeSync();
+			}
+		});
+	}
+});
+
+describe("memory-mode receipt revisions", () => {
+	it("reports changed paths and an independently reversible inverse", async () => {
+		const settings = Settings.isolated({ temperature: 0.2 });
+		const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.6 }]);
+		expect(receipt.revisions).toHaveLength(1);
+		const revision = receipt.revisions[0]!;
+		expect(revision.path).toBe("temperature");
+		expect(revision.afterHash).not.toBe(revision.beforeHash);
+		expect(revision.afterRevision).toBeGreaterThan(revision.beforeRevision);
+		const restored = await receipt.restore();
+		if (restored.status !== "restored") throw new Error("Expected restore");
+		expect(settings.get("temperature")).toBe(0.2);
+		expect(restored.receipt.revisions[0]?.afterHash).toBe(revision.beforeHash);
+		expect(restored.receipt.revisions[0]?.beforeHash).toBe(revision.afterHash);
+		expect((await restored.receipt.restore()).status).toBe("restored");
+		expect(settings.get("temperature")).toBe(0.6);
+	});
+});
+
+describe("lock-only atomic builders", () => {
+	it("completes an empty builder after a newer local setter but still rejects a nonempty one", async () => {
+		const temp = TempDir.createSync("@gjc-lock-only-builder-");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir: path.join(temp.path(), "agent") });
+		try {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const sideEffect = path.join(temp.path(), "completed-action");
+			const lockOnly = settings.commitAtomicBatchWithCurrent(async () => {
+				entered.resolve();
+				await release.promise;
+				await Bun.write(sideEffect, "completed");
+				return [];
+			});
+			await entered.promise;
+			settings.set("temperature", 0.9);
+			release.resolve();
+			await expect(lockOnly).resolves.toBeDefined();
+			expect(await Bun.file(sideEffect).text()).toBe("completed");
+			expect(settings.get("temperature")).toBe(0.9);
+
+			const enteredNonEmpty = Promise.withResolvers<void>();
+			const releaseNonEmpty = Promise.withResolvers<void>();
+			const nonEmpty = settings.commitAtomicBatchWithCurrent(async () => {
+				enteredNonEmpty.resolve();
+				await releaseNonEmpty.promise;
+				return [{ path: "topP", op: "set", value: 0.5 }];
+			});
+			await enteredNonEmpty.promise;
+			settings.set("temperature", 0.95);
+			releaseNonEmpty.resolve();
+			await expect(nonEmpty).rejects.toThrow("changed");
+			expect(settings.get("topP")).not.toBe(0.5);
+		} finally {
+			await settings.close();
+			temp.removeSync();
+		}
+	});
+});
+
 describe("concurrent parent and child atomic batches", () => {
 	it("keeps memory equal to disk when a child batch reserves a newer revision", async () => {
 		const temp = TempDir.createSync("@gjc-concurrent-batch-");

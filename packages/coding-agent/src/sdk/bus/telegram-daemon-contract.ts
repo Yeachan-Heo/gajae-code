@@ -318,8 +318,13 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * agent dir's per-session authority and resumes a stored replay cursor only
  * within its own generation, replacing owners that reuse the previous host's
  * replay position or publication receipts for a resumed session.
+ * Generation 223 admits the retained suffix of a `sequence_gap` event replay
+ * (#7582), replacing owners that end every gapped attachment as invalid.
+ * Generation 229 tracks native ownership-descent completeness (#7765).
+ * Generation 230 composes that ownership policy with retained replay and
+ * SDK notification-authority bindings.
  */
-export const DAEMON_GENERATION = 212;
+export const DAEMON_GENERATION = 230;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

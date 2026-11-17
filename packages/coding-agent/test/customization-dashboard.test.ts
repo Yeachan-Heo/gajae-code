@@ -11,8 +11,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CustomizationDashboard } from "@gajae-code/coding-agent/modes/components/customization/customization-dashboard";
 import { ImportWizard } from "@gajae-code/coding-agent/modes/components/customization/import-wizard";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 let tmpRoot: string;
 let projectDir: string;
@@ -26,8 +27,7 @@ beforeEach(async () => {
 	await fs.mkdir(projectDir, { recursive: true });
 	await fs.mkdir(homeDir, { recursive: true });
 	savedAgentDir = getAgentDir();
-	const themeInstance = await getThemeByName("red-claw");
-	if (!themeInstance) throw new Error("Failed to load theme for tests");
+	const themeInstance = await loadTestTheme();
 	setThemeInstance(themeInstance);
 	setAgentDir(path.join(homeDir, ".gjc", "agent"));
 });

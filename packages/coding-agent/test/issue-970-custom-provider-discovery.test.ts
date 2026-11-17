@@ -7,10 +7,11 @@ import type { ModelRegistry, ProviderDiscoveryState } from "@gajae-code/coding-a
 import { ModelRegistry as ModelRegistryImpl } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 function normalizeRenderedText(text: string): string {
 	return text
@@ -19,14 +20,7 @@ function normalizeRenderedText(text: string): string {
 		.trim();
 }
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) {
-		throw new Error("Failed to load dark theme for issue-970 selector test");
-	}
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelectorComponent> {
 	const modelRegistry = {
@@ -53,7 +47,7 @@ async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelec
 		() => {},
 	);
 	await Bun.sleep(0);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	selector.handleInput("\x1b[C");
 	selector.handleInput("\x1b[C");
 	await Bun.sleep(0);
@@ -66,10 +60,7 @@ describe("issue #970 custom provider discovery", () => {
 	let authStorage: AuthStorage;
 
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		if (!testTheme) {
-			throw new Error("Failed to load dark theme for issue-970 selector test");
-		}
+		testTheme = await loadTestTheme();
 	});
 
 	beforeEach(async () => {
@@ -252,7 +243,7 @@ describe("issue #970 custom provider discovery", () => {
 	});
 
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = await createSelector({
 			provider: "vllm",
 			status: "empty",
@@ -268,7 +259,7 @@ describe("issue #970 custom provider discovery", () => {
 	});
 
 	test("shows a provider-tab hint when the discovery endpoint returns 404", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = await createSelector({
 			provider: "vllm",
 			status: "unavailable",

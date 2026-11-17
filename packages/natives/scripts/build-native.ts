@@ -254,6 +254,7 @@ const requiredGeneratedBindingSymbols = [
 	"__gjcInstallTokioRuntime",
 	"PowerAssertion",
 	"currentExecutablePath",
+	"readOwnerOnlyFile",
 	"windowsOrdinalCaseFold",
 ] as const;
 

@@ -345,6 +345,213 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("io-intelligence")?.id).toBe("ionet");
 	});
 
+	it("adds Runcrate with automatic discovery and its reasoning field", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "runcrate", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.runcrate;
+
+		expect(result.providerId).toBe("runcrate");
+		expect(result.presetName).toBe("Runcrate");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.runcrate.ai/v1",
+			api: "openai-completions",
+			apiKeyEnv: "RUNCRATE_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(provider?.compat).toMatchObject({ reasoningContentField: "reasoning_content" });
+		expect(findProviderPreset("runcrate-ai")?.id).toBe("runcrate");
+	});
+
+	it("adds CloudGPU with automatic discovery, system-role instructions and its reasoning field", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "cloudgpu", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.cloudgpu;
+
+		expect(result.providerId).toBe("cloudgpu");
+		expect(result.presetName).toBe("CloudGPU");
+		expect(provider).toMatchObject({
+			baseUrl: "https://cloudgpu.app/v1",
+			api: "openai-completions",
+			apiKeyEnv: "CLOUDGPU_API_KEY",
+			discovery: { type: "openai-models-list", outputModalities: ["text"], inputModalities: ["text"] },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(provider?.compat).toMatchObject({
+			supportsDeveloperRole: false,
+			reasoningContentField: "reasoning_content",
+		});
+		expect(findProviderPreset("cloudgpu")?.discovery).toEqual({
+			type: "openai-models-list",
+			outputModalities: ["text"],
+			inputModalities: ["text"],
+		});
+		expect(findProviderPreset("cloudgpu-app")?.id).toBe("cloudgpu");
+	});
+
+	it("adds Cheaper Inference with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "cheaper-inference", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.["cheaper-inference"];
+
+		expect(result.providerId).toBe("cheaper-inference");
+		expect(result.presetName).toBe("Cheaper Inference");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.cheaperinference.com/v1",
+			api: "openai-completions",
+			apiKeyEnv: "CHEAPER_INFERENCE_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("cheaperinference")?.id).toBe("cheaper-inference");
+	});
+
+	it("adds Standard Compute with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "standardcompute", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.standardcompute;
+
+		expect(result.providerId).toBe("standardcompute");
+		expect(result.presetName).toBe("Standard Compute");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.stdcmpt.com/v1",
+			api: "openai-completions",
+			apiKeyEnv: "STANDARDCOMPUTE_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("standard-compute")?.id).toBe("standardcompute");
+	});
+
+	it("adds UberLLM with text-only automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "uberllm", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.uberllm;
+
+		expect(result.providerId).toBe("uberllm");
+		expect(result.presetName).toBe("UberLLM");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.uberllm.dev/v1",
+			api: "openai-completions",
+			apiKeyEnv: "UBERLLM_API_KEY",
+			discovery: { type: "openai-models-list", outputModalities: ["text"] },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("uberllm-dev")?.id).toBe("uberllm");
+	});
+
+	it("adds Requesty with a seeded vendor/model list", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "requesty", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.requesty;
+		const seeded = [
+			"openai/gpt-5.4",
+			"openai/gpt-5.4-mini",
+			"anthropic/claude-sonnet-5-5",
+			"anthropic/claude-opus-5-5",
+			"google/gemini-3.6-flash",
+		];
+
+		expect(result.providerId).toBe("requesty");
+		expect(result.presetName).toBe("Requesty");
+		expect(provider).toMatchObject({
+			baseUrl: "https://router.requesty.ai/v1",
+			api: "openai-completions",
+			apiKeyEnv: "REQUESTY_API_KEY",
+		});
+		expect(provider?.discovery).toBeUndefined();
+		expect(result.modelIds).toEqual(seeded);
+		expect(provider?.models?.map(model => model.id)).toEqual(seeded);
+		expect(findProviderPreset("requesty-ai")?.id).toBe("requesty");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });

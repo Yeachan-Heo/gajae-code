@@ -1,9 +1,16 @@
 /**
  * Render file listings with optional icons and metadata.
  */
+import { sanitizeText } from "@gajae-code/utils";
 import type { Theme } from "../modes/theme/theme";
 import { getLanguageFromPath } from "../modes/theme/theme";
 import { renderTreeList } from "./tree-list";
+
+// One label. Flatten line breaks, then strip C0/C1 and ANSI. Directional
+// marks stay: they are part of a name, not a terminal command.
+function sanitizeFileLabel(text: string): string {
+	return sanitizeText(text.replace(/[\r\n\u2028\u2029]+/gu, " "));
+}
 
 export interface FileEntry {
 	path: string;
@@ -34,8 +41,11 @@ export function renderFileList(options: FileListOptions, theme: Theme): string[]
 			maxCollapsed,
 			itemType: "file",
 			renderItem: entry => {
-				const isDirectory = entry.isDirectory ?? entry.path.endsWith("/");
-				const displayPath = isDirectory && entry.path.endsWith("/") ? entry.path : entry.path;
+				// Names are repository-controlled. Strip controls before theme
+				// styling: the caller clips the styled line, and a zero-width
+				// sequence would survive that clip.
+				const displayPath = sanitizeFileLabel(entry.path);
+				const isDirectory = entry.isDirectory ?? displayPath.endsWith("/");
 				const lang = isDirectory ? undefined : getLanguageFromPath(displayPath);
 				const icon = !showIcons
 					? ""
@@ -43,7 +53,8 @@ export function renderFileList(options: FileListOptions, theme: Theme): string[]
 						? theme.fg("accent", theme.icon.folder)
 						: theme.fg("muted", theme.getLangIcon(lang));
 				const labelColor = isDirectory ? "accent" : "toolOutput";
-				const meta = entry.meta ? ` ${theme.fg("dim", entry.meta)}` : "";
+				const safeMeta = entry.meta ? sanitizeFileLabel(entry.meta) : "";
+				const meta = safeMeta ? ` ${theme.fg("dim", safeMeta)}` : "";
 				const iconPrefix = icon ? `${icon} ` : "";
 				const pathStr = theme.fg(labelColor, displayPath);
 				const linkedPath = entry.absPath && hyperlinkFn ? hyperlinkFn(entry.absPath, pathStr) : pathStr;

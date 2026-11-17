@@ -10,6 +10,7 @@ import {
 	writeActiveEntry,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import type { SkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+import { asRecord, readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -35,10 +36,6 @@ afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 	else delete process.env.GJC_SESSION_ID;
 });
-
-async function readJson<T>(filePath: string): Promise<T> {
-	return JSON.parse(await fs.readFile(filePath, "utf-8")) as T;
-}
 
 describe("gjc state no-lock concurrency fuzz", () => {
 	it("preserves all per-skill active entries when concurrent writers rebuild the derived snapshot", async () => {
@@ -66,7 +63,7 @@ describe("gjc state no-lock concurrency fuzz", () => {
 		);
 
 		await rebuildActiveSnapshot(root, { sessionId: TEST_SESSION_ID }, { cwd: root });
-		const snapshot = await readJson<SkillActiveState>(activeSnapshotPath(root, TEST_SESSION_ID));
+		const snapshot = asRecord<SkillActiveState>(await readJson(activeSnapshotPath(root, TEST_SESSION_ID)));
 		const activeSkills = snapshot.active_skills ?? [];
 		const bySkill = new Map(activeSkills.map(entry => [entry.skill, entry]));
 
@@ -112,7 +109,7 @@ describe("gjc state no-lock concurrency fuzz", () => {
 		expect(winners).toHaveLength(1);
 		expect(losers).toHaveLength(WORKER_COUNT - 1);
 
-		const claim = await readJson<Record<string, unknown>>(path.join(root, claimPath));
+		const claim = await readJson(path.join(root, claimPath));
 		expect(claim.worker_id).toBe(winners[0]?.worker);
 	});
 

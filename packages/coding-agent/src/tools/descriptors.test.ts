@@ -133,8 +133,14 @@ describe("tool descriptor compatibility gate", () => {
 		];
 		expect(Object.keys(BUILTIN_TOOLS)).toEqual(expectedBuiltin);
 		expect(Object.keys(BUILTIN_TOOL_DESCRIPTORS)).toEqual(expectedBuiltin);
-		expect(Object.keys(HIDDEN_TOOL_DESCRIPTORS)).toEqual(["yield", "report_finding", "resolve"]);
-		expect(Object.keys(TOOL_DESCRIPTORS)).toEqual([...expectedBuiltin, "yield", "report_finding", "resolve"]);
+		expect(Object.keys(HIDDEN_TOOL_DESCRIPTORS)).toEqual(["yield", "report_finding", "report_metric", "resolve"]);
+		expect(Object.keys(TOOL_DESCRIPTORS)).toEqual([
+			...expectedBuiltin,
+			"yield",
+			"report_finding",
+			"report_metric",
+			"resolve",
+		]);
 		for (const [name, descriptor] of Object.entries(BUILTIN_TOOL_DESCRIPTORS)) {
 			expect(BUILTIN_TOOLS[name]).toBe(descriptor.load);
 		}

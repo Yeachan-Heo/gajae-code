@@ -118,6 +118,7 @@ export interface DoctorRepair {
 	readonly state: RepairState;
 	readonly reasonCode?: string;
 	readonly sideEffectStarted?: boolean;
+	readonly diagnostic?: string;
 	readonly outcome?: { readonly mutationVerified: boolean; readonly desiredStartupStateAchieved?: boolean };
 	readonly beforeCheckIds: readonly string[];
 	readonly afterCheckIds: readonly string[];

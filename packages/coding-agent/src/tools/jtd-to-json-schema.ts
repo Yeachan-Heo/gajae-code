@@ -69,7 +69,7 @@ function convertSchema(schema: unknown): unknown {
 
 	// Properties form: { properties: {...}, optionalProperties: {...} }
 	if (isJTDProperties(schema)) {
-		const properties: Record<string, unknown> = {};
+		const properties: Record<string, unknown> = Object.create(null);
 		const required: string[] = [];
 
 		// Required properties
@@ -107,7 +107,7 @@ function convertSchema(schema: unknown): unknown {
 		for (const [tag, props] of Object.entries(schema.mapping)) {
 			const converted = convertSchema(props) as Record<string, unknown>;
 			// Add the discriminator property
-			const properties = (converted.properties || {}) as Record<string, unknown>;
+			const properties = Object.assign(Object.create(null), converted.properties || {}) as Record<string, unknown>;
 			properties[schema.discriminator] = { const: tag };
 
 			const required = ((converted.required as string[]) || []).slice();
@@ -187,7 +187,7 @@ function normalizeMixedSchemaNode(schema: unknown): unknown {
 		return convertSchema(schema);
 	}
 
-	const normalized: Record<string, unknown> = {};
+	const normalized: Record<string, unknown> = Object.create(null);
 	for (const [key, value] of Object.entries(schema)) {
 		normalized[key] = normalizeMixedSchemaNode(value);
 	}

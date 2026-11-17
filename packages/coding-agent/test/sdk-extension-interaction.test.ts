@@ -133,6 +133,41 @@ describe("portable extension interactions", () => {
 		}
 	});
 
+	for (const action of ["respond", "cancel"] as const) {
+		for (const rotation of ["disconnect", "reconnect"] as const) {
+			it(`refuses ${action} when a requestId getter triggers ${rotation}`, async () => {
+				const { service, connectionId } = fixture();
+				try {
+					const pending = service.request({ kind: "input", title: "Owned request" });
+					const request = service.snapshot().pending[0]!;
+					let currentConnection = connectionId;
+					let reads = 0;
+					const address: ExtensionInteractionAddress = {
+						sessionId: request.sessionId,
+						connectionId,
+						get requestId() {
+							reads++;
+							if (rotation === "disconnect") service.disconnect(connectionId);
+							else currentConnection = service.connect().connectionId;
+							return request.requestId;
+						},
+					};
+					errorCode(
+						() => (action === "respond" ? service.respond(address, "revoked") : service.cancel(address)),
+						"stale-connection",
+					);
+					expect(reads).toBe(1);
+					expect(service.snapshot().pending.map(item => item.requestId)).toEqual([request.requestId]);
+					if (rotation === "disconnect") currentConnection = service.connect().connectionId;
+					service.respond({ ...request, connectionId: currentConnection }, "current renderer");
+					expect(await pending).toEqual({ status: "answered", value: "current renderer" });
+				} finally {
+					service.dispose();
+				}
+			});
+		}
+	}
+
 	it("makes cancellation observable and refuses stale answers", async () => {
 		const { service, address } = fixture();
 		const request = service.request({ kind: "input", title: "Name" });

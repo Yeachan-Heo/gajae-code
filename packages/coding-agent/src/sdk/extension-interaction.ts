@@ -462,6 +462,7 @@ export class ExtensionInteractionService {
 			options?.onLeft ||
 			options?.onRight ||
 			options?.onExternalEditor ||
+			options?.onInputModeChange ||
 			options?.customInput ||
 			options?.clarificationInput
 		) {
@@ -490,10 +491,14 @@ export class ExtensionInteractionService {
 
 	#lookup(address: ExtensionInteractionAddress): PendingInteraction {
 		this.#assertAlive();
-		if (address.sessionId !== this.#sessionId)
+		const { sessionId, connectionId, requestId } = address;
+		// Accessors may synchronously disconnect, rotate or dispose the renderer.
+		// Validate only after extracting the complete address, with no later caller reads.
+		this.#assertAlive();
+		if (sessionId !== this.#sessionId)
 			throw new ExtensionInteractionError("wrong-session", "Interaction belongs to another session");
-		this.#assertConnection(address.connectionId);
-		const item = this.#pending.get(address.requestId);
+		this.#assertConnection(connectionId);
+		const item = this.#pending.get(requestId);
 		if (!item) throw new ExtensionInteractionError("stale-request", "Interaction is no longer pending");
 		return item;
 	}

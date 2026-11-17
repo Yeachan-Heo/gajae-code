@@ -36,6 +36,9 @@ const ELLIPSIS = "…";
 // large callback. Keep batches small enough to avoid per-line retention work.
 const COLUMN_CAP_BATCH_CHARS = 64 * 1024;
 
+// Pressure-flush live output rather than retaining an unbounded throttle window.
+const CHUNK_FLUSH_CHARS = 64 * 1024;
+
 const outputPlainSecrets = new AsyncLocalStorage<readonly string[]>();
 
 /** Run `fn` while column caps can see these plain secrets. */
@@ -182,8 +185,16 @@ export interface OutputSinkOptions {
 	maxColumns?: number;
 	/** Hard cap for artifact writes/pending replay. Default DEFAULT_ARTIFACT_MAX_BYTES. */
 	artifactMaxBytes?: number;
+	/**
+	 * Receives the complete sanitized, uncapped stream, optionally in batches.
+	 * Callback failures are sticky: push/replace/dump propagate them, with dump
+	 * completing artifact cleanup before rejecting, including timer-originated failures.
+	 */
 	onChunk?: (chunk: string) => void;
-	/** Minimum ms between onChunk calls. 0 = every chunk (default). */
+	/**
+	 * Coalesce onChunk calls over this many ms. 0 = every chunk (default).
+	 * Pending output is flushed sooner at dump() or under buffer pressure.
+	 */
 	chunkThrottleMs?: number;
 	/**
 	 * Unthrottled per-chunk callback fired *after* sanitization but *before*
@@ -1365,7 +1376,11 @@ export class OutputSink {
 	#processedLines = 0; // newline count after sanitize/column-cap
 	#sawData = false;
 	#truncated = false;
-	#lastChunkTime = 0;
+	#lastChunkTime = Number.NEGATIVE_INFINITY;
+	#pendingChunks: string[] = [];
+	#pendingChunkChars = 0;
+	#chunkTimer?: NodeJS.Timeout;
+	#chunkError?: { error: unknown };
 	#artifactBytes = 0;
 	#artifactTruncatedBytes = 0;
 	#artifactTruncationNoticeWritten = false;
@@ -1486,12 +1501,60 @@ export class OutputSink {
 	// F21: with coalescing enabled, accumulate raw chunks and process them in batches; the default
 	// (disabled) path calls #ingest directly and is byte-identical to the historical per-chunk path.
 	push(chunk: string): void | Promise<void> {
+		this.#throwChunkError();
 		if (!this.#coalesceSanitize) this.#ingest(chunk);
 		else {
 			this.#coalesceBuf += chunk;
 			if (this.#coalesceBuf.length >= COALESCE_FLUSH_CHARS) this.#flushCoalesced();
 		}
+		this.#throwChunkError();
 		return this.#file?.sink.settled();
+	}
+
+	#throwChunkError(): void {
+		if (this.#chunkError) throw this.#chunkError.error;
+	}
+
+	#emitChunk(chunk: string): void {
+		if (this.#chunkError) return;
+		this.#lastChunkTime = Date.now();
+		try {
+			this.#onChunk?.(chunk);
+		} catch (error) {
+			// Timer callbacks cannot throw into the producer. Keep the failure sticky
+			// until an operation can report it, including after dump's artifact cleanup.
+			this.#chunkError = { error };
+		}
+	}
+
+	#flushPendingChunks(): void {
+		if (this.#chunkTimer !== undefined) {
+			clearTimeout(this.#chunkTimer);
+			this.#chunkTimer = undefined;
+		}
+		if (this.#pendingChunks.length === 0) return;
+		const chunks = this.#pendingChunks;
+		this.#pendingChunks = [];
+		this.#pendingChunkChars = 0;
+		this.#emitChunk(chunks.join(""));
+	}
+
+	#queueChunk(chunk: string): void {
+		if (!this.#onChunk || this.#chunkError) return;
+		const elapsed = Date.now() - this.#lastChunkTime;
+		if (this.#chunkThrottleMs <= 0 || (this.#pendingChunks.length === 0 && elapsed >= this.#chunkThrottleMs)) {
+			this.#emitChunk(chunk);
+			return;
+		}
+		if (chunk.length > 0) {
+			this.#pendingChunks.push(chunk);
+			this.#pendingChunkChars += chunk.length;
+		}
+		if (this.#pendingChunkChars >= CHUNK_FLUSH_CHARS || elapsed >= this.#chunkThrottleMs) {
+			this.#flushPendingChunks();
+		} else if (this.#pendingChunks.length > 0 && this.#chunkTimer === undefined) {
+			this.#chunkTimer = setTimeout(() => this.#flushPendingChunks(), this.#chunkThrottleMs - elapsed);
+		}
 	}
 
 	/** Process any buffered coalesced chunks as a single batch (F21). */
@@ -1513,13 +1576,7 @@ export class OutputSink {
 			this.#onRawChunk(sanitizedChunk);
 		}
 
-		if (this.#onChunk) {
-			const now = Date.now();
-			if (now - this.#lastChunkTime >= this.#chunkThrottleMs) {
-				this.#lastChunkTime = now;
-				this.#onChunk(sanitizedChunk);
-			}
-		}
+		this.#queueChunk(sanitizedChunk);
 
 		const rawBytes = Buffer.byteLength(rawChunk, "utf-8");
 		this.#totalBytes += rawBytes;
@@ -1995,6 +2052,7 @@ export class OutputSink {
 	 * append directly to the tail without reordering the replacement.
 	 */
 	replace(text: string): void {
+		this.#throwChunkError();
 		this.#coalesceBuf = "";
 		this.#columnLine = "";
 		this.#columnLineContext = "";
@@ -2027,6 +2085,7 @@ export class OutputSink {
 
 	async dump(notice?: string): Promise<OutputSummary> {
 		this.#flushCoalesced();
+		this.#flushPendingChunks();
 		const noticeLine = notice ? `[${notice}]\n` : "";
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 
@@ -2109,6 +2168,7 @@ export class OutputSink {
 		}
 
 		if (this.#columnDroppedBytes > 0) this.#truncated = true;
+		this.#throwChunkError();
 		return {
 			output: `${noticeLine}${body}`,
 			truncated: this.#truncated,

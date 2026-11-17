@@ -4,16 +4,11 @@ import { getBundledModel } from "../src/models";
 import { streamAnthropic } from "../src/providers/anthropic";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Context, Model } from "../src/types";
+import { createAbortedSignal } from "./helpers";
 
 const testContext: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
 };
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
 
 function captureResponsesPayload(model: Model<"openai-responses">): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();

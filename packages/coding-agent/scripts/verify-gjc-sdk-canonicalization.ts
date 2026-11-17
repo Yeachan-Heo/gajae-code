@@ -264,7 +264,14 @@ function exportTargetStrings(target: unknown): string[] {
 	return Object.values(target as Record<string, unknown>).flatMap(exportTargetStrings);
 }
 
+/**
+ * The retired ingress package only ever existed in the CLI package. Another package may keep a
+ * retained module that happens to be called `bridge` (the desktop renderer's transport bridge),
+ * so this rule stays scoped to the tree it retired instead of matching every package.
+ */
+const RETIRED_INGRESS_ROOT = "packages/coding-agent/src/";
 function retiredIngressSource(file: string): boolean {
+	if (!file.startsWith(RETIRED_INGRESS_ROOT)) return false;
 	return /\/src\/(?:modes\/(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\/|$)|(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\/|\.[cm]?[jt]sx?$))/i.test(
 		file,
 	);

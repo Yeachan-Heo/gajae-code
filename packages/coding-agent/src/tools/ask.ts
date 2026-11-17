@@ -75,7 +75,6 @@ import type {
 	ToolSession,
 } from ".";
 import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
-
 import {
 	type AskParametersSchema,
 	type AskToolInput,
@@ -85,6 +84,7 @@ import {
 	recoverRoundZeroIntentContract,
 	selectAskParameters,
 } from "./ask-contract";
+import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
@@ -400,6 +400,7 @@ interface UIContext {
 			helpText?: string;
 			customInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
+			onInputModeChange?: (mode: "selector" | "custom_editor" | "clarification_editor") => void;
 		},
 	): Promise<string | undefined>;
 	editor(
@@ -1049,6 +1050,41 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		};
 
 		const extensionUi = context?.ui;
+		const logicalQuestionIds = params.questions.map(() => randomUUID());
+		let logicalQuestionId: string | undefined;
+		const publicSessionId = hasInteractiveUi ? this.session.getSessionId?.() : undefined;
+		const invokeLocal = <T>(work: () => Promise<T>): Promise<T> => {
+			try {
+				return work();
+			} catch (error) {
+				return Promise.reject(error);
+			}
+		};
+		const awaitRemoteAnswer = (
+			request: AskAnswerRequest,
+			remoteSignal: AbortSignal,
+			legacy: { question: string; options: string[] },
+			onOpen?: (handle: PendingAskHandle) => void,
+			onShutdown?: () => void,
+		) => {
+			const source = this.session.getAskAnswerSource?.();
+			if (publicSessionId) {
+				if (!logicalQuestionId) throw new ToolError("Ask interaction has no logical question binding");
+				const handle = openPendingAsk(
+					publicSessionId,
+					{ ...request, questionId: logicalQuestionId },
+					source,
+					remoteSignal,
+					onShutdown,
+				);
+				onOpen?.(handle);
+				return handle.promise;
+			}
+			if (!source) throw new ToolAbortError("Ask tool requires an answer source");
+			return source.awaitAnswerRequest
+				? source.awaitAnswerRequest(request, remoteSignal)
+				: source.awaitAnswer(legacy.question, legacy.options, remoteSignal);
+		};
 		const throwRemoteCancellation = (remoteSignal: AbortSignal, toolSignal?: AbortSignal): never => {
 			// A headless remote answer source owns the only interactive surface. When it
 			// explicitly closes the ask, abort the enclosing turn as well; otherwise the
@@ -1060,8 +1096,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		};
 		const ui: UIContext = {
 			select: (prompt, options, dialogOptions) => {
-				const source = this.session.getAskAnswerSource?.();
-				if (!source) {
+				let pendingAsk: PendingAskHandle | undefined;
+				const selectorRequest = activeRemoteRequest;
+				let inlineMode: "custom_editor" | "clarification_editor" | undefined;
+				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 					return extensionUi.select(prompt, options, dialogOptions);
 				}
@@ -1073,9 +1111,17 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				const remoteController = new AbortController();
 				const localController = new AbortController();
 				const generation = ++remoteGeneration;
+				const cancelled = Promise.withResolvers<never>();
+				let raceCancelled = false;
+				let raceClosed = false;
+				let observedReceipt: AskRemoteReceipt | undefined;
+				let receiptTransferred = false;
+				let receiptSettled = false;
 				// Propagate external cancellation to both race legs and invalidate late replies.
 				const toolSignal = dialogOptions?.signal;
 				const abortRace = () => {
+					raceCancelled = true;
+					cancelled.reject(new ToolAbortError("Ask input was cancelled"));
 					if (generation === remoteGeneration) remoteGeneration++;
 					localController.abort();
 					remoteController.abort();
@@ -1084,13 +1130,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					if (toolSignal.aborted) abortRace();
 					else toolSignal.addEventListener("abort", abortRace, { once: true });
 				}
-				const remote = (
-					source.awaitAnswerRequest
-						? source.awaitAnswerRequest(
-								activeRemoteRequest ?? { question: prompt, options, interaction: "selector", controls: [] },
-								remoteController.signal,
-							)
-						: source.awaitAnswer(prompt, options, remoteController.signal)
+				const remote = awaitRemoteAnswer(
+					activeRemoteRequest ?? { question: prompt, options, interaction: "selector", controls: [] },
+					remoteController.signal,
+					{ question: prompt, options },
+					handle => {
+						pendingAsk = handle;
+					},
+					abortRace,
 				)
 					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
 						if (answer === undefined) {
@@ -1098,12 +1145,19 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							return new Promise<never>(() => {});
 						}
 						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
-						if (generation !== remoteGeneration) {
+						observedReceipt = receipt;
+						if (raceClosed || generation !== remoteGeneration) {
+							receiptSettled = true;
 							return receipt
 								.settle({ kind: "resolve_without_commit", reason: "aborted" })
 								.then(() => new Promise<never>(() => {}));
 						}
 						const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
+						if (inlineMode && remoteValue !== undefined) {
+							const input =
+								inlineMode === "custom_editor" ? dialogOptions?.customInput : dialogOptions?.clarificationInput;
+							return { winner: "remote", value: input!.optionLabel, receipt };
+						}
 						const value = remoteValue ?? REMOTE_NAVIGATION_FORWARD;
 						const checkboxPrefixes = theme?.checkbox
 							? [theme.checkbox.checked, theme.checkbox.unchecked].filter(
@@ -1159,8 +1213,39 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					});
 
 				const local = extensionUi
-					? extensionUi
-							.select(prompt, options, { ...dialogOptions, signal: localController.signal })
+					? invokeLocal(() =>
+							extensionUi.select(prompt, options, {
+								...dialogOptions,
+								signal: localController.signal,
+								onInputModeChange: mode => {
+									dialogOptions?.onInputModeChange?.(mode);
+									if (!selectorRequest) return;
+									// The terminal permanently stops its countdown on inline editor entry.
+									const nextRequest: AskAnswerRequest =
+										mode === "selector"
+											? { ...selectorRequest, timeoutMs: undefined }
+											: {
+													...selectorRequest,
+													interaction: mode,
+													options: [],
+													controls: [],
+													timeoutMs: undefined,
+													recommendedIndex: undefined,
+													transitionCount: undefined,
+													editor: {
+														title:
+															mode === "custom_editor"
+																? "Enter your response:"
+																: "Ask a clarification question:",
+														prefill: "",
+													},
+												};
+									if (pendingAsk && !pendingAsk.update(nextRequest)) return;
+									activeRemoteRequest = nextRequest;
+									inlineMode = mode === "selector" ? undefined : mode;
+								},
+							}),
+						)
 							.then(answer => {
 								if (generation === remoteGeneration) remoteGeneration++;
 								remoteController.abort();
@@ -1176,25 +1261,38 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				// swallow that so it is not an unhandled rejection (the race result is unaffected).
 				void local.catch(() => undefined);
 				return awaitAskAnswer(() =>
-					Promise.race([local, remote])
+					Promise.race([cancelled.promise, local, remote])
 						.then(async result => {
+							if (raceCancelled) throw new ToolAbortError("Ask input was cancelled");
 							if (result.winner === "remote") {
+								if (inlineMode && result.receipt.interaction.kind === "value") {
+									const input =
+										inlineMode === "custom_editor"
+											? dialogOptions?.customInput
+											: dialogOptions?.clarificationInput;
+									input?.onSubmit(result.receipt.interaction.value);
+								}
 								localController.abort();
 								if (result.settlement) await result.receipt.settle(result.settlement);
 								else activeRemoteReceipt = result.receipt;
-							} else {
-								void remote.then(remoteResult =>
-									remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
-								);
+								receiptTransferred = true;
 							}
 							return result.value;
 						})
-						.finally(() => toolSignal?.removeEventListener("abort", abortRace)),
+						.finally(async () => {
+							raceClosed = true;
+							localController.abort();
+							remoteController.abort();
+							toolSignal?.removeEventListener("abort", abortRace);
+							if (!receiptTransferred && !receiptSettled && observedReceipt) {
+								receiptSettled = true;
+								await observedReceipt.settle({ kind: "resolve_without_commit", reason: "aborted" });
+							}
+						}),
 				);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
-				const source = this.session.getAskAnswerSource?.();
-				if (!source) {
+				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 					return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
 				}
@@ -1204,8 +1302,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				const remoteController = new AbortController();
 				const localController = new AbortController();
 				const generation = ++remoteGeneration;
+				const cancelled = Promise.withResolvers<never>();
+				let raceCancelled = false;
+				let raceClosed = false;
+				let observedReceipt: AskRemoteReceipt | undefined;
+				let receiptTransferred = false;
+				let receiptSettled = false;
 				const toolSignal = dialogOptions?.signal;
 				const abortRace = () => {
+					raceCancelled = true;
+					cancelled.reject(new ToolAbortError("Ask input was cancelled"));
 					if (generation === remoteGeneration) remoteGeneration++;
 					localController.abort();
 					remoteController.abort();
@@ -1214,18 +1320,20 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					if (toolSignal.aborted) abortRace();
 					else toolSignal.addEventListener("abort", abortRace, { once: true });
 				}
-				const remote = (
-					source.awaitAnswerRequest
-						? source.awaitAnswerRequest(
-								activeRemoteRequest ?? {
-									question: title,
-									options: [],
-									interaction: "custom_editor",
-									controls: [],
-								},
-								remoteController.signal,
-							)
-						: source.awaitAnswer(title, [], remoteController.signal)
+				const remote = awaitRemoteAnswer(
+					{
+						...(activeRemoteRequest ?? {
+							question: title,
+							options: [],
+							interaction: "custom_editor",
+							controls: [],
+						}),
+						editor: { title, prefill: prefill ?? "" },
+					},
+					remoteController.signal,
+					{ question: title, options: [] },
+					undefined,
+					abortRace,
 				)
 					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
 						if (answer === undefined) {
@@ -1233,7 +1341,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							return new Promise<never>(() => {});
 						}
 						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
-						if (generation !== remoteGeneration) {
+						observedReceipt = receipt;
+						if (raceClosed || generation !== remoteGeneration) {
+							receiptSettled = true;
 							return receipt
 								.settle({ kind: "resolve_without_commit", reason: "aborted" })
 								.then(() => new Promise<never>(() => {}));
@@ -1247,13 +1357,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						return ignoreRemoteAnswerFailure(error);
 					});
 				const local = extensionUi
-					? extensionUi
-							.editor(
+					? invokeLocal(() =>
+							extensionUi.editor(
 								title,
 								prefill,
 								{ ...(dialogOptions ?? {}), signal: localController.signal },
 								editorOptions,
-							)
+							),
+						)
 							.then(answer => {
 								if (generation === remoteGeneration) remoteGeneration++;
 								remoteController.abort();
@@ -1267,19 +1378,26 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					: new Promise<never>(() => {});
 				void local.catch(() => undefined);
 				return awaitAskAnswer(() =>
-					Promise.race([local, remote])
+					Promise.race([cancelled.promise, local, remote])
 						.then(result => {
+							if (raceCancelled) throw new ToolAbortError("Ask input was cancelled");
 							if (result.winner === "remote") {
 								activeRemoteReceipt = result.receipt;
+								receiptTransferred = true;
 								localController.abort();
-							} else {
-								void remote.then(remoteResult =>
-									remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
-								);
 							}
 							return result.value;
 						})
-						.finally(() => toolSignal?.removeEventListener("abort", abortRace)),
+						.finally(async () => {
+							raceClosed = true;
+							localController.abort();
+							remoteController.abort();
+							toolSignal?.removeEventListener("abort", abortRace);
+							if (!receiptTransferred && !receiptSettled && observedReceipt) {
+								receiptSettled = true;
+								await observedReceipt.settle({ kind: "resolve_without_commit", reason: "aborted" });
+							}
+						}),
 				);
 			},
 		};
@@ -1313,6 +1431,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const rawOptionLabels = q.options.map(o => o.label);
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
+			logicalQuestionId = logicalQuestionIds[questionIndex];
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
 			const isExecutionApprovalQuestion =
 				(q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution") ||
@@ -1352,6 +1471,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						);
 					}
 				}
+				// Cancellation can land during an awaited preflight; never publish a gate
+				// that would be revoked as soon as it opens.
+				if (signal?.aborted) throw new ToolAbortError("Ask input was cancelled");
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
 					if (
@@ -1364,8 +1486,20 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						executionGateId = gate.gate_id;
 				});
 				let answer: unknown;
+				// The emitter revokes this ask's gate when the ask fails, so a late
+				// answer cannot advance it. The answer deadline aborts it too.
+				const revokeGate = new AbortController();
 				try {
-					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+					const gateAnswer = gateEmitter.emitGate(questionToGate(gateQuestion), {
+						signal: signal ? AbortSignal.any([signal, revokeGate.signal]) : revokeGate.signal,
+					});
+					answer = await awaitAskAnswer(() => untilAborted(signal, gateAnswer));
+				} catch (error) {
+					revokeGate.abort();
+					if (error instanceof Error && error.name === "AbortError") {
+						throw new ToolAbortError("Ask input was cancelled");
+					}
+					throw error;
 				} finally {
 					stopGateObservation?.();
 				}

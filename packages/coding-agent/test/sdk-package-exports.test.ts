@@ -67,9 +67,12 @@ describe("SDK package exports", () => {
 		expect(publicSdk.ExtensionInteractionService).toBeFunction();
 		expect(publicSdk.JobObservation).toBeFunction();
 		expect(root.getSettingsCatalog).toBe(publicSdk.getSettingsCatalog);
+		expect(root.createNotificationsEditorOperations).toBe(publicSdk.createNotificationsEditorOperations);
 		expect(root.createRoutingSettingsService).toBe(publicSdk.createRoutingSettingsService);
 		expect(publicSdk.RoutingSettingsConfirmationRequiredError).toBeFunction();
 		expect(root.RoutingSettingsConfirmationRequiredError).toBe(publicSdk.RoutingSettingsConfirmationRequiredError);
+		expect(root.executeAcpBuiltinSlashCommand).toBe(publicSdk.executeAcpBuiltinSlashCommand);
+		expect(root.ACP_BUILTIN_SLASH_COMMANDS).toBe(publicSdk.ACP_BUILTIN_SLASH_COMMANDS);
 		expect(root.ExtensionInteractionService).toBe(publicSdk.ExtensionInteractionService);
 		expect(root.JobObservation).toBe(publicSdk.JobObservation);
 		expect(publicSdk.lifecycle.SessionLifecycleService).toBeFunction();

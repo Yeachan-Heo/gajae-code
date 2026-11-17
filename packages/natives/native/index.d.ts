@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -686,7 +687,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_19_0(): void
+export declare function __piNativesV0_21_0(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -770,6 +771,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -930,6 +933,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */
@@ -2302,6 +2307,24 @@ export interface NativeExactUnlinkResult {
    * namespace mutation.
    */
   windowsErrorCode?: string
+  /**
+   * ACL failure details: offending principal (account name or SID string).
+   * Present only when code is `acl_present` on Windows exact-replace
+   * pre-mutation failures.
+   */
+  aclFailurePrincipal?: string
+  /**
+   * ACL failure detail: whether the offending ACE is inherited from a parent
+   * directory. Present only when code is `acl_present` on Windows
+   * exact-replace pre-mutation failures.
+   */
+  aclFailureInherited?: boolean
+  /**
+   * ACL failure detail: identifies which path failed ACL validation
+   * (`source` or `destination`). Present only when code is `acl_present` on
+   * Windows exact-replace pre-mutation failures.
+   */
+  aclFailureSide?: string
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */
@@ -2314,6 +2337,16 @@ export interface NativeNoReplaceResult {
   primitive: string
   phase: string
   diagnostic: NativePublishDiagnostic
+}
+
+/**
+ * Bounded, read-only owner-private file bytes. Failures never contain paths or
+ * bytes.
+ */
+export interface NativeOwnerOnlyFileReadResult {
+  ok: boolean
+  data?: Uint8Array
+  code?: string
 }
 
 /** Result of applying or checking owner-only path security. */
@@ -2672,6 +2705,16 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
 
 /**
+ * Read a private regular file under a private lifecycle directory on
+ * macOS/Linux.
+ *
+ * `max_bytes` must be an integer in 1..=65536. Both
+ * same-descriptor reads are bounded; no path, digest, descriptor, or partial
+ * bytes are returned on failure.
+ */
+export declare function readOwnerOnlyFile(path: string, maxBytes: number): NativeOwnerOnlyFileReadResult
+
+/**
  * Re-apply raw mode to `fd` when a direct termios change left it cooked.
  *
  * Applies the transform Bun's `setRawMode(true)` uses (libuv's
@@ -2832,6 +2875,14 @@ export interface ReplyEvent {
   /** One-shot receipt binding this callback to the atomically claimed reply. */
   replyReceiptId: string
 }
+
+/**
+ * Re-assert the console code pages recorded before the first shell command.
+ *
+ * The Windows TUI calls this before each frame, because a background shell
+ * child sharing the console may have switched them (#7760). No-op elsewhere.
+ */
+export declare function restoreConsoleCodePagesForRender(): void
 
 /**
  * Retain the existing no-follow SDK publication objects after one-time

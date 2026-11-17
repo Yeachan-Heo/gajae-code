@@ -11,6 +11,19 @@ import type {
 	UserMessage,
 } from "@gajae-code/ai/types";
 
+const model: Model<"anthropic-messages"> = {
+	api: "anthropic-messages",
+	provider: "anthropic",
+	id: "claude-3-5-sonnet-20241022",
+	name: "Claude 3.5 Sonnet",
+	baseUrl: "https://api.anthropic.com",
+	input: ["text"],
+	cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+	maxTokens: 8192,
+	contextWindow: 200000,
+	reasoning: true,
+};
+
 /**
  * Regression test for: "each tool_use must have a single result. Found multiple tool_result blocks with id"
  *
@@ -19,19 +32,6 @@ import type {
  * transformMessages should NOT add duplicate synthetic tool results.
  */
 describe("Duplicate Tool Results Regression", () => {
-	const model: Model<"anthropic-messages"> = {
-		api: "anthropic-messages",
-		provider: "anthropic",
-		id: "claude-3-5-sonnet-20241022",
-		name: "Claude 3.5 Sonnet",
-		baseUrl: "https://api.anthropic.com",
-		input: ["text"],
-		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-		maxTokens: 8192,
-		contextWindow: 200000,
-		reasoning: true,
-	};
-
 	it("should not duplicate tool results for errored messages when results already exist", () => {
 		const toolCallId = "toolu_019xqMTvqWZiTDy8XxmjxrTo";
 
@@ -331,19 +331,6 @@ describe("Duplicate Tool Results Regression", () => {
  * request is rejected.
  */
 describe("Orphan Tool Result (handoff/compaction) Regression", () => {
-	const model: Model<"anthropic-messages"> = {
-		api: "anthropic-messages",
-		provider: "anthropic",
-		id: "claude-3-5-sonnet-20241022",
-		name: "Claude 3.5 Sonnet",
-		baseUrl: "https://api.anthropic.com",
-		input: ["text"],
-		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-		maxTokens: 8192,
-		contextWindow: 200000,
-		reasoning: true,
-	};
-
 	const makeAssistantWithToolCall = (
 		id: string,
 		name = "bash",
@@ -726,19 +713,6 @@ describe("Orphan Tool Result (handoff/compaction) Regression", () => {
  * - A <turn-aborted> guidance marker is added as synthetic user message
  */
 describe("Codex-style Abort Handling", () => {
-	const model: Model<"anthropic-messages"> = {
-		api: "anthropic-messages",
-		provider: "anthropic",
-		id: "claude-3-5-sonnet-20241022",
-		name: "Claude 3.5 Sonnet",
-		baseUrl: "https://api.anthropic.com",
-		input: ["text"],
-		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-		maxTokens: 8192,
-		contextWindow: 200000,
-		reasoning: true,
-	};
-
 	it("should preserve tool call structure in aborted messages", () => {
 		const toolCallId = "toolu_preserve_test";
 

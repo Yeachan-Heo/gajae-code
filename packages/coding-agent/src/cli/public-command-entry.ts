@@ -430,12 +430,14 @@ export async function dispatchPublicCommand(
 		const operationArgv = [...scan.operationArgv];
 		// Families whose runtime must observe the boundary `--json` flag: daemon and
 		// sdk spawn/search select their successful output mode with it, and sdk
-		// session forwards it to its JSON-aware runner. The boundary scanner always
+		// session and broker attest-spawn-anchors forward it to their JSON-aware runners.
+		// Broker run does not observe JSON. The boundary scanner always
 		// consumes `--json`, so it is re-inserted here for exactly those families.
 		const familyObservesJson =
 			context.command === "daemon" ||
 			(scan.descriptor.command[0] === "sdk" &&
-				["spawn", "search", "session"].includes(scan.descriptor.command[1] ?? ""));
+				(["spawn", "search", "session"].includes(scan.descriptor.command[1] ?? "") ||
+					(scan.descriptor.command[1] === "broker" && scan.descriptor.command[2] === "attest-spawn-anchors")));
 		// Insert before --, never after it where the operation parser would see a positional.
 		if (json && familyObservesJson) {
 			const delimiter = operationArgv.indexOf("--");
