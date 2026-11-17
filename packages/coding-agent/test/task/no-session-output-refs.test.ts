@@ -12,10 +12,11 @@ import type { ExtensionRunner } from "../../src/extensibility/extensions/runner"
 import * as internalUrls from "../../src/internal-urls";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
+import { CURRENT_SESSION_VERSION } from "../../src/sdk/session-readonly/format";
 import { AgentSession, type AgentSessionEvent } from "../../src/session/agent-session";
 import { ArtifactManager } from "../../src/session/artifacts";
 import { AuthStorage } from "../../src/session/auth-storage";
-import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
+import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";

@@ -9,6 +9,7 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
+import { ModelProfileRegistryError } from "../src/config/model-profile-contract";
 import {
 	Broker,
 	type BrokerResponse,
@@ -59,7 +60,8 @@ import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "../src/sdk/host/control/runtime-gate";
-import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
+import { prepareManagedSessionScopeForWrite } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -3134,6 +3136,26 @@ describe("SDK broker identity and discovery", () => {
 				: { sessionId, cwd: root, sessionPath: path.join(root, `${sessionId}.jsonl`) };
 		const nonCreateOperations = ["session.close", "session.resume", "session.delete"];
 
+		// Admitted past the legacy fence, each request for session-b fails later only
+		// because session-b has no fixture.
+		const admittedSessionBResponses: Record<string, BrokerResponse> = {
+			"session.close": { ok: false, error: { code: "not_found", message: "session is not indexed" } },
+			"session.resume": {
+				ok: false,
+				error: {
+					code: "invalid_input",
+					message: "Saved saved session does not match the requested workspace and session id.",
+				},
+			},
+			"session.delete": {
+				ok: false,
+				error: {
+					code: "invalid_input",
+					message: "session.delete path is not an owned managed session for the configured cwd.",
+				},
+			},
+		};
+
 		it("admits close, resume, and delete for a different session with a fresh key", async () => {
 			await withLegacyLedger(seedFinalRowsForSessionA, async (broker, root) => {
 				const responses: Record<string, BrokerResponse> = {};
@@ -3143,24 +3165,7 @@ describe("SDK broker identity and discovery", () => {
 						requestFor(operation, "session-b", root),
 						`fresh-${operation}-b`,
 					);
-				// Admitted past the legacy fence; each fails later only because session-b has no fixture.
-				expect(responses).toEqual({
-					"session.close": { ok: false, error: { code: "not_found", message: "session is not indexed" } },
-					"session.resume": {
-						ok: false,
-						error: {
-							code: "invalid_input",
-							message: "Saved saved session does not match the requested workspace and session id.",
-						},
-					},
-					"session.delete": {
-						ok: false,
-						error: {
-							code: "invalid_input",
-							message: "session.delete path is not an owned managed session for the configured cwd.",
-						},
-					},
-				});
+				expect(responses).toEqual(admittedSessionBResponses);
 			});
 		});
 		it("admits session.reconcile_uncertain for a different session with a fresh key", async () => {
@@ -3258,7 +3263,7 @@ describe("SDK broker identity and discovery", () => {
 							).resolves.toEqual(ambiguousTarget);
 						await expect(
 							broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}`),
-						).resolves.not.toEqual(ambiguousTarget);
+						).resolves.toEqual(admittedSessionBResponses[operation]);
 					},
 				);
 			}
@@ -3280,7 +3285,7 @@ describe("SDK broker identity and discovery", () => {
 					).resolves.toEqual(ambiguousTarget);
 					await expect(
 						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-b"),
-					).resolves.not.toEqual(ambiguousTarget);
+					).resolves.toEqual(admittedSessionBResponses["session.close"]);
 					await broker.ledger.begin("legacy-uncertain", "legacy-uncertain-request", {
 						intendedSessionId: "session-a",
 					});
@@ -3304,6 +3309,313 @@ describe("SDK broker identity and discovery", () => {
 						).resolves.toEqual(ambiguousTarget);
 				},
 			);
+		});
+		describe("legacy session.create rows that failed before any effect", () => {
+			// The rows a models.yml profile-registry outage left behind: an unkeyed
+			// session.create was accepted and then refused by model-profile validation
+			// before its effect boundary. On disk each identity is an accepted row and a
+			// terminal_error row with exactly these fields and the validation's response.
+			const registryError = new ModelProfileRegistryError("codex-medium");
+			const preEffectFailure = {
+				ok: false,
+				error: { code: registryError.code, message: registryError.message, details: registryError.details },
+			};
+			const incidentIdentities = [
+				"legacy-create-codex-medium",
+				"legacy-create-codex-pro",
+				"legacy-create-codex-high",
+			];
+			const seedPreEffectCreateFailures = async (ledger: LifecycleLedger, agentDir: string): Promise<void> => {
+				for (const identity of incidentIdentities) {
+					await ledger.begin(identity, `${identity}-request`);
+					await ledger.transition(identity, "terminal_error", { response: preEffectFailure });
+				}
+				const rows = (await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text())
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as Record<string, unknown>);
+				expect(rows.map(row => [row.identity, row.state, Object.keys(row).sort()])).toEqual(
+					incidentIdentities.flatMap(identity => [
+						[identity, "accepted", ["identity", "requestHash", "state", "ts", "version"]],
+						[
+							identity,
+							"terminal_error",
+							["identity", "requestHash", "response", "responseDigest", "state", "ts", "version"],
+						],
+					]),
+				);
+			};
+			const registerLiveHost = async (
+				broker: Broker,
+				root: string,
+				sessionId: string,
+				frames: Array<Record<string, unknown>>,
+			): Promise<{ stop: () => void }> => {
+				const stateRoot = path.join(root, ".gjc", "state");
+				const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+				const server = Bun.serve({
+					hostname: "127.0.0.1",
+					port: 0,
+					fetch(request, httpServer) {
+						if (httpServer.upgrade(request)) return;
+						return new Response("WebSocket required", { status: 426 });
+					},
+					websocket: {
+						open(ws) {
+							ws.send(JSON.stringify({ type: "hello" }));
+						},
+						message(ws, message) {
+							const frame = JSON.parse(String(message)) as Record<string, unknown>;
+							if (typeof frame.id !== "string") return;
+							frames.push(frame);
+							// A typed host refusal proves the close was admitted and dispatched to
+							// the live host without letting the fixture process exit.
+							ws.send(
+								JSON.stringify({
+									id: frame.id,
+									ok: false,
+									error: { code: "flush_failed", message: "session flush failed" },
+								}),
+							);
+						},
+					},
+				});
+				await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+				await fs.writeFile(
+					endpointPath,
+					JSON.stringify({
+						sessionId,
+						pid: process.pid,
+						url: `ws://127.0.0.1:${server.port}`,
+						token: "live-token",
+					}),
+				);
+				const locator = { cwd: root, worktreeRoot: null, stateRoot };
+				await broker.index.append({
+					type: "host_registered",
+					sessionId,
+					locator,
+					endpointGeneration: 1,
+					pid: process.pid,
+					endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+					lifecycleRequestId: `${sessionId}-capability`,
+				});
+				await broker.index.append({
+					type: "host_heartbeat",
+					sessionId,
+					locator,
+					endpointGeneration: 1,
+					pid: process.pid,
+				});
+				return { stop: () => server.stop(true) };
+			};
+
+			it("admits close of an unrelated live session", async () => {
+				await withLegacyLedger(seedPreEffectCreateFailures, async (broker, root) => {
+					const frames: Array<Record<string, unknown>> = [];
+					const host = await registerLiveHost(broker, root, "live-unrelated", frames);
+					try {
+						const ledgerBefore = broker.ledger.get("legacy-create-codex-medium");
+						await expect(
+							broker.handleRequest("session.close", { sessionId: "live-unrelated" }, "fresh-live-close"),
+						).resolves.toEqual({
+							ok: false,
+							error: { code: "flush_failed", message: "session flush failed" },
+						});
+						expect(frames.length).toBeGreaterThan(0);
+						// Admission recorded a keyed close; the legacy rows are left untouched.
+						expect(broker.ledger.findAnyByOperationKey("session.close\u0000fresh-live-close")).toBeDefined();
+						expect(broker.ledger.get("legacy-create-codex-medium")).toEqual(ledgerBefore);
+						// The idle-fenced close operators use for resource return is admitted too.
+						const dispatchedBefore = frames.length;
+						await expect(
+							broker.handleRequest(
+								"session.close",
+								{ sessionId: "live-unrelated", ifIdle: true },
+								"fresh-live-close-if-idle",
+							),
+						).resolves.toEqual({
+							ok: false,
+							error: { code: "flush_failed", message: "session flush failed" },
+						});
+						expect(frames.length).toBeGreaterThan(dispatchedBefore);
+					} finally {
+						host.stop();
+					}
+				});
+			});
+			it("admits close, resume, delete, and reconcile_uncertain for any other target", async () => {
+				await withLegacyLedger(seedPreEffectCreateFailures, async (broker, root) => {
+					for (const operation of nonCreateOperations)
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}-b`),
+						).resolves.toEqual(admittedSessionBResponses[operation]);
+					await expect(
+						broker.handleRequest(
+							"session.reconcile_uncertain",
+							{ sessionId: "session-b", remoteCreateKey: "remote-create-b" },
+							"fresh-reconcile-b",
+						),
+					).resolves.toEqual({ ok: false, error: { code: "not_found", message: "session is not indexed" } });
+				});
+			});
+			it("admits a reused key whose only legacy row failed before any effect", async () => {
+				// Intentional: a key whose earlier legacy request failed before any effect
+				// cannot double an effect when reused, so it no longer fences a new target.
+				const reusedKey = "reused-pre-effect-delete-key";
+				const priorTarget = { sessionId: "session-a" };
+				await withLegacyLedger(
+					async (ledger, agentDir) => {
+						const identity = await deriveLegacyTargetIdentity(
+							agentDir,
+							"session.delete",
+							reusedKey,
+							createHash("sha256")
+								.update(JSON.stringify(lifecycleTargetForTest("session.delete", priorTarget)))
+								.digest("hex"),
+						);
+						await ledger.begin(identity, "legacy-pre-effect-delete-request");
+						await ledger.transition(identity, "terminal_error", { response: preEffectFailure });
+					},
+					async (broker, root) => {
+						await expect(
+							broker.handleRequest("session.delete", requestFor("session.delete", "session-b", root), reusedKey),
+						).resolves.toEqual(admittedSessionBResponses["session.delete"]);
+					},
+				);
+			});
+			it.each([
+				"session.delete",
+				"session.resume",
+			])("admits %s under a reused pre-effect key while another legacy row records the prior target", async operation => {
+				// The settled create of session-a puts this key's earlier identity in the
+				// caller's key-reuse set; the pre-effect refusal still changed nothing.
+				const reusedKey = `reused-pre-effect-${operation}-key`;
+				const priorTarget = { sessionId: "session-a" };
+				await withLegacyLedger(
+					async (ledger, agentDir) => {
+						const identity = await deriveLegacyTargetIdentity(
+							agentDir,
+							operation,
+							reusedKey,
+							createHash("sha256")
+								.update(JSON.stringify(lifecycleTargetForTest(operation, priorTarget)))
+								.digest("hex"),
+						);
+						await ledger.begin(identity, `legacy-pre-effect-${operation}-request`);
+						await ledger.transition(identity, "terminal_error", { response: preEffectFailure });
+						await ledger.begin("legacy-create-a", "legacy-create-a-request");
+						await ledger.transition("legacy-create-a", "terminal_ok", {
+							resultSessionId: "session-a",
+							response: { ok: true, result: { sessionId: "session-a" } },
+						});
+					},
+					async (broker, root) => {
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), reusedKey),
+						).resolves.toEqual(admittedSessionBResponses[operation]);
+					},
+				);
+			});
+			it("keeps a terminal_error row with an effect marker fenced", async () => {
+				await withLegacyLedger(
+					async ledger => {
+						await ledger.begin("legacy-marked", "legacy-marked-request");
+						await ledger.transition("legacy-marked", "terminal_error", {
+							effectMarker: "legacy-marker",
+							response: preEffectFailure,
+						});
+					},
+					async (broker, root) => {
+						expect(broker.ledger.get("legacy-marked")?.state).toBe("terminal_error");
+						for (const operation of nonCreateOperations)
+							await expect(
+								broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}`),
+							).resolves.toEqual(ambiguousTarget);
+					},
+				);
+			});
+			it("keeps a terminal_error row whose retained history reached effect_started fenced", async () => {
+				await withLegacyLedger(
+					async ledger => {
+						await ledger.begin("legacy-started", "legacy-started-request");
+						await ledger.transition("legacy-started", "effect_started");
+						await ledger.transition("legacy-started", "terminal_error", { response: preEffectFailure });
+						expect(ledger.get("legacy-started")?.effectMarker).toBeUndefined();
+					},
+					async broker => {
+						expect(broker.ledger.get("legacy-started")?.state).toBe("terminal_error");
+						await expect(
+							broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-started"),
+						).resolves.toEqual(ambiguousTarget);
+					},
+				);
+			});
+			it("keeps a terminal_error row with effect or cleanup evidence fenced", async () => {
+				const evidence: Array<Record<string, unknown>> = [
+					{ effectIntent: { sessionId: "", stateRoot: "/legacy/state" } },
+					{ durableEffects: { transcript: { identityDigest: "a", contentDigest: "b" } } },
+					{
+						response: {
+							ok: false,
+							error: { code: "fixture_error", message: "legacy cleanup", cleanup: { worktree: true } },
+						},
+					},
+				];
+				for (const fields of evidence)
+					await withLegacyLedger(
+						async ledger => {
+							await ledger.begin("legacy-evidence", "legacy-evidence-request");
+							await ledger.transition("legacy-evidence", "terminal_error", {
+								response: preEffectFailure,
+								...fields,
+							});
+						},
+						async broker => {
+							expect(broker.ledger.get("legacy-evidence")?.state).toBe("terminal_error");
+							await expect(
+								broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-evidence"),
+							).resolves.toEqual(ambiguousTarget);
+						},
+					);
+			});
+			it("keeps a terminal_error row recording the requested session fenced", async () => {
+				for (const field of ["intendedSessionId", "resultSessionId"] as const)
+					await withLegacyLedger(
+						async ledger => {
+							await ledger.begin("legacy-same", "legacy-same-request");
+							await ledger.transition("legacy-same", "terminal_error", {
+								[field]: "session-b",
+								response: preEffectFailure,
+							});
+						},
+						async (broker, root) => {
+							expect(broker.ledger.get("legacy-same")?.state).toBe("terminal_error");
+							for (const operation of nonCreateOperations)
+								await expect(
+									broker.handleRequest(
+										operation,
+										requestFor(operation, "session-b", root),
+										`fresh-${operation}`,
+									),
+								).resolves.toEqual(ambiguousTarget);
+						},
+					);
+			});
+			it("keeps unsettled legacy rows without a session or marker fenced", async () => {
+				for (const state of ["accepted", "effect_started", "awaiting_ready", "terminal_uncertain"] as const)
+					await withLegacyLedger(
+						async ledger => {
+							await ledger.begin("legacy-unsettled", "legacy-unsettled-request");
+							if (state !== "accepted") await ledger.transition("legacy-unsettled", state);
+						},
+						async broker => {
+							await expect(
+								broker.handleRequest("session.close", { sessionId: "session-b" }, `fresh-close-${state}`),
+							).resolves.toEqual(ambiguousTarget);
+						},
+					);
+			});
 		});
 	});
 	it("replays exact-target terminal legacy creates and expires opaque cross-target key history", async () => {
@@ -3595,7 +3907,7 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 
-	it("fails closed on retained artifacts across retry without deleting transcript authority", async () => {
+	it("completes delete once the retained artifact namespace is durably scrubbed (#7749)", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
 		const stateRoot = path.join(cwd, ".gjc", "state");
@@ -3616,39 +3928,87 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
-			const pending = await broker.handleRequest(
+			const deleted = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },
 				"verified-delete-key",
+			);
+			expect(deleted).toEqual({ ok: true, result: { sessionId } });
+			await expect(fs.stat(sessionPath)).rejects.toThrow();
+			await expect(fs.stat(artifactsDir)).rejects.toThrow();
+			// POSIX retains the payload-free namespace; no artifact bytes survive.
+			const retainedPayloads = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
+				entry.endsWith(".artifact.txt"),
+			);
+			for (const retained of retainedPayloads)
+				expect(await fs.readFile(path.join(path.dirname(sessionPath), retained), "utf8")).toBe("");
+
+			expect(
+				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "verified-delete-key"),
+			).toEqual({ ok: true, result: { sessionId } });
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a retained artifact namespace still holds payload despite a durable claim", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "retained-payload-delete";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		let retainedRoot: string | undefined;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await fs.writeFile(path.join(artifactsDir, ".artifact.txt"), "artifact");
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (!target.plannedArtifactsPath || !target.expectedArtifactsIdentity)
+				throw new Error("Expected preauthorized artifact quarantine");
+			retainedRoot = `${target.plannedArtifactsPath}.removing`;
+			await fs.rename(artifactsDir, retainedRoot);
+			const tree = native.snapshotDirectoryTree(retainedRoot);
+			if (!tree.ok || !tree.snapshot) throw new Error("Expected retained root tree snapshot");
+			return {
+				kind: "cleanup_pending",
+				phase: "artifacts",
+				error: new Error("Exact detached artifact removal rejected: cleanup_pending"),
+				artifactsIdentity: target.expectedArtifactsIdentity,
+				artifactsTree: tree.snapshot,
+				detachedArtifactsPath: retainedRoot,
+				artifactsPayloadDurable: true,
+				transcriptIdentity: target.transcriptIdentity,
+			};
+		};
+		try {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: 999_999_999,
+			});
+			const pending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-payload-key",
 			);
 			expect(pending).toMatchObject({
 				ok: false,
 				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
 			});
+			expect(calls).toBe(1);
 			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
-			await expect(fs.stat(artifactsDir)).rejects.toThrow();
-			const retainedPayloads = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
-				entry.endsWith(".artifact.txt"),
-			);
-			expect(retainedPayloads).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("");
-
-			const retried = await broker.handleRequest(
-				"session.delete",
-				{ sessionId, sessionPath, cwd },
-				"verified-delete-key",
-			);
-			expect(retried).toMatchObject({
-				ok: false,
-				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
-			});
-			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
-			const payloadsAfterRetry = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
-				entry.endsWith(".artifact.txt"),
-			);
-			expect(payloadsAfterRetry).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe("");
+			expect(await fs.readFile(path.join(retainedRoot!, ".artifact.txt"), "utf8")).toBe("artifact");
 		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}

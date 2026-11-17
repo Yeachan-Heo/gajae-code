@@ -38,6 +38,44 @@ function authority(): { authority: FilesystemTopicRegistryCasAuthority; file: st
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
+test("Darwin machine identity invokes ioreg by absolute path", async () => {
+	const hostId = await loadInstallationHostId({
+		platform: "darwin",
+		installationSecret: "11".repeat(32),
+		runCommand(command, args) {
+			expect(command).toBe("/usr/sbin/ioreg");
+			expect(args).toEqual(["-rd1", "-c", "IOPlatformExpertDevice"]);
+			return {
+				exitCode: 0,
+				stdout: new TextEncoder().encode('"IOPlatformUUID" = "00112233-4455-6677-8899-aabbccddeeff"'),
+			};
+		},
+	});
+
+	expect(hostId).toMatch(/^[0-9a-f]{64}$/);
+});
+
+test("Darwin machine identity treats an unavailable ioreg executable as unavailable identity", async () => {
+	await expect(
+		loadInstallationHostId({
+			platform: "darwin",
+			installationSecret: "11".repeat(32),
+			runCommand: () => {
+				throw Object.assign(new Error('Executable not found in $PATH: "ioreg"'), { code: "ENOENT" });
+			},
+		}),
+	).rejects.toThrow("machine-local identity is unavailable or malformed");
+	await expect(
+		loadInstallationHostId({
+			platform: "darwin",
+			installationSecret: "11".repeat(32),
+			runCommand: () => {
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			},
+		}),
+	).rejects.toThrow("permission denied");
+});
+
 test("machine-local identity parsing is strict and machine IDs are keyed per installation", async () => {
 	expect(parseWindowsMachineGuid("MachineGuid    REG_SZ    00112233-4455-6677-8899-aabbccddeeff")).toBe(
 		"00112233-4455-6677-8899-aabbccddeeff",

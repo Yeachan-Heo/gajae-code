@@ -156,7 +156,8 @@ export async function fetchWithRetry(
 		if (!isRetryableStatus(response.status)) return response;
 		if (attempt + 1 >= maxAttempts) return response;
 
-		const hint = extractRetryHint(response, await response.clone().text());
+		// Header hints take precedence and must not wait for an error body to finish.
+		const hint = extractRetryHint(response) ?? extractRetryHint(response, await response.clone().text());
 		if (hint !== undefined && hint > maxDelayMs) return response;
 
 		const delayMs = normalizeRetryDelay(hint ?? resolveDefaultDelay(defaultDelayMs, attempt), maxDelayMs);

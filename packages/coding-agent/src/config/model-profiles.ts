@@ -670,6 +670,15 @@ const PROFILE_GROUP_ORDER = [
 	"COMBOS",
 ];
 
+/**
+ * Position of a provider family in the preset group order. Families the terminal does not list
+ * report undefined, which sorts after every listed family.
+ */
+export function modelProfileGroupRank(group: string): number | undefined {
+	const index = PROFILE_GROUP_ORDER.indexOf(group);
+	return index < 0 ? undefined : index;
+}
+
 const OPEN_WEIGHT_PROFILE_ORDER = [
 	"open-weights-glm",
 	"open-weights-deepseek",

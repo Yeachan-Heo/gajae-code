@@ -1,3 +1,4 @@
+import type { EndpointConfiguration } from "@gajae-code/utils";
 import type { ZodType, z } from "zod/v4";
 import type { CustomApiRegistry } from "./api-registry";
 import type { ProviderDiagnostic } from "./provider-diagnostic";
@@ -396,6 +397,25 @@ export type FetchImpl = ((input: string | URL | Request, init?: RequestInit) => 
 };
 
 /**
+ * Detached snapshot of one outbound provider HTTP request, handed to
+ * {@link StreamOptions.onProviderDispatch} immediately before it is sent.
+ *
+ * SENSITIVE: `url` (query included), `headers` (credentials) and `body`
+ * (conversation content) must never be logged or persisted. `headers` and
+ * `body` are copies; mutating them does not affect the request on the wire.
+ * `body` is `undefined` when the request has no body or its body is not a
+ * readable string/ArrayBuffer/view (streams and `Request` bodies are never
+ * consumed).
+ */
+export interface ProviderDispatch {
+	readonly api: Api;
+	readonly url: string;
+	readonly method: string;
+	readonly headers: Headers;
+	readonly body: string | Uint8Array | undefined;
+}
+
+/**
  * Credential returned by an auth retry resolver.
  *
  * The optional admission callback lets an authority-bearing caller retain a
@@ -430,6 +450,8 @@ export interface StreamOptions {
 	maxTokens?: number;
 	/** Explicit custom API handler scope for this execution; never inferred from model metadata. */
 	customApiRegistry?: CustomApiRegistry;
+	/** Captured routing only; credentials, ADC and callback authority remain live/shared. */
+	endpointConfiguration?: EndpointConfiguration;
 	signal?: AbortSignal;
 	apiKey?: string;
 	/** Disables all transport-level replay; the fallback controller owns retries. */
@@ -532,6 +554,28 @@ export interface StreamOptions {
 	 * fallback for custom providers that do not expose a transport seam.
 	 */
 	onStreamCreated?: () => void;
+	/**
+	 * Synchronous observe/reject hook invoked immediately before each actual HTTP
+	 * send of a provider request, after every request transform (payload hooks,
+	 * compression). Every network attempt, including SDK and provider retries, is
+	 * observed.
+	 *
+	 * The hook has no authority to replace the request or the response: the
+	 * dispatch it receives is a detached copy, and mutating it does not change the
+	 * wire request. Throwing rejects that dispatch with zero network I/O; the
+	 * rejection is not retried and the thrown error is the stream failure.
+	 *
+	 * SENSITIVE: the URL (including query), headers (credentials) and body
+	 * (conversation content) must never be logged or persisted.
+	 *
+	 * Currently honoured only by the built-in Anthropic Messages transport. A
+	 * caller-supplied `client` owns its own HTTP stack, so observation there
+	 * cannot be guaranteed and the hook is not invoked. With a caller-supplied
+	 * `fetch`, the hook observes the handoff to that function, not any additional
+	 * transformations or network requests it performs. Cache-prefix validation
+	 * must exclude those custom transports.
+	 */
+	onProviderDispatch?: (dispatch: ProviderDispatch) => void;
 	/** Internal authority policy: disable provider-owned retries and corrective replays. */
 	disableProviderRetries?: boolean;
 	/**

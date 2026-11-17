@@ -62,6 +62,7 @@ export interface PreflightRecord {
 
 export type AdmissionResult = { ok: true } | { ok: false; reason: string };
 
+/** Preregistration digests: sorted keys, omits undefined-valued keys, and rejects non-finite numbers, non-plain objects, cycles, and non-JSON scalars. */
 export function canonicalJson(value: unknown): string {
 	return encodeCanonical(value, new WeakSet<object>());
 }

@@ -6,6 +6,7 @@ import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as git from "@gajae-code/coding-agent/utils/git";
 import { getAgentDir, getResidentCacheRootDir, setAgentDir } from "@gajae-code/utils";
+import { mulberry32 } from "./helpers/seeded-random";
 
 const PROPERTY_SEED = 5180518;
 const PROPERTY_INPUTS = 64;
@@ -97,17 +98,6 @@ function treeHas(root: string, needle: string): boolean {
 		if (fs.readFileSync(current).includes(target)) return true;
 	}
 	return false;
-}
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let value = state;
-		value = Math.imul(value ^ (value >>> 15), value | 1);
-		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-		return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
-	};
 }
 
 const ASSISTANT_CANARY = `sk-live-CANARY518-assistant-${"A".repeat(1200)}`;

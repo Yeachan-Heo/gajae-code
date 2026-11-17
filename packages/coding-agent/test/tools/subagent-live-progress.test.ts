@@ -5,7 +5,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 import { AsyncJobManager, type SubagentRecord } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { mapAgentSessionEventToAcpSessionUpdates } from "../../src/modes/acp/acp-event-mapper";
-import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import { setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 import { SubagentTool } from "../../src/tools/implementations";
@@ -15,6 +15,7 @@ import {
 	subagentAwaitRenderedStateSignature,
 } from "../../src/tools/subagent";
 import { subagentToolRenderer } from "../../src/tools/subagent-render";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -850,7 +851,7 @@ describe("subagent await progress visibility boundary", () => {
 		expect(String(telemetryInput)).not.toContain("secret-marker-text");
 		await tracerProvider.shutdown();
 
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		setThemeInstance(theme);
 		const rendered = Bun.stripANSI(
 			subagentToolRenderer
@@ -882,6 +883,90 @@ describe("subagent await progress visibility boundary", () => {
 		expect(staleRendered).not.toContain("read");
 
 		manager.cancelSubagent("0-Vis", { ownerId: "0-Main" });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("shows report_metric charts in the await panel without putting them in model-visible content", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"metric subagent",
+			async () => {
+				await Bun.sleep(150);
+				return "done";
+			},
+			{
+				id: "job-metric",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Metric", agent: "explore", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Metric", jobId));
+		const chart = {
+			title: "Changed pixels",
+			rows: [
+				{ label: "webp", value: 6841 },
+				{ label: "avif", value: 7308 },
+			],
+		};
+		manager.recordSubagentProgress(
+			"0-Metric",
+			makeProgress({
+				id: "0-Metric",
+				currentTool: "bash",
+				extractedToolData: {
+					report_metric: [chart, { title: "invalid", rows: [{ label: "x", value: -1 }] }],
+				},
+			}),
+		);
+
+		const result = await tool.execute("await", { action: "await", ids: ["0-Metric"], timeout_ms: 5 });
+		const snap = result.details?.subagents.find(s => s.id === "0-Metric");
+		expect(snap?.progress?.metrics).toEqual([chart]);
+		const modelText = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
+		expect(modelText).not.toContain("Changed pixels");
+
+		const theme = (await loadTestTheme())!;
+		setThemeInstance(theme);
+		const rendered = Bun.stripANSI(
+			subagentToolRenderer
+				.renderResult(result, { expanded: true, isPartial: true, spinnerFrame: 0 }, theme)
+				.render(80)
+				.join("\n"),
+		);
+		expect(rendered).toContain("Changed pixels");
+		expect(rendered).toContain(`avif ${"█".repeat(24)} 7308`);
+		expect(rendered).not.toContain("invalid");
+
+		// Restored details are untrusted: malformed metrics render nothing instead of throwing.
+		for (const metrics of [{}, [null, { title: "broken" }, chart]]) {
+			const restored = {
+				...result,
+				details: {
+					...result.details!,
+					subagents: result.details!.subagents.map(s => ({ ...s, progress: { ...s.progress!, metrics } })),
+				},
+			} as typeof result;
+			const restoredText = Bun.stripANSI(
+				subagentToolRenderer
+					.renderResult(restored, { expanded: true, isPartial: true, spinnerFrame: 0 }, theme)
+					.render(80)
+					.join("\n"),
+			);
+			expect(restoredText).not.toContain("broken");
+			expect(restoredText.includes("Changed pixels")).toBe(Array.isArray(metrics));
+		}
+
+		// The chart is part of the rendered-state signature, so a new chart re-renders.
+		const before = subagentAwaitRenderedStateSignature(result.details!.subagents);
+		const changed = result.details!.subagents.map(s => ({
+			...s,
+			progress: { ...s.progress!, metrics: [{ ...chart, rows: [{ label: "webp", value: 1 }] }] },
+		}));
+		expect(subagentAwaitRenderedStateSignature(changed)).not.toBe(before);
+
+		manager.cancelSubagent("0-Metric", { ownerId: "0-Main" });
 		await manager.dispose({ timeoutMs: 100 });
 	});
 });

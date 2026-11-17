@@ -11,11 +11,12 @@ import {
 	IRC_OBSERVATION_LEDGER_MAX_SEEN_IDENTITIES,
 	IrcObservationLedger,
 } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { Container, Text } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 async function dispatchAndSelectFork(ctx: InteractiveModeContext): Promise<void> {
 	await new CommandController(ctx).handleForkCommand();
@@ -131,8 +132,7 @@ afterEach(() => {
 });
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Expected dark theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

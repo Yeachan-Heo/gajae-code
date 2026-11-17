@@ -2,6 +2,11 @@ import { describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
+import {
+	commitDurableModelProfileOwnership,
+	type DurableModelProfileOwnership,
+	readDurableModelProfileOwnership,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { runExtensionSetModel } from "@gajae-code/coding-agent/extensibility/extensions/compact-handler";
@@ -80,16 +85,16 @@ describe("AgentSession model-change causes", () => {
 	});
 	test("runExtensionSetModel passes user-selection cause", async () => {
 		const model = { provider: "p", id: "m" } as unknown as Model;
-		const calls: Array<{ role?: string; cause?: string }> = [];
-		const materialized: Model[] = [];
+		const calls: Array<{ role?: string; cause?: string; observedOwnership?: DurableModelProfileOwnership }> = [];
 		const session = {
+			settings: Settings.isolated(),
 			modelRegistry: { getApiKey: async () => "key" },
-			setModel: async (_model: Model, role?: string, options?: { cause?: string }) => {
-				calls.push({ role, cause: options?.cause });
-			},
-			materializeActiveDefaultModelProfileAssignment: (selected: Model) => {
-				materialized.push(selected);
-				return true;
+			setModel: async (
+				_model: Model,
+				role?: string,
+				options?: { cause?: string; observedOwnership?: DurableModelProfileOwnership },
+			) => {
+				calls.push({ role, ...options });
 			},
 		};
 
@@ -97,14 +102,44 @@ describe("AgentSession model-change causes", () => {
 
 		expect(ok).toBe(true);
 		expect(calls).toHaveLength(1);
-		expect(calls[0]).toEqual({ role: "default", cause: "user-selection" });
-		expect(materialized).toEqual([model]);
+		expect(calls[0]).toEqual({
+			role: "default",
+			cause: "user-selection",
+			observedOwnership: { schemaVersion: 1, version: 0, marker: { kind: "inherit" } },
+		});
+	});
+
+	test("runExtensionSetModel captures ownership before its credential await", async () => {
+		const model = { provider: "p", id: "m" } as unknown as Model;
+		const settings = Settings.isolated();
+		const before = await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-a" });
+		const credential = Promise.withResolvers<string>();
+		const setModel = vi.fn(
+			async (_model: Model, _role?: string, _options?: { observedOwnership?: DurableModelProfileOwnership }) => {},
+		);
+		const selection = runExtensionSetModel(
+			{
+				settings,
+				modelRegistry: { getApiKey: () => credential.promise },
+				setModel,
+			},
+			model,
+		);
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-b" });
+		credential.resolve("key");
+		expect(await selection).toBe(true);
+		expect(setModel).toHaveBeenCalledWith(model, "default", { cause: "user-selection", observedOwnership: before });
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 2,
+			marker: { kind: "profile", profile: "profile-b" },
+		});
 	});
 
 	test("runExtensionSetModel returns false without an API key and does not set the model", async () => {
 		const model = { provider: "p", id: "m" } as unknown as Model;
 		let setModelCalled = false;
 		const session = {
+			settings: Settings.isolated(),
 			modelRegistry: { getApiKey: async () => undefined },
 			setModel: async () => {
 				setModelCalled = true;

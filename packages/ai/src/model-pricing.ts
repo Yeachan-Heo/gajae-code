@@ -18,6 +18,11 @@ const ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING: LongContextPricing = {
 // tokens, $1 above), and the provider defaults to `ttl: "1h"`.
 const ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H = { standard: 0.2, longContext: 1 };
 
+// Claude Fable 5.x on the direct Messages API bills 1-hour cache writes at twice the
+// base input rate ($20 for Fable 5 and 5.1, $16 for Fable 5.2).
+// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+const ANTHROPIC_FABLE_ID = /^claude-fable-5(?:-\d)?(?:-\d{8})?$/;
+
 const GPT_5_6_SOL_PRICING: TieredPricing = {
 	cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
 	longContextPricing: {
@@ -55,6 +60,17 @@ const GPT_6_1_SOL_PRICING: TieredPricing = {
 	},
 };
 
+// GPT-6.1 Terra: $1/$5 standard, cache read $0.05, cache write $1.25 (30m) / $2.50 (12h);
+// inputs past 272K apply 2x to input/cache and 1.5x to output.
+// No Ultrafast tier for Terra (only Astra and Sol have Ultrafast).
+const GPT_6_1_TERRA_PRICING: TieredPricing = {
+	cost: { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 },
+	longContextPricing: {
+		threshold: LONG_CONTEXT_THRESHOLD,
+		cost: { input: 2, output: 7.5, cacheRead: 0.1, cacheWrite: 2.5 },
+	},
+};
+
 // GPT-6 Luna: $0.10/$0.50 standard, cache read $0.01, cache write $0.125;
 // inputs past 272K apply 2x to input/cache and 1.5x to output.
 const GPT_6_LUNA_PRICING: TieredPricing = {
@@ -70,6 +86,7 @@ const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
 	["gpt-6-astra", GPT_6_ASTRA_PRICING],
 	["gpt-6-sol", GPT_6_SOL_PRICING],
 	["gpt-6.1-sol", GPT_6_1_SOL_PRICING],
+	["gpt-6.1-terra", GPT_6_1_TERRA_PRICING],
 	["gpt-6-luna", GPT_6_LUNA_PRICING],
 	["gpt-5.6", GPT_5_6_SOL_PRICING],
 	["gpt-5.6-sol", GPT_5_6_SOL_PRICING],
@@ -165,6 +182,9 @@ export function getAnthropicCacheWriteOneHourRate<TApi extends Api>(
 			? ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H.longContext
 			: ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H.standard;
 	}
+	if (model.provider === "anthropic" && model.api === "anthropic-messages" && ANTHROPIC_FABLE_ID.test(model.id)) {
+		return Math.round(2 * model.cost.input * 1e9) / 1e9;
+	}
 	if (
 		model.provider === "amazon-bedrock" &&
 		model.api === "bedrock-converse-stream" &&
@@ -177,7 +197,29 @@ export function getAnthropicCacheWriteOneHourRate<TApi extends Api>(
 	return undefined;
 }
 
+// Anthropic bills Claude Sonnet 5.5 cache hits at 0.05x base input, not the standard 0.1x
+// that Sonnet 5 uses. Bedrock inference profiles apply the same multiplier to their own
+// input rate, so the regional premium carries through.
+// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+const SONNET_5_5_CACHE_READ_MULTIPLIER = 0.05;
+const BEDROCK_SONNET_5_5_ID = /^(?:(?:au|eu|global|jp|us)\.)?anthropic\.claude-sonnet-5-5$/;
+
+function isFirstPartySonnet55<TApi extends Api>(model: Model<TApi>): boolean {
+	if (model.provider === "anthropic") {
+		return model.api === "anthropic-messages" && model.id === "claude-sonnet-5-5";
+	}
+	return (
+		model.provider === "amazon-bedrock" &&
+		model.api === "bedrock-converse-stream" &&
+		BEDROCK_SONNET_5_5_ID.test(model.id)
+	);
+}
+
 export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>): void {
+	if (isFirstPartySonnet55(model)) {
+		const cacheRead = Math.round(model.cost.input * SONNET_5_5_CACHE_READ_MULTIPLIER * 1e9) / 1e9;
+		model.cost = { ...model.cost, cacheRead };
+	}
 	const pricing = getAnthropicLongContextPricing(model);
 	if (pricing) model.longContextPricing = pricing;
 }

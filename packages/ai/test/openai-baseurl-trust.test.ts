@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * These base URLs become the request endpoints that carry the OpenAI / Azure
@@ -25,18 +25,7 @@ interface Resolved {
 	azure: string | null;
 }
 
-const tempDirs: string[] = [];
-
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-openai-baseurl-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { projectDir } = createTrustTempDirs("gjc-openai-baseurl-trust-");
 
 async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
 	const env: Record<string, string> = {};

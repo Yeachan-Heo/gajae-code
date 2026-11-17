@@ -17,7 +17,7 @@ import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
-import { TempDir } from "@gajae-code/utils";
+import { hookFetch, TempDir } from "@gajae-code/utils";
 import { attachExactMcpControls } from "../src/runtime-mcp/redaction";
 
 describe("AgentSession handoff", () => {
@@ -211,6 +211,74 @@ describe("AgentSession handoff", () => {
 		expect(session.sessionId).not.toBe(previousSessionId);
 		expect(observedSessionIds).toEqual([session.sessionId]);
 		unsubscribe();
+	});
+
+	it.each([
+		["handoff", undefined],
+		["branch", undefined],
+		["handoff", "runtime"],
+		["branch", "runtime"],
+		["handoff", "config"],
+		["branch", "config"],
+		["handoff", "fallback"],
+		["branch", "fallback"],
+	] as const)("keeps credential routing in production %s maintenance (override=%s)", async (kind, override) => {
+		const bundled = getBundledModel("openai", "gpt-4o");
+		if (!bundled) throw new Error("Expected bundled OpenAI model");
+		const model = { ...bundled, api: "openai-completions" as const, baseUrl: "https://maintenance-proxy.example/v1" };
+		session.agent.setModel(model);
+		authStorage.set("openai", {
+			type: "oauth",
+			access: "fixture-oauth",
+			refresh: "fixture-refresh",
+			expires: Date.now() + 3600000,
+		});
+		expect(await modelRegistry.getApiKey(model, session.credentialSessionId)).toBe("fixture-oauth");
+		if (override === "runtime") authStorage.setRuntimeApiKey("openai", "fixture-proxy-key");
+		if (override === "config") modelRegistry.registerProvider("openai", { apiKey: "fixture-proxy-key" });
+		if (override === "fallback") {
+			authStorage.set("openai", {
+				type: "oauth",
+				access: "expired-fixture",
+				refresh: "fixture-refresh",
+				expires: 1,
+			});
+			authStorage.setFallbackResolver(
+				provider => (provider === "openai" ? "fixture-proxy-key" : undefined),
+				modelRegistry.getAuthStorageOwner(),
+			);
+		}
+		const requests: { url: string; authorization: string | null }[] = [];
+		using _hook = hookFetch(async (input, init) => {
+			const request = input instanceof Request ? input : new Request(String(input), init);
+			requests.push({ url: request.url, authorization: request.headers.get("authorization") });
+			const chunk = {
+				id: "fixture",
+				object: "chat.completion.chunk",
+				created: 1,
+				model: model.id,
+				choices: [{ index: 0, delta: { role: "assistant", content: "maintenance summary" }, finish_reason: null }],
+			};
+			const done = { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
+			return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(done)}\n\ndata: [DONE]\n\n`, {
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+		if (kind === "handoff") {
+			const result = await session.handoff();
+			expect(result?.document).toBe("maintenance summary");
+		} else {
+			const target = sessionManager.getBranch().find(entry => entry.type === "message");
+			if (!target) throw new Error("Expected seeded branch");
+			const result = await session.navigateTree(target.id, { summarize: true });
+			expect(result.summaryEntry?.summary).toContain("maintenance summary");
+		}
+		expect(requests).toEqual([
+			{
+				url: `${override ? model.baseUrl : "https://api.openai.com/v1"}/chat/completions`,
+				authorization: `Bearer ${override ? "fixture-proxy-key" : "fixture-oauth"}`,
+			},
+		]);
 	});
 
 	it("notifies after a committed session switch even when transition cleanup rejects", async () => {

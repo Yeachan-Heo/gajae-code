@@ -1,8 +1,10 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { enrichModelThinking } from "@gajae-code/ai/model-thinking";
-import type { Model } from "@gajae-code/ai/types";
+import type { AssistantMessage, Model } from "@gajae-code/ai/types";
 import { isEnoent } from "@gajae-code/utils";
+
+export * from "./aws-eventstream";
 
 export async function withEnv(
 	overrides: Record<string, string | undefined>,
@@ -52,6 +54,34 @@ export async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal |
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", onAbort);
 	}
+}
+
+/** Already-aborted signal for provider paths that must bail out before any request goes out. */
+export function createAbortedSignal(): AbortSignal {
+	const controller = new AbortController();
+	controller.abort();
+	return controller.signal;
+}
+
+/** Empty assistant output for `openai-responses` stream-processing tests. */
+export function createResponsesOutput(): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		timestamp: Date.now(),
+		provider: "test-provider",
+		model: "test-model",
+		api: "openai-responses",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+	};
 }
 
 export function createCodexModel(id: string): Model<"openai-codex-responses"> {

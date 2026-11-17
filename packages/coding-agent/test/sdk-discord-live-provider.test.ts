@@ -515,6 +515,42 @@ describe("DiscordLiveProvider protocol", () => {
 		await live.stop();
 	});
 
+	test("honors the requested resume delay when the clock advances between reads", async () => {
+		const sockets: FakeSocket[] = [];
+		const delays: number[] = [];
+		let clock = 0;
+		const live = new DiscordLiveProvider({
+			applicationId: "app",
+			botToken: "discord-secret-token",
+			apiBaseUrl: "https://discord.test/api",
+			fetchImpl: async input =>
+				String(input).endsWith("/users/@me") ? response({ id: "bot" }) : response({ url: "wss://gateway.test" }),
+			WebSocketImpl: () => {
+				const socket = new FakeSocket();
+				sockets.push(socket);
+				return socket;
+			},
+			now: () => (clock += 5),
+			setTimeoutImpl: (_callback, milliseconds) => {
+				delays.push(milliseconds);
+				return { cancel() {} };
+			},
+		});
+		await live.start(async () => {});
+		const first = sockets[0]!;
+		first.message({ op: 10, d: { heartbeat_interval: 1 } });
+		first.message({
+			op: 0,
+			t: "READY",
+			s: 7,
+			d: { session_id: "resume-me", resume_gateway_url: "wss://resume.test" },
+		});
+		first.message({ op: 9, d: true });
+		// The timer receives the requested minimum, not that minimum minus elapsed clock time.
+		expect(delays).toEqual([1_000]);
+		await live.stop();
+	});
+
 	test("resumable invalid session retains resume state and resumes after the retry delay", async () => {
 		const sockets: FakeSocket[] = [];
 		const delays: number[] = [];

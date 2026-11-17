@@ -1,9 +1,10 @@
 import type { AutocompleteItem } from "@gajae-code/tui";
-import { parseFrontmatter, prompt } from "@gajae-code/utils";
+import { parseFrontmatter, prompt, sanitizeDisplayLine } from "@gajae-code/utils";
 import { slashCommandCapability } from "../capability/slash-command";
 import { appendInlineArgsFallback, templateUsesInlineArgPlaceholders } from "../config/prompt-templates";
 import type { SlashCommand } from "../discovery";
 import { loadCapability } from "../discovery";
+import type { AgentSession } from "../session/agent-session";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
 	type BuiltinSlashCommand,
@@ -116,8 +117,65 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<
 	return cmd;
 });
 
-export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {
+const SESSION_MCP_SUBCOMMANDS: SubcommandDef[] = [
+	{ name: "status", description: "Show MCP server status for this session" },
+	{ name: "list", description: "Alias for status" },
+	{ name: "connect", description: "Connect one server", usage: "<name>" },
+	{ name: "disconnect", description: "Disconnect one server", usage: "<name>" },
+	{ name: "reconnect", description: "Reconnect one server", usage: "<name>" },
+];
+
+/**
+ * Server names come from repository-controlled mcp.json files and are inserted into the
+ * editor and rendered by the select list. Offer only names that match the mcp.json
+ * schema's name pattern, so terminal control bytes never reach the completion UI.
+ */
+const COMPLETABLE_MCP_SERVER_NAME = /^[A-Za-z0-9_.-]{1,100}$/;
+
+/** Builtin command whose argument completions may resolve asynchronously from session state. */
+export type SessionBuiltinSlashCommand = BuiltinSlashCommand & {
+	getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
+	getInlineHint?: (argumentText: string) => string | null;
+};
+
+function getSessionMcpSlashCommands(
+	session: Pick<AgentSession, "getSessionMcpCompletionCandidates">,
+): readonly SessionBuiltinSlashCommand[] {
+	return BUILTIN_SLASH_COMMANDS.map(command => {
+		if (command.name !== "mcp") return command;
+		return {
+			...command,
+			subcommands: SESSION_MCP_SUBCOMMANDS,
+			getArgumentCompletions: async (prefix: string) => {
+				if (!prefix.includes(" ")) return buildArgumentCompletions(SESSION_MCP_SUBCOMMANDS)(prefix);
+				const match = /^(connect|disconnect|reconnect)\s+(\S*)$/.exec(prefix);
+				if (!match) return null;
+				const candidates = await session.getSessionMcpCompletionCandidates();
+				const list =
+					match[1] === "connect"
+						? candidates.connectable
+						: match[1] === "disconnect"
+							? candidates.connected
+							: candidates.reconnectable;
+				return list
+					.filter(server => COMPLETABLE_MCP_SERVER_NAME.test(server.name) && server.name.startsWith(match[2]))
+					.map(server => ({
+						value: `${match[1]} ${server.name}`,
+						label: server.name,
+						description: `${server.scope} · ${server.state} · autoload ${server.autoload ? "on" : "off"}`,
+					}));
+			},
+			getInlineHint: buildSubcommandInlineHint(SESSION_MCP_SUBCOMMANDS),
+		};
+	});
+}
+
+export function getBuiltinSlashCommandsForSession(
+	hasExactMcpControls: boolean,
+	session?: Pick<AgentSession, "hasSessionMcpControls" | "getSessionMcpCompletionCandidates">,
+): readonly SessionBuiltinSlashCommand[] {
 	if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;
+	if (session?.hasSessionMcpControls) return getSessionMcpSlashCommands(session);
 	return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp");
 }
 
@@ -135,23 +193,37 @@ export interface FileSlashCommand {
 
 const EMBEDDED_SLASH_COMMANDS = EMBEDDED_COMMAND_TEMPLATES;
 
+const COMMAND_DESCRIPTION_PREVIEW = 60;
+
+/** A command name is shown as typed. Names that display sanitization would change are not loaded. */
+export function isDisplaySafeCommandName(name: string): boolean {
+	// SelectList replaces HT. sanitizeDisplayLine keeps it, so a tabbed name would paint as a different string.
+	return name.length > 0 && !name.includes("\t") && sanitizeDisplayLine(name) === name;
+}
+
+/**
+ * Description shown for a file-backed slash command.
+ * Terminal controls are removed before the body-preview cutoff.
+ */
+export function slashCommandDescription(content: string): string {
+	return parseCommandTemplate(content, { source: "slash-command", level: "off" }).description;
+}
+
 function parseCommandTemplate(
 	content: string,
 	options: { source: string; level?: "off" | "warn" | "fatal" },
 ): { description: string; body: string } {
 	const { frontmatter, body } = parseFrontmatter(content, options);
 	const frontmatterDesc = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
-
-	// Get description from frontmatter or first non-empty line
-	let description = frontmatterDesc;
-	if (!description) {
-		const firstLine = body.split("\n").find(line => line.trim());
-		if (firstLine) {
-			description = firstLine.slice(0, 60);
-			if (firstLine.length > 60) description += "...";
-		}
+	if (frontmatterDesc) {
+		return { description: sanitizeDisplayLine(frontmatterDesc), body };
 	}
 
+	const firstLine = body.split("\n").find(line => line.trim());
+	if (!firstLine) return { description: "", body };
+	const clean = sanitizeDisplayLine(firstLine);
+	const description =
+		clean.length > COMMAND_DESCRIPTION_PREVIEW ? `${clean.slice(0, COMMAND_DESCRIPTION_PREVIEW)}...` : clean;
 	return { description, body };
 }
 
@@ -167,7 +239,9 @@ export interface LoadSlashCommandsOptions {
 export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}): Promise<FileSlashCommand[]> {
 	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: options.cwd });
 
-	const fileCommands: FileSlashCommand[] = result.items.map(cmd => {
+	const fileCommands: FileSlashCommand[] = [];
+	for (const cmd of result.items) {
+		if (!isDisplaySafeCommandName(cmd.name)) continue;
 		const { description, body } = parseCommandTemplate(cmd.content, {
 			source: cmd.path ?? `slash-command:${cmd.name}`,
 			level: cmd.level === "native" ? "fatal" : "warn",
@@ -177,19 +251,19 @@ export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}):
 		const capitalizedLevel = cmd.level.charAt(0).toUpperCase() + cmd.level.slice(1);
 		const sourceStr = `via ${cmd._source.providerName} ${capitalizedLevel}`;
 
-		return {
+		fileCommands.push({
 			name: cmd.name,
 			description,
 			content: body,
 			source: sourceStr,
 			_source: { providerName: cmd._source.providerName, level: cmd.level },
-		};
-	});
+		});
+	}
 
 	const seenNames = new Set(fileCommands.map(cmd => cmd.name));
 	for (const cmd of EMBEDDED_SLASH_COMMANDS) {
 		const name = cmd.name.replace(/\.md$/, "");
-		if (seenNames.has(name)) continue;
+		if (seenNames.has(name) || !isDisplaySafeCommandName(name)) continue;
 
 		const { description, body } = parseCommandTemplate(cmd.content, {
 			source: `embedded:${cmd.name}`,

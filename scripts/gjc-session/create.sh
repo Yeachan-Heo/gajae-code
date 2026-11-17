@@ -12,7 +12,14 @@ SESSION="$1"
 WORKDIR="$2"
 GJC_BIN="${GJC_BIN-$(command -v gjc || true)}"
 TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
-STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
+if [[ -n "${GJC_SESSION_STATE_DIR:-}" ]]; then
+  STATE_DIR="$GJC_SESSION_STATE_DIR"
+else
+  # The owner-lifecycle writers refuse a link anywhere in the state path, so the
+  # default names the workspace physically, once, at this trust boundary.
+  PHYSICAL_WORKDIR="$(CDPATH='' cd -P -- "$WORKDIR" 2>/dev/null && pwd -P)" || PHYSICAL_WORKDIR="$WORKDIR"
+  STATE_DIR="$PHYSICAL_WORKDIR/.gjc-session-state/$SESSION"
+fi
 RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 SOCKET_KEY="gjc-${SESSION//[^A-Za-z0-9_.-]/_}"
 MONITOR_SESSION="${SESSION}-owner-monitor"
@@ -35,9 +42,11 @@ git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not
 BRANCH="$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 [[ -n "$BRANCH" && "$BRANCH" != HEAD ]] || { echo "could not determine branch/worktree name for: $WORKDIR" >&2; exit 1; }
 
-mkdir -p "$STATE_DIR/$SESSION/owner-lifecycle"
 LIFECYCLE_DIR="$STATE_DIR/$SESSION/owner-lifecycle"
 GENERATION_JSON="$LIFECYCLE_DIR/generation.json"
+# Refuse a linked state tail before anything is created or opened in it.
+gjc_session_require_private_path --create "$LIFECYCLE_DIR" || exit 1
+gjc_session_require_private_path "$LIFECYCLE_DIR" "${GENERATION_JSON%.json}.transition.lock" || exit 1
 exec 9>"${GENERATION_JSON%.json}.transition.lock"
 flock -x 9
 GJC_SESSION_TRANSITION_LOCK_HELD=1
@@ -102,6 +111,7 @@ PY
   fi
 
   local reconciliation
+  gjc_session_require_private_path "$LIFECYCLE_DIR" || return 1
   reconciliation="$(python3 - "$LIFECYCLE_DIR" "$SESSION" "$prior_generation" "$SOCKET_KEY" <<'PY'
 import datetime, json, os, sys
 lifecycle, session, generation, server_key = sys.argv[1:]
@@ -109,16 +119,19 @@ verdict_path = os.path.join(lifecycle, f"verdict-{generation}.json")
 started_path = os.path.join(lifecycle, f"started-{generation}.json")
 def immutable(path, record):
     temporary = f"{path}.{os.getpid()}.tmp"
+    created = False
     try:
         with open(temporary, "x", encoding="utf-8") as handle:
+            created = True
             json.dump(record, handle, separators=(",", ":")); handle.write("\n")
         os.link(temporary, path)
         return True
     except FileExistsError:
         return False
     finally:
-        try: os.unlink(temporary)
-        except FileNotFoundError: pass
+        if created:
+            try: os.unlink(temporary)
+            except FileNotFoundError: pass
 def valid_started():
     try:
         with open(started_path, encoding="utf-8") as handle: started = json.load(handle)
@@ -143,6 +156,7 @@ PY
     echo "invalid prior owner verdict: $prior_generation" >&2
     return 1
   fi
+  gjc_session_require_private_path "$LIFECYCLE_DIR" || return 1
   python3 - "$LIFECYCLE_DIR/verdict-$prior_generation.json" "$LIFECYCLE_DIR/incident-$prior_generation.json" <<'PY'
 import json, os, sys
 verdict_path, incident_path = sys.argv[1:]
@@ -152,8 +166,10 @@ if verdict["classification"] != "unexpected_owner_loss":
     raise SystemExit(0)
 incident = {"schema_version": 1, "generation": verdict["generation"], "session_id": verdict["session_id"], "dedupe_key": verdict["dedupe_key"], "created_at": verdict["observed_at"], "classification": "unexpected_owner_loss"}
 temporary = f"{incident_path}.{os.getpid()}.tmp"
+created = False
 try:
     with open(temporary, "x", encoding="utf-8") as handle:
+        created = True
         json.dump(incident, handle, separators=(",", ":")); handle.write("\n")
     try:
         os.link(temporary, incident_path)
@@ -161,8 +177,9 @@ try:
         with open(incident_path, encoding="utf-8") as handle:
             if json.load(handle) != incident: raise SystemExit(1)
 finally:
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
+    if created:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
 PY
   gjc_session_publish_current_alias "$LIFECYCLE_DIR/verdict-$prior_generation.json" "$STATE_DIR/verdict.json" "$GENERATION_JSON" "$SESSION" "$prior_generation"
   if [[ -f "$LIFECYCLE_DIR/incident-$prior_generation.json" ]]; then
@@ -324,20 +341,23 @@ PY
 publish_creation_failure() {
   local status="$1"
   [[ "$CREATION_COMPLETE" == 0 ]] || return 0
+  gjc_session_require_private_path "$LIFECYCLE_DIR" || return 1
   python3 - "$LIFECYCLE_DIR/creation-failed-$OWNER_GENERATION.json" "$SESSION" "$OWNER_GENERATION" "$CREATION_BOUNDARY" "$status" <<'PY'
 import json, os, sys
 path, session, generation, boundary, status = sys.argv[1:]
 record = {"schema_version": 1, "kind": "creation_failed", "session_id": session, "owner_generation": generation, "boundary": boundary, "exit_code": int(status)}
 temporary = f"{path}.{os.getpid()}.tmp"
+created = False
 try:
-    with open(temporary, "x", encoding="utf-8") as handle: json.dump(record, handle, separators=(",", ":")); handle.write("\n")
+    with open(temporary, "x", encoding="utf-8") as handle: created = True; json.dump(record, handle, separators=(",", ":")); handle.write("\n")
     os.link(temporary, path)
 except FileExistsError:
     with open(path, encoding="utf-8") as handle:
         if json.load(handle) != record: raise
 finally:
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
+    if created:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
 PY
   if generation_is_current; then
     gjc_session_publish_current_alias "$LIFECYCLE_DIR/creation-failed-$OWNER_GENERATION.json" "$STATE_DIR/creation-state.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" creation_failed
@@ -345,21 +365,24 @@ PY
 }
 publish_creation_cleanup_failure() {
   local status="$1" publication_failed="$2" canonical="$LIFECYCLE_DIR/creation-cleanup-failure-$OWNER_GENERATION.json"
+  gjc_session_require_private_path "$LIFECYCLE_DIR" || return 1
   python3 - "$canonical" "$SESSION" "$OWNER_GENERATION" "$status" "$ROLLBACK_FAILURES" "$publication_failed" <<'PY' || return 1
 import json, os, sys
 canonical, session, generation, status, rollback, publication = sys.argv[1:]
 record = {"schema_version": 1, "kind": "creation_cleanup_failed", "session_id": session, "owner_generation": generation, "exit_code": int(status), "rollback_failures": [value for value in rollback.split(",") if value], "failure_publication_failed": publication == "true"}
 temporary = f"{canonical}.{os.getpid()}.tmp"
+created = False
 try:
-    with open(temporary, "x", encoding="utf-8") as handle: json.dump(record, handle, separators=(",", ":")); handle.write("\n")
+    with open(temporary, "x", encoding="utf-8") as handle: created = True; json.dump(record, handle, separators=(",", ":")); handle.write("\n")
     try:
         os.link(temporary, canonical)
     except FileExistsError:
         with open(canonical, encoding="utf-8") as handle:
             if json.load(handle) != record: raise
 finally:
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
+    if created:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
 PY
   if generation_is_current; then
     gjc_session_publish_current_alias "$canonical" "$STATE_DIR/creation-cleanup-failure.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" creation_cleanup_failed
@@ -367,6 +390,8 @@ PY
 }
 creation_exit() { local status="$?" cleanup_failed=0 publication_failed=false; if [[ "$CREATION_COMPLETE" == 0 ]]; then if ! rollback_attempt_sessions; then cleanup_failed=1; fi; if ! publish_creation_failure "$status"; then cleanup_failed=1; publication_failed=true; fi; if [[ "$cleanup_failed" == 1 ]] && ! publish_creation_cleanup_failure "$status" "$publication_failed"; then echo "creation cleanup failure receipt unavailable" >&2; fi; fi; exit "$status"; }
 trap creation_exit EXIT
+gjc_session_require_private_path "$LIFECYCLE_DIR" || exit 1
+gjc_session_require_private_path "$STATE_DIR" "$STATE_DIR/started.json" "$STATE_DIR/prompt-accepted.json" "$STATE_DIR/terminal.json" "$STATE_DIR/final.json" "$STATE_DIR/recovery.json" || exit 1
 rm -f "$STATE_DIR/started.json" "$STATE_DIR/prompt-accepted.json" "$STATE_DIR/terminal.json" "$STATE_DIR/final.json" "$STATE_DIR/recovery.json"
 METADATA_CANONICAL="$LIFECYCLE_DIR/metadata-$OWNER_GENERATION.json"
 python3 - "$METADATA_CANONICAL" "$SESSION" "$WORKDIR" "$BRANCH" "$CREATED_AT" "$GJC_BIN" "$STATE_DIR" "$RUNTIME_STATE_JSON" "$WORKTREE_BASELINE_DIRTY" "$OWNER_GENERATION" "$SOCKET_KEY" <<'PY'
@@ -385,11 +410,13 @@ with open(path, "x", encoding="utf-8") as handle:
 PY
 CREATION_CANONICAL="$LIFECYCLE_DIR/creation-state-$OWNER_GENERATION.json"
 gjc_session_write_public_marker "$CREATION_CANONICAL" creation_started "$SESSION" "$OWNER_GENERATION"
+gjc_session_require_private_path "$STATE_DIR" "$STATE_DIR/runner.sh" || exit 1
 cat >"$STATE_DIR/runner.sh" <<'RUNNER'
 #!/usr/bin/env bash
 set +e
 source "$GJC_SESSION_POSTMORTEM_SH"
 write_terminal() {
+  gjc_session_require_private_path "$(dirname "$GJC_SESSION_FINAL_CANONICAL_JSON")" || return 1
   python3 - "$GJC_SESSION_FINAL_CANONICAL_JSON" "$GJC_SESSION_TERMINAL_CANONICAL_JSON" "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" "$1" "$2" "$3" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$GJC_SESSION_WORKDIR" "$GJC_SESSION_WORKTREE_BASELINE_DIRTY" "$GJC_SESSION_PROMPT_ACCEPTED_JSON" <<'PY'
 import json
 import datetime
@@ -463,16 +490,19 @@ terminal = {"schema_version": 1, "kind": "terminal", "session_id": session, "own
 final = {**terminal, "runtime_state": runtime_path, "prompt_accepted": prompt_accepted, "owner_exit_reason": reason, "severity": severity, "runtime_terminal": runtime["terminal"], "runtime_terminal_state": runtime["terminalState"], "worktree_baseline_dirty": baseline_value, "observed_recoverable_worktree_changes": current_dirty is True, "worktree_changed_since_baseline": changed}
 for path, value in ((terminal_path, terminal), (final_path, final)):
     temporary = f"{path}.{os.getpid()}.tmp"
+    created = False
     try:
         with open(temporary, "x", encoding="utf-8") as handle:
+            created = True
             json.dump(value, handle, separators=(",", ":")); handle.write("\n")
         os.link(temporary, path)
     except FileExistsError:
         with open(path, encoding="utf-8") as handle:
             if json.load(handle) != value: raise
     finally:
-        try: os.unlink(temporary)
-        except FileNotFoundError: pass
+        if created:
+            try: os.unlink(temporary)
+            except FileNotFoundError: pass
 PY
   gjc_session_publish_current_alias "$GJC_SESSION_TERMINAL_CANONICAL_JSON" "$GJC_SESSION_TERMINAL_JSON" "$GJC_SESSION_GENERATION_JSON" "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" terminal
   gjc_session_publish_current_alias "$GJC_SESSION_FINAL_CANONICAL_JSON" "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_GENERATION_JSON" "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" terminal
@@ -481,6 +511,7 @@ PY
 write_terminal "$2" "$3" "$4"
 RUNNER
 chmod +x "$STATE_DIR/runner.sh"
+gjc_session_require_private_path "$STATE_DIR" "$STATE_DIR/supervisor.py" || exit 1
 cat >"$STATE_DIR/supervisor.py" <<'SUPERVISOR'
 import datetime
 import json
@@ -497,20 +528,35 @@ def now():
 child = None
 SIGNAL_NAMES = {signal.SIGTERM: "SIGTERM", signal.SIGINT: "SIGINT", signal.SIGHUP: "SIGHUP"}
 
+def require_private_directory(directory):
+    # Every caller treats a refusal as a failed write, so report a checker that
+    # cannot run or finish the same way.
+    try:
+        completed = subprocess.run(["bash", "-c", 'source "$1"; gjc_session_require_private_path "$2"', "gjc-supervisor-path", os.environ["GJC_SESSION_POSTMORTEM_SH"], directory], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
+    except subprocess.SubprocessError as error:
+        raise OSError("owner lifecycle path check unavailable") from error
+    if completed.returncode != 0:
+        raise OSError("unsafe owner lifecycle path")
+
+
 def write_immutable(path, record, inject=None):
     if inject and os.environ.get("GJC_SESSION_TEST_FAIL_RECEIPT_WRITE") in {inject, inject.removesuffix("_canonical")}:
         raise OSError("injected receipt write failure")
+    require_private_directory(os.path.dirname(path))
     temporary = f"{path}.{os.getpid()}.tmp"
+    created = False
     try:
         with open(temporary, "x", encoding="utf-8") as handle:
+            created = True
             json.dump(record, handle, separators=(",", ":")); handle.write("\n")
         os.link(temporary, path)
     except FileExistsError:
         with open(path, encoding="utf-8") as handle:
             if json.load(handle) != record: raise
     finally:
-        try: os.unlink(temporary)
-        except FileNotFoundError: pass
+        if created:
+            try: os.unlink(temporary)
+            except FileNotFoundError: pass
 
 
 def record_publication_failure(boundary):
@@ -859,6 +905,8 @@ gjc_session_write_public_marker "$STARTED_CANONICAL" started "$SESSION" "$OWNER_
 gjc_session_publish_current_alias "$STARTED_CANONICAL" "$STATE_DIR/started.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" started
 LIFECYCLE_DIR="$STATE_DIR/$SESSION/owner-lifecycle"
 GENERATION_JSON="$LIFECYCLE_DIR/generation.json"
+gjc_session_require_private_path "$LIFECYCLE_DIR" || exit 1
+gjc_session_require_private_path "$STATE_DIR" "$STATE_DIR/incident.json" || exit 1
 RECOVERY_RESULT="$(python3 - "$STATE_DIR/incident.json" "$LIFECYCLE_DIR" "$LIFECYCLE_DIR/recovery-$OWNER_GENERATION.json" "$SESSION" "$OWNER_GENERATION" <<'PY'
 import json, os, sys
 incident_path, lifecycle_dir, recovery_path, session, generation = sys.argv[1:]
@@ -890,8 +938,9 @@ for name in os.listdir(lifecycle_dir):
         continue
 record = {"schema_version": 1, "kind": "owner_recovered", "session_id": session, "owner_generation": generation, "prior_owner_generation": prior_generation, "prior_incident_dedupe": dedupe}
 temporary = f"{recovery_path}.{os.getpid()}.tmp"
+created = False
 try:
-    with open(temporary, "x", encoding="utf-8") as handle: json.dump(record, handle, separators=(",", ":")); handle.write("\n")
+    with open(temporary, "x", encoding="utf-8") as handle: created = True; json.dump(record, handle, separators=(",", ":")); handle.write("\n")
     os.link(temporary, recovery_path)
 except FileExistsError:
     with open(recovery_path, encoding="utf-8") as handle:
@@ -901,14 +950,16 @@ else:
     os.unlink(incident_path)
     print(f"1:{dedupe}")
 finally:
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
+    if created:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
 PY
 )"
 if [[ "$RECOVERY_RESULT" == 1:* ]]; then
   gjc_session_publish_current_alias "$LIFECYCLE_DIR/recovery-$OWNER_GENERATION.json" "$STATE_DIR/recovery.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" owner_recovered || { echo "failed to publish recovery lifecycle alias" >&2; exit 1; }
 fi
 
+gjc_session_require_private_path "$STATE_DIR" "$STATE_DIR/monitor.sh" || exit 1
 cat >"$STATE_DIR/monitor.sh" <<'MONITOR'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -949,21 +1000,24 @@ done
 now_ms="$(date +%s%3N)"
 if [[ -z "$verdict" || "$now_ms" -ge "$deadline_at_ms" ]]; then
   monitor_failure_canonical="$GJC_SESSION_STATE_DIR/$GJC_SESSION_NAME/owner-lifecycle/monitor-failure-$GJC_SESSION_OWNER_GENERATION.json"
+  gjc_session_require_private_path "$(dirname "$monitor_failure_canonical")" || exit 1
   python3 - "$monitor_failure_canonical" "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" <<'PY'
 import json, os, sys
 path, session, generation = sys.argv[1:]
 record = {"schema_version":1,"kind":"monitor_failure","session_id":session,"owner_generation":generation,"reason":"observer_timeout_or_failure"}
 temporary = f"{path}.{os.getpid()}.tmp"
+created = False
 try:
-    with open(temporary, "x", encoding="utf-8") as handle: json.dump(record, handle, separators=(",", ":")); handle.write("\n")
+    with open(temporary, "x", encoding="utf-8") as handle: created = True; json.dump(record, handle, separators=(",", ":")); handle.write("\n")
     try:
         os.link(temporary, path)
     except FileExistsError:
         with open(path, encoding="utf-8") as handle:
             if json.load(handle) != record: raise
 finally:
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
+    if created:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
 PY
   gjc_session_publish_current_alias "$monitor_failure_canonical" "$GJC_SESSION_STATE_DIR/monitor-failure.json" "$GJC_SESSION_GENERATION_JSON" "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" monitor_failure || exit 1
   exit 1

@@ -19,6 +19,9 @@ import {
 	runCrashReportFlow,
 } from "../src/crash/report";
 import type { GhResult, RunGh } from "../src/utils/gh";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 const NOW = Date.UTC(2026, 7, 11, 12, 0, 0);
 const ENVIRONMENT = { platform: "Linux", gjcVersion: "0.13.1", bunVersion: "1.3.14" };
@@ -42,7 +45,7 @@ interface Harness {
 }
 
 async function harness(options: { withRecord?: boolean } = {}): Promise<Harness> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-crash-flow-"));
+	const dir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "gjc-crash-flow-"));
 	const paths: CrashStatePaths = {
 		index: path.join(dir, "gjc-crash-index.json"),
 		events: path.join(dir, "gjc-crash-events.jsonl"),

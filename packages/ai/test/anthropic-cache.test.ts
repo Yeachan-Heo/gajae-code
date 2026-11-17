@@ -8,6 +8,8 @@ import {
 } from "@gajae-code/ai/providers/anthropic";
 import { clearGitLabDuoDirectAccessCache, streamGitLabDuo } from "@gajae-code/ai/providers/gitlab-duo";
 import type { CacheRetention, Context, Model, TJsonSchema } from "@gajae-code/ai/types";
+import { mulberry32 } from "../../utils/test/helpers/prng";
+import { createAbortedSignal } from "./helpers";
 
 const canonicalModel: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -24,16 +26,6 @@ const canonicalModel: Model<"anthropic-messages"> = {
 
 type CacheControl = { type: string; ttl?: string };
 type Payload = MessageCreateParamsStreaming & { cache_control?: CacheControl };
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let value = Math.imul(state ^ (state >>> 15), state | 1);
-		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-		return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
-	};
-}
 
 function pick<T>(random: () => number, items: readonly T[]): T {
 	return items[Math.floor(random() * items.length)]!;
@@ -56,12 +48,6 @@ function cacheMarkerLayout(payload: Payload): Map<string, CacheControl> {
 		}
 	}
 	return markers;
-}
-
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
 }
 
 function context(messages: Context["messages"] = [{ role: "user", content: "Continue", timestamp: 1 }]): Context {
@@ -88,7 +74,7 @@ function capturePayload(
 	streamAnthropic(model, input, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		cacheRetention,
 		onPayload: payload => {
 			const replacement = onPayload?.(payload as Payload);
@@ -100,10 +86,11 @@ function capturePayload(
 }
 function captureGitLabPayload(model: Model<"anthropic-messages">, cacheRetention?: CacheRetention): Promise<Payload> {
 	clearGitLabDuoDirectAccessCache();
+	const controller = new AbortController();
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	streamGitLabDuo(model, context(), {
 		apiKey: "glpat-test",
-		signal: abortedSignal(),
+		signal: controller.signal,
 		cacheRetention,
 		fetch: async input => {
 			const url = input instanceof Request ? input.url : String(input);
@@ -120,6 +107,7 @@ function captureGitLabPayload(model: Model<"anthropic-messages">, cacheRetention
 		},
 		onPayload: payload => {
 			resolve(payload as Payload);
+			controller.abort();
 		},
 	});
 	return promise;
@@ -259,7 +247,7 @@ describe("Anthropic prompt caching", () => {
 	describe("generated cache-marker layouts", () => {
 		for (let seed = 0; seed < 500; seed++) {
 			it(`preserves allocation invariants for seed ${seed}`, () => {
-				const random = seededRandom(seed);
+				const random = mulberry32(seed);
 				const mode = pick(random, ["automatic", "explicit", "none"] as const);
 				const budget = pick(random, [0, 1, 2] as const);
 				// Use the same TTL for existing and generated markers so every layout
@@ -505,15 +493,6 @@ describe("Anthropic prompt caching", () => {
 	});
 
 	describe("generated automatic root-marker layouts", () => {
-		const seededRandom = (seed: number): (() => number) => {
-			let state = seed >>> 0;
-			return () => {
-				state = (state + 0x6d2b79f5) >>> 0;
-				let value = Math.imul(state ^ (state >>> 15), state | 1);
-				value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-				return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
-			};
-		};
 		const pick = <T>(random: () => number, items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
 		const withoutRoot = (payload: Payload): Payload => {
 			const { cache_control: _root, ...rest } = payload;
@@ -522,7 +501,7 @@ describe("Anthropic prompt caching", () => {
 
 		for (let seed = 0; seed < 500; seed++) {
 			it(`keeps caller markers and the four-breakpoint cap for seed ${seed}`, () => {
-				const random = seededRandom(seed);
+				const random = mulberry32(seed);
 				// One TTL for every marker so each layout satisfies the long-before-short ordering rule.
 				const control: CacheControlEphemeral = { type: "ephemeral" };
 				const ttl = pick(random, [undefined, "5m", "1h"] as const);

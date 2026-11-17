@@ -583,6 +583,17 @@
 			},
 			"additionalProperties": false
 		},
+		"recap": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Generate a short recap after completed turns for session listings. Uses the default model and may incur model usage; never adds recap text to the conversation.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"modelTags": {
 			"type": "object",
 			"additionalProperties": true,
@@ -1427,6 +1438,10 @@
 				"circuitMaxCooldownMs": {
 					"type": "number",
 					"default": 1800000
+				},
+				"concurrencyWaitMs": {
+					"type": "number",
+					"default": 300000
 				}
 			},
 			"additionalProperties": false
@@ -2711,7 +2726,8 @@
 						"parallel",
 						"kagi",
 						"synthetic",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"default": "auto"
 				},
@@ -2736,7 +2752,8 @@
 							"parallel",
 							"kagi",
 							"synthetic",
-							"searxng"
+							"searxng",
+							"keenable"
 						]
 					},
 					"description": "Ordered fallback web search providers after the active model native provider",
@@ -3203,7 +3220,8 @@
 						"kagi",
 						"synthetic",
 						"parallel",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"

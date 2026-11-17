@@ -7,6 +7,7 @@ import { Container, type KeyId, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { isEnoent, prompt, resolveEquivalentPath, pathIsWithin as rootContainsCandidate } from "@gajae-code/utils";
 import { resolveLocalRoot, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
+import { restoredPlanFilePath } from "../../plan-mode/state";
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -139,15 +140,20 @@ export class PlanModeController {
 		if (this.ctx.session.isExplicitEmptyToolSelection()) return;
 		if (!this.ctx.session.settings.get("plan.enabled")) {
 			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused")
-				this.ctx.sessionManager.appendModeChange("none");
+				this.ctx.session.appendModeChangeInBackground("none");
 			return;
 		}
+		if (sessionContext.mode !== "plan" && sessionContext.mode !== "plan_paused") return;
+		// A held goal gate keeps goal mode. Reject before any plan model, tool, or pause side effect.
+		if (!this.ctx.modeGate.enter("plan")) {
+			this.ctx.session.clearPlanModeBinding();
+			return this.ctx.showWarning("Exit goal mode first.");
+		}
 		if (sessionContext.mode === "plan") {
-			await this.enter({ planFilePath: sessionContext.modeData?.planFilePath as string | undefined });
-		} else if (sessionContext.mode === "plan_paused") {
+			await this.enter({ planFilePath: restoredPlanFilePath(sessionContext.modeData?.planFilePath) });
+		} else {
 			this.#paused = true;
 			this.#hasEntered = true;
-			this.ctx.modeGate.enter("plan");
 			this.#updateStatus();
 		}
 	}
@@ -183,6 +189,8 @@ export class PlanModeController {
 			this.#previousTools = undefined;
 			this.#previousMCPToolNames = undefined;
 			this.ctx.modeGate.exit("plan");
+			this.ctx.session.setStandingResolveHandler?.(null);
+			this.ctx.session.clearPlanModeBinding();
 			throw error;
 		}
 		this.ctx.session.setPlanModeState({
@@ -196,7 +204,7 @@ export class PlanModeController {
 		this.#hasEntered = true;
 		await this.#applyModel();
 		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange("plan", { planFilePath });
+		this.ctx.session.appendModeChangeInBackground("plan", { planFilePath });
 		this.ctx.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
 	}
 
@@ -215,7 +223,7 @@ export class PlanModeController {
 		} else if (this.#previousModelState) {
 			const previous = this.#previousModelState;
 			if (modelsAreEqual(this.ctx.session.model, previous.model))
-				this.ctx.session.setThinkingLevel(previous.thinkingLevel);
+				await this.ctx.session.setThinkingLevelForSession(previous.thinkingLevel);
 			else if (this.ctx.session.isStreaming) this.#pendingModelSwitch = previous;
 			else
 				await this.ctx.session.setModelTemporary(previous.model, previous.thinkingLevel, {
@@ -236,7 +244,7 @@ export class PlanModeController {
 		this.#previousModelState = undefined;
 		if (!this.#paused) this.ctx.modeGate.exit("plan");
 		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange(this.#paused ? "plan_paused" : "none");
+		this.ctx.session.appendModeChangeInBackground(this.#paused ? "plan_paused" : "none");
 		if (!options?.silent) this.ctx.showStatus(this.#paused ? "Plan mode paused." : "Plan mode disabled.");
 	}
 
@@ -344,7 +352,7 @@ export class PlanModeController {
 			? { model: current, thinkingLevel: this.ctx.session.thinkingLevel }
 			: undefined;
 		if (modelsAreEqual(current, resolved.model)) {
-			if (thinkingLevel) this.ctx.session.setThinkingLevel(thinkingLevel);
+			if (thinkingLevel) await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 			return;
 		}
 		if (this.ctx.session.isStreaming) {
@@ -591,11 +599,7 @@ export class PlanModeController {
 			);
 		}
 		const name = humanizePlanTitle(options.title);
-		if (
-			name &&
-			!this.ctx.sessionManager.getSessionName() &&
-			(await this.ctx.sessionManager.setSessionName(name, "auto"))
-		) {
+		if (name && !this.ctx.sessionManager.getSessionName() && (await this.ctx.session.setSessionName(name, "auto"))) {
 			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 			this.ctx.updateEditorChrome();
 		}

@@ -17,6 +17,7 @@ import {
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import packageJson from "../../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
@@ -90,14 +91,8 @@ async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	]);
 }
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 10_000;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error(`Timed out waiting for ${label}`);
-}
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 10_000, { intervalMs: 5, label });
 
 function phaseUpdates(updates: SessionNotification[], phase: string): number {
 	return updates.filter(

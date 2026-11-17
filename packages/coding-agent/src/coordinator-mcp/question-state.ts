@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { isRecord, logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import { canonicalJson } from "./canonical-json";
 import { ensureCoordinatorDirectory, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
@@ -166,6 +167,15 @@ export interface PromptRequestV1 {
 	coordinator_turn_id?: string;
 	/** Retain prompt and source turn until the delegate's outer response is durable. */
 	delegate_response_pending?: boolean;
+	/** Preserve steer disposition durably for recovery when a prompt is converted to a steer. */
+	steer_disposition?: {
+		accepted: boolean;
+		command_id: string;
+		turn_id: string;
+		queued_as?: string;
+		/** Synthetic coordinator turn removed when the steer settled; its projection is removed too. */
+		removed_turn_id?: string;
+	};
 	safe_response?: Record<string, unknown>;
 	error_code?: PublicReason | "idempotency_conflict";
 	created_at: string;
@@ -394,15 +404,6 @@ const PUBLIC_CLAIM_LEASE_MS = 30_000;
 export const COORDINATOR_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const COORDINATOR_REPORT_ID_PATTERN = /^report-[a-f0-9]{64}$/;
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
-const canonicalJson = (value: unknown): string => {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-};
 const lockOptions = (signal?: AbortSignal) => (signal ? { signal } : undefined);
 
 function publicDeliveryFor(event: OutboxEventV1): PublicDeliveryV1 {
@@ -697,8 +698,6 @@ function migrateLegacyTransactionV1(transaction: CoordinatorSessionTransactionV1
 }
 
 function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespaceId: string, sessionId: string): void {
-	const isRecord = (value: unknown): value is Record<string, unknown> =>
-		typeof value === "object" && value !== null && !Array.isArray(value);
 	migrateLegacyTransactionV1(transaction);
 	const isTime = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
 	const safeId = (value: unknown) => typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(value);
@@ -2536,6 +2535,24 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)
 				delete group[id];
+	if (Buffer.byteLength(JSON.stringify(transaction)) > MAX_NORMAL_BYTES) {
+		// Completed turnless steer tombstones have no turn to age out with; evict the
+		// oldest first. Pinned and in-progress requests are never candidates.
+		const steerTombstones = Object.entries(transaction.requests.prompts)
+			.filter(
+				([id, request]) =>
+					request.phase === "completed" &&
+					request.steer_disposition !== undefined &&
+					request.coordinator_turn_id === undefined &&
+					!pinnedRequests.has(request) &&
+					!receiptBearingPromptIds.has(id),
+			)
+			.sort(([, left], [, right]) => left.updated_at.localeCompare(right.updated_at));
+		for (const [id] of steerTombstones) {
+			delete transaction.requests.prompts[id];
+			if (Buffer.byteLength(JSON.stringify(transaction)) <= MAX_NORMAL_BYTES) break;
+		}
+	}
 	if (Buffer.byteLength(JSON.stringify(transaction)) > MAX_NORMAL_BYTES) {
 		const terminalTurnIds = Object.values(transaction.canonical.turns)
 			.filter(turn => ["completed", "failed", "cancelled", "superseded"].includes(turn.status))

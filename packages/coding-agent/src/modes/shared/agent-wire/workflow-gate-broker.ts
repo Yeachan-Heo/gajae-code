@@ -13,6 +13,7 @@
  */
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { AskSelectedAckOutcome } from "../../../tools";
 import { classifyAskGateDisposition } from "./deep-interview-gate";
 import { answerHashOf, canonicalJson, compileGateSchema, schemaHash, validateGateAnswer } from "./workflow-gate-schema";
@@ -97,10 +98,21 @@ export interface AskSelectedAckRecoveryParticipant {
 	}): Promise<AskSelectedAckOutcome>;
 }
 
+export interface EmitGateOptions {
+	/**
+	 * Aborting it revokes the gate this call opened and rejects the returned
+	 * promise, so a late answer cannot advance it. An already-aborted signal opens
+	 * no gate. Emitters must honor it: `AskTool` relies on it to revoke the gate of
+	 * a cancelled or expired ask.
+	 */
+	signal: AbortSignal;
+}
+
 /** SDK-native surface for emitting a workflow gate and awaiting its answer. */
 export interface WorkflowGateEmitter {
 	supportsRemoteGateAnswers(): boolean;
-	emitGate(input: OpenGateInput): Promise<unknown>;
+	/** Opens a gate and awaits its answer. Revocation through `options.signal` is required. */
+	emitGate(input: OpenGateInput, options: EmitGateOptions): Promise<unknown>;
 	onGateEmitted?(listener: (gate: WorkflowGate) => void): () => void;
 	resolveGate?(response: WorkflowGateResponse): Promise<WorkflowGateResolution>;
 	resolveGateFromNotification?(
@@ -179,29 +191,58 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 		this.#runtimeTurnProvider = provider ?? undefined;
 	}
 
-	emitGate(input: OpenGateInput): Promise<unknown> {
+	emitGate(input: OpenGateInput, options?: EmitGateOptions): Promise<unknown> {
 		if (this.#fenced || this.#suspended) return Promise.reject(new Error("workflow gate emitter is unavailable"));
+		const signal = options?.signal;
+		if (signal?.aborted) return Promise.reject(signal.reason);
 		const waiter = Promise.withResolvers<unknown>();
-		const gate = this.#broker.openGate(
-			{
-				...input,
-				...(input.runtimeTurnId === undefined ? { runtimeTurnId: this.#runtimeTurnProvider?.() } : {}),
-			},
-			{
-				activate: opened => this.#waiters.set(opened.gate_id, waiter),
-				isLive: gateId => this.#waiters.has(gateId),
-				release: gateId => {
-					const activeWaiter = this.#waiters.get(gateId);
-					if (!activeWaiter) return;
-					this.#waiters.delete(gateId);
-					activeWaiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+		let openedGateId: string | undefined;
+		let gate: WorkflowGate;
+		try {
+			gate = this.#broker.openGate(
+				{
+					...input,
+					...(input.runtimeTurnId === undefined ? { runtimeTurnId: this.#runtimeTurnProvider?.() } : {}),
 				},
-			},
-		);
+				{
+					activate: opened => {
+						this.#waiters.set(opened.gate_id, waiter);
+						openedGateId = opened.gate_id;
+					},
+					isLive: gateId => this.#waiters.has(gateId),
+					release: gateId => {
+						const activeWaiter = this.#waiters.get(gateId);
+						if (!activeWaiter) return;
+						this.#waiters.delete(gateId);
+						activeWaiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+					},
+				},
+			);
+		} catch (error) {
+			// A throwing gate listener aborts openGate after the gate is live. No
+			// caller receives its promise, so revoke the gate and keep the rejection
+			// from surfacing as unhandled.
+			waiter.promise.catch(() => {});
+			if (openedGateId !== undefined) this.#revokeEmittedGate(openedGateId);
+			throw error;
+		}
 		// A listener may answer synchronously while the broker emits. The durable
 		// record is the source of truth in that race; never strand its promise.
 		const persisted = this.#store.get(gate.gate_id);
-		return persisted?.status === "accepted" ? Promise.resolve(persisted.answer) : waiter.promise;
+		if (persisted?.status === "accepted") return Promise.resolve(persisted.answer);
+		if (signal) {
+			const gateId = gate.gate_id;
+			const revoke = () => this.#revokeEmittedGate(gateId);
+			// A gate listener may abort the signal while the broker emits.
+			if (signal.aborted) {
+				revoke();
+				return waiter.promise;
+			}
+			signal.addEventListener("abort", revoke, { once: true });
+			const stopRevoking = () => signal.removeEventListener("abort", revoke);
+			waiter.promise.then(stopRevoking, stopRevoking);
+		}
+		return waiter.promise;
 	}
 
 	onGateEmitted(listener: (gate: WorkflowGate) => void): () => void {
@@ -265,6 +306,23 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			waiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
 		}
 		this.#broker.fenceContinuations();
+	}
+
+	/**
+	 * Revokes a gate from an abort listener or a failed emission. `quarantineGate`
+	 * releases the continuation and rejects the waiter before it persists, so a
+	 * store write failure is logged here instead of escaping as an uncaught
+	 * exception that would end the host.
+	 */
+	#revokeEmittedGate(gateId: string): void {
+		try {
+			this.quarantineGate(gateId);
+		} catch (error) {
+			logger.warn("Failed to persist workflow gate revocation", {
+				gateId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	quarantineGate(gateId: string): void {

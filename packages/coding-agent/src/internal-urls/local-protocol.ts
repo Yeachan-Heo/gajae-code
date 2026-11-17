@@ -614,6 +614,13 @@ async function migrateLegacyLocal(
 const initializedLocalRoots = new Map<string, ManagedRootIdentity>();
 /** A directory this process created and has not finished migrating. */
 const pendingCreatedRoots = new Map<string, ManagedRootIdentity>();
+/**
+ * Pinned roots whose legacy migration settled with no legacy source left
+ * (`absent` or `verified`). When such a root disappears (temp sweeper, `gjc gc`,
+ * manual cleanup) there is nothing left to migrate, so the sync resolver may
+ * re-create it instead of failing every later access closed.
+ */
+const legacyRetiredRoots = new Set<string>();
 const initializingLocalRoots = new Map<string, Promise<string>>();
 
 function assertRememberedManagedRoot(localRoot: string, recorded: ManagedRootIdentity): void {
@@ -636,6 +643,29 @@ function rememberManagedRoot(localRoot: string, expected: ManagedRootIdentity): 
 	if (!sameManagedRoot(stat, expected)) throw new Error("Unsafe local:// root");
 	initializedLocalRoots.set(localRoot, managedRootIdentity(stat));
 	pendingCreatedRoots.delete(localRoot);
+	const marker = readMarkerValueSync(localRoot);
+	if (marker === "absent\n" || marker === "verified\n") legacyRetiredRoots.add(localRoot);
+	else legacyRetiredRoots.delete(localRoot);
+}
+
+function readMarkerValueSync(localRoot: string): string | null {
+	try {
+		return fsSync.readFileSync(path.join(localRoot, LEGACY_MIGRATION_MARKER), "utf8");
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
+}
+
+/** Whether the pinned managed parent is gone entirely; any other lstat failure stays unsafe. */
+function managedParentRemovedSync(localRoot: string): boolean {
+	try {
+		fsSync.lstatSync(path.dirname(localRoot));
+		return false;
+	} catch (error) {
+		if (isEnoent(error)) return true;
+		throw new Error("Unsafe local:// root");
+	}
 }
 
 /**
@@ -723,7 +753,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 		return;
 	}
 	const recorded = initializedLocalRoots.get(localRoot);
-	if (recorded) {
+	if (recorded && !managedParentRemovedSync(localRoot)) {
 		assertManagedParentSync(localRoot);
 		let present: fsSync.Stats | undefined;
 		try {
@@ -771,7 +801,10 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
-	if (options.getManagedLegacyLocalMigrationSource?.()) {
+	// A pinned root whose migration already retired (or never had) a legacy source
+	// has nothing left to copy; only a pending source needs the async gate.
+	const legacyRetired = recorded !== undefined && legacyRetiredRoots.has(localRoot);
+	if (!legacyRetired && options.getManagedLegacyLocalMigrationSource?.()) {
 		throw new Error("local:// legacy migration must complete before path resolution");
 	}
 	const artifactsDir = options.getArtifactsDir?.();
@@ -855,6 +888,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		LocalProtocolHandler.#ownedOverrides = [];
 		initializedLocalRoots.clear();
 		pendingCreatedRoots.clear();
+		legacyRetiredRoots.clear();
 		initializingLocalRoots.clear();
 	}
 
