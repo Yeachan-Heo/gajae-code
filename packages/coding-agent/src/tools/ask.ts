@@ -1899,9 +1899,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						: `User asked a clarification question about the choices: ${clarificationQuestion}`,
 				);
 			}
-			// A timeout is not a user selection: auto-selected options during timeout are
-			// not presented as the user's choice. Indicate no answer was received.
-			if (selectedOptions.length > 0 && !timedOut) {
+			// For ordinary asks: show auto-selected options even during timeout.
+			// For human-blocked asks: suppress the selection text to let it fall through to the timeout message.
+			if (selectedOptions.length > 0 && (!timedOut || context?.isHumanBlockedAsk !== true)) {
 				responseParts.push(
 					q.multi ? `User selected: ${selectedOptions.join(", ")}` : `User selected: ${selectedOptions[0]}`,
 				);
