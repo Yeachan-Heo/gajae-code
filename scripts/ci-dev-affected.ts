@@ -288,6 +288,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 
 export interface PackageManifest {
 	name?: string;
+	main?: string;
 	scripts?: Record<string, string>;
 	dependencies?: Record<string, string>;
 	devDependencies?: Record<string, string>;
@@ -493,7 +494,7 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	const normalizedPaths = normalizeChangedPaths(paths);
 	const packages = await getWorkspacePackages();
 	const legacy = resolvePlanMode() === "pr"
-		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true)
+		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true, loadReverseDependencyIndex(packages))
 		: planTasks(normalizedPaths, packages, true);
 	if (normalizedPaths.length > 0 && normalizedPaths.every(isDocOrChangelogPath)) return legacy;
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
@@ -994,6 +995,7 @@ async function readPackageManifest(filePath: string): Promise<PackageManifest | 
 	}
 	return {
 		name: isString(value.name) ? value.name : undefined,
+		main: isString(value.main) ? value.main : undefined,
 		scripts: readStringMap(value.scripts),
 		dependencies: readStringMap(value.dependencies),
 		devDependencies: readStringMap(value.devDependencies),
@@ -1124,8 +1126,11 @@ export function planTasks(
 //   - docs/changelog-only -> nothing expensive
 //   - workflow / CI harness scripts -> yaml-parse + ci-selftest + ci-dry-run + permission check
 //   - a changed test file -> run exactly that test file (test:<path>)
-//   - a source file with a directly-named test -> run that test file only
+//   - a source file with a directly-named test -> run that test file
 //   - a source file with no mapped test -> owning package check + relevant smoke
+//   - every changed file -> also each same-package test that loads it through
+//     the module graph or reads it as data (see ReverseDependencyIndex); the
+//     package's own test tasks carry it above TARGETED_DEPENDENT_TEST_LIMIT
 //   - rust/python/web/install changes -> their scoped check+test
 // A genuine full-workspace config change still escalates to root check + test.
 // Native builds are added once (native-linux-x64) only when a planned task needs
@@ -1136,6 +1141,7 @@ export function planTargetedTasks(
 	packages: readonly WorkspacePackage[],
 	testFiles: readonly string[],
 	validateTestPaths = false,
+	dependencies?: ReverseDependencyIndex,
 ): Task[] {
 	const tasks = new Map<string, Task>();
 	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath) || isRuntimeMarkdownPath(changedPath));
@@ -1280,6 +1286,10 @@ export function planTargetedTasks(
 		addTestFileTask(tasks, canary);
 	}
 
+	if (dependencies && !fullWorkspace) {
+		addDependentTestTasks(tasks, relevant, packages, dependencies, validateTestPaths);
+	}
+
 	ensureNativeBuild(tasks);
 
 	return Array.from(tasks.values());
@@ -1414,6 +1424,178 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 		testFile => wanted.has(path.posix.basename(testFile)) && testFile.startsWith(scopePrefix),
 	);
 	return matches.length === 1 ? matches : [];
+}
+
+// Basename mapping alone cannot see a test that loads a changed module under
+// another name: a hand-rolled fake that lags a new method on the module it
+// imports (directly or through another module), or a generated-inventory check
+// whose generator reads the changed source as text. #7829 shipped four such
+// failures to dev. The PR planner therefore also selects every test that
+// reaches a changed file through the package's own module graph.
+//
+// Edges are confined to one workspace package: cross-package consumers keep
+// their existing owner-test and package-check policy, so an agent-core change is
+// not silently widened into the whole coding-agent suite.
+export interface ReverseDependencyIndex {
+	/** Repo-relative file -> repo-relative files in the same package that load it. */
+	readonly dependents: ReadonlyMap<string, ReadonlySet<string>>;
+	/** Package-internal specifiers that matched no file; a nonzero count means the graph is incomplete. */
+	readonly unresolved: readonly { from: string; specifier: string }[];
+}
+
+// Above this many graph-selected test files in one package, the package's own
+// test tasks (the sharded suite for coding-agent) carry the selection: per-file
+// matrix jobs each pay a full install, and the matrix is capped at 256 entries.
+export const TARGETED_DEPENDENT_TEST_LIMIT = 40;
+
+// Build output and installed dependencies are not package sources.
+const DEPENDENCY_SCAN_EXCLUDED_DIRS = new Set(["node_modules", "dist", "target", "coverage"]);
+const DEPENDENCY_SOURCE_FILE = /\.(?:[cm]?tsx?|[cm]?jsx?)$/;
+const MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"] as const;
+// A path string naming a file read as data, e.g. a generator scanning
+// `packages/coding-agent/src/session/agent-session.ts` or a test locating its
+// generator script. Repo-relative or relative to the reading file.
+const FILE_PATH_LITERAL = /["'`]((?:packages\/|\.\.?\/)[^"'`\s$]*\.[A-Za-z0-9]+)["'`]/g;
+
+function resolveModuleCandidate(base: string, files: ReadonlySet<string>): string | undefined {
+	const normalized = path.posix.normalize(base);
+	if (files.has(normalized)) return normalized;
+	const stem = normalized.replace(/\.[cm]?jsx?$/, "");
+	for (const extension of MODULE_EXTENSIONS) {
+		if (files.has(`${stem}${extension}`)) return `${stem}${extension}`;
+	}
+	for (const extension of MODULE_EXTENSIONS) {
+		if (files.has(`${normalized}/index${extension}`)) return `${normalized}/index${extension}`;
+	}
+	return undefined;
+}
+
+/**
+ * Build the per-package reverse dependency index from file contents.
+ *
+ * Edges are runtime module loads (static imports, re-exports, side-effect
+ * imports, dynamic imports and require calls of a literal specifier, including
+ * the package's self-reference `<name>/<sub>` resolved to `src/<sub>`) and file
+ * path literals naming another file of the same package. Type-only imports are
+ * erased before scanning: they cannot fail a test at runtime, and the package
+ * `check` task that every touched package already gets typechecks them.
+ */
+export function buildReverseDependencyIndex(
+	packages: readonly WorkspacePackage[],
+	files: readonly string[],
+	readText: (file: string) => string,
+): ReverseDependencyIndex {
+	const transpilers = {
+		ts: new Bun.Transpiler({ loader: "ts" }),
+		tsx: new Bun.Transpiler({ loader: "tsx" }),
+		js: new Bun.Transpiler({ loader: "js" }),
+		jsx: new Bun.Transpiler({ loader: "jsx" }),
+	};
+	const dependents = new Map<string, Set<string>>();
+	const unresolved: { from: string; specifier: string }[] = [];
+	const link = (target: string, from: string) => {
+		if (target === from) return;
+		let set = dependents.get(target);
+		if (!set) dependents.set(target, (set = new Set()));
+		set.add(from);
+	};
+	for (const workspacePackage of packages) {
+		const prefix = `${workspacePackage.dir}/`;
+		const own = new Set(files.filter(file => file.startsWith(prefix)));
+		for (const file of own) {
+			if (!DEPENDENCY_SOURCE_FILE.test(file) || file.endsWith(".d.ts")) continue;
+			const text = readText(file);
+			const directory = path.posix.dirname(file);
+			const loader = /x$/.test(file) ? (/\.[cm]?tsx$/.test(file) ? "tsx" : "jsx") : /\.[cm]?ts$/.test(file) ? "ts" : "js";
+			let imports: { path: string }[];
+			try {
+				// The transpiler rejects an entrypoint's shebang line; blank it to keep line numbers.
+				imports = transpilers[loader].scanImports(text.startsWith("#!") ? text.replace(/^#![^\n]*/, "") : text);
+			} catch {
+				unresolved.push({ from: file, specifier: "<unparseable module>" });
+				continue;
+			}
+			for (const { path: specifier } of imports) {
+				let base: string | undefined;
+				if (specifier.startsWith("./") || specifier.startsWith("../")) base = path.posix.join(directory, specifier);
+				else if (specifier === workspacePackage.name)
+					base = path.posix.join(workspacePackage.dir, workspacePackage.manifest.main ?? "src/index");
+				else if (specifier.startsWith(`${workspacePackage.name}/`))
+					base = `${workspacePackage.dir}/src/${specifier.slice(workspacePackage.name.length + 1)}`;
+				if (base === undefined) continue;
+				// A relative import may leave the package; only same-package edges count.
+				if (!path.posix.normalize(base).startsWith(prefix)) continue;
+				const target = resolveModuleCandidate(base, own);
+				if (target) link(target, file);
+				else unresolved.push({ from: file, specifier });
+			}
+			for (const match of text.matchAll(FILE_PATH_LITERAL)) {
+				const literal = match[1]!;
+				const candidate = path.posix.normalize(
+					literal.startsWith("packages/") ? literal : path.posix.join(directory, literal),
+				);
+				if (own.has(candidate)) link(candidate, file);
+			}
+		}
+	}
+	return { dependents, unresolved };
+}
+
+/** Index the checked-out workspace's package trees, never installed dependencies or build output. */
+export function loadReverseDependencyIndex(packages: readonly WorkspacePackage[], root: string = repoRoot): ReverseDependencyIndex {
+	const files: string[] = [];
+	for (const workspacePackage of packages) {
+		const packageRoot = path.join(root, workspacePackage.dir);
+		if (!fsSync.existsSync(packageRoot)) continue;
+		for (const entry of new Bun.Glob("**/*").scanSync({ cwd: packageRoot, onlyFiles: true })) {
+			const segments = entry.split(path.sep);
+			if (segments.some(segment => DEPENDENCY_SCAN_EXCLUDED_DIRS.has(segment))) continue;
+			files.push(`${workspacePackage.dir}/${segments.join("/")}`);
+		}
+	}
+	files.sort();
+	return buildReverseDependencyIndex(packages, files, file => fsSync.readFileSync(path.join(root, file), "utf8"));
+}
+
+/** Test files that transitively load any changed path, in breadth-first then lexical order. */
+export function dependentTestsFor(changedPaths: readonly string[], index: ReverseDependencyIndex): string[] {
+	const seen = new Set<string>(changedPaths);
+	const queue = [...changedPaths];
+	const tests: string[] = [];
+	for (let cursor = 0; cursor < queue.length; cursor++) {
+		const importers = [...(index.dependents.get(queue[cursor]!) ?? [])].sort();
+		for (const importer of importers) {
+			if (seen.has(importer)) continue;
+			seen.add(importer);
+			queue.push(importer);
+			if (isTestFilePath(importer)) tests.push(importer);
+		}
+	}
+	return tests;
+}
+
+function addDependentTestTasks(
+	tasks: Map<string, Task>,
+	changedPaths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	index: ReverseDependencyIndex,
+	validateTestPaths: boolean,
+): void {
+	const byPackage = new Map<WorkspacePackage, string[]>();
+	for (const testFile of dependentTestsFor(changedPaths, index)) {
+		const owner = owningPackage(testFile, packages);
+		if (!owner) continue;
+		const selected = byPackage.get(owner);
+		if (selected) selected.push(testFile);
+		else byPackage.set(owner, [testFile]);
+	}
+	for (const [owner, selected] of byPackage) {
+		if (selected.length > TARGETED_DEPENDENT_TEST_LIMIT && owner.manifest.scripts?.test) {
+			addPackageTestTasks(tasks, owner);
+			continue;
+		}
+		for (const testFile of selected) addTestFileTask(tasks, testFile, validateTestPaths);
+	}
 }
 
 // Resolve explicit behavioral-owner tests. These supplement package checks and
