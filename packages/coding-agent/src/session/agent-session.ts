@@ -33628,13 +33628,18 @@ export class AgentSession {
 	}
 
 	/**
-	 * Serialize deferred command-result drains.
+	 * Claim and publish one deferred command-result batch.
 	 *
-	 * Queue items stay in place while a shared publication awaits, so a second drain
-	 * (forced recovery, a replacement prompt, a prompt finalizer) must wait for the
-	 * in-flight one instead of publishing the same item again and running its
-	 * `onPersisted` twice. Waiting also keeps transcript order: a later drain retries
-	 * only what the earlier one left queued, behind the entry that failed.
+	 * Serialization lives in the retained drain owner ({@link #pendingPromptDrain}):
+	 * prompt preflight, prompt finalization, and forced recovery all join that single
+	 * promise, so no second traversal runs over this queue while a publication awaits.
+	 * Everything here is per batch. The batch is claimed by one splice of the rows
+	 * queued at that moment, so anything queued during the awaits below stays in a
+	 * successor batch behind it. Cancellation is re-read at the claim, so a preflight
+	 * cancelled while an earlier kind was still being published takes no further rows.
+	 * A row whose durability is unresolved stays queued and is reconciled by its
+	 * original attempted id on a later drain instead of being resubmitted, and a batch
+	 * that outlived its transcript is dropped without publishing or firing `onPersisted`.
 	 */
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
 		pendingMessages: Array<PendingExecutionMessage<T>>,
