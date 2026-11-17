@@ -393,6 +393,19 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(large).toBeLessThan(small * 10 + 2_000);
 	});
 
+	it("keeps line-based redaction linear when the other terminator appears once", () => {
+		const measure = (text: string): number => {
+			const started = performance.now();
+			const dumped = dump([{ role: "user", content: text, timestamp: 1 }] as AgentMessage[]);
+			expect(dumped).toContain("«redacted»");
+			return performance.now() - started;
+		};
+		measure(`${"secret={unclosed\n".repeat(1_000)}\r`);
+		const small = measure(`${"secret={unclosed\n".repeat(4_000)}\r`);
+		const large = measure(`${"secret={unclosed\n".repeat(16_000)}\r`);
+		expect(large).toBeLessThan(small * 10 + 2_000);
+	});
+
 	it("removes a private-key block split across a schema default object", () => {
 		const body = "SCHEMA_SPLIT_PEM_BODY";
 		const dumped = formatSessionDumpText({
@@ -468,6 +481,85 @@ describe("formatSessionDumpText credential scrub", () => {
 		] as AgentMessage[]);
 
 		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("pairs bash sections in render order even when the message stores output first", () => {
+		const body = "ORDERED_OUTPUT_SECRET";
+		const dumped = dump([
+			{
+				role: "bashExecution",
+				output: `${body}\n${pem("RSA", "END")}`,
+				command: `export PRIVATE_KEY='${pem("RSA", "BEGIN")}`,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("scrubs a token-shaped schema key outside a properties map", () => {
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: { $defs: { "sk-abcdefghijklmnop": { type: "string" } } },
+				},
+			],
+		});
+
+		expect(dumped).not.toContain("sk-abcdefghijklmnop");
+		expect(dumped).toContain("«redacted-api-key»");
+	});
+
+	it("keeps header-pair redaction inside a schema default", () => {
+		const secret = "OPAQUE_SCHEMA_HEADER_SECRET";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: { type: "object", default: { headers: ["Authorization", secret] } },
+				},
+			],
+		});
+
+		expect(dumped).toContain('"Authorization"');
+		expect(dumped).not.toContain(secret);
+	});
+
+	it("pairs a private-key block split across schema data keywords", () => {
+		const body = "SCHEMA_CROSS_KEYWORD_SECRET";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						default: `${pem("RSA", "BEGIN")}\n${body}`,
+						example: pem("RSA", "END"),
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
 		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
@@ -606,7 +698,7 @@ describe("formatSessionDumpText credential scrub", () => {
 		const dumped = dump([
 			{
 				role: "bashExecution",
-				command: `export PRIVATE_KEY='${pem("RSA", "BEGIN")}`,
+				command: `export PRIVATE_KEY='${pem("RSA", "BEGIN")}\n${firstSecretPart}`,
 				output: `${secondSecretPart}\n${pem("RSA", "END")}`,
 				exitCode: 0,
 				cancelled: false,

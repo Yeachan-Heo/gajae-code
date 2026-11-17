@@ -688,9 +688,10 @@ function createContainerScanBudget(length: number): ContainerScanBudget {
 /**
  * Lookahead for the next container scan.
  * While the main budget lasts a scan may look at everything that is left. Once it is
- * spent, each scan gets at most the floor, and the floor itself is spent down, so
- * repeated unterminated containers cost a bounded amount each instead of a full text
- * scan — while a container that closes just past its line is still found.
+ * spent, each scan gets at most the floor, and the floor allowance is cumulative and can
+ * reach zero — so a long enough run of malformed containers gives up on finding a distant
+ * closing brace and treats later ones as unterminated. The give-up point is deliberate: it
+ * is what keeps a repeated unterminated container from costing a full text scan each time.
  */
 function containerLookahead(budget: ContainerScanBudget): number {
 	if (budget.remaining > 0) return budget.remaining;
@@ -709,7 +710,7 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
 
 function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
 	const budget = createContainerScanBudget(text.length);
-	const lineScan = createLineEndScan(text);
+	const lineScan = createLineEndScan();
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
@@ -746,34 +747,53 @@ interface BoundedScan<T> {
 	readonly scanned: number;
 }
 
+/** One terminator's cached search state, advanced forward within a pass. */
+interface TerminatorSearch {
+	/** Next occurrence found by the last search, or -1 for none at or after `searchedFrom`. */
+	next: number;
+	/** Position the last search started from, or -1 before the first search. */
+	searchedFrom: number;
+}
+
 /**
  * Forward-only line-end lookup shared by one container pass.
- * Each terminator is examined once per pass, so looking up the line for many
- * containers stays linear instead of rescanning the remaining text per container.
+ * Each terminator search resumes where the previous one stopped, so every character is
+ * examined at most once per pass no matter how many containers ask for their line.
  */
 interface LineEndScan {
-	/** Whether the text contains a line feed at all. */
-	readonly hasLineFeed: boolean;
-	/** Whether the text contains a carriage return at all. */
-	readonly hasCarriageReturn: boolean;
-	/** Position the search resumes from. */
+	readonly lineFeed: TerminatorSearch;
+	readonly carriageReturn: TerminatorSearch;
+	/** Position the next lookup starts from. */
 	from: number;
 	/** Line end found for the last request, or -1 before the first request. */
 	end: number;
 }
 
-function createLineEndScan(text: string): LineEndScan {
-	return { hasLineFeed: text.includes("\n"), hasCarriageReturn: text.includes("\r"), from: 0, end: -1 };
+function createLineEndScan(): LineEndScan {
+	return {
+		lineFeed: { next: -1, searchedFrom: -1 },
+		carriageReturn: { next: -1, searchedFrom: -1 },
+		from: 0,
+		end: -1,
+	};
+}
+
+function nextTerminator(text: string, terminator: string, search: TerminatorSearch, from: number): number {
+	if (search.searchedFrom >= 0) {
+		if (search.next >= from) return search.next;
+		if (search.next < 0) return -1;
+	}
+	search.searchedFrom = from;
+	search.next = text.indexOf(terminator, from);
+	return search.next;
 }
 
 function currentLineEnd(text: string, start: number, scan: LineEndScan): number {
 	if (scan.end >= start) return scan.end;
 	const from = Math.max(scan.from, start);
-	// Both terminators count, as they always have. A terminator the text does not contain
-	// at all is not searched for, because that search would scan the rest of the text for
-	// every container instead of stopping at the next line.
-	const lineFeed = scan.hasLineFeed ? text.indexOf("\n", from) : -1;
-	const carriageReturn = scan.hasCarriageReturn ? text.indexOf("\r", from) : -1;
+	// Both terminators count, as they always have.
+	const lineFeed = nextTerminator(text, "\n", scan.lineFeed, from);
+	const carriageReturn = nextTerminator(text, "\r", scan.carriageReturn, from);
 	const terminator =
 		lineFeed < 0 ? carriageReturn : carriageReturn < 0 ? lineFeed : Math.min(lineFeed, carriageReturn);
 	scan.end = terminator >= 0 ? terminator : text.length;
@@ -804,7 +824,7 @@ function findCredentialContainerEnd(
 		const character = text[index] ?? "";
 		if (character === "\\") {
 			let backslashEnd = index;
-			while (text[backslashEnd + 1] === "\\") backslashEnd++;
+			while (backslashEnd + 1 < limit && text[backslashEnd + 1] === "\\") backslashEnd++;
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
 			// The opening escape run identifies this serialization layer; matching runs delimit strings.
@@ -851,7 +871,7 @@ function findEscapedQuoteDelimiter(
 		const character = text[index] ?? "";
 		if (character === "\\") {
 			let backslashEnd = index;
-			while (text[backslashEnd + 1] === "\\") backslashEnd++;
+			while (backslashEnd + 1 < limit && text[backslashEnd + 1] === "\\") backslashEnd++;
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
 			if ((nextCharacter === '"' || nextCharacter === "'" || nextCharacter === "`") && backslashCount % 2 === 1) {

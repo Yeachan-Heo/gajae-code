@@ -189,12 +189,19 @@ function serializeParameterValue(value: unknown): string {
 }
 
 /**
- * Redact a private-key block that spans an execution message's command (or code),
- * its output, and the notice text rendered after them. The block is located over the
- * whole message before field-level credential masking can remove one of the banners.
+ * Redact a private-key block that spans an execution message's rendered sections.
+ * The fields are paired in render order — a message whose `output` is stored before its
+ * `command` must still be read command-first — and before field-level credential masking
+ * can remove one of the banners.
  */
-function redactExecutionPrivateKey<T extends object>(message: T): T {
-	return redactCrossFieldPrivateKeys([message])[0] as T;
+function redactExecutionPrivateKey<T extends object>(message: T, textFields: readonly string[]): T {
+	const source = message as Record<string, unknown>;
+	const redacted = redactCrossFieldPrivateKeys(textFields.map(field => source[field]));
+	const result = { ...source };
+	for (let index = 0; index < textFields.length; index++) {
+		result[textFields[index]] = redacted[index];
+	}
+	return result as T;
 }
 
 /** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
@@ -208,18 +215,12 @@ const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"
 
 /**
  * Scrub a data value inside a schema (a `default`, `example`, or `const`).
- * The value is data, not schema structure, so it is decoded before scrubbing and
- * nested credential-named fields are masked the same way tool arguments are.
+ * The value is data, not schema structure, so it is decoded first and then scrubbed with
+ * the same rules as tool arguments: credential-named fields are masked, text is scrubbed,
+ * and a known header collection keeps its value redaction.
  */
 function scrubSchemaData(value: unknown): unknown {
-	if (typeof value === "string") return redactCrashSecrets(decodeUnicodeEscapeText(value));
-	if (Array.isArray(value)) return value.map(scrubSchemaData);
-	if (value === null || typeof value !== "object") return value;
-	const scrubbed = Object.create(null) as Record<string, unknown>;
-	for (const [key, nested] of Object.entries(value)) {
-		scrubbed[redactCrashSecrets(key)] = isCredentialKey(key) ? "«redacted»" : scrubSchemaData(nested);
-	}
-	return scrubbed;
+	return redactStructuredSecrets(decodeValueStrings(value), undefined, { headerPairs: isHeaderCollectionKey });
 }
 
 /** Replace every leaf of a data value with the marker, preserving its shape. */
@@ -247,25 +248,30 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
+	// Data-carrying keywords render as separate parameters, so a private-key block is paired
+	// across all of them before any credential-named field inside them is masked.
+	const dataFields = Object.keys(source).filter(field => SCHEMA_VALUE_KEYWORDS.has(field));
+	const dataValues =
+		dataFields.length === 0 ? [] : redactCrossFieldPrivateKeys(dataFields.map(field => source[field]));
 	for (const [field, nested] of Object.entries(source)) {
+		const dataIndex = dataFields.indexOf(field);
 		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const properties = Object.create(null) as Record<string, unknown>;
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
 				properties[redactCrashSecrets(name)] = redactSchemaValue(schema, name);
 			}
-			redacted[field] = properties;
+			redacted[redactCrashSecrets(field)] = properties;
 			continue;
 		}
-		if (SCHEMA_VALUE_KEYWORDS.has(field)) {
-			// Schema data is handled like tool arguments: a private-key block is paired over
-			// the whole value before credential-named fields inside it are masked.
-			redacted[field] =
+		if (dataIndex >= 0) {
+			const paired = dataValues[dataIndex];
+			redacted[redactCrashSecrets(field)] =
 				propertyName !== undefined && isCredentialKey(propertyName)
-					? maskSchemaData(nested)
-					: scrubSchemaData(redactCrossFieldPrivateKeys([nested])[0]);
+					? maskSchemaData(paired)
+					: scrubSchemaData(paired);
 			continue;
 		}
-		redacted[field] = redactSchemaValue(nested, propertyName);
+		redacted[redactCrashSecrets(field)] = redactSchemaValue(nested, propertyName);
 	}
 	return redacted;
 }
@@ -430,7 +436,9 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const bashMsg = msg as BashExecutionMessage;
 			if (!bashMsg.excludeFromContext) {
 				lines.push("## Bash Execution\n");
-				const structured = redactStructuredSecrets(redactExecutionPrivateKey(bashMsg)) as BashExecutionMessage;
+				const structured = redactStructuredSecrets(
+					redactExecutionPrivateKey(bashMsg, ["command", "output", "signal", "meta"]),
+				) as BashExecutionMessage;
 				lines.push(redactCrashSecrets(bashExecutionToText(structured)));
 				lines.push("\n");
 			}
@@ -438,7 +446,9 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const pythonMsg = msg as PythonExecutionMessage;
 			if (!pythonMsg.excludeFromContext) {
 				lines.push("## Python Execution\n");
-				const structured = redactStructuredSecrets(redactExecutionPrivateKey(pythonMsg)) as PythonExecutionMessage;
+				const structured = redactStructuredSecrets(
+					redactExecutionPrivateKey(pythonMsg, ["code", "output", "meta"]),
+				) as PythonExecutionMessage;
 				lines.push(redactCrashSecrets(pythonExecutionToText(structured)));
 				lines.push("\n");
 			}
