@@ -4863,8 +4863,11 @@ export class AgentSession {
 	/**
 	 * Settled per-tool reminders from tool results that completed before the TTSR retry.
 	 * Keyed by tool call id: { rules, reminderText }. Cleared after extraction into the retry injection.
+	 * Scoped to #ttsrSettledGeneration to prevent reminders from previous turns being re-injected.
 	 */
 	#settledToolTtsrReminders = new Map<string, { rules: Rule[]; reminderText: string }>();
+	/** Generation that owns the current settled reminders; cleared when a new turn starts. */
+	#ttsrSettledGeneration = 0;
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -11016,6 +11019,8 @@ export class AgentSession {
 			rules: folded.rules,
 			reminderText: folded.block.text,
 		});
+		// Track the generation that owns this reminder to prevent cross-turn leaks (#7838).
+		this.#ttsrSettledGeneration = this.#promptGeneration;
 		this.#perToolTtsrFolded.delete(message.toolCallId);
 		this.#perToolTtsrClaims.delete(message.toolCallId);
 		// The TTSR manager was already claimed at bucket time; only persistence remains.
@@ -11410,15 +11415,18 @@ export class AgentSession {
 					const discardedContent: string[] = [];
 					const settledRules: Rule[] = [];
 					
-					// Extract settled per-tool reminders that were delivered but are now being discarded
-					for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
-						for (const rule of rules) {
-							if (!carriedNames.has(rule.name)) {
-								carriedNames.add(rule.name);
-								settledRules.push(rule);
+					// Extract settled per-tool reminders that were delivered but are now being discarded.
+					// Only use reminders that belong to the current generation to prevent cross-turn leaks (#7838).
+					if (this.#ttsrSettledGeneration === generation) {
+						for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
+							for (const rule of rules) {
+								if (!carriedNames.has(rule.name)) {
+									carriedNames.add(rule.name);
+									settledRules.push(rule);
+								}
 							}
+							discardedContent.push(reminderText);
 						}
-						discardedContent.push(reminderText);
 					}
 					
 					// Extract custom ttsr-injection messages from the assistant message history
@@ -12847,6 +12855,8 @@ export class AgentSession {
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
 		this.#promptRunAcceptedObservers.clear();
+		// Clear TTSR state as part of session teardown.
+		this.#settledToolTtsrReminders.clear();
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;
@@ -18138,6 +18148,8 @@ export class AgentSession {
 			this.#promptGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
+			// Clear settled reminders from the previous turn to prevent cross-turn leaks (#7838).
+			this.#settledToolTtsrReminders.clear();
 		}
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
