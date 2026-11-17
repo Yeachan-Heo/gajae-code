@@ -1130,7 +1130,7 @@ export async function backmergeReleaseIntoDev(
 				title: `chore(release): backmerge v${version} into dev`,
 				body: `Sync the v${version} release commit from main into dev so this published version is included before a later release merge.
 
-The release consumed its changelog fragments; the history guard admits those deletions because their notes are already under the released \`## [${version}]\` section (a \`v${version}\` tag that deleted them counts as evidence too). The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's manifest wholesale — its version and its artifact digests — so no digest dev built for another version is relabelled under v${version}.
+The release consumed its changelog fragments; the history guard admits those deletions because a stable release tag in this range records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's manifest wholesale — its version and its artifact digests — so no digest dev built for another version is relabelled under v${version}.
 
 Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of dev. Merging requires maintainer approval of this exact head.`,
 			});

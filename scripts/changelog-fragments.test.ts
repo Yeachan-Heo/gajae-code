@@ -81,14 +81,6 @@ function insert(content: string, entry: string): string {
 	return content.replace("### Fixed\n\n", `### Fixed\n\n${entry}\n`);
 }
 
-function releasedNoteBlock(version: string, notes: readonly string[]): string {
-	return `## [${version}] - 2026-02-01\n\n### Fixed\n\n${notes.map(note => `- ${note}`).join("\n")}\n\n`;
-}
-
-function insertRelease(content: string, block: string): string {
-	return content.replace("## [1.0.0]", `${block}## [1.0.0]`);
-}
-
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
@@ -206,58 +198,73 @@ describe("pull request guards", () => {
 	});
 });
 
-async function deleteFragment(root: string, fragment: string): Promise<void> {
-	await fs.rm(path.join(root, fragment));
-	await commit(root, "drop the fragment");
-}
+const SHIPPED_FRAGMENT = "packages/coding-agent/changelog.d/shipped.md";
 
-async function deletedFragmentRange(content: string): Promise<{ root: string; base: string; fragment: string }> {
+/** A dev branch with one pending fragment, plus the commit before it. */
+async function devWithFragment(content: string): Promise<{ root: string; base: string; root0: string }> {
 	const root = await tempDir();
 	await init(root);
-	const fragment = "packages/coding-agent/changelog.d/note.md";
-	await put(root, fragment, content);
+	const root0 = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+	await put(root, SHIPPED_FRAGMENT, content);
 	await commit(root, "add a fragment");
 	const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
-	return { root, base, fragment };
+	return { root, base, root0 };
 }
 
-describe("release fold evidence", () => {
-	test("excuses a deleted fragment whose notes sit inside a released section this import adds", async () => {
-		const { root, base, fragment } = await deletedFragmentRange("### Fixed\n\n- Web   search  picked a provider.\n");
-		await put(
-			root,
-			"packages/coding-agent/CHANGELOG.md",
-			insertRelease(CHANGELOG, releasedNoteBlock("1.0.1", ["Web search picked a provider."])),
+describe("release tag evidence", () => {
+	test("admits a deletion the release bump made on the tag's second-parent branch", async () => {
+		const { root, base, root0 } = await devWithFragment("### Fixed\n\n- Shipped by 1.0.1.\n");
+		const released = CHANGELOG.replace(
+			"## [1.0.0]",
+			"## [1.0.1] - 2026-02-01\n\n### Fixed\n\n- Shipped by 1.0.1.\n\n## [1.0.0]",
 		);
-		await deleteFragment(root, fragment);
-		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		// The release branch starts at main's tip, which never carried the dev-origin fragment.
+		await git(root, ["checkout", "-q", "-b", "release", root0]);
+		expect((await git(root, ["merge", "--no-ff", "-m", "merge dev into release", "dev"])).exitCode).toBe(0);
+		await put(root, "packages/coding-agent/CHANGELOG.md", released);
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "chore: bump version to 1.0.1");
+		await git(root, ["checkout", "-q", "-b", "main", root0]);
+		expect((await git(root, ["merge", "--no-ff", "-m", "merge release into main", "release"])).exitCode).toBe(0);
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+		const head = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+		// The first-parent diff sees nothing, which is why the old query admitted no deletion.
+		expect((await git(root, ["diff", "--name-only", "--diff-filter=D", `${head}^1`, head])).stdout.trim()).toBe("");
+		const result = await run(["bun", historyGuardPath, "--base", base, "--head", head], root);
 		expect(result.stderr).toBe("");
 		expect(result.exitCode).toBe(0);
 	});
 
-	test("rejects a deleted fragment when one of its notes is missing from the imported section", async () => {
-		const { root, base, fragment } = await deletedFragmentRange("### Fixed\n\n- Shipped note.\n\n### Added\n\n- Missing note.\n");
-		await put(root, "packages/coding-agent/CHANGELOG.md", insertRelease(CHANGELOG, releasedNoteBlock("1.0.1", ["Shipped note."])));
-		await deleteFragment(root, fragment);
+	test("still rejects a fragment deletion no release tag records", async () => {
+		const { root, base } = await devWithFragment("### Fixed\n\n- Never shipped.\n");
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "drop a pending note");
 		const result = await run(["bun", historyGuardPath, "--base", base], root);
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain(`${fragment}::is deleted by this pull request`);
+		expect(result.stderr).toContain(`${SHIPPED_FRAGMENT}::is deleted by this pull request`);
 	});
 
-	test("does not treat [Unreleased] text as shipped evidence", async () => {
-		const { root, base, fragment } = await deletedFragmentRange("### Fixed\n\n- An older fix.\n");
-		await deleteFragment(root, fragment);
+	test("does not use a release tag that is not merged into head", async () => {
+		const { root, base } = await devWithFragment("### Fixed\n\n- Shipped on a side branch.\n");
+		await git(root, ["checkout", "-q", "-b", "side"]);
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "chore: bump version to 1.0.1");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+		await git(root, ["checkout", "-q", "dev"]);
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "drop the fragment");
 		const result = await run(["bun", historyGuardPath, "--base", base], root);
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain(`${fragment}::is deleted by this pull request`);
+		expect(result.stderr).toContain(`${SHIPPED_FRAGMENT}::is deleted by this pull request`);
 	});
 
-	test("does not treat a released section that already existed at base as evidence", async () => {
-		const { root, base, fragment } = await deletedFragmentRange("### Added\n\n- Something shipped.\n");
-		await deleteFragment(root, fragment);
-		const result = await run(["bun", historyGuardPath, "--base", base], root);
-		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain(`${fragment}::is deleted by this pull request`);
+	test("guard exits 0 on this worktree with the backmerge deletions in place", async () => {
+		const base =
+			process.env.GITHUB_BASE_SHA?.trim() || (await git(repoRoot, ["merge-base", "HEAD", "origin/dev"])).stdout.trim();
+		expect(base).not.toBe("");
+		const result = await run(["bun", historyGuardPath, "--base", base], repoRoot);
+		expect(result.stderr).toBe("");
+		expect(result.exitCode).toBe(0);
 	});
 });
 

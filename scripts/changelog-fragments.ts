@@ -26,8 +26,6 @@ const GUARDED_CHANGELOG = /^packages\/[^/]+\/CHANGELOG\.md$/;
 const FRAGMENT_PATH = /^packages\/[^/]+\/changelog\.d\/[^/]+$/;
 const UNRELEASED_HEADING = /^##\s+\[Unreleased\]\s*$/u;
 const VERSION_HEADING = /^##\s+/u;
-const VERSIONED_HEADING = /^##\s+\[([^\]]+)\]/u;
-const UNRELEASED_VERSION = "unreleased";
 const SECTION_HEADING = /^###\s+(.+?)\s*$/u;
 const ANY_HEADING = /^#+\s/u;
 const BULLET = /^\s*-\s+\S/u;
@@ -429,83 +427,6 @@ export async function runCheck(): Promise<number> {
 	return 0;
 }
 
-/** Collapse whitespace so a fragment bullet and its folded changelog line compare equal. */
-function normalizeNote(line: string): string {
-	return line.replace(/\s+/gu, " ").trim();
-}
-
-/** Released version a heading declares, or undefined for `[Unreleased]` and ordinary headings. */
-function releasedVersion(line: string): string | undefined {
-	const version = VERSIONED_HEADING.exec(line)?.[1]?.trim().toLowerCase();
-	return version === undefined || version === UNRELEASED_VERSION ? undefined : version;
-}
-
-interface ImportedReleaseSection {
-	version: string;
-	notes: Set<string>;
-}
-
-/**
- * Released sections this range imports: their heading is present at `head` and absent from
- * the same changelog at `base`. Bodies stay per section, so evidence cannot be assembled
- * across sections, from `[Unreleased]`, or from a release dev already had.
- */
-function importedReleaseSections(head: string | undefined, base: string | undefined): ImportedReleaseSection[] {
-	if (head === undefined) return [];
-	const existing = new Set<string>();
-	for (const line of (base ?? "").split("\n")) {
-		const version = releasedVersion(line);
-		if (version !== undefined) existing.add(version);
-	}
-	const sections: ImportedReleaseSection[] = [];
-	let current: ImportedReleaseSection | undefined;
-	for (const line of head.split("\n")) {
-		if (VERSION_HEADING.test(line)) {
-			const version = releasedVersion(line);
-			current = version === undefined || existing.has(version) ? undefined : { version, notes: new Set() };
-			if (current !== undefined) sections.push(current);
-			continue;
-		}
-		if (current !== undefined && BULLET.test(line)) current.notes.add(normalizeNote(line));
-	}
-	return sections;
-}
-
-/** `- ` notes a fragment declares, whitespace-normalized. */
-function declaredNotes(fragment: string): string[] {
-	return fragment
-		.split(/\r?\n/u)
-		.filter(line => BULLET.test(line))
-		.map(normalizeNote);
-}
-
-function changelogForFragment(file: string): string {
-	return `${file.slice(0, file.indexOf(`/${FRAGMENT_DIRECTORY}/`))}/CHANGELOG.md`;
-}
-
-/**
- * Fold evidence for a deleted fragment: every `- ` note it declared appears verbatim
- * (whitespace-normalized) inside one released `## [x.y.z]` section that this range imports.
- *
- * A release can fold a dev-origin fragment into changelog text `main` already tracks while
- * never deleting the fragment in its own commit, because `main` never tracked the file. The
- * `vX.Y.Z` tag then records no deletion for `releaseConsumedFragments` to find, so the folded
- * notes are the only surviving evidence that the note shipped. `[Unreleased]` never counts:
- * text parked there has not shipped.
- */
-async function foldedIntoImportedRelease(
-	base: string,
-	file: string,
-	importedFor: (changelog: string) => Promise<ImportedReleaseSection[]>,
-): Promise<boolean> {
-	const source = await gitShow(base, file);
-	if (source === undefined) return false;
-	const declared = declaredNotes(source);
-	if (declared.length === 0) return false;
-	const imported = await importedFor(changelogForFragment(file));
-	return imported.some(section => declared.every(note => section.notes.has(note)));
-}
-
 export async function collectPullRequestFragmentViolations(
 	base: string,
 	head: string,
@@ -518,26 +439,9 @@ export async function collectPullRequestFragmentViolations(
 		if (violation) errors.push(violation);
 	}
 	const consumed = await releaseConsumedFragments(base, head);
-	const imports = new Map<string, Promise<ImportedReleaseSection[]>>();
-	const importedFor = (changelog: string): Promise<ImportedReleaseSection[]> => {
-		let imported = imports.get(changelog);
-		if (imported === undefined) {
-			imported = Promise.all([gitShow(head, changelog), gitShow(base, changelog)]).then(([now, before]) =>
-				importedReleaseSections(now, before),
-			);
-			imports.set(changelog, imported);
-		}
-		return imported;
-	};
 	for (const file of (await gitDiffPaths(base, head, "D")).filter(isFragmentPath)) {
 		if (consumed.has(file)) continue;
-		if (await foldedIntoImportedRelease(base, file, importedFor)) continue;
-		errors.push({
-			file,
-			message:
-				"is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it. " +
-				`No reachable stable release tag in this range deleted it, and not all of its '- ' notes appear inside one released '## [x.y.z]' section that this pull request imports into ${changelogForFragment(file)}.`,
-		});
+		errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
 	}
 	const collected = await collectPackageFragments();
 	errors.push(...collected.errors);
@@ -556,13 +460,16 @@ const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
 /**
  * Fragments consumed by a release that this range brings in, keyed by path.
  *
- * Release provenance is the stable `vX.Y.Z` tag that `scripts/release.ts` places on
- * its version-bump commit, and that commit is where the fragments are folded and
- * deleted. A release backmerge merges a tag that is reachable from `head` but not from
- * `base`, so the deletions that tagged commit made are legitimate in this range. Any
- * other deletion needs its own evidence, which `foldedIntoImportedRelease` supplies when
- * the released changelog already carries the fragment's notes; absent both, it is a
- * violation.
+ * Release provenance is the stable `vX.Y.Z` tag that `scripts/release.ts` places on its
+ * version-bump commit, and that commit is where the fragments are folded and deleted. A
+ * backmerge merges a tag that is reachable from `head` but not from `base`, so every
+ * `changelog.d` deletion a commit reachable from that tag made is legitimate here.
+ *
+ * The deletions must come from history, not from the tag's first-parent diff: main merges
+ * the release through a merge commit whose first parent never carried the dev-origin
+ * fragments, so `git diff <tag>^1 <tag>` reports no deletion at all. History simplification
+ * hides the same commits for the same reason, which is why `--full-history` is required for
+ * `git log --diff-filter=D` to walk the branch the version bump lives on.
  */
 async function releaseConsumedFragments(base: string, head: string): Promise<Set<string>> {
 	const listed = await $`git tag --list ${"v*"} --merged ${head} --no-merged ${base}`.quiet().nothrow();
@@ -570,7 +477,11 @@ async function releaseConsumedFragments(base: string, head: string): Promise<Set
 	const consumed = new Set<string>();
 	const tags = listed.text().split("\n").map(line => line.trim()).filter(tag => STABLE_RELEASE_TAG.test(tag));
 	for (const tag of tags) {
-		for (const file of await gitDiffPaths(`${tag}^1`, tag, "D")) {
+		const deleted = await $`git log --full-history --diff-filter=D --name-only --format= ${`${base}..${tag}`}`
+			.quiet()
+			.nothrow();
+		if (deleted.exitCode !== 0) throw new Error(`git log ${base}..${tag} failed: ${deleted.stderr.toString().trim()}`);
+		for (const file of deleted.text().split("\n").map(line => line.trim())) {
 			if (isFragmentPath(file)) consumed.add(file);
 		}
 	}
