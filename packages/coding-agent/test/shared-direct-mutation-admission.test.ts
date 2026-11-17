@@ -113,8 +113,6 @@ describe("early direct shared mutation admission", () => {
 		expect(root).not.toBe(own);
 		const mutations: Array<() => unknown> = [
 			() => a.setSessionName("forbidden title", "user", { onApplied: applied }),
-			() => a.setSessionStarred(true),
-			() => a.setSessionStarredForPicker(candidate, true),
 			() => a.applyEntryMessageUpdates([{ ...message, message: user("new payload ".repeat(100_000)) }]),
 			() => a.applyCustomMessageEntryUpdates([{ ...customMessage, content: "changed", details: { value: 2 } }]),
 			() => a.evictCompactedContent(kept, compaction),
@@ -137,10 +135,24 @@ describe("early direct shared mutation admission", () => {
 		a.resetLeaf();
 		expect(a.getLeafId()).toBeNull();
 		expect(await fs.readFile(file)).toEqual(bytes);
+		// Both star writers select shared publication: each appends exactly one header patch
+		// after the committed bytes, with no rewrite of the sibling's transcript.
+		expect(await a.setSessionStarred(true)).toBe(true);
+		const starred = await fs.readFile(file);
+		expect(starred.subarray(0, bytes.length)).toEqual(bytes);
+		expect(starred.subarray(bytes.length).toString()).toBe(
+			`${JSON.stringify({ type: "header_patch", patch: { starred: true } })}\n`,
+		);
+		const [fresh] = await a.listForResumePickerReadOnly();
+		if (!fresh || fresh.path !== file) throw new Error("missing picker candidate");
+		await a.setSessionStarredForPicker(fresh, false);
+		expect(a.isSessionStarred()).toBe(false);
+		const unstarred = await fs.readFile(file);
+		expect(unstarred.subarray(0, starred.length)).toEqual(starred);
 		const reopened = await SessionManager.open(file, destination);
 		managers.push(reopened);
 		expect(reopened.getEntries().some(entry => entry.id === sibling)).toBe(true);
-		expect(await fs.readFile(file)).toEqual(bytes);
+		expect(reopened.isSessionStarred()).toBe(false);
 	});
 
 	it("keeps ordinary metadata, payload, eviction, sanitation, and summary mutations working", async () => {

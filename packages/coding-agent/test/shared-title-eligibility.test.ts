@@ -155,13 +155,17 @@ describe("shared publication admission split", () => {
 			SharedSessionMutationUnsupportedError,
 		);
 		await expect(f.manager.fork()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+		// Starring selects shared publication from the manager's own eligibility: an
+		// append-only header patch, never the legacy header upgrade.
+		expect(await f.manager.setSessionStarred(true)).toBe(true);
+		expect(f.manager.isSessionStarred()).toBe(true);
 		expect((await fs.readFile(f.file)).subarray(0, before.length).equals(before)).toBe(true);
 
 		const reopened = await SessionManager.open(f.file, f.destination);
 		managers.push(reopened);
 		expect(reopened.getEntries().some(entry => entry.id === peer.id)).toBe(true);
+		expect(reopened.isSessionStarred()).toBe(true);
 	});
 
 	it("holds the in-flight fence until every queued title publication settles", async () => {
@@ -230,7 +234,8 @@ describe("shared publication admission split", () => {
 		expect(outcome.kind).toBe("committed");
 		expect(() => f.manager.appendMessage(user("after temporary model"))).not.toThrow();
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+		// Starring is an append-only header patch, not a rewrite: it commits under the fence.
+		expect(await f.manager.setSessionStarred(true)).toBe(true);
 	});
 
 	it("scopes thinking append admission while retaining rewrite authority", async () => {
@@ -256,7 +261,8 @@ describe("shared publication admission split", () => {
 		expect(outcome.kind).toBe("committed");
 		expect(() => f.manager.appendMessage(user("after tool selection"))).not.toThrow();
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+		// Starring is an append-only header patch, not a rewrite: it commits under the fence.
+		expect(await f.manager.setSessionStarred(true)).toBe(true);
 	});
 
 	it("persists a custom message_end emitted after a committed canonical shared append", async () => {
@@ -384,7 +390,8 @@ describe("shared publication admission split", () => {
 		expect(outcome.kind).toBe("committed");
 		expect(() => f.manager.appendMessage(user("after mode change"))).not.toThrow();
 		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+		// Starring is an append-only header patch, not a rewrite: it commits under the fence.
+		expect(await f.manager.setSessionStarred(true)).toBe(true);
 	});
 
 	it("persists a tree-navigator label after shared admission", async () => {

@@ -6471,6 +6471,7 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.#rootInteractiveSharedAppend = config.rootInteractiveSharedAppend === true;
+		if (this.#rootInteractiveSharedAppend) this.sessionManager.admitRootSharedPublication();
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
@@ -22126,6 +22127,12 @@ export class AgentSession {
 		this.#beginSessionTransition("fork");
 		try {
 			const previousSessionFile = this.sessionFile;
+			// The in-place fork re-identifies this manager's resident transcript, which a
+			// session under shared admission cannot do. Take prepareFork's admission decision
+			// before the hook, the agent disconnect, and the flush, so a refusal leaves the live
+			// session untouched. The bounded cold fork only reads the committed source.
+			if (!(this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined))
+				this.sessionManager.assertLegacyMutationAllowed("prepare fork");
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
 			const predecessorQueuedSdkWork = this.#queuedMessagesForSessionTransition();
@@ -22186,6 +22193,7 @@ export class AgentSession {
 					exactRetirement = await this.#prepareExactMcpControlRetirement(previousManager.getSessionId(), true);
 					if (exactRetirement && !exactRetirement.canCommit())
 						throw new Error("Exact MCP control retirement changed before session adoption");
+					if (this.#rootInteractiveSharedAppend) forkedManager.admitRootSharedPublication();
 					this.sessionManager = forkedManager;
 					adopted = true;
 					if (!exactRetirement) revokeExactMcpControls(this);
@@ -23848,6 +23856,10 @@ export class AgentSession {
 	 * append would be refused (shared admission latched; #7824).
 	 */
 	assertConfiguredModelChainWritable(): void {
+		// Eligibility, not the latched append bar, decides: an admitted root session that has
+		// not published yet must not take the legacy chain append either.
+		if (this.#usesSharedSessionPublication())
+			throw new SharedSessionMutationUnsupportedError("set configured model chain");
 		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
 	}
 
@@ -24049,6 +24061,9 @@ export class AgentSession {
 	 * Never writes global settings.
 	 */
 	recordResumeDefaultModel(selector: string | undefined): void {
+		// Shared sessions record the resume default inside their admitted model publication.
+		if (this.#usesSharedSessionPublication())
+			throw new SharedSessionMutationUnsupportedError("record resume default model");
 		if (selector === undefined) {
 			this.sessionManager.clearModelRole("default");
 			return;
@@ -32530,15 +32545,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * The single eligibility rule for admitted shared publication (#7824):
-	 * managed destination && (root shared mode || session already requires shared admission).
-	 * Every migrated control and canonical producer routes through this predicate.
+	 * Admitted shared publication for this session's current manager. The rule lives on
+	 * {@link SessionManager.usesSharedPublication} so admission-aware SessionManager writers
+	 * and these seams can never disagree about the protocol.
 	 */
 	#usesSharedSessionPublication(): boolean {
-		return (
-			this.sessionManager.isManagedDestination() &&
-			(this.#rootInteractiveSharedAppend || this.sessionManager.requiresSharedMutationAdmission())
-		);
+		return this.sessionManager.usesSharedPublication();
 	}
 
 	/**
