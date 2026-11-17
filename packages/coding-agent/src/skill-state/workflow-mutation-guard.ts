@@ -152,6 +152,11 @@ const INTERPRETER_FILESYSTEM_REQUIRE_RE =
 	/\b(?:require|import|from)\s*(?:\(\s*)?(['"\x60])(?:node:)?(?:fs(?:\/promises)?|fs-extra|graceful-fs|child_process|fileutils|io|lfs)\1(?:\s*\))?/i;
 const INTERPRETER_NONLITERAL_REQUIRE_RE = /\brequire\s*(?:\(\s*(?!['"\x60])|\s+(?!['"\x60]))/i;
 const SHELL_DOT_SOURCE_RE = /(?:^|[;&|\n])\s*(?:(?:if|then|do)\s+)?\.\s+(?:["'$`]|[A-Za-z0-9_./~])/;
+/**
+ * Node/Bun flags that load a module before the scanned one-liner runs. The loaded
+ * module is never scanned, so planning fails closed on every spelling of them.
+ */
+const NODE_PRELOAD_FLAG_RE = /^(?:-r|--require|--import|--loader|--experimental-loader|--preload)(?:=|$)|^-r./;
 /** Executable Python source evaluation and dynamic imports make payloads opaque; compile() alone is inert. */
 const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
 	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
@@ -2170,8 +2175,15 @@ function collectInterpreterOneLinerWrites(
 				targets.unknown = true;
 				return;
 			}
+			// Node/Bun preload flags load a module the scanner never sees, so fail closed
+			// for every detached, attached, and equals-form spelling.
+			if (/^(?:node|bun)$/.test(binary) && NODE_PRELOAD_FLAG_RE.test(part)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
 			let rawScript: string | undefined;
-			let option = options.find(
+			const option = options.find(
 				candidate =>
 					part === candidate || (candidate.length === 2 && part.startsWith(candidate) && part.length > 2),
 			);
@@ -2181,18 +2193,13 @@ function collectInterpreterOneLinerWrites(
 				const rawWord = words[index] ?? "";
 				rawScript = rawWord.startsWith("-") ? rawWord.slice(option.length) : part.slice(option.length);
 			} else {
-				option = options.find(candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`));
-				if (!option) continue;
-				rawScript = words[index]?.slice(option.length + 1);
+				const equalsFormOption = options.find(
+					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
+				);
+				if (!equalsFormOption) continue;
+				rawScript = words[index]?.slice(equalsFormOption.length + 1);
 			}
 			if (rawScript === undefined) continue;
-			// Node/Bun preload options load external files that cannot be scanned, so fail
-			// closed for every spelling: `-r mod`, `-rmod`, `--require mod`, `--require=mod`.
-			if ((option === "-r" || option === "--require") && /^(?:node|bun)$/.test(binary)) {
-				targets.explicitMutation = true;
-				targets.unknown = true;
-				return;
-			}
 			const script = cleanInterpreterCodeWord(rawScript);
 			if (
 				script === undefined ||

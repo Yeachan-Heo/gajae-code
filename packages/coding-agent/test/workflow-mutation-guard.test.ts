@@ -2931,9 +2931,15 @@ describe("bash scanner quoting model", () => {
 			`node -r/tmp/payload.cjs -e 'process.stdout.write("status")'`,
 			`node --require /tmp/payload.cjs -e 'process.stdout.write("status")'`,
 			`node --require=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`node --import /tmp/payload.mjs -e 'process.stdout.write("status")'`,
+			`node --import=/tmp/payload.mjs -e 'process.stdout.write("status")'`,
+			`node --loader /tmp/loader.mjs -e 'process.stdout.write("status")'`,
+			`node --experimental-loader=/tmp/loader.mjs -e 'process.stdout.write("status")'`,
 			`bun -r /tmp/payload.cjs script.ts`,
 			`bun --require /tmp/payload.cjs script.ts`,
 			`bun --require=/tmp/payload.cjs script.ts`,
+			`bun --preload /tmp/payload.cjs script.ts`,
+			`bun --preload=/tmp/payload.cjs script.ts`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -2956,6 +2962,8 @@ describe("bash scanner quoting model", () => {
 			[`bun --print='process.stdout.write("status")'`, false],
 			[`node --eval='require("node:fs").writeFileSync("src/product.ts","PWNED")'`, true],
 			[`bun --print='require("node:fs").writeFileSync("src/product.ts","PWNED")'`, true],
+			[`node script.ts`, false],
+			[`bun run script.ts`, false],
 		] as const) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
