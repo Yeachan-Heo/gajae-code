@@ -1196,6 +1196,59 @@ setInterval(() => {}, 1000);
 			vi.restoreAllMocks();
 		}
 	});
+	test("refuses MCP dispatch when a stored binding points at a cleartext non-loopback token endpoint", async () => {
+		let requests = 0;
+		const server = Bun.serve({
+			port: 0,
+			async fetch() {
+				requests += 1;
+				return new Response(null, { status: 202 });
+			},
+		});
+		const cwd = await mkdtempExact("gjc-mcp-cleartext-binding-");
+		const configPath = join(cwd, "cleartext.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		const forceRefresh = vi.fn();
+		manager.setAuthStorage({
+			get: () => ({
+				type: "oauth",
+				access: "legacy-access",
+				refresh: "legacy-refresh",
+				expires: Date.now() + 60 * 60_000,
+				mcpBinding: { resourceOrigin: server.url.origin, tokenEndpoint: "http://192.0.0.9/token" },
+			}),
+			forceRefreshOAuthCredential: forceRefresh,
+		} as never);
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						legacy: {
+							type: "http",
+							url: server.url.href,
+							auth: { type: "oauth", credentialId: "legacy-credential" },
+						},
+					},
+				}),
+			);
+			const result = await manager.discoverAndConnect({ configPath });
+			expect(result.errors.get("legacy")).toBe("MCP server unavailable");
+			expect(forceRefresh).not.toHaveBeenCalled();
+			expect(requests).toBe(0);
+			expect(warn.mock.calls.some(([message]) => String(message).includes("is not HTTPS and is not loopback"))).toBe(
+				true,
+			);
+		} finally {
+			await manager.disconnectAll();
+			warn.mockRestore();
+			await server.stop(true);
+			await rm(cwd, { recursive: true, force: true });
+			vi.restoreAllMocks();
+		}
+	});
 	test("fails soft per server for malformed HTTP initialize and stdio tools/list results", async () => {
 		const server = Bun.serve({
 			port: 0,
