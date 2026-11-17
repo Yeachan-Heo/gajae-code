@@ -93,11 +93,75 @@ describe("managed Task storage follows only the original logical owner's relocat
 		}
 	});
 
+	it("advances the lineage only for a cwd move that actually commits", async () => {
+		const f = await fixture();
+		try {
+			const lineage = f.parent.getTranscriptLineageId();
+			const identity = f.parent.getSessionIdentityGeneration();
+			// A committed direct cwd move re-roots the transcript, so it advances the lineage.
+			await f.parent.moveTo(f.cwdB);
+			expect(f.parent.getCwd()).toBe(f.cwdB);
+			const moved = f.parent.getTranscriptLineageId();
+			expect(moved).not.toBe(lineage);
+			// It adopts no other transcript, so it reports no identity change, and re-selecting the
+			// moved file afterwards must not read as one either.
+			expect(f.parent.getSessionIdentityGeneration()).toBe(identity);
+			await f.parent.setSessionFile(f.parent.getSessionFile()!);
+			expect(f.parent.getSessionIdentityGeneration()).toBe(identity);
+			expect(f.parent.getTranscriptLineageId()).toBe(moved);
+
+			// A move that fails during publication restores the source namespace, so it must not
+			// advance either authority: queued state still belongs to the transcript it was queued for.
+			const cwdC = path.join(f.cwdB, "rolled-back");
+			await fs.mkdir(cwdC);
+			let injected = false;
+			const injection = injectManagedAppendPreCommit((_file, data) => {
+				if (!injected && Buffer.from(data).toString("utf8").includes(cwdC)) {
+					injected = true;
+					return { ok: false, code: "io_error" };
+				}
+				return "passthrough";
+			});
+			try {
+				await expect(f.parent.moveTo(cwdC)).rejects.toThrow("io_error");
+			} finally {
+				injection.restore();
+			}
+			injection.assertHit();
+			expect(f.parent.getCwd()).toBe(f.cwdB);
+			expect(f.parent.getTranscriptLineageId()).toBe(moved);
+			expect(f.parent.getSessionIdentityGeneration()).toBe(identity);
+		} finally {
+			await dispose(f);
+		}
+	});
+
+	it("keeps both the lineage and the identity generation across a no-op reselection after relocation", async () => {
+		const f = await fixture();
+		try {
+			// Initialize the recorded identity before the relocation. A recorded path left behind at
+			// the predecessor location is what makes the next no-op re-selection look like a change.
+			const identity = f.child.getSessionIdentityGeneration();
+			const lineage = f.child.getTranscriptLineageId();
+			await f.parent.moveTo(f.cwdB);
+			await appendAfterMove(f.child);
+			const relocatedFile = f.child.getSessionFile();
+			expect(relocatedFile).not.toBe(f.originalChildFile);
+			// Re-selecting the file it already writes adopts nothing, relocates nothing and
+			// commits no identity change, so neither authority may move.
+			await f.child.setSessionFile(relocatedFile!);
+			expect(f.child.getTranscriptLineageId()).toBe(lineage);
+			expect(f.child.getSessionIdentityGeneration()).toBe(identity);
+		} finally {
+			await dispose(f);
+		}
+	});
+
 	it("keeps the transcript lineage across verified relocation and advances it on adoption", async () => {
 		const f = await fixture();
 		try {
+			const childId = f.child.getSessionId();
 			const lineage = f.child.getTranscriptLineageId();
-			expect(lineage).toBe(`${f.child.getSessionId()}@${f.originalChildFile}`);
 			await f.parent.moveTo(f.cwdB);
 			await appendAfterMove(f.child);
 			const relocatedFile = f.child.getSessionFile();
@@ -113,8 +177,51 @@ describe("managed Task storage follows only the original logical owner's relocat
 			const adoptedFile = path.join(path.dirname(relocatedFile!), "adopted-copy.jsonl");
 			await fs.copyFile(relocatedFile!, adoptedFile);
 			await f.child.setSessionFile(adoptedFile);
-			expect(f.child.getSessionId()).toBe(lineage.split("@")[0]);
+			expect(f.child.getSessionId()).toBe(childId);
 			expect(f.child.getTranscriptLineageId()).not.toBe(lineage);
+		} finally {
+			await dispose(f);
+		}
+	});
+
+	it("advances the lineage on adoption back to the predecessor path after a relocation", async () => {
+		const f = await fixture();
+		try {
+			const sessionId = f.parent.getSessionId();
+			const originalFile = f.parent.getSessionFile();
+			if (!originalFile) throw new Error("Expected a managed parent transcript");
+			const inherited = f.parent.getTranscriptLineageId();
+
+			// A cwd move re-roots the transcript under the destination session directory. It keeps
+			// the logical session id and the transcript basename, so a path-derived lineage would
+			// still name the predecessor and queued predecessor state would pass the guard.
+			await f.parent.moveTo(f.cwdB);
+			const relocatedFile = f.parent.getSessionFile();
+			if (!relocatedFile) throw new Error("Expected a relocated parent transcript");
+			expect(relocatedFile).not.toBe(originalFile);
+			const relocated = f.parent.getTranscriptLineageId();
+			expect(relocated).not.toBe(inherited);
+
+			// A different transcript that carries the same logical session id, back on the exact
+			// path the lineage was captured against. A lineage derived from `sessionId@path`
+			// recomputes the pre-move value here and compares equal to it again.
+			await fs.mkdir(path.dirname(originalFile), { recursive: true, mode: 0o700 });
+			await fs.copyFile(relocatedFile, originalFile);
+			await f.parent.setSessionFile(originalFile);
+
+			expect(f.parent.getSessionFile()).toBe(originalFile);
+			expect(f.parent.getSessionId()).toBe(sessionId);
+			const adopted = f.parent.getTranscriptLineageId();
+			expect(adopted).not.toBe(relocated);
+			expect(adopted).not.toBe(inherited);
+
+			// Nor may returning to a transcript the manager already wrote restore the value that
+			// adoption was issued under: an incarnation is never reconstructed.
+			await f.parent.setSessionFile(relocatedFile);
+			const readopted = f.parent.getTranscriptLineageId();
+			expect(readopted).not.toBe(adopted);
+			expect(readopted).not.toBe(relocated);
+			expect(readopted).not.toBe(inherited);
 		} finally {
 			await dispose(f);
 		}

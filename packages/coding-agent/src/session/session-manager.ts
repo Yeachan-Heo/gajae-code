@@ -7979,11 +7979,17 @@ export class SessionManager {
 	#committedIdentityGeneration = 0;
 	#committedIdentity: { id: string; file: string | undefined } | undefined;
 	/**
-	 * Logical transcript lineage, captured on first use and advanced only by a committed
-	 * identity change. A verified storage relocation rewrites `#sessionFile` without one, so
-	 * it preserves this value; re-selecting the transcript already written is a no-op.
+	 * Monotonic incarnation of the logical transcript lineage this manager is writing.
+	 *
+	 * A verified storage relocation re-roots `#sessionFile` without adopting another
+	 * transcript, so it preserves this value; re-selecting the transcript already written is
+	 * a no-op. Every committed identity change (adoption through `setSessionFile`, a new
+	 * session, a branch switch, a cwd move) advances it. It is a counter rather than a
+	 * session-id/path pair because that pair is reconstructible: a transcript that returns to
+	 * a path the predecessor once wrote would compare equal again, and a cwd move that keeps
+	 * both the id and the basename would never advance at all.
 	 */
-	#transcriptLineageId: string | undefined;
+	#transcriptLineageIncarnation = 0;
 	#titleMutationRevision = 0;
 	#titleMutationTail: Promise<void> = Promise.resolve();
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
@@ -12999,6 +13005,15 @@ export class SessionManager {
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
 
+		// The move is committed: cwd, session directory, and the transcript location all moved
+		// while the logical session id stayed the same, so state queued against the predecessor
+		// location must not publish into the destination. Advancing only here is what keeps a
+		// rolled-back attempt (which restored every one of those fields) on its predecessor
+		// lineage. The recorded identity follows the new path without an identity change: a cwd
+		// move adopts no other transcript, so the next no-op re-selection must not read as one.
+		this.#transcriptLineageIncarnation++;
+		this.#rebaseCommittedIdentity();
+
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
@@ -13600,6 +13615,10 @@ export class SessionManager {
 			this.destination = nextDestination;
 			this.sessionDir = nextDirectory;
 			this.#sessionFile = nextSessionFile;
+			// The relocation moves this same transcript; it adopts nothing, so the recorded identity
+			// follows the path without advancing either authority. Leaving the predecessor path here
+			// would make the next no-op re-selection report an identity change.
+			this.#rebaseCommittedIdentity();
 			this.#managedTranscriptStoreCache = { directory: nextDirectory, store: nextStore };
 			this.#managedPersistExpectedIdentity = { ...destinationTranscript.identity };
 			this.#managedRangeExpectedDescriptor = {
@@ -18125,19 +18144,32 @@ export class SessionManager {
 		const previous = this.#committedIdentity ?? { id: previousId, file: previousFile };
 		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) this.#committedIdentityGeneration++;
 		this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
-		// This is the only place the lineage advances: a verified relocation rewrites the path
-		// without committing an identity change, and re-selecting the same transcript is not a
-		// change at all. Callers capture the lineage before an adoption, so it must keep naming
-		// the predecessor until the adoption actually commits.
-		if (
-			this.#transcriptLineageId !== undefined &&
-			(previousId !== this.#sessionId || previousFile !== this.#sessionFile)
-		)
-			this.#transcriptLineageId = `${this.#sessionId}@${this.#sessionFile ?? ""}`;
+		// Advance the lineage from the caller's pre-change state, never from `#committedIdentity`:
+		// a verified relocation moves the file without committing an identity change, so the
+		// recorded pair is deliberately stale there and comparing against it would report an
+		// advance for a re-selection that changed nothing. Callers capture the lineage before an
+		// adoption, so this must keep naming the predecessor until the adoption actually commits.
+		if (previousId !== this.#sessionId || previousFile !== this.#sessionFile)
+			this.#transcriptLineageIncarnation++;
 	}
 
 	/**
-	 * Identity of the logical transcript lineage this manager is writing.
+	 * Record a committed path move that adopts no other transcript.
+	 *
+	 * A verified relocation and a committed cwd move both re-root this transcript without
+	 * changing its logical identity, so neither advances {@link getSessionIdentityGeneration}.
+	 * The recorded pair still has to follow the new path: leaving the predecessor path behind
+	 * would make the next no-op re-selection of the current file look like an identity change
+	 * and retire live observers for nothing. The transcript lineage deliberately does not move
+	 * here either — the relocation case preserves it, and the cwd-move caller advances it
+	 * explicitly.
+	 */
+	#rebaseCommittedIdentity(): void {
+		if (this.#committedIdentity) this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
+	}
+
+	/**
+	 * Identity of the transcript lineage this manager is writing, as an opaque incarnation.
 	 *
 	 * A verified same-owner storage relocation of the same transcript preserves this value:
 	 * the file is the same logical transcript reached through a re-rooted artifact directory,
@@ -18147,10 +18179,12 @@ export class SessionManager {
 	 * predecessor. Re-selecting the transcript the manager already writes is not a change.
 	 * Callers that must distinguish relocation from adoption compare this value instead of
 	 * {@link getSessionFile}.
+	 *
+	 * The value is an incarnation counter, not a derived identity: it cannot be reconstructed
+	 * from the session id or the path, so two different transcripts can never compare equal.
 	 */
 	getTranscriptLineageId(): string {
-		this.#transcriptLineageId ??= `${this.#sessionId}@${this.#sessionFile ?? ""}`;
-		return this.#transcriptLineageId;
+		return `transcript-incarnation:${this.#transcriptLineageIncarnation}`;
 	}
 
 	getSessionId(): string {
