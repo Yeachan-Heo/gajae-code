@@ -35,6 +35,7 @@ import {
 	type SdkComposerCompletionResult,
 	type SdkComposerObservation,
 	type SdkPreferenceOutcome,
+	type SdkSelectModelResult,
 	SdkRevisionError,
 	type SdkSessionInfo,
 	type SdkSessionView,
@@ -42,7 +43,10 @@ import {
 	Settings,
 	type SlashCommandRuntime,
 	validateEmbeddedConfigPatch,
+	type NativeInvocationResult,
 } from "@gajae-code/coding-agent/sdk";
+import { bridgeNativeInteraction, type NativeInteractionQuestion } from "./native-interaction-bridge";
+import { type NativeSession, openNativeSession } from "./native-session";
 import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
@@ -79,6 +83,7 @@ import {
 	validateModelThinking,
 	validateSessionThinking,
 } from "./model-controls";
+import { createNativeAdmission } from "./native-admission";
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
 import {
 	createDesktopPreferencesController,
@@ -363,10 +368,61 @@ interface TrackedQueuedInput {
 interface SessionCandidate {
 	sdk: AgentSession;
 	factory: EmbeddedAgentSessionResult;
+	native?: NativeSession;
 	metadata: SavedSession;
 	settings: Settings;
 	registry: ModelRegistry;
 	notices: DesktopMessage[];
+}
+/**
+ * Route a transcript mutation through the runtime when the conversation is native.
+ * A borrowed (cooperative) session keeps calling the SDK directly, so two-TUI
+ * behaviour is unchanged; a native refusal is an error, never a silent fallback.
+ */
+async function admitted<T>(
+	live: SessionCandidate,
+	raw: (sdk: AgentSession) => Promise<T>,
+	viaRuntime: (runtime: NonNullable<SessionCandidate["native"]>["runtime"]) => Promise<NativeInvocationResult<T>>,
+): Promise<T> {
+	if (!live.native) return raw(live.sdk);
+	const result = await viaRuntime(live.native.runtime);
+	if (result.kind !== "applied") {
+		throw new Error(`Native runtime refused: ${result.reason}`);
+	}
+	return result.value;
+}
+/** Admit only slash-command mutations; keep getters and other methods on the real session. */
+function admittedSlashSession(live: LiveSession): AgentSession {
+	if (!live.native) return live.sdk;
+	return new Proxy<AgentSession>(live.sdk, {
+		get(target, prop) {
+			const value: unknown = Reflect.get(target, prop, target);
+			if (typeof value !== "function") return value;
+			switch (prop) {
+				case "clearContext":
+					return (...args: Parameters<AgentSession["clearContext"]>) =>
+						admitted(live, sdk => sdk.clearContext(...args), runtime => runtime.session.clearContext(...args));
+				case "compact":
+					return (...args: Parameters<AgentSession["compact"]>) =>
+						admitted(live, sdk => sdk.compact(...args), runtime => runtime.session.compact(...args));
+				case "setSessionName":
+					return (...args: Parameters<AgentSession["setSessionName"]>) =>
+						admitted(live, sdk => sdk.setSessionName(...args), runtime => runtime.session.setSessionName(...args));
+				case "setThinkingLevelForControl":
+					return (...args: Parameters<AgentSession["setThinkingLevelForControl"]>) =>
+						admitted(
+							live,
+							sdk => sdk.setThinkingLevelForControl(...args),
+							runtime => runtime.session.setThinkingLevelForControl(...args),
+						);
+				case "exportToHtml":
+					return (...args: Parameters<AgentSession["exportToHtml"]>) =>
+						admitted(live, sdk => sdk.exportToHtml(...args), runtime => runtime.session.exportToHtml(...args));
+				default:
+					return value.bind(target);
+			}
+		},
+	});
 }
 interface ExclusiveViewHandoff {
 	/** No more SDK mutations remain in the exclusive operation. Receipt writes may still be pending. */
@@ -377,6 +433,7 @@ interface ExclusiveViewHandoff {
 	persistence?: Promise<void>;
 }
 interface LiveSession extends SessionCandidate {
+	nativeBridge?: { dispose(): void };
 	viewOwnerToken: symbol;
 	completion?: DesktopComposerCompletion;
 	observation?: SdkComposerObservation;
@@ -433,6 +490,8 @@ export interface HostOptions {
 	dataDir?: string;
 	emit: (frame: DesktopFrame) => void;
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+	/** Open App-created conversations as exclusive native owners (default true); cooperative fixtures set false. */
+	nativeCreation?: boolean;
 }
 
 /** A close stops its runs on a budget: a wedged abort must not strand the folder's queue. */
@@ -465,6 +524,7 @@ export class DesktopHost {
 	}
 	#emit: (frame: DesktopFrame, projected?: boolean, preferenceOutcome?: DesktopPreferenceOutcome) => void;
 	#createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+	#nativeCreation: boolean;
 	#catalog: Catalog = { version: 1, projects: [], sessions: [] };
 	#deliveries!: DeliveryJournal;
 	/** Process-local only: receipts and snapshots never recreate completion intent. */
@@ -559,6 +619,7 @@ export class DesktopHost {
 			options.emit(detached);
 		};
 		this.#createSession = options.createSession ?? createAgentSession;
+		this.#nativeCreation = options.nativeCreation ?? true;
 	}
 	#redact(text: string): string {
 		for (const secret of this.#secrets) text = text.split(secret).join("[redacted]");
@@ -1173,24 +1234,42 @@ export class DesktopHost {
 			if (!existingFile.startsWith(`${root}${path.sep}`) || !(await fs.stat(existingFile)).isFile())
 				throw new Error("Invalid saved session file");
 		}
-		const result = await createEmbeddedAgentSession({
+		const openOptions = {
 			cwd: project.path,
 			agentDir: this.agentDir,
-			profileAuthority: "custom",
+			profileAuthority: "custom" as const,
 			authStorage: this.#auth,
-			storage: {
-				...(metadata.scope === "managed" ? { managed: true as const } : { directory }),
-				...(existingFile ? { file: existingFile } : {}),
-				...(manager ? { manager } : {}),
-			},
 			createSession: this.#createSession,
 			hasUI: true,
 			notificationHostModeSupported: false,
 			sdkHostModeSupported: false,
-		});
+			// The App runs background jobs in its own runner, so it never supplies an
+			// SDK async job manager and owns no SDK job work to stop on teardown.
+			asyncJobs: "none" as const,
+		};
+		const native =
+			!existingFile && !manager && this.#nativeCreation
+				? await openNativeSession({
+						options: openOptions,
+						storage: metadata.scope === "managed" ? { managed: true } : { directory },
+					})
+				: undefined;
+		if (native && native.kind !== "opened") throw new Error(`Native open ${native.kind}`);
+		const result =
+			native?.kind === "opened"
+				? native.session.result
+				: await createEmbeddedAgentSession({
+						...openOptions,
+						storage: {
+							...(metadata.scope === "managed" ? { managed: true as const } : { directory }),
+							...(existingFile ? { file: existingFile } : {}),
+							...(manager ? { manager } : {}),
+						},
+					});
 		const candidate: SessionCandidate = {
 			sdk: result.session,
 			factory: result,
+			...(native?.kind === "opened" ? { native: native.session } : {}),
 			metadata,
 			settings: result.session.settings,
 			registry: result.session.modelRegistry,
@@ -1248,11 +1327,11 @@ export class DesktopHost {
 				connectionGeneration: this.#connectionGeneration,
 				redact: text => this.#redact(text),
 			}),
-			preferences: createDesktopPreferencesController(candidate.sdk),
+			preferences: createDesktopPreferencesController(candidate.sdk, createNativeAdmission(candidate.native?.runtime)),
 			mcp: createDesktopMcpController(candidate.factory, {
 				connectionGeneration: this.#connectionGeneration,
 				redact: text => this.#redact(text),
-			}),
+			}, createNativeAdmission(candidate.native?.runtime)),
 			activityRevision: 0,
 			activityPublishedRevision: 0,
 			busy: false,
@@ -1299,7 +1378,28 @@ export class DesktopHost {
 	}
 	#initializeLiveExtensions(live: LiveSession): void {
 		const generation = live.sdk.sessionLifecycle.generation;
-		const currentUI = this.#ui(live, generation);
+		// A native runtime answers only the interaction service it registered, so the host
+		// renders that service's pending questions instead of owning the extension UI.
+		const currentUI = live.native ? live.native.interaction.service.ui : this.#ui(live, generation);
+		if (live.native) {
+			live.nativeBridge?.dispose();
+			live.nativeBridge = bridgeNativeInteraction({
+				interaction: live.native.interaction,
+				ask: (question: NativeInteractionQuestion) =>
+					this.#ask(
+						live,
+						{
+							kind: question.kind,
+							title: question.title,
+							...(question.message === undefined ? {} : { message: question.message }),
+							...(question.options === undefined ? {} : { options: [...question.options] }),
+							...(question.initialValue === undefined ? {} : { initialValue: question.initialValue }),
+						},
+						generation,
+						{ signal: question.signal },
+					),
+			});
+		}
 		live.extensionUI = currentUI;
 		const runner = live.sdk.extensionRunner;
 		if (live.startup && live.extensionRunner === runner) {
@@ -1365,6 +1465,32 @@ export class DesktopHost {
 			throw new Error("Session changed during extension initialization");
 	}
 	async #disposeCandidate(candidate: SessionCandidate): Promise<void> {
+		// TERM already disposed the native session under registry authorization, so a
+		// second dispose would be refused. Retiring is the whole teardown for that path.
+		if (candidate.native) {
+			if ((await candidate.native.disconnect()).kind !== "disconnected")
+				throw new Error("Native conversation could not be retired");
+			let nativeCompletion = this.#cleanupRuns.get(candidate);
+			if (!nativeCompletion) {
+				nativeCompletion = (async () => {
+					await candidate.factory.releaseResources();
+					this.#candidates.delete(candidate);
+				})();
+				this.#cleanupRuns.set(candidate, nativeCompletion);
+				this.#cleanupOwners.set(candidate, nativeCompletion);
+				// Same bookkeeping as the cooperative path: the resolved run stays cached so
+				// #disposeLive can still observe it and retire the live entry, while the owner
+				// set only tracks dependencies that have not been released yet.
+				void nativeCompletion.then(
+					() => this.#cleanupOwners.delete(candidate),
+					() => {
+						this.#cleanupRuns.delete(candidate);
+					},
+				);
+			}
+			await nativeCompletion;
+			return;
+		}
 		// dispose() has a caller deadline, not a lifetime guarantee. Start and observe
 		// both promises immediately; only the retained actual owner may release dependencies.
 		const bounded = candidate.sdk.dispose();
@@ -1394,7 +1520,12 @@ export class DesktopHost {
 	/** The SDK owns exact revision selection, remembered continuations and rollback. */
 	async #showRevision(live: LiveSession, params: Record<string, unknown>): Promise<null> {
 		try {
-			await live.factory.revise({ entryId: requiredString(params, "entryId", 128), action: "select" });
+			const entryId = requiredString(params, "entryId", 128);
+			await admitted(
+				live,
+				() => live.factory.revise({ entryId, action: "select" }),
+				runtime => runtime.session.revise({ entryId, action: "select" }),
+			);
 		} catch (error) {
 			if (error instanceof SdkRevisionError && error.code === "invalid_input")
 				throw new Error("Invalid entry ID for a prompt revision");
@@ -1483,7 +1614,11 @@ export class DesktopHost {
 				const entry = candidate.sdk.sessionManager.getEntry(entryId);
 				if (entry?.type !== "message" || entry.message.role !== "user")
 					throw new Error("Invalid entry ID for branching");
-				const result = await candidate.factory.branch(entryId);
+				const result = await admitted(
+					candidate,
+					() => candidate!.factory.branch(entryId),
+					runtime => runtime.session.branch(entryId),
+				);
 				// The SDK may rotate identity even when later cleanup or hooks throw.
 				rememberOwnedFile(candidate.sdk.sessionManager.getSessionFile());
 				assertSource();
@@ -1584,7 +1719,7 @@ export class DesktopHost {
 				this.#emit({ type: "operator", sessionId: live.metadata.id, event });
 				this.#schedule(live);
 			},
-		});
+		}, createNativeAdmission(live.native?.runtime));
 	}
 	#attachBtwController(live: LiveSession): void {
 		const generation = live.sdk.sessionLifecycle.generation;
@@ -1637,11 +1772,11 @@ export class DesktopHost {
 			connectionGeneration: this.#connectionGeneration,
 			redact: text => this.#redact(text),
 		});
-		live.preferences = createDesktopPreferencesController(live.sdk);
+		live.preferences = createDesktopPreferencesController(live.sdk, createNativeAdmission(live.native?.runtime));
 		live.mcp = createDesktopMcpController(live.factory, {
 			connectionGeneration: this.#connectionGeneration,
 			redact: text => this.#redact(text),
-		});
+		}, createNativeAdmission(live.native?.runtime));
 		this.#cancelQuestions(live);
 		live.titleAbort?.abort();
 		live.titleAbort = undefined;
@@ -1685,6 +1820,7 @@ export class DesktopHost {
 		await attempt(() => live.btw?.dispose());
 		await attempt(() => live.operator?.dispose());
 		await attempt(() => live.gatePresenter?.dispose());
+		await attempt(() => live.nativeBridge?.dispose());
 		await attempt(() => live.preferences.dispose());
 		await attempt(() => live.mcp.dispose());
 		await attempt(() => live.activity.dispose());
@@ -2096,13 +2232,16 @@ export class DesktopHost {
 			},
 		};
 		try {
-			if (editEntryId !== undefined)
-				await live.factory.revise(
-					{ entryId: editEntryId, action: "edit", body: text, ...(images.length ? { images } : {}) },
-					options,
+			if (editEntryId !== undefined) {
+				const input = { entryId: editEntryId, action: "edit" as const, body: text, ...(images.length ? { images } : {}) };
+				await admitted(
+					live,
+					() => live.factory.revise(input, options),
+					runtime => runtime.session.revise(input, options),
 				);
+			}
 			else if (images.length) await createSessionImageInput(live.sdk).prompt(text, images, options);
-			else await live.sdk.prompt(text, options);
+			else await admitted(live, sdk => sdk.prompt(text, options), runtime => runtime.prompt.prompt(text, options));
 			await live.sdk.waitForIdle();
 		} catch (error) {
 			await this.#delivery(
@@ -2597,7 +2736,7 @@ export class DesktopHost {
 			live.titleAbort?.abort();
 			try {
 				this.#cancelQuestions(live);
-				await live.sdk.abort();
+				await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort());
 				return await this.#deleteSession(live, metadata);
 			} finally {
 				live.gateMutation = false;
@@ -2613,7 +2752,7 @@ export class DesktopHost {
 					throw new Error(
 						"Waiting for the previous command to settle. Stop cannot be proven for this conversation.",
 					);
-				live.operator.abort({ operationId: live.operatorCurrentId });
+				await live.operator.abort({ operationId: live.operatorCurrentId });
 				this.#publish(live);
 				return null;
 			}
@@ -2621,7 +2760,7 @@ export class DesktopHost {
 			for (const tracked of live.queued.values()) {
 				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			}
-			await live.sdk.abort();
+			await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort());
 			this.#publish(live);
 			return null;
 		}
@@ -2860,7 +2999,11 @@ export class DesktopHost {
 				try {
 					submission = images.length
 						? await createSessionImageInput(live.sdk).submitUserMessage(text, images, options)
-						: await live.sdk.submitUserMessage(text, { ...options, trackSubmission: true });
+						: await admitted(
+								live,
+								sdk => sdk.submitUserMessage(text, { ...options, trackSubmission: true }),
+								runtime => runtime.prompt.submitUserMessage(text, { ...options, trackSubmission: true }),
+							);
 				} catch (error) {
 					unsubscribeTerminal();
 					await this.#delivery(
@@ -3021,7 +3164,7 @@ export class DesktopHost {
 				switch (method) {
 					case "session.rename": {
 						const title = requiredString(params, "title", 200).trim();
-						await live.sdk.setSessionName(title, "user");
+						await admitted(live, sdk => sdk.setSessionName(title, "user"), runtime => runtime.session.setSessionName(title, "user"));
 						metadata.title = title;
 						this.#publishSnapshot();
 						return null;
@@ -3038,10 +3181,10 @@ export class DesktopHost {
 					case "session.revision":
 						return this.#showRevision(live, params);
 					case "session.compact":
-						await live.sdk.compact();
+						await admitted(live, sdk => sdk.compact(), runtime => runtime.session.compact());
 						return null;
 					case "session.retry":
-						if (!(await live.sdk.retry())) throw new Error("Session cannot be retried");
+						if (!(await admitted(live, sdk => sdk.retry(), runtime => runtime.session.retry()))) throw new Error("Session cannot be retried");
 						return null;
 					case "session.export": {
 						const directory = path.join(this.dataDir, "exports");
@@ -3069,18 +3212,21 @@ export class DesktopHost {
 						const controls = createSdkPreferenceControls(live.sdk);
 						try {
 							requireAppliedPreference(
-								await controls.selectModel({ provider: model.provider, modelId: model.id, scope: "global" }),
+								(await createNativeAdmission(live.native?.runtime)(
+									rt => rt.preferences.handle("model.select", { provider: model.provider, modelId: model.id, scope: "global" }),
+									() => controls.selectModel({ provider: model.provider, modelId: model.id, scope: "global" }),
+								)) as SdkSelectModelResult,
 							);
 						} finally {
 							controls.dispose();
 						}
-						if (level !== undefined) await live.sdk.setThinkingLevelForControl(level, true);
+						if (level !== undefined) await admitted(live, sdk => sdk.setThinkingLevelForControl(level, true), runtime => runtime.session.setThinkingLevelForControl(level, true));
 						return null;
 					}
 					case "thinking.set": {
 						this.#assertModelCatalogReady(live.sdk.modelRegistry);
 						const level = validateSessionThinking(live.sdk, params.level);
-						await live.sdk.setThinkingLevelForControl(level, false);
+						await admitted(live, sdk => sdk.setThinkingLevelForControl(level, false), runtime => runtime.session.setThinkingLevelForControl(level, false));
 						return null;
 					}
 					case "tools.set": {
@@ -3090,7 +3236,7 @@ export class DesktopHost {
 							names.some(name => typeof name !== "string" || !live.sdk.getAllToolNames().includes(name))
 						)
 							throw new Error("Invalid tool names");
-						await live.sdk.setActiveToolsByName(names as string[], { explicit: true });
+						await admitted(live, sdk => sdk.setActiveToolsByName(names as string[], { explicit: true }), runtime => runtime.session.setActiveToolsByName(names as string[], { explicit: true }));
 						return null;
 					}
 					case "goal.operate": {
@@ -3104,7 +3250,7 @@ export class DesktopHost {
 							op !== "drop"
 						)
 							throw new Error("Invalid goal operation");
-						return live.sdk.operateGoal(op, op === "create" ? requiredString(params, "objective") : undefined);
+						return admitted(live, sdk => sdk.operateGoal(op, op === "create" ? requiredString(params, "objective") : undefined), runtime => runtime.workflow.operateGoal(op, op === "create" ? requiredString(params, "objective") : undefined));
 					}
 					default:
 						throw new Error("Unknown method");
@@ -3472,7 +3618,7 @@ export class DesktopHost {
 			this.#live.delete(id);
 			this.#retiredLive.add(live);
 			try {
-				await live.sdk.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS });
+				await admitted(live, sdk => sdk.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS }), runtime => runtime.queue.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS }));
 			} catch (error) {
 				console.error(`Desktop workspace close could not abort session ${id}: ${String(error)}`);
 			}
@@ -3676,7 +3822,7 @@ export class DesktopHost {
 		};
 		void (async () => {
 			try {
-				const result = await live.sdk.generateAutoSessionTitle(text, { signal: controller.signal });
+				const result = await admitted(live, sdk => sdk.generateAutoSessionTitle(text, { signal: controller.signal }), runtime => runtime.session.generateAutoSessionTitle(text, { signal: controller.signal }));
 				if (result.kind === "failed") {
 					console.error("Desktop automatic session title generation failed");
 					return;
@@ -3736,6 +3882,8 @@ export class DesktopHost {
 				output: "Side-chat request accepted. It is not added to the existing conversation history.",
 			};
 		}
+		if (live.native && /^\s*\/(?:model|models)(?:[\s:]|$)/i.test(text))
+			throw new Error("This command is not available for a natively-owned conversation.");
 		if (DESKTOP_OWNED_COMMANDS.has(name))
 			return { consumed: false, refused: true, output: DESKTOP_OWNED_REFUSALS[name] ?? DESKTOP_UNAVAILABLE };
 		if (text.trimStart().startsWith("/") && !ADVERTISED_COMMANDS.has(name))
@@ -3763,19 +3911,19 @@ export class DesktopHost {
 			if (bounded.length < redacted.length) dropped = true;
 		};
 		const runtime: SlashCommandRuntime = {
-			session: live.sdk,
+			session: admittedSlashSession(live),
 			sessionManager: live.sdk.sessionManager,
 			settings: live.settings,
 			cwd: live.sdk.sessionManager.getCwd(),
 			output: value => append(String(value)),
 			refreshCommands: async () => {
-				await live.factory.refreshCommands();
+				await admitted(live, () => live.factory.refreshCommands(), runtime => runtime.session.refreshCommands());
 				live.completion = undefined;
 				this.#publishSnapshot();
 			},
 			reloadPlugins: async () => {
-				await live.sdk.reloadSkills();
-				await live.factory.refreshCommands();
+				await admitted(live, sdk => sdk.reloadSkills(), runtime => runtime.session.reloadSkills());
+				await admitted(live, () => live.factory.refreshCommands(), runtime => runtime.session.refreshCommands());
 				live.completion = undefined;
 				this.#publishSnapshot();
 			},
@@ -3879,7 +4027,7 @@ export class DesktopHost {
 		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
 		this.#managed.clear();
 		await attempt(() => this.#cancelQuestions());
-		await Promise.all([...this.#live.values()].map(live => attempt(() => live.sdk.abort())));
+		await Promise.all([...this.#live.values()].map(live => attempt(() => admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort()))));
 		await Promise.allSettled([...this.#tasks]);
 		await Promise.all(
 			[...new Set([...this.#live.values(), ...this.#retiredLive])].map(async live => {

@@ -123,6 +123,7 @@ export interface SdkWriteConfigResult extends SdkPreferenceOutcome {
 }
 export type SdkPreferenceResult =
 	| SdkRoleModelPreferences
+	| SdkProfileCatalogEntry[]
 	| SdkSetRoleModelResult
 	| SdkSelectModelResult
 	| SdkSelectProfileResult
@@ -773,6 +774,9 @@ export class SdkPreferenceControls {
 			case "model.roles.get":
 				exactKeys(record(input), []);
 				return this.readRoles();
+			case "model.profiles.get":
+				exactKeys(record(input), []);
+				return this.readProfiles();
 			case "model.role.set":
 				return this.setRole(input as unknown as SdkSetRoleModelInput);
 			case "model.select":

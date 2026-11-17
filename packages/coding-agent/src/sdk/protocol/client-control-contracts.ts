@@ -85,7 +85,7 @@ export function isSdkDiffObservationOperation(value: unknown): value is SdkDiffO
 }
 
 /** Installed by a trusted local application in SessionRouter, never accepted from a wire request. */
-export const SDK_PREFERENCE_QUERY_OPERATIONS = ["model.roles.get"] as const;
+export const SDK_PREFERENCE_QUERY_OPERATIONS = ["model.roles.get", "model.profiles.get"] as const;
 export const SDK_PREFERENCE_CONTROL_OPERATIONS = [
 	"model.role.set",
 	"model.select",

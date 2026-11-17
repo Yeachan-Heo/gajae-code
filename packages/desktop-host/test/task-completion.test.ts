@@ -720,7 +720,7 @@ for (const state of ["generation", "transitioning", "disposed", "session-identit
 			try {
 				// Also settle preflight/stream ownership when an earlier assertion
 				// failed, rather than awaiting a still-controlled request forever.
-				await h.sdk.abort();
+				await h.call("abort", { sessionId: h.session.id });
 				await running;
 			} finally {
 				journal.mockRestore();

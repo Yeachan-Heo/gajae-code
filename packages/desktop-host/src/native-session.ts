@@ -1,9 +1,11 @@
 import {
 	consentEmbeddedDisconnect,
 	createEmbeddedAgentSession,
+	currentEmbeddedInteraction,
 	currentEmbeddedResumeOperation,
 	type EmbeddedAgentSessionOptions,
 	type EmbeddedAgentSessionResult,
+	type NativeEmbeddedOpenResult,
 	type NativeEmbeddedRuntime,
 	type PendingResumeOp,
 	prepareEmbeddedDisconnect,
@@ -44,9 +46,19 @@ export type NativeOpenOutcome =
 	  }
 	| { readonly kind: "refused"; readonly reason: string };
 
-type NativeOpenHandle = Extract<Awaited<ReturnType<typeof createEmbeddedAgentSession>>, { kind: "opened" }>["handle"];
+type NativeOpenHandle = Extract<NativeEmbeddedOpenResult, { kind: "opened" }>["handle"];
 
-function mapOpenOutcome(opened: Awaited<ReturnType<typeof createEmbeddedAgentSession>>): NativeOpenOutcome {
+/** Default graceful Disconnect outcome. A blocked result keeps the runtime and handle live. */
+export type NativeDisconnectOutcome =
+	| { readonly kind: "disconnected" }
+	| {
+			readonly kind: "blocked";
+			readonly state: NativeConnectionState;
+			readonly blockers: readonly string[];
+	  }
+	| { readonly kind: "release_failed"; readonly error: string };
+
+function mapOpenOutcome(opened: NativeEmbeddedOpenResult): NativeOpenOutcome {
 	switch (opened.kind) {
 		case "opened":
 			return { kind: "opened", session: new NativeSession(opened.handle, opened.result, opened.runtime) };
@@ -108,6 +120,10 @@ export class NativeSession {
 	get epoch(): number {
 		return this.#epoch;
 	}
+	/** The registered interaction service this runtime publishes questions on. */
+	get interaction(): ReturnType<typeof currentEmbeddedInteraction> {
+		return currentEmbeddedInteraction(this.#handle);
+	}
 	/** The operation this runtime reconciles right now; a durable selection replaces it. */
 	get operation(): PendingResumeOp {
 		return currentEmbeddedResumeOperation(this.#handle);
@@ -138,9 +154,20 @@ export class NativeSession {
 			const preparation = await prepareEmbeddedDisconnect(this.#handle, op);
 			if (!current()) return { kind: "blocked", state: this.#state, blockers: ["superseded"] };
 			if (!preparation.inventory) return { kind: "blocked", state: this.#state, blockers: ["work_inventory_missing"] };
+			const inventory = preparation.inventory;
+			// Default Disconnect stops the work this session still owns. A blocker with no
+			// addressable target cannot be stopped by consent, so it is retained and reported.
+			const untargeted = inventory.blockers.filter(blocker => !blocker.target);
+			if (untargeted.length > 0) {
+				this.#state = "checkpoint_incomplete";
+				return { kind: "blocked", state: this.#state, blockers: untargeted.map(blocker => `owned_work:${blocker.kind}`) };
+			}
 			const consent = consentEmbeddedDisconnect(this.#handle, preparation, {
 				stopAndJoin: true,
-				work: { inventory: preparation.inventory, targets: [] },
+				work: {
+					inventory,
+					targets: inventory.blockers.flatMap(blocker => (blocker.target ? [blocker.target] : [])),
+				},
 			});
 			if (!consent) return { kind: "blocked", state: this.#state, blockers: ["consent_refused"] };
 			const receipt = await terminateEmbeddedAgentSession(this.#handle, { op, consent });
@@ -161,7 +188,7 @@ function disconnectBlockers(reconciled: Awaited<ReturnType<typeof reconcileEmbed
 	if (reconciled.outcome.kind === "unknown") blockers.push("uncertain_cursor");
 	if (reconciled.outcome.kind === "suffix_incomplete") blockers.push("suffix_incomplete");
 	if (!reconciled.receipt.commitment.continueEligible) blockers.push("not_continue_eligible");
-	for (const id of reconciled.receipt.heldIds ?? []) blockers.push(`suffix_held:${id}`);
+	for (const id of reconciled.receipt.commitment.heldIds) blockers.push(`suffix_held:${id}`);
 	return blockers;
 }
 
@@ -186,7 +213,7 @@ export async function openNativeSession(input: NativeOpenInput): Promise<NativeO
 	// guess. The SDK reports that as `selector`; anything ambiguous is surfaced, not resolved here.
 	const opened = await createEmbeddedAgentSession({
 		...input.options,
-		storage: { ...input.storage, file: input.file },
+		storage: { ...input.storage, ...(input.file ? { file: input.file } : {}) },
 		native: {
 			expected: { snapshotDigest: checkpoint.snapshotDigest, resolved: checkpoint },
 			// The policy must carry the same evidence it was admitted with, or the SDK

@@ -113,6 +113,7 @@ class Input implements AsyncIterable<Uint8Array> {
 function connect(
 	dataDir: string,
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>,
+	nativeCreation = true,
 ) {
 	const input = new Input();
 	const frames: DesktopFrame[] = [];
@@ -123,7 +124,7 @@ function connect(
 		if (frame.type === "response") responses.get(frame.id)?.(frame);
 		for (const observer of observers) observer();
 	};
-	const host = new DesktopHost({ dataDir, createSession, emit });
+	const host = new DesktopHost({ dataDir, createSession, emit, nativeCreation });
 	const serving = serveProtocol(input, host, emit);
 	const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<T> => {
 		const id = crypto.randomUUID();
@@ -220,7 +221,7 @@ function heldAgent(model: Model) {
 	};
 }
 
-async function fixture(retentionMs?: number, canonicalFactory = false) {
+async function fixture(retentionMs?: number, canonicalFactory = false, nativeCreation = true) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-activity-transport-"));
 	const dataDir = path.join(directory, "app");
 	const scopedAgentDir = path.join(dataDir, "agent");
@@ -343,7 +344,7 @@ async function fixture(retentionMs?: number, canonicalFactory = false) {
 		captures.push({ sdk, owner, observation, options, control, factory, manager: jobs });
 		return factory;
 	};
-	const connections = [connect(dataDir, createSession)];
+	const connections = [connect(dataDir, createSession, nativeCreation)];
 	cleanups.push(async () => {
 		try {
 			for (const connection of connections) await connection.close();
@@ -379,7 +380,7 @@ async function fixture(retentionMs?: number, canonicalFactory = false) {
 		captures,
 		async reconnect() {
 			await connection.close();
-			const successor = connect(dataDir, createSession);
+			const successor = connect(dataDir, createSession, nativeCreation);
 			connections.push(successor);
 			return successor;
 		},
@@ -916,7 +917,8 @@ describe("desktop activity and preferences over the real transport", () => {
 	});
 
 	test("canonical factory renews Host capabilities after same-ID clear and A-B-A, never old references", async () => {
-		const f = await fixture(undefined, true);
+		// This fixture models a cooperative session whose context resets in place, forbidden by exclusive native ownership.
+		const f = await fixture(undefined, true, false);
 		const { sdk, factory, manager, owner, dto } = f.first;
 		const originalId = sdk.sessionId;
 		const originalFile = sdk.sessionFile!;
@@ -1207,7 +1209,8 @@ describe("genuine workflow gate transport terminalization", () => {
 		"clear",
 		"delete",
 	] as const)("%s waits for every issued gate surface before mutating the SDK session", async operation => {
-		const f = await fixture(undefined, true);
+		// The delete fixture models a cooperative session whose pending workflow gate is discarded at close, which exclusive native ownership refuses by design.
+		const f = await fixture(undefined, true, operation !== "delete");
 		const { sdk, dto } = f.first;
 		const pending = workflow(sdk);
 		const ui = new CommittedOwner(f, dto.id);
@@ -1341,7 +1344,8 @@ describe("genuine workflow gate transport terminalization", () => {
 	});
 
 	test("reads, guessed IDs, foreign refs, uncommitted surfaces and invalid answers cannot advance a workflow", async () => {
-		const f = await fixture();
+		// This fixture models a cooperative session whose pending workflow gate is discarded at close, which exclusive native ownership refuses by design.
+		const f = await fixture(undefined, false, false);
 		const second = await f.open();
 		const pending = workflow(f.first.sdk, executionGate({ summary: `${secret}: complete execution boundary` }));
 		const other = workflow(second.sdk);
@@ -1387,7 +1391,8 @@ describe("genuine workflow gate transport terminalization", () => {
 	});
 
 	test("every issued surface needs its exact owner retirement nonce; foreign, wrong, duplicate ACKs do not count", async () => {
-		const f = await fixture();
+		// This fixture models a cooperative session whose pending workflow gate is discarded at close, which exclusive native ownership refuses by design.
+		const f = await fixture(undefined, false, false);
 		const second = await f.open();
 		const pending = workflow(f.first.sdk);
 		const other = workflow(second.sdk);
@@ -1513,7 +1518,8 @@ describe("genuine workflow gate transport terminalization", () => {
 	});
 
 	test("connection replacement rejects old ACKs and refs without opening an unloaded session", async () => {
-		const f = await fixture();
+		// This fixture models a cooperative session whose pending workflow gate is discarded at close, which exclusive native ownership refuses by design.
+		const f = await fixture(undefined, false, false);
 		const pending = workflow(f.first.sdk);
 		const oldUpdate = await f.activity();
 		const ui = new CommittedOwner(f, f.first.dto.id);

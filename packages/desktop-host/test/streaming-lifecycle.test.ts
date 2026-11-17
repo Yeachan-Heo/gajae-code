@@ -152,7 +152,7 @@ describe("desktop streaming lifecycle", () => {
 		}
 	});
 
-	async function launch(withRunner = false, extensionSource?: string) {
+	async function launch(withRunner = false, extensionSource?: string, nativeCreation = true) {
 		const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-stream-"));
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-project-"));
 		await setModelPresetRegistryDisabled({ agentDir: path.join(dataDir, "agent"), disabled: true });
@@ -174,6 +174,7 @@ describe("desktop streaming lifecycle", () => {
 		}> = [];
 		const host = new DesktopHost({
 			dataDir,
+			nativeCreation,
 			emit: frame => frames.push(frame),
 			createSession: async options => {
 				if (!options.sessionManager || !options.settings || !options.modelRegistry || !options.authStorage)
@@ -265,7 +266,8 @@ describe("desktop streaming lifecycle", () => {
 	}
 
 	test("same runner refreshes UI without repeating startup or error listeners", async () => {
-		const { call, snapshot, session, sdk, runner, contexts, startupEvents } = await launch(true);
+		// This fixture models a cooperative session whose context resets in place, forbidden by exclusive native ownership.
+		const { call, snapshot, session, sdk, runner, contexts, startupEvents } = await launch(true, undefined, false);
 		if (!runner) throw new Error("Expected extension runner");
 		await call("command.run", { sessionId: session.id, text: "/tools" });
 		const oldUI = contexts[0]!;

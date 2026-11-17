@@ -19674,13 +19674,30 @@ export class SessionManager {
 		} catch (error) {
 			return { kind: "unknown", error: toError(error) };
 		}
+		let publicationPredecessor: ManagedFileIdentity | undefined;
 		if (stage.persistsToExistingFile) {
 			if (!this.#sessionFile) {
 				transition.dispose();
 				return { kind: "unknown", error: new Error("Missing staged session replacement") };
 			}
+			if (this.#nativeResumeOperations.size > 0) {
+				try {
+					const captured = inspectTranscriptBounded(this.#sessionFile, this.#storage);
+					if (!captured.ok) throw new Error("stale_snapshot");
+					const identity = captured.inspection.identity;
+					if (identity.ctimeNs === undefined) throw new Error("stale_snapshot");
+					publicationPredecessor = {
+						...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }),
+						sha256: identity.sha256,
+					};
+				} catch (error) {
+					transition.dispose();
+					return { kind: "unknown", error: toError(error) };
+				}
+			}
 			if (this.destination.kind === "managed") {
 				try {
+					let publicationSuccessor: ManagedFileIdentity | undefined;
 					if (stage.boundedCold) {
 						if (!stage.managedAppendExpectation) throw new Error("Managed bounded append expectation is missing");
 						const bytes = Buffer.concat(
@@ -19691,18 +19708,22 @@ export class SessionManager {
 								),
 							),
 						);
-						this.#managedTranscriptStore(this.#sessionFile).appendExpectedSync(
+						const receipt = this.#managedTranscriptStore(this.#sessionFile).appendExpectedSync(
 							path.basename(this.#sessionFile),
 							bytes,
 							stage.managedAppendExpectation,
 						);
+						publicationSuccessor = receipt.identity;
 					} else {
 						const persistedEntries = materializeResidentEntriesForPersistenceSync(
 							[...stage.entries],
 							this.#residentBlobStores(),
 						).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
 						this.#writeEntriesAtomicallySync(persistedEntries);
+						publicationSuccessor = this.#managedPersistExpectedIdentity;
 					}
+					if (publicationPredecessor && publicationSuccessor)
+						this.#recordResumePublicationSuccession(publicationPredecessor, publicationSuccessor);
 				} catch (error) {
 					transition.dispose();
 					return { kind: "unknown", error: toError(error) };
@@ -19714,6 +19735,18 @@ export class SessionManager {
 				}
 				try {
 					this.#closePersistWriterInternalSync();
+					let publicationSuccessor: ManagedFileIdentity | undefined;
+					if (publicationPredecessor) {
+						// Bind the successor to the staged inode and bytes, not a later path read.
+						const captured = inspectTranscriptBounded(stage.tempPath, this.#storage);
+						if (!captured.ok) throw new Error("stale_snapshot");
+						const identity = captured.inspection.identity;
+						if (identity.ctimeNs === undefined) throw new Error("stale_snapshot");
+						publicationSuccessor = {
+							...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }),
+							sha256: identity.sha256,
+						};
+					}
 					if (stage.boundedCold) {
 						if (!this.#storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
 							transition.dispose();
@@ -19735,6 +19768,8 @@ export class SessionManager {
 							return { kind: "not_promoted", error: replacement.error };
 						}
 					}
+					if (publicationPredecessor && publicationSuccessor)
+						this.#recordResumePublicationSuccession(publicationPredecessor, publicationSuccessor);
 				} catch (error) {
 					transition.dispose();
 					if (this.#persistWriter?.getCloseState() === "close_failed_retryable") {
@@ -19751,12 +19786,10 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			this.#readOnlyResume = false;
 		}
-		if (!stage.boundedCold) {
-			this.#commitResidentTextStoreTransition(transition);
-			return { kind: "promoted" };
-		}
 		const aggregateUsage = this.#usageStatistics;
-		this.#commitResidentTextStoreTransition(transition, false);
+		this.#commitResidentTextStoreTransition(transition, !stage.boundedCold);
+		for (const entry of stage.appendEntries) this.#recordNativeResumeEntry(entry);
+		if (!stage.boundedCold) return { kind: "promoted" };
 		this.#usageStatistics = aggregateUsage;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return { kind: "promoted" };
