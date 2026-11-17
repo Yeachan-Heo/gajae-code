@@ -4,8 +4,9 @@ import { getBundledModel, type Model } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 function normalizeRenderedText(text: string): string {
 	return text
@@ -55,28 +56,22 @@ function createSelector(
 	);
 }
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load theme for ModelSelector tests");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 /** Open the assignment menu for the first model and return its normalized rendering. */
 async function renderActionMenu(model: Model, settings: Settings, knownModels: Model[]): Promise<string> {
-	installTestTheme();
+	setThemeInstance(testTheme);
 	const selector = createSelector(model, settings, knownModels);
 	await Bun.sleep(0);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	selector.handleInput("\n");
-	installTestTheme();
+	setThemeInstance(testTheme);
 	return normalizeRenderedText(selector.render(240).join("\n"));
 }
 
 describe("ModelSelector assignment menu role bindings", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		if (!testTheme) throw new Error("Failed to load theme for ModelSelector tests");
+		testTheme = await loadTestTheme();
 	});
 
 	test("shows the model each role currently resolves to", async () => {
@@ -120,14 +115,14 @@ describe("ModelSelector assignment menu role bindings", () => {
 
 		const selector = createSelector(model, Settings.isolated({}), [model]);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		selector.handleInput("\n");
 		selector.refreshRoleAssignments({
 			currentModel: model,
 			currentThinkingLevel: ThinkingLevel.High,
 			activeModelProfile: "profile-a",
 		});
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain(`Set as DEFAULT (Default) — now: ${model.provider}/${model.id} (high)`);
@@ -159,7 +154,7 @@ describe("ModelSelector assignment menu role bindings", () => {
 		catalog.splice(0, 1, replacement);
 		failProviderTabs = true;
 		selector.refreshRoleAssignments();
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("claude-sonnet-4-5");
@@ -235,15 +230,15 @@ describe("ModelSelector assignment menu role bindings", () => {
 			"task.agentModelOverrides": { executor: `${lateModel.provider}/${lateModel.id}` },
 		});
 
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const catalog: Model[] = [model];
 		const selector = createSelector(model, settings, catalog, []);
 		// The provider's models land while the selector is still loading its catalog.
 		catalog.push(lateModel);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		selector.handleInput("\n");
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain(`Set as EXECUTOR (Executor) — now: ${lateModel.provider}/${lateModel.id}`);
@@ -253,7 +248,7 @@ describe("ModelSelector assignment menu role bindings", () => {
 
 		catalog.splice(1, 1);
 		selector.refreshRoleAssignments();
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const refreshed = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(refreshed).toContain(
@@ -281,12 +276,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			},
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\t");
 		selector.handleInput("\t");
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("replacement");
@@ -321,12 +316,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			},
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\t");
 		selector.handleInput("\t");
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("claude-sonnet-4-5");
@@ -362,12 +357,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			},
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\t");
 		selector.handleInput("\t");
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("claude-sonnet-4-5");
@@ -398,12 +393,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			},
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\t");
 		selector.handleInput("\t");
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("claude-sonnet-4-5");
@@ -439,12 +434,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			},
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\t");
 		selector.handleInput("\t");
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
 		expect(rendered).toContain("claude-sonnet-4-5");
@@ -464,12 +459,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			"task.agentModelOverrides": { architect: hostile },
 		});
 
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(model, settings, [model]);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		selector.handleInput("\n");
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const frame = selector.render(240).join("\n");
 		const architectRow = frame.split("\n").find(line => line.includes("Set as ARCHITECT"));
 		if (!architectRow) throw new Error("Expected an architect row in the assignment menu");
@@ -493,12 +488,12 @@ describe("ModelSelector assignment menu role bindings", () => {
 			modelRoles: { default: `${hostileModel.provider}/${hostileModel.id}` },
 		});
 
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(model, settings, [model, hostileModel]);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		selector.handleInput("\n");
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const frame = selector.render(240).join("\n");
 		const defaultRow = frame.split("\n").find(line => line.includes("Set as DEFAULT"));
 		if (!defaultRow) throw new Error("Expected a default row in the assignment menu");

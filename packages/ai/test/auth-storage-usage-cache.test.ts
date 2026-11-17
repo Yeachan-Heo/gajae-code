@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import fc from "fast-check";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
@@ -29,15 +30,8 @@ function anthropicReports(reports: UsageReport[] | null): UsageReport[] {
 	return (reports ?? []).filter(r => r.provider === "anthropic");
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-
-	throw new Error("Timed out waiting for condition");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 500): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 /**
  * Force every cache entry to look stale to AuthStorage WITHOUT dropping the

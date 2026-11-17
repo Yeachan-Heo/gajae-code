@@ -1,4 +1,5 @@
 import { sanitizeText as currentSanitizeText } from "@gajae-code/utils/sanitize-text";
+import { createBench } from "./harness";
 
 const STRIP_RE = new RegExp(
 	[
@@ -281,6 +282,7 @@ function jsSanitizeText(text: string): string {
 }
 
 const ITERATIONS = 2000;
+const bench = createBench(ITERATIONS);
 
 const bigPlain = "hello world ".repeat(500);
 const bigAnsi = ("\x1b[31mred\x1b[0m " + "lorem ipsum dolor ".repeat(20)).repeat(5);
@@ -296,18 +298,6 @@ const samples = {
 };
 
 const wrapWidth = 40;
-
-function bench(name: string, fn: () => void): number {
-	const start = Bun.nanoseconds();
-	for (let i = 0; i < ITERATIONS; i++) {
-		fn();
-	}
-	const elapsed = (Bun.nanoseconds() - start) / 1e6;
-	const perOp = (elapsed / ITERATIONS).toFixed(6);
-	console.log(`${name}: ${elapsed.toFixed(2)}ms total (${perOp}ms/op)`);
-	return elapsed;
-}
-
 console.log(`Text layout benchmark (${ITERATIONS} iterations)\n`);
 
 for (const name in samples) {

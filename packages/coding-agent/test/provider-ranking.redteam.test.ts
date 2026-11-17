@@ -8,6 +8,7 @@ import {
 	sortRankedProviders,
 } from "../src/config/provider-ranking";
 import { formatProviderPresetList, PROVIDER_PRESETS } from "../src/setup/provider-onboarding";
+import { mulberry32 } from "./helpers/seeded-random";
 
 const AUTH_STATES: readonly ProviderAuthState[] = ["valid", "checking", "configured", "invalid", "none"];
 const EXISTING_AUTH_STATES: readonly ProviderAuthState[] = ["valid", "checking", "configured"];
@@ -26,17 +27,6 @@ function sign(value: number): -1 | 0 | 1 {
 function oppositeSign(value: number): -1 | 0 | 1 {
 	const valueSign = sign(value);
 	return valueSign === 0 ? 0 : valueSign === 1 ? -1 : 1;
-}
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let value = state;
-		value = Math.imul(value ^ (value >>> 15), value | 1);
-		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-		return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-	};
 }
 
 function shuffle<T>(values: readonly T[], seed: number): T[] {

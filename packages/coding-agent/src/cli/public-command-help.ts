@@ -85,7 +85,7 @@ export interface PublicHelpRenderResult {
 	document: PublicHelpDocument;
 }
 
-/** Sorted object keys; array ordering is semantic. JSON escaping preserves lone surrogates. */
+/** Sorted object keys; array ordering is semantic. JSON escaping preserves lone surrogates. Normalizes to JSON first: undefined array entries become null, undefined object keys are dropped, and non-JSON values throw invalid_registry. */
 function canonicalJson(value: unknown): string {
 	const normalize = (item: unknown): unknown => {
 		if (item === null || typeof item === "string" || typeof item === "boolean") return item;

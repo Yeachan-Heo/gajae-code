@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import {
@@ -14,14 +15,8 @@ import {
 import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await sleep(25);
-	}
-	throw new Error(`timed out waiting for ${label}`);
-}
+const waitFor = (pred: () => boolean, ms = 4000, label = "condition"): Promise<void> =>
+	waitForCondition(pred, ms, { intervalMs: 25, label, sleep });
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = { type: string; redact?: boolean; name?: string; mime?: string };

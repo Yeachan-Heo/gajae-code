@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * `fetchOpenCodexModels` reads `runtime-port.json` from `OPENCODEX_HOME`.
@@ -30,19 +30,14 @@ interface Probe {
 	secondAsyncArrayHome: string;
 }
 
-const tempDirs: string[] = [];
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-opencodex-home-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
+const projectTrustDirs = createTrustTempDirs("gjc-opencodex-home-");
+const runtimeTrustDirs = createTrustTempDirs("gjc-opencodex-runtime-");
+const { projectDir } = projectTrustDirs;
 
 function runtimeHome(port: number): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-opencodex-runtime-"));
-	tempDirs.push(dir);
+	const dir = runtimeTrustDirs.tempDir();
 	fs.writeFileSync(path.join(dir, "runtime-port.json"), JSON.stringify({ hostname: "127.0.0.1", port }));
 	return dir;
 }
@@ -67,7 +62,6 @@ function listen(): { port: number; hits: string[] } {
 
 afterEach(() => {
 	for (const server of servers.splice(0)) server.stop(true);
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 function expectProjectHome(probe: Probe, home: string) {

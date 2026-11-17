@@ -2402,6 +2402,7 @@ type LifecycleFailureArtifact = EffectMarker &
 		transcript?: LifecycleTranscriptEvidence;
 	};
 
+/** Lifecycle artifact digests: byte-stable; `undefined`-valued keys are kept (unlike ./canonical-json.ts, which omits them). */
 function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

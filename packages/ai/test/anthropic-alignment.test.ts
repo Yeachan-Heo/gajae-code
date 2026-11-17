@@ -22,7 +22,7 @@ import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "@gajae-code/ai/utils/tool-choice-capability";
 import * as z from "zod/v4";
-import { withEnv } from "./helpers";
+import { createAbortedSignal, withEnv } from "./helpers";
 
 const ANTHROPIC_MODEL: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -44,12 +44,6 @@ const CLOUDFLARE_ANTHROPIC_MODEL: Model<"anthropic-messages"> = {
 	provider: "cloudflare-ai-gateway",
 	baseUrl: "https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic",
 };
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
 
 type CaptureAnthropicOptions = {
 	isOAuth?: boolean;
@@ -1516,12 +1510,6 @@ describe("Anthropic strict-tool and adaptive-thinking compatibility opt-outs for
 		tools: [bashTool],
 	};
 
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
-
 	function captureParams(
 		model: Model<"anthropic-messages">,
 	): Promise<{ tools?: Array<{ name: string; strict?: unknown }> }> {
@@ -1529,7 +1517,7 @@ describe("Anthropic strict-tool and adaptive-thinking compatibility opt-outs for
 		void streamAnthropic(model, baseContext, {
 			apiKey: "sk-ant-api-test",
 			isOAuth: false,
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			onPayload: payload => {
 				resolve(payload as { tools?: Array<{ name: string; strict?: unknown }> });
 				return undefined;
@@ -1570,7 +1558,7 @@ describe("Anthropic strict-tool and adaptive-thinking compatibility opt-outs for
 		void streamAnthropic(adaptiveModel, baseContext, {
 			apiKey: "sk-ant-api-test",
 			isOAuth: false,
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			thinkingEnabled: true,
 			onPayload: payload => {
 				resolve(payload as { thinking?: { type?: string } });
@@ -1597,7 +1585,7 @@ describe("Anthropic strict-tool and adaptive-thinking compatibility opt-outs for
 		void streamAnthropic(adaptiveModel, baseContext, {
 			apiKey: "sk-ant-api-test",
 			isOAuth: false,
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			thinkingEnabled: true,
 			onPayload: payload => {
 				resolve(payload as { thinking?: { type?: string; budget_tokens?: number } });

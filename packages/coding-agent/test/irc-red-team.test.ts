@@ -6,11 +6,12 @@ import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/component
 import { IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
-import { getThemeByName, initTheme, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
 import { Container, ImageProtocol, TERMINAL, type TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const SIXEL_START = "\x1bPq";
 const SIXEL_END = "\x1b\\";
@@ -24,8 +25,7 @@ const originalAllowPassthrough = Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH;
 
 beforeAll(async () => {
 	await initTheme();
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Expected red-claw theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

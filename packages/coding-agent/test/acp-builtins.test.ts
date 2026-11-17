@@ -7,11 +7,12 @@ import type { DurableModelProfileOwnership } from "../src/config/model-profile-o
 import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
-import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
+import { setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
+import { loadTestTheme } from "./helpers/test-theme";
 
 interface FakeAcpBuiltinSession {
 	fastMode: boolean;
@@ -93,6 +94,8 @@ interface FakeAcpBuiltinSession {
 	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
 	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
+	setThinkingLevelForControl(thinkingLevel: ThinkingLevel, persist: boolean): Promise<void>;
+	setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined): Promise<void>;
 }
 
 function createRuntime() {
@@ -227,6 +230,14 @@ function createRuntime() {
 			this.thinkingLevel = thinkingLevel;
 			this.thinkingLevelCalls.push({ thinkingLevel, persist });
 		},
+		// The real controls publish before applying; the fake applies through the
+		// overridable setter so tests can observe the requested level.
+		async setThinkingLevelForControl(thinkingLevel: ThinkingLevel, persist: boolean) {
+			this.setThinkingLevel(thinkingLevel, persist);
+		},
+		async setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined) {
+			this.setThinkingLevel(thinkingLevel);
+		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const fakeSessionManager = {
@@ -293,6 +304,7 @@ function createRuntime() {
 	};
 	const typedSession = Object.assign(session, {
 		sessionManager: fakeSessionManager as unknown as SessionManager,
+		setSessionName: (name: string, source: "auto" | "user") => fakeSessionManager.setSessionName(name, source),
 	}) as unknown as AgentSession & FakeAcpBuiltinSession;
 	return {
 		output,
@@ -335,8 +347,7 @@ const INHERITED_OWNERSHIP_V0: DurableModelProfileOwnership = {
 
 describe("ACP builtin slash commands", () => {
 	it("consumes fast status without returning prompt text", async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for fast status test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 
@@ -351,8 +362,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("renders a provider-aware multiline fast status report and never calls isFastModeEnabled", async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for fast status test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 		const session = runtime.session as unknown as {

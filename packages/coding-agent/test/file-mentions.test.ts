@@ -11,6 +11,7 @@ import {
 	isCanonicalWindowsPathWithin,
 } from "@gajae-code/coding-agent/utils/file-mentions";
 import { directoryCaseSensitive } from "@gajae-code/natives";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 
 const tempDirs: string[] = [];
 
@@ -24,14 +25,6 @@ async function createTempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-file-mentions-"));
 	tempDirs.push(dir);
 	return dir;
-}
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
 }
 
 describe("generateFileMentionMessages path resolution", () => {
@@ -238,7 +231,7 @@ describe("generateFileMentionMessages workspace boundary", () => {
 	});
 
 	test("holds seeded Windows containment properties (seed 0x5eed6837)", () => {
-		const random = seededRandom(0x5eed6837);
+		const random = lcgUnit(0x5eed6837);
 		const randomInt = (max: number): number => Math.floor(random() * max);
 
 		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {

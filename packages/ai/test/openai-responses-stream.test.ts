@@ -8,6 +8,7 @@ import {
 import type { AssistantMessage, Model } from "@gajae-code/ai/types";
 import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
+import { createResponsesOutput } from "./helpers";
 
 // A generic Responses failure arrives inside an HTTP 200 stream — as a
 // `response.failed` event or as a `response.completed` event whose response
@@ -35,26 +36,6 @@ function makeModel(): Model<"openai-responses"> {
 	};
 }
 
-function makeOutput(): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [],
-		timestamp: Date.now(),
-		provider: "test-provider",
-		model: "test-model",
-		api: "openai-responses",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-	};
-}
-
 function makeSink(): AssistantMessageEventStream {
 	return { push: () => {}, end: () => {} } as never;
 }
@@ -73,7 +54,7 @@ function failureEvent(shape: FailureShape, code: string | undefined, message: st
 
 async function streamError(events: unknown[]): Promise<unknown> {
 	try {
-		await processResponsesStream(makeStream(events), makeOutput(), makeSink(), makeModel());
+		await processResponsesStream(makeStream(events), createResponsesOutput(), makeSink(), makeModel());
 	} catch (error) {
 		return error;
 	}
@@ -165,7 +146,9 @@ describe("Responses provider: bounded stream-failure classification", () => {
 
 	test("reports an unexpected EOF instead of a content-free success", async () => {
 		// The parser reports that no terminal event was observed...
-		expect(await processResponsesStream(makeStream([]), makeOutput(), makeSink(), makeModel())).toBe(false);
+		expect(await processResponsesStream(makeStream([]), createResponsesOutput(), makeSink(), makeModel())).toBe(
+			false,
+		);
 
 		// ...and the provider turns that into a bounded failure, not a `done` turn.
 		const result = await streamProviderResult([]);

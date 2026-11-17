@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { AsyncJobManager } from "../../src/async";
-import { getThemeByName } from "../../src/modes/theme/theme";
+
 import type { ToolSession } from "../../src/tools/index";
 import { JobTool, jobToolRenderer } from "../../src/tools/job";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function toolSession(manager: AsyncJobManager): ToolSession {
 	return {
@@ -21,7 +22,7 @@ function renderResultLines(component: { render(width: number): string[] }): stri
 
 describe("jobToolRenderer", () => {
 	it("renders a paused job instead of failing the component render", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 
 		// A folded background job is paused while it stays resumable, so the job
@@ -52,7 +53,7 @@ describe("jobToolRenderer", () => {
 	});
 
 	it("does not report a paused-only snapshot as settled", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 
 		const result = {
@@ -71,7 +72,7 @@ describe("jobToolRenderer", () => {
 	});
 
 	it("renders a status this build does not know without reporting success", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 
 		// Tool details are read back from persisted sessions, so a snapshot can

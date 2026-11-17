@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { processResponsesStream } from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai/types";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
+import { createResponsesOutput } from "./helpers";
 
 // A response cut short for length (`incomplete`) can stop mid-tool-call. The
 // streaming JSON parser repairs the partial arguments into a plausible-but-wrong
@@ -26,26 +27,6 @@ function makeModel(): Model<"openai-responses"> {
 	};
 }
 
-function makeOutput(): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [],
-		timestamp: Date.now(),
-		provider: "test-provider",
-		model: "test-model",
-		api: "openai-responses",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-	};
-}
-
 function makeCapture() {
 	const emitted: Array<Record<string, unknown>> = [];
 	const stream = { push: (e: Record<string, unknown>) => emitted.push(e), end: () => {} } as never;
@@ -63,7 +44,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 		["response.incomplete", "completed"],
 		["response.completed", "incomplete"],
 	])("preserves content-filter diagnostics and tool guards for %s / %s", async (type, status) => {
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(
 			makeStream([
@@ -130,7 +111,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 				response: { id: "resp_1", status: "incomplete", incomplete_details: { reason: "max_output_tokens" } },
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -170,7 +151,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 			},
 			{ type: "response.completed", response: { id: "resp_1", status: "incomplete" } },
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -201,7 +182,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 			},
 			{ type: "response.completed", response: { id: "resp_1", status: "completed" } },
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -225,7 +206,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 			},
 			{ type: "response.completed", response: { id: "resp_1", status: "incomplete" } },
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -256,7 +237,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 			// Turn truncated on trailing content AFTER the tool call finished.
 			{ type: "response.completed", response: { id: "resp_1", status: "incomplete" } },
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -285,7 +266,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 			},
 			{ type: "response.incomplete", response: { id: "resp_1" } },
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -313,7 +294,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 			},
 			{ type: "response.incomplete", response: { id: "resp_1", status: "completed" } },
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
