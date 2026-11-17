@@ -40,6 +40,7 @@ import type {
 import { isSessionLifecycleMutationOperation } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import {
+	containsSecretConfigKey,
 	validateAdapterControl,
 	validateAdapterSecretFields,
 	validateRequiredPromptText,
@@ -125,7 +126,6 @@ export interface RetainedTranscriptTailReader {
 	readRange(start: number, end: number): Promise<Uint8Array>;
 }
 
-const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const SDK_SESSION_CLI_LIFECYCLE_ACTOR = { id: "gjc-sdk-session-cli", namespace: "sdk:session-cli" } as const;
 const ROUTER_START_TIMEOUT_MS = 10_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
@@ -475,12 +475,6 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 	}
 }
 
-function containsSecretField(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsSecretField);
-	if (!isRecord(value)) return false;
-	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
-}
-
 async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	const sources = [
 		args.jsonInput !== undefined,
@@ -490,7 +484,7 @@ async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	if (sources > 1) throw new SdkSessionCliError("usage", "Use only one JSON input source.", 2);
 	if (args.jsonInput !== undefined) {
 		const input = parseInput(args.jsonInput, "--json-input");
-		if (containsSecretField(input))
+		if (containsSecretConfigKey(input))
 			throw new SdkSessionCliError(
 				"secret_field_forbidden",
 				"Secret values must use --json-input-file or --json-input-stdin.",

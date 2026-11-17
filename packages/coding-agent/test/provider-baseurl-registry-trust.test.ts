@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * `resolveProviderBaseUrlFromEnv()` feeds both `getProviderBaseUrl()` and the
@@ -26,23 +25,7 @@ interface Resolved {
 	google: string | null;
 }
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-baseurl-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
-
-function projectDir(dotenv?: string): string {
-	const dir = tempDir();
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { tempDir, projectDir } = createTrustTempDirs("gjc-provider-baseurl-trust-");
 
 async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
 	const env: Record<string, string> = {};

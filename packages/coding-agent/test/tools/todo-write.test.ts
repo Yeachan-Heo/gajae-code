@@ -5,6 +5,7 @@ import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { applyOpsToPhases, type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools/implementations";
 import { phasesToMarkdown, todoWriteToolRenderer } from "../../src/tools/todo-write";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function captureValidationError(run: () => void): string {
 	try {
@@ -45,8 +46,7 @@ function phasesWithRawNotes(notes: unknown[]): TodoPhase[] {
 
 async function getUiTheme() {
 	await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
-	const theme = await themeModule.getThemeByName("red-claw");
-	if (!theme) throw new Error("Expected red-claw theme");
+	const theme = await loadTestTheme();
 	return theme;
 }
 

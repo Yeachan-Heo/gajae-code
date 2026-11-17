@@ -3,9 +3,10 @@ import type { Model } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { Container, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { loadTestTheme } from "./helpers/test-theme";
 
 // Image-only model (output: ["image"] only)
 const imageOnlyModel: Model = {
@@ -52,7 +53,7 @@ const textAndImageModel: Model = {
 };
 
 test("image-only models excluded from ordinary chat selection", async () => {
-	await setThemeInstance((await getThemeByName("red-claw"))!);
+	await setThemeInstance((await loadTestTheme())!);
 
 	const terminal = new VirtualTerminal(100, 40);
 	const tui = new TUI(terminal, false, { widthSettleMs: 0 });

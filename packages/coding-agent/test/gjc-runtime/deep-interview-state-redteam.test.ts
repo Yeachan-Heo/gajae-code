@@ -14,6 +14,7 @@ import {
 import { activeSnapshotPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { deriveDeepInterviewHud } from "@gajae-code/coding-agent/skill-state/workflow-hud";
+import { readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -45,10 +46,6 @@ function inner(envelope: { state?: Record<string, unknown> }): Record<string, un
 
 function clone<T>(value: T): T {
 	return JSON.parse(JSON.stringify(value)) as T;
-}
-
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
 }
 
 async function activeChips(cwd: string): Promise<Record<string, string | undefined>> {

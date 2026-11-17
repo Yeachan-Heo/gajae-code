@@ -3,7 +3,7 @@ import { type Component, renderMetrics, Text, TUI } from "@gajae-code/tui";
 import { Markdown } from "@gajae-code/tui/components/markdown";
 import { $flag } from "@gajae-code/utils";
 import { defaultMarkdownTheme } from "./test-themes";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 const PERF_GATES = $flag("PI_TUI_PERF_GATES");
 const PROMOTION_GATE = PERF_GATES && $flag("PI_TUI_PROMOTION_GATE");
@@ -58,12 +58,6 @@ function rows(): string[] {
 	);
 }
 
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(20);
-	await term.flush();
-}
-
 function lineCount(snapshot: ReturnType<typeof renderMetrics.snapshot>, name: keyof LineCounts): number {
 	return snapshot.lineCounts[name]?.last ?? 0;
 }
@@ -71,7 +65,7 @@ function lineCount(snapshot: ReturnType<typeof renderMetrics.snapshot>, name: ke
 async function renderFrame(tui: TUI, term: VirtualTerminal, source: string): Promise<FrameMeasurement> {
 	renderMetrics.reset();
 	tui.requestRender(false, source);
-	await settle(term);
+	await settle(term, 20);
 	const snapshot = renderMetrics.snapshot();
 	const renderTreeMs = snapshot.helperStats.renderTree?.totalMs ?? 0;
 	const totalFrameMs = snapshot.renderDurations.meanMs;

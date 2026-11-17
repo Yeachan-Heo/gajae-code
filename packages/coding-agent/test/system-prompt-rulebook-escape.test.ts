@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as os from "node:os";
 import { buildSystemPrompt } from "@gajae-code/coding-agent/system-prompt";
 import { escapePromptMetadata } from "../src/session/messages";
+import { mulberry32 } from "./helpers/seeded-random";
 
 const PROPERTY_SEED = 423;
 const PROPERTY_COUNT = 64;
@@ -17,17 +18,6 @@ const emptyTree = {
 	totalLines: 0,
 	agentsMdFiles: [] as string[],
 };
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) | 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 function pick(rng: () => number, alphabet: string, length: number): string {
 	let value = "";
 	for (let index = 0; index < length; index++) {

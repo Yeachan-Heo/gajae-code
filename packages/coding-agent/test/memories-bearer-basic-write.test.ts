@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as ai from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { getMemoryRoot, startMemoryStartupTask } from "@gajae-code/coding-agent/memories";
+import { retryUntil } from "../../utils/test/helpers/wait-for";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 /**
@@ -41,20 +42,8 @@ afterEach(async () => {
 	createdDirs.clear();
 });
 
-async function waitFor(assertion: () => Promise<void> | void, timeoutMs = 10_000): Promise<void> {
-	const start = Date.now();
-	let lastError: unknown;
-	while (Date.now() - start < timeoutMs) {
-		try {
-			await assertion();
-			return;
-		} catch (error) {
-			lastError = error;
-		}
-		await Bun.sleep(20);
-	}
-	throw lastError;
-}
+const waitFor = (assertion: () => Promise<void> | void, timeoutMs = 10_000): Promise<void> =>
+	retryUntil(assertion, timeoutMs, { intervalMs: 20 });
 
 async function persistMemory(input: {
 	rawMemory: string;

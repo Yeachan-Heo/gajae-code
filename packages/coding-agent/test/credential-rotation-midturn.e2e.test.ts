@@ -2,8 +2,8 @@ import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Message, type Model } from "@gajae-code/ai";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type { CredentialRankingStrategy, UsageProvider, UsageReport } from "@gajae-code/ai/usage";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -15,13 +15,11 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as z from "zod/v4";
+import { identityConverter } from "../../agent/test/helpers";
 
 const provider = "openai-codex";
 const providerAlias = "openai-codex-device";
 const selector = (model: Model) => `${model.provider}/${model.id}`;
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 function usageLimitStream(
 	model: Model,

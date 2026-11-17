@@ -14,13 +14,15 @@ import {
 	SmartRoutingPanelComponent as SmartRoutingPanelClass,
 } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { TempDir } from "@gajae-code/utils";
 import {
 	createRoutingSettingsService,
 	RoutingSettingsConfirmationRequiredError,
 	type RoutingSettingsPreview,
 } from "../src/sdk/routing-settings";
+import { drainMicrotasks } from "./helpers/microtasks";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -55,7 +57,7 @@ function canonicalBytes(value: unknown): string {
 	return Buffer.from(canonicalJsonBytes(value)).toString("hex");
 }
 
-let themeInstance = await getThemeByName("red-claw");
+let themeInstance = await loadTestTheme();
 
 function installTheme(): void {
 	if (!themeInstance) throw new Error("Failed to load test theme");
@@ -146,12 +148,6 @@ function createContext(
 	return { ctx, settings, session, editorContainer, notifyCatalogChanged: () => notifyCatalogChanged() };
 }
 
-async function settle(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
-}
-
 async function openPanel(options: Parameters<typeof createContext>[0] & { smartRoutingOnly?: boolean } = {}): Promise<{
 	controller: SelectorController;
 	selector: ModelSelectorComponent;
@@ -164,7 +160,7 @@ async function openPanel(options: Parameters<typeof createContext>[0] & { smartR
 	const controller = new SelectorController(ctx as never);
 	controller.showModelSelector(options.smartRoutingOnly ? { smartRoutingOnly: true } : undefined);
 	const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
-	await settle();
+	await drainMicrotasks();
 	installTheme();
 	if (options.smartRoutingOnly) {
 		// Nothing to navigate: the standalone entry mounts the panel itself.
@@ -176,7 +172,7 @@ async function openPanel(options: Parameters<typeof createContext>[0] & { smartR
 		}
 		selector.handleInput("\n");
 	}
-	await settle();
+	await drainMicrotasks();
 	const panel = selector.__testGetSmartRoutingPanel();
 	if (!panel) throw new Error("Smart-routing landing row did not open the panel");
 	return { controller, selector, panel, settings, ctx, notifyCatalogChanged };
@@ -184,7 +180,7 @@ async function openPanel(options: Parameters<typeof createContext>[0] & { smartR
 
 describe("/model smart-routing panel integration", () => {
 	beforeAll(async () => {
-		themeInstance = await getThemeByName("red-claw");
+		themeInstance = await loadTestTheme();
 		installTheme();
 	});
 
@@ -509,7 +505,7 @@ describe("/model smart-routing panel integration", () => {
 			expect(renderText(selector)).toContain("reload Settings before continuing");
 			controller.showModelSelector();
 			const reopened = ctx.editorContainer.addChild.mock.calls.at(-1)?.[0] as ModelSelectorComponent;
-			await settle();
+			await drainMicrotasks();
 			expect(renderText(reopened)).toContain("Smart routing (unknown)");
 			reopened.__testOpenSmartRoutingPanel();
 			expect(reopened.__testGetSmartRoutingPanel()).toBeUndefined();
@@ -612,7 +608,7 @@ describe("/model smart-routing panel integration", () => {
 		await initialPanel.__testApply();
 		initialPanel.handleInput("\x1b");
 		selector.handleInput("\n");
-		await settle();
+		await drainMicrotasks();
 		const panel = selector.__testGetSmartRoutingPanel();
 		if (!panel) throw new Error("Expected reopened routing panel");
 		const runtimeSetup: AutoroutingSetup = { schema: 1, providers: ["openai-codex"] };
@@ -644,7 +640,7 @@ describe("/model smart-routing panel integration", () => {
 					await initialPanel.__testApply();
 					initialPanel.handleInput("\x1b");
 					selector.handleInput("\n");
-					await settle();
+					await drainMicrotasks();
 					const reopened = selector.__testGetSmartRoutingPanel();
 					if (!reopened) throw new Error("Expected reopened routing panel");
 					panel = reopened;
@@ -721,7 +717,7 @@ describe("/model smart-routing panel integration", () => {
 		settings.override("task.autorouting.setup", runtimeSetup);
 		settings.set("task.autorouting.tiers", { fast: ["anthropic/hand-edited"] });
 		selector.handleInput("\n");
-		await settle();
+		await drainMicrotasks();
 		const panel = selector.__testGetSmartRoutingPanel();
 		if (!panel) throw new Error("Expected reopened routing panel");
 		const refresh = controller.refreshSmartRouting.bind(controller);
@@ -736,7 +732,7 @@ describe("/model smart-routing panel integration", () => {
 		await calls[0]?.catch(error => {
 			if (error instanceof RoutingSettingsConfirmationRequiredError) guards.push(error);
 		});
-		await settle();
+		await drainMicrotasks();
 		const first = guards[0];
 		if (!first) throw new Error("Expected first refresh guard");
 		expect(panel.getDraft()).toEqual(runtimeSetup);
@@ -752,14 +748,14 @@ describe("/model smart-routing panel integration", () => {
 		await calls[1]?.catch(error => {
 			if (error instanceof RoutingSettingsConfirmationRequiredError) guards.push(error);
 		});
-		await settle();
+		await drainMicrotasks();
 		const second = guards[1];
 		if (!second) throw new Error("Expected second refresh guard");
 		expect(first.preview).not.toBe(second.preview);
 		await expect(refresh({ preview: first.preview, confirmHandEdit: true })).rejects.toThrow("not valid");
 		panel.handleInput("\r");
 		await calls[2];
-		await settle();
+		await drainMicrotasks();
 		expect(spy.mock.calls[2]?.[0]?.preview).toBe(second.preview);
 		expect(spy.mock.calls[2]?.[0]?.confirmHandEdit).toBe(true);
 		expect(panel.mode).toBe("done");
@@ -816,7 +812,7 @@ describe("/model smart-routing panel integration", () => {
 		await panel.__testApply();
 		panel.handleInput("\x1b");
 		selector.handleInput("\n");
-		await settle();
+		await drainMicrotasks();
 		const reopened = selector.__testGetSmartRoutingPanel();
 		if (!reopened) throw new Error("Smart-routing panel did not reopen");
 		reopened.handleInput("c");
@@ -870,7 +866,7 @@ describe("/model smart-routing panel integration", () => {
 		expect(renderText(selector)).toContain("Refreshing model configuration...");
 
 		gate.resolve();
-		await settle();
+		await drainMicrotasks();
 		expect(selector.__testGetSmartRoutingPanel()).toBeDefined();
 	});
 
@@ -880,7 +876,7 @@ describe("/model smart-routing panel integration", () => {
 		panel.__testSetProviders(editedProviders);
 
 		notifyCatalogChanged();
-		await settle();
+		await drainMicrotasks();
 		expect(selector.__testGetSmartRoutingPanel()).toBe(panel);
 		expect(panel.getProviderOrder()).toEqual(editedProviders);
 	});
@@ -893,7 +889,7 @@ describe("/model smart-routing panel integration", () => {
 		const controller = new SelectorController(ctx as never);
 		controller.showModelSelector({ smartRoutingOnly: true });
 		const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
-		await settle();
+		await drainMicrotasks();
 		installTheme();
 
 		const text = renderText(selector);
@@ -940,13 +936,13 @@ describe("provider-order derived seeding (Steps 3-4)", () => {
 		const controller = new SelectorController(ctx as never);
 		controller.showModelSelector();
 		const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
-		await settle();
+		await drainMicrotasks();
 		installTheme();
 		for (let index = 0; index < 20 && selector.__testSelectedPresetRowIdentity() !== "smartRouting"; index++) {
 			selector.handleInput("\x1b[B");
 		}
 		selector.handleInput("\n");
-		await settle();
+		await drainMicrotasks();
 		expect(selector.__testGetSmartRoutingPanel()).toBeUndefined();
 		expect(selector.__testViewMode()).toBe("presets");
 	});
@@ -963,7 +959,7 @@ describe("provider-order derived seeding (Steps 3-4)", () => {
 		// Guard against a tautology: the edit must actually have changed the draft.
 		expect(edited).not.toEqual(before);
 		await settings.set("modelProviderOrder", ["openai-codex"]);
-		await settle();
+		await drainMicrotasks();
 		// The unsaved draft must survive the advisory refresh.
 		expect(panel.getProviderOrder()).toEqual(edited);
 	});

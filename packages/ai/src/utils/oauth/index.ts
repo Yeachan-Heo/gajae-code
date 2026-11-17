@@ -547,6 +547,22 @@ export async function getOAuthApiKey(
 export function resolveOAuthStorageProvider(provider: OAuthProviderId): OAuthProviderId {
 	return provider === "openai-codex-device" ? "openai-codex" : provider;
 }
+
+/**
+ * True when an exported credential-snapshot row is an api_key credential stored
+ * for `provider` (after storage-id normalization). The consumers are provider
+ * setup's cleanup scope, its disable accounting, the discovery probe's
+ * credential presence check, and the registry's load-time `credential: store`
+ * warning; all four decide "stored api_key rows for this provider" here so a
+ * change to the stored-credential model moves them together.
+ */
+export function isStoredApiKeyCredentialForProvider<T extends { provider: string; credential: { type: string } }>(
+	entry: T,
+	provider: OAuthProviderId,
+): entry is T & { credential: { type: "api_key"; key: string } } {
+	return entry.provider === resolveOAuthStorageProvider(provider) && entry.credential.type === "api_key";
+}
+
 /**
  * Get list of OAuth providers.
  */

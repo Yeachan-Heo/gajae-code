@@ -2,13 +2,13 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { AuthStorage, OAuthCredentialSelectorError, SqliteAuthCredentialStore } from "@gajae-code/ai/core";
 import type { OAuthSelectorComponent } from "../src/modes/components/oauth-selector";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const stores: SqliteAuthCredentialStore[] = [];
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("test setup failed: theme missing");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

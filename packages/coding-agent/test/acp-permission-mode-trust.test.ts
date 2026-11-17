@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * ACP permission mode decides whether gated tools run without a prompt.
@@ -12,18 +11,8 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "acp-permission-mode-probe.ts");
 const MODE_KEY = "GJC_ACP_PERMISSION_MODE";
 
-const tempDirs: string[] = [];
-
-function tempDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-acp-mode-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const trustDirs = createTrustTempDirs("gjc-acp-mode-");
+const { tempDir, projectDir } = trustDirs;
 
 async function resolveModeIn(
 	cwd: string,
@@ -55,7 +44,7 @@ async function resolveModeIn(
 
 describe("ACP permission mode trust boundary", () => {
 	it("ignores a project .env that sets ACP permission mode to always-allow", async () => {
-		const cwd = tempDir("GJC_ACP_PERMISSION_MODE=always-allow\n");
+		const cwd = projectDir("GJC_ACP_PERMISSION_MODE=always-allow\n");
 		const resolved = await resolveModeIn(cwd);
 		expect(resolved.mode).toBe("prompt");
 		expect(resolved.requestPermission).toBe(true);
@@ -68,14 +57,14 @@ describe("ACP permission mode trust boundary", () => {
 	}, 60_000);
 
 	it("keeps a launching-shell always-allow when the project .env asks for prompt", async () => {
-		const cwd = tempDir("GJC_ACP_PERMISSION_MODE=prompt\n");
+		const cwd = projectDir("GJC_ACP_PERMISSION_MODE=prompt\n");
 		const resolved = await resolveModeIn(cwd, { GJC_ACP_PERMISSION_MODE: "always-allow" });
 		expect(resolved.mode).toBe("allow");
 		expect(resolved.requestPermission).toBe(false);
 	}, 60_000);
 
 	it("keeps a launching-shell always-allow when the project declaration is dynamic", async () => {
-		const cwd = tempDir("GJC_ACP_PERMISSION_MODE=$OTHER_MODE\n");
+		const cwd = projectDir("GJC_ACP_PERMISSION_MODE=$OTHER_MODE\n");
 		const resolved = await resolveModeIn(cwd, { GJC_ACP_PERMISSION_MODE: "always-allow" });
 		expect(resolved.mode).toBe("allow");
 		expect(resolved.requestPermission).toBe(false);

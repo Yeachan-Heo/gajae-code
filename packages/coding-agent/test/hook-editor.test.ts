@@ -2,15 +2,13 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import { HookEditorComponent } from "@gajae-code/coding-agent/modes/components/hook-editor";
 import { ExtensionUiController } from "@gajae-code/coding-agent/modes/controllers/extension-ui-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { setKeybindings, type TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 
@@ -181,30 +179,13 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(onCancel).not.toHaveBeenCalled();
 	});
 
-	it("submits when a non-Windows terminal reports plain Enter as LF", () => {
+	it.each([
+		"darwin",
+		"linux",
+		"win32",
+	] as const)("inserts a newline for raw LF (Ctrl+J / Shift+Enter→LF mapping) on %s", platform => {
 		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		Object.defineProperty(process, "platform", { value: "linux" });
-		try {
-			const onSubmit = vi.fn();
-			const onCancel = vi.fn();
-			const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
-				promptStyle: true,
-			});
-
-			component.handleInput("a");
-			component.handleInput("\n");
-
-			expect(onSubmit).toHaveBeenCalledTimes(1);
-			expect(onSubmit).toHaveBeenCalledWith("a");
-			expect(onCancel).not.toHaveBeenCalled();
-		} finally {
-			if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-		}
-	});
-
-	it("inserts newline for Windows PowerShell raw LF newline chords", () => {
-		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		Object.defineProperty(process, "platform", { value: "win32" });
+		Object.defineProperty(process, "platform", { value: platform });
 		try {
 			const onSubmit = vi.fn();
 			const onCancel = vi.fn();

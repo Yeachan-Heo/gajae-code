@@ -1,11 +1,12 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import type { UsageLimit, UsageReport } from "@gajae-code/ai";
 import { renderUsageReports } from "@gajae-code/coding-agent/modes/controllers/command-controller";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import {
 	collectCachedUsageReports,
 	formatLimitDetail,
 } from "@gajae-code/coding-agent/slash-commands/helpers/usage-report";
+import { loadTestTheme } from "./helpers/test-theme";
 
 function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -63,7 +64,7 @@ function singleWindowReport(email: string, windowId: "5h" | "7d", usedFraction: 
 
 describe("usage report column ordering", () => {
 	beforeAll(async () => {
-		const loaded = await getThemeByName("red-claw");
+		const loaded = await loadTestTheme();
 		if (loaded) setThemeInstance(loaded);
 	});
 
@@ -148,7 +149,7 @@ describe("usage report column ordering", () => {
 
 describe("usage report reset visibility", () => {
 	beforeAll(async () => {
-		const loaded = await getThemeByName("red-claw");
+		const loaded = await loadTestTheme();
 		if (loaded) setThemeInstance(loaded);
 	});
 
@@ -300,7 +301,7 @@ describe("usage text rows", () => {
 
 describe("usage report sibling-window gaps", () => {
 	beforeAll(async () => {
-		const loaded = await getThemeByName("red-claw");
+		const loaded = await loadTestTheme();
 		if (loaded) setThemeInstance(loaded);
 	});
 

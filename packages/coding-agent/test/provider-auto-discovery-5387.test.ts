@@ -213,6 +213,8 @@ describe("issue #5387 custom provider auto-discovery", () => {
 						return result;
 					},
 					remove: (...args: Parameters<AuthStorage["remove"]>) => authStorage.remove(...args),
+					disableCredentialById: () => true,
+					reload: async () => undefined,
 				},
 			});
 			expect(result.providerId).toBe("force-gateway");
@@ -256,6 +258,8 @@ describe("issue #5387 custom provider auto-discovery", () => {
 						throw new Error("credential write failed after peer update");
 					},
 					remove: (...args: Parameters<AuthStorage["remove"]>) => authStorage.remove(...args),
+					disableCredentialById: () => true,
+					reload: async () => undefined,
 				},
 			});
 			void result;
@@ -366,6 +370,8 @@ describe("issue #5387 custom provider auto-discovery", () => {
 						}),
 						set: async () => undefined,
 						remove: async () => undefined,
+						disableCredentialById: () => true,
+						reload: async () => undefined,
 					},
 					discoverySignal: controller.signal,
 					probeDiscovery: async () => ({

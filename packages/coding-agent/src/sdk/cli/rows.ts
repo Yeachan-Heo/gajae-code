@@ -10,6 +10,7 @@
 
 import { isRecord } from "@gajae-code/utils";
 import { sessionOwnershipV1 } from "../broker/session-scope";
+import { isSecretConfigKey } from "../protocol/adapter-validation";
 
 export const SESSION_ROWS_VERSION = 2;
 
@@ -145,15 +146,13 @@ export class TailRevisionBuffer {
 	}
 }
 
-const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
-
 /** Recursively removes secret-shaped fields (defense in depth for DTO output). */
 export function stripSecretFields(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(stripSecretFields);
 	if (!value || typeof value !== "object") return value;
 	const out: Record<string, unknown> = {};
 	for (const [key, nested] of Object.entries(value)) {
-		if (SECRET_FIELD.test(key)) continue;
+		if (isSecretConfigKey(key)) continue;
 		out[key] = stripSecretFields(nested);
 	}
 	return out;

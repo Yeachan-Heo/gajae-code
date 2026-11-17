@@ -1,4 +1,4 @@
-import { sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
+import { isRecord, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import type { SkillManifest } from "./workflow-manifest";
 
@@ -16,10 +16,6 @@ function scalar(value: unknown): string | undefined {
 	if (typeof value === "string") return value.trim() || undefined;
 	if (typeof value === "number" || typeof value === "boolean") return String(value);
 	return undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function stateObject(stateJson: Record<string, unknown>): Record<string, unknown> {

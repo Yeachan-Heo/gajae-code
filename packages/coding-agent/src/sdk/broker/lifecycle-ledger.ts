@@ -206,6 +206,7 @@ export function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedger
 		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
+/** Ledger digests: bigint becomes a decimal string and `undefined`-valued keys are omitted. */
 function canonicalJson(value: unknown): string {
 	if (typeof value === "bigint") return JSON.stringify(value.toString());
 	if (value === null || typeof value !== "object") return JSON.stringify(value);

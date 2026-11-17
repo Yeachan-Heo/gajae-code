@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * The Kimi OAuth host receives the device-authorization request, the
@@ -17,18 +16,7 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "kimi-oauth-host-probe.ts");
 const KEYS = ["KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST"] as const;
 
-const tempDirs: string[] = [];
-
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-kimi-oauth-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { projectDir } = createTrustTempDirs("gjc-kimi-oauth-trust-");
 
 async function hostIn(cwd: string, overrides: Record<string, string> = {}): Promise<string> {
 	const env: Record<string, string> = {};

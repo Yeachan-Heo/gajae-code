@@ -377,6 +377,35 @@ describe("AgentSession canonical completion", () => {
 		).toHaveLength(1);
 	});
 
+	it("persists a custom message after a shared canonical append without leaving the shared path", async () => {
+		const { agent, manager, session } = await setup({ sharedManaged: true });
+		const failures: unknown[] = [];
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: { role: "user", content: "committed", timestamp: Date.now() },
+		});
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: {
+				role: "custom",
+				customType: "shared-custom-probe",
+				content: "after shared append",
+				display: true,
+				timestamp: Date.now(),
+			},
+		});
+		await withTimeout(session.awaitSessionSettlement(), 5_000, "Custom message did not settle").catch(error =>
+			failures.push(error),
+		);
+		expect(failures).toEqual([]);
+		expect(
+			manager
+				.getBranch()
+				.map(entry => (entry.type === "custom_message" ? entry.customType : entry.type))
+				.filter(kind => kind === "shared-custom-probe"),
+		).toEqual(["shared-custom-probe"]);
+	});
+
 	it("does not treat a released predecessor as the terminal assistant's failed append", async () => {
 		const removed: string[] = [];
 		const { agent, manager, session } = await setup({ onAuthRemoval: () => removed.push("removed") });

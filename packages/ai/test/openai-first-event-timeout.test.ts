@@ -6,6 +6,7 @@ import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Context, Model, TextContent } from "../src/types";
 import { waitForDelayOrAbort, withEnv } from "./helpers";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 
@@ -119,15 +120,6 @@ function createAbortIgnoringHangingFetch(): typeof fetch {
 
 	return Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
 }
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function createNoProgressOpenAIResponsesStream(signal: AbortSignal | undefined): Response {
 	const encoder = new TextEncoder();
 	let interval: NodeJS.Timeout | undefined;

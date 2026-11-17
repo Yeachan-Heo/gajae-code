@@ -1,9 +1,10 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { getBundledModel, type Model, type Usage } from "@gajae-code/ai";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { Text } from "@gajae-code/tui";
+import { loadTestTheme } from "../../helpers/test-theme";
 
 /** OSC 52 clipboard write. The payload is the base64 of "owned". */
 const OSC_CLIPBOARD = "\u001b]52;c;b3duZWQ=\u0007";
@@ -120,8 +121,7 @@ async function renderSessionInfo(
 }
 
 beforeAll(async () => {
-	const installed = await getThemeByName("red-claw");
-	if (!installed) throw new Error("Expected dark theme");
+	const installed = await loadTestTheme();
 	setThemeInstance(installed);
 });
 

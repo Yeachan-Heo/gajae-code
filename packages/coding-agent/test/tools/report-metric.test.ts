@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { visibleWidth } from "@gajae-code/tui";
-import { getThemeByName, setThemeInstance, type Theme } from "../../src/modes/theme/theme";
+import { setThemeInstance, type Theme } from "../../src/modes/theme/theme";
 import { renderResult as renderTaskResult } from "../../src/task/render";
 import type { AgentProgress, TaskToolDetails } from "../../src/task/types";
 import {
@@ -10,10 +10,11 @@ import {
 	renderMetricChart,
 	reportMetricTool,
 } from "../../src/tools/report-metric";
+import { loadTestTheme } from "../helpers/test-theme";
 
 let theme: Theme;
 beforeAll(async () => {
-	theme = (await getThemeByName("red-claw"))!;
+	theme = (await loadTestTheme())!;
 	setThemeInstance(theme);
 });
 

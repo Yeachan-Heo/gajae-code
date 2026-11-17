@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { logger } from "@gajae-code/utils";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { connectToServer, MCPConnectionCleanupFailure } from "../../src/runtime-mcp/client";
 import { MCPManager } from "../../src/runtime-mcp/manager";
@@ -9,14 +10,8 @@ import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
 import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 function processState(pid: number): string {
 	try {

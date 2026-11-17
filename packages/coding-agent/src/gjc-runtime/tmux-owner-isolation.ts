@@ -19,6 +19,7 @@ import {
 	readOwnerOnlyFile,
 	verifyOwnerOnlyPathSecurity,
 } from "@gajae-code/natives";
+import { isRecord } from "@gajae-code/utils";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { observeProcessIncarnation, type ProcessIncarnationObservation } from "../sdk/broker/process-incarnation";
 import { parseLinuxProcStartTime } from "./linux-proc";
@@ -3082,9 +3083,6 @@ function hasOnlyKeys(record: Record<string, unknown>, allowed: string[]): boolea
 }
 function nonEmpty(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isCode(error: unknown, code: string): boolean {
 	return isRecord(error) && error.code === code;

@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-11-17
+
+### Removed
+
+- Removed the `tui.input.copy` keybinding. Nothing dispatched it, so it only advertised a Ctrl+C copy that never happened.
+
+### Fixed
+
+- Inserting a newline closes an open autocomplete list, so the next Enter submits instead of only dismissing the stale list.
+
+- With an autocomplete list open, a bare line feed (Ctrl+J, or a Shift+Enter→LF terminal mapping) inserts a newline instead of applying the highlighted completion.
+
+- A bracketed paste whose end marker never arrives now delivers what arrived after a 1 s inactivity watchdog, or at a 64 MiB cap, instead of leaving input dead.
+- Unbracketed multi-line pastes (for example `tmux paste-buffer` without `-p`) arrive as one paste instead of submitting line by line.
+
 ## [0.21.0] - 2026-11-16
 
 ### Performance
