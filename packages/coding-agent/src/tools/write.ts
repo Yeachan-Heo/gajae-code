@@ -287,6 +287,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		resolvedArchivePath: ResolvedArchiveWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const isZip = resolvedArchivePath.absolutePath.toLowerCase().endsWith(".zip");
+		// Archive publication goes straight to `writeFileAtomically`, so it does not
+		// pass through the writethrough callback that carries this session's local
+		// root. Pass the binding here as well, or an explicit local root's archive
+		// symlink would publish outside it.
+		const localProtocolOptions = this.session.getLocalProtocolOptions?.();
 
 		if (isZip) {
 			const zipEntries: Record<string, Uint8Array> = {};
@@ -309,7 +314,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				const { zipSync } = await loadFflate();
 				const zipBuffer = zipSync(zipEntries);
-				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer);
+				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer, { localProtocolOptions });
 			} catch (error) {
 				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
@@ -340,7 +345,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				const archive = new Bun.Archive(archiveEntries);
 				const archiveBytes = await archive.bytes();
-				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes);
+				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes, { localProtocolOptions });
 			} catch (error) {
 				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}

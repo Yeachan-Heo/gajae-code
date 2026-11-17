@@ -750,6 +750,48 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it.skipIf(process.platform === "win32")("bounds an archive local:// write with the session's own root", async () => {
+		const artifacts = path.join(tmpDir, "archive-artifacts");
+		const globalArtifacts = path.join(tmpDir, "archive-global-artifacts");
+		const localRoot = path.join(artifacts, "local");
+		const outsideRoot = path.join(tmpDir, "archive-outside-root");
+		const danglingArchive = path.join(outsideRoot, "attacker", "nested", "payload.zip");
+		const link = path.join(localRoot, "alias.zip");
+		await fs.mkdir(localRoot, { recursive: true });
+		await fs.mkdir(path.join(globalArtifacts, "local"), { recursive: true });
+		await fs.symlink(danglingArchive, link);
+		const tool = new WriteTool(
+			createSession(tmpDir, {
+				enableLsp: false,
+				getLocalProtocolOptions: () => ({
+					getArtifactsDir: () => artifacts,
+					isManagedDestination: () => false,
+					getSessionId: () => "archive-root",
+				}),
+				isManagedSessionDestination: () => false,
+				getSessionId: () => "archive-root",
+			}),
+		);
+		// The process-global binding names a different explicit root, so the
+		// archive destination must be bounded by the session's own binding.
+		LocalProtocolHandler.setOverride({
+			getArtifactsDir: () => globalArtifacts,
+			getSessionId: () => "global-root",
+		});
+		try {
+			await expect(
+				tool.execute("archive-local-write", {
+					path: "local://alias.zip:payload.txt",
+					content: "must not publish\n",
+				}),
+			).rejects.toThrow(/outside trust boundary/);
+			expect(await Bun.file(danglingArchive).exists()).toBe(false);
+			await expect(fs.stat(outsideRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			LocalProtocolHandler.setOverride(undefined);
+		}
+	});
+
 	it("does not mkdir an archive path before rejecting a boundary escape", async () => {
 		if (process.platform === "win32") return;
 		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "archive-boundary-test");
