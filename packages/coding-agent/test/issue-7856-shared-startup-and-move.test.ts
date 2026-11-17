@@ -193,16 +193,17 @@ describe("#7856 setTemporaryModel in a shared root TUI session", () => {
 });
 
 describe("#7856 Move Session in a shared root TUI session", () => {
-	it("allows moveTo in a shared session without throwing SharedSessionMutationUnsupportedError", async () => {
+	it("allows moveTo through runExclusiveCwdMoveTransition in a shared session", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
 
 		const targetDir = path.join(f.cwd, "..", "moved-session");
 		await fs.mkdir(targetDir, { recursive: true });
 
-		// This should not throw SharedSessionMutationUnsupportedError
+		// moveTo through runExclusiveCwdMoveTransition should not throw SharedSessionMutationUnsupportedError
+		// This matches the path used by Move Session tool (via rescopeSessionCwd)
 		try {
-			await f.manager.moveTo(targetDir);
+			await f.manager.runExclusiveCwdMoveTransition(() => f.manager.moveTo(targetDir));
 		} catch (error) {
 			throw new Error(`moveTo failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
