@@ -1179,7 +1179,7 @@ type RetainedManagedReplacer = {
 		expectedMtimeNs: string,
 		expectedCtimeNs: string,
 		expectedSha256: string,
-	): { ok: boolean; code?: string };
+	): RecoveryFsResult;
 	removeManaged(
 		relativePath: string,
 		expectedDev: string,
@@ -2400,29 +2400,30 @@ export class ManagedSessionDescendantStore {
 		});
 	}
 
-	async publishNoReplace(relativePath: string, bytes: Uint8Array): Promise<void> {
+	async publishNoReplace(relativePath: string, bytes: Uint8Array): Promise<ManagedFileIdentity> {
 		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
 		if (this.#authority) {
 			this.#assertBound();
-			this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
+			const published = this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
 			this.#assertBound();
-			return;
+			return published;
 		}
-		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
+		return publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
 	}
 
-	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {
+	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): ManagedFileIdentity {
 		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
+			const published = publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
 			this.#assertBound();
-			return;
+			return published;
 		}
 		this.#assertBound();
-		this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
+		const published = this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
 		this.#assertBound();
+		return published;
 	}
 	/**
 	 * Atomically publishes an already-written managed staging file without
@@ -2511,16 +2512,20 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
-	replaceExpectedIdentitySync(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): void {
+	replaceExpectedIdentitySync(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedFileIdentity,
+	): ManagedFileIdentity {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
 			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
 			if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
+			const replaced = replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
 			this.#assertBound();
-			return;
+			return replaced;
 		}
 		const relative = this.#relative(resolved);
 		const observed = this.#authority.stat(relative);
@@ -2551,7 +2556,13 @@ export class ManagedSessionDescendantStore {
 			expectedSha256,
 		);
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		if (!replaced.identity)
+			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
 		this.#assertBound();
+		return {
+			...managedFileIdentityFromNative(replaced.identity),
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
 	}
 
 	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
@@ -2578,23 +2589,32 @@ export class ManagedSessionDescendantStore {
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
 		this.#assertBound();
 	}
-	replaceSync(relativePath: string, bytes: Uint8Array): void {
+	replaceSync(relativePath: string, bytes: Uint8Array): ManagedFileIdentity {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
+			let published: ManagedFileIdentity;
 			try {
 				const expected = captureManagedFileNoFollow(resolved);
-				replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
+				published = replaceManagedFileSync(
+					resolved,
+					bytes,
+					this.#subtreeRoot,
+					this.#policy,
+					undefined,
+					expected.identity,
+				);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				publishManagedFileNoReplaceSync(resolved, bytes, this.#subtreeRoot, this.#policy);
+				published = publishManagedFileNoReplaceSync(resolved, bytes, this.#subtreeRoot, this.#policy);
 			}
 			this.#assertBound();
-			return;
+			return published;
 		}
-		this.#replaceRetained(this.#relative(resolved), bytes);
+		const published = this.#replaceRetained(this.#relative(resolved), bytes);
 		this.#assertBound();
+		return published;
 	}
 
 	captureBoundedAppendExpectation(relativePath: string): ManagedBoundedAppendExpectation | undefined {
@@ -2790,7 +2810,7 @@ export class ManagedSessionDescendantStore {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
 
-	#publishRetainedNoReplace(relative: string, bytes: Uint8Array): void {
+	#publishRetainedNoReplace(relative: string, bytes: Uint8Array): ManagedFileIdentity {
 		if (!this.#authority) throw new Error("Managed descendant authority is unavailable");
 		const separator = relative.lastIndexOf("/");
 		const parent = separator < 0 ? "" : relative.slice(0, separator);
@@ -2838,6 +2858,7 @@ export class ManagedSessionDescendantStore {
 			);
 			const outcome = classifyNativePublishOutcome(published, "retained_file");
 			if (!outcome.ok) throw publishFailure(outcome);
+			return { ...managedFileIdentityFromNative(captured.identity), sha256: digest };
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result
@@ -2869,14 +2890,13 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
-	#replaceRetained(relative: string, bytes: Uint8Array): void {
+	#replaceRetained(relative: string, bytes: Uint8Array): ManagedFileIdentity {
 		if (!this.#authority) throw new Error("Managed descendant authority is unavailable");
 		this.#assertBound();
 		const existing = this.#authority.readManaged(relative);
 		if (!existing.ok) {
 			if (existing.code !== "not_found") throw new Error(existing.code ?? "managed_replace_failed");
-			this.#publishRetainedNoReplace(relative, bytes);
-			return;
+			return this.#publishRetainedNoReplace(relative, bytes);
 		}
 		if (!existing.identity || !existing.data) throw new Error("Managed descendant identity is unavailable");
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
@@ -2890,6 +2910,12 @@ export class ManagedSessionDescendantStore {
 			existing.identity.sha256 ?? createHash("sha256").update(existing.data).digest("hex"),
 		);
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		if (!replaced.identity)
+			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
+		return {
+			...managedFileIdentityFromNative(replaced.identity),
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
 	}
 
 	/** Capture descriptor identity without copying file bytes when retained authority is available. */
@@ -3990,13 +4016,14 @@ export async function publishManagedFileNoReplace(
 	assertOwned?: () => void,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
-): Promise<void> {
+): Promise<ManagedFileIdentity> {
 	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
 	let handle: fsp.FileHandle | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
+	let publishedIdentity: ManagedFileIdentity | undefined;
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
 	let renameAttempted = false;
@@ -4027,6 +4054,7 @@ export async function publishManagedFileNoReplace(
 		secureFileDescriptor(staging, handle.fd, "verify");
 		const staged = await handle.stat({ bigint: true });
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
+		publishedIdentity = identity(staged, createHash("sha256").update(bytes).digest("hex"));
 		assertOwned?.();
 
 		renameAttempted = true;
@@ -4086,6 +4114,8 @@ export async function publishManagedFileNoReplace(
 		}
 	}
 	if (failure !== undefined) throw failure;
+	if (!publishedIdentity) throw new Error("managed_publish_identity_unavailable");
+	return publishedIdentity;
 }
 
 export function publishManagedFileNoReplaceSync(
@@ -4413,9 +4443,9 @@ export function replaceManagedFileSync(
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
-): void {
+): ManagedFileIdentity {
 	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
-	replaceManagedFileGeneratedSync(
+	return replaceManagedFileGeneratedSync(
 		destination,
 		fd => {
 			const hash = createHash("sha256");

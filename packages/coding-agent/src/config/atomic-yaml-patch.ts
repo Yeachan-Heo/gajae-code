@@ -4,7 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
-import { exactReplacePath, exactUnlink } from "@gajae-code/natives";
+import { exactReplacePath, exactUnlink, linkNoReplacePath, renameNoReplacePath } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { YAML } from "bun";
 import type { AtomicYamlNativeWorkerRequest, AtomicYamlNativeWorkerResponse } from "./atomic-yaml-patch-worker";
@@ -77,6 +77,8 @@ export interface AtomicYamlUpdate<T> {
 }
 
 export interface AtomicYamlPatchOptions {
+	/** Admit the actual namespace commit after staging and asynchronous preflight. */
+	withCommit?: <T>(commit: () => T | Promise<T>) => Promise<T>;
 	/** Test seam for deterministic pre-rename and Windows sharing-violation failures. */
 	rename?: (from: string, to: string) => Promise<void>;
 	/** Test seam for an identity-checked atomic replacement. */
@@ -623,11 +625,36 @@ async function runNativeAtomicYamlWorker(
 	}
 }
 
+// Guarded publication must execute the native namespace operation in the
+// admission callback, not dispatch a worker whose later commit outlives it.
+// A native exception has an unknown outcome, so retain its staged path.
+function runGuardedNativeYamlCommit<T>(configPath: string, commit: () => T): T {
+	try {
+		return commit();
+	} catch (error) {
+		throw new AtomicYamlReplaceError(configPath, 1, error, true);
+	}
+}
+
+function commitYamlNamespace<T>(
+	options: AtomicYamlPatchOptions,
+	configPath: string,
+	lexicalConfigPath: string | undefined,
+	commit: () => T | Promise<T>,
+): T | Promise<T> {
+	const publish = (): T | Promise<T> => {
+		if (lexicalConfigPath !== undefined) assertLexicalTargetUnchanged(lexicalConfigPath, configPath);
+		return commit();
+	};
+	return options.withCommit ? options.withCommit(publish) : publish();
+}
+
 async function replaceWithExpectedIdentity(
 	tempPath: string,
 	configPath: string,
 	expectedState: YamlFileState,
 	options: AtomicYamlPatchOptions,
+	lexicalConfigPath?: string,
 ): Promise<void> {
 	const { exists: expectedExists, raw: expectedRaw } = expectedState;
 	const expectedHash = nodeCrypto.createHash("sha256").update(expectedRaw).digest("hex");
@@ -645,21 +672,29 @@ async function replaceWithExpectedIdentity(
 				nodeCrypto.createHash("sha256").update("").digest("hex"),
 			);
 		const publishOnce = async (): Promise<NativeNoReplaceResult> =>
-			options.noReplace
-				? await options.noReplace(tempPath, configPath)
-				: ((await runNativeAtomicYamlWorker({
-						operation: "no-replace",
-						sourcePath: tempPath,
-						destinationPath: configPath,
-					})) as NativeNoReplaceResult);
+			await commitYamlNamespace(options, configPath, lexicalConfigPath, () =>
+				options.noReplace
+					? options.noReplace(tempPath, configPath)
+					: options.withCommit
+						? runGuardedNativeYamlCommit(configPath, () => renameNoReplacePath(tempPath, configPath))
+						: (runNativeAtomicYamlWorker({
+								operation: "no-replace",
+								sourcePath: tempPath,
+								destinationPath: configPath,
+							}) as Promise<NativeNoReplaceResult>),
+			);
 		const publishOnceWithLink = async (): Promise<NativeNoReplaceResult> =>
-			options.noReplace
-				? await options.noReplace(tempPath, configPath)
-				: ((await runNativeAtomicYamlWorker({
-						operation: "no-replace-link",
-						sourcePath: tempPath,
-						destinationPath: configPath,
-					})) as NativeNoReplaceResult);
+			await commitYamlNamespace(options, configPath, lexicalConfigPath, () =>
+				options.noReplace
+					? options.noReplace(tempPath, configPath)
+					: options.withCommit
+						? runGuardedNativeYamlCommit(configPath, () => linkNoReplacePath(tempPath, configPath))
+						: (runNativeAtomicYamlWorker({
+								operation: "no-replace-link",
+								sourcePath: tempPath,
+								destinationPath: configPath,
+							}) as Promise<NativeNoReplaceResult>),
+			);
 		let published = await publishOnce();
 		if (
 			!published.ok &&
@@ -696,15 +731,19 @@ async function replaceWithExpectedIdentity(
 	// `exactReplacePath` validates both identities inside one native atomic
 	// namespace exchange. A save after the snapshots therefore rejects the
 	// exchange without replacing the editor's newer destination.
-	const replaced: NativeExactUnlinkResult = options.exactReplace
-		? await options.exactReplace(tempPath, configPath, source, destination)
-		: ((await runNativeAtomicYamlWorker({
-				operation: "exact-replace",
-				sourcePath: tempPath,
-				destinationPath: configPath,
-				expectedSource: source,
-				expectedDestination: destination,
-			})) as NativeExactUnlinkResult);
+	const replaced: NativeExactUnlinkResult = await commitYamlNamespace(options, configPath, lexicalConfigPath, () =>
+		options.exactReplace
+			? options.exactReplace(tempPath, configPath, source, destination)
+			: options.withCommit
+				? runGuardedNativeYamlCommit(configPath, () => exactReplacePath(tempPath, configPath, source, destination))
+				: (runNativeAtomicYamlWorker({
+						operation: "exact-replace",
+						sourcePath: tempPath,
+						destinationPath: configPath,
+						expectedSource: source,
+						expectedDestination: destination,
+					}) as Promise<NativeExactUnlinkResult>),
+	);
 	if (replaced.ok) return;
 	// RENAME_EXCHANGE is unsupported (NFS, kernels before 3.15): the native
 	// exact-replace reports atomic_unavailable. A replacement fallback that
@@ -759,9 +798,10 @@ async function replaceWithRetry(
 	options: AtomicYamlPatchOptions,
 	/** Expected current file state; native exact replacement validates it with the destination identity. */
 	expectedState?: YamlFileState,
+	lexicalConfigPath?: string,
 ): Promise<void> {
 	if (expectedState !== undefined) {
-		await replaceWithExpectedIdentity(tempPath, configPath, expectedState, options);
+		await replaceWithExpectedIdentity(tempPath, configPath, expectedState, options, lexicalConfigPath);
 		return;
 	}
 	const rename = options.rename ?? fs.rename;
@@ -771,7 +811,11 @@ async function replaceWithRetry(
 	for (;;) {
 		attempts++;
 		try {
-			await rename(tempPath, configPath);
+			await commitYamlNamespace(options, configPath, lexicalConfigPath, () =>
+				options.withCommit && !options.rename
+					? fsSync.renameSync(tempPath, configPath)
+					: rename(tempPath, configPath),
+			);
 			return;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
@@ -801,6 +845,8 @@ async function writeAtomicYaml(
 	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
 	const nextRaw = YAML.stringify(value, null, 2);
 	let preserveTempPath = false;
+	let failed = false;
+	let failure: unknown;
 	try {
 		const tempHandle = await fs.open(tempPath, "wx", 0o600);
 		try {
@@ -841,7 +887,7 @@ async function writeAtomicYaml(
 		let publishedIdentity: NativeExactFileIdentity | null = null;
 		publishedIdentity = await captureExactFileIdentity(tempPath);
 		try {
-			await replaceWithRetry(tempPath, configPath, options, expectedState);
+			await replaceWithRetry(tempPath, configPath, options, expectedState, lexicalConfigPath);
 		} catch (error) {
 			preserveTempPath = error instanceof AtomicYamlReplaceError && error.preserveTempPath;
 			throw error;
@@ -950,10 +996,22 @@ async function writeAtomicYaml(
 			}
 		}
 		await syncParentDirectory(directory);
-	} finally {
-		if (!preserveTempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
+		recordDurableMutation(configPath, mutationPaths);
+	} catch (error) {
+		failed = true;
+		failure = error;
 	}
-	recordDurableMutation(configPath, mutationPaths);
+	if (!preserveTempPath) {
+		try {
+			await fs.rm(tempPath, { force: true });
+		} catch (cleanupError) {
+			throw new AggregateError(
+				failed ? [failure, cleanupError] : [cleanupError],
+				`Atomic YAML staging cleanup failed; retained path: ${tempPath}`,
+			);
+		}
+	}
+	if (failed) throw failure;
 	return { exists: true, raw: nextRaw };
 }
 

@@ -2,16 +2,38 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { createCooperativeOwnerInspectors } from "@gajae-code/coding-agent/sdk/native-ownership";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import {
+	admitOwnerMembershipSync,
+	captureLegacyTakeoverAttestationSync,
+	captureOwnerTargetSync,
+	ownerFirstWriteMarkerSync,
+	ownerHostIdSync,
+	withOwnerPublicationSync,
+} from "@gajae-code/coding-agent/session/owner-group";
+import {
+	isOwnerEnrollData,
+	OWNER_ENROLL_CUSTOM_TYPE,
+	resolveResumeCheckpoint,
+} from "@gajae-code/coding-agent/session/resume-cursor";
 import {
 	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	type FileEntry,
 	SessionManager,
 	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
-import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	type SessionDurabilityRepairReceipt,
+	type SessionStorageExclusiveLock,
+	type SessionStorageWriter,
+	SessionStorageWriterRetryableCloseError,
+} from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
 import { TempDir } from "@gajae-code/utils";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import {
 	injectManagedFileRename,
 	injectManagedTreeFsync,
@@ -84,6 +106,231 @@ describe("SessionManager session ids", () => {
 		}
 	});
 
+	it.each([
+		false,
+		true,
+	])("binds marker repair only to the verified managed inode (foreign successor=%s)", async foreignSuccessor => {
+		using root = TempDir.createSync("gjc-marker-repair-inode-");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(
+			root.path(),
+			SessionManager.managedDestination(root.path(), root.path(), storage),
+			storage,
+		);
+		manager.setSessionMemoryMode("off");
+		manager.appendMessage({ role: "user", content: "retained repair history", timestamp: 1 });
+		const file = manager.getSessionFile()!;
+		const token = manager.getOwnerMembership()!;
+		const marker = withOwnerPublicationSync(token, () => ownerFirstWriteMarkerSync(token));
+		if (!marker) throw new Error("Expected actual unconfirmed enrollment");
+		const authorityKey = manager.getSessionOwnerEvidence()!.authorityKey;
+		const ownerBefore = await Bun.file(authorityKey).text();
+		let beforeRepairIdentity = manager.captureState().managedPersistExpectedIdentity;
+		let receipt: SessionDurabilityRepairReceipt | undefined;
+		let repairedBytes: Buffer | undefined;
+		let afterCaptures = 0;
+		let freshManagedCaptures = 0;
+		const repair = storage.repairDurabilitySync.bind(storage);
+		const repairSpy = vi.spyOn(storage, "repairDurabilitySync").mockImplementation((...args) => {
+			beforeRepairIdentity = manager.captureState().managedPersistExpectedIdentity;
+			// Start from a real managed publication and a real descriptor-bound repair.
+			receipt = repair(...args);
+			repairedBytes = fsSync.readFileSync(file);
+			expect(receipt.stat.ino).toBe(args[1].stat.ino);
+			expect(receipt.stat.mtimeNs).not.toBe(args[1].stat.mtimeNs);
+			return receipt;
+		});
+		const capture = SessionManager.captureTranscriptStrict.bind(SessionManager);
+		const captureSpy = vi.spyOn(SessionManager, "captureTranscriptStrict").mockImplementation((...args) => {
+			const result = capture(...args);
+			if (receipt) afterCaptures++;
+			return result;
+		});
+		const managedCapture = ManagedSessionDescendantStore.prototype.captureBoundedAppendExpectation;
+		const managedSpy = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "captureBoundedAppendExpectation")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relativePath) {
+				if (receipt && relativePath === path.basename(file)) {
+					freshManagedCaptures++;
+					// This boundary is after the post-repair capture, not during repair or its verification.
+					expect(afterCaptures).toBe(1);
+					if (foreignSuccessor && freshManagedCaptures === 1) {
+						if (!repairedBytes) throw new Error("Expected actual repaired transcript bytes");
+						fsSync.writeFileSync(`${file}.foreign`, repairedBytes, { mode: 0o600 });
+						fsSync.renameSync(file, `${file}.verified`);
+						fsSync.renameSync(`${file}.foreign`, file);
+						expect(storage.statSync(file).ino).not.toBe(receipt.stat.ino);
+					}
+				}
+				return managedCapture.call(this, relativePath);
+			});
+		try {
+			if (foreignSuccessor) await expect(manager.ensureOnDisk()).rejects.toThrow("durability_unproven");
+			else await manager.ensureOnDisk();
+			expect(freshManagedCaptures).toBe(1);
+			const verifiedReceipt = receipt;
+			const verifiedBytes = repairedBytes;
+			if (!verifiedReceipt || !verifiedBytes) throw new Error("Expected actual repair receipt and bytes");
+			if (verifiedReceipt.stat.nlink !== 1n) throw new Error("Expected single-link repaired transcript");
+			expect(verifiedReceipt.namespaceSynced).toBe(true);
+			managedSpy.mockRestore();
+			captureSpy.mockRestore();
+			repairSpy.mockRestore();
+			const currentIdentity = manager.captureState().managedPersistExpectedIdentity;
+			const freeze = await manager.quiesceNonterminalPublication(Symbol("inspect-marker-repair"));
+			try {
+				const debt = freeze.debt();
+				const enrollment = debt.entries.find(
+					entry => entry.type === "custom" && entry.customType === OWNER_ENROLL_CUSTOM_TYPE,
+				);
+				if (enrollment?.type !== "custom") throw new Error("Expected retained marker entry");
+				if (foreignSuccessor) {
+					// No durable enrollment, identity adoption, or own-publication successor authority escapes.
+					expect(currentIdentity).toEqual(beforeRepairIdentity);
+					expect(currentIdentity?.ino).toBe(verifiedReceipt.stat.ino);
+					expect(currentIdentity?.ino).not.toBe(storage.statSync(file).ino);
+					expect(debt.heldIds).toContain(enrollment.id);
+					expect(debt.persistError?.message).toBe("durability_unproven");
+				} else {
+					expect(currentIdentity).toEqual({
+						dev: verifiedReceipt.stat.dev,
+						ino: verifiedReceipt.stat.ino,
+						nlink: verifiedReceipt.stat.nlink,
+						size: verifiedReceipt.stat.size,
+						mtimeNs: verifiedReceipt.stat.mtimeNs,
+						ctimeNs: verifiedReceipt.stat.ctimeNs,
+						sha256: verifiedReceipt.sha256,
+					});
+					expect(debt.heldIds).toEqual([]);
+					expect(debt.persistError).toBeUndefined();
+				}
+			} finally {
+				await freeze.thaw();
+			}
+			expect(withOwnerPublicationSync(token, () => ownerFirstWriteMarkerSync(token))).toBe(
+				foreignSuccessor ? marker : undefined,
+			);
+			expect(manager.getOwnerMembership()).toBe(token);
+			expect(await Bun.file(authorityKey).text()).toBe(ownerBefore);
+			expect(fsSync.readFileSync(file).equals(verifiedBytes)).toBe(true);
+			if (foreignSuccessor) expect(fsSync.readFileSync(`${file}.verified`).equals(verifiedBytes)).toBe(true);
+			else {
+				manager.appendMessage({ role: "user", content: "append after timestamp advance", timestamp: 2 });
+				await manager.flush();
+				expect(await Bun.file(file).text()).toContain("append after timestamp advance");
+			}
+		} finally {
+			managedSpy.mockRestore();
+			captureSpy.mockRestore();
+			repairSpy.mockRestore();
+			await manager.closeStrict();
+			if (foreignSuccessor && repairedBytes) expect(fsSync.readFileSync(file).equals(repairedBytes)).toBe(true);
+		}
+	});
+
+	it.each([
+		"unknown",
+		"retryable",
+	] as const)("refuses fork before effects while an enrolled explicit rewrite retains %s staging-close debt", async mode => {
+		using root = TempDir.createSync("gjc-enrolled-fork-rewrite-debt-");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(
+			root.path(),
+			SessionManager.explicitDestination(root.path(), root.path()),
+			storage,
+		);
+		manager.setSessionMemoryMode("off");
+		manager.appendMessage({ role: "user", content: "source remains owned", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const id = manager.appendCustomMessageEntry("rewrite", "before", true);
+		await manager.flush();
+		const file = manager.getSessionFile()!;
+		const sessionId = manager.getSessionId();
+		const token = manager.getOwnerMembership()!;
+		expect(token).toBeDefined();
+		expect(withOwnerPublicationSync(token, () => ownerFirstWriteMarkerSync(token))).toBeUndefined();
+		const authorityKey = manager.getSessionOwnerEvidence()!.authorityKey;
+		const ownerBefore = await Bun.file(authorityKey).text();
+		const sourceBefore = await Bun.file(file).text();
+		const entry = manager.getBranch().find(value => value.id === id);
+		if (entry?.type !== "custom_message") throw new Error("Expected rewrite fixture");
+		manager.applyCustomMessageEntryUpdates([{ ...entry, content: "retained rewrite" }]);
+		const failure =
+			mode === "retryable"
+				? new SessionStorageWriterRetryableCloseError("retained staging close")
+				: new Error("dispatched staging close outcome unknown");
+		let closeAttempts = 0;
+		let tempPath: string | undefined;
+		let tempWriter: SessionStorageWriter | undefined;
+		const openWriter = storage.openWriter.bind(storage);
+		const openSpy = vi.spyOn(storage, "openWriter").mockImplementation((target, options) => {
+			if (!target.endsWith(".tmp")) return openWriter(target, options);
+			expect(tempWriter).toBeUndefined();
+			tempPath = target;
+			tempWriter = openWriter(target, {
+				...options,
+				closeAdapter: {
+					close(fd) {
+						closeAttempts++;
+						if (mode === "retryable" && closeAttempts <= 2) throw failure;
+						fsSync.closeSync(fd);
+						if (mode === "unknown") throw failure;
+					},
+				},
+			});
+			return tempWriter;
+		});
+		const copy = vi.spyOn(manager, "copyArtifactsForFork");
+		const staged = vi.spyOn(storage, "openStagedWriter");
+		try {
+			await expect(manager.rewriteEntries()).rejects.toBe(failure);
+			if (!tempPath || !tempWriter) throw new Error("Expected retained real rewrite writer");
+			const expectedCloseState = mode === "unknown" ? "close_unknown" : "close_failed_retryable";
+			expect(tempWriter.getCloseState()).toBe(expectedCloseState);
+			expect(tempWriter.getCloseError()).toBe(failure);
+			expect(closeAttempts).toBe(mode === "unknown" ? 1 : 2);
+			const attemptsBeforeFork = closeAttempts;
+			const opensBeforeFork = openSpy.mock.calls.length;
+			const tempBefore = await Bun.file(tempPath).text();
+			const tempStatBefore = storage.statSync(tempPath);
+			expect(tempBefore).toContain("retained rewrite");
+			const namesBefore = (await fs.readdir(root.path(), { recursive: true })).sort();
+			const freeze = await manager.quiesceNonterminalPublication(Symbol("inspect-rewrite-close-debt"));
+			try {
+				expect(freeze.debt().persistError).toBe(failure);
+				expect(freeze.debt().rewriteDebt).toBe(true);
+			} finally {
+				await freeze.thaw();
+			}
+			await expect(manager.fork()).rejects.toBe(failure);
+			expect(copy).not.toHaveBeenCalled();
+			expect(staged).not.toHaveBeenCalled();
+			expect(openSpy).toHaveBeenCalledTimes(opensBeforeFork);
+			expect(closeAttempts).toBe(attemptsBeforeFork);
+			expect(tempWriter.getCloseState()).toBe(expectedCloseState);
+			expect(tempWriter.getCloseError()).toBe(failure);
+			expect(manager.getStrictCloseState().kind).toBe("none_started");
+			expect(manager.getOwnerMembership()).toBe(token);
+			expect(manager.getSessionId()).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getEntry(id)).toMatchObject({ content: "retained rewrite" });
+			expect(await Bun.file(authorityKey).text()).toBe(ownerBefore);
+			expect(await Bun.file(file).text()).toBe(sourceBefore);
+			expect(await Bun.file(tempPath).text()).toBe(tempBefore);
+			expect(storage.statSync(tempPath)).toEqual(tempStatBefore);
+			expect((await fs.readdir(root.path(), { recursive: true })).sort()).toEqual(namesBefore);
+		} finally {
+			copy.mockRestore();
+			staged.mockRestore();
+			openSpy.mockRestore();
+			const outcome = await manager.closeStrict();
+			if (mode === "unknown") {
+				expect(outcome).toEqual({ kind: "close_unknown", error: failure });
+				expect(closeAttempts).toBe(1);
+			} else expect(outcome).toEqual({ kind: "closed" });
+		}
+	});
+
 	it("generates a UUIDv7 when forking a persisted session", async () => {
 		using tempDir = TempDir.createSync("@pi-session-id-fork-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
@@ -101,6 +348,151 @@ describe("SessionManager session ids", () => {
 		expect(session.getHeader()?.parentSession).toBe(firstId);
 		expect(session.isSessionStarred()).toBe(false);
 		expect(session.getHeader()).not.toHaveProperty("starred");
+	});
+
+	it("refuses a legacy fork with actual exclusive native membership before destination effects", async () => {
+		using root = TempDir.createSync("gjc-legacy-fork-native-owner-");
+		const agentDir = path.join(root.path(), "agent");
+		await fs.mkdir(agentDir, { mode: 0o700 });
+		const storage = new FileSessionStorage();
+		const file = path.resolve(root.path(), "source.jsonl");
+		const records: FileEntry[] = [
+			{ type: "session", version: 5, id: "native-owned-fork", timestamp: "0", cwd: root.path() },
+			{
+				type: "message",
+				id: "first",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "retained", timestamp: 1 },
+			},
+		];
+		storage.writeTextSync(file, `${records.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			file,
+			SessionManager.explicitDestination(root.path(), agentDir),
+			storage,
+		);
+		const target = captureOwnerTargetSync({ transcriptPath: file, headerId: manager.getSessionId() });
+		const inspectors = {
+			...createCooperativeOwnerInspectors({ cwd: root.path(), agentDir }),
+			runtime: "sdk-legacy-fork-test",
+			capabilities: ["publication"],
+		};
+		const membership = admitOwnerMembershipSync(
+			target,
+			{
+				kind: "exclusive_native",
+				expected: {
+					snapshotDigest: target.snapshotDigest,
+					resolved: resolveResumeCheckpoint(records, target.snapshotDigest),
+				},
+				legacyAttestation: captureLegacyTakeoverAttestationSync(target, inspectors),
+			},
+			inspectors,
+		);
+		manager.installOwnerMembership(membership);
+		const before = await Bun.file(file).text();
+		const ownerBefore = await Bun.file(target.authorityKey).text();
+		const namesBefore = (await fs.readdir(root.path(), { recursive: true })).sort();
+		const copy = vi.spyOn(manager, "copyArtifactsForFork");
+		const staged = vi.spyOn(storage, "openStagedWriter");
+		try {
+			await expect(manager.fork()).rejects.toThrow("participation_lost");
+			expect(copy).not.toHaveBeenCalled();
+			expect(staged).not.toHaveBeenCalled();
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getSessionId()).toBe("native-owned-fork");
+			expect(await Bun.file(file).text()).toBe(before);
+			expect(await Bun.file(target.authorityKey).text()).toBe(ownerBefore);
+			expect((await fs.readdir(root.path(), { recursive: true })).sort()).toEqual(namesBefore);
+		} finally {
+			copy.mockRestore();
+			staged.mockRestore();
+			await manager.closeStrict();
+		}
+	});
+
+	it("cleans exact fork publications when late cooperative retirement is refused", async () => {
+		using root = TempDir.createSync("gjc-legacy-fork-retirement-refusal-");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(
+			root.path(),
+			SessionManager.managedDestination(root.path(), root.path()),
+			storage,
+		);
+		let held: SessionStorageExclusiveLock | undefined;
+		try {
+			manager.appendMessage({ role: "user", content: "original history", timestamp: 1 });
+			await manager.ensureOnDisk();
+			await manager.saveArtifact("original artifact", "test");
+			const file = manager.getSessionFile()!;
+			const id = manager.getSessionId();
+			const membership = manager.getOwnerMembership();
+			const authorityKey = manager.getSessionOwnerEvidence()!.authorityKey;
+			const before = await Bun.file(file).text();
+			const ownerBefore = await Bun.file(authorityKey).text();
+			let destinationFile: string | undefined;
+			SessionManagerTestHooks.afterForkTranscriptPublished = async () => {
+				SessionManagerTestHooks.afterForkTranscriptPublished = undefined;
+				const files = (await fs.readdir(path.dirname(file))).filter(name => name.endsWith(".jsonl"));
+				expect(files).toHaveLength(2);
+				destinationFile = path.join(path.dirname(file), files.find(name => name !== path.basename(file))!);
+				expect(await Bun.file(destinationFile).text()).toContain("original history");
+				expect(await Bun.file(path.join(destinationFile.slice(0, -6), "0.test.log")).text()).toBe(
+					"original artifact",
+				);
+				held = storage.acquireExclusiveLockSync(`${authorityKey}.lock`, { ownerHostId: ownerHostIdSync()! });
+				expect(held).toBeDefined();
+			};
+			await expect(manager.fork()).rejects.toThrow("authority_busy");
+			expect(destinationFile).toBeDefined();
+			expect(await Bun.file(destinationFile!).exists()).toBe(false);
+			expect(fsSync.existsSync(destinationFile!.slice(0, -6))).toBe(false);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getSessionId()).toBe(id);
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(await Bun.file(authorityKey).text()).toBe(ownerBefore);
+			expect(await Bun.file(file).text()).toBe(before);
+			expect(await Bun.file(path.join(file.slice(0, -6), "0.test.log")).text()).toBe("original artifact");
+			held!.releaseSync();
+			held = undefined;
+			manager.appendMessage({ role: "user", content: "source remains writable", timestamp: 2 });
+			await manager.flush();
+			expect(await Bun.file(file).text()).toContain("source remains writable");
+		} finally {
+			SessionManagerTestHooks.afterForkTranscriptPublished = undefined;
+			held?.releaseSync();
+			await manager.closeStrict();
+		}
+	});
+
+	it("keeps an admitted managed successor refusal sticky without changing foreign bytes", async () => {
+		using root = TempDir.createSync("gjc-managed-owner-header-refusal-");
+		const manager = SessionManager.create(root.path(), SessionManager.managedDestination(root.path(), root.path()));
+		try {
+			manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+			await manager.ensureOnDisk();
+			const file = manager.getSessionFile()!;
+			const membership = manager.getOwnerMembership();
+			const entriesBefore = manager.getEntries();
+			const successor = `${JSON.stringify({ type: "session", id: "foreign-successor", timestamp: "0", cwd: root.path() })}\n`;
+			await Bun.write(file, successor);
+			expect(() => manager.appendMessage({ role: "user", content: "rejected", timestamp: 2 })).toThrow(
+				"managed_append_identity_mismatch",
+			);
+			const refusal = manager.getAppendIdentityMismatch();
+			expect(refusal).toBeDefined();
+			expect(() => manager.appendMessage({ role: "user", content: "also rejected", timestamp: 3 })).toThrow(
+				refusal!,
+			);
+			await expect(manager.flush()).rejects.toBe(refusal);
+			expect(manager.getEntries()).toEqual(entriesBefore);
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(await Bun.file(file).text()).toBe(successor);
+		} finally {
+			await manager.closeStrict();
+		}
 	});
 
 	it("rolls back fork identity before publishing a transcript when artifact import fails", async () => {
@@ -600,7 +992,7 @@ describe("authenticated generic rollback", () => {
 			const originalBytes = await Bun.file(file).text();
 			const snapshot = await session.captureRollbackState();
 			const message = snapshot.fileEntries.find(entry => entry.type === "message");
-			const custom = snapshot.materializedFileEntries.find(entry => entry.type === "custom");
+			const custom = snapshot.materializedFileEntries.find(entry => entry.id === customId);
 			if (
 				message?.type !== "message" ||
 				message.message.role !== "user" ||
@@ -955,7 +1347,20 @@ describe("authenticated generic rollback", () => {
 			await seed.ensureOnDisk();
 			const file = seed.getSessionFile();
 			if (!file) throw new Error("Expected explicit transcript");
-			const header = JSON.parse((await Bun.file(file).text()).trim()) as Record<string, unknown>;
+			const records = (await Bun.file(file).text())
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line)) as Record<string, unknown>[];
+			expect(records).toHaveLength(2);
+			const header = records[0]!;
+			const seedHeader = seed.getHeader();
+			if (!seedHeader) throw new Error("Expected the seeded session header");
+			expect(header).toEqual({ ...seedHeader });
+			const enrollment = records[1]!;
+			expect(enrollment).toMatchObject({ type: "custom", customType: OWNER_ENROLL_CUSTOM_TYPE, parentId: null });
+			expect(isOwnerEnrollData(enrollment.data, seed.getSessionId())).toBe(true);
+			expect(enrollment.id).toEqual(expect.any(String));
+			expect(enrollment.timestamp).toEqual(expect.any(String));
 			await seed.close();
 			const headerLine = JSON.stringify(header);
 			fsSync.writeFileSync(file, form === "eof" ? headerLine : `\n\n${headerLine}\n`);
@@ -1313,6 +1718,74 @@ describe("authenticated generic rollback", () => {
 			await source?.close();
 			await seed.close();
 			await target.close();
+		}
+	});
+
+	it("does not certify an unpublished owner after the first rename publishes then throws", async () => {
+		using root = TempDir.createSync("gjc-initial-publish-then-eio-");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(root.path(), root.path(), storage);
+		const target = SessionManager.create(root.path(), root.path());
+		const eio = Object.assign(new Error("EIO after actual publication"), { code: "EIO" });
+		let restoreRename: (() => void) | undefined;
+		try {
+			target.appendMessage({ role: "user", content: "other stable transcript", timestamp: 1 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile()!;
+			await target.close();
+			const targetBytes = await Bun.file(targetFile).text();
+			manager.appendMessage({ role: "user", content: "actually published predecessor", timestamp: 2 });
+			const file = manager.getSessionFile()!;
+			const id = manager.getSessionId();
+			const membership = manager.getOwnerMembership();
+			const renameSync = storage.renameSync.bind(storage);
+			let published = false;
+			const rename = vi.spyOn(storage, "renameSync").mockImplementation((source, destination) => {
+				renameSync(source, destination);
+				if (destination === file && !published) {
+					published = true;
+					throw eio;
+				}
+			});
+			restoreRename = () => rename.mockRestore();
+			await expect(manager.ensureOnDisk()).rejects.toBe(eio);
+			expect(published).toBe(true);
+			rename.mockRestore();
+			restoreRename = undefined;
+			const issuedBytes = await Bun.file(file).text();
+			expect(issuedBytes).toContain("actually published predecessor");
+			expect(issuedBytes).toContain(OWNER_ENROLL_CUSTOM_TYPE);
+			await expect(manager.setSessionFile(targetFile)).rejects.toBe(eio);
+			await expect(manager.flush()).rejects.toBe(eio);
+			expect(manager.getSessionId()).toBe(id);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(await Bun.file(file).text()).toBe(issuedBytes);
+			expect(await Bun.file(targetFile).text()).toBe(targetBytes);
+		} finally {
+			restoreRename?.();
+			await manager.closeStrict();
+			await target.closeStrict();
+		}
+	});
+
+	it("rejects idle cooperative close after its actual owner record is corrupted", async () => {
+		using root = TempDir.createSync("gjc-idle-owner-record-close-");
+		const manager = SessionManager.create(root.path(), root.path());
+		await manager.ensureOnDisk();
+		const membership = manager.getOwnerMembership();
+		const authorityKey = manager.getSessionOwnerEvidence()!.authorityKey;
+		const file = manager.getSessionFile()!;
+		const transcript = await Bun.file(file).text();
+		const foreign = "foreign owner record must remain untouched";
+		await Bun.write(authorityKey, foreign);
+		try {
+			await expect(manager.close()).rejects.toMatchObject({ code: "participation_lost" });
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(await Bun.file(authorityKey).text()).toBe(foreign);
+			expect(await Bun.file(file).text()).toBe(transcript);
+		} finally {
+			await manager.closeStrict();
 		}
 	});
 

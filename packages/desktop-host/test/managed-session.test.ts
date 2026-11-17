@@ -562,12 +562,14 @@ for (const retirement of ["close", "reopen"] as const) {
 		const previousAgentDir = getAgentDir();
 		process.env.GJC_DESKTOP_ISOLATED = "1";
 		const createEmbedded = sdk.createEmbeddedAgentSession;
-		vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation(async options => {
+		vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation((async (
+			options: sdk.EmbeddedAgentSessionOptions,
+		) => {
 			const owner = await createEmbedded(options);
 			const refresh = owner.refreshModels.bind(owner);
 			vi.spyOn(owner, "refreshModels").mockImplementation(() => refresh("offline"));
 			return owner;
-		});
+		}) as typeof sdk.createEmbeddedAgentSession);
 		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "list").mockImplementation(input =>
 			h.lifecycle.list(input),
 		);

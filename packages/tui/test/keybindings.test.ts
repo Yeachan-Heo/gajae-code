@@ -113,8 +113,6 @@ describe("detectDefaultKeyCollisions", () => {
 		const byKey = new Map(detectDefaultKeyCollisions(TUI_KEYBINDINGS).map(c => [c.key, c.keybindings]));
 		// enter is intentionally shared by submit + confirm (context-disambiguated).
 		expect(byKey.get("enter")).toEqual(expect.arrayContaining(["tui.input.submit", "tui.select.confirm"]));
-		// ctrl+c is shared by input copy + select cancel.
-		expect(byKey.get("ctrl+c")).toEqual(expect.arrayContaining(["tui.input.copy", "tui.select.cancel"]));
 	});
 });
 

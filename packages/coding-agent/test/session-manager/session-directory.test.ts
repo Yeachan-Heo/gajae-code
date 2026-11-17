@@ -34,6 +34,7 @@ import {
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	publishManagedFileNoReplace,
 } from "../../src/session/internal/managed-session-storage";
+import * as managedTaskOwnerCleanup from "../../src/session/internal/managed-task-owner-cleanup";
 import { classifyNativePublishOutcome } from "../../src/session/internal/native-publish-outcome";
 import { SessionMigrationBusyError } from "../../src/session/internal/session-open-errors";
 import { SessionArtifactCapacityError, SessionManager } from "../../src/session/session-manager";
@@ -538,7 +539,7 @@ describe("managed session write protocol", () => {
 			this: managedSessionStorage.ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): void {
+		) {
 			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
 				injected += 1;
 				throw denied;
@@ -581,7 +582,7 @@ describe("managed session write protocol", () => {
 			this: managedSessionStorage.ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): void {
+		) {
 			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
 				injected += 1;
 				throw new Error("managed_replace_cleanup_receipt_invalid");
@@ -632,7 +633,7 @@ describe("managed session write protocol", () => {
 			this: managedSessionStorage.ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): void {
+		) {
 			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
 				injected += 1;
 				throw denied;
@@ -2374,6 +2375,110 @@ describe("managed session write protocol", () => {
 		if (afterRestart.kind === "complete")
 			expect(afterRestart.owned.some(candidate => candidate.sessionId === "crash-restart")).toBe(false);
 	});
+
+	for (const replacement of ["symlink", "directory"] as const) {
+		it(`retains transcript cleanup pending when native io_error leaves a foreign ${replacement} at the canonical name`, async () => {
+			if (replacement === "symlink" && process.platform === "win32") return;
+			const { cwd, sessionsRoot, scope } = await fixture();
+			const legacy = legacyDirectory(sessionsRoot, cwd);
+			const sessionId = `io-error-foreign-${replacement}`;
+			const source = path.join(legacy, `${sessionId}.jsonl`);
+			const retainedOriginal = `${source}.retained-original`;
+			const foreign = path.join(legacy, "foreign-payload");
+			const originalBytes = transcript(sessionId, cwd);
+			const foreignBytes = "foreign payload must remain intact\n";
+			await fs.mkdir(legacy, { recursive: true });
+			await fs.writeFile(source, originalBytes);
+			if (replacement === "symlink") await fs.writeFile(foreign, foreignBytes);
+			const listed = listManagedCandidates(scope);
+			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+			const candidate = listed.owned[0];
+			const exactUnlink = native.exactUnlink;
+			const capture = sessionInspection.captureManagedFileNoFollow;
+			let canonicalDispatches = 0;
+			let failedCanonicalProofs = 0;
+			const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				if (pathname !== source) return exactUnlink(pathname, identity);
+				canonicalDispatches += 1;
+				if (canonicalDispatches !== 1) throw new Error("Unexpected retry of foreign canonical path");
+				syncFs.renameSync(source, retainedOriginal);
+				if (replacement === "symlink") syncFs.symlinkSync(foreign, source);
+				else {
+					syncFs.mkdirSync(source);
+					syncFs.writeFileSync(path.join(source, "foreign.txt"), foreignBytes);
+				}
+				return { ok: false, code: "io_error" };
+			});
+			const proof = vi.spyOn(sessionInspection, "captureManagedFileNoFollow").mockImplementation(pathname => {
+				try {
+					return capture(pathname);
+				} catch (error) {
+					if (pathname === source && canonicalDispatches > 0) failedCanonicalProofs += 1;
+					throw error;
+				}
+			});
+			const transcriptResult = vi.spyOn(managedTaskOwnerCleanup, "taskArtifactOwnerTranscriptResult");
+			const transcriptDeletion = vi.spyOn(managedTaskOwnerCleanup, "persistManagedGcOwnerTranscriptDeletion");
+			try {
+				const result = await deleteManagedSessionCandidate(scope, candidate);
+				expect(result).toMatchObject({ kind: "cleanup_pending", phase: "transcript" });
+				if (result.kind !== "cleanup_pending") throw new Error("Missing pending deletion result");
+				expect(canonicalDispatches).toBe(1);
+				expect(failedCanonicalProofs).toBeGreaterThan(0);
+				const tombstones = path.dirname(result.tombstonePath);
+				const pendingNames = (await fs.readdir(tombstones))
+					.filter(name => name.includes(".cleanup-pending-"))
+					.sort();
+				expect(pendingNames.length).toBeGreaterThan(1);
+				const pendingBytes = await Promise.all(
+					pendingNames.map(name => fs.readFile(path.join(tombstones, name), "utf8")),
+				);
+				for (const bytes of pendingBytes) {
+					const pending = JSON.parse(bytes);
+					expect(pending).toMatchObject({
+						state: "cleanup_pending",
+						target: { path: source, sessionId, identity: { sha256: candidate.identity.sha256 } },
+					});
+					expect(pending.transcriptPayloadDurable).toBeUndefined();
+					expect(pending.taskArtifactOwnerTranscriptDeleted).toBeUndefined();
+				}
+				const beforeRetry = (await fs.readdir(tombstones)).sort();
+				await expect(deleteManagedSessionCandidate(scope, candidate)).resolves.toMatchObject({
+					kind: "error",
+					code: "managed_storage_unsupported",
+					message: expect.stringMatching(replacement === "symlink" ? /ELOOP/ : /Not a regular file/),
+				});
+				expect(canonicalDispatches).toBe(1);
+				expect(
+					unlink.mock.calls.filter(
+						([pathname]) => pathname === foreign || pathname.startsWith(`${source}${path.sep}`),
+					),
+				).toEqual([]);
+				expect((await fs.readdir(tombstones)).sort()).toEqual(beforeRetry);
+				expect(
+					await Promise.all(pendingNames.map(name => fs.readFile(path.join(tombstones, name), "utf8"))),
+				).toEqual(pendingBytes);
+				expect(beforeRetry.some(name => name.includes(".cleanup-completed-"))).toBe(false);
+				expect(transcriptResult).not.toHaveBeenCalled();
+				expect(transcriptDeletion).not.toHaveBeenCalled();
+				expect(await fs.readFile(retainedOriginal, "utf8")).toBe(originalBytes);
+				if (replacement === "symlink") {
+					expect((await fs.lstat(source)).isSymbolicLink()).toBe(true);
+					expect(await fs.readlink(source)).toBe(foreign);
+					expect(await fs.readFile(foreign, "utf8")).toBe(foreignBytes);
+				} else {
+					expect((await fs.lstat(source)).isDirectory()).toBe(true);
+					expect(await fs.readdir(source)).toEqual(["foreign.txt"]);
+					expect(await fs.readFile(path.join(source, "foreign.txt"), "utf8")).toBe(foreignBytes);
+				}
+			} finally {
+				transcriptDeletion.mockRestore();
+				transcriptResult.mockRestore();
+				proof.mockRestore();
+				unlink.mockRestore();
+			}
+		});
+	}
 
 	it("recovers a crash after artifact detach but before the native result is persisted", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();

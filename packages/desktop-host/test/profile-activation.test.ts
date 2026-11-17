@@ -122,6 +122,8 @@ describe("public SDK embedding initialization", () => {
 			file: source.session.sessionManager.getSessionFile()!,
 			cwd: f.cwd,
 			directory: path.join(f.directory, "forks"),
+			// Owner admission reads this agent directory's lifecycle ledger, never the user's profile.
+			agentDir: f.agentDir,
 		});
 		const close = vi.spyOn(manager, "close");
 		const createSession = vi.fn(async () => {

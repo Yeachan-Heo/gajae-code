@@ -23,7 +23,7 @@
  * yields on its inner writer `close()` — which is our parked promise.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { SessionStorageSnapshot } from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
@@ -334,7 +334,10 @@ describe("SessionManager close/appendMessage race", () => {
 		sm.appendMessage({ role: "user", content: "prime", timestamp: Date.now() });
 		await settle(sm.flush(), storage);
 
+		expect(sm.getStrictCloseState()).toEqual({ kind: "none_started" });
 		const closing = sm.closeStrict();
+		expect(sm.getStrictCloseState()).toEqual({ kind: "in_flight" });
+		expect(sm.closeStrict()).toBe(closing);
 		for (let i = 0; i < 200; i++) {
 			if (storage.hasPendingClose()) break;
 			await Promise.resolve();
@@ -345,6 +348,10 @@ describe("SessionManager close/appendMessage race", () => {
 		);
 		storage.releaseNextClose();
 		expect(await settle(closing, storage)).toEqual({ kind: "closed" });
+		expect(sm.getStrictCloseState()).toEqual({ kind: "closed" });
+		expect(await sm.closeStrict()).toEqual({ kind: "closed" });
+		expect(storage.hasPendingClose()).toBe(false);
+		expect(() => sm.appendCustomEntry("after-close")).toThrow("Session manager is closing.");
 		expect(sm.getBranch()).toEqual([]);
 	});
 
@@ -601,6 +608,8 @@ describe("SessionManager closeStrict retryable-close ownership", () => {
 		// (never manufacture `closed`) and RETAIN the writer.
 		const r1: SessionManagerCloseOutcome = await sm.flushAndCloseStrict();
 		expect(r1.kind).toBe("close_failed_retryable");
+		expect(sm.getStrictCloseState().kind).toBe("close_failed_retryable");
+		expect(() => sm.appendCustomEntry("after-retryable-close")).toThrow("Session manager is closing.");
 		// The failure was certified pre-dispatch: no successful close ran.
 		expect(storage.closeAttempts).toBe(1);
 		expect(storage.successfulCloses).toBe(0);
@@ -616,5 +625,312 @@ describe("SessionManager closeStrict retryable-close ownership", () => {
 		// the first attempt threw pre-dispatch, the retry dispatched and closed.
 		expect(storage.closeAttempts).toBe(2);
 		expect(storage.successfulCloses).toBe(1);
+		expect(sm.getStrictCloseState()).toEqual({ kind: "closed" });
+	});
+
+	it.each([
+		false,
+		true,
+	])("settles a retained retryable close and rewrite without retiring unrelated errors (unrelated=%s)", async unrelated => {
+		const storage = new RetryableFirstCloseStorage();
+		const openWriter = storage.openWriter.bind(storage);
+		const independentError = unrelated ? new Error("independent append persistence failure") : undefined;
+		let appendWriter: SessionStorageWriter | undefined;
+		let reportAppendError: ((error: Error) => void) | undefined;
+		let appendWriters = 0;
+		const replacementWriters: SessionStorageWriter[] = [];
+		const spy = vi.spyOn(storage, "openWriter").mockImplementation((file, options) => {
+			const writer = openWriter(file, options);
+			if (options?.flags === "w") replacementWriters.push(writer);
+			else {
+				appendWriters++;
+				appendWriter = writer;
+				reportAppendError = options?.onError;
+			}
+			return writer;
+		});
+		try {
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			const id = manager.appendCustomMessageEntry("rewrite", "before", true);
+			manager.appendMessage({ role: "user", content: "hot", timestamp: 2 });
+			await manager.flush();
+			const writer = appendWriter;
+			if (!writer || !reportAppendError) throw new Error("Missing retained append writer");
+			const entry = manager.getBranch().find(value => value.id === id);
+			if (entry?.type !== "custom_message") throw new Error("Missing custom message");
+			const file = manager.getSessionFile()!;
+			const before = storage.readTextSync(file);
+			const updated = { ...entry, content: "after" };
+			const expected = before.replace(`${JSON.stringify(entry)}\n`, `${JSON.stringify(updated)}\n`);
+			expect(expected).not.toBe(before);
+			manager.applyCustomMessageEntryUpdates([updated]);
+			const baseline = replacementWriters.length;
+			if (independentError) reportAppendError(independentError);
+
+			const first = await manager.closeStrict();
+			expect(first.kind).toBe("close_failed_retryable");
+			if (first.kind !== "close_failed_retryable") throw new Error("Expected certified retryable close");
+			const retryOrigin = writer.getCloseError();
+			expect(retryOrigin).toBeInstanceOf(SessionStorageWriterRetryableCloseError);
+			if (!retryOrigin) throw new Error("Expected the certified retry-origin error");
+			expect(first.error).toBe(independentError ?? retryOrigin);
+			expect(manager.getStrictCloseState()).toBe(first);
+			expect(writer.getCloseState()).toBe("close_failed_retryable");
+			expect(storage.closeAttempts).toBe(1);
+			expect(storage.successfulCloses).toBe(0);
+			expect(appendWriters).toBe(1);
+			expect(replacementWriters).toHaveLength(baseline);
+			expect(storage.readTextSync(file)).toBe(before);
+			expect(manager.getBranch().find(value => value.id === id)).toMatchObject({ content: "after" });
+			expect(() => manager.appendCustomEntry("after-retryable-close")).toThrow("Session manager is closing.");
+
+			let final = await manager.closeStrict();
+			if (independentError) {
+				// Confirmed writer closure still reports its independent drain error.
+				// A further pass may publish the rewrite, but must not erase that error.
+				expect(final).toEqual({ kind: "close_failed_retryable", error: independentError });
+				expect(writer.getCloseState()).toBe("closed");
+				expect(storage.closeAttempts).toBe(2);
+				expect(storage.successfulCloses).toBe(1);
+				expect(replacementWriters).toHaveLength(baseline);
+				expect(storage.readTextSync(file)).toBe(before);
+				final = await manager.closeStrict();
+			}
+			expect(final).toEqual(
+				independentError ? { kind: "close_unknown", error: independentError } : { kind: "closed" },
+			);
+			expect(manager.getStrictCloseState()).toBe(final);
+			expect(await manager.closeStrict()).toBe(final);
+			expect(writer.getCloseState()).toBe("closed");
+			expect(storage.closeAttempts).toBe(2);
+			expect(storage.successfulCloses).toBe(1);
+			expect(appendWriters).toBe(1);
+			expect(replacementWriters).toHaveLength(baseline + 1);
+			expect(replacementWriters.at(-1)?.getCloseState()).toBe("closed");
+			expect(storage.readTextSync(file)).toBe(expected);
+			expect(persistedMessageTexts(storage.readTextSync(file))).toEqual(["seed", "hot"]);
+			if (!independentError) expect(manager.getBranch()).toEqual([]);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("retains a later rename failure after the exact retryable rewrite-close origin settles", async () => {
+		const storage = new RetryableFirstCloseStorage();
+		const openWriter = storage.openWriter.bind(storage);
+		const renameSync = storage.renameSync.bind(storage);
+		const failure = new Error("independent replacement rename failure");
+		const trace: string[] = [];
+		let appendWriter: SessionStorageWriter | undefined;
+		let appendWriters = 0;
+		const replacementWriters: SessionStorageWriter[] = [];
+		const openSpy = vi.spyOn(storage, "openWriter").mockImplementation((file, options) => {
+			const writer = openWriter(file, options);
+			if (options?.flags === "w") {
+				replacementWriters.push(writer);
+				const closeSync = writer.closeSync.bind(writer);
+				vi.spyOn(writer, "closeSync").mockImplementation(() => {
+					closeSync();
+					trace.push(`replacement:${writer.getCloseState()}`);
+				});
+			} else {
+				appendWriters++;
+				appendWriter = writer;
+				const close = writer.close.bind(writer);
+				vi.spyOn(writer, "close").mockImplementation(async () => {
+					try {
+						await close();
+					} finally {
+						trace.push(`append:${writer.getCloseState()}`);
+					}
+				});
+			}
+			return writer;
+		});
+		let failRename = false;
+		const renameSpy = vi.spyOn(storage, "renameSync").mockImplementation((file, target) => {
+			if (failRename) {
+				failRename = false;
+				trace.push("rename:failed-before-dispatch");
+				throw failure;
+			}
+			renameSync(file, target);
+			trace.push("rename:replaced");
+		});
+		try {
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			const id = manager.appendCustomMessageEntry("rewrite", "before", true);
+			manager.appendMessage({ role: "user", content: "hot", timestamp: 2 });
+			await manager.flush();
+			const writer = appendWriter;
+			if (!writer) throw new Error("Missing retained append writer");
+			const entry = manager.getBranch().find(value => value.id === id);
+			if (entry?.type !== "custom_message") throw new Error("Missing custom message");
+			const file = manager.getSessionFile()!;
+			const before = storage.readTextSync(file);
+			const updated = { ...entry, content: "after" };
+			const expected = before.replace(`${JSON.stringify(entry)}\n`, `${JSON.stringify(updated)}\n`);
+			expect(expected).not.toBe(before);
+			manager.applyCustomMessageEntryUpdates([updated]);
+			const baseline = replacementWriters.length;
+			trace.length = 0;
+
+			const first = await manager.closeStrict();
+			if (first.kind !== "close_failed_retryable") throw new Error("Expected certified retryable close");
+			const origin = writer.getCloseError();
+			expect(origin).toBeInstanceOf(SessionStorageWriterRetryableCloseError);
+			if (!origin) throw new Error("Expected the certified retry-origin error");
+			expect(first.error).toBe(origin);
+			expect(manager.getStrictCloseState()).toBe(first);
+			expect(trace).toEqual(["append:close_failed_retryable"]);
+			expect(storage.closeAttempts).toBe(1);
+			expect(storage.successfulCloses).toBe(0);
+			expect(replacementWriters).toHaveLength(baseline);
+
+			failRename = true;
+			const second = await manager.closeStrict();
+			expect(second.kind).toBe("close_failed_retryable");
+			if (second.kind !== "close_failed_retryable") throw new Error("Expected retryable rename failure");
+			expect(second.error).toBe(failure);
+			expect(second.error).not.toBe(origin);
+			expect(manager.getStrictCloseState()).toBe(second);
+			expect(writer.getCloseState()).toBe("closed");
+			expect(writer.getCloseError()).toBeUndefined();
+			expect(storage.closeAttempts).toBe(2);
+			expect(storage.successfulCloses).toBe(1);
+			expect(appendWriters).toBe(1);
+			expect(replacementWriters).toHaveLength(baseline + 1);
+			expect(trace).toEqual([
+				"append:close_failed_retryable",
+				"append:closed",
+				"replacement:closed",
+				"rename:failed-before-dispatch",
+			]);
+			expect(storage.readTextSync(file)).toBe(before);
+			expect(manager.getBranch().find(value => value.id === id)).toMatchObject({ content: "after" });
+			expect(() => manager.appendCustomEntry("closed-admission")).toThrow("Session manager is closing.");
+
+			// A successful publication retry cannot erase the independently retained F.
+			const final = await manager.closeStrict();
+			expect(final.kind).toBe("close_unknown");
+			if (final.kind !== "close_unknown") throw new Error("Expected retained persistence failure");
+			expect(final.error).toBe(failure);
+			expect(manager.getStrictCloseState()).toBe(final);
+			expect(await manager.closeStrict()).toBe(final);
+			expect(await manager.closeStrict()).toBe(final);
+			expect(storage.closeAttempts).toBe(2);
+			expect(storage.successfulCloses).toBe(1);
+			expect(appendWriters).toBe(1);
+			expect(replacementWriters).toHaveLength(baseline + 2);
+			expect(trace).toEqual([
+				"append:close_failed_retryable",
+				"append:closed",
+				"replacement:closed",
+				"rename:failed-before-dispatch",
+				"replacement:closed",
+				"rename:replaced",
+			]);
+			expect(storage.readTextSync(file)).toBe(expected);
+			expect(persistedMessageTexts(storage.readTextSync(file))).toEqual(["seed", "hot"]);
+		} finally {
+			openSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
+	it("keeps a dispatched unknown close terminal while rewrite debt remains, without retry or replacement", async () => {
+		const storage = new MemorySessionStorage();
+		const openWriter = storage.openWriter.bind(storage);
+		const failure = new Error("rewrite close dispatched but outcome uncertain");
+		let closeCalls = 0;
+		let replacementWriters = 0;
+		const spy = vi.spyOn(storage, "openWriter").mockImplementation((file, options) => {
+			const writer = openWriter(file, options);
+			if (options?.flags === "w") {
+				replacementWriters++;
+				return writer;
+			}
+			const close = writer.close.bind(writer);
+			const state = writer.getCloseState.bind(writer);
+			let dispatched = false;
+			vi.spyOn(writer, "close").mockImplementation(async () => {
+				closeCalls++;
+				await close();
+				dispatched = true;
+				throw failure;
+			});
+			vi.spyOn(writer, "getCloseState").mockImplementation(() => (dispatched ? "close_unknown" : state()));
+			vi.spyOn(writer, "getCloseError").mockImplementation(() => (dispatched ? failure : undefined));
+			return writer;
+		});
+		try {
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			const id = manager.appendCustomMessageEntry("rewrite", "before", true);
+			await manager.flush();
+			const entry = manager.getBranch().find(value => value.id === id);
+			if (entry?.type !== "custom_message") throw new Error("Missing custom message");
+			manager.applyCustomMessageEntryUpdates([{ ...entry, content: "after" }]);
+			const file = manager.getSessionFile()!;
+			const before = storage.readTextSync(file);
+			const baseline = replacementWriters;
+			const outcome = await manager.closeStrict();
+			expect(outcome).toEqual({ kind: "close_unknown", error: failure });
+			expect(manager.getStrictCloseState()).toBe(outcome);
+			expect(await manager.closeStrict()).toBe(outcome);
+			expect(await manager.closeStrict()).toBe(outcome);
+			expect(closeCalls).toBe(1);
+			expect(replacementWriters).toBe(baseline);
+			expect(storage.readTextSync(file)).toBe(before);
+			expect(() => manager.appendCustomEntry("closed-admission")).toThrow("Session manager is closing.");
+		} finally {
+			spy.mockRestore();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("retains a terminal unknown outcome rather than inferring closed from the released writer", async () => {
+		const storage = new MemorySessionStorage();
+		const openWriter = storage.openWriter.bind(storage);
+		const failure = new Error("post-dispatch close uncertainty");
+		let closeCalls = 0;
+		const spy = vi.spyOn(storage, "openWriter").mockImplementation((file, options) => {
+			const writer = openWriter(file, options);
+			if (options?.flags === "w") return writer;
+			const close = writer.close.bind(writer);
+			let dispatched = false;
+			const getCloseState = writer.getCloseState.bind(writer);
+			const getCloseError = writer.getCloseError.bind(writer);
+			vi.spyOn(writer, "close").mockImplementation(async () => {
+				closeCalls++;
+				await close();
+				dispatched = true;
+				throw failure;
+			});
+			vi.spyOn(writer, "getCloseState").mockImplementation(() => (dispatched ? "close_unknown" : getCloseState()));
+			vi.spyOn(writer, "getCloseError").mockImplementation(() => (dispatched ? failure : getCloseError()));
+			return writer;
+		});
+		try {
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			manager.appendMessage({ role: "user", content: "hot", timestamp: 2 });
+			await manager.flush();
+			const outcome = await manager.closeStrict();
+			expect(outcome).toEqual({ kind: "close_unknown", error: failure });
+			expect(manager.getStrictCloseState()).toBe(outcome);
+			expect(await manager.closeStrict()).toBe(outcome);
+			expect(closeCalls).toBe(1);
+			expect(() => manager.appendCustomEntry("after-unknown-close")).toThrow("Session manager is closing.");
+		} finally {
+			spy.mockRestore();
+			vi.restoreAllMocks();
+		}
 	});
 });

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,6 +23,7 @@ import {
 	withAtomicYamlConfigTransaction,
 } from "../../src/config/atomic-yaml-patch";
 import { FileLockAcquireError, FileLockTestHooks } from "../../src/config/file-lock";
+import { Settings } from "../../src/config/settings";
 
 const temporaryDirectories: string[] = [];
 
@@ -44,6 +46,255 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	for (const initiallyPresent of [true, false]) {
+		test(`refuses the actual namespace commit after held preflight (existing=${initiallyPresent})`, async () => {
+			const configPath = await configPathForTest();
+			const directory = path.dirname(configPath);
+			if (initiallyPresent) await Bun.write(configPath, "feature: original\n");
+			const before = initiallyPresent ? await fs.stat(configPath, { bigint: true }) : null;
+			const rootBefore = await fs.stat(directory, { bigint: true });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const refused = new Error("namespace admission refused");
+			const events: string[] = [];
+			const pending = applyAtomicYamlPatchesWithCurrent(
+				configPath,
+				async current => {
+					events.push("builder");
+					expect(current).toEqual(initiallyPresent ? { feature: "original" } : {});
+					entered.resolve();
+					await release.promise;
+					events.push("built");
+					return [{ path: "feature", op: "set", value: "candidate" }];
+				},
+				{
+					async validateRoot() {
+						events.push("validated");
+					},
+					async withCommit() {
+						events.push("admit");
+						const staged = (await fs.readdir(directory)).filter(name => name.endsWith(".tmp"));
+						expect(staged).toHaveLength(1);
+						expect(await readYaml(path.join(directory, staged[0]!))).toEqual({ feature: "candidate" });
+						throw refused;
+					},
+				},
+			);
+			const rejection = pending.then(
+				() => ({ status: "fulfilled" as const }),
+				(error: unknown) => ({ status: "rejected" as const, error }),
+			);
+			await entered.promise;
+			expect(events).toEqual(["builder"]);
+			release.resolve();
+			expect(await rejection).toEqual({ status: "rejected", error: refused });
+			expect(events).toEqual(["builder", "built", "validated", "admit"]);
+			if (before) {
+				expect(await Bun.file(configPath).text()).toBe("feature: original\n");
+				const after = await fs.stat(configPath, { bigint: true });
+				expect([after.dev, after.ino, after.size, after.mtimeNs]).toEqual([
+					before.dev,
+					before.ino,
+					before.size,
+					before.mtimeNs,
+				]);
+			} else {
+				expect(await Bun.file(configPath).exists()).toBe(false);
+			}
+			const rootAfter = await fs.stat(directory, { bigint: true });
+			expect([rootAfter.dev, rootAfter.ino]).toEqual([rootBefore.dev, rootBefore.ino]);
+			expect((await fs.readdir(directory)).sort()).toEqual(initiallyPresent ? ["config.yml"] : []);
+			// Refusal released both the shared queue and the lock.
+			await applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "ordinary" }]);
+			expect(await readYaml(configPath)).toEqual({ feature: "ordinary" });
+		});
+
+		test(`publishes inside the commit callback before it returns (existing=${initiallyPresent})`, async () => {
+			const configPath = await configPathForTest();
+			if (initiallyPresent) await Bun.write(configPath, "feature: old\n");
+			const before = initiallyPresent ? await fs.stat(configPath, { bigint: true }) : null;
+			const events: string[] = [];
+			await applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "committed" }], {
+				async withCommit(commit) {
+					events.push("admit");
+					const result = commit();
+					// A delayed worker dispatch or an awaited beforeCommit cannot satisfy this.
+					const published = fsSync.statSync(configPath, { bigint: true });
+					if (before) expect(published.ino).not.toBe(before.ino);
+					expect(await readYaml(configPath)).toEqual({ feature: "committed" });
+					events.push("published");
+					return await result;
+				},
+			});
+			expect(events).toEqual(["admit", "published"]);
+			expect(await readYaml(configPath)).toEqual({ feature: "committed" });
+			const siblings = await fs.readdir(path.dirname(configPath));
+			if (before && siblings.length > 1) {
+				// Native exact replacement may retain the scrubbed original inode.
+				// Authenticate that retirement, rather than accepting arbitrary residue.
+				const retired = siblings.filter(name => name !== "config.yml");
+				expect(retired).toHaveLength(1);
+				expect(retired[0]).toMatch(/^\.gjc-exact-replace-destination-[A-Za-z0-9-]+$/u);
+				const retiredPath = path.join(path.dirname(configPath), retired[0]!);
+				const identity = await fs.lstat(retiredPath, { bigint: true });
+				expect(identity.isFile()).toBe(true);
+				expect([identity.dev, identity.ino, identity.nlink, identity.size]).toEqual([
+					before.dev,
+					before.ino,
+					1n,
+					0n,
+				]);
+				expect(await Bun.file(retiredPath).text()).toBe("");
+			} else {
+				expect(siblings).toEqual(["config.yml"]);
+			}
+		});
+	}
+
+	test("reports retained staging and preserves the admission error when cleanup fails", async () => {
+		const configPath = await configPathForTest();
+		const directory = path.dirname(configPath);
+		await Bun.write(configPath, "feature: original\n");
+		const refused = new Error("refused before namespace commit");
+		let stagedPath = "";
+		const failure = await applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "candidate" }], {
+			async withCommit() {
+				const staged = (await fs.readdir(directory)).find(name => name.endsWith(".tmp"));
+				if (!staged) throw new Error("expected staged YAML");
+				stagedPath = path.join(directory, staged);
+				// A nonempty replacement directory makes nonrecursive staging cleanup fail.
+				await fs.unlink(stagedPath);
+				await fs.mkdir(stagedPath);
+				await Bun.write(path.join(stagedPath, "retained"), "retained artifact");
+				throw refused;
+			},
+		}).then(
+			() => undefined,
+			error => error,
+		);
+		if (!(failure instanceof AggregateError)) throw new Error("expected separated cleanup failure");
+		expect(failure.errors[0]).toBe(refused);
+		expect(failure.errors).toHaveLength(2);
+		expect(failure.message).toContain(stagedPath);
+		expect(await Bun.file(path.join(stagedPath, "retained")).text()).toBe("retained artifact");
+		expect(await Bun.file(configPath).text()).toBe("feature: original\n");
+	});
+
+	test("rechecks the lexical root inside delayed admission without touching either target", async () => {
+		const first = await configPathForTest();
+		const directory = path.dirname(first);
+		const second = path.join(directory, "foreign.yml");
+		const alias = path.join(directory, "alias.yml");
+		await Bun.write(first, "feature: first\n");
+		await Bun.write(second, "feature: foreign\n");
+		await fs.symlink(first, alias);
+		const before = await Promise.all([fs.stat(first, { bigint: true }), fs.stat(second, { bigint: true })]);
+		await expect(
+			applyAtomicYamlPatches(alias, [{ path: "feature", op: "set", value: "candidate" }], {
+				async withCommit(commit) {
+					await fs.unlink(alias);
+					await fs.symlink(second, alias);
+					return await commit();
+				},
+			}),
+		).rejects.toThrow("Atomic YAML target retargeted");
+		expect(await Bun.file(first).text()).toBe("feature: first\n");
+		expect(await Bun.file(second).text()).toBe("feature: foreign\n");
+		const after = await Promise.all([fs.stat(first, { bigint: true }), fs.stat(second, { bigint: true })]);
+		expect(after.map(stat => [stat.dev, stat.ino, stat.mtimeNs])).toEqual(
+			before.map(stat => [stat.dev, stat.ino, stat.mtimeNs]),
+		);
+		expect(await fs.readlink(alias)).toBe(second);
+		expect((await fs.readdir(directory)).sort()).toEqual(["alias.yml", "config.yml", "foreign.yml"]);
+	});
+
+	test("retains a foreign destination appearing inside first-publication admission", async () => {
+		const configPath = await configPathForTest();
+		let foreignInode = 0n;
+		await expect(
+			applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "candidate" }], {
+				async withCommit(commit) {
+					await Bun.write(configPath, "feature: foreign\n");
+					foreignInode = (await fs.stat(configPath, { bigint: true })).ino;
+					return await commit();
+				},
+			}),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await Bun.file(configPath).text()).toBe("feature: foreign\n");
+		expect((await fs.stat(configPath, { bigint: true })).ino).toBe(foreignInode);
+		expect(await fs.readdir(path.dirname(configPath))).toEqual(["config.yml"]);
+	});
+
+	for (const intent of ["refuse", "local", "runtime", "commit"] as const) {
+		test(`Settings rechecks builder ownership at namespace admission: ${intent}`, async () => {
+			const configPath = await configPathForTest();
+			const directory = path.dirname(configPath);
+			await Bun.write(configPath, "temperature: 0.2\n");
+			const settings = await Settings.loadForScope({ cwd: directory, agentDir: directory });
+			const baseline = await Bun.file(configPath).text();
+			const before = await fs.stat(configPath, { bigint: true });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const refusal = new Error("preferences admission refused");
+			const events: string[] = [];
+			try {
+				const pending = settings.commitAtomicBatchWithCurrent(
+					async current => {
+						events.push("builder");
+						expect(current.temperature).toBe(0.2);
+						entered.resolve();
+						await release.promise;
+						events.push("built");
+						return [{ path: "temperature", op: "set", value: 0.4 }];
+					},
+					{
+						async withCommit(commit) {
+							events.push("admit");
+							if (intent === "refuse") throw refusal;
+							if (intent === "local") settings.set("temperature", 0.7);
+							if (intent === "runtime") settings.override("temperature", 0.8);
+							const result = commit();
+							if (intent === "commit") {
+								expect(fsSync.statSync(configPath, { bigint: true }).ino).not.toBe(before.ino);
+								expect(await readYaml(configPath)).toMatchObject({ temperature: 0.4 });
+								events.push("published");
+							}
+							return await result;
+						},
+					},
+				);
+				const outcome = pending.then(
+					receipt => ({ receipt }),
+					error => ({ error }),
+				);
+				await entered.promise;
+				expect(events).toEqual(["builder"]);
+				expect(await Bun.file(configPath).text()).toBe(baseline);
+				release.resolve();
+				const result = await outcome;
+				if (intent === "commit") {
+					expect("receipt" in result).toBe(true);
+					expect(settings.get("temperature")).toBe(0.4);
+					expect(events).toEqual(["builder", "built", "admit", "published"]);
+				} else {
+					if (!("error" in result)) throw new Error("expected rejected preferences commit");
+					if (intent === "refuse") expect(result.error).toBe(refusal);
+					else expect(String(result.error)).toContain("Settings changed while the atomic batch was preparing");
+					expect(events).toEqual(["builder", "built", "admit"]);
+					if (intent !== "local") {
+						expect(await Bun.file(configPath).text()).toBe(baseline);
+						expect((await fs.stat(configPath, { bigint: true })).ino).toBe(before.ino);
+					}
+					expect(settings.get("temperature")).toBe(intent === "local" ? 0.7 : intent === "runtime" ? 0.8 : 0.2);
+				}
+				expect((await fs.readdir(directory)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+			} finally {
+				release.resolve();
+				await settings.close();
+			}
+		});
+	}
+
 	async function bounded<T>(promise: Promise<T>): Promise<T> {
 		const timeout = Promise.withResolvers<never>();
 		const timer = setTimeout(() => timeout.reject(new Error("Atomic YAML operation timed out")), 1000);

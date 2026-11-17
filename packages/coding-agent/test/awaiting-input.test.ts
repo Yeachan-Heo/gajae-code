@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import { AwaitingInputDetector, type AwaitingInputSignal, classifyAwaitingInput } from "../src/tools/awaiting-input";
 
 const TAILSCALE = "\nTo authenticate, visit:\n\n\thttps://login.tailscale.com/a/1a2b3c4d5e6f\n\n";
@@ -126,14 +127,6 @@ describe("AwaitingInputDetector", () => {
 	});
 });
 
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
-
 function pick<T>(random: () => number, items: readonly T[]): T {
 	return items[Math.floor(random() * items.length)]!;
 }
@@ -213,7 +206,7 @@ function chunked(random: () => number, text: string): string[] {
 
 describe("awaiting-input properties", () => {
 	test("unrelated output never classifies (seed 0x6852a001)", () => {
-		const random = seededRandom(0x6852a001);
+		const random = lcgUnit(0x6852a001);
 		for (let caseIndex = 0; caseIndex < 300; caseIndex++) {
 			const text = unrelatedText(random);
 			expect({ text, kind: classifyAwaitingInput(text) }).toEqual({ text, kind: undefined });
@@ -221,7 +214,7 @@ describe("awaiting-input properties", () => {
 	});
 
 	test("sign-in words on separate lines never classify (seed 0x6852a005)", () => {
-		const random = seededRandom(0x6852a005);
+		const random = lcgUnit(0x6852a005);
 		for (let caseIndex = 0; caseIndex < 300; caseIndex++) {
 			const text = scatteredSignInWords(random);
 			expect({ text, kind: classifyAwaitingInput(text) }).toEqual({ text, kind: undefined });
@@ -229,7 +222,7 @@ describe("awaiting-input properties", () => {
 	});
 
 	test("ANSI decoration preserves classification (seed 0x6852a002)", () => {
-		const random = seededRandom(0x6852a002);
+		const random = lcgUnit(0x6852a002);
 		for (let caseIndex = 0; caseIndex < 200; caseIndex++) {
 			const [prompt, kind] = pick(random, PROMPTS);
 			const decorated = decorate(random, prompt);
@@ -238,7 +231,7 @@ describe("awaiting-input properties", () => {
 	});
 
 	test("arbitrary chunk boundaries yield the same single signal (seed 0x6852a003)", () => {
-		const random = seededRandom(0x6852a003);
+		const random = lcgUnit(0x6852a003);
 		for (let caseIndex = 0; caseIndex < 200; caseIndex++) {
 			const [prompt, kind] = pick(random, PROMPTS);
 			const text = `${unrelatedText(random).slice(0, 400)}\n${prompt}`;
@@ -253,7 +246,7 @@ describe("awaiting-input properties", () => {
 	});
 
 	test("nothing is emitted after disposal, whatever arrives next (seed 0x6852a004)", () => {
-		const random = seededRandom(0x6852a004);
+		const random = lcgUnit(0x6852a004);
 		for (let caseIndex = 0; caseIndex < 200; caseIndex++) {
 			const [prompt] = pick(random, PROMPTS);
 			const { clock, signals, instance } = detector();

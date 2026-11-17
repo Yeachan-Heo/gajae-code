@@ -35,6 +35,12 @@ import {
 	DefaultModelSelectionRecoveryError,
 } from "../session/default-model-selection";
 import type { SessionManager } from "../session/session-manager";
+import {
+	assertNativeRuntimeEffect,
+	assertNativeRuntimeInvocation,
+	NativeRuntimeRefusal,
+	withNativeRuntimeEffect,
+} from "./native-lifecycle";
 import { isSecretConfigKey } from "./protocol/adapter-validation";
 import type { SdkPreferenceOperation } from "./protocol/client-control-contracts";
 import { getSettingsCatalog, type SettingCatalogItem } from "./settings-catalog";
@@ -308,6 +314,7 @@ export class SdkPreferenceControls {
 	}
 
 	#assertIdentity(): void {
+		assertNativeRuntimeInvocation(this.#session);
 		if (!this.#sameIdentity()) {
 			this.dispose();
 			throw new SdkPreferenceError("stale_preferences", "The preference session identity has retired.");
@@ -362,7 +369,7 @@ export class SdkPreferenceControls {
 		try {
 			return await body();
 		} catch (error) {
-			if (error instanceof SdkPreferenceError) throw error;
+			if (error instanceof SdkPreferenceError || error instanceof NativeRuntimeRefusal) throw error;
 			// Persistence/auth/provider errors can contain paths, endpoints and credentials.
 			throw new SdkPreferenceError("preference_failed", "The preference operation could not be completed.");
 		} finally {
@@ -608,16 +615,32 @@ export class SdkPreferenceControls {
 				if (scope === "project") {
 					const projectPath = await this.#projectConfigPath();
 					try {
-						const receipt = await applyAtomicYamlPatchesWithCurrent(projectPath, async () => {
-							// The atomic writer owns parent creation. Revalidate after its
-							// queue/lock admission, before authorizing any configuration write.
-							await this.#projectConfigPath();
+						const receipt = await withNativeRuntimeEffect(this.#session, "preferences", () => {
 							this.#assertIdentity();
-							return patches satisfies readonly AtomicYamlPatch[];
+							return applyAtomicYamlPatchesWithCurrent(
+								projectPath,
+								async () => {
+									// Keep the canonical writer's queue/lock and path preflight. The
+									// authorizing callback and namespace commit each need fresh admission.
+									await this.#projectConfigPath();
+									return withNativeRuntimeEffect(this.#session, "preferences", () => {
+										this.#assertIdentity();
+										return patches satisfies readonly AtomicYamlPatch[];
+									});
+								},
+								{
+									withCommit: commit =>
+										withNativeRuntimeEffect(this.#session, "preferences", () => {
+											this.#assertIdentity();
+											assertNativeRuntimeEffect(this.#session, "preferences");
+											return commit();
+										}),
+								},
+							);
 						});
 						receipt.discard();
 					} catch (error) {
-						if (error instanceof SdkPreferenceError) throw error;
+						if (error instanceof SdkPreferenceError || error instanceof NativeRuntimeRefusal) throw error;
 						// A rejected writer may have renamed before a later durability/publication failure.
 						return this.#writeFailure(scope, paths);
 					}
@@ -634,25 +657,42 @@ export class SdkPreferenceControls {
 				}
 				if (scope === "global") {
 					try {
-						const receipt = await this.#settings.commitAtomicBatchWithCurrent(() => {
+						const receipt = await withNativeRuntimeEffect(this.#session, "preferences", () => {
 							this.#assertIdentity();
-							return patches;
+							return this.#settings.commitAtomicBatchWithCurrent(
+								() =>
+									withNativeRuntimeEffect(this.#session, "preferences", () => {
+										this.#assertIdentity();
+										return patches;
+									}),
+								{
+									withCommit: commit =>
+										withNativeRuntimeEffect(this.#session, "preferences", () => {
+											this.#assertIdentity();
+											assertNativeRuntimeEffect(this.#session, "preferences");
+											return commit();
+										}),
+								},
+							);
 						});
 						receipt.discard();
 					} catch (error) {
-						if (error instanceof SdkPreferenceError) throw error;
+						if (error instanceof SdkPreferenceError || error instanceof NativeRuntimeRefusal) throw error;
 						return this.#writeFailure(scope, paths);
 					}
 				} else {
 					let started = false;
 					try {
-						for (const settingPath of paths) {
-							this.#assertIdentity();
-							started = true;
-							this.#overrideConfig(settingPath, patch[settingPath] as SettingValue<SettingPath>);
-						}
+						await withNativeRuntimeEffect(this.#session, "preferences", () => {
+							for (const settingPath of paths) {
+								assertNativeRuntimeEffect(this.#session, "preferences");
+								this.#assertIdentity();
+								started = true;
+								this.#overrideConfig(settingPath, patch[settingPath] as SettingValue<SettingPath>);
+							}
+						});
 					} catch (error) {
-						if (!started) throw error;
+						if (!started || error instanceof NativeRuntimeRefusal) throw error;
 						return this.#writeFailure(scope, paths);
 					}
 				}
@@ -728,6 +768,7 @@ export class SdkPreferenceControls {
 
 	/** Closed dispatch seam for ctx.sdkControl; unknown operations/fields never pass through. */
 	async handle(operation: SdkPreferenceOperation, input: Record<string, unknown>): Promise<SdkPreferenceResult> {
+		assertNativeRuntimeInvocation(this.#session);
 		switch (operation) {
 			case "model.roles.get":
 				exactKeys(record(input), []);

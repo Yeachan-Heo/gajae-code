@@ -1,25 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
-
-function createModel(): Model<"openai-responses"> {
-	return {
-		id: "mock",
-		name: "mock",
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
-}
+import { createModel } from "./helpers/mock-model";
 
 function skill(name: string): Skill {
 	return {

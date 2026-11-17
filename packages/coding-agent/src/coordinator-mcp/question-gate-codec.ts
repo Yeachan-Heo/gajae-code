@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { isRecord } from "@gajae-code/utils";
 import { compileGateSchema, schemaHash, validateGateAnswer } from "../modes/shared/agent-wire/workflow-gate-schema";
 import type { JsonSchema, WorkflowGate } from "../modes/shared/agent-wire/workflow-gate-types";
 import { buildAskGateAnswerSchema, validateAskGateStageState } from "../modes/shared/agent-wire/workflow-gate-types";
@@ -126,8 +127,6 @@ export interface PrivateAskGateCodecV1 {
 }
 
 const MAX_TEXT = 4096;
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-	typeof value === "object" && value !== null && !Array.isArray(value);
 const boundedText = (value: unknown, max = 256): value is string =>
 	typeof value === "string" && /\S/u.test(value) && Buffer.byteLength(value) <= max;
 function sameKeys(value: Record<string, unknown>, permitted: readonly string[]): boolean {

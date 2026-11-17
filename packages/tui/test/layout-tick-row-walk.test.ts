@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { type Component, Container, CURSOR_MARKER, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 const VIEWPORT_NORMALIZE_OVERSCAN = 8;
 
@@ -25,14 +25,6 @@ class Line implements Component {
 	render(): string[] {
 		return [this.text];
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	const tick = Promise.withResolvers<void>();
-	process.nextTick(tick.resolve);
-	await tick.promise;
-	await Bun.sleep(20);
-	await term.flush();
 }
 
 describe("layout tick row walk", () => {
@@ -62,7 +54,7 @@ describe("layout tick row walk", () => {
 
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 20);
 			expect(transcript.renderCount).toBe(1);
 			TUI.resetRenderCountersForTest();
 
@@ -70,7 +62,7 @@ describe("layout tick row walk", () => {
 			const offscreenPrefix = Math.max(0, frameRows - height - VIEWPORT_NORMALIZE_OVERSCAN);
 			loader.setText(`load-1${CURSOR_MARKER}`);
 			tui.requestLayoutRender("layout-row-walk");
-			await settle(term);
+			await settle(term, 20);
 
 			const first = TUI.getRenderCountersForTest();
 			const firstViewport = term.getViewport().join("\n");
@@ -89,7 +81,7 @@ describe("layout tick row walk", () => {
 			TUI.resetRenderCountersForTest();
 			loader.setText(`load-2${CURSOR_MARKER}`);
 			tui.requestLayoutRender("layout-row-walk-again");
-			await settle(term);
+			await settle(term, 20);
 
 			const second = TUI.getRenderCountersForTest();
 			const secondViewport = term.getViewport().join("\n");
@@ -105,7 +97,7 @@ describe("layout tick row walk", () => {
 			transcript.addChild(new Line("line-extra"));
 			TUI.resetRenderCountersForTest();
 			tui.requestLayoutRender("layout-row-walk-invalidated");
-			await settle(term);
+			await settle(term, 20);
 
 			const invalidated = TUI.getRenderCountersForTest();
 			expect(transcript.renderCount).toBe(2);
@@ -185,13 +177,13 @@ async function captureFrame(input: {
 
 	try {
 		tui.start();
-		await settle(term);
+		await settle(term, 20);
 		TUI.resetRenderCountersForTest();
 		for (let tick = 1; tick <= input.ticks; tick++) {
 			loader.setText(input.cursor === "loader" ? `load-${tick}${CURSOR_MARKER}` : `load-${tick}`);
 			if (input.mode === "layout") tui.requestLayoutRender("layout-byte-parity");
 			else tui.requestRender(false, "layout-byte-parity");
-			await settle(term);
+			await settle(term, 20);
 		}
 		const counters = TUI.getRenderCountersForTest();
 		return {

@@ -82,6 +82,7 @@ async function records(file: string) {
 			line =>
 				JSON.parse(line) as {
 					type: string;
+					customType?: string;
 					id?: string;
 					parentId?: string;
 					model?: string;
@@ -166,20 +167,29 @@ describe("shared temporary model control", () => {
 	});
 
 	for (const optedIn of [false, true]) {
-		it(`refuses ${optedIn ? "persistent" : "non-opted-in temporary"} role cycles before effects`, async () => {
+		// #7824: an adopted non-root session keeps using shared publication, and a
+		// persistent cycle publishes additively instead of staging a transcript rewrite.
+		it(`publishes ${optedIn ? "persistent root" : "adopted non-root temporary"} role cycles additively`, async () => {
 			const f = await fixture(undefined, optedIn);
 			const roles = configureRoleCycle(f);
 			const before = await Bun.file(f.file).text();
-			const revision = f.session.getUserModelSelectionRevision();
-			const key = vi.spyOn(f.registry, "getApiKey");
-			await expect(f.session.cycleRoleModels(["default", "smol"], { temporary: !optedIn })).rejects.toThrow(
-				"Shared session mutation requires transaction admission: cycle role models",
-			);
-			expect(key).not.toHaveBeenCalled();
-			expect(f.session.getUserModelSelectionRevision()).toBe(revision);
-			expect(f.session.model).toBe(f.initial);
-			expect(f.settings.get("modelRoles")).toEqual(roles);
-			expect(await Bun.file(f.file).text()).toBe(before);
+			const leaf = f.manager.getLeafId();
+			const result = await f.session.cycleRoleModels(["default", "smol"], { temporary: !optedIn });
+			expect(result?.role).toBe("smol");
+			expect(f.session.model).toMatchObject({ provider: f.selected.provider, id: f.selected.id });
+			const after = await Bun.file(f.file).text();
+			expect(after.startsWith(before)).toBe(true);
+			const appended = (await records(f.file)).slice(before.trim().split("\n").length);
+			expect(appended[0]).toMatchObject({ parentId: leaf });
+			if (optedIn) {
+				expect(appended.filter(entry => entry.type === "model_change").map(entry => entry.role)).toEqual([
+					"default",
+					"smol",
+				]);
+			} else {
+				expect(f.settings.get("modelRoles")).toEqual(roles);
+				expect(appended[0]).toMatchObject({ type: "model_change", role: "temporary" });
+			}
 		});
 	}
 
@@ -562,7 +572,20 @@ describe("shared temporary model control", () => {
 			if (outcome.kind !== "committed") throw new Error(`Bootstrap: ${outcome.kind}`);
 			expect(outcome.ids).toHaveLength(emitThinking ? 2 : 1);
 			const file = manager.getSessionFile()!;
-			const entries = await records(file);
+			const all = await records(file);
+			const markers = all.filter(entry => entry.type === "custom" && entry.customType === "gjc.owner_enroll");
+			expect(markers).toHaveLength(1);
+			expect(markers[0]).toMatchObject({
+				parentId: null,
+				data: {
+					v: 1,
+					bind: manager.getSessionId(),
+					member: manager.getSessionOwnerEvidence()!.memberId,
+					runtime: "cooperative_tui",
+				},
+			});
+			expect(all).toHaveLength(emitThinking ? 5 : 4);
+			const entries = all.filter(entry => !markers.includes(entry));
 			expect(entries[1]).toMatchObject({ type: "message", id: pending });
 			expect(entries[2]).toMatchObject({
 				type: "model_change",

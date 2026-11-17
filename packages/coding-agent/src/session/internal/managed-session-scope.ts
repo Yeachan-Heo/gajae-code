@@ -79,8 +79,14 @@ import {
 } from "../../sdk/session-readonly/inspection";
 import type { ResumeSessionIdentity, SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
 import {
+	assertSessionSpillCleanup,
+	assertSessionSpillCleanupTransition,
+	captureSessionSpillCleanup,
 	FileSessionStorage,
 	type NativeDirectoryTreeSnapshot,
+	parseSessionSpillCleanup,
+	SessionDeleteVerificationError,
+	type SessionSpillCleanupEvidence,
 	type SessionStorageFileIdentity,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
@@ -133,7 +139,6 @@ import {
 	type ManagedGcOwnerProgress,
 	managedGcOwnerDeleteFields as managedGcOwnerDeleteFieldsInternal,
 	managedGcOwnerProgressBeforeDelete as managedGcOwnerProgressBeforeDeleteInternal,
-	persistManagedGcOwnerTranscriptDeletion,
 	persistManagedGcStorageOwnerDisposition as persistManagedGcStorageOwnerDispositionInternal,
 	prepareManagedGcOwnerTargets as prepareManagedGcOwnerTargetsInternal,
 	publishManagedGcArtifactsRemoved as publishManagedGcArtifactsRemovedInternal,
@@ -467,21 +472,38 @@ async function deleteSessionVerifiedWithFence(
 	target: VerifiedSessionDeleteTarget,
 	scope: ManagedScope,
 	retiredTarget: RetiredTarget,
+	tombstone: string,
 	verifyAuthority?: () => void,
 ): Promise<VerifiedSessionDeleteResult> {
+	const verify = () => {
+		verifyAuthority?.();
+		if (target.artifactsRemoved) {
+			const pending = pendingCleanupReceipt(scope, tombstone, retiredTarget);
+			if (!pending) throw new Error("durability_failed");
+			assertArtifactCleanupReady(scope, tombstone, pending);
+		}
+	};
 	lock.assertOwned();
-	verifyAuthority?.();
+	verify();
 	const hook = ManagedSessionScopeTestHooks.beforeVerifiedDelete;
 	if (hook) await hook({ flow, stage });
 	lock.assertOwned();
-	verifyAuthority?.();
+	verify();
 	const ownerFields = await managedGcOwnerDeleteFields(scope, retiredTarget, lock);
 	assertOwnerTranscriptLocator(target, ownerFields.taskArtifactOwnerDeletionEvidence);
 	lock.assertOwned();
-	verifyAuthority?.();
+	verify();
+	const pending = pendingCleanupReceipt(scope, tombstone, retiredTarget);
+	const spillCleanup = pending?.spillCleanup ?? captureSessionSpillCleanup(target.transcriptPath);
+	const initialSpillCleanup = structuredClone(spillCleanup);
 	return new FileSessionStorage().deleteSessionVerified(
-		{ ...target, ...ownerFields },
+		{ ...target, ...ownerFields, spillCleanup },
 		managedGcProtocolInspectorForLock(scope, lock),
+		async evidence => {
+			lock.assertOwned();
+			verify();
+			await publishSpillCleanupProgress(scope, tombstone, retiredTarget, initialSpillCleanup, evidence, lock);
+		},
 	);
 }
 
@@ -3346,7 +3368,7 @@ function isManagedGcCleanupReceiptPath(relativePath: string): boolean {
 	const prefix = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_TOMBSTONES_DIRECTORY}/`;
 	if (!relativePath.startsWith(prefix)) return false;
 	const match =
-		/^[a-f0-9]{64}\.[a-f0-9]{64}\.cleanup-(pending|artifacts_removed|completed)-([1-9][0-9]*)\.json$/u.exec(
+		/^[a-f0-9]{64}\.[a-f0-9]{64}\.cleanup-(pending|artifacts_removed|completed|spill)-([1-9][0-9]*)\.json$/u.exec(
 			relativePath.slice(prefix.length),
 		);
 	if (!match) return false;
@@ -3431,7 +3453,9 @@ function validateManagedGcProtocolTombstoneFile(
 		return;
 	}
 	const match =
-		/^([a-f0-9]{64})\.([a-f0-9]{64})\.cleanup-(pending|artifacts_removed|completed)-([1-9][0-9]*)\.json$/u.exec(name);
+		/^([a-f0-9]{64})\.([a-f0-9]{64})\.cleanup-(pending|artifacts_removed|completed|spill)-([1-9][0-9]*)\.json$/u.exec(
+			name,
+		);
 	if (!match || (match[3] === "completed" && match[4] !== "1"))
 		throw new Error("managed_gc_protocol_tombstone_role_invalid");
 	const tombstone = path.join(path.dirname(pathname), `${match[1]}.json`);
@@ -3440,6 +3464,13 @@ function validateManagedGcProtocolTombstoneFile(
 	const target = targets.find(candidate => stableOperationName(candidate) === match[2]);
 	if (!target) throw new Error("managed_gc_protocol_tombstone_target_missing");
 	const attempt = Number(match[4]);
+	if (match[3] === "spill") {
+		const pending = pendingCleanupReceipt(scope, tombstone, target);
+		if (!pending?.spillCleanup) throw new Error("managed_gc_protocol_tombstone_spill_authority_missing");
+		const progress = readSpillCleanupProgress(scope, tombstone, target, pending.spillCleanup);
+		if (progress.attempt < attempt) throw new Error("managed_gc_protocol_tombstone_spill_history_invalid");
+		return;
+	}
 	if (match[3] === "pending") {
 		const pending = pendingCleanupReceipt(scope, tombstone, target);
 		if (!pending || pending.attempt < attempt) throw new Error("managed_gc_protocol_tombstone_history_invalid");
@@ -4028,7 +4059,13 @@ function retiredTargets(scope: ManagedScope, pathname: string): readonly Retired
 		if (!targets) assertLegacyOwnerFreeRecord(value);
 		return targets;
 	} catch (error) {
-		assertLegacyOwnerFreeRecord(value);
+		try {
+			assertLegacyOwnerFreeRecord(value);
+		} catch (boundary) {
+			throw new Error(OWNER_CONSUMER_UNAVAILABLE, {
+				cause: new Error(`retired_target_parser:${path.basename(pathname)}`, { cause: error ?? boundary }),
+			});
+		}
 		if (isOwnerBoundaryFailure(error)) throw error;
 		if (error instanceof SyntaxError) throw new Error("durability_failed", { cause: error });
 		return undefined;
@@ -4231,6 +4268,7 @@ function retainedArtifactsRootMatches(record: Record<string, unknown>): boolean 
 }
 
 type CleanupReceipt = {
+	spillCleanup?: SessionSpillCleanupEvidence;
 	attempt: number;
 	target: RetiredTarget;
 	taskArtifactOwnerTranscriptDeleted?: true;
@@ -4268,6 +4306,7 @@ function cleanupReceipt(scope: ManagedScope, tombstone: string, receipt: Cleanup
 	return {
 		schemaVersion: 2,
 		state: "cleanup_pending",
+		...(receipt.spillCleanup ? { spillCleanup: receipt.spillCleanup } : {}),
 		scope: scopeDigest(scope.platform, scope.canonicalCwd),
 		tombstone,
 		attempt: receipt.attempt,
@@ -4312,6 +4351,36 @@ function cleanupReceipt(scope: ManagedScope, tombstone: string, receipt: Cleanup
 
 type CleanupArtifactsRemovedEvidence = { retainedArtifactsRootPath?: string };
 
+function assertArtifactCleanupReady(scope: ManagedScope, tombstone: string, receipt: CleanupReceipt): void {
+	const retained = retainedArtifactsRootReceipt(receipt);
+	const inspect = (pending: CleanupReceipt) => {
+		// Only the exact original artifact root, freshly proven payload-free, may
+		// survive completion. A native side-path label is not identity authority,
+		// even when the named object is empty or payloadDurable was returned.
+		for (const pathname of new Set([
+			pending.target.path.slice(0, -6),
+			pending.plannedArtifactsPath,
+			deterministicRemovalRoot(pending.plannedArtifactsPath),
+			pending.detachedArtifactsPath,
+			pending.retainedArtifactsSuccessorPath,
+			pending.retainedArtifactsPlaceholderPath,
+			pending.retainedArtifactsUnknownPath,
+		])) {
+			if (!pathname || pathname === retained?.path) continue;
+			if (managedPathPresentNoFollow(pathname)) throw new Error("durability_failed");
+		}
+	};
+	// Replay every target-bound journal: a later native result cannot erase a
+	// previously retained side path or an older planned alias.
+	const latest = pendingCleanupReceipt(scope, tombstone, receipt.target, inspect);
+	if (!latest || latest.attempt < receipt.attempt) throw new Error("durability_failed");
+	inspect(receipt);
+	if (retained) {
+		assertRetainedArtifactsAuthority(receipt);
+		if (!retainedArtifactPayloadAbsent(retained.path)) throw new Error("durability_failed");
+	}
+}
+
 function cleanupArtifactsRemovedEvidence(
 	scope: ManagedScope,
 	tombstone: string,
@@ -4346,6 +4415,9 @@ function cleanupArtifactsRemovedEvidence(
 			!retainedArtifactsRootMatches(record)
 		)
 			return undefined;
+		const pending = pendingCleanupReceipt(scope, tombstone, target);
+		if (!pending) return undefined;
+		assertArtifactCleanupReady(scope, tombstone, pending);
 		const retained = record.retainedArtifactsRoot as Record<string, unknown> | undefined;
 		return { retainedArtifactsRootPath: typeof retained?.path === "string" ? retained.path : undefined };
 	} catch (error) {
@@ -4412,6 +4484,8 @@ async function publishCleanupArtifactsRemoved(
 	receipt: CleanupReceipt,
 	lock: ManagedStorageLock,
 ): Promise<void> {
+	lock.assertOwned();
+	assertArtifactCleanupReady(scope, tombstone, receipt);
 	const retainedArtifactsRoot = retainedArtifactsRootReceipt(receipt);
 	await publishManagedTombstone(
 		cleanupReceiptPath(tombstone, receipt.target, "artifacts_removed", receipt.attempt),
@@ -4420,7 +4494,10 @@ async function publishCleanupArtifactsRemoved(
 			state: "artifacts_removed",
 			...(retainedArtifactsRoot ? { retainedArtifactsRoot } : {}),
 		},
-		lock.assertOwned,
+		() => {
+			lock.assertOwned();
+			assertArtifactCleanupReady(scope, tombstone, receipt);
+		},
 	).catch(error => {
 		if ((error as Error).message !== "destination_conflict") throw error;
 	});
@@ -4467,7 +4544,9 @@ function assertAuthorizedCleanupPending(
 				active.detachedArtifactsPath ?? active.plannedArtifactsPath,
 				deletion.detachedArtifactsPath,
 			)) ||
-		(deletion.phase === "transcript" && deletion.detachedTranscriptPath !== active.plannedTranscriptPath)
+		(deletion.phase === "transcript" &&
+			deletion.detachedTranscriptPath !== active.plannedTranscriptPath &&
+			!(deletion.detachedTranscriptPath === undefined && managedPathPresentNoFollow(target.path)))
 	)
 		throw new Error("durability_failed");
 }
@@ -4508,6 +4587,12 @@ function managedPathPresentNoFollow(pathname: string): boolean {
 	}
 }
 
+function assertCanonicalTranscriptAbsent(target: RetiredTarget): void {
+	// Canonical reappearance is never a native recovery placeholder, regardless
+	// of size or inode. Only the separately issued quarantine name may survive.
+	if (managedPathPresentNoFollow(target.path)) throw new Error("canonical_transcript_reappeared");
+}
+
 function isScrubbedTranscriptPlaceholder(pathname: string): boolean {
 	try {
 		const stat = fs.lstatSync(pathname);
@@ -4528,6 +4613,7 @@ function cleanupRootsAbsent(
 	pending: CleanupReceipt,
 	allowedRetainedArtifactsRoot?: string,
 ): boolean {
+	if (managedPathPresentNoFollow(target.path)) return false;
 	const prefix = `${path.basename(tombstone, ".json")}.${stableOperationName(target)}.cleanup-pending-`;
 	const activeTranscriptRoots = new Set(
 		[pending.plannedTranscriptPath, pending.detachedTranscriptPath].filter((pathname): pathname is string =>
@@ -4620,7 +4706,6 @@ function cleanupRootsAbsent(
 			}
 		}
 		for (const placeholder of [
-			target.path,
 			pending.plannedTranscriptPath,
 			pending.detachedTranscriptPath,
 			pending.retainedTranscriptPlaceholderPath,
@@ -4629,6 +4714,14 @@ function cleanupRootsAbsent(
 			roots.delete(placeholder);
 			activeTranscriptRoots.delete(placeholder);
 		}
+	}
+	if (pending.taskArtifactOwnerTranscriptDeleted === true && pending.retainedTranscriptPlaceholderPath) {
+		// Native success and cleanup_pending are distinct result variants. A
+		// positive transcript-deleted receipt may retain the exact issued empty
+		// recovery name without inventing a payloadDurable flag for native success.
+		if (!reconcileScrubbedTranscriptPlaceholder(pending.retainedTranscriptPlaceholderPath)) return false;
+		roots.delete(pending.retainedTranscriptPlaceholderPath);
+		activeTranscriptRoots.delete(pending.retainedTranscriptPlaceholderPath);
 	}
 	if (allowedRetainedArtifactsRoot) {
 		if (
@@ -4768,6 +4861,15 @@ function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
 }
 
 function probePlannedCleanupDetach(target: RetiredTarget, pending: CleanupReceipt): CleanupReceipt {
+	// Reject a replacement before inspecting retained cleanup roots, including
+	// an empty canonical inode that resembles the issued recovery placeholder.
+	if (
+		managedPathPresentNoFollow(target.path) &&
+		(pending.transcriptPayloadDurable === true ||
+			pending.taskArtifactOwnerTranscriptDeleted === true ||
+			!transcriptRootMatchesTarget(target.path, target))
+	)
+		throw new Error("durability_failed");
 	assertRetainedArtifactsAuthority(pending);
 
 	let detachedArtifactsPath = pending.detachedArtifactsPath;
@@ -4808,7 +4910,6 @@ function probePlannedCleanupDetach(target: RetiredTarget, pending: CleanupReceip
 			}
 		}
 		for (const placeholder of [
-			target.path,
 			pending.plannedTranscriptPath,
 			pending.detachedTranscriptPath,
 			pending.retainedTranscriptPlaceholderPath,
@@ -4864,10 +4965,141 @@ function admitCleanupReceiptReplayEntry(budget: CleanupReceiptReplayBudget): voi
 	budget.directoryEntries++;
 }
 
+function spillCleanupReceiptPath(tombstone: string, target: RetiredTarget, attempt: number): string {
+	return path.join(
+		path.dirname(tombstone),
+		`${path.basename(tombstone, ".json")}.${stableOperationName(target)}.cleanup-spill-${attempt}.json`,
+	);
+}
+
+function readSpillCleanupProgress(
+	scope: ManagedScope,
+	tombstone: string,
+	target: RetiredTarget,
+	initial: SessionSpillCleanupEvidence,
+): { evidence: SessionSpillCleanupEvidence; attempt: number } {
+	const budget: CleanupReceiptReplayBudget = { workUnits: 0, directoryEntries: 0, receiptReads: 0, readBytes: 0 };
+	const prefix = `${path.basename(tombstone, ".json")}.${stableOperationName(target)}.cleanup-spill-`;
+	const directory = fs.opendirSync(path.dirname(tombstone));
+	const records: Array<{ name: string; attempt: number }> = [];
+	try {
+		for (;;) {
+			const entry = directory.readSync();
+			if (!entry) break;
+			admitCleanupReceiptReplayEntry(budget);
+			if (!entry.name.startsWith(prefix) || !entry.name.endsWith(".json")) continue;
+			const suffix = entry.name.slice(prefix.length, -5);
+			const attempt = Number(suffix);
+			if (!/^[1-9][0-9]*$/.test(suffix) || !Number.isSafeInteger(attempt) || String(attempt) !== suffix)
+				throw new Error("durability_failed");
+			records.push({ name: entry.name, attempt });
+		}
+	} finally {
+		directory.closeSync();
+	}
+	records.sort((left, right) => left.attempt - right.attempt);
+	let evidence = parseSessionSpillCleanup(initial, target.path);
+	for (const entry of evidence.entries) {
+		entry.state = "prepared";
+		delete entry.outcome;
+		delete entry.retained;
+	}
+	let attempt = 0;
+	for (const record of records) {
+		const snapshot = captureManagedFileNoFollowBounded(
+			path.join(path.dirname(tombstone), record.name),
+			CLEANUP_RECEIPT_REPLAY_MAX_BYTES,
+			size => admitCleanupReceiptReplayRead(budget, size),
+		);
+		const value = managedGcProtocolRecord(snapshot.bytes, MANAGED_TOMBSTONES_DIRECTORY, record.name);
+		const recorded = value.target as Record<string, unknown> | undefined;
+		const identity = recorded?.identity as Record<string, unknown> | undefined;
+		if (
+			Object.keys(value).length !== 7 ||
+			value.schemaVersion !== 1 ||
+			value.state !== "spill_cleanup" ||
+			value.scope !== scopeDigest(scope.platform, scope.canonicalCwd) ||
+			value.tombstone !== tombstone ||
+			value.attempt !== record.attempt ||
+			record.attempt !== ++attempt ||
+			recorded?.path !== target.path ||
+			recorded.sessionId !== target.sessionId ||
+			recorded.cwd !== target.cwd ||
+			identity?.dev !== String(target.identity.dev) ||
+			identity.ino !== String(target.identity.ino) ||
+			identity.size !== target.identity.size ||
+			identity.mtimeNs !== String(target.identity.mtimeNs) ||
+			identity.sha256 !== target.identity.sha256
+		)
+			throw new Error("durability_failed");
+		const next = parseSessionSpillCleanup(value.spillCleanup, target.path);
+		assertSessionSpillCleanupTransition(evidence, next);
+		const changed = next.entries.filter((entry, index) => !deepSame(entry, evidence.entries[index]));
+		if (changed.length !== 1) throw new Error("durability_failed");
+		const entry = changed[0]!;
+		const previous = evidence.entries.find(candidate => candidate.path === entry.path)!;
+		if (
+			!(
+				(previous.state === "prepared" && entry.state === "dispatching") ||
+				(previous.state === "dispatching" && entry.state === "settled")
+			)
+		)
+			throw new Error("durability_failed");
+		evidence = next;
+	}
+	assertSessionSpillCleanupTransition(initial, evidence);
+	return { evidence, attempt };
+}
+
+async function publishSpillCleanupProgress(
+	scope: ManagedScope,
+	tombstone: string,
+	target: RetiredTarget,
+	initial: SessionSpillCleanupEvidence,
+	evidence: SessionSpillCleanupEvidence,
+	lock: ManagedStorageLock,
+): Promise<void> {
+	lock.assertOwned();
+	const previous = readSpillCleanupProgress(scope, tombstone, target, initial);
+	const next = parseSessionSpillCleanup(evidence, target.path);
+	assertSessionSpillCleanupTransition(previous.evidence, next);
+	const attempt = previous.attempt + 1;
+	await publishManagedTombstone(
+		spillCleanupReceiptPath(tombstone, target, attempt),
+		{
+			schemaVersion: 1,
+			state: "spill_cleanup",
+			scope: scopeDigest(scope.platform, scope.canonicalCwd),
+			tombstone,
+			attempt,
+			target: { path: target.path, sessionId: target.sessionId, cwd: target.cwd, identity: target.identity },
+			spillCleanup: next,
+		},
+		lock.assertOwned,
+	);
+	lock.assertOwned();
+	const persisted = readSpillCleanupProgress(scope, tombstone, target, initial);
+	if (persisted.attempt !== attempt || !deepSame(persisted.evidence, next)) throw new Error("durability_failed");
+}
+
+function assertManagedSpillCompletion(scope: ManagedScope, tombstone: string, target: RetiredTarget): void {
+	const pending = pendingCleanupReceipt(scope, tombstone, target);
+	if (!pending?.spillCleanup) throw new Error("durability_failed");
+	assertSessionSpillCleanup(pending.spillCleanup, true);
+}
+
+class SpillCleanupProgressReplayError extends Error {
+	override readonly name = "SpillCleanupProgressReplayError";
+	constructor(cause: unknown) {
+		super("durability_failed", { cause });
+	}
+}
+
 function pendingCleanupReceipt(
 	scope: ManagedScope,
 	tombstone: string,
 	target: RetiredTarget,
+	inspect?: (receipt: CleanupReceipt) => void,
 ): CleanupReceipt | undefined {
 	const budget: CleanupReceiptReplayBudget = { workUnits: 0, directoryEntries: 0, receiptReads: 0, readBytes: 0 };
 	try {
@@ -4917,11 +5149,23 @@ function pendingCleanupReceipt(
 				latest,
 				plannedPaths,
 			);
+			inspect?.(latest);
+		}
+		if (latest?.spillCleanup) {
+			try {
+				latest.spillCleanup = readSpillCleanupProgress(scope, tombstone, target, latest.spillCleanup).evidence;
+			} catch (error) {
+				if (isOwnerBoundaryFailure(error) || isManagedGcJournalCapacityError(error)) throw error;
+				// Known pending authority cannot become "no receipt" when its spill
+				// progress is malformed, unreadable or missing during replay.
+				throw new SpillCleanupProgressReplayError(error);
+			}
 		}
 		return latest;
 	} catch (error) {
 		if (
 			(error as Error).message === "durability_failed" ||
+			error instanceof SessionDeleteVerificationError ||
 			(error as Error).message === "managed_gc_journal_capacity_exceeded" ||
 			isOwnerBoundaryFailure(error)
 		)
@@ -5025,7 +5269,14 @@ function parseCleanupReceiptRecord(
 		throw new Error("durability_failed");
 	plannedPaths.add(record.plannedArtifactsPath as string);
 	plannedPaths.add(record.plannedTranscriptPath as string);
+	const spillCleanup =
+		record.spillCleanup === undefined ? undefined : parseSessionSpillCleanup(record.spillCleanup, target.path);
+	if (latest?.spillCleanup) {
+		if (!spillCleanup) throw new Error("durability_failed");
+		assertSessionSpillCleanupTransition(latest.spillCleanup, spillCleanup);
+	}
 	return {
+		spillCleanup,
 		taskArtifactOwnerTranscriptDeleted: record.taskArtifactOwnerTranscriptDeleted === true ? true : undefined,
 		attempt,
 		target,
@@ -5084,6 +5335,7 @@ function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | und
 		(expectedArtifactsIdentity ? snapshotArtifactTree(target.path.slice(0, -6)) : undefined);
 	if (pending?.expectedArtifactsIdentity && !expectedArtifactsTree) throw new Error("durability_failed");
 	return {
+		spillCleanup: pending?.spillCleanup ?? captureSessionSpillCleanup(target.path),
 		attempt,
 		target,
 		taskArtifactOwnerTranscriptDeleted: pending?.taskArtifactOwnerTranscriptDeleted,
@@ -5194,6 +5446,7 @@ async function continueDetachedArtifactCleanup(
 		},
 		scope,
 		target,
+		tombstone,
 	);
 	if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner") {
 		await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
@@ -5246,16 +5499,41 @@ async function persistManagedOwnerTranscriptDeletion(
 	target: RetiredTarget,
 	fallback: CleanupReceipt,
 	lock: ManagedStorageLock,
-	deletion: Extract<VerifiedSessionDeleteResult, { kind: "deleted" }>,
+	deletion:
+		| Extract<VerifiedSessionDeleteResult, { kind: "deleted" }>
+		| Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending"; phase: "task_artifact_owner" }>,
 ): Promise<void> {
-	return persistManagedGcOwnerTranscriptDeletion({
-		target,
-		fallback,
-		deletion,
-		readLatest: () => pendingCleanupReceipt(scope, tombstone, target),
-		nextReceipt: latest => nextCleanupReceipt(target, latest),
-		publishPending: receipt => publishCleanupPending(scope, tombstone, receipt, lock),
-	});
+	assertCanonicalTranscriptAbsent(target);
+	if (!target.taskArtifactOwnerDeletionEvidence) return;
+	if (deletion.taskArtifactOwnerTranscriptDeleted !== true)
+		throw new Error("task_artifact_owner_transcript_deletion_unverified");
+	const latest = pendingCleanupReceipt(scope, tombstone, target) ?? fallback;
+	if (latest.taskArtifactOwnerTranscriptDeleted) return;
+	const artifactsRemovedAttempt = latest.artifactsRemovedAttempt ?? latest.attempt;
+	if (!cleanupArtifactsRemovedEvidence(scope, tombstone, target, artifactsRemovedAttempt))
+		throw new Error("durability_failed");
+	const next = nextCleanupReceipt(target, latest);
+	await publishCleanupPending(
+		scope,
+		tombstone,
+		{
+			...next,
+			artifactsRemovedAttempt,
+			taskArtifactOwnerTranscriptDeleted: true,
+			...(deletion.kind === "deleted"
+				? {
+						detachedTranscriptPath: deletion.detachedTranscriptPath ?? next.detachedTranscriptPath,
+						transcriptPayloadDurable: deletion.transcriptPayloadDurable ?? next.transcriptPayloadDurable,
+						retainedTranscriptSuccessorPath:
+							deletion.retainedSuccessorPath ?? next.retainedTranscriptSuccessorPath,
+						retainedTranscriptPlaceholderPath:
+							deletion.retainedPlaceholderPath ?? next.retainedTranscriptPlaceholderPath,
+						retainedTranscriptUnknownPath: deletion.retainedUnknownPath ?? next.retainedTranscriptUnknownPath,
+					}
+				: {}),
+		},
+		lock,
+	);
 }
 
 async function cleanupCompleted(scope: ManagedScope, tombstone: string, target: RetiredTarget): Promise<boolean> {
@@ -5272,7 +5550,13 @@ async function cleanupCompleted(scope: ManagedScope, tombstone: string, target: 
 		const value: unknown = JSON.parse(
 			captureManagedFileNoFollow(cleanupReceiptPath(tombstone, target, "completed", 1)).bytes.toString("utf8"),
 		);
-		return cleanupCompletedRecordMatches(scope, tombstone, target, ownerReceipt, value);
+		if (!cleanupCompletedRecordMatches(scope, tombstone, target, ownerReceipt, value)) return false;
+		const pending = pendingCleanupReceipt(scope, tombstone, target);
+		if (!pending) return false;
+		assertArtifactCleanupReady(scope, tombstone, pending);
+		assertManagedSpillCompletion(scope, tombstone, target);
+		assertCanonicalTranscriptAbsent(target);
+		return true;
 	} catch (error) {
 		if (isOwnerBoundaryFailure(error) || isManagedGcJournalCapacityError(error)) throw error;
 		return false;
@@ -5361,6 +5645,15 @@ async function publishCleanupCompleted(
 			!deepSame(ownerReceipt.taskArtifactOwnerDeletionEvidence, target.taskArtifactOwnerDeletionEvidence))
 	)
 		throw new Error("durability_failed");
+	const verifyArtifacts = () => {
+		lock.assertOwned();
+		const pending = pendingCleanupReceipt(scope, tombstone, target);
+		if (!pending) throw new Error("durability_failed");
+		assertArtifactCleanupReady(scope, tombstone, pending);
+		assertManagedSpillCompletion(scope, tombstone, target);
+		assertCanonicalTranscriptAbsent(target);
+	};
+	verifyArtifacts();
 	const ownerOutcome = ownerReceipt?.taskArtifactOwnerRetirementOutcome;
 	if (
 		ownerReceipt &&
@@ -5387,12 +5680,46 @@ async function publishCleanupCompleted(
 						}
 					: {}),
 			},
-			lock.assertOwned,
+			verifyArtifacts,
 		);
 	} catch (error) {
 		if ((error as Error).message !== "destination_conflict") throw error;
 	}
-	if (!(await cleanupCompleted(scope, tombstone, target))) throw new Error("durability_failed");
+	verifyArtifacts();
+	if (!(await cleanupCompleted(scope, tombstone, target))) {
+		assertCanonicalTranscriptAbsent(target);
+		throw new Error("durability_failed");
+	}
+}
+
+/** Discovery routes phase journals separately; their full authority is replayed under the root lease. */
+function isCleanupPhaseJournal(scope: ManagedScope, pathname: string, name: string): boolean {
+	const role =
+		/^([a-f0-9]{64})\.([a-f0-9]{64})\.cleanup-(pending|artifacts_removed|completed|spill)-([1-9][0-9]*)\.json$/u.exec(
+			name,
+		);
+	if (!role) return false;
+	const snapshot = captureManagedFileNoFollow(pathname);
+	const record = managedGcProtocolRecord(snapshot.bytes, MANAGED_TOMBSTONES_DIRECTORY, name);
+	const attempt = Number(role[4]);
+	if (
+		!Number.isSafeInteger(attempt) ||
+		(role[3] === "completed" && attempt !== 1) ||
+		record.schemaVersion !== (role[3] === "completed" || role[3] === "spill" ? 1 : 2) ||
+		record.state !==
+			(role[3] === "pending"
+				? "cleanup_pending"
+				: role[3] === "completed"
+					? "cleanup_completed"
+					: role[3] === "spill"
+						? "spill_cleanup"
+						: "artifacts_removed") ||
+		record.scope !== scopeDigest(scope.platform, scope.canonicalCwd) ||
+		record.tombstone !== path.join(path.dirname(pathname), `${role[1]}.json`) ||
+		record.attempt !== attempt
+	)
+		throw new Error("durability_failed");
+	return true;
 }
 
 function tombstonePathContaining(scope: ManagedScope, candidate: ManagedCandidate): string | undefined {
@@ -5400,6 +5727,7 @@ function tombstonePathContaining(scope: ManagedScope, candidate: ManagedCandidat
 	try {
 		for (const name of fs.readdirSync(directory)) {
 			const pathname = path.join(directory, name);
+			if (isCleanupPhaseJournal(scope, pathname, name)) continue;
 			if (retiredTargets(scope, pathname)?.some(target => sameCandidate(target, candidate))) return pathname;
 		}
 	} catch (error) {
@@ -5952,6 +6280,7 @@ export async function reconcileManagedTombstones(
 	if (prepared.kind === "error") throw new Error(prepared.message);
 	for (const name of fs.readdirSync(directory)) {
 		const tombstone = path.join(directory, name);
+		if (isCleanupPhaseJournal(scope, tombstone, name)) continue;
 		const discoveredTargets = retiredTargets(scope, tombstone);
 		if (!discoveredTargets || discoveredTargets.some(target => hasUnsupportedLegacyOwnerTarget(scope, target)))
 			continue;
@@ -6114,8 +6443,10 @@ export async function reconcileManagedTombstones(
 						},
 						scope,
 						target,
+						tombstone,
 					);
 					if (deletion.kind === "artifacts_removed") {
+						assertArtifactCleanupReady(scope, tombstone, active);
 						await publishManagedGcArtifactsRemoved(scope, target, lock);
 						await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 						ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, lockedTargets, lock);
@@ -6148,6 +6479,7 @@ export async function reconcileManagedTombstones(
 							},
 							scope,
 							target,
+							tombstone,
 						);
 					}
 					if (deletion.kind === "cleanup_pending") {
@@ -6181,6 +6513,7 @@ export async function reconcileManagedTombstones(
 									!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath))
 							)
 								continue;
+							assertArtifactCleanupReady(scope, tombstone, pendingEvidence);
 							await publishManagedGcArtifactsRemoved(scope, target, lock);
 							await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
 							ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, lockedTargets, lock);
@@ -6222,6 +6555,7 @@ export async function reconcileManagedTombstones(
 								},
 								scope,
 								target,
+								tombstone,
 								() => {
 									if (
 										!cleanupArtifactsRemoved(
@@ -6242,7 +6576,11 @@ export async function reconcileManagedTombstones(
 								if (
 									deletion.phase !== "transcript" ||
 									(deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath &&
-										deletion.transcriptPayloadDurable !== true)
+										deletion.transcriptPayloadDurable !== true &&
+										!(
+											deletion.detachedTranscriptPath === undefined &&
+											managedPathPresentNoFollow(target.path)
+										))
 								)
 									throw new Error("durability_failed");
 								const followup = nextCleanupReceipt(target, pendingEvidence);
@@ -6719,7 +7057,38 @@ async function deleteManagedSessionCandidateInternal(
 		const code = expectedFailure(error);
 		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed deletion failed." };
 	}
-	const prepared = await prepareManagedSessionScopeForWrite(scope);
+	let existingTombstone: string | undefined;
+	try {
+		existingTombstone = tombstonePathContaining(scope, candidate);
+		if (existingTombstone && managedPathPresentNoFollow(candidate.path)) {
+			const named = fs.lstatSync(candidate.path, { bigint: true });
+			if (
+				named.isSymbolicLink() ||
+				!named.isFile() ||
+				named.dev !== candidate.identity.dev ||
+				named.ino !== candidate.identity.ino ||
+				Number(named.size) !== candidate.identity.size ||
+				named.mtimeNs !== candidate.identity.mtimeNs
+			)
+				throw new Error("durability_failed");
+		}
+	} catch (error) {
+		return {
+			kind: "error",
+			code: expectedFailure(error),
+			message: error instanceof Error ? error.message : "Managed deletion failed.",
+		};
+	}
+	// Direct deletion replays its selected tombstone below under the original
+	// operation lease. General write preparation would reconcile that same
+	// pending operation first, before this coordinator has bound its journal.
+	// Keep async binding publication and its typed failures before structural
+	// preparation, but do not run a second cleanup.
+	const policy = scope.platform === "win32" ? "windows-existing-verify-first" : "default";
+	const initialized = await ensureManagedScope(scope, policy);
+	if (initialized.kind === "error")
+		return { kind: "error", code: expectedFailure(new Error(initialized.code)), message: initialized.message };
+	const prepared = prepareManagedSessionScopeForWriteSync(scope, policy);
 	if (prepared.kind === "error")
 		return {
 			kind: "error",
@@ -6735,7 +7104,6 @@ async function deleteManagedSessionCandidateInternal(
 			transcriptIdentity: paired.identity,
 		});
 	const logical = paired?.provenance === "legacy" ? paired : (current ?? candidate);
-	const existingTombstone = tombstonePathContaining(scope, candidate);
 	const tombstone =
 		existingTombstone ??
 		path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY, `${stableOperationName(logical)}.json`);
@@ -6945,8 +7313,10 @@ async function deleteManagedSessionCandidateInternal(
 				},
 				scope,
 				target,
+				tombstone,
 			);
 			if (deletion.kind === "artifacts_removed") {
+				assertArtifactCleanupReady(scope, tombstone, active);
 				await publishManagedGcArtifactsRemoved(scope, target, lock);
 				await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
 				ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, targets, lock);
@@ -6983,11 +7353,14 @@ async function deleteManagedSessionCandidateInternal(
 					},
 					scope,
 					target,
+					tombstone,
 				);
 			}
 			if (deletion.kind === "cleanup_pending") {
 				if (deletion.phase === "task_artifact_owner") {
 					ownerProgress = await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+					if (deletion.taskArtifactOwnerTranscriptDeleted === true)
+						await persistManagedOwnerTranscriptDeletion(scope, tombstone, target, active, lock, deletion);
 					return {
 						kind: "cleanup_pending",
 						tombstonePath: tombstone,
@@ -7028,6 +7401,7 @@ async function deleteManagedSessionCandidateInternal(
 							phase: deletion.phase,
 							message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
 						};
+					assertArtifactCleanupReady(scope, tombstone, pendingEvidence);
 					await publishManagedGcArtifactsRemoved(scope, target, lock);
 					await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
 					ownerProgress = await retireManagedGcOwnerAfterArtifacts(scope, target, targets, lock);
@@ -7075,6 +7449,7 @@ async function deleteManagedSessionCandidateInternal(
 						},
 						scope,
 						target,
+						tombstone,
 						() => {
 							if (
 								!cleanupArtifactsRemoved(
@@ -7089,6 +7464,15 @@ async function deleteManagedSessionCandidateInternal(
 					);
 					if (deletion.kind === "cleanup_pending" && deletion.phase === "task_artifact_owner") {
 						ownerProgress = await persistManagedGcStorageOwnerDisposition(scope, target, deletion, lock);
+						if (deletion.taskArtifactOwnerTranscriptDeleted === true)
+							await persistManagedOwnerTranscriptDeletion(
+								scope,
+								tombstone,
+								target,
+								pendingEvidence,
+								lock,
+								deletion,
+							);
 						return {
 							kind: "cleanup_pending",
 							tombstonePath: tombstone,
@@ -7100,7 +7484,8 @@ async function deleteManagedSessionCandidateInternal(
 						if (
 							deletion.phase !== "transcript" ||
 							(deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath &&
-								deletion.transcriptPayloadDurable !== true)
+								deletion.transcriptPayloadDurable !== true &&
+								!(deletion.detachedTranscriptPath === undefined && managedPathPresentNoFollow(target.path)))
 						)
 							throw new Error("durability_failed");
 						const followup = nextCleanupReceipt(target, pendingEvidence);
@@ -7122,7 +7507,30 @@ async function deleteManagedSessionCandidateInternal(
 								? pendingEvidence.detachedArtifactsPath
 								: undefined,
 						))
-				)
+				) {
+					// The pending receipt above preserves uncertain native effects. A
+					// negative dispatch with the original transcript still authenticated
+					// keeps its public failure classification, not a completion claim.
+					if (
+						deletion.phase === "transcript" &&
+						ownerProgress.state !== "payload_retired" &&
+						deletion.error instanceof SessionDeleteVerificationError &&
+						deletion.error.nativeFailureCode === "io_error" &&
+						deletion.transcriptPayloadDurable !== true &&
+						deletion.detachedTranscriptPath === undefined &&
+						deletion.retainedSuccessorPath === undefined &&
+						deletion.retainedPlaceholderPath === undefined &&
+						deletion.retainedUnknownPath === undefined
+					) {
+						let originalTranscriptAuthenticated = false;
+						try {
+							originalTranscriptAuthenticated = transcriptRootMatchesTarget(target.path, target);
+						} catch {
+							// Failed proof cannot establish that the native dispatch had no effect.
+						}
+						if (originalTranscriptAuthenticated)
+							return { kind: "error", code: "durability_failed", message: deletion.error.message };
+					}
 					return {
 						kind: "cleanup_pending",
 						tombstonePath: tombstone,
@@ -7132,6 +7540,7 @@ async function deleteManagedSessionCandidateInternal(
 								? "task_artifact_owner_namespace_cleanup_pending"
 								: deletion.error.message,
 					};
+				}
 				// A retained transcript quarantine proves canonical absence and remains
 				// identity-bound in the durable pending receipt.
 			}
@@ -7165,8 +7574,10 @@ async function deleteManagedSessionCandidateInternal(
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);
 		}
-		return { kind: deletedAny ? "deleted" : "already_deleted", tombstonePath: tombstone };
+		return { kind: !existingTombstone && deletedAny ? "deleted" : "already_deleted", tombstonePath: tombstone };
 	} catch (error) {
+		if (error instanceof Error && error.message === "canonical_transcript_reappeared")
+			return { kind: "cleanup_pending", tombstonePath: tombstone, phase: "transcript", message: error.message };
 		const code = expectedFailure(error);
 		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed deletion failed." };
 	} finally {

@@ -95,6 +95,16 @@ describe("CLI help load order", () => {
 		expect(source).toContain('{ name: "model-presets", load: () => import("./commands/model-presets")');
 	});
 
+	it("keeps the models config loader out of the eager setup module graph (#5949)", async () => {
+		// `gjc setup <component>` loads setup-cli eagerly. Provider setup shares the
+		// models-config validator and loader, but only through a dynamic import so
+		// unrelated setup components do not pay for evaluating the registry.
+		const setupCliPath = path.join(repoRoot, "packages", "coding-agent", "src", "cli", "setup-cli.ts");
+		const graph = await eagerModuleGraph(setupCliPath);
+		// The entry must actually reach provider setup, or the absence check is vacuous.
+		expect(graph.some(entry => entry.endsWith(path.join("setup", "provider-onboarding.ts")))).toBe(true);
+		expect(graph.filter(entry => entry.endsWith(path.join("config", "model-registry.ts")))).toEqual([]);
+	}, 60_000);
 	itWithTempRoot(
 		"loads the root help command without tripping config/model-registry cycles",
 		"gjc-help-load-order-",

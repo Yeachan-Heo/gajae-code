@@ -15,6 +15,7 @@ import {
 } from "@gajae-code/coding-agent/sdk/revision-controls";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { RESUME_CURSOR_CUSTOM_TYPE } from "@gajae-code/coding-agent/session/resume-cursor";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
 import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { TempDir } from "@gajae-code/utils";
@@ -131,7 +132,7 @@ describe("SDK same-session native prompt revision", () => {
 		const sessionId = session.sessionId;
 		const originalLeaf = manager.getLeafId();
 		const originalEntries = manager.getEntries();
-		const navigation = spyOn(session, "navigateTree");
+		const navigation = spyOn(session, "prepareTreeEdit");
 		const send = spyOn(session, "prompt");
 		restores.push(
 			() => navigation.mockRestore(),
@@ -150,7 +151,7 @@ describe("SDK same-session native prompt revision", () => {
 		});
 		expect(session.sessionManager).toBe(manager);
 		expect(session.sessionId).toBe(sessionId);
-		expect(navigation).toHaveBeenCalledWith(original.id, { summarize: false });
+		expect(navigation).toHaveBeenCalledWith(original.id, { beforeExecutionCommit: expect.any(Function) });
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(send.mock.calls[0]?.[0]).toBe("replacement user text");
 		for (const entry of originalEntries) expect(manager.getEntry(entry.id)).toEqual(entry);
@@ -158,6 +159,12 @@ describe("SDK same-session native prompt revision", () => {
 		expect(manager.getBranch().some(entry => entry.id === original.id)).toBe(false);
 		expect(manager.getBranch().map(entry => entry.id)).toContain(result.replacementEntryId);
 		expect(manager.getLeafId()).toBe(result.assistantEntryId);
+		expect(manager.getSessionFile()).toBeUndefined();
+		expect(
+			manager
+				.getEntries()
+				.filter(entry => entry.type === "custom" && entry.customType === RESUME_CURSOR_CUSTOM_TYPE),
+		).toEqual([]);
 		replacementSiblingRoot(session, original, result.replacementEntryId);
 		expect(model.calls).toHaveLength(2);
 		expect(userTexts(model, 1)).toEqual(["replacement user text"]);
@@ -194,7 +201,7 @@ describe("SDK same-session native prompt revision", () => {
 		const original = await prompt("original");
 		const leaf = session.sessionManager.getLeafId();
 		const entries = session.sessionManager.getEntries();
-		const navigation = spyOn(session, "navigateTree");
+		const navigation = spyOn(session, "prepareTreeEdit");
 		restores.push(() => navigation.mockRestore());
 		const image: ImageContent = { type: "image", data: "cG5n", mimeType: "image/png" };
 		for (const images of [
@@ -249,7 +256,11 @@ describe("SDK same-session native prompt revision", () => {
 				selected: true,
 				status: "selected",
 			});
-			expect(navigation).toHaveBeenLastCalledWith(leafEntryId, { includeTarget: true, summarize: false });
+			expect(navigation).toHaveBeenLastCalledWith(leafEntryId, {
+				includeTarget: true,
+				summarize: false,
+				beforeExecutionCommit: expect.any(Function),
+			});
 			expect(manager.getLeafId()).toBe(leafEntryId);
 			expect(session.sessionManager).toBe(manager);
 			expect(manager.getEntries()).toEqual(entries);
@@ -408,7 +419,7 @@ describe("SDK same-session native prompt revision", () => {
 
 	it("rejects malformed bodies, IDs, and client-supplied runtime capabilities before native mutation", async () => {
 		const original = seedUnanswered("original");
-		const navigation = spyOn(session, "navigateTree");
+		const navigation = spyOn(session, "prepareTreeEdit");
 		restores.push(() => navigation.mockRestore());
 		for (const body of [
 			undefined,
@@ -506,6 +517,41 @@ describe("SDK same-session native prompt revision", () => {
 		});
 	}
 
+	for (const mutation of ["append", "entry-update", "leaf-roundtrip"] as const) {
+		it(`revalidates ${mutation} during awaited revision admission before selecting execution`, async () => {
+			const original = await prompt("original");
+			const manager = session.sessionManager;
+			const selection = spyOn(session, "selectExecutionBranchDurably");
+			restores.push(() => selection.mockRestore());
+			let foreignLeaf: string | null = null;
+			await expect(
+				reviseSession(session, input(original.id), {
+					onPreflightAcceptCommit: async () => {
+						await Promise.resolve();
+						if (mutation === "append") manager.appendCustomEntry("foreign-admission", { retained: true });
+						if (mutation === "entry-update")
+							manager.applyEntryMessageUpdates([
+								{ ...original, message: { role: "user", content: "foreign updated original", timestamp: 3 } },
+							]);
+						if (mutation === "leaf-roundtrip") {
+							manager.branch(original.id);
+							if (original.parentId === null) manager.resetLeaf();
+							else manager.branch(original.parentId);
+						}
+						foreignLeaf = manager.getLeafId();
+					},
+				}),
+			).rejects.toMatchObject({ code: "resource_gone" });
+			expect(selection).not.toHaveBeenCalled();
+			expect(manager.getLeafId()).toBe(foreignLeaf);
+			if (mutation === "append")
+				expect(manager.getEntries().at(-1)).toMatchObject({ customType: "foreign-admission" });
+			if (mutation === "entry-update")
+				expect(manager.getEntry(original.id)).toMatchObject({ message: { content: "foreign updated original" } });
+			expect(model.calls).toHaveLength(1);
+		});
+	}
+
 	it("reports terminal provider failure explicitly and never erases the appended revision", async () => {
 		const original = await prompt("original");
 		model.push({ throw: "provider private-token /private/provider-path" });
@@ -535,8 +581,20 @@ describe("SDK same-session native prompt revision", () => {
 		});
 		const revision = reviseSession(session, input(original.id));
 		try {
-			await started.promise;
+			await Promise.race([
+				started.promise,
+				revision.then(() => {
+					throw new Error("Revision settled before provider start");
+				}),
+			]);
 			await expect(reviseSession(session, input(original.id, "overlap"))).rejects.toMatchObject({ code: "busy" });
+			const entries = session.sessionManager.getEntries();
+			const leaf = session.sessionManager.getLeafId();
+			await expect(session.selectExecutionBranchDurably(original.id)).rejects.toMatchObject({
+				name: "AgentBusyError",
+			});
+			expect(session.sessionManager.getLeafId()).toBe(leaf);
+			expect(session.sessionManager.getEntries()).toEqual(entries);
 		} finally {
 			response.resolve({ content: ["real revision response"] });
 		}
@@ -689,9 +747,9 @@ describe("SDK same-session native prompt revision", () => {
 		successor.appendMessage({ role: "user", content: "successor sentinel", timestamp: Date.now() });
 		const successorEntries = successor.getEntries();
 		const successorLeaf = successor.getLeafId();
-		const navigate = session.navigateTree.bind(session);
-		const navigation = spyOn(session, "navigateTree").mockImplementation(async (target, options) => {
-			const result = await navigate(target, options);
+		const prepare = session.prepareTreeEdit.bind(session);
+		const navigation = spyOn(session, "prepareTreeEdit").mockImplementation(async (target, options) => {
+			const result = await prepare(target, options);
 			session.sessionManager = successor;
 			return result;
 		});
@@ -711,10 +769,10 @@ describe("SDK same-session native prompt revision", () => {
 	it("does not roll back over another native branch selection", async () => {
 		const original = await prompt("original");
 		const previousLeaf = session.sessionManager.getLeafId()!;
-		const navigate = session.navigateTree.bind(session);
-		const navigation = spyOn(session, "navigateTree").mockImplementation(async (target, options) => {
-			const result = await navigate(target, options);
-			await navigate(previousLeaf);
+		const prepare = session.prepareTreeEdit.bind(session);
+		const navigation = spyOn(session, "prepareTreeEdit").mockImplementation(async (target, options) => {
+			const result = await prepare(target, options);
+			await session.navigateTree(previousLeaf);
 			return result;
 		});
 		restores.push(() => navigation.mockRestore());

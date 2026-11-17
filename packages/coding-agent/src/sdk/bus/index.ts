@@ -36,6 +36,8 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
+import { containsSecretConfigKey } from "../protocol/adapter-validation";
 import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
@@ -54,7 +56,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 
 type NotificationServer = NativeNotificationServer;
 
-import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+import { $credentialEnv, isRecord, logger, postmortem, VERSION } from "@gajae-code/utils";
 
 import { AsyncJobManager } from "../../async";
 import {
@@ -75,6 +77,8 @@ import {
 import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
 import type { BtwTextExchange } from "../../session/btw-contract";
 import type { ClientBridge } from "../../session/client-bridge";
+import { revalidateOwnerMembership } from "../../session/owner-group";
+import { SessionManager } from "../../session/session-manager";
 import {
 	createSessionWorkLease,
 	type SessionWorkLease,
@@ -1880,10 +1884,6 @@ interface SafeUsageWindow {
 	resetsAt?: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function classifyUsageWindow(limit: Record<string, unknown>): "5h" | "7d" | undefined {
 	const window = isRecord(limit.window) ? limit.window : undefined;
 	const scope = isRecord(limit.scope) ? limit.scope : undefined;
@@ -2582,61 +2582,6 @@ function sdkQuerySurface(
 		externalPermissions,
 		primaryControlSurface,
 	}).query;
-}
-
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
-	);
-}
-
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
 }
 
 /**
@@ -4725,6 +4670,7 @@ export function createNotificationsExtension(
 	// exact runtime object retains authority for an explicit idempotent retry.
 	const cleanupRetries = new Map<string, SessionRuntime>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
+	const cancelSessionStarts = new Map<string, () => void>();
 	const forceIsolatedChatSessions = new Set<string>();
 	const branchStartupTasks = new Set<Promise<void>>();
 	const sessionLifecycleTasks = new Set<Promise<void>>();
@@ -4984,6 +4930,7 @@ export function createNotificationsExtension(
 			if (activeRuntimeId === id) activeRuntimeId = undefined;
 		}
 		const pendingStart = sessionStartPromises.get(id);
+		if (reason === "session") cancelSessionStarts.get(id)?.();
 		if (pendingStart)
 			void pendingStart
 				.catch(() => {})
@@ -5174,7 +5121,44 @@ export function createNotificationsExtension(
 		);
 	}
 
-	async function startSession(ctx: ExtensionContext): Promise<SessionStartResult> {
+	function startSession(ctx: ExtensionContext): Promise<SessionStartResult> {
+		const id = sessionId(ctx);
+		const pendingStart = sessionStartPromises.get(id);
+		if (pendingStart) return pendingStart;
+		// Reserve before identity preflight (or writer admission) can yield. Stops
+		// must be able to cancel this exact flight even before it owns a runtime.
+		const settled = Promise.withResolvers<SessionStartResult>();
+		let cancelled = false;
+		sessionStartPromises.set(id, settled.promise);
+		cancelSessionStarts.set(id, () => {
+			cancelled = true;
+		});
+		const releaseReservation = (): void => {
+			if (sessionStartPromises.get(id) !== settled.promise) return;
+			sessionStartPromises.delete(id);
+			cancelSessionStarts.delete(id);
+		};
+		let finished = false;
+		const finish = (result: SessionStartResult): void => {
+			if (finished) return;
+			finished = true;
+			releaseReservation();
+			settled.resolve(result);
+		};
+		void startOwnedSession(ctx, () => cancelled, finish).then(finish, error => {
+			if (finished) return;
+			finished = true;
+			releaseReservation();
+			settled.reject(error);
+		});
+		return settled.promise;
+	}
+
+	async function startOwnedSession(
+		ctx: ExtensionContext,
+		startupCancelled: () => boolean,
+		settleStartup: (result: SessionStartResult) => void,
+	): Promise<SessionStartResult> {
 		const id = sessionId(ctx);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = controller.query(ctx).genericSessionEnabled;
@@ -5198,7 +5182,13 @@ export function createNotificationsExtension(
 			return { status: reason === "disabled" ? "disabled" : "failed", failure };
 		};
 		const throwIfLifecycleStopped = (): void => {
-			if (lifecycleStartupCapability?.cancelled || runtime?.stopping || runtimes.get(id) !== runtime)
+			if (
+				extensionShuttingDown ||
+				startupCancelled() ||
+				lifecycleStartupCapability?.cancelled ||
+				runtime?.stopping ||
+				runtimes.get(id) !== runtime
+			)
 				throw new Error("Lifecycle SDK startup was cancelled.");
 		};
 
@@ -5208,8 +5198,6 @@ export function createNotificationsExtension(
 		)
 			return { status: "disabled" };
 		if (lifecycleRequired && !isNotificationEligibleContext(ctx)) return failLifecycleStartup("ineligible");
-		const pendingStart = sessionStartPromises.get(id);
-		if (pendingStart) return pendingStart;
 		const retainedCleanup = cleanupRetries.get(id);
 		if (retainedCleanup) return failLifecycleStartup("failed", "SDK notification runtime cleanup is still pending.");
 		const existingRuntime = runtimes.get(id);
@@ -5222,6 +5210,8 @@ export function createNotificationsExtension(
 			return { status: "already", runtime: existingRuntime };
 		}
 
+		if (extensionShuttingDown || startupCancelled() || lifecycleStartupCapability?.cancelled)
+			return failLifecycleStartup("failed", "Lifecycle SDK startup was cancelled.");
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
 		let isolateChatEndpoint = forceIsolatedChatSessions.delete(id);
 		if (
@@ -5238,6 +5228,9 @@ export function createNotificationsExtension(
 			if (marker) isolateChatEndpoint = true;
 			else {
 				const identity = await proposedTelegramIdentity({ settings, botToken: cfg.botToken, chatId: cfg.chatId });
+				// Shutdown can cancel the reserved flight before it owns any resources.
+				if (extensionShuttingDown || startupCancelled() || lifecycleStartupCapability?.cancelled)
+					return failLifecycleStartup("failed", "Lifecycle SDK startup was cancelled.");
 				isolateChatEndpoint = identity.status === "foreign" || identity.status === "unknown";
 			}
 		}
@@ -9122,8 +9115,6 @@ export function createNotificationsExtension(
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
 		activeRuntimeId = id;
-		const startSettled = Promise.withResolvers<SessionStartResult>();
-		sessionStartPromises.set(id, startSettled.promise);
 		const finishStartup = (result: SessionStartResult): void => {
 			if (lifecycleRequired) {
 				if (result.status === "started") lifecycleStartupCapability?.settleStarted();
@@ -9137,16 +9128,17 @@ export function createNotificationsExtension(
 							normalizeSdkStartupFailure("startup", result.status === "disabled" ? "disabled" : "failed"),
 					);
 			}
-			if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
-			startSettled.resolve(result);
+			settleStartup(result);
 		};
-		const cleanupAbandonedStartup = async (): Promise<void> => {
+		const cleanupAbandonedStartup = async (): Promise<boolean> => {
 			try {
 				await stopSession(id, "session", initializedRuntime);
+				return false;
 			} catch (error) {
 				// stopSession fences the exact runtime before releasing its owners and records
 				// the lifecycle rollback proof even when one release needs a later retry.
 				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+				return true;
 			}
 		};
 
@@ -9211,6 +9203,17 @@ export function createNotificationsExtension(
 			} catch {}
 		};
 		try {
+			// Real writers must hold independently admitted ownership before this
+			// transport advertises them. Register the startup promise first so a
+			// concurrent start joins this admission instead of publishing a rival.
+			// Read-only structural extension contexts do not own a transcript writer.
+			if (ctx.sessionManager instanceof SessionManager && ctx.sessionManager.isPersisted()) {
+				if (!ctx.sessionManager.getOwnerMembership()) await ctx.sessionManager.ensureOnDisk();
+				const membership = ctx.sessionManager.getOwnerMembership();
+				if (!membership) throw new Error("SDK transport requires admitted transcript ownership.");
+				await revalidateOwnerMembership(membership);
+				throwIfLifecycleStopped();
+			}
 			server.onSdkFrame((err, inbound) => {
 				if (err) {
 					if (inbound?.connectionId) sendMalformed(inbound.connectionId, err.message);
@@ -9784,9 +9787,10 @@ export function createNotificationsExtension(
 			lifecycleStartupCapability?.rollback?.recordGeneration(host.generation);
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
-				finishStartup({ status: "failed" });
-				await cleanupAbandonedStartup();
-				return { status: "failed" };
+				const suppressExtensionError = await cleanupAbandonedStartup();
+				const result: SessionStartResult = { status: "failed", runtime, suppressExtensionError };
+				finishStartup(result);
+				return result;
 			}
 
 			// Fail-closed daemon isolation: the chat daemons (Telegram, Discord,
@@ -9852,9 +9856,10 @@ export function createNotificationsExtension(
 			});
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
-				finishStartup({ status: "failed" });
-				await cleanupAbandonedStartup();
-				return { status: "failed" };
+				const suppressExtensionError = await cleanupAbandonedStartup();
+				const result: SessionStartResult = { status: "failed", runtime, suppressExtensionError };
+				finishStartup(result);
+				return result;
 			}
 
 			server.pushFrame(JSON.stringify(identityHeader));
@@ -10178,7 +10183,6 @@ export function createNotificationsExtension(
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
-			finishStartup(result);
 			let suppressExtensionError = false;
 			let stopped = false;
 			try {
@@ -10191,8 +10195,12 @@ export function createNotificationsExtension(
 				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
 				suppressExtensionError = true;
 			}
-			if (!stopped) await cleanupAbandonedStartup();
-			return { ...result, runtime, suppressExtensionError };
+			if (!stopped) suppressExtensionError = (await cleanupAbandonedStartup()) || suppressExtensionError;
+			// Lifecycle readiness can fail immediately, but every joined start caller
+			// must observe the final cleanup-aware result after owner release settles.
+			const finalResult = { ...result, runtime, suppressExtensionError };
+			finishStartup(finalResult);
+			return finalResult;
 		}
 	}
 

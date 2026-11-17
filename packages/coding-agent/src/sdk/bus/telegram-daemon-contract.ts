@@ -324,7 +324,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 230 composes that ownership policy with retained replay and
  * SDK notification-authority bindings.
  */
-export const DAEMON_GENERATION = 230;
+export const DAEMON_GENERATION = 231;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

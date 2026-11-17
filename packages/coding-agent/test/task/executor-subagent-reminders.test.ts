@@ -290,7 +290,11 @@ describe("runSubprocess yield reminders", () => {
 		expect(updates.length).toBeGreaterThanOrEqual(2);
 		expect(updates.at(-1)).toMatchObject({
 			subagentId: "subagent-fallback-inherited-manager",
-			meta: expect.objectContaining({ modelFellBack: true, effectiveModel: "fallback/model" }),
+			meta: expect.objectContaining({
+				modelFellBack: true,
+				modelFallbackReason: "rate_limit",
+				effectiveModel: "fallback/model",
+			}),
 		});
 	});
 

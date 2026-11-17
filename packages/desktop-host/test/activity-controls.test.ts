@@ -43,6 +43,8 @@ async function fixture(redact: (text: string) => string = text => text, availabl
 	});
 	const state: JobObservationSnapshot = {
 		failureRevision: "failure-1",
+		unsettledJobs: [],
+		unsettledCrons: [],
 		jobs: [
 			{
 				id: "private-monitor-id",

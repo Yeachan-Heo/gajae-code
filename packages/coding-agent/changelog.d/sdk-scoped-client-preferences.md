@@ -1,8 +1,0 @@
-### Added
-- Expose identity-fenced read-only profile labels, provider grouping/ranks, availability and role selectors through the public preference service so embedders preserve canonical picker presentation without internal imports or catalog refresh.
-- Expose session-owned task-role model overrides and explicit model/profile/configuration scopes through canonical SDK controls, with durable commitment and live-application outcomes kept distinct.
-
-### Fixed
-- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
-- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
-- Let the canonical atomic configuration writer create project config directories, with read-only path/symlink checks before admission and revalidation under its queue/lock before publication.

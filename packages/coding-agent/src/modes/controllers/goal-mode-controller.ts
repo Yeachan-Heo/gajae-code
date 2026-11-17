@@ -277,14 +277,14 @@ export class GoalModeController {
 		const goalEnabled = this.ctx.session.settings.get("goal.enabled");
 		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
 			if (recoveryHydration) return false;
-			this.ctx.sessionManager.appendModeChange("none");
+			this.ctx.session.appendModeChangeInBackground("none");
 			return true;
 		}
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
 			const goal = normalizeGoal(sessionContext.modeData?.goal) ?? undefined;
 			if (!goal) {
 				if (recoveryHydration) throw new Error("Recovery hydration rejected an invalid persisted goal state.");
-				this.ctx.sessionManager.appendModeChange("none");
+				this.ctx.session.appendModeChangeInBackground("none");
 				return true;
 			}
 			this.ctx.session.setGoalModeState({ enabled: sessionContext.mode === "goal", mode: "active", goal });
@@ -442,8 +442,8 @@ export class GoalModeController {
 		const currentState = this.ctx.session.getGoalModeState();
 		if (options?.reason === "completed") {
 			this.ctx.session.setGoalModeState(undefined);
-			this.ctx.sessionManager.appendModeChange("none");
-			this.ctx.sessionManager.appendCustomEntry("goal-completed", {
+			this.ctx.session.appendModeChangeInBackground("none");
+			this.ctx.session.appendCustomEntryInBackground("goal-completed", {
 				objective: currentState?.goal?.objective,
 				tokensUsed: currentState?.goal?.tokensUsed,
 				timeUsedSeconds: currentState?.goal?.timeUsedSeconds,

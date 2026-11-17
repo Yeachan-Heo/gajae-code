@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	type InventoryRecord,
 	pendingReviewErrors,
 	scanAcpMethods,
 	scanAgentSessionMethods,
@@ -449,6 +450,84 @@ describe("SDK operation inventory", () => {
 					exclusionMetadata: { adapterMappings: "not_applicable", testIds: "not_applicable" },
 				}),
 			);
+		}
+	});
+
+	it("reviews native stop and revision helper seams without admitting independent protocol operations", async () => {
+		const records = (await Bun.file(inventory).json()) as InventoryRecord[];
+		const source = await Bun.file(path.join(repoRoot, "packages/coding-agent/src/session/agent-session.ts")).text();
+		const discovered = scanAgentSessionMethods(source);
+		const expected = new Map([
+			[
+				"agent_session:acquireExternalStopAdmission",
+				"internal identity-bound reversible admission lease acquired by terminateEmbeddedAgentSession through native-lifecycle and acquireEmbeddedStopAdmission after consented work cancellation; the lease neither cancels work nor closes the session, so it is not turn.abort, session.close, or an independent protocol ingress",
+			],
+			[
+				"agent_session:getDisposeResourceState",
+				"internal non-writer cleanup evidence read by terminateEmbeddedAgentSession through native-lifecycle after joining disposal; settled resources do not prove transcript closure or durability, so this is not session.checkpoint or an independent protocol query",
+			],
+			[
+				"agent_session:cancelQueuedMessage",
+				"internal executable-display-identity cancellation used by cancelEmbeddedOwnedWork during consented terminateEmbeddedAgentSession teardown; returns removed/already_executing/unknown rather than queue.message.remove's editing payload and refuses stale display chips, so it is not that control contract or an independent protocol ingress",
+			],
+			[
+				"agent_session:cancelQueuedInputSubmission",
+				"internal exact tracked-submission cancellation used by cancelQueuedMessage and cancelEmbeddedOwnedWork during consented terminateEmbeddedAgentSession teardown; reports already_executing without aborting the delivered run, unlike queue.message.remove's stable display-ID editing contract, and is not an independent protocol ingress",
+			],
+			[
+				"agent_session:restoreTreeLeaf",
+				"internal exact presentation-cursor restoration used by restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
+			],
+			[
+				"agent_session:selectExecutionBranchDurably",
+				"internal durable execution-selection publication at accepted prompt preflight inside createEmbeddedAgentSession().revise (session.revise C84/G11); it does not perform the complete revision or open a session and is distinct from selectEmbeddedExecutionBranch's native checkpoint API, so it is not an independent protocol ingress",
+			],
+			[
+				"agent_session:prepareTreeEdit",
+				"internal tree-hook and admission preparation used by createEmbeddedAgentSession().revise (session.revise C84/G11) before prompt preflight; cannot publish an execution selection or submit the replacement prompt, so it is not the complete revision contract or an independent protocol ingress",
+			],
+		]);
+		for (const [sourceId, rationale] of expected) {
+			expect(discovered).toContain(sourceId);
+			// Exact records reject duplicate rows, accidental sdkId mappings, and inherited adapter authority.
+			expect(records.filter(record => record.sourceId === sourceId)).toEqual([
+				{
+					sourceId,
+					sourceFile: "packages/coding-agent/src/session/agent-session.ts",
+					sourceKind: "agent_session",
+					decision: "exclude",
+					rationale,
+					exclusionMetadata: { adapterMappings: "not_applicable", testIds: "not_applicable" },
+				},
+			]);
+		}
+		expect(pendingReviewErrors([...expected.keys()].map(sourceId => ({ sourceId })))).toEqual([]);
+	});
+
+	it("retains registry-derived stop, queue, and revision contracts alongside excluded helpers", async () => {
+		const records = (await Bun.file(inventory).json()) as InventoryRecord[];
+		for (const [id, kind, sdkId] of [
+			["C04", "control", "turn.abort"],
+			["C30", "control", "session.close"],
+			["C43", "control", "queue.message.remove"],
+			["Q30", "query", "session.checkpoint"],
+			["C84", "control", "session.revise"],
+			["G11", "global", "session.revise"],
+		] as const) {
+			const operation = findOperation(kind, sdkId);
+			if (!operation) throw new Error(`Missing registry operation: ${id} ${sdkId}`);
+			expect(operation.id).toBe(id);
+			expect(records.filter(record => record.sourceId === `registry:${id}`)).toEqual([
+				{
+					sourceId: `registry:${id}`,
+					sourceFile: "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+					sourceKind: "registry",
+					decision: "include",
+					sdkId,
+					adapterMappings: operation.adapterDispositions,
+					testIds: operation.testIds,
+				},
+			]);
 		}
 	});
 

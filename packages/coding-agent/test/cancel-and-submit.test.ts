@@ -367,8 +367,25 @@ describe("AgentSession.cancelAndSubmit", () => {
 			kind: "rolled_back",
 			outcome: { kind: "error", cause },
 		});
-		await activePrompt;
+		// The rollback restores every store before cancelAndSubmit resolves.
 		expect(stores(s)).toEqual(before);
+
+		// The aborted run is gone, so the restored queue is handed to queued delivery
+		// (cancelAndSubmit's finally). Whether the aborted prompt settles before or after
+		// that continuation is scheduling, not contract: once idle, the restored steer and
+		// follow-up were delivered exactly once and the rejected replacement was never sent.
+		await activePrompt;
+		await s.waitForIdle();
+		const texts = s.agent.state.messages.map(messageText);
+		expect(texts).not.toContain("send now");
+		expect(texts.filter(text => text === "mid-streaming: steer")).toHaveLength(1);
+		expect(texts.filter(text => text === "mid-streaming: follow-up")).toHaveLength(1);
+		expect(texts.indexOf("mid-streaming: steer")).toBeLessThan(texts.indexOf("mid-streaming: follow-up"));
+		expect(stores(s)).toEqual({
+			agent: { steering: [], followUp: [] },
+			display: { steering: [], followUp: [] },
+			pendingNextTurn: before.pendingNextTurn,
+		});
 	});
 
 	describe("seam-injected abort outcomes", () => {

@@ -29,6 +29,7 @@ import { JobTool } from "@gajae-code/coding-agent/tools/job";
 import { MonitorTool } from "@gajae-code/coding-agent/tools/monitor";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AsyncJobManager } from "../src/async";
 import { __sessionStateSidecarTestHooks } from "../src/gjc-runtime/session-state-sidecar";
 import { createTempDirRegistry, reapStaleTempDirs, sweepAfterSettle } from "./helpers/temp-dir-registry";
@@ -61,13 +62,8 @@ function stopReply(text: string): MockResponse {
 	};
 }
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(10);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10, label });
 
 describe("terminal abort registers a turn scope so left-running owned work classifies by source", () => {
 	let session: AgentSession;

@@ -17,9 +17,11 @@ import {
 	parseDictionaryArtifactCommit,
 	serializeParentBucketRecord,
 } from "../../src/session/internal/session-memory-sidecar";
+import { reduceResumeTranscript } from "../../src/session/resume-cursor";
 import {
 	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	type FileEntry,
 	type PreparedNewSession,
 	SessionManager,
 	SessionManagerTestHooks,
@@ -160,14 +162,34 @@ describe("SessionManager cold sidecar integration", () => {
 			expect(branch[0]?.id).toBe(ids[0]);
 			expect(branch.at(-1)?.type).toBe("compaction");
 			expect(manager.getEntriesForExport()).toHaveLength(202);
+			const contextBeforeRewrite = manager.buildSessionContext();
 			await manager.rewriteEntries();
 			const rewrittenEntries = storage
 				.readTextSync(sessionFile)
 				.trimEnd()
 				.split("\n")
-				.map(line => JSON.parse(line) as { id?: string });
-			expect(rewrittenEntries).toHaveLength(203);
-			expect(rewrittenEntries.some(entry => entry.id === ids[0])).toBe(true);
+				.map(line => JSON.parse(line) as FileEntry);
+			// The 203 original physical records are unchanged and retain their exact order.
+			expect(rewrittenEntries).toHaveLength(204);
+			expect<unknown>(rewrittenEntries.slice(0, 203)).toEqual(entries);
+			const metadata = rewrittenEntries.slice(203);
+			expect(metadata).toHaveLength(1);
+			expect(metadata[0]).toMatchObject({
+				type: "custom",
+				customType: "gjc.owner_enroll",
+				parentId: "compaction-0001",
+				data: {
+					v: 1,
+					bind: "sidecar-session",
+					member: manager.getSessionOwnerEvidence()?.memberId,
+					epoch: manager.getSessionOwnerEvidence()?.epoch,
+				},
+			});
+			const reduced = reduceResumeTranscript(rewrittenEntries, "fixture");
+			expect(reduced.markerEvidence).toHaveLength(1);
+			expect(reduced.diagnostics).toEqual([]);
+			expect(reduced.checkpoint.leafEntryId).toBe("compaction-0001");
+			expect(manager.buildSessionContext()).toEqual(contextBeforeRewrite);
 			manager.branch(ids[0]);
 			expect(manager.getBranch().map(entry => entry.id)).toEqual([ids[0]]);
 			expect(manager.getLastModelChangeRole()).toBeUndefined();
@@ -1411,6 +1433,86 @@ it("folds direct fork header and entry patches without full transcript reads", a
 		expect(forked.getEntry("kept")).toMatchObject({ message: { content: "after" } });
 	} finally {
 		await forked.close();
+	}
+});
+
+it("bounds enrollment-prefixed history without treating physical metadata as an execution root", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/enrollment-prefixed.jsonl";
+	const enrollments = (["member-one", "member-two", "member-three"] as const).map(member => ({
+		type: "custom" as const,
+		id: member,
+		parentId: member === "member-three" ? "kept" : null,
+		timestamp: "0",
+		customType: "gjc.owner_enroll",
+		data: {
+			v: 1,
+			bind: "enrollment-prefixed",
+			member,
+			runtime: "fixture",
+			pid: 1,
+			processIncarnation: "fixture-incarnation",
+			hostId: "fixture-host",
+			epoch: "fixture-epoch",
+		},
+	}));
+	const records: FileEntry[] = [
+		{ type: "session", version: 5, id: "enrollment-prefixed", timestamp: "0", cwd: "/cwd" },
+		enrollments[0]!,
+		enrollments[1]!,
+		{ type: "custom", id: "cold", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "cold", timestamp: "0", customType: "node", data: {} },
+		enrollments[2]!,
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			lazyReopenSucceeded: true,
+			coldRetirementActive: true,
+			firstOpen: { recordsParsed: 10, semanticRecordsParsed: 7, suffixRecordsParsed: 3 },
+		});
+		expect(manager.getLeafId()).toBe("compact");
+		const firstMarker = records[1];
+		const secondMarker = records[2];
+		if (!firstMarker || firstMarker.type === "session" || !secondMarker || secondMarker.type === "session")
+			throw new Error("Missing original enrollment fixture records");
+		expect(manager.getEntry("member-one")).toEqual(firstMarker);
+		expect(manager.getEntry("member-two")).toEqual(secondMarker);
+		const id = manager.appendCustomEntry("after", { payload: true });
+		expect(manager.getEntry(id)).toMatchObject({ parentId: "compact" });
+		expect(manager.getSessionMemoryStats().currentCommitTransition).toEqual({
+			kind: "exact",
+			reason: "descriptor_and_proof_match",
+		});
+		const persisted = storage
+			.readTextSync(sessionFile)
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(persisted).toHaveLength(8);
+		expect(persisted.slice(0, 7)).toEqual(records);
+		const reduced = reduceResumeTranscript(persisted, "fixture");
+		expect(reduced.diagnostics).toEqual([]);
+		expect(reduced.markerEvidence).toHaveLength(3);
+		expect(reduced.checkpoint.leafEntryId).toBe(id);
+	} finally {
+		await manager.close();
 	}
 });
 
@@ -3632,36 +3734,9 @@ describe("whole-session persistence freshness", () => {
 		}
 	});
 	it("aborts a prepared rewrite when the manager adopts another lifecycle", async () => {
-		class LifecycleRaceStorage extends MemorySessionStorage {
-			blockNextFlush = false;
-			readonly flushStarted = Promise.withResolvers<void>();
-			readonly releaseFlush = Promise.withResolvers<void>();
-			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
-				const writer = super.openWriter(filePath, options);
-				if (filePath.includes(".spill.")) return writer;
-				return {
-					writeLine: writer.writeLine.bind(writer),
-					writeLineSync: writer.writeLineSync.bind(writer),
-					flush: async () => {
-						if (this.blockNextFlush) {
-							this.blockNextFlush = false;
-							this.flushStarted.resolve();
-							await this.releaseFlush.promise;
-						}
-						await writer.flush();
-					},
-					fsync: writer.fsync.bind(writer),
-					fsyncSync: writer.fsyncSync?.bind(writer),
-					statSync: writer.statSync?.bind(writer),
-					close: writer.close.bind(writer),
-					closeSync: writer.closeSync.bind(writer),
-					getError: writer.getError.bind(writer),
-					getCloseState: writer.getCloseState.bind(writer),
-					getCloseError: writer.getCloseError.bind(writer),
-				};
-			}
-		}
-		const storage = new LifecycleRaceStorage();
+		const storage = new MemorySessionStorage();
+		const prepared = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
 		const sourceFile = "/sessions/rewrite-lifecycle-source.jsonl";
 		const destinationFile = "/sessions/rewrite-lifecycle-destination.jsonl";
 		storage.writeTextSync(
@@ -3685,21 +3760,103 @@ describe("whole-session persistence freshness", () => {
 			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
 			await manager.flush();
 			const sourceBeforeRewrite = storage.readTextSync(sourceFile);
-			storage.blockNextFlush = true;
+			SessionManagerTestHooks.beforeRewriteFence = async () => {
+				prepared.resolve();
+				await release.promise;
+			};
 			const rewrite = manager.rewriteEntries();
-			await storage.flushStarted.promise;
+			await prepared.promise;
 			manager.restoreState(destinationSnapshot);
-			storage.releaseFlush.resolve();
+			release.resolve();
 			await expect(rewrite).rejects.toThrow("session_persistence_lifecycle_changed");
 			expect(storage.readTextSync(sourceFile)).toBe(sourceBeforeRewrite);
 			expect(storage.readTextSync(destinationFile)).not.toContain(sourceEntryId);
 			expect(manager.getSessionId()).toBe("rewrite-destination");
 			expect(manager.getEntry(sourceEntryId)).toBeUndefined();
 		} finally {
-			storage.releaseFlush.resolve();
+			release.resolve();
+			SessionManagerTestHooks.beforeRewriteFence = undefined;
 			await expect(manager.close()).rejects.toThrow("session_persistence_lifecycle_changed");
 		}
 	});
+	it("refuses synchronous rollback while the predecessor close is still draining", async () => {
+		class DrainingCloseStorage extends MemorySessionStorage {
+			blockNextFlush = false;
+			readonly started = Promise.withResolvers<void>();
+			readonly release = Promise.withResolvers<void>();
+			readonly writers: SessionStorageWriter[] = [];
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				if (filePath.includes(".spill.")) return writer;
+				this.writers.push(writer);
+				return {
+					writeLine: writer.writeLine.bind(writer),
+					writeLineSync: writer.writeLineSync.bind(writer),
+					flush: async () => {
+						if (this.blockNextFlush) {
+							this.blockNextFlush = false;
+							this.started.resolve();
+							await this.release.promise;
+						}
+						await writer.flush();
+					},
+					fsync: writer.fsync.bind(writer),
+					fsyncSync: writer.fsyncSync?.bind(writer),
+					statSync: writer.statSync?.bind(writer),
+					close: writer.close.bind(writer),
+					closeSync: writer.closeSync.bind(writer),
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new DrainingCloseStorage();
+		const sourceFile = "/sessions/draining-close-source.jsonl";
+		const targetFile = "/sessions/draining-close-target.jsonl";
+		for (const [file, id] of [
+			[sourceFile, "draining-source"],
+			[targetFile, "draining-target"],
+		] as const)
+			storage.writeTextSync(
+				file,
+				`${JSON.stringify({ type: "session", version: 5, id, timestamp: "0", cwd: "/cwd" })}\n`,
+			);
+		const manager = await SessionManager.open(
+			targetFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const snapshot = manager.captureState();
+		let rewrite: Promise<void> | undefined;
+		try {
+			await manager.setSessionFile(sourceFile);
+			manager.appendCustomEntry("source-entry", {});
+			await manager.flush();
+			const sourceBefore = storage.readTextSync(sourceFile);
+			const targetBefore = storage.readTextSync(targetFile);
+			storage.blockNextFlush = true;
+			rewrite = manager.rewriteEntries();
+			await storage.started.promise;
+			expect(() => manager.restoreState(snapshot)).toThrow("Writer close outcome is unknown");
+			expect(storage.writers.at(-1)?.getCloseState()).toBe("open");
+			expect(manager.getSessionId()).toBe("draining-source");
+			expect(storage.readTextSync(sourceFile)).toBe(sourceBefore);
+			expect(storage.readTextSync(targetFile)).toBe(targetBefore);
+			storage.release.resolve();
+			await expect(rewrite).rejects.toThrow("Writer close outcome is unknown");
+			expect(storage.writers.at(-1)?.getCloseState()).toBe("closed");
+			expect(storage.readTextSync(sourceFile)).toBe(sourceBefore);
+			expect(storage.readTextSync(targetFile)).toBe(targetBefore);
+		} finally {
+			storage.release.resolve();
+			await rewrite?.catch(() => {});
+			await manager.close().catch(() => {});
+		}
+	});
+
 	it.each([1, 2])("clears the original certified writer-close error after %i failed attempts", async failures => {
 		class RetryableCloseStorage extends MemorySessionStorage {
 			closeFailures = failures;
@@ -3766,7 +3923,7 @@ describe("whole-session persistence freshness", () => {
 								this.events.push(`rewrite-close-${this.rewriteCloseDispatches}`);
 								if (this.#rewriteCloseFailures > 0) {
 									this.#rewriteCloseFailures--;
-									throw new Error("rewrite_debt_error_y");
+									throw new SessionStorageWriterRetryableCloseError("rewrite_debt_error_y");
 								}
 								return;
 							}
@@ -3822,7 +3979,7 @@ describe("whole-session persistence freshness", () => {
 		expect(manager.getEntry("existing")).toEqual(existing);
 		expect(manager.getEntries()).toHaveLength(2);
 		await expect(manager.close()).rejects.toThrow("rewrite_debt_error_y");
-		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1"]);
+		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1", "rewrite-close-2"]);
 		expect(storage.readTextSync(sessionFile)).toBe(beforeRewrite);
 		expect(manager.getEntry("existing")).toEqual(existing);
 		expect(manager.getEntries()).toHaveLength(2);
@@ -3830,7 +3987,13 @@ describe("whole-session persistence freshness", () => {
 		// The real close body must finish the rewrite and release resident state,
 		// even though the second attempt already closed and released its writer.
 		await expect(manager.close()).resolves.toBeUndefined();
-		expect(storage.events).toEqual(["session-close-1", "session-close-2", "rewrite-close-1", "rewrite-close-2"]);
+		expect(storage.events).toEqual([
+			"session-close-1",
+			"session-close-2",
+			"rewrite-close-1",
+			"rewrite-close-2",
+			"rewrite-close-3",
+		]);
 		expect(manager.getEntries()).toHaveLength(0);
 		expect(manager.getHeader()).toBeNull();
 		expect(manager.hasHistoryEntries()).toBe(false);
@@ -3852,6 +4015,143 @@ describe("whole-session persistence freshness", () => {
 		expect(manager.getEntries()).toHaveLength(0);
 		expect(manager.hotRetainedMessageCharsForTests()).toBe(0);
 	});
+	it.each([
+		false,
+		true,
+	])("retains certified temporary-writer cleanup ownership with replacement=%s", async replaceTemp => {
+		class RetryableRewriteStorage extends MemorySessionStorage {
+			rewriteCloses = 0;
+			readonly tempPaths: string[] = [];
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (!filePath.endsWith(".tmp")) return super.openWriter(filePath, options);
+				this.tempPaths.push(filePath);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.rewriteCloses++;
+							if (this.rewriteCloses <= 2)
+								throw new SessionStorageWriterRetryableCloseError("retained_rewrite_close");
+						},
+					},
+				});
+			}
+		}
+		const storage = new RetryableRewriteStorage();
+		const sessionFile = "/sessions/retained-rewrite-close.jsonl";
+		const records: FileEntry[] = [
+			{ type: "session", version: 5, id: "retained-rewrite-close", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "existing",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "before", timestamp: 0 },
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const before = storage.readTextSync(sessionFile);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const existing = manager.getEntry("existing");
+		if (existing?.type !== "message") throw new Error("Missing message fixture");
+		existing.message = { role: "user", content: "after", timestamp: 0 };
+		manager.applyEntryMessageUpdates([existing]);
+		expect(await manager.closeStrict()).toMatchObject({
+			kind: "close_failed_retryable",
+			error: { message: "retained_rewrite_close" },
+		});
+		expect(storage.rewriteCloses).toBe(2);
+		expect(storage.readTextSync(sessionFile)).toBe(before);
+		expect(manager.getEntry("existing")).toEqual(existing);
+		expect(storage.tempPaths).toHaveLength(1);
+		const retainedTemp = storage.tempPaths[0]!;
+		if (replaceTemp) {
+			storage.unlinkSync(retainedTemp);
+			storage.writeTextSync(retainedTemp, "unowned replacement");
+		}
+		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+		if (replaceTemp) expect(storage.readTextSync(retainedTemp)).toBe("unowned replacement");
+		else expect(storage.existsSync(retainedTemp)).toBe(false);
+		expect(storage.tempPaths).toHaveLength(2);
+		expect(storage.rewriteCloses).toBe(4);
+		expect(storage.readTextSync(sessionFile)).toBe(
+			`${[records[0], existing].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+		);
+		expect(manager.getEntries()).toHaveLength(0);
+		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+		expect(storage.rewriteCloses).toBe(4);
+	});
+
+	it.each([1, 2])("never retries an uncertain rewrite close at dispatch %i", async unknownAttempt => {
+		class UnknownRewriteCloseStorage extends MemorySessionStorage {
+			rewriteCloses = 0;
+			override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+				if (!filePath.endsWith(".tmp")) return super.openWriter(filePath, options);
+				return super.openWriter(filePath, {
+					...options,
+					closeAdapter: {
+						close: () => {
+							this.rewriteCloses++;
+							if (this.rewriteCloses < unknownAttempt)
+								throw new SessionStorageWriterRetryableCloseError("certified_before_unknown");
+							throw new Error("uncertain_rewrite_close");
+						},
+					},
+				});
+			}
+		}
+		const storage = new UnknownRewriteCloseStorage();
+		const sessionFile = "/sessions/unknown-rewrite-close.jsonl";
+		const records: FileEntry[] = [
+			{ type: "session", version: 5, id: "unknown-rewrite-close", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "existing",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "before", timestamp: 0 },
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const before = storage.readTextSync(sessionFile);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const existing = manager.getEntry("existing");
+		if (existing?.type !== "message") throw new Error("Missing message fixture");
+		existing.message = { role: "user", content: "after", timestamp: 0 };
+		manager.applyEntryMessageUpdates([existing]);
+		const rename = vi.spyOn(storage, "renameSync");
+		try {
+			const outcome = await manager.closeStrict();
+			expect(outcome).toMatchObject({
+				kind: "close_unknown",
+				error: { message: "uncertain_rewrite_close" },
+			});
+			expect(storage.rewriteCloses).toBe(unknownAttempt);
+			expect(storage.readTextSync(sessionFile)).toBe(before);
+			expect(rename).not.toHaveBeenCalled();
+			expect(await manager.closeStrict()).toBe(outcome);
+			await expect(manager.close()).rejects.toThrow("uncertain_rewrite_close");
+			expect(storage.rewriteCloses).toBe(unknownAttempt);
+			expect(storage.readTextSync(sessionFile)).toBe(before);
+			expect(rename).not.toHaveBeenCalled();
+			expect(manager.getEntry("existing")).toEqual(existing);
+		} finally {
+			rename.mockRestore();
+		}
+	});
+
 	it("resets a stale close origin across session replacement", async () => {
 		class ReplacementCloseStorage extends MemorySessionStorage {
 			readonly closeDispatches = new Map<string, number>();
@@ -4156,12 +4456,30 @@ describe("sidecar I/O fallback", () => {
 			return realStat(filePath);
 		});
 		try {
-			manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
+			const appendedId = manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
 			expect(manager.getSessionMemoryStats()).toMatchObject({
 				coldRetirementActive: true,
 				currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
 			});
 			expect(statSpy.mock.calls.some(([filePath]) => filePath === sessionFile)).toBe(false);
+			const persisted = storage
+				.readTextSync(sessionFile)
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(persisted).toHaveLength(6);
+			expect(persisted.slice(0, 4)).toEqual(records);
+			expect(persisted[4]).toMatchObject({
+				type: "custom",
+				customType: "gjc.owner_enroll",
+				parentId: "compact",
+				data: { bind: "writer-descriptor", member: manager.getSessionOwnerEvidence()?.memberId },
+			});
+			expect(persisted[5]).toEqual(manager.getEntry(appendedId));
+			const reduced = reduceResumeTranscript(persisted, "fixture");
+			expect(reduced.markerEvidence).toHaveLength(1);
+			expect(reduced.diagnostics).toEqual([]);
+			expect(reduced.checkpoint.leafEntryId).toBe(appendedId);
 		} finally {
 			statSpy.mockRestore();
 			await manager.close();
@@ -5164,9 +5482,10 @@ describePosix("managed session memory authority", () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
 		let sessionFile: string;
+		let firstId = "";
 		try {
 			manager.setSessionMemoryMode("enabled");
-			const firstId = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+			firstId = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
 			const keptId = manager.appendMessage({ role: "user", content: "kept", timestamp: 2 });
 			await manager.ensureOnDisk();
 			manager.appendCompaction("summary", undefined, keptId, 10);
@@ -5196,7 +5515,7 @@ describePosix("managed session memory authority", () => {
 					lazyReopenSucceeded: true,
 					lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 				});
-				expect(reopened.getLabel(reopened.getEntries()[0]!.id)).toBe("managed label");
+				expect(reopened.getLabel(firstId)).toBe("managed label");
 				expect(reopened.buildSessionContext().messages).toHaveLength(3);
 			} finally {
 				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;

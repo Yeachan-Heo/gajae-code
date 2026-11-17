@@ -4,9 +4,10 @@ import type { Model } from "@gajae-code/ai";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import type { PreparedProfileModelSelection } from "@gajae-code/coding-agent/session/agent-session";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({
@@ -32,12 +33,7 @@ const profile = (name: string, provider: string, selector: string): ModelProfile
 const codexProfile = profile("codex-medium", "openai-codex", "openai-codex/gpt-5.5:medium");
 const minimaxProfile = profile("minimax-medium", "minimax-code", "minimax-code/MiniMax-M3:medium");
 const plainMinimaxProfile = profile("minimax", "minimax-code", "minimax-code/MiniMax-M3:medium");
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 function createControllerContext(
 	options: {
@@ -168,15 +164,15 @@ function createControllerContext(
 }
 
 async function login(ctx: InteractiveModeContext, providerId: string): Promise<void> {
-	installTestTheme();
+	setThemeInstance(testTheme);
 	const controller = new SelectorController(ctx);
 	await controller.showOAuthSelector("login", providerId);
 }
 
 describe("login preset recommendation", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 
 	test("login on openai-codex with no active profile prompts and confirm activates session-only profile", async () => {

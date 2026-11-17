@@ -1,3 +1,4 @@
+import { isRecord } from "@gajae-code/utils";
 import {
 	FUNCTION_HOOK_CAPABILITIES,
 	type FunctionHookCapability,
@@ -94,10 +95,6 @@ const MCP_SERVER_ALIAS_UNSUPPORTED_KEYS = [
 ] as const;
 
 const MCP_TRANSPORTS: readonly GjcPluginMcpTransport[] = ["stdio", "http", "sse"];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function rejectUnknownKeys(
 	value: Record<string, unknown>,

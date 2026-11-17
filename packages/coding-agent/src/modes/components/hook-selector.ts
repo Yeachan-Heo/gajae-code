@@ -6,6 +6,7 @@ import {
 	type AutocompleteProvider,
 	Container,
 	Editor,
+	isBareLineFeed,
 	Markdown,
 	matchesKey,
 	padding,
@@ -663,7 +664,8 @@ export class HookSelectorComponent extends Container {
 			void this.#openExternalEditor(editor);
 			return;
 		}
-		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return")) {
+		// A bare LF is the newline chord (Ctrl+J, Shift+Enter→LF terminal mappings).
+		if (!isBareLineFeed(keyData) && (matchesKey(keyData, "enter") || matchesKey(keyData, "return"))) {
 			const text = editor.getExpandedText();
 			if (this.#activeInput?.allowEmpty === false && text.trim() === "") {
 				return;

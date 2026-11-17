@@ -4,12 +4,22 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
+import {
+	type AuthCredential,
+	type AuthCredentialCommitOptions,
+	AuthStorage,
+	SqliteAuthCredentialStore,
+	type StoredAuthCredential,
+} from "../src/auth-storage";
+import { registerOAuthProvider, unregisterOAuthProviders } from "../src/utils/oauth";
 import * as commandcodeModule from "../src/utils/oauth/commandcode";
 import * as deepseekModule from "../src/utils/oauth/deepseek";
 import * as kagiModule from "../src/utils/oauth/kagi";
 import * as ollamaCloudModule from "../src/utils/oauth/ollama-cloud";
+import * as codexModule from "../src/utils/oauth/openai-codex";
 import * as openrouterModule from "../src/utils/oauth/openrouter";
+import type { OAuthCredentials } from "../src/utils/oauth/types";
+import * as xaiModule from "../src/utils/oauth/xai";
 
 function countCredentialRows(dbPath: string, provider: string): number {
 	const db = new Database(dbPath, { readonly: true });
@@ -48,6 +58,7 @@ describe("AuthStorage api-key login replacement", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		unregisterOAuthProviders("credential-commit-test");
 		store?.close();
 		store = null;
 		authStorage = null;
@@ -56,6 +67,201 @@ describe("AuthStorage api-key login replacement", () => {
 			await fs.rm(tempDir, { recursive: true, force: true });
 			tempDir = "";
 		}
+	});
+
+	for (const flow of ["api-key", "device", "oauth", "xai"] as const) {
+		it(`admits the actual ${flow} credential commit only after provider preflight`, async () => {
+			if (!store || !authStorage) throw new Error("test setup failed");
+			const storage = authStorage;
+			const credentialStore = store;
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const events: string[] = [];
+			const oauth: OAuthCredentials = {
+				access: "synthetic-access",
+				refresh: "synthetic-refresh",
+				expires: 9_999_999_999_999,
+				email: "commit@example.invalid",
+			};
+			const provider =
+				flow === "api-key"
+					? "kagi"
+					: flow === "device"
+						? "openai-codex-device"
+						: flow === "xai"
+							? "xai"
+							: "unit-credential-commit";
+			const storedProvider = flow === "device" ? "openai-codex" : provider;
+			const expected: AuthCredential =
+				flow === "api-key" ? { type: "api_key", key: "synthetic-key" } : { type: "oauth", ...oauth };
+			const preflight = async (): Promise<void> => {
+				events.push("provider");
+				entered.resolve();
+				await release.promise;
+				events.push("provider-done");
+			};
+			if (flow === "api-key") {
+				loginKagiSpy.mockImplementation(async () => {
+					await preflight();
+					return "synthetic-key";
+				});
+			} else if (flow === "device") {
+				vi.spyOn(codexModule, "loginOpenAICodexDevice").mockImplementation(async () => {
+					await preflight();
+					return oauth;
+				});
+			} else if (flow === "xai") {
+				vi.spyOn(xaiModule, "loginXai").mockImplementation(async () => {
+					await preflight();
+					return oauth;
+				});
+			} else {
+				registerOAuthProvider({
+					id: provider,
+					name: "Credential commit synthetic",
+					sourceId: "credential-commit-test",
+					async login() {
+						await preflight();
+						return oauth;
+					},
+				});
+			}
+			const rejected = new Error("credential admission refused");
+			let refuse = true;
+			const options: AuthCredentialCommitOptions = {
+				async withCredentialCommit(commit) {
+					events.push("admit");
+					if (refuse) throw rejected;
+					expect(credentialStore.listAuthCredentials(storedProvider)).toEqual([]);
+					const result = commit();
+					// The synchronous store effect has already occurred inside admission.
+					expect(credentialStore.listAuthCredentials(storedProvider).map(entry => entry.credential)).toEqual([
+						expected,
+					]);
+					events.push("committed");
+					return await result;
+				},
+			};
+			const controller = { onAuth: () => {}, onPrompt: async () => "" };
+			const pending = storage.login(provider, controller, {}, options);
+			const rejectedResult = pending.then(
+				() => ({ status: "fulfilled" as const }),
+				(error: unknown) => ({ status: "rejected" as const, error }),
+			);
+			await entered.promise;
+			expect(events).toEqual(["provider"]);
+			expect(credentialStore.listAuthCredentials(storedProvider)).toEqual([]);
+			release.resolve();
+			expect(await rejectedResult).toEqual({ status: "rejected", error: rejected });
+			expect(events).toEqual(["provider", "provider-done", "admit"]);
+			expect(countCredentialRows(dbPath, storedProvider)).toBe(0);
+			expect(storage.get(storedProvider)).toBeUndefined();
+			refuse = false;
+			await storage.login(provider, controller, {}, options);
+			expect(events.slice(-4)).toEqual(["provider", "provider-done", "admit", "committed"]);
+			expect(credentialStore.listAuthCredentials(storedProvider).map(entry => entry.credential)).toEqual([expected]);
+		});
+	}
+
+	for (const operation of ["replace", "upsert"] as const) {
+		it(`does not dispatch a refused remote ${operation} and owns its original commit future`, async () => {
+			if (!store) throw new Error("test setup failed");
+			const local = store;
+			const response = Promise.withResolvers<StoredAuthCredential[]>();
+			const events: string[] = [];
+			const provider = operation === "replace" ? "kagi" : "unit-remote-credential";
+			const credential: AuthCredential =
+				operation === "replace"
+					? { type: "api_key", key: "remote-synthetic" }
+					: { type: "oauth", access: "remote-access", refresh: "remote-refresh", expires: 9_999_999_999_999 };
+			const dispatch = (actualProvider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]> => {
+				events.push("remote-dispatch");
+				expect(actualProvider).toBe(provider);
+				expect(credentials).toEqual([credential]);
+				return response.promise;
+			};
+			const remoteStore = Object.assign(local, {
+				replaceAuthCredentialsRemote: dispatch,
+				upsertAuthCredentialRemote(actualProvider: string, value: AuthCredential): Promise<StoredAuthCredential[]> {
+					return dispatch(actualProvider, [value]);
+				},
+			});
+			const remote = new AuthStorage(remoteStore);
+			if (credential.type === "oauth") {
+				registerOAuthProvider({
+					id: provider,
+					name: "Remote credential synthetic",
+					sourceId: "credential-commit-test",
+					async login() {
+						return credential;
+					},
+				});
+			}
+			const invoke = (options: AuthCredentialCommitOptions): Promise<void> =>
+				operation === "replace"
+					? remote.set(provider, credential, options)
+					: remote.login(provider, { onAuth: () => {}, onPrompt: async () => "" }, {}, options);
+			const refused = new Error("remote admission refused");
+			await expect(
+				invoke({
+					withCredentialCommit: async () => {
+						throw refused;
+					},
+				}),
+			).rejects.toBe(refused);
+			expect(events).toEqual([]);
+			expect(local.listAuthCredentials(provider)).toEqual([]);
+			const dispatched = Promise.withResolvers<void>();
+			const pending = invoke({
+				async withCredentialCommit(commit) {
+					events.push("admit");
+					const future = commit();
+					expect(future).toBe(response.promise);
+					dispatched.resolve();
+					const result = await future;
+					events.push("remote-settled");
+					return result;
+				},
+			});
+			await dispatched.promise;
+			expect(events).toEqual(["admit", "remote-dispatch"]);
+			expect(remote.get(provider)).toBeUndefined();
+			response.resolve([{ id: 101, provider, credential, disabledCause: null }]);
+			await pending;
+			expect(events).toEqual(["admit", "remote-dispatch", "remote-settled"]);
+			expect(remote.get(provider)).toEqual(credential);
+		});
+	}
+
+	it("leaves existing local credentials and selection unchanged when a set is refused", async () => {
+		if (!store || !authStorage) throw new Error("test setup failed");
+		await authStorage.set("kagi", { type: "api_key", key: "retained-synthetic" });
+		const before = store.listAuthCredentials("kagi");
+		const generation = authStorage.getProviderConfigurationGeneration("kagi");
+		const refused = new Error("replacement refused");
+		await expect(
+			authStorage.set(
+				"kagi",
+				{ type: "api_key", key: "candidate-synthetic" },
+				{
+					withCredentialCommit: async () => {
+						throw refused;
+					},
+				},
+			),
+		).rejects.toBe(refused);
+		expect(store.listAuthCredentials("kagi")).toEqual(before);
+		expect(countCredentialRows(dbPath, "kagi")).toBe(1);
+		expect(authStorage.get("kagi")).toEqual({ type: "api_key", key: "retained-synthetic" });
+		expect(authStorage.getProviderConfigurationGeneration("kagi")).toBe(generation);
+	});
+
+	it("keeps an unguarded local setter synchronous until its returned promise", async () => {
+		if (!store || !authStorage) throw new Error("test setup failed");
+		const pending = authStorage.set("kagi", { type: "api_key", key: "ordinary-synthetic" });
+		expect(store.getApiKey("kagi")).toBe("ordinary-synthetic");
+		expect(authStorage.get("kagi")).toEqual({ type: "api_key", key: "ordinary-synthetic" });
+		await pending;
 	});
 
 	it("reuses the stored api-key row when re-login returns the same key", async () => {

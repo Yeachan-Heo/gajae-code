@@ -10,11 +10,11 @@ import { Settings } from "../src/config/settings";
 import { getDefault } from "../src/config/settings-schema";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { type CreateAgentSessionOptions, createAgentSession } from "../src/sdk/session";
-import { AgentSession } from "../src/session/agent-session";
+import { AgentSession, SharedControlPublicationError } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
-import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
+import { type FileEntry, SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
 
 const roots: string[] = [];
@@ -23,6 +23,25 @@ const managers: SessionManager[] = [];
 const registries: ModelRegistry[] = [];
 const stores: AuthStorage[] = [];
 const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
+
+function executionEntries(entries: FileEntry[], manager: SessionManager): FileEntry[] {
+	const markers = entries.filter(entry => entry.type === "custom" && entry.customType === "gjc.owner_enroll");
+	const owner = manager.getSessionOwnerEvidence();
+	expect(markers).toHaveLength(1);
+	expect(markers[0]).toMatchObject({
+		type: "custom",
+		customType: "gjc.owner_enroll",
+		parentId: null,
+		data: {
+			v: 1,
+			bind: manager.getSessionId(),
+			member: owner?.memberId,
+			epoch: owner?.epoch,
+			runtime: "cooperative_tui",
+		},
+	});
+	return entries.filter(entry => !markers.includes(entry));
+}
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -256,16 +275,18 @@ describe("shared AgentSession control admission", () => {
 	] as const) {
 		it(`factory shared authority follows trusted provenance: ${label}`, async () => {
 			const f = await fixture(false, false, undefined, false, { cli, options });
+			// Only trusted root provenance opts an untouched session into shared publication.
+			expect(f.session.usesSharedControlPublication()).toBe(admitted);
 			await f.admit();
+			// Once the logical session requires shared admission every provenance continues
+			// through the shared protocol (#7824) instead of being refused.
+			expect(f.session.usesSharedControlPublication()).toBe(true);
 			const before = await Bun.file(f.file).text();
-			const rename = async () => f.session.setSessionName("trusted root title");
-			if (admitted) {
-				await rename();
-				expect(f.manager.getSessionName()).toBe("trusted root title");
-			} else {
-				await expect(rename()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-				expect(await Bun.file(f.file).text()).toBe(before);
-			}
+			await f.session.setSessionName("trusted root title");
+			expect(f.manager.getSessionName()).toBe("trusted root title");
+			const reopened = await SessionManager.open(f.file, f.destination);
+			managers.push(reopened);
+			expect(reopened.getEntries().length).toBeGreaterThanOrEqual(before.trim().split("\n").length - 1);
 		});
 	}
 
@@ -322,14 +343,58 @@ describe("shared AgentSession control admission", () => {
 			if (++reads === 2) throw new Error("publication verification unavailable");
 			return result;
 		});
-		await expect(f.session.activateDiscoveredTools(["scheduled_fixture"])).rejects.toMatchObject({
-			message: "Shared discovered-tool activation unknown",
-			cause: { kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) },
-		});
+		let thrown: unknown;
+		try {
+			await f.session.activateDiscoveredTools(["scheduled_fixture"]);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(SharedControlPublicationError);
+		const error = thrown as SharedControlPublicationError;
+		expect(error).toMatchObject({ code: "unknown", operation: "select active tools" });
+		expect(error.outcome).toMatchObject({ kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) });
 		expect(reads).toBe(2);
 		expect(f.session.getActiveToolNames()).toEqual(before);
 		expect(f.agent.state.systemPrompt).toEqual(prompt);
 		expect((await Bun.file(f.file).text()).startsWith(original)).toBe(true);
+		// The unproven selection keeps its receipt, closes ingress, and latches persistence
+		// so no later publication continues from a transcript this session cannot vouch for.
+		expect(f.session.isDisposed).toBe(true);
+		expect(await f.manager.appendToolSelectionsSharingSession(undefined, ["scheduled_fixture"], () => true)).toEqual({
+			kind: "stale",
+			reason: "persistence_latched",
+		});
+		sessions.splice(sessions.indexOf(f.session), 1);
+		managers.splice(managers.indexOf(f.manager), 1);
+		expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: error.outcome } });
+		await f.session.dispose().catch(() => {});
+	});
+
+	it("fails closed with the committed receipt when discovered-tool promotion throws", async () => {
+		const f = await fixture(false, true, undefined, true);
+		const before = f.session.getActiveToolNames();
+		const promotion = new Error("live promotion failed");
+		vi.spyOn(f.agent, "setSystemPrompt").mockImplementation(() => {
+			throw promotion;
+		});
+		let thrown: unknown;
+		try {
+			await f.session.activateDiscoveredTools(["scheduled_fixture"]);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(SharedControlPublicationError);
+		const error = thrown as SharedControlPublicationError;
+		expect(error).toMatchObject({ code: "committed_not_applied", operation: "select active tools" });
+		expect(error.cause).toBe(promotion);
+		if (error.outcome.kind !== "committed") throw new Error(error.outcome.kind);
+		const [receipt] = error.outcome.ids;
+		// The selection is durable under its receipt while the live tools never changed,
+		// so the session closes instead of running on tools its transcript no longer names.
+		expect(await Bun.file(f.file).text()).toContain(`"id":"${receipt}"`);
+		expect(f.session.getActiveToolNames()).toEqual(before);
+		expect(f.session.isDisposed).toBe(true);
+		await f.session.dispose().catch(() => {});
 	});
 	it("renames an opted-in root after shared append without moving its branch cursor", async () => {
 		const f = await fixture(false, true);
@@ -473,21 +538,28 @@ describe("shared AgentSession control admission", () => {
 		const lines = (await Bun.file(file).text())
 			.trim()
 			.split("\n")
-			.map(
-				line =>
-					JSON.parse(line) as {
-						type: string;
-						id?: string;
-						title?: string;
-						message?: { content: string };
-					},
-			);
+			.map(line => JSON.parse(line) as FileEntry);
 		expect(lines[0]).toMatchObject({ type: "session", title: "First title" });
-		expect(lines.slice(1).map(entry => entry.id)).toEqual([first, second]);
-		expect(lines.slice(1).map(entry => entry.message?.content)).toEqual(["pending one", "pending two"]);
+		const execution = executionEntries(lines.slice(1), manager);
+		expect(execution.map(entry => entry.id)).toEqual([first, second]);
+		expect(
+			execution.map(entry =>
+				entry.type === "message" && entry.message.role === "user" ? entry.message.content : undefined,
+			),
+		).toEqual(["pending one", "pending two"]);
 		const append = await manager.appendMessageSharingSession(user("after title bootstrap"));
 		expect(append.kind).toBe("committed");
-		expect((await Bun.file(file).text()).includes('"after title bootstrap"')).toBe(true);
+		if (append.kind !== "committed") throw new Error(`Unexpected title followup: ${append.kind}`);
+		const finalBytes = await Bun.file(file).text();
+		expect(finalBytes.includes('"after title bootstrap"')).toBe(true);
+		const finalEntries = finalBytes
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as FileEntry);
+		const finalExecution = executionEntries(finalEntries.slice(1), manager);
+		expect(finalExecution.map(entry => entry.id)).toEqual([first, second, append.id]);
+		const ids = finalEntries.map(entry => entry.id);
+		expect(new Set(ids).size).toBe(ids.length);
 	});
 
 	it("refuses an existing same-ID file without discarding unpublished title-owner entries", async () => {
@@ -511,7 +583,7 @@ describe("shared AgentSession control admission", () => {
 		expect(publish).not.toHaveBeenCalled();
 		expect(await Bun.file(file).text()).toBe(existing);
 		expect(manager.getLeafId()).toBe(second);
-		expect(manager.getEntries().map(entry => entry.id)).toEqual([first, second]);
+		expect(executionEntries(manager.getEntries(), manager).map(entry => entry.id)).toEqual([first, second]);
 		expect(manager.getSessionName()).toBeUndefined();
 	});
 
@@ -529,7 +601,7 @@ describe("shared AgentSession control admission", () => {
 		}
 		expect(await title).toEqual({ kind: "committed", title: "Shared title" });
 		expect(legacyError).toMatchObject({ code: "shared_session_mutation_unsupported" });
-		expect(manager.getEntries().map(entry => entry.id)).toEqual([first]);
+		expect(executionEntries(manager.getEntries(), manager).map(entry => entry.id)).toEqual([first]);
 	});
 
 	it("orders a started title before thinking", async () => {
@@ -1582,7 +1654,9 @@ describe("shared AgentSession control admission", () => {
 		}
 	});
 
-	it("rejects controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
+	// #7824: an adopted session continues through admitted shared publication; the
+	// remaining synchronous/internal writers have no shared protocol and refuse first.
+	it("refuses unmigrated synchronous controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
 		const f = await fixture();
 		await f.admit();
 		const before = snapshot(f.session);
@@ -1593,18 +1667,9 @@ describe("shared AgentSession control admission", () => {
 		const persist = vi.spyOn(f.settings, "commitAtomicBatch");
 		const mutationStarted = vi.fn();
 		const operations: Array<() => unknown> = [
-			() => f.session.setServiceTier("priority"),
-			() => f.session.setFastMode(true),
 			() => f.session.setThinkingLevel(ThinkingLevel.High, true),
-			() => f.session.setThinkingLevelForControl(ThinkingLevel.High, false),
-			() => f.session.setThinkingLevelForControl(ThinkingLevel.High, true),
 			() => f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted }),
-			() => f.session.setDefaultModelSelection(f.model, ThinkingLevel.High, { onBeforeMutation: mutationStarted }),
-			() => f.session.setModelTemporary(f.model),
-			() => f.session.setDefaultModelProfileForControl("unavailable", { onBeforeActivation: mutationStarted }),
 			() => f.session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5"], "test"),
-			() => f.session.setActiveToolsByName([]),
-			() => f.session.compact(),
 			() => f.session.navigateTree(f.first, { summarize: true }),
 		];
 		try {
@@ -1624,6 +1689,41 @@ describe("shared AgentSession control admission", () => {
 		} finally {
 			unsubscribe();
 		}
+	});
+
+	it("publishes migrated controls of an adopted session additively at its own cursor", async () => {
+		const f = await fixture();
+		await f.admit();
+		const bytes = await Bun.file(f.file).text();
+		const peerIds = new Set(
+			bytes
+				.trim()
+				.split("\n")
+				.map(line => (JSON.parse(line) as { id?: string }).id),
+		);
+		const localLeaf = f.manager.getLeafId();
+		await f.session.setFastMode(true);
+		await f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+		await f.session.setDefaultModelSelection(f.model, ThinkingLevel.High);
+		await f.session.setActiveToolsByName([]);
+		expect(f.session.serviceTier).toBe("priority");
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.session.getActiveToolNames()).toEqual([]);
+		const after = await Bun.file(f.file).text();
+		// Append-only: the peer's unseen sibling and every committed byte survive.
+		expect(after.startsWith(bytes)).toBe(true);
+		const appended = after
+			.slice(bytes.length)
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { id: string; parentId: string | null; type: string });
+		expect(appended[0]?.parentId).toBe(localLeaf);
+		for (const entry of appended) expect(peerIds.has(entry.id)).toBe(false);
+		expect(appended.map(entry => entry.type)).toContain("service_tier_change");
+		expect(appended.map(entry => entry.type)).toContain("configured_model_chain");
+		expect(() => f.manager.assertLegacyMutationAllowed("rewrite transcript")).toThrow(
+			SharedSessionMutationUnsupportedError,
+		);
 	});
 
 	it("rechecks admission after model credentials resolve", async () => {

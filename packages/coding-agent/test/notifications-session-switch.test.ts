@@ -4,12 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../src/extensibility/shared-events";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension, shouldAwaitNotificationStartup } from "../src/sdk/bus/index";
-import { SessionSdkHost } from "../src/sdk/host";
+import * as notificationOrchestration from "../src/sdk/bus/notification-orchestration";
+import { SessionSdkHost, SessionSdkSessionRuntime } from "../src/sdk/host";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -32,14 +34,8 @@ import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
  */
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await sleep(25);
-	}
-	throw new Error(`timed out waiting for ${label}`);
-}
+const waitFor = (pred: () => boolean, ms = 4000, label = "condition"): Promise<void> =>
+	waitForCondition(pred, ms, { intervalMs: 25, label, sleep });
 
 function deferred<T = void>(): {
 	promise: Promise<T>;
@@ -174,6 +170,347 @@ async function startAndConnect(harness: ReturnType<typeof createHarness>): Promi
 	return connectFrames(harness.endpoint());
 }
 
+test.each([
+	"pending",
+	"started",
+	"cleanup_pending",
+	"shutdown",
+] as const)("mixed-provider identity preflight rechecks %s startup ownership before constructing resources", async state => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-mixed-preflight-"));
+	const agentDir = path.join(cwd, "agent");
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+	const settings = isolatedNotificationSettings(agentDir, {
+		"notifications.enabled": true,
+		"notifications.telegram.enabled": true,
+		"notifications.telegram.botToken": "123456:fixture-token",
+		"notifications.telegram.chatId": "42",
+		"notifications.discord.enabled": true,
+		"notifications.discord.botToken": "fixture-discord-token",
+		"notifications.discord.applicationId": "app",
+		"notifications.discord.guildId": "guild",
+		"notifications.discord.parentChannelId": "parent",
+	});
+	const lookups = [deferred<notificationOrchestration.ProposedTelegramIdentity>()];
+	let lookupCount = 0;
+	const identitySpy = vi.spyOn(notificationOrchestration, "proposedTelegramIdentity").mockImplementation(() => {
+		const lookup = lookups[lookupCount++];
+		if (!lookup) throw new Error("Unexpected extra identity preflight");
+		return lookup.promise;
+	});
+	const releaseHost = deferred();
+	const hosts = new Set<SessionSdkHost>();
+	const runtimes = new Set<SessionSdkSessionRuntime>();
+	const hostStart = SessionSdkHost.prototype.start;
+	const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+		this: SessionSdkHost,
+	) {
+		hosts.add(this);
+		if (state === "pending") await releaseHost.promise;
+		return await hostStart.call(this);
+	});
+	const startTransport = SessionSdkSessionRuntime.prototype.startTransport;
+	const transportSpy = vi
+		.spyOn(SessionSdkSessionRuntime.prototype, "startTransport")
+		.mockImplementation(async function (this: SessionSdkSessionRuntime) {
+			runtimes.add(this);
+			return await startTransport.call(this);
+		});
+	const stopSpy = vi.spyOn(SessionSdkHost.prototype, "stop");
+	const handlers = new Map<string, Handler>();
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	const generations: number[] = [];
+	let startupFinished = false;
+	const id = `mixed-preflight-${process.pid}-${Date.now()}-${state}`;
+	let currentId = id;
+	const ctx = {
+		cwd,
+		sessionManager: {
+			getSessionId: () => currentId,
+			getSessionName: () => "Mixed provider preflight",
+			getArtifactsDir: () => cwd,
+			getCwd: () => cwd,
+		},
+		onJobFold: () => {
+			startupFinished = true;
+			return () => {};
+		},
+		ui: { notify: () => {} },
+	} as never;
+	createNotificationsExtension(
+		{
+			on: (event: string, handler: Handler) => handlers.set(event, handler),
+			registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
+				commands.set(name, command),
+		} as never,
+		{
+			settings,
+			ensureTelegramDaemon: async () => "attached",
+			ensureProviderDaemon: async () => {},
+			onBrokerRegistered: (_sessionId, generation) => generations.push(generation),
+		},
+	);
+	registerNotificationRuntime(cleanup, {
+		key: "mixed-provider-preflight",
+		shutdown: async () => {
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		},
+		dispose: async () => {
+			for (const runtime of runtimes) await runtime.stop();
+		},
+	});
+	const tasks: Promise<unknown>[] = [];
+	const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${id}.json`);
+	try {
+		// Every later caller must join the flight while identity lookup is held.
+		const older =
+			state === "cleanup_pending"
+				? Promise.resolve(handlers.get("session_branch")!({ type: "session_branch" }, ctx))
+				: commands.get("notify")!.handler("on", ctx);
+		tasks.push(older);
+		// Attach rejection handling before releasing either asynchronous lookup.
+		const olderOutcome = older.then(
+			() => undefined,
+			error => error,
+		);
+		await waitFor(() => lookupCount === 1, 4000, "first identity preflight");
+		const newer = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx));
+		tasks.push(newer);
+		await sleep(25);
+		expect(identitySpy).toHaveBeenCalledTimes(1);
+		expect(startSpy).not.toHaveBeenCalled();
+		expect(transportSpy).not.toHaveBeenCalled();
+		expect(fs.existsSync(endpoint)).toBe(false);
+		if (state === "shutdown") {
+			// This must return while the shared preflight is still held, cancel
+			// its reservation, and prevent any publication after it resumes.
+			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+			lookups[0]!.resolve({ status: "absent" });
+			await olderOutcome;
+			await newer;
+			expect(startSpy).not.toHaveBeenCalled();
+			expect(transportSpy).not.toHaveBeenCalled();
+			expect(hosts.size).toBe(0);
+			expect(generations).toHaveLength(0);
+			expect(fs.existsSync(endpoint)).toBe(false);
+			expect(getAskAnswerSource(id)).toBeUndefined();
+			expect(getTelegramFileSink(id)).toBeUndefined();
+			return;
+		}
+		lookups[0]!.resolve({ status: "absent" });
+		await waitFor(() => startSpy.mock.calls.length === 1, 4000, "owned host startup");
+		if (state === "pending") {
+			await sleep(25);
+			expect(startSpy).toHaveBeenCalledTimes(1);
+			expect(transportSpy).not.toHaveBeenCalled();
+			releaseHost.resolve();
+		}
+		const olderError = await olderOutcome;
+		await newer;
+		expect(olderError).toBeUndefined();
+		await waitFor(() => startupFinished, 4000, "owned startup settlement");
+		if (state === "cleanup_pending") {
+			stopSpy.mockRejectedValue(new Error("held host cleanup failure"));
+			currentId = `${id}-successor`;
+			await expect(
+				Promise.resolve(handlers.get("session_switch")!({ type: "session_switch" }, ctx)),
+			).rejects.toThrow("owner release failed");
+			currentId = id;
+			expect([...hosts][0]!.started).toBe(true);
+			await expect(Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx))).rejects.toThrow(
+				"cleanup is still pending",
+			);
+		} else if (state === "started") {
+			await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		}
+		expect(identitySpy).toHaveBeenCalledTimes(1);
+		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(transportSpy).toHaveBeenCalledTimes(1);
+		expect(hosts.size).toBe(1);
+		expect(generations).toHaveLength(1);
+		stopSpy.mockRestore();
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		expect([...hosts][0]!.started).toBe(false);
+		expect(fs.existsSync(endpoint)).toBe(false);
+		expect(getAskAnswerSource(id)).toBeUndefined();
+		expect(getTelegramFileSink(id)).toBeUndefined();
+	} finally {
+		for (const lookup of lookups) lookup.resolve({ status: "absent" });
+		releaseHost.resolve();
+		stopSpy.mockRestore();
+		await Promise.allSettled(tasks);
+		try {
+			await cleanupFixtureRoot(cleanup);
+		} finally {
+			identitySpy.mockRestore();
+			startSpy.mockRestore();
+			transportSpy.mockRestore();
+		}
+	}
+});
+
+test("joined startup failures wait for held cleanup and retain failed owner release for retry", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-startup-cleanup-"));
+	const agentDir = path.join(cwd, "agent");
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+	const settings = isolatedNotificationSettings(agentDir, { "notifications.enabled": false });
+	const releaseCleanup = deferred();
+	const hosts = new Set<SessionSdkHost>();
+	const runtimes = new Set<SessionSdkSessionRuntime>();
+	const hostStart = SessionSdkHost.prototype.start;
+	const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+		this: SessionSdkHost,
+	) {
+		hosts.add(this);
+		return await hostStart.call(this);
+	});
+	const startTransport = SessionSdkSessionRuntime.prototype.startTransport;
+	const transportSpy = vi
+		.spyOn(SessionSdkSessionRuntime.prototype, "startTransport")
+		.mockImplementation(async function (this: SessionSdkSessionRuntime) {
+			runtimes.add(this);
+			await startTransport.call(this);
+			throw new Error("fixture startup failed after transport publication");
+		});
+	const stopSpy = vi.spyOn(SessionSdkHost.prototype, "stop").mockImplementation(async () => {
+		await releaseCleanup.promise;
+		throw new Error("held startup host cleanup failure");
+	});
+	const handlers = new Map<string, Handler>();
+	const id = `startup-cleanup-${process.pid}-${Date.now()}`;
+	const ctx = {
+		cwd,
+		sessionManager: {
+			getSessionId: () => id,
+			getSessionName: () => "Held startup cleanup",
+			getArtifactsDir: () => cwd,
+			getCwd: () => cwd,
+		},
+	} as never;
+	createNotificationsExtension(
+		{
+			on: (event: string, handler: Handler) => handlers.set(event, handler),
+			registerCommand: () => {},
+		} as never,
+		{ settings },
+	);
+	registerNotificationRuntime(cleanup, {
+		key: "startup-cleanup-settlement",
+		shutdown: async () => {
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		},
+		dispose: async () => {
+			for (const runtime of runtimes) await runtime.stop();
+		},
+	});
+	const tasks: Promise<unknown>[] = [];
+	const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${id}.json`);
+	try {
+		let initiatingSettled = false;
+		const initiating = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx));
+		tasks.push(initiating);
+		const initiatingOutcome = initiating.then(
+			() => {
+				initiatingSettled = true;
+			},
+			error => {
+				initiatingSettled = true;
+				return error;
+			},
+		);
+		await waitFor(() => stopSpy.mock.calls.length === 1, 4000, "held startup cleanup");
+		let concurrentSettled = false;
+		const concurrent = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx));
+		tasks.push(concurrent);
+		const concurrentOutcome = concurrent.then(
+			() => {
+				concurrentSettled = true;
+			},
+			error => {
+				concurrentSettled = true;
+				return error;
+			},
+		);
+		await sleep(25);
+		expect(initiatingSettled).toBe(false);
+		expect(concurrentSettled).toBe(false);
+		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(transportSpy).toHaveBeenCalledTimes(1);
+		expect(hosts.size).toBe(1);
+		expect([...hosts][0]!.started).toBe(true);
+		expect(fs.existsSync(endpoint)).toBe(true);
+
+		releaseCleanup.resolve();
+		// The final result carries cleanup-error suppression to both session_start
+		// callers instead of surfacing the original failure as a red extension error.
+		expect(await initiatingOutcome).toBeUndefined();
+		expect(await concurrentOutcome).toBeUndefined();
+		expect(initiatingSettled).toBe(true);
+		expect(concurrentSettled).toBe(true);
+		expect(fs.existsSync(endpoint)).toBe(false);
+		expect([...hosts][0]!.started).toBe(true);
+		await expect(Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx))).rejects.toThrow(
+			"cleanup is still pending",
+		);
+		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(transportSpy).toHaveBeenCalledTimes(1);
+
+		// Only a real successful retry may release the retained runtime authority.
+		stopSpy.mockRestore();
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		expect([...hosts][0]!.started).toBe(false);
+		expect(fs.existsSync(endpoint)).toBe(false);
+		expect(getAskAnswerSource(id)).toBeUndefined();
+		expect(getTelegramFileSink(id)).toBeUndefined();
+	} finally {
+		releaseCleanup.resolve();
+		await Promise.allSettled(tasks);
+		stopSpy.mockRestore();
+		try {
+			await cleanupFixtureRoot(cleanup);
+		} finally {
+			startSpy.mockRestore();
+			transportSpy.mockRestore();
+		}
+	}
+});
+
+test("loss of a real writer's admitted ownership prevents SDK transport publication", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-owner-refusal-"));
+	tempDirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	const id = manager.getSessionId();
+	await manager.ensureOnDisk();
+	const membership = manager.getOwnerMembership();
+	const evidence = manager.getSessionOwnerEvidence();
+	if (!membership || !evidence) throw new Error("Expected the real writer's admitted membership");
+	const ownerFile = evidence.authorityKey;
+	const foreign = "foreign owner authority must not be repaired";
+	await Bun.write(ownerFile, foreign);
+	const handlers = new Map<string, Handler>();
+	createNotificationsExtension({
+		on: (event: string, handler: Handler) => handlers.set(event, handler),
+		registerCommand: () => {},
+	} as never);
+	const ctx = { cwd, sessionManager: manager } as never;
+	const start = vi.spyOn(SessionSdkHost.prototype, "start");
+	const admission = vi.spyOn(manager, "ensureOnDisk");
+	try {
+		await Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx)).catch(() => {});
+		expect(admission).not.toHaveBeenCalled();
+		expect(start).not.toHaveBeenCalled();
+		expect(manager.getOwnerMembership()).toBe(membership);
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${id}.json`))).toBe(false);
+		expect(await Bun.file(ownerFile).text()).toBe(foreign);
+	} finally {
+		admission.mockRestore();
+		start.mockRestore();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		await expect(manager.close()).rejects.toMatchObject({ code: "participation_lost" });
+		expect(manager.getOwnerMembership()).toBe(membership);
+		expect(await Bun.file(ownerFile).text()).toBe(foreign);
+	}
+});
+
 test("session_switch publishes successor SDK authority only after AgentSession restore commits", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-post-commit-switch-"));
 	const agentDir = path.join(cwd, ".gjc", "agent");
@@ -187,6 +524,8 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 	await targetSessionManager.ensureOnDisk();
 	const targetSessionFile = targetSessionManager.getSessionFile();
 	const targetSessionId = targetSessionManager.getSessionId();
+	const targetAuthorityKey = targetSessionManager.getSessionOwnerEvidence()?.authorityKey;
+	if (!targetAuthorityKey) throw new Error("Expected admitted target session");
 	await targetSessionManager.close();
 	if (!targetSessionFile) throw new Error("Expected persisted target session");
 
@@ -209,6 +548,11 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 			if (event.type !== "session_switch") return;
 			postCommitObserved = true;
 			expect(currentSessionManager.getSessionId()).toBe(targetSessionId);
+			expect(currentSessionManager.getSessionOwnerEvidence()).toMatchObject({
+				policy: { kind: "cooperative" },
+				memberKind: "cooperative",
+				authorityKey: targetAuthorityKey,
+			});
 			expect(session?.agent.state.messages).toEqual(
 				expect.arrayContaining([expect.objectContaining({ role: "user", content: "restored target message" })]),
 			);

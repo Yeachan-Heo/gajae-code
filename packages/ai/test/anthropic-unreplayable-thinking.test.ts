@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
 import type { AssistantMessage, Context, Message, Model, ToolResultMessage, UserMessage } from "@gajae-code/ai/types";
+import { createAbortedSignal } from "./helpers";
 
 const model: Model<"anthropic-messages"> = {
 	api: "anthropic-messages",
@@ -22,12 +23,6 @@ const deepseekModel: Model<"anthropic-messages"> = {
 	baseUrl: "https://api.deepseek.com",
 };
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 /** Build the request the provider would send, without letting it leave the process. */
 function capturePayload(
 	messages: Message[],
@@ -39,7 +34,7 @@ function capturePayload(
 		apiKey: "sk-ant-oat-test",
 		isOAuth: true,
 		thinkingEnabled: true,
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		onPayload: payload => resolve(payload as { messages: unknown[] }),
 	});
 	return promise;

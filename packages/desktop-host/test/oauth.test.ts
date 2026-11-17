@@ -58,7 +58,9 @@ describe("desktop authorization through the public SDK", () => {
 			throw new Error(`Unexpected fixture request: ${url}`);
 		};
 		fetchHook = hookFetch((input, init) => respond(input instanceof Request ? input.url : String(input), init));
-		const factory = vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation(async options => {
+		const factory = vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation((async (
+			options: sdk.EmbeddedAgentSessionOptions,
+		) => {
 			factoryInputs.push(options);
 			const result = await createEmbeddedSession(options);
 			owners.push(result);
@@ -66,7 +68,7 @@ describe("desktop authorization through the public SDK", () => {
 			const refresh = vi.spyOn(result.session.modelRegistry, "refresh").mockResolvedValue(undefined);
 			restores.push(() => refresh.mockRestore());
 			return result;
-		});
+		}) as typeof sdk.createEmbeddedAgentSession);
 		const execute = vi.spyOn(sdk.AuthorizationControls.prototype, "execute").mockImplementation(function (
 			this: sdk.AuthorizationControls,
 			operation,
@@ -366,7 +368,7 @@ describe("desktop authorization through the public SDK", () => {
 		expect(JSON.stringify(h.frames)).not.toContain("private-stale-answer");
 	});
 
-	test("does not mistake cancellation for provider settlement and joins late storage before owner shutdown", async () => {
+	test("does not mistake cancellation for provider settlement and refuses late storage before owner shutdown", async () => {
 		let providerPolled = false;
 		const approval = Promise.withResolvers<Response>();
 		const token = "private-late-provider-access-token";
@@ -411,7 +413,9 @@ describe("desktop authorization through the public SDK", () => {
 		approval.resolve(json({ status: "approved", token }));
 		await closing;
 		expect(dispose).toHaveBeenCalledTimes(1);
-		expect(storedAtDispose).toMatchObject({ type: "oauth", access: token });
+		// The SDK admits a credential commit only while its flow is live; a cancelled
+		// flow's late approval settles the provider but is never persisted.
+		expect(storedAtDispose).toBeUndefined();
 		expect(h.owner.session.isDisposed).toBe(true);
 		expect(h.frames.some(frame => frame.type === "auth" && frame.auth.status === "complete")).toBe(false);
 		for (const secret of [token, "private-contended-key"]) expect(JSON.stringify(h.frames)).not.toContain(secret);

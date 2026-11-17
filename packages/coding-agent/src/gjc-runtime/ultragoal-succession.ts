@@ -56,6 +56,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
@@ -324,10 +325,6 @@ export function ultragoalSuccessionClaimPath(cwd: string, operationId: string): 
 }
 
 // ---- small helpers -----------------------------------------------------
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function nonEmpty(value: unknown): string | null {
 	return typeof value === "string" && value.trim() !== "" ? value : null;

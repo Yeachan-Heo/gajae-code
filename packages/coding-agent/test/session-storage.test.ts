@@ -4926,9 +4926,17 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		};
 		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
 		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
-		expect(result).toEqual({ kind: "deleted" });
+		expect(result).toEqual({
+			kind: "deleted",
+			detachedTranscriptPath: plannedTranscriptPath,
+			transcriptPayloadDurable: true,
+			retainedPlaceholderPath: placeholderPath,
+			retainedSuccessorPath: undefined,
+			retainedUnknownPath: undefined,
+		});
 		expect(fs.existsSync(transcriptPath)).toBe(false);
 		expect(await fsp.readFile(plannedTranscriptPath, "utf8")).toBe("");
+		expect(await fsp.readFile(placeholderPath, "utf8")).toBe("");
 	});
 
 	// Regression for #4273: a transcript-phase cleanup_pending with a retained successor

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, Container, renderMetrics, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 /** Minimal component that returns a fixed line array regardless of width. */
 class FixedLines implements Component {
@@ -19,12 +19,6 @@ class FixedLines implements Component {
 	render(_width: number): string[] {
 		return this.#lines;
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
 }
 
 describe("Container spread-safe composition (W1a / F2)", () => {

@@ -80,6 +80,29 @@ describe("portable extension interactions", () => {
 		await expect(service.ui.input("Name")).rejects.toMatchObject({ code: "disposed" });
 	});
 
+	it("prevalidates the owning address without settling or changing pending interactions", async () => {
+		const { service, address, connectionId } = fixture();
+		const answer = service.ui.input("Retain until consent is fully validated");
+		const selected = address();
+		const before = service.snapshot();
+		service.validateAddress(selected);
+		expect(service.snapshot()).toEqual(before);
+		errorCode(() => service.validateAddress({ ...selected, sessionId: "foreign" }), "wrong-session");
+		errorCode(() => service.validateAddress({ ...selected, requestId: "missing" }), "stale-request");
+		expect(service.snapshot()).toEqual(before);
+		service.disconnect(connectionId);
+		const current = service.connect();
+		const reconnected = service.snapshot();
+		errorCode(() => service.validateAddress(selected), "stale-connection");
+		expect(service.snapshot()).toEqual(reconnected);
+		const admitted = { ...selected, connectionId: current.connectionId };
+		service.validateAddress(admitted);
+		service.respond(admitted, "still available");
+		expect(await answer).toBe("still available");
+		errorCode(() => service.validateAddress(admitted), "stale-request");
+		service.dispose();
+	});
+
 	it("preserves requests on reconnect while revoking the previous renderer's authority", async () => {
 		const { service, address, connectionId } = fixture();
 		const answer = service.ui.input("Name");

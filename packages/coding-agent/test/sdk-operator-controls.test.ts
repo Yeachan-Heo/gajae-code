@@ -49,12 +49,12 @@ async function settle(): Promise<void> {
 
 async function terminalSnapshot(controls: SdkOperatorControls, operationId: string): Promise<SdkOperatorSnapshot> {
 	const deadline = Date.now() + 1000;
-	while (Date.now() < deadline) {
+	for (;;) {
 		const snapshot = controls.read({ operationId }).operation;
 		if (snapshot.terminal) return snapshot;
+		if (Date.now() >= deadline) throw new Error(`Operator execution did not settle: ${JSON.stringify(snapshot)}`);
 		await Bun.sleep(0);
 	}
-	throw new Error(`Operator execution did not settle: ${JSON.stringify(controls.read({ operationId }).operation)}`);
 }
 
 function failure(action: () => unknown, code: SdkOperatorError["code"]): void {
@@ -418,8 +418,7 @@ describe("session-bound SDK operator controls", () => {
 		expect(controls.cancel(ref)).toMatchObject({ status: "cancel_requested", terminal: false });
 		expect(signals[0]?.aborted).toBe(true);
 		expect(signals[1]?.aborted).toBe(false);
-		await settle();
-		expect(controls.read(ref).operation.status).toBe("cancelled");
+		expect((await terminalSnapshot(controls, ref.operationId)).status).toBe("cancelled");
 		failure(() => controls.cancel(ref), "already_terminal");
 		expect(signals[1]?.aborted).toBe(false);
 		session.abortBash();

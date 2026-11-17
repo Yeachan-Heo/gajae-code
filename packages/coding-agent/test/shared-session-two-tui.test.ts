@@ -47,6 +47,32 @@ afterEach(async () => {
 
 const strip = (value: string) => value.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 
+function failureEvidence(error: unknown): unknown {
+	if (!(error instanceof Error)) return error === undefined ? null : String(error);
+	return {
+		name: error.name,
+		message: error.message,
+		stack: error.stack,
+		cause: error.cause === undefined ? null : failureEvidence(error.cause),
+		...(error instanceof AggregateError ? { errors: error.errors.map(failureEvidence) } : {}),
+	};
+}
+
+// These diagnostics only inspect synthetic requests from the isolated managed fixture.
+function latestUserText(content: unknown): string | null {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return null;
+	return content
+		.flatMap(part =>
+			typeof part === "object" && part !== null && "text" in part && typeof part.text === "string"
+				? [part.text]
+				: [],
+		)
+		.join("\n");
+}
+
+const diagnosticScreen = (value: string) => Bun.stripANSI(value).replace(/\r/g, "\n");
+
 type FakeModelCompletion = { delta: object; finish: "tool_calls" | "stop" };
 type FakeModelHandler = (request: Request) => Promise<FakeModelCompletion | Response>;
 
@@ -92,7 +118,16 @@ function startManagedFakeModel(readTarget: string) {
 			function?: { name?: string; parameters?: { required?: string[]; properties?: Record<string, unknown> } };
 		}[];
 	};
-	const observed: { kind: string; roles: string[]; toolNames: string[] }[] = [];
+	const observed: {
+		atMs: number;
+		kind: string;
+		prompt: string | null;
+		latestUserText: string | null;
+		roles: string[];
+		toolNames: string[];
+	}[] = [];
+	const barrierEvents: { atMs: number; event: string; kind: string }[] = [];
+	const recordBarrier = (event: string, kind: string) => barrierEvents.push({ atMs: performance.now(), event, kind });
 	let toolRequested = false;
 	let toolSupported = false;
 	let discoveryRequested = false;
@@ -106,13 +141,16 @@ function startManagedFakeModel(readTarget: string) {
 	let barrierFailure: unknown;
 	const model = startFakeModel(async request => {
 		if (request.method === "GET") {
+			recordBarrier("entered", "peer-tool");
 			peerToolStarted.resolve();
 			try {
 				await withTimeout(releasePeerTool.promise, 20_000, "A2 discovery must progress while B2 bash is active");
 			} catch (error) {
 				barrierFailure = error;
+				recordBarrier("failed", "peer-tool");
 				return new Response("Peer tool barrier failed", { status: 400 });
 			}
+			recordBarrier("passed", "peer-tool");
 			return new Response("peer tool completed");
 		}
 		const body = (await request.json()) as RequestBody;
@@ -139,7 +177,10 @@ function startManagedFakeModel(readTarget: string) {
 		if (isToolResult && prompt === "managed-A2") releasePeerTool.resolve();
 		const kind = isToolResult ? "tool-result" : (prompt ?? "background");
 		observed.push({
+			atMs: performance.now(),
 			kind,
+			prompt: prompt ?? null,
+			latestUserText: latestUserText(latestUser?.content),
 			roles: messages.map(message => message.role ?? "?"),
 			toolNames: (body.tools ?? []).map(tool => tool.function?.name ?? "?"),
 		});
@@ -158,6 +199,7 @@ function startManagedFakeModel(readTarget: string) {
 						? overlappingTurns.promise
 						: undefined;
 		if (barrier) {
+			recordBarrier("entered", kind);
 			try {
 				await withTimeout<unknown>(
 					barrier,
@@ -168,8 +210,10 @@ function startManagedFakeModel(readTarget: string) {
 				);
 			} catch (error) {
 				barrierFailure = error;
+				recordBarrier("failed", kind);
 				return Response.json({ error: { message: "Managed TUI barrier failed" } }, { status: 400 });
 			}
+			recordBarrier("passed", kind);
 		}
 		if (stopping) return new Response(null, { status: 503 });
 		let delta: object;
@@ -227,8 +271,16 @@ function startManagedFakeModel(readTarget: string) {
 		port: model.port,
 		observed,
 		barrierFailure: () => barrierFailure,
+		barrierEvidence: () => ({
+			secondTurns: [...secondTurns],
+			failure: failureEvidence(barrierFailure),
+			events: barrierEvents,
+		}),
 		thirdTurnStarted: thirdTurnStarted.promise,
-		releaseThirdTurn: () => releaseThirdTurn.resolve(),
+		releaseThirdTurn: () => {
+			recordBarrier("released", "managed-survivor3");
+			releaseThirdTurn.resolve();
+		},
 		stop: async () => {
 			stopping = true;
 			overlappingTurns.resolve();
@@ -237,11 +289,16 @@ function startManagedFakeModel(readTarget: string) {
 			releaseThirdTurn.resolve();
 			await model.server.stop(true);
 		},
-		toolEvidence: () => ({ toolRequested, toolSupported }),
+		toolEvidence: () => ({ toolRequested, toolSupported, discoveryRequested }),
 	};
 }
 
-type Tui = { pty: PtySession; done: Promise<PtyRunResult>; screen: () => string };
+type Tui = {
+	pty: PtySession;
+	done: Promise<PtyRunResult>;
+	screen: () => string;
+	output: { atMs: number; text: string; error: unknown }[];
+};
 
 async function writeModelsConfig(agent: string, port: number, contextWindow = 8000) {
 	await Bun.write(
@@ -270,6 +327,7 @@ function startTui(options: {
 	sessions?: string;
 	noTitle?: boolean;
 	extra?: string[];
+	diagnostics?: boolean;
 }): Tui {
 	// Explicit allowlist rather than the whole environment: the child must not inherit credentials
 	// or an outer agent directory from the process running the suite.
@@ -284,6 +342,7 @@ function startTui(options: {
 		GJC_NOTIFY: "off",
 	};
 	const pty = new PtySession();
+	const output: Tui["output"] = [];
 	let raw = "";
 	const done = pty.start(
 		{
@@ -307,12 +366,18 @@ function startTui(options: {
 			rows: 36,
 			timeoutMs: 120_000,
 		},
-		(_error, chunk) => {
+		(error, chunk) => {
+			if (options.diagnostics)
+				output.push({
+					atMs: performance.now(),
+					text: diagnosticScreen(chunk ?? ""),
+					error: failureEvidence(error),
+				});
 			if (chunk) raw += chunk;
 		},
 	);
 	live.push({ pty, done });
-	return { pty, done, screen: () => strip(raw) };
+	return { pty, done, screen: () => strip(raw), output };
 }
 
 async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs: number, label: string) {
@@ -348,10 +413,36 @@ async function readSingleTranscript(sessions: string) {
 }
 
 /** Waits until the TUI has drawn its footer, which is not part of the spawned argv. */
-const ready = (tui: Tui) => waitFor(() => /v\d+\.\d+\.\d+/.test(tui.screen()), 60_000, "TUI footer");
+const ready = (tui: Tui) =>
+	Promise.race([
+		waitFor(() => /v\d+\.\d+\.\d+/.test(tui.screen()), 60_000, "TUI footer"),
+		tui.done.then(() => {
+			throw new Error(`TUI exited before footer: ${tui.screen()}`);
+		}),
+	]);
+
+/**
+ * Whether a message entry carrying `needle` is on disk. Raw text is not enough: the prompt's
+ * workflow-intent record also quotes it and is published before the message itself.
+ */
+async function hasMessage(sessions: string, needle: string): Promise<boolean> {
+	const raw = await transcriptText(sessions);
+	if (!raw) return false;
+	const entries = raw
+		.split("\n")
+		.slice(1)
+		.flatMap(line => {
+			try {
+				return [JSON.parse(line) as TranscriptEntry];
+			} catch {
+				return [];
+			}
+		});
+	return promptEntries(entries, needle).length > 0;
+}
 
 const committed = (sessions: string, needle: string) =>
-	waitFor(async () => (await transcriptText(sessions))?.includes(needle) ?? false, 60_000, `entry ${needle}`);
+	waitFor(() => hasMessage(sessions, needle), 60_000, `entry ${needle}`);
 
 /** Entries whose serialized form contains the prompt as a complete JSON string value. */
 function promptEntries(entries: TranscriptEntry[], prompt: string) {
@@ -390,14 +481,82 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		const cli = path.resolve(import.meta.dirname, "../src/cli.ts");
 		const model = startManagedFakeModel(cli);
 		const terminals: Tui[] = [];
+		const inputs: {
+			atMs: number;
+			phase: string;
+			terminal: number;
+			input: string;
+			providerRequestCount: number;
+			screen: string;
+		}[] = [];
+		const canonical: {
+			label: string;
+			requestedAtMs: number;
+			completedAtMs: number;
+			entries?: unknown[];
+			raw?: string | null;
+			error?: unknown;
+		}[] = [];
+		const snapshots: Promise<void>[] = [];
+		const snapshot = (label: string) => {
+			const requestedAtMs = performance.now();
+			// Reads are observational, not an admission/readiness barrier. Their explicit read window
+			// must not be mistaken for an atomic canonical snapshot at the PTY write timestamp.
+			snapshots.push(
+				transcriptText(sessions).then(
+					raw => {
+						const timing = { label, requestedAtMs, completedAtMs: performance.now() };
+						try {
+							canonical.push({
+								...timing,
+								entries:
+									raw === null
+										? []
+										: raw
+												.split("\n")
+												.filter(Boolean)
+												.map(line => JSON.parse(line)),
+							});
+						} catch (error) {
+							canonical.push({ ...timing, raw, error: failureEvidence(error) });
+						}
+					},
+					error => {
+						canonical.push({
+							label,
+							requestedAtMs,
+							completedAtMs: performance.now(),
+							error: failureEvidence(error),
+						});
+					},
+				),
+			);
+		};
+		const writeInput = (terminal: Tui, input: string) => {
+			const record = (phase: string) => {
+				const index = terminals.indexOf(terminal);
+				inputs.push({
+					atMs: performance.now(),
+					phase,
+					terminal: index,
+					input,
+					providerRequestCount: model.observed.length,
+					screen: diagnosticScreen(terminal.screen()),
+				});
+				snapshot(`terminal-${index} ${JSON.stringify(input)} ${phase}`);
+			};
+			record("before-write");
+			terminal.pty.write(input);
+			record("after-write");
+		};
 		let failure: unknown;
 		let shutdownFailure: unknown;
 		try {
 			await writeModelsConfig(agent, model.port, 200_000);
-			const first = startTui({ cli, cwd, root, agent, noTitle: false });
+			const first = startTui({ cli, cwd, root, agent, noTitle: false, diagnostics: true });
 			terminals.push(first);
 			await ready(first);
-			first.pty.write("managed-A1\r");
+			writeInput(first, "managed-A1\r");
 			await committed(sessions, "managed-A1-reply");
 			const beforeSecond = await readSingleTranscript(sessions);
 			const sessionId = beforeSecond.header.id!;
@@ -407,13 +566,21 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 			)?.id;
 			if (!split) throw new Error("Completed A1 reply has no branch anchor");
 
-			const second = startTui({ cli, cwd, root, agent, noTitle: false, extra: ["--resume", sessionId] });
+			const second = startTui({
+				cli,
+				cwd,
+				root,
+				agent,
+				noTitle: false,
+				extra: ["--resume", sessionId],
+				diagnostics: true,
+			});
 			terminals.push(second);
 			await ready(second);
-			second.pty.write("managed-B1\r");
+			writeInput(second, "managed-B1\r");
 			await committed(sessions, "managed-B1-reply");
-			first.pty.write("managed-A2\r");
-			second.pty.write("managed-B2\r");
+			writeInput(first, "managed-A2\r");
+			writeInput(second, "managed-B2\r");
 			await waitFor(
 				async () => {
 					const failure = model.barrierFailure();
@@ -483,10 +650,10 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 			expect(model.observed.some(request => request.kind === "managed-B2")).toBe(true);
 			const survivor = closingPeer === "creator" ? second : first;
 			const closer = closingPeer === "creator" ? first : second;
-			survivor.pty.write("managed-survivor3\r");
+			writeInput(survivor, "managed-survivor3\r");
 			await withTimeout(model.thirdTurnStarted, 20_000, "Survivor must reach the provider while its peer is alive");
 			expect(await transcriptText(sessions)).not.toContain("managed-survivor3-reply");
-			closer.pty.write("/quit\r");
+			writeInput(closer, "/quit\r");
 			expect(await withTimeout(closer.done, 20_000, "Closing peer did not exit cleanly")).toMatchObject({
 				exitCode: 0,
 				cancelled: false,
@@ -495,7 +662,7 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 			expect(await transcriptText(sessions)).not.toContain("managed-survivor3-reply");
 			model.releaseThirdTurn();
 			await committed(sessions, "managed-survivor3-reply");
-			survivor.pty.write("managed-survivor4\r");
+			writeInput(survivor, "managed-survivor4\r");
 			await committed(sessions, "managed-survivor4-reply");
 			const continued = await readSingleTranscript(sessions);
 			expect(continued.header.id).toBe(sessionId);
@@ -511,20 +678,56 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 			expect(continuedBranch).not.toContain(closingPeer === "creator" ? a2 : b2);
 			if (closingPeer === "creator") expect(continuedBranch).toContain(b1);
 			else expect(continuedBranch).not.toContain(b1);
-			survivor.pty.write("/quit\r");
+			writeInput(survivor, "/quit\r");
 			expect(await withTimeout(survivor.done, 20_000, "Survivor did not exit cleanly")).toMatchObject({
 				exitCode: 0,
 				cancelled: false,
 				timedOut: false,
 			});
 		} catch (error) {
-			failure = new Error(
-				`Managed TUI root: ${root}; requests: ${JSON.stringify(model.observed)}; tool: ${JSON.stringify(model.toolEvidence())}; screens: ${JSON.stringify(terminals.map(terminal => terminal.screen().slice(-12000)))}`,
-				{
-					cause: error,
-				},
-			);
+			failure = new Error(`Managed TUI root: ${root}; structured evidence: ${path.join(root, "tui-failure.json")}`, {
+				cause: error,
+			});
+			retainedFailures.set(root, failure);
+			try {
+				snapshot("failure");
+				await Promise.all(snapshots);
+				const screens = terminals.map(terminal => diagnosticScreen(terminal.screen()));
+				const evidence = {
+					"tui-failure.json": {
+						root,
+						closingPeer,
+						atMs: performance.now(),
+						clock: "performance.now() in the test process; output arrival and async canonical reads are not child processing timestamps",
+						failure: failureEvidence(error),
+					},
+					"tui-failure-model-observed.json": model.observed,
+					"tui-failure-barrier.json": model.barrierEvidence(),
+					"tui-failure-tool.json": model.toolEvidence(),
+					"tui-failure-inputs.json": inputs,
+					"tui-failure-canonical.json": canonical.sort((a, b) => a.requestedAtMs - b.requestedAtMs),
+					"tui-failure-screens.json": screens,
+					"tui-failure-output.json": terminals.map((terminal, index) => ({
+						terminal: index,
+						chunks: terminal.output,
+					})),
+				};
+				await Promise.all([
+					...Object.entries(evidence).map(([name, value]) =>
+						Bun.write(path.join(root, name), JSON.stringify(value, null, 2)),
+					),
+					...screens.map((screen, index) =>
+						Bun.write(path.join(root, `tui-failure-terminal-${index}.txt`), screen),
+					),
+				]);
+			} catch (captureError) {
+				failure = new AggregateError(
+					[failure, captureError],
+					`Managed TUI evidence capture failed; retained root: ${root}`,
+				);
+			}
 		} finally {
+			await Promise.all(snapshots);
 			shutdownFailure = await withTimeout(model.stop(), 20_000, "Model server cleanup did not settle").then(
 				() => undefined,
 				error => error,
@@ -716,6 +919,7 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 	it("keeps both appends when two processes commit at the same time", async () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-race-"));
 		roots.push(root);
+		retainedFailures.set(root, new Error(`Simultaneous PTY scenario did not complete: ${root}`));
 		const cwd = path.join(root, "workspace");
 		const agent = path.join(root, "agent");
 		const sessions = path.join(root, "sessions");
@@ -738,14 +942,28 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		first.pty.write("race-from-A\r");
 		second.pty.write("race-from-B\r");
 
-		await waitFor(
-			async () => {
-				const text = await transcriptText(sessions);
-				return text?.includes("race-from-A") === true && text.includes("race-from-B");
-			},
-			90_000,
-			"both simultaneous prompts",
-		);
+		try {
+			await waitFor(
+				async () => {
+					const observed = await readSingleTranscript(sessions);
+					return (
+						promptEntries(observed.entries, "race-from-A").length === 1 &&
+						promptEntries(observed.entries, "race-from-B").length === 1
+					);
+				},
+				90_000,
+				"both simultaneous prompts",
+			);
+		} catch (error) {
+			const screens = [first.screen(), second.screen()];
+			await Bun.write(path.join(root, "tui-failure-screens.json"), JSON.stringify(screens));
+			const failure = new Error(`Simultaneous TUI root: ${root}; screens: ${JSON.stringify(screens)}`, {
+				cause: error,
+			});
+			retainedFailures.set(root, failure);
+			model.server.stop(true);
+			throw failure;
+		}
 
 		const merged = await readSingleTranscript(sessions);
 		expect(merged.header.id).toBe(sessionId);
@@ -761,6 +979,7 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		second.pty.write("/quit\r");
 		first.pty.write("/quit\r");
 		await Promise.race([Promise.all([first.done, second.done]), Bun.sleep(20_000)]);
+		retainedFailures.delete(root);
 		model.server.stop(true);
 	}, 180_000);
 });

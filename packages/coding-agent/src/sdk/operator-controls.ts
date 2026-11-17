@@ -1,4 +1,5 @@
 import type { AgentSession } from "../session/agent-session";
+import { assertNativeRuntimeEffect, assertNativeRuntimeInvocation, retainNativeRuntimeWork } from "./native-lifecycle";
 
 export const SDK_OPERATOR_LIMITS = {
 	inputChars: 65_536,
@@ -249,6 +250,7 @@ export class SdkOperatorControls {
 	}
 
 	execute(value: unknown): SdkOperatorAccepted {
+		assertNativeRuntimeInvocation(this.#session);
 		this.#assertCurrent();
 		const parsed = parse(value);
 		this.#assertCurrent();
@@ -272,6 +274,7 @@ export class SdkOperatorControls {
 			oldestCursor: 0,
 			deltasTruncated: false,
 		};
+		assertNativeRuntimeEffect(this.#session, "operator");
 		while (this.#operations.size >= SDK_OPERATOR_LIMITS.operations) {
 			const oldest = this.#operations.keys().next().value;
 			if (oldest === undefined) break;
@@ -281,7 +284,8 @@ export class SdkOperatorControls {
 		executions.set(this.#session, execution);
 		// Capture admission before synchronous hooks/chunks can re-enter the service.
 		const admitted: SdkOperatorAccepted = { admission: "accepted", operation: copy(execution, this.#session) };
-		void this.#run(execution, parsed.source, parsed.excludeFromContext);
+		const completion = this.#run(execution, parsed.source, parsed.excludeFromContext);
+		retainNativeRuntimeWork(this.#session, completion);
 		return admitted;
 	}
 
@@ -323,16 +327,18 @@ export class SdkOperatorControls {
 	async #run(execution: Execution, source: string, excludeFromContext: boolean): Promise<void> {
 		try {
 			const onChunk = (chunk: string) => this.#chunk(execution, chunk);
-			const result: ExecutionResult =
+			const completion =
 				execution.snapshot.kind === "bash"
-					? await this.#session.executeBash(source, onChunk, {
+					? this.#session.executeBash(source, onChunk, {
 							excludeFromContext,
 							signal: execution.controller.signal,
 						})
-					: await this.#session.executePython(source, onChunk, {
+					: this.#session.executePython(source, onChunk, {
 							excludeFromContext,
 							signal: execution.controller.signal,
 						});
+			retainNativeRuntimeWork(this.#session, completion);
+			const result: ExecutionResult = await completion;
 			if (this.#retired || !this.#ownsIdentity() || this.#session.sessionLifecycle.disposed) return;
 			execution.snapshot.output = result.output.slice(-SDK_OPERATOR_LIMITS.outputChars);
 			execution.snapshot.outputTruncated ||=
@@ -354,6 +360,7 @@ export class SdkOperatorControls {
 	}
 
 	read(value: unknown): SdkOperatorReadResult {
+		assertNativeRuntimeInvocation(this.#session);
 		this.#assertCurrent();
 		const input = object(value, ["operationId"], ["cursor"]);
 		const execution = this.#find(input);
@@ -375,11 +382,13 @@ export class SdkOperatorControls {
 	}
 
 	cancel(value: unknown): SdkOperatorSnapshot {
+		assertNativeRuntimeInvocation(this.#session);
 		this.#assertCurrent();
 		const execution = this.#find(object(value, ["operationId"]));
 		if (execution.snapshot.terminal) throw new SdkOperatorError("already_terminal");
 		if (executions.get(this.#session) !== execution) throw new SdkOperatorError("not_found");
 		if (execution.snapshot.status === "cancel_requested") return copy(execution, this.#session);
+		assertNativeRuntimeEffect(this.#session, "operator");
 		try {
 			this.#abort(execution);
 		} catch {

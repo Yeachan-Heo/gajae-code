@@ -10,7 +10,6 @@ import {
 } from "@gajae-code/agent-core";
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
-
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
@@ -69,6 +68,7 @@ import {
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
 import { collectSdkStoredSecrets } from "../credential-secrets";
 import { readSdkWorkingTreeDiff, SdkDiffObservationError } from "../diff-observation";
 import {
@@ -92,6 +92,7 @@ import {
 	failureEvidence,
 	failureProviderDiagnostic,
 	formatPromptFailureForLocalLog,
+	isPreservedProviderFailure,
 	PROMPT_FAILURE_MESSAGE_SUBMISSION,
 	type PromptFailureEvidence,
 	providerDiagnosticField,
@@ -102,7 +103,7 @@ import {
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
-import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
+import { containsSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { MAX_DURABLE_TERMINAL_RESERVATIONS } from "../protocol/terminal-abort-contract";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
@@ -946,18 +947,6 @@ type InvocationOutcomeInput = {
 	provenance?: unknown;
 };
 const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
-const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
-	"provider_down",
-	"provider_unavailable",
-	"provider_rejected",
-	"upstream_stream_interrupted",
-	"argument_validation",
-	"execution",
-	"upstream_error",
-	"transport_reset",
-]);
-const isPreservedProviderFailure = (code: string | undefined): boolean =>
-	code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
 
 /**
  * Durable reconciliation accepts only the bounded outcome vocabulary from
@@ -2879,59 +2868,6 @@ export function createSdkSurfaceFactory(
 	};
 }
 
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
-}
-
-/** True when a patch contains any secret-shaped key, recursively. */
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
-	);
-}
 async function resolveSdkWorkflowGate(
 	ctx: ExtensionContext,
 	operation: "workflow.gate_answer" | "workflow.plan_approve",

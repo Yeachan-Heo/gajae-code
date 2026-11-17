@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * The browser launch overrides choose which binary runs and how its traffic is
@@ -49,24 +48,10 @@ interface BrowserEnvOverrides {
 	localAppData?: string;
 }
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-trust-iso-"));
-	tempDirs.push(dir);
-	return dir;
-}
-
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-browser-env-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const trustDirs = createTrustTempDirs("gjc-trust-iso-");
+const projectTrustDirs = createTrustTempDirs("gjc-browser-env-trust-");
+const { tempDir } = trustDirs;
+const { projectDir } = projectTrustDirs;
 
 async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<BrowserEnvOverrides> {
 	const env: Record<string, string> = {};

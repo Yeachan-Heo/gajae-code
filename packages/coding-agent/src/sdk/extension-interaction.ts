@@ -349,6 +349,11 @@ export class ExtensionInteractionService {
 		return { grantsExecutionPermission: false };
 	}
 
+	/** Validate ownership/current connection before a multi-work consent performs any effect. */
+	validateAddress(address: ExtensionInteractionAddress): void {
+		this.#lookup(address);
+	}
+
 	cancel(address: ExtensionInteractionAddress): void {
 		const item = this.#lookup(address);
 		this.#finish(item.request.requestId, { status: "cancelled", reason: "user" });
