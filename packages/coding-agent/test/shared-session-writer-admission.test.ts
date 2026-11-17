@@ -242,4 +242,102 @@ describe("root interactive bootstrap admission", () => {
 		expect(context.selectedMCPToolNames).toEqual(["mcp__docs_kept"]);
 		expect(reopened.getEntries().some(entry => entry.id === peerAppend.id)).toBe(true);
 	});
+
+	it("publishes initial metadata through admission for header-only resumes", async () => {
+		const ws = await workspace();
+		// Create a published transcript with no messages (header-only)
+		const seed = SessionManager.create(ws.cwd, ws.destination);
+		// Don't add any messages - just ensure it's on disk and published
+		await seed.ensureOnDisk();
+		await seed.flush();
+		const file = seed.getSessionFile();
+		if (!file) throw new Error("Missing transcript");
+		await seed.closeStrict();
+
+		const resumed = await SessionManager.open(file, ws.destination);
+		managers.push(resumed);
+		expect(resumed.isTranscriptPublished()).toBe(true);
+		expect(resumed.getBranch().length).toBe(0); // Header-only: empty branch
+
+		// A live peer will publish after this opener reads the transcript to admit the root
+		const peer = await SessionManager.open(file, ws.destination);
+		managers.push(peer);
+		// The peer publishes to admit the root
+		const peerAppend = await peer.appendMessageSharingSession(user("peer turn"));
+		if (peerAppend.kind !== "committed") throw new Error(`peer append: ${peerAppend.kind}`);
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"todo.reminders": false,
+			defaultThinkingLevel: "low",
+		});
+		const options = {
+			cwd: ws.cwd,
+			agentDir: ws.agentDir,
+			sessionManager: resumed,
+			authStorage: ws.auth,
+			modelRegistry: new ModelRegistry(ws.auth),
+			settings,
+			model: getBundledModel("anthropic", "claude-sonnet-4-5"),
+			thinkingLevel: ThinkingLevel.Low,
+			hasUI: true,
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+		};
+		setPrimaryControlSurface(options, "cli");
+
+		// This should not throw when creating the session with initial metadata
+		let session: AgentSession | undefined;
+		let createError: unknown;
+		try {
+			const result = await createAgentSession(options);
+			session = result.session;
+			sessions.push(session);
+		} catch (error) {
+			createError = error;
+		}
+
+		// After peer publication, the resumed manager should use shared publication
+		expect(resumed.usesSharedPublication()).toBe(true);
+
+		// Now when resumed tries to write initial metadata through legacy methods, it should fail
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Missing bundled model");
+
+		// Legacy writes on the admitted root should fail
+		expect(() => resumed.appendModelChange(`${model.provider}/${model.id}`)).toThrow(
+			expect.objectContaining(refused),
+		);
+
+		expect(() => resumed.appendThinkingLevelChange(ThinkingLevel.Low)).toThrow(expect.objectContaining(refused));
+
+		// Despite legacy writes failing, createAgentSession should succeed by routing metadata through shared publication
+		if (createError) {
+			throw createError;
+		}
+		expect(session).toBeDefined();
+		if (session) {
+			expect(session.agent.state.error).toBeUndefined();
+		}
+
+		// Verify that the metadata entries were published through the shared path
+		const finalManager = await SessionManager.open(file, ws.destination);
+		managers.push(finalManager);
+		const allEntries = finalManager.getEntries();
+
+		const thinkingEntries = allEntries.filter(entry => entry.type === "thinking_level_change");
+		const modelEntries = allEntries.filter(entry => entry.type === "model_change");
+
+		// Should have metadata entries published through admission
+		expect(thinkingEntries.length).toBeGreaterThan(0);
+		expect(modelEntries.length).toBeGreaterThan(0);
+	});
 });

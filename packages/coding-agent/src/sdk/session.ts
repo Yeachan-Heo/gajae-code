@@ -23,6 +23,7 @@ import {
 	type Model,
 	type ProviderSessionState,
 	resolveOAuthStorageProvider,
+	type ServiceTier,
 	type SimpleStreamOptions,
 	streamSimple,
 	type ToolResultMessage,
@@ -196,7 +197,12 @@ import {
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
-import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
+import {
+	createReadonlySessionManager,
+	SessionManager,
+	type SharedControlEntry,
+	sessionArtifactCapability,
+} from "../session/session-manager";
 import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -1651,6 +1657,86 @@ async function persistBootstrapToolSelections(
 	}
 	const outcome = await manager.appendToolSelectionsSharingSession(mcpToolNames, builtinToolNames, () => true);
 	if (outcome.kind !== "committed") throw new SharedControlPublicationError("restore tool selection", outcome);
+}
+
+/**
+ * Publish initial metadata (model, thinking level, service tier) for a header-only resume.
+ * When the transcript is published and uses shared publication, legacy writes fail,
+ * so we route through the shared publication path instead.
+ */
+async function persistBootstrapMetadata(
+	manager: SessionManager,
+	model: { readonly provider: string; readonly id: string } | undefined,
+	thinkingLevel: string | undefined,
+	serviceTier: ServiceTier | null | undefined,
+	modelSubstitution:
+		| { readonly requestedModel: { readonly provider: string; readonly id: string }; readonly reason?: string }
+		| undefined,
+): Promise<void> {
+	if (!model && !thinkingLevel && !serviceTier) return;
+	if (!manager.usesSharedPublication()) {
+		if (model) {
+			manager.appendModelChange(
+				`${model.provider}/${model.id}`,
+				undefined,
+				modelSubstitution
+					? {
+							previousModel: `${modelSubstitution.requestedModel.provider}/${modelSubstitution.requestedModel.id}`,
+							reason: modelSubstitution.reason,
+							thinkingLevel: thinkingLevel ?? null,
+						}
+					: undefined,
+			);
+		}
+		if (thinkingLevel) {
+			manager.appendThinkingLevelChange(thinkingLevel);
+		}
+		if (serviceTier) {
+			manager.appendServiceTierChange(serviceTier);
+		}
+		return;
+	}
+
+	// Publish through shared publication path
+	// Build control entries for shared publication
+	const modelChangeEntry: Partial<SharedControlEntry> | undefined = model
+		? {
+				type: "model_change" as const,
+				model: `${model.provider}/${model.id}`,
+				role: "",
+				metadata: modelSubstitution
+					? {
+							previousModel: `${modelSubstitution.requestedModel.provider}/${modelSubstitution.requestedModel.id}`,
+							reason: modelSubstitution.reason,
+							thinkingLevel: thinkingLevel ?? null,
+						}
+					: undefined,
+			}
+		: undefined;
+	const thinkingLevelEntry: Partial<SharedControlEntry> | undefined = thinkingLevel
+		? {
+				type: "thinking_level_change" as const,
+				level: thinkingLevel,
+				operatorIntent: false,
+			}
+		: undefined;
+	const serviceTierEntry: Partial<SharedControlEntry> | undefined = serviceTier
+		? {
+				type: "service_tier_change" as const,
+				serviceTier,
+			}
+		: undefined;
+
+	const entries: readonly SharedControlEntry[] = [
+		...(modelChangeEntry ? [modelChangeEntry as SharedControlEntry] : []),
+		...(thinkingLevelEntry ? [thinkingLevelEntry as SharedControlEntry] : []),
+		...(serviceTierEntry ? [serviceTierEntry as SharedControlEntry] : []),
+	];
+
+	const outcome = await manager.appendControlEntriesSharingSession(entries, () => true);
+	if (outcome.kind !== "committed") {
+		throw new SharedControlPublicationError("initial metadata", outcome);
+	}
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
@@ -5785,26 +5871,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Restore messages if session has existing data
 		if (hasExistingSession) {
 			agent.replaceMessages(reconcileTrailingToolCalls(existingSession.messages));
-		} else {
-			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
-			if (model) {
-				const substitution = options.modelSubstitution;
-				sessionManager.appendModelChange(
-					`${model.provider}/${model.id}`,
-					undefined,
-					substitution
-						? {
-								previousModel: `${substitution.requestedModel.provider}/${substitution.requestedModel.id}`,
-								reason: substitution.reason,
-								thinkingLevel: thinkingLevel ?? null,
-							}
-						: undefined,
-				);
-			}
-			sessionManager.appendThinkingLevelChange(options.thinkingLevel ?? ThinkingLevel.Inherit);
-			if (initialServiceTier) {
-				sessionManager.appendServiceTierChange(initialServiceTier);
-			}
 		}
 
 		const deferredMcpTurnReady =
@@ -6071,6 +6137,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+
+		// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
+		// This must happen after the session is created so the manager is properly admitted.
+		// Route through shared publication if the transcript is published and uses shared publication.
+		if (!hasExistingSession) {
+			await persistBootstrapMetadata(
+				sessionManager,
+				model,
+				options.thinkingLevel ?? ThinkingLevel.Inherit,
+				initialServiceTier,
+				options.modelSubstitution,
+			);
+		}
+
 		// Empty-config grants can acquire session servers later, without a deferred starter.
 		// Their restores still belong to teardown, and must never disconnect a successor.
 		if (sessionMcpGrant) {
