@@ -1,32 +1,16 @@
 import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import { Settings } from "../src/config/settings";
 import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { createModel } from "./helpers/mock-model";
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
 // definitions, `refreshMCPTools` must not rebuild the system prompt. A rebuild
 // invalidates the Anthropic prompt-cache breakpoint placed on the system block
 // and forces a full prefix re-encode on the next request.
-
-function createModel(): Model<"openai-responses"> {
-	return {
-		id: "mock",
-		name: "mock",
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
-}
-
 function createBasicTool(name: string, label: string, description = `${label} tool`): AgentTool {
 	return {
 		name,

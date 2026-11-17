@@ -10,26 +10,22 @@ import {
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { OAuthSelectorComponent } from "@gajae-code/coding-agent/modes/components/oauth-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage, type AuthStorage as AuthStorageType } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 function stripAnsi(value: string): string {
 	return value.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function renderedLines(component: { render(width: number): string[] }): string[] {
-	installTestTheme();
+	setThemeInstance(testTheme);
 	return component.render(240).map(stripAnsi);
 }
 
@@ -142,8 +138,8 @@ async function createModelSelector(
 
 beforeEach(async () => {
 	clearTrackedProviderAuthHealth();
-	testTheme = await getThemeByName("red-claw");
-	installTestTheme();
+	testTheme = await loadTestTheme();
+	setThemeInstance(testTheme);
 });
 
 afterEach(() => {

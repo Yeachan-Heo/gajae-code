@@ -26,33 +26,12 @@ import {
 	type SpawnSubstrateProof,
 } from "../src/sdk/broker/spawn-authority";
 import { createSpawnSubstrateProvider } from "../src/sdk/broker/spawn-substrate";
+import { createAttest } from "./helpers/managed-attestation";
 
 const ownerId = "marker-test-owner";
 const epoch = "marker-test-epoch";
 const task = "private marker test task";
-
-async function attest(broker: Broker, cwd: string): Promise<void> {
-	const incarnation = processIncarnation(process.pid);
-	if (!incarnation) throw new Error("Test owner has no process incarnation");
-	for (const endpointGeneration of [0, 1]) {
-		await broker.index.append({
-			type: "host_registered",
-			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
-			endpointGeneration,
-			pid: process.pid,
-			hostIncarnation: incarnation,
-			masterRole: {
-				version: 2,
-				ownerSessionId: ownerId,
-				launchPid: process.pid,
-				launchProcessIncarnation: incarnation,
-				role: "master",
-				attestationEpoch: epoch,
-			},
-		});
-	}
-}
+const attest = createAttest(ownerId, epoch);
 
 async function spawn(broker: Broker, cwd: string) {
 	return broker.handleRequest(

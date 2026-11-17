@@ -421,8 +421,28 @@ const ready = (tui: Tui) =>
 		}),
 	]);
 
+/**
+ * Whether a message entry carrying `needle` is on disk. Raw text is not enough: the prompt's
+ * workflow-intent record also quotes it and is published before the message itself.
+ */
+async function hasMessage(sessions: string, needle: string): Promise<boolean> {
+	const raw = await transcriptText(sessions);
+	if (!raw) return false;
+	const entries = raw
+		.split("\n")
+		.slice(1)
+		.flatMap(line => {
+			try {
+				return [JSON.parse(line) as TranscriptEntry];
+			} catch {
+				return [];
+			}
+		});
+	return promptEntries(entries, needle).length > 0;
+}
+
 const committed = (sessions: string, needle: string) =>
-	waitFor(async () => (await transcriptText(sessions))?.includes(needle) ?? false, 60_000, `entry ${needle}`);
+	waitFor(() => hasMessage(sessions, needle), 60_000, `entry ${needle}`);
 
 /** Entries whose serialized form contains the prompt as a complete JSON string value. */
 function promptEntries(entries: TranscriptEntry[], prompt: string) {

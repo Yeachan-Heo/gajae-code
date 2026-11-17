@@ -110,6 +110,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | `CHEAPER_INFERENCE_API_KEY`     | Cheaper Inference auth                           | Using the `cheaper-inference` provider preset                  | Create at https://cheaperinference.com                                                              |
 | `STANDARDCOMPUTE_API_KEY`       | Standard Compute auth                            | Using the `standardcompute` provider preset                    | Create at https://standardcompute.com/dashboard                                                     |
 | `UBERLLM_API_KEY`               | UberLLM auth                                     | Using the `uberllm` provider preset                            | Create at https://uberllm.dev/signup                                                                |
+| `REQUESTY_API_KEY`              | Requesty auth                                    | Using the `requesty` provider preset                           | Create at https://app.requesty.ai/api-keys                                                          |
 | `KILO_API_KEY`                  | Kilo auth                                        | Using Kilo models                                              |                                                                                                     |
 | `OLLAMA_CLOUD_API_KEY`          | Ollama Cloud auth                                | Using `ollama-cloud` provider                                  |                                                                                                     |
 | `GITLAB_TOKEN`                  | GitLab Duo auth                                  | Using `gitlab-duo` provider                                    |                                                                                                     |
@@ -446,6 +447,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `KAGI_API_KEY`                                      | Kagi search provider                                          |
 | `JINA_API_KEY`                                      | Jina search provider                                          |
 | `PARALLEL_API_KEY`                                  | Parallel search provider                                      |
+| `KEENABLE_API_KEY`                                  | Keenable search provider (optional; keyless without it)       |
 | `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`                 | SearXNG endpoint and optional bearer token                    |
 | `SEARXNG_BASIC_USERNAME`, `SEARXNG_BASIC_PASSWORD`  | SearXNG HTTP Basic Auth credentials                           |
 

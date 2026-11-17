@@ -9,9 +9,10 @@ import {
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { PreparedProfileModelSelection } from "@gajae-code/coding-agent/session/agent-session";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -23,12 +24,7 @@ function normalizeRenderedText(text: string): string {
 		.trim();
 }
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 const defaultModel = model("provider-a", "default");
 const alternateModel = model("provider-a", "alternate");
@@ -82,7 +78,7 @@ function createSelector(
 
 async function renderSelector(selector: ModelSelectorComponent): Promise<string> {
 	await Bun.sleep(10);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	return normalizeRenderedText(selector.render(240).join("\n"));
 }
 
@@ -218,15 +214,15 @@ async function selectProfileThroughController(controller: SelectorController, se
 	const selector = (controller as unknown as { ctx: { editorContainer: { addChild: ReturnType<typeof vi.fn> } } }).ctx
 		.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 	await Bun.sleep(10);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	await selector.__testSelectProfile("profile-a", setDefault);
 	await Bun.sleep(0);
 }
 
 describe("model selector profile red-team", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 
 	test("empty profile catalog omits Profiles section and does not crash", async () => {

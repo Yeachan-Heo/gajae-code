@@ -771,6 +771,15 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 }
 
 /**
+ * Whether `data` is a bare line feed: legacy Ctrl+J, or a terminal's Shift+Enter→LF
+ * mapping. `matchesKey` reports it as "enter" so selectors confirm on it; text entry
+ * treats it as a newline instead.
+ */
+export function isBareLineFeed(data: string): boolean {
+	return data === "\n";
+}
+
+/**
  * Parse terminal input and return a normalized key identifier.
  *
  * Returns key names like "escape", "ctrl+c", "shift+tab", "alt+enter".

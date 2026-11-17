@@ -49,12 +49,12 @@ async function settle(): Promise<void> {
 
 async function terminalSnapshot(controls: SdkOperatorControls, operationId: string): Promise<SdkOperatorSnapshot> {
 	const deadline = Date.now() + 1000;
-	while (Date.now() < deadline) {
+	for (;;) {
 		const snapshot = controls.read({ operationId }).operation;
 		if (snapshot.terminal) return snapshot;
+		if (Date.now() >= deadline) throw new Error(`Operator execution did not settle: ${JSON.stringify(snapshot)}`);
 		await Bun.sleep(0);
 	}
-	throw new Error(`Operator execution did not settle: ${JSON.stringify(controls.read({ operationId }).operation)}`);
 }
 
 function failure(action: () => unknown, code: SdkOperatorError["code"]): void {

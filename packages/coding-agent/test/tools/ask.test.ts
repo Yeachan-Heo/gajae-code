@@ -9,7 +9,7 @@ import * as deepInterviewRuntime from "@gajae-code/coding-agent/gjc-runtime/deep
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import type { DeepInterviewExecutionApprovalRecord } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import * as stateRuntime from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
-import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type {
 	AskAnswerRequest,
 	AskAnswerSource,
@@ -41,6 +41,7 @@ import {
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../../src/modes/types";
 import { answerPendingAsk, closePendingAsks, listPendingAsks } from "../../src/tools/pending-asks";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function createAskFixture() {
 	let root: TempDir | undefined;
@@ -2302,7 +2303,7 @@ describe("AskTool custom input", () => {
 		expect(result.content[0].text).toContain("alpha");
 		expect(result.content[0].text).toContain("custom detail");
 
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
@@ -2387,7 +2388,7 @@ describe("AskTool custom input", () => {
 
 describe("AskTool option rendering", () => {
 	it("wraps long single-question option labels without ellipsis", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const longLabel =
 			"Wrap this long option label across multiple indented lines so the entire choice remains visible to the user";
@@ -2409,7 +2410,7 @@ describe("AskTool option rendering", () => {
 	});
 
 	it("wraps long multi-question option labels under their option prefix", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const longLabel =
 			"Keep every multi question option fully readable by wrapping continuation text under the checkbox prefix";
@@ -2464,7 +2465,7 @@ describe("AskTool multiline custom input rendering", () => {
 
 		expect(result.details?.customInput).toBe(multilineText);
 
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
@@ -2519,7 +2520,7 @@ describe("AskTool multiline custom input rendering", () => {
 			context,
 		);
 
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
@@ -3372,7 +3373,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 	});
 
 	it("renders round questions as structured cards in history", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const rawQuestion = [
 			"Round 2 | Component: Export | Targeting: Constraints | Why now: output boundaries are unclear | Ambiguity: 42%",

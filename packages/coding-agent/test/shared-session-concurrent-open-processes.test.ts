@@ -25,6 +25,8 @@ type Event = {
 type Child = Bun.Subprocess<"ignore", "pipe", "pipe">;
 type TranscriptRecord = {
 	type: string;
+	customType?: string;
+	data?: { v: number; bind: string; member: string; pid: number; runtime: string };
 	id: string;
 	version?: number;
 	parentId?: string | null;
@@ -148,11 +150,21 @@ for (const scenario of ["hydration", "finalize"] as const)
 						seed.currentBytes.slice(seed.currentBytes.indexOf("\n")),
 					);
 					legacyEntries = legacy.slice(1);
-					expect(legacyEntries).toHaveLength(3);
-					expect(legacy[1].parentId).toBeNull();
-					expect(legacy[2].parentId).toBe(legacy[1].id);
-					expect(legacy[3].parentId).toBe(legacy[1].id);
-					expect(legacy[3].id).toBe(seed.parent);
+					const enrollment = legacyEntries.filter(
+						entry => entry.type === "custom" && entry.customType === "gjc.owner_enroll",
+					);
+					expect(enrollment).toHaveLength(1);
+					expect(enrollment[0]).toMatchObject({
+						parentId: null,
+						data: { v: 1, bind: seed.logicalId, pid: a.pid, runtime: "cooperative_tui" },
+					});
+					expect(legacyEntries).toHaveLength(4);
+					const execution = legacyEntries.filter(entry => !enrollment.includes(entry));
+					expect(execution).toHaveLength(3);
+					expect(execution[0].parentId).toBeNull();
+					expect(execution[1].parentId).toBe(execution[0].id);
+					expect(execution[2].parentId).toBe(execution[0].id);
+					expect(execution[2].id).toBe(seed.parent);
 					for (const worker of children.keys()) {
 						const opened = await wait(
 							`${worker} legacy opened`,
@@ -188,7 +200,20 @@ for (const scenario of ["hydration", "finalize"] as const)
 					migratedBytes = finalized.bytes;
 					const migrated = Bun.JSONL.parse(migratedBytes) as TranscriptRecord[];
 					expect(migrated[0]).toEqual({ ...legacy[0], version: CURRENT_SESSION_VERSION });
-					expect(migrated.slice(1)).toEqual(legacyEntries);
+					expect(migrated.slice(1, legacyEntries.length + 1)).toEqual(legacyEntries);
+					expect(
+						migratedBytes
+							.slice(migratedBytes.indexOf("\n") + 1)
+							.startsWith(seed.bytes.slice(seed.bytes.indexOf("\n") + 1)),
+					).toBe(true);
+					const migrationEnrollment = migrated.slice(legacyEntries.length + 1);
+					expect(migrationEnrollment).toHaveLength(1);
+					expect(migrationEnrollment[0]).toMatchObject({
+						type: "custom",
+						customType: "gjc.owner_enroll",
+						parentId: seed.parent,
+						data: { v: 1, bind: seed.logicalId, pid: a.pid, runtime: "cooperative_tui" },
+					});
 					const refused = await wait(
 						"legacy append refusal",
 						event => event.worker === "b" && event.event === "refused",
@@ -293,8 +318,19 @@ for (const scenario of ["hydration", "finalize"] as const)
 					expect(matching[0]!.message?.content).toBe(`branch ${receipt.worker}`);
 				}
 				const entries = records.filter(record => record.type !== "session");
-				expect(entries).toHaveLength(scenario === "finalize" ? 5 : 3);
-				if (scenario === "finalize") expect(entries.slice(0, 3)).toEqual(legacyEntries);
+				const enrollments = entries.filter(
+					entry => entry.type === "custom" && entry.customType === "gjc.owner_enroll",
+				);
+				expect(enrollments).toHaveLength(3);
+				for (const enrollment of enrollments) {
+					expect(enrollment.data).toMatchObject({ v: 1, bind: seed.logicalId, runtime: "cooperative_tui" });
+					expect(enrollment.data?.member).toMatch(/^[0-9a-f]{32}$/u);
+				}
+				expect(new Set(enrollments.map(entry => entry.data?.member)).size).toBe(3);
+				expect(enrollments.map(entry => entry.data?.pid).sort()).toEqual([a.pid, a.pid, b.pid].sort());
+				expect(entries.filter(entry => !enrollments.includes(entry))).toHaveLength(scenario === "finalize" ? 5 : 3);
+				expect(entries).toHaveLength(scenario === "finalize" ? 8 : 6);
+				if (scenario === "finalize") expect(entries.slice(0, legacyEntries.length)).toEqual(legacyEntries);
 				const ids = new Set(entries.map(entry => entry.id));
 				expect(ids.size).toBe(entries.length);
 				for (const entry of entries)

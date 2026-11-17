@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 import {
 	GLM_ZCODE_OAUTH_AUTHORIZE_URL,
 	GLM_ZCODE_OAUTH_BROKER_TOKEN_URL,
@@ -45,18 +44,7 @@ interface Probe {
 	login: string | null;
 }
 
-const tempDirs: string[] = [];
-
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-glm-zcode-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { projectDir } = createTrustTempDirs("gjc-glm-zcode-trust-");
 
 async function endpoints(cwd: string, overrides: Record<string, string> = {}): Promise<Probe> {
 	const env: Record<string, string> = {};

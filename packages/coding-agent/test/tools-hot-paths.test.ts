@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
-import { getThemeByName } from "../src/modes/theme/theme";
+
 import type { ToolSession } from "../src/tools";
 import { suffixPrefixOverlap } from "../src/tools/bash";
 import { JobTool } from "../src/tools/job";
 import { formatDiagnostics } from "../src/tools/render-utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 describe("ACP snapshot overlap", () => {
 	test.each([
@@ -63,7 +64,7 @@ describe("job poll progress cleanup", () => {
 });
 
 test("diagnostics keep collapsed and expanded tree branches across many files", async () => {
-	const theme = (await getThemeByName("red-claw"))!;
+	const theme = (await loadTestTheme())!;
 	for (const count of [1, 5, 6, 100]) {
 		const messages = Array.from({ length: count }, (_, index) => `file-${index}.ts:1:2 [error] problem-${index}`);
 		const diag = { errored: true, summary: `${count} errors`, messages };

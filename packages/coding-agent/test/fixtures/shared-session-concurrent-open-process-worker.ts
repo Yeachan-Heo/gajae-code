@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { ManagedLockTestHooks } from "../../src/session/internal/managed-session-storage";
 import { managedSessionTransactionLockName } from "../../src/session/internal/managed-session-transaction";
 import { getSessionMessageEntryId, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
+import { FileSessionStorage, type SessionStorageLockOptions } from "../../src/session/session-storage";
 
 const [worker, cwd, agentDir, scenario] = process.argv.slice(2);
 if (!worker || !cwd || !agentDir || !process.send) throw new Error("Expected isolated IPC worker arguments");
@@ -32,6 +33,7 @@ const deadline = setTimeout(() => {
 	process.exit(1);
 }, 25_000);
 let manager: SessionManager | undefined;
+const acquireAuthorityLock = FileSessionStorage.prototype.acquireExclusiveLockSync;
 try {
 	const destination = SessionManager.managedDestination(cwd, agentDir);
 	send("ready", { pid: process.pid });
@@ -80,6 +82,22 @@ try {
 	await gates.get("open")!.promise;
 	let phase = "open";
 	const reported = new Set<string>();
+	FileSessionStorage.prototype.acquireExclusiveLockSync = function (
+		candidate: string,
+		options?: SessionStorageLockOptions,
+	) {
+		const acquired = acquireAuthorityLock.call(this, candidate, options);
+		// Observe the actual physical authority refusal, not an artificial delay.
+		if (
+			!acquired &&
+			candidate === path.join(path.dirname(file), ".gjc-owners", `${logicalId}.json.lock`) &&
+			!reported.has(phase)
+		) {
+			reported.add(phase);
+			send(`${phase}-contention`, { lock: "owner_authority" });
+		}
+		return acquired;
+	};
 	ManagedLockTestHooks.beforeContentionWait = candidate => {
 		if (path.basename(candidate) !== `${managedSessionTransactionLockName(logicalId)}.lock`) return;
 		if (reported.has(phase)) return;
@@ -167,6 +185,7 @@ try {
 	send("error", { error: error instanceof Error ? error.stack : String(error) });
 	process.exitCode = 1;
 } finally {
+	FileSessionStorage.prototype.acquireExclusiveLockSync = acquireAuthorityLock;
 	SessionManagerTestHooks.beforeExistingSessionHydration = undefined;
 	ManagedLockTestHooks.beforeContentionWait = undefined;
 	try {

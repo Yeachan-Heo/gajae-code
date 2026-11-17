@@ -1,16 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AgentContext, AgentLoopConfig, AgentTool } from "@gajae-code/agent-core/types";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
+import { createUserMessage, identityConverter } from "./helpers";
 
 describe("managed attempt trajectory", () => {
 	it("preserves incomplete tool-call metadata without executing it", async () => {

@@ -36,6 +36,8 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
+import { containsSecretConfigKey } from "../protocol/adapter-validation";
 import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
@@ -54,7 +56,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 
 type NotificationServer = NativeNotificationServer;
 
-import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+import { $credentialEnv, isRecord, logger, postmortem, VERSION } from "@gajae-code/utils";
 
 import { AsyncJobManager } from "../../async";
 import {
@@ -1882,10 +1884,6 @@ interface SafeUsageWindow {
 	resetsAt?: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function classifyUsageWindow(limit: Record<string, unknown>): "5h" | "7d" | undefined {
 	const window = isRecord(limit.window) ? limit.window : undefined;
 	const scope = isRecord(limit.scope) ? limit.scope : undefined;
@@ -2584,61 +2582,6 @@ function sdkQuerySurface(
 		externalPermissions,
 		primaryControlSurface,
 	}).query;
-}
-
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
-	);
-}
-
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
 }
 
 /**

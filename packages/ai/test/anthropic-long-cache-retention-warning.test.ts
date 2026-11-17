@@ -3,6 +3,7 @@ import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/m
 import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
 import type { CacheRetention, Context, Model, ProviderSessionState } from "@gajae-code/ai/types";
 import { logger } from "@gajae-code/utils";
+import { createAbortedSignal } from "./helpers";
 
 // Issue #5944: Anthropic-compatible proxies silently received the ~5m default TTL
 // when `long` retention was requested but `compat.supportsLongCacheRetention`
@@ -28,12 +29,6 @@ const context: Context = {
 	messages: [{ role: "user", content: "Continue", timestamp: 1 }],
 };
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 function capturePayload(
 	model: Model<"anthropic-messages">,
 	options: { cacheRetention?: CacheRetention; providerSessionState?: Map<string, ProviderSessionState> } = {},
@@ -42,7 +37,7 @@ function capturePayload(
 	streamAnthropic(model, context, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		...options,
 		onPayload: payload => {
 			resolve(payload as Payload);

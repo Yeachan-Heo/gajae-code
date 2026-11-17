@@ -2436,13 +2436,32 @@ export class Agent {
 				return;
 			}
 			const providerCode = providerFailureCode(err);
-			const runtimeFailureCode = abortController.signal.aborted
-				? "aborted"
-				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
+			const aborted = abortController.signal.aborted;
+			const abortReason = abortController.signal.reason;
+			// A publication rejection aborts the run with its own error. That is a
+			// failure to diagnose, not a caller cancellation, so keep the cause log.
+			// Only the DOMException our own `abort()` installs marks a caller cancellation.
+			// Keying on the name alone would also suppress a publication error that happens
+			// to be named "AbortError".
+			const cancelled = aborted && abortReason instanceof DOMException && abortReason.name === "AbortError";
+			const runtimeFailureCode = aborted ? "aborted" : (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			} else if (!cancelled) {
+				// The only in-band abort reason is a canonical publication rejection, which
+				// aborts with its own error. Report that cause under a distinct diagnostic
+				// instead of mislabeling it as a run failure. `forceAbort` clears the active
+				// run before this catch can observe it, so a deliberate forced abort never
+				// reaches here, and `abort()` takes the cancellation branch above.
+				logger.warn("Agent run aborted with an underlying failure", {
 					provider: model.provider,
 					model: model.id,
 					code: sanitized.code,
@@ -2465,7 +2484,7 @@ export class Agent {
 					totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
-				stopReason: abortController.signal.aborted ? "aborted" : "error",
+				stopReason: aborted ? "aborted" : "error",
 				errorMessage: sanitized.message,
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
@@ -2483,7 +2502,7 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				this.#emit({
 					type: "agent_failed",
 					// Only the identity-checked local staging diagnostic may assert a
@@ -2493,7 +2512,7 @@ export class Agent {
 				});
 			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
-				stopReason: abortController.signal.aborted ? "cancelled" : "error",
+				stopReason: aborted ? "cancelled" : "error",
 				messages: [errorMsg],
 			});
 		} finally {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { normalizeLegacyState } from "../../src/gjc-runtime/state-migrations";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+import { readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -24,10 +25,6 @@ async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 async function writeJson(filePath: string, value: unknown): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	await fs.writeFile(filePath, JSON.stringify(value, null, 2));
-}
-
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
 }
 
 async function readAuditEntries(cwd: string): Promise<Array<Record<string, unknown>>> {

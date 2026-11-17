@@ -28,7 +28,7 @@ import {
 } from "@gajae-code/tui";
 import { renderMetrics } from "@gajae-code/tui/metrics";
 import { defaultEditorTheme, defaultMarkdownTheme } from "./test-themes";
-import { VirtualTerminal } from "./virtual-terminal";
+import { VirtualTerminal, visible } from "./virtual-terminal";
 
 class Lines implements Component {
 	static #nextId = 0;
@@ -123,10 +123,6 @@ class RecoveringText extends Text {
 
 async function settle(term: VirtualTerminal): Promise<void> {
 	await term.waitForRender();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 function cursorPosition(term: VirtualTerminal): { row: number; col: number } {

@@ -15,7 +15,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 	return nativeSessionStorageBindings;
 }
 
-import { isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
+import { getTrustedHomeDir, isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
 import { inspectManagedFileNoFollow, validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
 import {
 	FileSessionReader,
@@ -29,7 +29,9 @@ import {
 import type { ManagedGcProtocolScopeInspector } from "./internal/managed-session-scope";
 import {
 	assertManagedDirectoryRoot,
+	ensureManagedDirectory,
 	type ManagedDirectoryRoot,
+	type ManagedSessionSecurityPolicy,
 	renameFlagsUnsupported,
 	shouldFsyncManagedDirectory,
 } from "./internal/managed-session-storage";
@@ -67,6 +69,104 @@ function canonicalPathSync(value: string): string {
 	} catch {
 		return path.resolve(value);
 	}
+}
+
+// The home directory itself is trusted and may be a symlink; only the components
+// below it must be real directories, which assertNoReparsePath checks.
+
+/**
+ * Stable identity of a transcript for its append-lock key: its parent's native realpath
+ * (the on-disk spelling, so directory case aliases agree) plus its basename folded to
+ * lower case. Folding makes case aliases agree even while the file does not exist yet,
+ * when two first openers cannot learn its on-disk spelling; on a case-sensitive volume
+ * it only lets two names differing in case share a lock, which merely serializes them.
+ */
+function transcriptLockIdentity(transcriptPath: string): string {
+	const resolved = path.resolve(transcriptPath);
+	return path.join(fs.realpathSync.native(path.dirname(resolved)), path.basename(resolved).toLowerCase());
+}
+
+/**
+ * The lock namespace is reached by pathname under the trusted home, so another principal
+ * able to rename entries in that home could swap `.gjc` between the identity checks and the
+ * lock operations. Refuse a home that another POSIX user can write: foreign-owned, world-
+ * writable without the sticky bit, or group-writable through a group other than the user's
+ * primary group. (Windows profile DACLs grant only the user, SYSTEM, and Administrators.)
+ */
+function assertAppendLockHomeNotSharedWritable(home: string): void {
+	if (process.platform === "win32") return;
+	const stat = fs.statSync(home);
+	const uid = process.getuid?.();
+	const sticky = (stat.mode & 0o1000) !== 0;
+	const foreignOwner = uid !== undefined && stat.uid !== uid && stat.uid !== 0;
+	const worldWritable = (stat.mode & 0o002) !== 0 && !sticky;
+	const groupWritable = (stat.mode & 0o020) !== 0 && !sticky && stat.gid !== process.getgid?.();
+	if (foreignOwner || worldWritable || groupWritable) {
+		throw new Error(`append_lock_home_shared_writable: ${home}`);
+	}
+}
+
+interface DirectoryIdentity {
+	readonly path: string;
+	readonly dev: bigint;
+	readonly ino: bigint;
+}
+
+/** A prepared append-lock path plus the identities of `.gjc`, `runtime`, and `append-locks`. */
+interface AppendLockTarget {
+	readonly lockPath: string;
+	readonly directories: readonly DirectoryIdentity[];
+}
+
+function realDirectoryIdentity(pathname: string): DirectoryIdentity {
+	const stat = fs.lstatSync(pathname, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe append-lock directory: ${pathname}`);
+	return { path: pathname, dev: stat.dev, ino: stat.ino };
+}
+
+/**
+ * Fails closed when any directory of the prepared lock namespace was replaced after setup,
+ * so a principal able to rename entries in `.gjc` cannot redirect a writer to a fresh,
+ * empty lock directory and enter the critical section beside another writer.
+ */
+function assertAppendLockTargetUnchanged(target: AppendLockTarget): void {
+	for (const expected of target.directories) {
+		let current: DirectoryIdentity;
+		try {
+			current = realDirectoryIdentity(expected.path);
+		} catch (error) {
+			throw new Error(`append_lock_root_changed: ${expected.path}`, { cause: error });
+		}
+		if (current.dev !== expected.dev || current.ino !== expected.ino) {
+			throw new Error(`append_lock_root_changed: ${expected.path}`);
+		}
+	}
+}
+
+function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
+	const home = canonicalPathSync(getTrustedHomeDir());
+	assertAppendLockHomeNotSharedWritable(home);
+	const gjcRoot = path.join(home, ".gjc");
+	const appendLockRuntimeRoot = path.join(gjcRoot, "runtime");
+	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
+	// No component below the trusted home may be a reparse point, including `.gjc`,
+	// which ensureManagedDirectory would otherwise create through recursively.
+	assertNoReparsePath(lockRoot);
+	// Owner-only mode (POSIX) or DACL (Windows) is applied and verified for `.gjc` and both
+	// lock directories, pre-existing ones included, so no other principal can replace a
+	// child of the chain; setup throws before any transcript opens.
+	const policy: ManagedSessionSecurityPolicy =
+		process.platform === "win32" ? "windows-existing-verify-first" : "default";
+	ensureManagedDirectory(gjcRoot, undefined, policy);
+	ensureManagedDirectory(appendLockRuntimeRoot, undefined, policy);
+	ensureManagedDirectory(lockRoot, undefined, policy);
+	return {
+		lockPath: path.join(
+			lockRoot,
+			`gjc-${createHash("sha256").update(transcriptLockIdentity(transcriptPath)).digest("hex")}.append-lock`,
+		),
+		directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(realDirectoryIdentity),
+	};
 }
 
 export interface SessionStorageExactReplacementExpectation {
@@ -165,6 +265,8 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
+	/** Internal lock provider for cross-process append serialization. */
+	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -319,6 +421,7 @@ export interface SessionStorageLockOptions {
 	/** Nonempty matching caller and recorded host IDs are required for stale-lock recovery. */
 	ownerHostId?: string;
 }
+type SessionStorageInternalWriterOpenOptions = SessionStorageWriterOpenOptions;
 
 export interface SessionStorage extends SessionStorageReader {
 	ensureDirSync(dir: string): void;
@@ -1500,6 +1603,9 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#onError: ((err: Error) => void) | undefined;
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
+	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
+	#appendLockTarget: AppendLockTarget | undefined;
+	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1509,10 +1615,11 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeCalls = 0;
 	#flushCalls = 0;
 
-	constructor(fpath: string, options?: SessionStorageWriterOpenOptions) {
+	constructor(fpath: string, options?: SessionStorageInternalWriterOpenOptions) {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
+		this.#appendLock = options?.appendLock;
 		this.#bufferSize =
 			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
 		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
@@ -1522,6 +1629,9 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		assertNoReparsePath(dir);
 		assertNoReparsePath(fpath);
+		// Fallible lock-namespace setup runs before the target is opened or truncated,
+		// and only for writers that actually serialize appends.
+		this.#appendLockTarget = this.#appendLock ? prepareAppendLockTarget(fpath) : undefined;
 		// Never truncate before the descriptor and its terminal pathname have passed native security.
 		const openFlags =
 			(flags === "w"
@@ -1574,14 +1684,55 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-		let offset = 0;
-		while (offset < buffer.byteLength) {
-			this.#writeCalls++;
-			const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
-			if (written === 0) throw new Error("Short write");
-			offset += written;
-			this.#bytesWritten += written;
+		let failure: unknown;
+		if (this.#appendLock && this.#appendLockTarget !== undefined && !this.#appendLockHandle) {
+			const target = this.#appendLockTarget;
+			assertAppendLockTargetUnchanged(target);
+			const deadline = Date.now() + 5_000;
+			for (;;) {
+				const handle = this.#appendLock(target.lockPath);
+				if (handle) {
+					// A swap between the check above and acquisition would leave this lock in a
+					// namespace other writers no longer see; release it and fail closed.
+					try {
+						assertAppendLockTargetUnchanged(target);
+					} catch (error) {
+						handle.releaseSync();
+						throw error;
+					}
+					this.#appendLockHandle = handle;
+					break;
+				}
+				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+			}
 		}
+		try {
+			let offset = 0;
+			while (offset < buffer.byteLength) {
+				this.#writeCalls++;
+				const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
+				if (written === 0) throw new Error("Short write");
+				offset += written;
+				this.#bytesWritten += written;
+			}
+		} catch (error) {
+			failure = error;
+		} finally {
+			if (this.#appendLockHandle) {
+				const appendLockHandle = this.#appendLockHandle;
+				for (let attempt = 0; attempt < 2; attempt++) {
+					try {
+						appendLockHandle.releaseSync();
+						this.#appendLockHandle = undefined;
+						break;
+					} catch {
+						if (attempt === 1) break;
+					}
+				}
+			}
+		}
+		if (failure !== undefined) throw failure;
 	}
 
 	#flushPending(): void {
@@ -1666,13 +1817,22 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		// Dispatched close already threw: outcome is uncertain. Never dispatch OS close
 		// for this numeric fd again; surface the stored non-quiescent error.
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
-
 		let flushError: Error | undefined;
 		if (!this.#error) {
 			try {
 				this.#flushPending();
 			} catch (err) {
 				flushError = this.#recordError(err);
+			}
+		}
+		if (this.#appendLockHandle) {
+			try {
+				this.#appendLockHandle.releaseSync();
+				this.#appendLockHandle = undefined;
+			} catch (err) {
+				this.#closeState = "close_failed_retryable";
+				this.#closeError = toError(err);
+				throw this.#closeError;
 			}
 		}
 		// State is "open" or "close_failed_retryable": a close may be dispatched.
@@ -2821,7 +2981,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 	}
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
-		return new FileSessionStorageWriter(path, options);
+		return new FileSessionStorageWriter(path, options as SessionStorageInternalWriterOpenOptions | undefined);
 	}
 	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
 		return new FileSessionStorageWriter(path, {

@@ -1,7 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { loadTestTheme } from "../../helpers/test-theme";
 
 function createContainer() {
 	return {
@@ -17,8 +18,7 @@ function createContainer() {
 
 describe("/handoff command", () => {
 	beforeAll(async () => {
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Expected dark theme");
+		const theme = await loadTestTheme();
 		setThemeInstance(theme);
 	});
 

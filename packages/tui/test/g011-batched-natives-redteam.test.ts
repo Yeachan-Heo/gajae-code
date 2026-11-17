@@ -12,7 +12,7 @@ import {
 } from "@gajae-code/tui";
 import { ImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 const REPORT_PATH = "artifacts/g011-qa-report.json";
 const SEGMENT_RESET = "\x1b[0m";
@@ -40,12 +40,6 @@ class FixedLines implements Component {
 	render(_width: number): string[] {
 		return this.lines;
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(25);
-	await term.flush();
 }
 
 function record(result: CaseResult): void {
@@ -191,7 +185,7 @@ describe("G011 batched text natives red-team", () => {
 		try {
 			tui.addChild(new FixedLines(lines));
 			tui.start();
-			await settle(term);
+			await settle(term, 25);
 			const actual = term.getWriteLog().join("");
 			const diffAt = findFirstDiff(actual, expectedFullWrite);
 			record({
@@ -248,13 +242,13 @@ describe("G011 batched text natives red-team", () => {
 			setDefaultTabWidth(2);
 			tui.addChild(component);
 			tui.start();
-			await settle(term);
+			await settle(term, 25);
 			initialPayload = renderedLineReference("a\tbbbb", 5);
 			expect(term.getWriteLog().join("")).toContain(initialPayload);
 			term.clearWriteLog();
 
 			setDefaultTabWidth(6);
-			await settle(term);
+			await settle(term, 25);
 			changedPayload = renderedLineReference("a\tbbbb", 5);
 			expect(changedPayload).not.toBe(initialPayload);
 			expect(term.getWriteLog().join("")).toContain(changedPayload);

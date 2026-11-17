@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { HookSelectorComponent } from "@gajae-code/coding-agent/modes/components/hook-selector";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { type TUI, visibleWidth } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 // =============================================================================
 // Helpers shared across required tests.
@@ -26,10 +27,7 @@ function bareSelectedPrefix(): string {
 }
 
 beforeAll(async () => {
-	const themeInstance = await getThemeByName("red-claw");
-	if (!themeInstance) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const themeInstance = await loadTestTheme();
 	setThemeInstance(themeInstance);
 });
 

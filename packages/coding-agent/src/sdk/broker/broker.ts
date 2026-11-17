@@ -20,7 +20,7 @@ import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
 } from "../../session/task-artifact-owner-codec";
-import { SdkClient, SdkClientError } from "../client";
+import { lifecycleFingerprint, lifecycleRequestIdentity, SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
@@ -49,6 +49,7 @@ import {
 	type BrokerStopRequest,
 	writeBrokerExitRecord,
 } from "./broker-exit";
+import { canonicalJson } from "./canonical-json";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -453,20 +454,6 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.delete",
 	"session.reconcile_uncertain",
 ]);
-
-/** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
-function lifecycleRequestIdentity(input: Record<string, unknown>): Record<string, unknown> {
-	const identity = { ...input };
-	delete identity.coordinatorSidecarSigningKey;
-	delete identity.coordinatorSidecarKeyId;
-	return identity;
-}
-
-function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
-		.digest("hex");
-}
 
 function publicLifecycleLookupInput(
 	input: Record<string, unknown>,
@@ -987,17 +974,6 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	}
 	return { input: normalized };
 }
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 type TerminalPersistenceVerification =
 	| { kind: "unverified" }
 	| { kind: "verified" }
@@ -1708,7 +1684,6 @@ type BrokerPublicationState =
 	| "heartbeat-ambiguous"
 	| "stopping";
 
-const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
@@ -6086,7 +6061,6 @@ export class Broker {
 				});
 				return uncertain;
 			}
-			terminalPersistenceHooksForTest.get(this)?.();
 			await outcome.deferredArtifactCleanup?.();
 			return response;
 		} finally {
@@ -6094,12 +6068,6 @@ export class Broker {
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
 	}
-}
-
-/** Test-only hook for simulating a process crash after terminal persistence verification. */
-export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => void) | undefined): void {
-	if (hook) terminalPersistenceHooksForTest.set(broker, hook);
-	else terminalPersistenceHooksForTest.delete(broker);
 }
 
 /** Test-only hook for shortening the bounded ambiguity deadline. */
