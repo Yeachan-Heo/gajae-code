@@ -5,7 +5,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 import { AsyncJobManager, type SubagentRecord } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { mapAgentSessionEventToAcpSessionUpdates } from "../../src/modes/acp/acp-event-mapper";
-import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import { setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 import { SubagentTool } from "../../src/tools/implementations";
@@ -15,6 +15,7 @@ import {
 	subagentAwaitRenderedStateSignature,
 } from "../../src/tools/subagent";
 import { subagentToolRenderer } from "../../src/tools/subagent-render";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -850,7 +851,7 @@ describe("subagent await progress visibility boundary", () => {
 		expect(String(telemetryInput)).not.toContain("secret-marker-text");
 		await tracerProvider.shutdown();
 
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		setThemeInstance(theme);
 		const rendered = Bun.stripANSI(
 			subagentToolRenderer
@@ -926,7 +927,7 @@ describe("subagent await progress visibility boundary", () => {
 		const modelText = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
 		expect(modelText).not.toContain("Changed pixels");
 
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		setThemeInstance(theme);
 		const rendered = Bun.stripANSI(
 			subagentToolRenderer

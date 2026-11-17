@@ -1,10 +1,11 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import { ExtensionUiController } from "@gajae-code/coding-agent/modes/controllers/extension-ui-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import type { Component, TUI } from "@gajae-code/tui";
 import { setKeybindings } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 type TestEditor = {
 	id: string;
@@ -44,10 +45,7 @@ type PetRestore = {
 };
 
 beforeAll(async () => {
-	const loadedTheme = await getThemeByName("red-claw");
-	if (!loadedTheme) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const loadedTheme = await loadTestTheme();
 	setThemeInstance(loadedTheme);
 });
 

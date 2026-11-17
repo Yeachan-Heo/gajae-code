@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as http from "node:http";
 import * as stream from "node:stream";
+import { isRecord } from "@gajae-code/utils";
 import { AUTOROUTING_TIERS, type AutoroutingTier } from "../config/autorouting-contract";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 
@@ -82,10 +83,6 @@ function normalizeMetrics(metrics: DelegationHintMetrics): DelegationHintMetrics
 		activePlanStepCount: boundedCount(metrics.activePlanStepCount),
 		...(remainingContextRatio === undefined ? {} : { remainingContextRatio }),
 	};
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function parseDecision(content: string, choices: readonly Tier[]): KevDecision | undefined {

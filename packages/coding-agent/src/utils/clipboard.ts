@@ -1,4 +1,3 @@
-import { execSync } from "node:child_process";
 import type { ClipboardImage } from "@gajae-code/natives";
 
 let nativeClipboardModule: typeof import("@gajae-code/natives") | undefined;
@@ -10,6 +9,7 @@ function nativeClipboard(): typeof import("@gajae-code/natives") {
 
 import { logger } from "@gajae-code/utils";
 import { settings } from "../config/settings";
+import MAC_FILE_URL_SCRIPT from "./mac-file-urls.applescript" with { type: "text" };
 
 function hasDisplay(): boolean {
 	return process.platform !== "linux" || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
@@ -285,11 +285,56 @@ function emitOsc52(text: string): boolean {
 	return delivered;
 }
 
+type SpawnCaptureOptions = { input?: string; timeoutMs?: number };
+
+/**
+ * Run a subprocess and capture its stdout without blocking the event loop.
+ * A synchronous `execSync` parks the render loop until the child exits or the
+ * timeout fires, so a slow or hung clipboard helper would freeze the TUI.
+ *
+ * @throws Error when the child fails to spawn, is killed by the timeout, or
+ *   exits with a non-zero status.
+ */
+async function spawnCapture(cmd: string[], options: SpawnCaptureOptions = {}): Promise<string> {
+	const timeoutMs = options.timeoutMs ?? 2000;
+	const proc = Bun.spawn(cmd, {
+		stdout: "pipe",
+		stderr: "ignore",
+		stdin: options.input !== undefined ? Buffer.from(options.input) : "ignore",
+	});
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		proc.kill();
+	}, timeoutMs);
+	try {
+		const stdout = await new Response(proc.stdout).text();
+		await proc.exited;
+		if (timedOut) {
+			throw new Error(`${cmd[0]} timed out after ${timeoutMs}ms`);
+		}
+		if (proc.exitCode !== 0) {
+			throw new Error(`${cmd[0]} exited with code ${proc.exitCode}`);
+		}
+		return stdout;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+// Clipboard writes that spawn a helper finish asynchronously; chain them so the
+// last copy invoked is the one left on the clipboard.
+let clipboardWriteChain: Promise<void> = Promise.resolve();
+
 async function copyToClipboardNative(text: string): Promise<boolean> {
+	const previousWrite = clipboardWriteChain;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	clipboardWriteChain = promise;
+	await previousWrite;
 	try {
 		if (process.env.TERMUX_VERSION) {
 			try {
-				execSync("termux-clipboard-set", { input: text, timeout: 5000 });
+				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
 				return true;
 			} catch {
 				// Fall through to native
@@ -303,6 +348,8 @@ async function copyToClipboardNative(text: string): Promise<boolean> {
 		return true;
 	} catch {
 		return false;
+	} finally {
+		resolve();
 	}
 }
 
@@ -429,6 +476,112 @@ async function readImageViaPowerShell(): Promise<ClipboardImage | null> {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Read file paths from the macOS pasteboard's `public.file-url` representation.
+ *
+ * A Finder Cmd+C on an image file puts only file URLs plus a generated file-icon bitmap on the
+ * pasteboard; reading the bitmap first would attach the generic icon instead of the file.
+ * Returns an empty list off Darwin, under the `ssh` clipboard transport (the local pasteboard is
+ * not the configured clipboard), when AppleScript is unavailable, or when no file URL is present.
+ */
+export async function readMacFileUrlsFromClipboard(): Promise<string[]> {
+	if (process.platform !== "darwin" || getClipboardTransportConfig().transport === "ssh") return [];
+	try {
+		const stdout = await spawnCapture(["osascript", "-"], { input: MAC_FILE_URL_SCRIPT });
+		return stdout
+			.split(/\r?\n/)
+			.map(line => line.trim())
+			.filter(line => line.length > 0);
+	} catch (error) {
+		logger.warn("clipboard: failed to read macOS file URLs", { error: String(error) });
+		return [];
+	}
+}
+
+// PowerShell one-liner that emits the Windows clipboard text as UTF-8, or nothing when the
+// clipboard holds no text. `[Console]::Out.Write` avoids the trailing newline Write-Output adds.
+const POWERSHELL_TEXT_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+[Console]::Out.Write([string](Get-Clipboard -Raw))
+`;
+
+/**
+ * Read clipboard text through Windows PowerShell (native win32 or the WSL host over interop).
+ * Returns null when the bridge fails so WSL callers can fall through to wl-paste/xclip; an empty
+ * string is a successful "no text" read.
+ */
+async function readTextViaPowerShell(): Promise<string | null> {
+	try {
+		const proc = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_TEXT_SCRIPT], {
+			stdout: "pipe",
+			stderr: "ignore",
+			stdin: "ignore",
+		});
+		const timer = setTimeout(() => proc.kill(), POWERSHELL_TIMEOUT_MS);
+		let stdout = "";
+		try {
+			stdout = await new Response(proc.stdout).text();
+			await proc.exited;
+		} catch (err) {
+			logger.warn("clipboard: powershell text read failed", { error: String(err) });
+			return null;
+		} finally {
+			clearTimeout(timer);
+		}
+		if (proc.exitCode !== 0) return null;
+		return stdout.replaceAll("\r\n", "\n");
+	} catch {
+		return null;
+	}
+}
+
+async function readTextFromX11Clipboard(): Promise<string> {
+	try {
+		return await spawnCapture(["xclip", "-selection", "clipboard", "-o"]);
+	} catch {
+		return await spawnCapture(["xsel", "--clipboard", "--output"]);
+	}
+}
+
+/**
+ * Read plain text from the system clipboard for the smart-paste fallback.
+ *
+ * Under the `ssh` clipboard transport this reads the configured host's clipboard and throws
+ * {@link ClipboardTransportError} on failure; it never falls back to the local clipboard.
+ * Otherwise it uses `pbpaste` on macOS, PowerShell on Windows/WSL, `termux-clipboard-get`, or
+ * wl-paste/xclip/xsel on Linux. Returns an empty string when no text can be read.
+ */
+export async function readTextFromClipboard(): Promise<string> {
+	const { transport, sshHost } = getClipboardTransportConfig();
+	if (transport === "ssh") return await pasteFromClipboardViaSsh(sshHost);
+	try {
+		const platform = process.platform;
+		if (platform === "darwin") return await spawnCapture(["pbpaste"]);
+		if (platform === "win32") return (await readTextViaPowerShell()) ?? "";
+		if (process.env.TERMUX_VERSION) return await spawnCapture(["termux-clipboard-get"]);
+		if (isWsl()) {
+			const text = await readTextViaPowerShell();
+			if (text !== null) return text;
+			// Bridge failed: fall through to the wl-paste/xclip paths below.
+		}
+		const hasWaylandDisplay = Boolean(process.env.WAYLAND_DISPLAY);
+		const hasX11Display = Boolean(process.env.DISPLAY);
+		if (hasWaylandDisplay) {
+			try {
+				return await spawnCapture(["wl-paste", "--type", "text", "--no-newline"]);
+			} catch {
+				if (hasX11Display) return await readTextFromX11Clipboard();
+			}
+		} else if (hasX11Display) {
+			return await readTextFromX11Clipboard();
+		}
+	} catch (error) {
+		logger.warn("clipboard: failed to read clipboard text", { error: String(error) });
+	}
+	return "";
 }
 
 /**

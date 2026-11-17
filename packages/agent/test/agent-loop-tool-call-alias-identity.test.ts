@@ -1,19 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AgentContext, AgentLoopConfig, AgentTool } from "@gajae-code/agent-core/types";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 type PatternSchema = z.ZodObject<{ pattern: z.ZodString }>;
 type PatternTool = AgentTool<PatternSchema, Record<string, never>>;
 type EmptySchema = z.ZodObject<Record<string, never>>;
 type TestTool = AgentTool<EmptySchema, Record<string, never>>;
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 function makeTool(name: string, options: { customWireName?: string; onExecute?: () => void } = {}): TestTool {
 	return {

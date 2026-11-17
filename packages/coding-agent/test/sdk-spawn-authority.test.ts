@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Broker, type SpawnRegistrationRequest, spawnRegistrationMatches } from "../src/sdk/broker/broker";
+import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -24,16 +25,6 @@ import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../src/sdk/host/control/r
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
 async function writeSpawnModelFixtures(agentDir: string): Promise<void> {
 	await fs.writeFile(
 		path.join(agentDir, "models.yml"),

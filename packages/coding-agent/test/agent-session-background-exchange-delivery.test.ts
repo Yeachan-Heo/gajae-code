@@ -9,6 +9,7 @@ import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { z } from "zod";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { mulberry32 } from "./helpers/seeded-random";
 
 registerMockApi();
 
@@ -410,14 +411,3 @@ describe("background IRC exchange delivery", () => {
 		}
 	});
 });
-
-/** Deterministic generator so a failing schedule is reproducible from its seed. */
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let value = Math.imul(state ^ (state >>> 15), 1 | state);
-		value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
-		return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-	};
-}

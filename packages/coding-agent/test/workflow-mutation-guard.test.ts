@@ -22,6 +22,7 @@ import {
 } from "@gajae-code/coding-agent/skill-state/workflow-mutation-guard";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 
 const tempRoots: string[] = [];
 
@@ -119,14 +120,6 @@ function tool(name: string, extra: Record<string, unknown> = {}): AgentTool {
 function parseStateCommandJson(stdout: string | undefined): Record<string, unknown> {
 	if (!stdout) throw new Error("missing state command stdout");
 	return JSON.parse(stdout) as Record<string, unknown>;
-}
-
-function makeSeededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
 }
 
 function seededToken(random: () => number, length: number): string {
@@ -2786,7 +2779,7 @@ describe("bash scanner quoting model", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
-		const random = makeSeededRandom(0x6801);
+		const random = lcgUnit(0x6801);
 
 		for (let sample = 0; sample < 12; sample++) {
 			const target = `src/generated-${seededToken(random, 8)}.ts`;
@@ -2861,7 +2854,7 @@ describe("bash scanner quoting model", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
-		const random = makeSeededRandom(0x6801_2026);
+		const random = lcgUnit(0x6801_2026);
 		// Exact BASH_OPAQUE_INTERPRETER_WRITE_RE from merge-base 3756eeec.
 		// Generated inputs below are real writes, not inert string-literal matches.
 		const mergeBaseOpaqueInterpreterWriteRe =
@@ -2900,7 +2893,7 @@ describe("bash scanner quoting model", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
-		const random = makeSeededRandom(0x1_6801_2026);
+		const random = lcgUnit(0x1_6801_2026);
 		const apiSpellings = ["open(", "writeFileSync(", "appendFileSync(", "shutil.copy(", ".write("];
 
 		for (const api of apiSpellings) {
@@ -2945,7 +2938,7 @@ describe("bash scanner quoting model", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
-		const random = makeSeededRandom(0x6947);
+		const random = lcgUnit(0x6947);
 		for (let sample = 0; sample < 8; sample++) {
 			const alias = `s${seededToken(random, 6)}`;
 			for (const stream of ["stdout", "stderr"]) {
@@ -3274,7 +3267,7 @@ process.stdout.write(JSON.stringify(decision));`,
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
-		const random = makeSeededRandom(0x6947);
+		const random = lcgUnit(0x6947);
 		for (const delimiter of [",", ")", "(", ";", "}", "\n"]) {
 			const filename = `input-${seededToken(random, 8)}${delimiter}.txt`;
 			const literal = `"${filename}"`;
@@ -3420,7 +3413,7 @@ process.stdout.write(JSON.stringify(decision));`,
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
-		const random = makeSeededRandom(6947);
+		const random = lcgUnit(6947);
 		for (let sample = 0; sample < 12; sample++) {
 			const names = Array.from({ length: 3 }, () => `alias_${seededToken(random, 8)}`);
 			for (const name of names) {

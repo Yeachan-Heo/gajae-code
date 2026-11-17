@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import { isSettingsInitialized, Settings } from "../config/settings";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
@@ -56,10 +57,6 @@ import {
 } from "./state-writer";
 import { anchorInputFileArgs, assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { resolveWorkflowSetting } from "./workflow-settings";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 function assertNoFutureDeepInterviewEnvelope(value: Record<string, unknown>, surface: string): void {
 	if (

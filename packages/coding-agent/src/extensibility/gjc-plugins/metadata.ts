@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { upgradeJsonSchemaTo202012 } from "@gajae-code/ai/utils/schema";
+import { isRecord } from "@gajae-code/utils";
 import { resolveWithinRoot } from "./paths";
 import { GjcPluginLoadError, type JsonSchema202012, PluginImplementationHashMismatchError } from "./types";
 
 export const JSON_SCHEMA_202012_URI = "https://json-schema.org/draft/2020-12/schema";
 
-/** Stable JSON serialization used for schema hashes and registry fingerprints. */
+/** Stable JSON serialization used for schema hashes and registry fingerprints. Throws on an explicit undefined value or object key and on non-finite numbers; bigints fail in JSON.stringify. Sparse array holes are not visited by map and produce invalid JSON, so callers must not pass sparse arrays. */
 export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") {
 		if (typeof value === "number" && !Number.isFinite(value)) throw new Error("JSON value must be finite");
@@ -33,10 +34,6 @@ export async function verifyImplementationHash(filePath: string, expected: strin
 	if (actual.toLowerCase() !== expected.toLowerCase())
 		throw new PluginImplementationHashMismatchError(filePath, expected, actual);
 	return actual;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function cloneCanonical(value: unknown): unknown {

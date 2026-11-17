@@ -403,6 +403,20 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("names the typed failure class when retries stop, without the provider's prose", () => {
+		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				error: `error ${sentinel}`,
+				retryFailure: { attempt: 1, errorMessage: `429 ${sentinel}`, failureClass: "rate_limit" },
+			}),
+		);
+
+		expect(receipt.preview).toBe("Task merge_failed; retry stopped after attempt 1 (rate_limit).");
+		expect(receipt.retryFailure?.failureClass).toBe("rate_limit");
+		expect(JSON.stringify(receipt)).not.toContain(sentinel);
+	});
+
 	it("surfaces a local_buffer_overflow summary in the parent preview instead of the generic error text (#4618)", () => {
 		const structuredSummary = createLocalErrorSummary("local_buffer_overflow", "ignored message text", {
 			stage: "overflow.staged",

@@ -279,10 +279,7 @@ Mode rather than dropping them.
 
 The production Telegram multiplexer is
 `packages/coding-agent/src/sdk/bus/telegram-daemon.ts`. It already sends a
-protocol-v3 ClientHello with `ask_controls_v1` and `ask_selected_ack_v1`. The
-generic `packages/coding-agent/src/sdk/bus/managed-daemon.ts` is
-liveness-only: it advertises `client_ping_pong` but is intentionally
-non-capable for controlled asks.
+protocol-v3 ClientHello with `ask_controls_v1` and `ask_selected_ack_v1`.
 
 Telegram navigation controls appear only after `ask_controls_v1` is negotiated
 on that session connection. A non-capable or older third-party client receives

@@ -6695,7 +6695,7 @@ export const CURATED_TIER_MAP: AutoroutingCuratedTierMap = {
 	version: TIER_MAP_VERSION,
 };
 
-/** Canonical JSON uses sorted object keys and preserves array order. */
+/** Canonical JSON uses sorted object keys and preserves array order. `undefined`/function/symbol encode as the literal `undefined`; explicit undefined array entries become null, while sparse holes are skipped and produce invalid JSON. */
 export function canonicalJson(value: unknown): string {
 	if (value === null) return "null";
 	if (value === undefined) return "undefined";

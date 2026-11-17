@@ -1,3 +1,4 @@
+import { isRecord } from "@gajae-code/utils";
 import type { AgentProgress, TaskToolDetails } from "./types";
 
 export type ProviderRetryKind = NonNullable<AgentProgress["retryState"]>["kind"];
@@ -52,10 +53,6 @@ export function providerProgressAgeLabel(retryState: NonNullable<AgentProgress["
 	return `last provider progress ${ageSeconds}s ago`;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object";
-}
-
 function isTaskToolDetails(value: unknown): value is TaskToolDetails {
 	return (
 		isRecord(value) && Array.isArray(value.results) && (value.progress === undefined || Array.isArray(value.progress))
@@ -104,4 +101,16 @@ export function collectProviderDegradationGroups(progress: readonly AgentProgres
 	return Array.from(counts, ([provider, count]) => ({ provider, count }))
 		.filter(group => group.count > 1)
 		.sort((a, b) => b.count - a.count || a.provider.localeCompare(b.provider));
+}
+
+/**
+ * Parent-facing reason a subagent left its requested model. Auth fallback is
+ * `no_credentials`; a managed chain switch carries the fallback trigger class
+ * (`rate_limit`, `server`, …). Anything else renders without a reason so free
+ * text never reaches the panel.
+ */
+export function modelFallbackLabel(reason: string | undefined): string {
+	if (reason === "no_credentials") return "fell back — no credentials";
+	if (reason !== undefined && /^[a-z][a-z_]{0,39}$/.test(reason)) return `fell back — ${reason.replaceAll("_", " ")}`;
+	return "fell back";
 }

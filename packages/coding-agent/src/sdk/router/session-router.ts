@@ -13,6 +13,7 @@ import {
 } from "../broker/session-index";
 import { cancellableSleep, lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import {
+	deepFreeze,
 	SdkClient,
 	SdkClientError,
 	type SdkDispatchContext,
@@ -332,14 +333,6 @@ function redactDispatchFrame(frame: Record<string, unknown>): Record<string, unk
 	if (secureLocalFrameOperation(frame)) delete redacted.input;
 	const frozen = deepFreeze(redacted);
 	return frozen as Record<string, unknown>;
-}
-
-function deepFreeze<T>(value: T): T {
-	if (value && typeof value === "object") {
-		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
-		Object.freeze(value);
-	}
-	return value;
 }
 
 export type SessionRouterErrorPhase = "pre_send" | "ambiguous";

@@ -31,6 +31,7 @@ import {
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { buildChildEnv } from "./helpers/acp-child-env";
 import {
 	cleanupFixtureRoots,
 	createFixtureRootCleanup,
@@ -113,36 +114,6 @@ async function teardown(oracle: Oracle): Promise<void> {
 afterEach(async () => {
 	await cleanupFixtureRoots(cleanupRoots);
 });
-
-/**
- * Explicit minimal environment allowlist. NEVER spreads `process.env`: only
- * `PATH` and the locale/timezone vars (`LANG`/`LC_ALL`/`TZ`) are forwarded, and
- * the locale/timezone vars only "as available" (present and non-empty). `HOME`,
- * `TMPDIR`, every XDG dir, and the agent dirs are owned by the test and rooted
- * under the isolated temp root. This function performs no process-global env
- * mutation — it only constructs and returns a fresh object handed to the child.
- */
-function buildChildEnv(root: string): Record<string, string> {
-	const env: Record<string, string> = {
-		PATH: process.env.PATH ?? "/usr/bin:/bin",
-		HOME: root,
-		TMPDIR: path.join(root, "tmp"),
-		XDG_DATA_HOME: path.join(root, ".local", "share"),
-		XDG_CONFIG_HOME: path.join(root, ".config"),
-		XDG_STATE_HOME: path.join(root, ".local", "state"),
-		XDG_CACHE_HOME: path.join(root, ".cache"),
-		XDG_RUNTIME_DIR: path.join(root, ".run"),
-		GJC_CODING_AGENT_DIR: path.join(root, "agent"),
-		PI_CODING_AGENT_DIR: path.join(root, "agent"),
-		PI_NO_TITLE: "1",
-		NO_COLOR: "1",
-	};
-	for (const key of ["LANG", "LC_ALL", "TZ"] as const) {
-		const value = process.env[key];
-		if (value !== undefined && value !== "") env[key] = value;
-	}
-	return env;
-}
 
 interface Oracle {
 	proc: AcpProc;

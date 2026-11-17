@@ -3,7 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
+import { getAgentDir, isRecord, logger, sanitizeDisplayLine } from "@gajae-code/utils";
 import {
 	PUBLIC_COMMAND_DIAGNOSTICS,
 	type PublicCommandDiagnosticCode,
@@ -25,7 +25,7 @@ import {
 	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
+import { bounded, readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
 	SessionLifecycleLookupOutcome,
@@ -37,8 +37,10 @@ import type {
 	SessionLifecycleService,
 	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
+import { isSessionLifecycleMutationOperation } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import {
+	containsSecretConfigKey,
 	validateAdapterControl,
 	validateAdapterSecretFields,
 	validateRequiredPromptText,
@@ -124,7 +126,6 @@ export interface RetainedTranscriptTailReader {
 	readRange(start: number, end: number): Promise<Uint8Array>;
 }
 
-const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const SDK_SESSION_CLI_LIFECYCLE_ACTOR = { id: "gjc-sdk-session-cli", namespace: "sdk:session-cli" } as const;
 const ROUTER_START_TIMEOUT_MS = 10_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
@@ -327,10 +328,6 @@ function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
-function isRecord(value: unknown): value is JsonRecord {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function object(value: unknown): JsonRecord | undefined {
 	return isRecord(value) ? value : undefined;
 }
@@ -478,12 +475,6 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 	}
 }
 
-function containsSecretField(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsSecretField);
-	if (!isRecord(value)) return false;
-	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
-}
-
 async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	const sources = [
 		args.jsonInput !== undefined,
@@ -493,7 +484,7 @@ async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	if (sources > 1) throw new SdkSessionCliError("usage", "Use only one JSON input source.", 2);
 	if (args.jsonInput !== undefined) {
 		const input = parseInput(args.jsonInput, "--json-input");
-		if (containsSecretField(input))
+		if (containsSecretConfigKey(input))
 			throw new SdkSessionCliError(
 				"secret_field_forbidden",
 				"Secret values must use --json-input-file or --json-input-stdin.",
@@ -526,15 +517,8 @@ function isRawSpawnOperation(kind: OperationKind, operation: string): boolean {
 }
 
 function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.revise" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
+	// The local daemon CLI additionally exposes same-session revision (G11).
+	return operation === "session.revise" || isSessionLifecycleMutationOperation(operation);
 }
 
 function cliOperationError(kind: OperationKind, operation: string): { code: string; message: string } | undefined {
@@ -547,17 +531,6 @@ function cliOperationError(kind: OperationKind, operation: string): { code: stri
 			message: `${operation} is unavailable through the SDK session CLI.`,
 		};
 	return error;
-}
-
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: NodeJS.Timeout | undefined;
-	const timeout = Promise.withResolvers<never>();
-	try {
-		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
-		return await Promise.race([promise, timeout.promise]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
 }
 
 function reportRouterCleanupFailure(): void {
