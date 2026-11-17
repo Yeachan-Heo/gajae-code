@@ -35528,8 +35528,7 @@ export class AgentSession {
 		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
 		const previousMessages = agent.state.messages.slice();
 		let ownedMessages = previousMessages;
-		let ownedTools = agent.state.tools;
-		let ownedPromptRevision = agent.promptRevision;
+		let ownedContextRevision = agent.contextRevision;
 		let ownedHistoryRevision = agent.historyRevision;
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
@@ -35576,15 +35575,14 @@ export class AgentSession {
 			);
 		};
 		const current = () => {
-			// Prompt and tools are independently mutable; a concurrent publication is
-			// drift even while the view identity holds.
-			return historyIsOurs() && agent.state.tools === ownedTools && agent.promptRevision === ownedPromptRevision;
+			// Prompt and tool publications advance contextRevision even when they
+			// republish the same array, so ownership cannot rest on identity alone.
+			return historyIsOurs() && agent.contextRevision === ownedContextRevision;
 		};
 		const fence: SessionViewRestoreFence = {
 			isCurrent: current,
 			onApplied: () => {
-				ownedTools = agent.state.tools;
-				ownedPromptRevision = agent.promptRevision;
+				ownedContextRevision = agent.contextRevision;
 			},
 		};
 		this.#beginSessionTransition("navigate-tree");
@@ -35605,6 +35603,7 @@ export class AgentSession {
 			});
 			ownedMessages = agent.state.messages.slice();
 			ownedHistoryRevision = agent.historyRevision;
+			ownedContextRevision = agent.contextRevision;
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -35643,29 +35642,30 @@ export class AgentSession {
 							previousExplicitMCPToolSelectionPersistsForContext;
 						this.#commitExplicitMCPToolSelectionAuthority();
 					}
-					if (historyIsOurs() && selectionOurs() && agent.state.tools === ownedTools) {
+					// Prompt before tools: the tool observer may publish prompt state of
+					// its own, and that later publication must win over this revert.
+					if (historyIsOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#baseSystemPrompt = previousBaseSystemPrompt;
+						agent.setSystemPrompt(previousSystemPrompt);
+						ownedContextRevision = agent.contextRevision;
+						promptReverted = true;
+						// Invalidate rebuilds authorized for the abandoned target tools;
+						// otherwise one may publish their guidance over the reverted prompt.
+						this.#reserveBaseSystemPromptGeneration();
+					}
+					if (historyIsOurs() && selectionOurs() && agent.contextRevision === ownedContextRevision) {
 						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 						this.#activeToolSelectionRevision++;
 						agent.setTools(previousTools);
 						toolsReverted = true;
-						// The observer runs after the revert is owned: it may itself publish
-						// prompt or history state, which the next checks must observe.
+						ownedContextRevision = agent.contextRevision;
 						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 						this.#invalidateDiscoveryCaches();
-					} else if (selectionOurs() && agent.state.tools === ownedTools) {
+					} else if (selectionOurs() && agent.contextRevision === ownedContextRevision) {
 						// The view moved on, so its live tools stand. Only undo the
 						// discovered-selection staging this operation performed.
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
-					}
-					if (historyIsOurs() && agent.promptRevision === ownedPromptRevision) {
-						this.#baseSystemPrompt = previousBaseSystemPrompt;
-						agent.setSystemPrompt(previousSystemPrompt);
-						ownedPromptRevision = agent.promptRevision;
-						promptReverted = true;
-						// Invalidate rebuilds authorized for the abandoned target tools;
-						// otherwise one may publish their guidance over the reverted prompt.
-						this.#reserveBaseSystemPromptGeneration();
 					}
 					if (toolsReverted && promptReverted) {
 						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;

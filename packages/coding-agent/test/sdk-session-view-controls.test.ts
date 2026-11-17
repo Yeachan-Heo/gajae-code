@@ -799,14 +799,50 @@ describe("SDK exact session view", () => {
 		expect(captureSessionView(session)).toEqual(target(previous));
 	});
 
-	it("counts a same-array prompt republication without touching history", async () => {
+	it("rejects a same-array prompt republication during the rebuild", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
 		const prompt = session.agent.state.systemPrompt;
-		const history = session.agent.historyRevision;
-		const revision = session.agent.promptRevision;
+		prompt[0] = "foreign same-array edit";
 		session.agent.setSystemPrompt(prompt);
-		expect(session.agent.state.systemPrompt).toBe(prompt);
-		expect(session.agent.promptRevision).toBe(revision + 1);
-		expect(session.agent.historyRevision).toBe(history);
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.systemPrompt).toContain("foreign same-array edit");
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("rejects a same-array tool republication during the rebuild", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		const tools = session.agent.state.tools;
+		const first = tools[0];
+		if (!first) throw new Error("Expected an active tool");
+		tools.push({ ...first, name: "foreign_tool", label: "Foreign tool" });
+		session.agent.setTools(tools);
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.getActiveToolNames()).toContain("foreign_tool");
+		expect(model.calls).toHaveLength(0);
 	});
 
 	for (const interference of [

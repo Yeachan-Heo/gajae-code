@@ -535,7 +535,6 @@ export class Agent {
 	};
 	#contextRevision = 0;
 	#historyRevision = 0;
-	#promptRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
@@ -968,15 +967,6 @@ export class Agent {
 		return this.#historyRevision;
 	}
 
-	/**
-	 * Revision of the system prompt alone. It advances on every `setSystemPrompt`
-	 * call, including one that republishes the same array, and on an in-place
-	 * `touchContext`.
-	 */
-	get promptRevision(): number {
-		return this.#promptRevision;
-	}
-
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
 		return this.#appendOnlyContext;
 	}
@@ -1275,7 +1265,6 @@ export class Agent {
 	setSystemPrompt(v: string[]) {
 		this.#state.systemPrompt = v;
 		this.#contextRevision++;
-		this.#promptRevision++;
 	}
 
 	setModel(m: Model | undefined) {
@@ -1360,7 +1349,6 @@ export class Agent {
 	touchContext(): void {
 		this.#contextRevision++;
 		this.#historyRevision++;
-		this.#promptRevision++;
 	}
 
 	/**
