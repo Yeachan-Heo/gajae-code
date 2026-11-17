@@ -292,6 +292,75 @@ describe("auth-broker wire surface", () => {
 		}
 	});
 
+	test("a persisted legacy cleartext MCP binding keeps the snapshot decodable and is refused on use", async () => {
+		const legacyProvider = "mcp_oauth_legacy";
+		store!.replaceAuthCredentialsForProvider(legacyProvider, [
+			{
+				type: "oauth",
+				access: "legacy-access",
+				refresh: "legacy-refresh",
+				expires: Date.now() + 3_600_000,
+				mcpBinding: { resourceOrigin: "https://legacy.example", tokenEndpoint: "http://192.0.0.9/token" },
+			},
+		]);
+		const legacyId = store!.listAuthCredentials(legacyProvider)[0]?.id;
+		if (legacyId === undefined) throw new Error("expected persisted legacy credential");
+		await storage!.reload();
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const snapshot = await client.fetchSnapshot();
+		if (snapshot.status !== 200) throw new Error("expected the mixed snapshot to decode");
+		expect(snapshot.snapshot.credentials.map(entry => entry.provider).sort()).toEqual(["anthropic", legacyProvider]);
+
+		const remoteStore = new RemoteAuthCredentialStore({ client, initialSnapshot: snapshot.snapshot });
+		const remoteStorage = new AuthStorage(remoteStore);
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		try {
+			await remoteStorage.reload();
+			expect(remoteStorage.get("anthropic")?.type).toBe("oauth");
+			const legacy = remoteStorage.get(legacyProvider);
+			if (legacy?.type !== "oauth") throw new Error("expected legacy OAuth credential");
+
+			// The client refuses to dial before it even reaches the broker.
+			await expect(
+				remoteStorage.forceRefreshOAuthCredential(legacyProvider, legacy, {
+					clientId: "legacy-client",
+					clientSecret: "LEGACY_CLIENT_SECRET",
+				}),
+			).rejects.toThrow(/cleartext HTTP is loopback-only/);
+			expect(remoteStorage.get("anthropic")?.type).toBe("oauth");
+
+			// The broker holding the row refuses the same refresh on its own side.
+			const refused = await fetch(`${handle!.url}/v1/credential/${legacyId}/refresh`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ clientId: "legacy-client", clientSecret: "LEGACY_CLIENT_SECRET" }),
+			});
+			expect(refused.status).toBe(500);
+			const body = await refused.text();
+			expect(body).toContain("cleartext HTTP is loopback-only");
+			expect(body).not.toContain("LEGACY_CLIENT_SECRET");
+
+			// An unrelated update still lands, and the mixed snapshot still decodes afterwards.
+			await remoteStorage.set("test_api_key", { type: "api_key", key: "sk-remote" });
+			expect(remoteStorage.get("test_api_key")).toEqual({ type: "api_key", key: "sk-remote" });
+			const afterUpdate = await client.fetchSnapshot();
+			if (afterUpdate.status !== 200) throw new Error("expected the post-update snapshot to decode");
+			expect(afterUpdate.snapshot.credentials.map(entry => entry.provider)).toEqual(
+				expect.arrayContaining(["test_api_key", legacyProvider]),
+			);
+
+			// Neither side ever dialed the insecure token endpoint.
+			const dialed = fetchSpy.mock.calls.map(([input]) =>
+				typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+			);
+			expect(dialed.filter(href => href.includes("192.0.0.9"))).toEqual([]);
+		} finally {
+			fetchSpy.mockRestore();
+			remoteStorage.close();
+		}
+	});
+
 	test("GET /v1/snapshot rejects legacy conditional revalidation across restarts", async () => {
 		const res = await fetch(`${handle!.url}/v1/snapshot`, {
 			headers: { Authorization: `Bearer ${token}`, "X-GJC-Auth-Broker-Epoch": "1" },
