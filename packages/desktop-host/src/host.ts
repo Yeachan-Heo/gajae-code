@@ -1141,7 +1141,10 @@ export class DesktopHost {
 			throw error;
 		}
 	}
-	/** Remove the unowned catalog reference durably, then clean SDK-owned sidecars/artifacts. */
+	/**
+	 * Remove the unowned catalog reference durably. Missing transcript bytes never
+	 * authorize SDK deletion or derived-artifact cleanup, so nothing else is removed.
+	 */
 	async #forgetMissingSession(metadata: SavedSession): Promise<null> {
 		const index = this.#catalog.sessions.indexOf(metadata);
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
@@ -1151,7 +1154,6 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
-		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;
 	}
@@ -3629,7 +3631,10 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
-		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
+		// A transcript another surface already removed is forgotten after live-owner
+		// disposal; its absence is not deletion authority for the SDK.
+		if (metadata.file && !(await this.#transcriptMissing(metadata)))
+			await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;
 	}

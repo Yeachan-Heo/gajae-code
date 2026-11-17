@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import * as sdk from "@gajae-code/coding-agent/sdk";
 import {
 	type CreateAgentSessionResult,
 	captureSessionView,
@@ -12,7 +13,6 @@ import {
 	type ExtensionContext,
 	Settings,
 } from "@gajae-code/coding-agent/sdk";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { isolateEnvironment } from "../src/environment-policy";
 import {
@@ -1343,10 +1343,8 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 
 	test("artifact deletion failure does not resurrect a durably removed catalog entry", async () => {
 		const h = await launch();
-		// Inject failure at the SDK's verified managed deletion boundary.
-		const remove = vi
-			.spyOn(SessionManager, "deleteManagedCandidate")
-			.mockRejectedValue(new Error("artifact cleanup failed"));
+		// Inject failure at the public SDK's verified deletion boundary.
+		const remove = vi.spyOn(sdk, "deleteEmbeddedSession").mockRejectedValue(new Error("artifact cleanup failed"));
 		spies.push(remove);
 		try {
 			await expect(h.call("session.delete", { sessionId: h.source.id })).rejects.toThrow("artifact cleanup failed");

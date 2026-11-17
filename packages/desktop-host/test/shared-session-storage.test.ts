@@ -595,7 +595,7 @@ test("a row whose transcript another surface removed can still be deleted", asyn
 	expect(after.sessions).toEqual([]);
 });
 
-test("deleting an unopened missing transcript also removes its SDK artifact directory", async () => {
+test("deleting an unopened missing transcript forgets the row without inferring artifact cleanup", async () => {
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
 	const session = await h.call<DesktopSession>("session.create", { projectId: project.id });
@@ -609,8 +609,8 @@ test("deleting an unopened missing transcript also removes its SDK artifact dire
 	await fs.rm(transcript);
 	expect(await Bun.file(retained).exists()).toBe(true);
 	await h.call("session.delete", { sessionId: session.id });
-	expect(await Bun.file(retained).exists()).toBe(false);
-	await expect(fs.stat(artifacts)).rejects.toMatchObject({ code: "ENOENT" });
+	// Missing transcript bytes are not deletion authority: the SDK-owned artifacts stay.
+	expect(await Bun.file(retained).text()).toBe("owned derived artifact");
 	expect(h.snapshot().sessions).toEqual([]);
 	const after: { sessions: unknown[] } = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
 	expect(after.sessions).toEqual([]);
