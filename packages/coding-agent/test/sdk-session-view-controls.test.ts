@@ -615,9 +615,11 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
-	it("leaves an independently refreshed prompt in place when the view aborts afterwards", async () => {
-		await seedMcpBranches();
+	it("restores the previous view when only an independent prompt publication drifted", async () => {
+		const { previous } = await seedMcpBranches();
 		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entries = session.sessionManager.getEntries();
+		const messages = session.agent.state.messages.slice();
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		let rebuilds = 0;
@@ -636,6 +638,11 @@ describe("SDK exact session view", () => {
 		expect(session.systemPrompt).toEqual(["independent refresh"]);
 		release.resolve();
 		await expect(pending).rejects.toMatchObject({ code: "revision_failed", rollbackFailed: false });
+		// Prompt ownership is independent of history ownership: the cursor and
+		// transcript still return to the predecessor view.
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
 		expect(session.systemPrompt).toEqual(["independent refresh"]);
 		expect(model.calls).toHaveLength(0);
 	});

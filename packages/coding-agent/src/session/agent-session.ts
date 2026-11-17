@@ -35613,85 +35613,73 @@ export class AgentSession {
 			this.#resetActiveSdkRunOwnership();
 			if (!current()) throw gone();
 		} catch (error) {
-			// Revision counters catch even a competing selection away and back. Never
-			// overwrite appended work, a successor, disposal, or foreign agent history.
-			if (moved && current()) {
+			// Undo independently-owned components. History (leaf and transcript) is
+			// reverted while the view is still ours; prompts, tools and selection
+			// authority only while this operation still owns them, so an independent
+			// publication is never overwritten.
+			if (moved && sessionStillOurs()) {
+				const historyOurs = historyIsOurs();
+				const selectionOurs =
+					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
+				const authorityOurs =
+					selectionOurs &&
+					!this.#hasExplicitActiveToolSelectionForContext &&
+					this.#explicitMCPToolSelectionForContext === undefined &&
+					this.#explicitMCPToolSelectionPersistsForContext === true;
+				const toolsOurs = agent.state.tools === ownedTools;
+				const promptOurs = agent.state.systemPrompt === ownedSystemPrompt;
 				try {
-					if (previousLeaf === null) manager.resetLeaf();
-					else manager.branch(previousLeaf);
-					ownedLeaf = previousLeaf;
-					revisions = { ...revisions, leaf: revisions.leaf + 1 };
-					if (!current()) throw gone();
-					// The transcript may intentionally differ from the live selection. Restore
-					// prepared tools and both prompts without rebuilding or persisting it.
-					this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
-					this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-					this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
-					this.#commitExplicitMCPToolSelectionAuthority();
-					this.#selectedMCPToolNames = previousSelectedMCPToolNames;
-					this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
-					this.#activeToolSelectionRevision++;
-					agent.setTools(previousTools);
-					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
-					ownedTools = agent.state.tools;
-					ownedContextRevision = agent.contextRevision;
-					if (!current()) throw gone();
-					this.#baseSystemPrompt = previousBaseSystemPrompt;
-					agent.setSystemPrompt(previousSystemPrompt);
-					// Invalidate prompt rebuilds authorized for the abandoned target tools;
-					// otherwise one may publish their guidance over the reverted prompt.
-					this.#reserveBaseSystemPromptGeneration();
-					ownedSystemPrompt = agent.state.systemPrompt;
-					ownedContextRevision = agent.contextRevision;
-					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
-					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
-					this.#invalidateDiscoveryCaches();
-					if (!current()) throw gone();
-					agent.replaceMessages(previousMessages, {
-						historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
-					});
-					ownedMessages = agent.state.messages.slice();
-					ownedContextRevision = agent.contextRevision;
-					this.#resetInjectedContextSignatures();
-					this.#syncTodoPhasesFromBranch();
-					this.#closeCodexProviderSessionsForHistoryRewrite();
-					if (!current()) throw gone();
+					if (historyOurs) {
+						if (previousLeaf === null) manager.resetLeaf();
+						else manager.branch(previousLeaf);
+					}
+					if (authorityOurs) {
+						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+						this.#explicitMCPToolSelectionPersistsForContext =
+							previousExplicitMCPToolSelectionPersistsForContext;
+						this.#commitExplicitMCPToolSelectionAuthority();
+					}
+					if (historyOurs && selectionOurs && toolsOurs) {
+						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+						this.#activeToolSelectionRevision++;
+						agent.setTools(previousTools);
+						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+						this.#invalidateDiscoveryCaches();
+					} else if (selectionOurs && toolsOurs) {
+						// The view moved on, so its live tools stand. Only undo the
+						// discovered-selection staging this operation performed.
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+					}
+					if (historyOurs && promptOurs) {
+						this.#baseSystemPrompt = previousBaseSystemPrompt;
+						agent.setSystemPrompt(previousSystemPrompt);
+						// Invalidate rebuilds authorized for the abandoned target tools;
+						// otherwise one may publish their guidance over the reverted prompt.
+						this.#reserveBaseSystemPromptGeneration();
+					}
+					if (historyOurs && selectionOurs && toolsOurs && promptOurs) {
+						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+					}
+					if (historyOurs) {
+						agent.replaceMessages(previousMessages, {
+							historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
+						});
+						this.#resetInjectedContextSignatures();
+						this.#syncTodoPhasesFromBranch();
+						this.#closeCodexProviderSessionsForHistoryRewrite();
+					}
 				} catch {
 					throw Object.assign(new Error("Session view rollback failed."), {
 						code: "revision_failed",
 						rollbackFailed: true,
 					});
 				}
+				if (!historyOurs) throw gone();
 			} else if (moved) {
-				// Either the live view moved on, or an independent publication owns the
-				// prompt/tools. Undo only independently-owned state that this operation
-				// staged and still owns, without reviving superseded tools.
-				if (sessionStillOurs()) {
-					try {
-						if (this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration) {
-							if (
-								!this.#hasExplicitActiveToolSelectionForContext &&
-								this.#explicitMCPToolSelectionForContext === undefined &&
-								this.#explicitMCPToolSelectionPersistsForContext === true
-							) {
-								this.#hasExplicitActiveToolSelectionForContext =
-									previousHasExplicitActiveToolSelectionForContext;
-								this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-								this.#explicitMCPToolSelectionPersistsForContext =
-									previousExplicitMCPToolSelectionPersistsForContext;
-								this.#commitExplicitMCPToolSelectionAuthority();
-							}
-							if (agent.state.tools === ownedTools)
-								this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
-						}
-					} catch {
-						throw Object.assign(new Error("Session view rollback failed."), {
-							code: "revision_failed",
-							rollbackFailed: true,
-						});
-					}
-				}
-				if (!historyIsOurs()) throw gone();
+				throw gone();
 			}
 			throw error;
 		} finally {
