@@ -7978,6 +7978,12 @@ export class SessionManager {
 	#sessionId: string = "";
 	#committedIdentityGeneration = 0;
 	#committedIdentity: { id: string; file: string | undefined } | undefined;
+	/**
+	 * Logical transcript lineage, captured on first use and advanced only by a committed
+	 * identity change. A verified storage relocation rewrites `#sessionFile` without one, so
+	 * it preserves this value; re-selecting the transcript already written is a no-op.
+	 */
+	#transcriptLineageId: string | undefined;
 	#titleMutationRevision = 0;
 	#titleMutationTail: Promise<void> = Promise.resolve();
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
@@ -8186,7 +8192,6 @@ export class SessionManager {
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
 	#managedTranscriptRelocationResolver: (() => ArtifactManager) | undefined;
 	#managedTranscriptRelocationResolverToken: symbol | undefined;
-	#managedTranscriptRelocationFileOrigin: string | undefined;
 	#managedTranscriptRelocationParentArtifacts: ArtifactManager | undefined;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
@@ -13199,7 +13204,7 @@ export class SessionManager {
 	#capturePersistenceInputToken(): PersistenceInputToken {
 		return {
 			sessionFile: this.#sessionFile ?? "",
-			lifecycleId: `${this.#sessionId}@${this.#managedTranscriptRelocationFileOrigin ?? this.#sessionFile ?? ""}`,
+			lifecycleId: this.getTranscriptLineageId(),
 			entryRevision: this.#entryRevision,
 			headerRevision: this.#headerExportRevision,
 			residentBlobRevision: this.#residentBlobRevision,
@@ -13513,7 +13518,6 @@ export class SessionManager {
 	#clearManagedTranscriptRelocationResolver(): void {
 		this.#managedTranscriptRelocationResolver = undefined;
 		this.#managedTranscriptRelocationResolverToken = undefined;
-		this.#managedTranscriptRelocationFileOrigin = undefined;
 		this.#managedTranscriptRelocationParentArtifacts = undefined;
 	}
 
@@ -13593,7 +13597,6 @@ export class SessionManager {
 			// pins descriptor/path state that cannot be retargeted without rebuilding.
 			if (this.#managedSidecarCacheStore) this.#managedSidecarCacheSessionFile = nextSessionFile;
 			this.#boundedReadStorageProxy = undefined;
-			this.#managedTranscriptRelocationFileOrigin ??= currentSessionFile;
 			this.destination = nextDestination;
 			this.sessionDir = nextDirectory;
 			this.#sessionFile = nextSessionFile;
@@ -18122,6 +18125,32 @@ export class SessionManager {
 		const previous = this.#committedIdentity ?? { id: previousId, file: previousFile };
 		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) this.#committedIdentityGeneration++;
 		this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
+		// This is the only place the lineage advances: a verified relocation rewrites the path
+		// without committing an identity change, and re-selecting the same transcript is not a
+		// change at all. Callers capture the lineage before an adoption, so it must keep naming
+		// the predecessor until the adoption actually commits.
+		if (
+			this.#transcriptLineageId !== undefined &&
+			(previousId !== this.#sessionId || previousFile !== this.#sessionFile)
+		)
+			this.#transcriptLineageId = `${this.#sessionId}@${this.#sessionFile ?? ""}`;
+	}
+
+	/**
+	 * Identity of the logical transcript lineage this manager is writing.
+	 *
+	 * A verified same-owner storage relocation of the same transcript preserves this value:
+	 * the file is the same logical transcript reached through a re-rooted artifact directory,
+	 * so state queued against the old path still belongs to it. A committed identity change
+	 * (`setSessionFile` adoption of another transcript, a new session, a branch switch, a cwd
+	 * move) advances it, because queued state captured before the change belongs to the
+	 * predecessor. Re-selecting the transcript the manager already writes is not a change.
+	 * Callers that must distinguish relocation from adoption compare this value instead of
+	 * {@link getSessionFile}.
+	 */
+	getTranscriptLineageId(): string {
+		this.#transcriptLineageId ??= `${this.#sessionId}@${this.#sessionFile ?? ""}`;
+		return this.#transcriptLineageId;
 	}
 
 	getSessionId(): string {

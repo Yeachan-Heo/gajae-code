@@ -600,7 +600,6 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 	SharedAppendOutcome,
-	SharedAppendReconciliation,
 	SharedControlEntry,
 	SharedEntriesAppendOutcome,
 } from "./session-manager";
@@ -671,24 +670,39 @@ type SharedPublicationObstacle =
 	| "unreadable-transcript";
 
 /**
- * The transcript a queued publication was scheduled against.
+ * The transcript lineage a queued publication was scheduled against.
  *
  * The manager instance alone is not enough: session switches rotate the same manager, and
- * `setSessionFile` can adopt another file that carries the same logical session id.
+ * `setSessionFile` can adopt another file that carries the same logical session id. The
+ * lineage id is the manager's supported identity for this: a verified same-owner storage
+ * relocation of the same transcript preserves it, while adopting another transcript
+ * advances it.
  */
 interface PublicationOrigin {
 	readonly manager: SessionManager;
-	readonly sessionId: string;
-	readonly sessionFile: string | undefined;
+	readonly lineageId: string;
 }
+
+/**
+ * Terminal result of one deferred publication admission.
+ *
+ * Append, reconciliation, and a retry proven safe by that reconciliation share one
+ * canonical admission, so an `unknown` append never escapes this type: it resolves to
+ * `committed`, becomes a retained `unresolved` row, or is a refusal the caller reports.
+ */
+type DeferredPublicationOutcome =
+	| { readonly kind: "committed" }
+	| { readonly kind: "unresolved"; readonly entryId: string; readonly reason: string; readonly error: unknown }
+	| { readonly kind: "refused"; readonly outcome: Exclude<SharedAppendOutcome, { kind: "committed" }> };
 
 /**
  * One command result waiting for a publication slot.
  *
  * `unresolved` is set after reconciliation could neither find the attempted entry in the
- * transcript nor prove it absent. Such an entry is never resubmitted: its retained id is
- * re-read on the next explicit drain, which either acknowledges it as durable, keeps it
- * retained, or proves it absent so the ordinary retry path may run.
+ * transcript nor prove it absent. Such a row is always already in agent state: the
+ * publication attempt queued here followed its agent append. Its retained id is re-read on
+ * the next explicit drain, which either acknowledges it as durable, keeps it retained, or
+ * proves it absent so the same admission may retry it. It is never resubmitted blindly.
  */
 type PendingExecutionMessage<T extends BashExecutionMessage | PythonExecutionMessage> = {
 	message: T;
@@ -17460,23 +17474,24 @@ export class AgentSession {
 		);
 	}
 
-	/** The transcript a publication was scheduled against; compared after the lane wait. */
+	/** The transcript lineage a publication was scheduled against; compared after the lane wait. */
 	#capturePublicationOrigin(): PublicationOrigin {
 		return {
 			manager: this.sessionManager,
-			sessionId: this.sessionManager.getSessionId(),
-			sessionFile: this.sessionManager.getSessionFile(),
+			lineageId: this.sessionManager.getTranscriptLineageId(),
 		};
 	}
 
 	#isPublicationOriginCurrent(origin: PublicationOrigin): boolean {
-		// The session id alone is not the transcript identity: `setSessionFile` can adopt a
-		// different file that carries the same logical id, and a queued publication that
-		// survives that switch would append predecessor state to the adopted transcript.
+		// The lineage id, not the file path, is the transcript identity: a verified relocation
+		// of the same transcript changes `getSessionFile()` while preserving the lineage, so a
+		// path comparison would classify the manager's own supported relocation as a switch
+		// and drop queued state that still belongs to this transcript. Adopting a different
+		// transcript (including one that carries the same logical session id) advances the
+		// lineage, so a queued publication that survives that adoption is still refused.
 		return (
 			this.sessionManager === origin.manager &&
-			this.sessionManager.getSessionId() === origin.sessionId &&
-			this.sessionManager.getSessionFile() === origin.sessionFile
+			this.sessionManager.getTranscriptLineageId() === origin.lineageId
 		);
 	}
 
@@ -17487,10 +17502,22 @@ export class AgentSession {
 	 * persisted" so it can keep the entry queued for retry and withhold `onPersisted`. A
 	 * background publish cannot express that, so this path awaits the lease in the
 	 * canonical lane and converts every non-committed outcome into a throw carrying the
-	 * cause. An `unknown` outcome is reconciled first: the entry may already be durable,
-	 * and resubmitting it would duplicate it rather than retry it.
+	 * cause.
+	 *
+	 * Append, reconciliation, and a retry that reconciliation proved safe share ONE lane
+	 * admission. Releasing the lane between them would let a publication queued behind this
+	 * older row take the lease first, so newer state could reach the transcript before this
+	 * deferred result. Each admission is bounded to two appends and two reconciliations, so
+	 * an undecided row is retained for the next explicit drain instead of looping here.
+	 *
+	 * `retained` re-reads an attempted id from an earlier admission; it is never resubmitted
+	 * unless the transcript proves it absent.
 	 */
-	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
+	async #persistExecutionMessage(
+		label: string,
+		message: SessionPersistedMessage,
+		retained?: UnresolvedExecutionPublication,
+	): Promise<void> {
 		if (!this.#usesSharedSessionPublication()) {
 			this.sessionManager.appendMessage(message);
 			return;
@@ -17498,44 +17525,65 @@ export class AgentSession {
 		// The flush batch was taken from the predecessor queue; the lane wait can span a
 		// session switch, so the origin is captured here and re-checked under the lane.
 		const origin = this.#capturePublicationOrigin();
-		const outcome = await this.#trackBackgroundPublication(
-			this.#withCanonicalSchedulingLane(async () => {
+		// A retained row was already reported as unconfirmed when it was first held; re-reading
+		// it on every drain must not repeat the same operator notice.
+		const alreadyReportedUncertain = retained !== undefined;
+		const result = await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(async (): Promise<DeferredPublicationOutcome> => {
 				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
-				return await this.#appendMessageAtAdmittedCursor(message);
+				if (retained) {
+					const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(
+						retained.entryId,
+						retained.error,
+					);
+					if (reconciled.kind === "committed") return { kind: "committed" };
+					if (reconciled.kind === "unresolved")
+						return {
+							kind: "unresolved",
+							entryId: reconciled.id,
+							reason: retained.reason,
+							error: reconciled.error,
+						};
+					// Proven absent: the attempted id is in neither the transcript nor the resident
+					// graph, so publishing the row again cannot duplicate it.
+				}
+				const attempt = await this.#appendMessageAtAdmittedCursor(message);
+				if (attempt.kind !== "unknown")
+					return attempt.kind === "committed" ? { kind: "committed" } : { kind: "refused", outcome: attempt };
+				const cause = describeSharedAppendFailure(attempt);
+				const reason = cause.reason ?? cause.outcome;
+				const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(attempt.id, attempt.error);
+				if (reconciled.kind === "committed") return { kind: "committed" };
+				if (reconciled.kind === "unresolved")
+					return { kind: "unresolved", entryId: reconciled.id, reason, error: reconciled.error };
+				// Proven absent: retry once, still inside this admission, so a publication queued
+				// behind this row cannot commit newer state ahead of it. A second undecided outcome
+				// is reconciled and then left to the next explicit drain rather than looping here.
+				const retry = await this.#appendMessageAtAdmittedCursor(message);
+				if (retry.kind !== "unknown")
+					return retry.kind === "committed" ? { kind: "committed" } : { kind: "refused", outcome: retry };
+				const retryCause = describeSharedAppendFailure(retry);
+				const afterRetry = await this.sessionManager.reconcileUnknownSharedAppend(retry.id, retry.error);
+				if (afterRetry.kind === "committed") return { kind: "committed" };
+				if (afterRetry.kind === "unresolved")
+					return {
+						kind: "unresolved",
+						entryId: afterRetry.id,
+						reason: retryCause.reason ?? retryCause.outcome,
+						error: afterRetry.error,
+					};
+				// Absent again: the row is provably not durable, so the refusal below is honest and
+				// the caller retains it for the next drain.
+				return { kind: "refused", outcome: retry };
 			}),
 		);
-		if (outcome.kind === "committed") return;
-		const cause = describeSharedAppendFailure(outcome);
-		if (outcome.kind === "unknown") {
-			const reconciled = await this.#reconcileRetainedExecutionPublication(outcome.id, outcome.error, origin);
-			if (reconciled.kind === "committed") return;
-			const reason = cause.reason ?? cause.outcome;
-			if (reconciled.kind === "unresolved") {
-				this.#reportBackgroundUncertainty(label, "unreadable-transcript");
-				throw new UnresolvedExecutionPublicationError(outcome.id, reason, outcome.error);
-			}
+		if (result.kind === "committed") return;
+		if (result.kind === "unresolved") {
+			if (!alreadyReportedUncertain) this.#reportBackgroundUncertainty(label, "unreadable-transcript");
+			throw new UnresolvedExecutionPublicationError(result.entryId, result.reason, result.error);
 		}
-		this.#reportBackgroundRefusal(label, sharedAppendObstacle(outcome));
-		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
-	}
-
-	/**
-	 * Re-read a retained deferred publication's attempted id under the ordering lane.
-	 *
-	 * The id is never resubmitted: only the transcript decides whether the earlier append is
-	 * durable (`committed`), provably absent (`absent`), or still undecided (`unresolved`).
-	 */
-	async #reconcileRetainedExecutionPublication(
-		entryId: string,
-		error: unknown,
-		origin: PublicationOrigin,
-	): Promise<SharedAppendReconciliation> {
-		return await this.#trackBackgroundPublication(
-			this.#withCanonicalSchedulingLane(async () => {
-				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
-				return await this.sessionManager.reconcileUnknownSharedAppend(entryId, error);
-			}),
-		);
+		this.#reportBackgroundRefusal(label, sharedAppendObstacle(result.outcome));
+		assertSharedAppendCommitted(`Shared ${label} append`, result.outcome);
 	}
 
 	/**
@@ -33652,9 +33700,11 @@ export class AgentSession {
 		kind: "bash" | "python",
 		preflights: readonly PromptPreflightIdentity[],
 	): Promise<void> {
-		// The batch belongs to the transcript that was active when it was taken. A session
-		// switch rotates the same manager and clears these queues, so a batch survivor that
-		// outlived it must be dropped rather than published into the successor.
+		// The batch belongs to the transcript lineage that was active when it was taken. A
+		// verified storage relocation of that same transcript preserves the lineage, so its
+		// rows still publish into the relocated file; a session switch rotates the same manager
+		// and clears these queues while advancing the lineage, so a batch survivor that
+		// outlived the switch is dropped rather than published into the successor.
 		const batchOrigin = this.#capturePublicationOrigin();
 		if (pendingMessages.length === 0) return;
 		// Re-read cancellation at the claim itself, not only once per drain invocation: one
@@ -33684,58 +33734,11 @@ export class AgentSession {
 				superseded = true;
 				break;
 			}
-			if (pending.unresolved) {
-				if (persistenceBlocked || agentAppendBlocked) {
-					// An earlier row still owns the queue head. This row's attempted id stays
-					// retained untried this drain; a later prompt re-reads it once the head clears.
-					remaining.push(pending);
-					continue;
-				}
-				// Reconciliation could not prove this entry durable or absent. Nothing may
-				// resubmit the append, but the retained attempted id must be re-read on every
-				// explicit drain: a transient read failure would otherwise hold the queue for the
-				// rest of the session even when the append is already durable.
-				let reconciled: SharedAppendReconciliation;
-				try {
-					reconciled = await this.#reconcileRetainedExecutionPublication(
-						pending.unresolved.entryId,
-						pending.unresolved.error,
-						batchOrigin,
-					);
-				} catch (error) {
-					if (error instanceof SessionPublicationSupersededError) {
-						superseded = true;
-						break;
-					}
-					reconciled = { kind: "unresolved", id: pending.unresolved.entryId, error };
-					errors.push(error);
-				}
-				if (reconciled.kind === "committed") {
-					// The append was durable all along. Acknowledge it once, drop the row, and never
-					// publish it again: the message is already in agent state and in the transcript.
-					persisted.push("command" in pending.message ? pending.message.command : pending.message.code);
-					try {
-						pending.onPersisted?.();
-					} catch (error) {
-						callbackFailureCount++;
-						errors.push(error);
-					}
-					continue;
-				}
-				if (reconciled.kind === "unresolved") {
-					// Still undecided: retain the row, surface the uncertainty, append nothing.
-					pending.unresolved = {
-						entryId: reconciled.id,
-						reason: pending.unresolved.reason,
-						error: reconciled.error,
-					};
-					persistenceBlocked = true;
-					unresolvedCount++;
-					remaining.push(pending);
-					continue;
-				}
-				// Proven absent, so a retry cannot duplicate it: fall through to the ordinary path.
-				pending.unresolved = undefined;
+			if (pending.unresolved && (persistenceBlocked || agentAppendBlocked)) {
+				// An earlier row still owns the queue head. This row's attempted id stays retained
+				// untried this drain; a later prompt re-reads it once the head clears.
+				remaining.push(pending);
+				continue;
 			}
 			if (!pending.appendedToAgent) {
 				if (agentAppendBlocked) {
@@ -33760,7 +33763,10 @@ export class AgentSession {
 			}
 
 			try {
-				await this.#persistExecutionMessage("deferred command result", pending.message);
+				// A retained row is reconciled and, when the transcript proves the earlier attempt
+				// absent, retried inside the same canonical admission as this publication. Nothing
+				// queued behind it can therefore commit newer state ahead of this older result.
+				await this.#persistExecutionMessage("deferred command result", pending.message, pending.unresolved);
 			} catch (error) {
 				if (error instanceof SessionPublicationSupersededError) {
 					superseded = true;
@@ -33771,7 +33777,7 @@ export class AgentSession {
 				// retry would append the failed entry after messages that originally followed it.
 				persistenceBlocked = true;
 				if (error instanceof UnresolvedExecutionPublicationError) {
-					pending.unresolved = { entryId: error.entryId, reason: error.message, error: error.cause };
+					pending.unresolved = { entryId: error.entryId, reason: error.reason, error: error.cause };
 					unresolvedCount++;
 				}
 				remaining.push(pending);
@@ -36771,7 +36777,7 @@ interface BackgroundPublicationResult {
 class UnresolvedExecutionPublicationError extends Error {
 	constructor(
 		readonly entryId: string,
-		reason: string,
+		readonly reason: string,
 		cause?: unknown,
 	) {
 		super(
