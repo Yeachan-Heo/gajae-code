@@ -1188,6 +1188,59 @@ describe("shared publication admission split", () => {
 		expect(await Bun.file(successorFile).text()).not.toContain("orphaned output");
 	});
 
+	it("keeps the rest of a spliced batch when the same transcript is relocated", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const firstPersisted = vi.fn();
+		const secondPersisted = vi.fn();
+		f.session.recordBashResult("echo first", shellResult("first relocated output"), {
+			onPersisted: firstPersisted,
+		});
+		f.session.recordBashResult("echo second", shellResult("second relocated output"), {
+			onPersisted: secondPersisted,
+		});
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const originalFile = f.manager.getSessionFile();
+		if (!originalFile) throw new Error("missing session file");
+		const relocatedFile = path.join(path.dirname(originalFile), `relocated-${path.basename(originalFile)}`);
+		// A verified same-owner relocation re-roots the transcript path without adopting another
+		// session. That is exactly what the manager reports through this pair: a new
+		// `getSessionFile()` while `getTranscriptLineageId()` stays put.
+		const liveFile = f.manager.getSessionFile.bind(f.manager);
+		let relocated = false;
+		vi.spyOn(f.manager, "getSessionFile").mockImplementation(() => (relocated ? relocatedFile : liveFile()));
+
+		const commands: string[] = [];
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution") {
+				commands.push(message.command);
+				// The relocation lands while the first row of the already-spliced batch publishes.
+				if (commands.length === 1) relocated = true;
+			}
+			return await original(message);
+		});
+		vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
+
+		await f.session.prompt("relocation flush");
+		relocated = false;
+		// Both rows belong to the relocated transcript, so neither may be dropped.
+		expect(commands).toEqual(["echo first", "echo second"]);
+		expect(firstPersisted).toHaveBeenCalledTimes(1);
+		expect(secondPersisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.flush();
+		const durable = await Bun.file(originalFile).text();
+		expect(durable.indexOf("first relocated output")).toBeGreaterThanOrEqual(0);
+		expect(durable.indexOf("second relocated output")).toBeGreaterThan(
+			durable.indexOf("first relocated output"),
+		);
+	});
+
 	it("recovers a retained unresolved deferred result by re-reading it, never resubmitting", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
@@ -1234,6 +1287,47 @@ describe("shared publication admission split", () => {
 		await f.manager.flush();
 		expect((await Bun.file(f.file).text()).split("recoverable output").length - 1).toBe(1);
 		snapshot.mockRestore();
+	});
+
+	it("reconciles a proven-absent append before a publication queued behind it", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo retried", shellResult("retried output"));
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		let attempts = 0;
+		let queued: Promise<unknown> | undefined;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") return await original(message);
+			attempts++;
+			if (attempts > 1) return await original(message);
+			// The append leaves no durable trace but its outcome is unprovable, so the row must
+			// be reconciled. A newer local publication reserves its lane slot right now: it is
+			// queued behind this older row and must not commit ahead of its deferred result.
+			queued = f.session.appendModeChangeInBackground("plan");
+			return { kind: "unknown", id: "proven-absent-entry", error: new Error("transaction release failed") };
+		});
+		// The turn itself is not the subject; stop right after the drain.
+		vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
+
+		await f.session.prompt("first flush");
+		await queued;
+		// Reconciliation proved the first attempt absent, so the retry ran in the same
+		// admission instead of waiting for a later drain.
+		expect(attempts).toBe(2);
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.session.awaitSessionSettlement();
+		await f.manager.flush();
+		const durable = await Bun.file(f.file).text();
+		const resultIndex = durable.indexOf("retried output");
+		const queuedIndex = durable.indexOf('"type":"mode_change"');
+		expect(resultIndex).toBeGreaterThanOrEqual(0);
+		expect(queuedIndex).toBeGreaterThanOrEqual(0);
+		expect(resultIndex).toBeLessThan(queuedIndex);
 	});
 
 	it("drains a successor batch before the successor prompt reaches the agent", async () => {

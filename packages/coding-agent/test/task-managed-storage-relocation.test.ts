@@ -93,6 +93,33 @@ describe("managed Task storage follows only the original logical owner's relocat
 		}
 	});
 
+	it("keeps the transcript lineage across verified relocation and advances it on adoption", async () => {
+		const f = await fixture();
+		try {
+			const lineage = f.child.getTranscriptLineageId();
+			expect(lineage).toBe(`${f.child.getSessionId()}@${f.originalChildFile}`);
+			await f.parent.moveTo(f.cwdB);
+			await appendAfterMove(f.child);
+			const relocatedFile = f.child.getSessionFile();
+			expect(relocatedFile).not.toBe(f.originalChildFile);
+			// A verified same-owner relocation is the same logical transcript at a re-rooted
+			// path, so state queued against the predecessor path still belongs to it.
+			expect(f.child.getTranscriptLineageId()).toBe(lineage);
+			// Re-pointing at the file it already writes is not an adoption either.
+			await f.child.setSessionFile(relocatedFile!);
+			expect(f.child.getTranscriptLineageId()).toBe(lineage);
+			// Adopting a different file that carries the same logical session id is not a
+			// relocation: queued predecessor state must not follow it.
+			const adoptedFile = path.join(path.dirname(relocatedFile!), "adopted-copy.jsonl");
+			await fs.copyFile(relocatedFile!, adoptedFile);
+			await f.child.setSessionFile(adoptedFile);
+			expect(f.child.getSessionId()).toBe(lineage.split("@")[0]);
+			expect(f.child.getTranscriptLineageId()).not.toBe(lineage);
+		} finally {
+			await dispose(f);
+		}
+	});
+
 	it("refuses changed copied transcript bytes instead of recapturing their identity", async () => {
 		const f = await fixture();
 		try {
