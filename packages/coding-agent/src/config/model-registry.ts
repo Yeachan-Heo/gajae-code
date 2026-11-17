@@ -5222,9 +5222,29 @@ export class ModelRegistry {
 		// The implicit Rapid-MLX probe admits rows by evidence that exists only in
 		// the wire response, and a cached Model cannot be re-admitted; the offline
 		// cache path also serves a provenance-mismatched row on purpose. An offline
-		// refresh therefore cannot publish implicit Rapid-MLX models at all — one
-		// live fetch is required to establish identity.
-		if ((cacheDynamicModelProvenance === undefined || requiresWireAdmission) && strategy === "offline") {
+		// refresh may therefore serve the cached catalog only while the row itself
+		// carries the current identity-required provenance, i.e. a live probe
+		// admitted it. A row from any other policy is refused instead of published.
+		const offlineCacheAdmitted =
+			requiresWireAdmission &&
+			cacheDynamicModelProvenance !== undefined &&
+			(() => {
+				const cached = readModelCache<Api>(
+					effectiveProviderConfig.provider,
+					24 * 60 * 60 * 1000,
+					Date.now,
+					this.#cacheDbPath,
+				);
+				return (
+					cached !== null &&
+					cached.dynamicModelIds !== undefined &&
+					cached.dynamicModelProvenance === cacheDynamicModelProvenance
+				);
+			})();
+		if (
+			(cacheDynamicModelProvenance === undefined || (requiresWireAdmission && !offlineCacheAdmitted)) &&
+			strategy === "offline"
+		) {
 			const previouslyPublishedModelIds = [...(evidence?.modelIds ?? [])];
 			this.#configuredDiscoveryEvidence.delete(provider);
 			return {

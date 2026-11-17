@@ -424,13 +424,26 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			});
 		}
 
-		// Control: the offline cache path itself still serves a rapid-mlx row when the
-		// admission policy does not require wire-only evidence. An explicit selection
-		// is trusted as written, so its cached row survives an offline refresh; the
-		// empty results above are the implicit policy boundary, not an inert path.
 		using _nativeRowFetch = hookFetch(() =>
 			Response.json({ object: "list", data: [{ id: "native-row", context_window: 131072 }] }),
 		);
+		// Control 1: a row that WAS admitted under the implicit policy keeps serving an
+		// offline refresh, so opening the model selector (which refreshes offline) does
+		// not blank an admitted Rapid-MLX catalog.
+		for (const name of await fs.readdir(cacheDirectory)) {
+			if (name.startsWith("models.db")) await fs.rm(path.join(cacheDirectory, name), { force: true });
+		}
+		const admittedOnlineRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		await admittedOnlineRegistry.refresh("online");
+		expect(admittedOnlineRegistry.find("rapid-mlx", "native-row")).toBeDefined();
+		const admittedOfflineRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+		await admittedOfflineRegistry.refresh("offline");
+		expect(admittedOfflineRegistry.find("rapid-mlx", "native-row")).toBeDefined();
+
+		// Control 2: the offline cache path itself serves a rapid-mlx row when the
+		// admission policy does not require wire-only evidence. An explicit selection
+		// is trusted as written, so its cached row survives an offline refresh; the
+		// empty results above are the policy boundary, not an inert path.
 		await Bun.write(
 			modelsJsonPath,
 			JSON.stringify({
