@@ -117,9 +117,13 @@ function manifest(version: string, digest: string): string {
 
 /**
  * A bare origin whose `main` ships a release that `dev` has not seen, with a diverged
- * build-digest manifest — the shape every release backmerge has to merge.
+ * build-digest manifest — the shape every release backmerge has to merge. With
+ * `devAncestor`, `dev` stays at the base commit so the release tag descends from it and a
+ * plain `git merge` would only fast-forward.
  */
-async function backmergeFixture(options: { releaseManifest?: string; secondConflict?: boolean } = {}) {
+async function backmergeFixture(
+	options: { releaseManifest?: string; secondConflict?: boolean; devAncestor?: boolean } = {},
+) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-backmerge-e2e-"));
 	tempRoots.push(root);
 	const origin = path.join(root, "origin.git");
@@ -140,11 +144,13 @@ async function backmergeFixture(options: { releaseManifest?: string; secondConfl
 
 	// dev diverges first, so the release commit main ships afterwards is genuinely new to it.
 	await git(work, "checkout", "-b", "dev");
-	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.6", "dev-digest"));
-	if (options.secondConflict === true) await Bun.write(readme, "dev\n");
-	await Bun.write(path.join(work, "dev-only.txt"), "dev\n");
-	await git(work, "add", "-A");
-	await git(work, "commit", "-m", "feat: dev work");
+	if (options.devAncestor !== true) {
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.6", "dev-digest"));
+		if (options.secondConflict === true) await Bun.write(readme, "dev\n");
+		await Bun.write(path.join(work, "dev-only.txt"), "dev\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "feat: dev work");
+	}
 	await git(work, "push", "origin", "dev");
 
 	await git(work, "checkout", "main");
@@ -158,45 +164,88 @@ async function backmergeFixture(options: { releaseManifest?: string; secondConfl
 	return { origin, work };
 }
 
+/** Run the printed recipe verbatim from `work`, asserting each step's exit status. */
+async function runRecoveryRecipe(
+	work: string,
+	version: string,
+	topology: "conflict" | "fast-forward",
+): Promise<void> {
+	const worktree = path.join(path.dirname(work), `recovery-${topology}`);
+	const steps = backmergeRecoverySteps(version, worktree);
+	const mergeIndex = steps.findIndex(step => step.argv.includes("merge"));
+	expect(mergeIndex).toBeGreaterThan(-1);
+	for (const [index, step] of steps.entries()) {
+		const result = await gitCommand(work, step.argv);
+		if (index !== mergeIndex) {
+			expect(result.exitCode).toBe(0);
+			continue;
+		}
+		if (topology === "conflict") {
+			// The recipe exists because this merge conflicts on the build-digest manifest.
+			expect(result.exitCode).not.toBe(0);
+			expect(`${result.stdout}${result.stderr}`).toContain(BACKMERGE_CONFLICT_PATH);
+		} else {
+			// `--no-commit --no-ff` reports success and leaves the merge pending.
+			expect(result.exitCode).toBe(0);
+		}
+	}
+}
+
+/** Push `backmerge/<version>` the way the previous resolver built it: dev's merge, its manifest.
+ */
+async function pushLegacyBackmergeBranch(work: string, version: string, legacyManifest: string): Promise<void> {
+	await git(work, "fetch", "origin");
+	await git(work, "checkout", "-b", `legacy-${version}`, "origin/dev");
+	const merge = await gitCommand(work, ["merge", "--no-commit", "--no-ff", `v${version}`]);
+	expect(merge.exitCode).not.toBe(0);
+	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), legacyManifest);
+	await git(work, "add", BACKMERGE_CONFLICT_PATH);
+	await git(work, "commit", "-m", `chore(release): sync the v${version} release into dev`);
+	await git(work, "push", "origin", `HEAD:refs/heads/backmerge/${version}`);
+}
+
+/** The recipe must publish a two-parent merge of dev's tip and the release commit carrying the tag's manifest. */
+async function expectPublishedMerge(origin: string, version: string, releasedManifest: string): Promise<void> {
+	const branch = `backmerge/${version}`;
+	const devTip = (await git(origin, "rev-parse", "dev")).trim();
+	const releaseCommit = (await git(origin, "rev-parse", `v${version}^{commit}`)).trim();
+	const tip = (await git(origin, "rev-list", "--parents", "-n", "1", branch)).trim().split(" ");
+	expect(tip).toHaveLength(3);
+	expect(tip[1]).toBe(devTip);
+	expect(tip[2]).toBe(releaseCommit);
+	expect(await git(origin, "show", `${branch}:${BACKMERGE_CONFLICT_PATH}`)).toBe(releasedManifest);
+}
+
 describe("manual backmerge recovery recipe", () => {
 	test("the printed recipe publishes the merge, not the pre-merge dev commit", async () => {
 		const { origin, work } = await backmergeFixture();
-		const worktree = path.join(path.dirname(work), "recovery");
-		const devTip = (await git(origin, "rev-parse", "dev")).trim();
-		const releaseCommit = (await git(origin, "rev-parse", "v0.18.7^{commit}")).trim();
+		await runRecoveryRecipe(work, "0.18.7", "conflict");
+		// A recipe that resolves and pushes without completing the merge would publish dev's
+		// pre-merge commit instead, which the two-parent check rejects.
+		await expectPublishedMerge(origin, "0.18.7", manifest("0.18.7", "main-digest"));
+	});
 
-		const steps = backmergeRecoverySteps("0.18.7", worktree);
-		const mergeIndex = steps.findIndex(step => step.argv.includes("merge"));
-		expect(mergeIndex).toBeGreaterThan(-1);
-		for (const [index, step] of steps.entries()) {
-			const result = await gitCommand(work, step.argv);
-			if (index === mergeIndex) {
-				// The recipe exists because this merge conflicts on the build-digest manifest.
-				expect(result.exitCode).not.toBe(0);
-				expect(`${result.stdout}${result.stderr}`).toContain(BACKMERGE_CONFLICT_PATH);
-				continue;
-			}
-			expect(result.exitCode).toBe(0);
-		}
+	test("the printed recipe completes the merge when dev is an ancestor of the tag", async () => {
+		// A plain `git merge` fast-forwards here, so the manifest checkout is a no-op and
+		// `git commit --no-edit` fails with nothing to commit. The step ordering and the
+		// pending merge commit must survive this topology too.
+		const { origin, work } = await backmergeFixture({ devAncestor: true });
+		expect((await gitCommand(work, ["merge-base", "--is-ancestor", "dev", "v0.18.7"])).exitCode).toBe(0);
 
-		// The branch the recipe pushes is the merge itself, with dev's tip and the release
-		// commit as parents. A recipe that resolves and pushes without completing the merge
-		// would publish dev's pre-merge commit instead, which this rejects.
-		const branch = "backmerge/0.18.7";
-		const tip = (await git(origin, "rev-list", "--parents", "-n", "1", branch)).trim().split(" ");
-		expect(tip).toHaveLength(3);
-		expect(tip[1]).toBe(devTip);
-		expect(tip[2]).toBe(releaseCommit);
-		// The conflict resolution is the released manifest, byte for byte.
-		expect(await git(origin, "show", `${branch}:${BACKMERGE_CONFLICT_PATH}`)).toBe(manifest("0.18.7", "main-digest"));
+		await runRecoveryRecipe(work, "0.18.7", "fast-forward");
+		await expectPublishedMerge(origin, "0.18.7", manifest("0.18.7", "main-digest"));
 	});
 
 	test("prints the completion step between the resolution and the push", () => {
 		const commands = backmergeRecoverySteps("0.18.7", BACKMERGE_RECOVERY_WORKTREE).map(step => `git ${step.argv.join(" ")}`);
+		const merge = commands.findIndex(command => command.includes(" merge "));
 		const resolve = commands.findIndex(command => command.includes(`checkout refs/remotes/origin/tags/v0.18.7 -- ${BACKMERGE_CONFLICT_PATH}`));
 		const complete = commands.findIndex(command => command.endsWith("commit --no-edit"));
 		const push = commands.findIndex(command => command.includes("push origin HEAD:refs/heads/backmerge/0.18.7"));
-		expect(resolve).toBeGreaterThan(-1);
+		expect(merge).toBeGreaterThan(-1);
+		// Matching the automated path keeps a merge commit pending after a fast-forward.
+		expect(commands[merge]).toContain("merge --no-commit --no-ff");
+		expect(resolve).toBe(merge + 1);
 		expect(complete).toBe(resolve + 1);
 		expect(push).toBe(complete + 1);
 	});
@@ -322,6 +371,31 @@ describe("backmerge orchestration", () => {
 		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(oldTip);
 	});
 
+	test("refuses to reopen a legacy backmerge branch whose manifest is stale", async () => {
+		// The previous resolver could keep dev's digests under the released label, or keep the
+		// older label outright. Neither equals the tag, so both must fail closed and unchanged:
+		// reopening would relabel bytes this release never built.
+		for (const legacyManifest of [manifest("0.18.7", "dev-digest"), manifest("0.18.6", "base-digest")]) {
+			const { origin, work } = await backmergeFixture();
+			await pushLegacyBackmergeBranch(work, "0.18.7", legacyManifest);
+			const oldTip = await git(origin, "rev-parse", "backmerge/0.18.7");
+			const opener = recordingOpener();
+
+			const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
+
+			expect(outcome.action).toBe("blocked");
+			expect(outcome.detail).toContain("carries a stale manifest");
+			// Both versions are named: the branch's own label and the released one.
+			expect(outcome.detail).toContain(`branch version ${(JSON.parse(legacyManifest) as { version: string }).version}`);
+			expect(outcome.detail).toContain("released version 0.18.7");
+			expect(outcome.detail).toContain(
+				"git push origin --delete backmerge/0.18.7 && bun scripts/release.ts backmerge 0.18.7",
+			);
+			expect(opener.opened).toHaveLength(0);
+			expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(oldTip);
+		}
+	});
+
 	test("a rerun opens the pull request a failed run left behind without rebuilding the branch", async () => {
 		const { origin, work } = await backmergeFixture();
 		const failing = recordingOpener("HTTP 403: Resource not accessible by integration");
@@ -330,6 +404,9 @@ describe("backmerge orchestration", () => {
 		expect(first.action).toBe("blocked");
 		expect(first.detail).toContain("HTTP 403");
 		const tip = await git(origin, "rev-parse", "backmerge/0.18.7");
+		// The branch the automated path built already carries the tag's manifest, so the
+		// manifest check must let this reopen through unchanged.
+		expect(await git(origin, "show", `backmerge/0.18.7:${BACKMERGE_CONFLICT_PATH}`)).toBe(manifest("0.18.7", "main-digest"));
 
 		const working = recordingOpener();
 		const retry = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: working.openPullRequest });

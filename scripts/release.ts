@@ -984,9 +984,12 @@ export interface BackmergeRecoveryStep {
  *
  * Printed as instructions and driven directly by the recovery test, so the recipe a
  * maintainer reads is exactly the sequence that test proves completes the merge. The
- * checkout stages the resolution of the one known conflict; on its own it leaves `HEAD`
- * at pre-merge `dev`, so the commit that closes the merge is a separate step and the
- * push only ever publishes a real merge commit.
+ * merge runs with `--no-commit --no-ff` like the automated path, so a pending merge
+ * commit exists even when `origin/dev` is an ancestor of the release tag and a plain
+ * `git merge` would only fast-forward. The checkout stages the resolution of the one
+ * known conflict; on its own it leaves `HEAD` at pre-merge `dev`, so the commit that
+ * closes the merge is a separate step and the push only ever publishes a real merge
+ * commit.
  */
 export function backmergeRecoverySteps(
 	version: string,
@@ -1004,7 +1007,10 @@ export function backmergeRecoverySteps(
 			],
 		},
 		{ argv: ["worktree", "add", worktree, "origin/dev"] },
-		{ argv: ["-C", worktree, "merge", tag] },
+		{
+			argv: ["-C", worktree, "merge", "--no-commit", "--no-ff", tag],
+			note: "as in the automated path: a pending merge commit exists even when a plain merge would fast-forward",
+		},
 		{
 			argv: ["-C", worktree, "checkout", tag, "--", BACKMERGE_CONFLICT_PATH],
 			note: "take the tag's manifest wholesale: its version and its artifacts, never dev's digests",
@@ -1090,6 +1096,66 @@ function gitAt(dir: string, args: readonly string[]) {
 	return $`git -C ${dir} -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
 }
 
+/** The manifest text at `rev`, or `undefined` when that revision carries no such file. */
+async function backmergeManifestAt(repoDir: string, rev: string): Promise<string | undefined> {
+	const shown = await gitAt(repoDir, ["show", `${rev}:${BACKMERGE_CONFLICT_PATH}`]).quiet().nothrow();
+	return shown.exitCode === 0 ? shown.stdout.toString() : undefined;
+}
+
+/** JSON with object keys sorted, so a manifest that only reorders keys still compares equal. */
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (value !== null && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+			left < right ? -1 : left > right ? 1 : 0,
+		);
+		return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+/** The `version` a manifest labels itself with, for operator-facing guidance. */
+function manifestVersionLabel(manifest: unknown): string {
+	if (manifest === null || typeof manifest !== "object") return "<no version>";
+	const version = (manifest as Record<string, unknown>).version;
+	return typeof version === "string" ? version : "<no version>";
+}
+
+/**
+ * A branch built by an earlier resolver can carry dev's locally built digests relabelled
+ * under the released version. Reopening it would publish bytes the release never built, and
+ * this script never rewrites a branch that may already carry review fixes, so a manifest
+ * that differs from the tag's fails closed with delete-and-rerun guidance instead.
+ */
+async function existingBackmergeManifestProblem(
+	repoDir: string,
+	branchRef: string,
+	releaseTag: string,
+	version: string,
+): Promise<string | undefined> {
+	const branch = `backmerge/${version}`;
+	const [onBranch, onTag] = await Promise.all([
+		backmergeManifestAt(repoDir, branchRef),
+		backmergeManifestAt(repoDir, releaseTag),
+	]);
+	if (onTag === undefined) return `the v${version} release tag carries no ${BACKMERGE_CONFLICT_PATH}`;
+	if (onBranch === undefined) return `its ${BACKMERGE_CONFLICT_PATH} is missing`;
+	let tagManifest: unknown;
+	try {
+		tagManifest = JSON.parse(onTag);
+	} catch {
+		return `the v${version} release tag's ${BACKMERGE_CONFLICT_PATH} is not valid JSON`;
+	}
+	let branchManifest: unknown;
+	try {
+		branchManifest = JSON.parse(onBranch);
+	} catch {
+		return `its ${BACKMERGE_CONFLICT_PATH} cannot be read as JSON; delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
+	}
+	if (canonicalJson(branchManifest) === canonicalJson(tagManifest)) return undefined;
+	return `its ${BACKMERGE_CONFLICT_PATH} carries a stale manifest (branch version ${manifestVersionLabel(branchManifest)}, released version ${manifestVersionLabel(tagManifest)}) that does not match the v${version} release tag. Delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
+}
+
 async function existingBackmergeBranchProblem(
 	repoDir: string,
 	branchRef: string,
@@ -1116,7 +1182,7 @@ async function existingBackmergeBranchProblem(
 	if (mainBase.exitCode !== 0 || mainBase.stdout.toString().trim() !== releaseCommit) {
 		return `contains main history beyond v${version} or omits the requested release`;
 	}
-	return undefined;
+	return await existingBackmergeManifestProblem(repoDir, branchRef, releaseTag, version);
 }
 
 /**

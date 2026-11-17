@@ -516,7 +516,9 @@ describe("immutable stable release contracts", () => {
 		expect(releaseScript).toContain("await watchCI(`v${version}`)");
 		expect(releaseScript).toContain("backmergeRecoverySteps(version)");
 		const recovery = backmergeRecoverySteps("0.18.7").map(step => step.argv.join(" "));
-		expect(recovery).toContain(`-C ${BACKMERGE_RECOVERY_WORKTREE} merge refs/remotes/origin/tags/v0.18.7`);
+		expect(recovery).toContain(
+			`-C ${BACKMERGE_RECOVERY_WORKTREE} merge --no-commit --no-ff refs/remotes/origin/tags/v0.18.7`,
+		);
 		expect(recovery.some(command => command.includes("merge origin/main"))).toBe(false);
 		expect(assertionIndex).toBeGreaterThan(-1);
 		expect(assertionIndex).toBeLessThan(commitIndex);
