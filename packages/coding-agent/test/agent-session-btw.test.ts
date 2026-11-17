@@ -174,7 +174,16 @@ it("idle close refuses a real foreground bash command", async () => {
 	const pending = session.executeBash("printf started; sleep 30", chunk => {
 		if (chunk.includes("started")) entered.resolve();
 	});
-	await entered.promise;
+	// Race against pending settlement to prevent hanging if worker fails before sending "started".
+	// If pending rejects, the waiter should fail fast instead of hanging indefinitely.
+	await Promise.race([
+		entered.promise,
+		pending.catch(err => {
+			// If bash command fails before sending "started", reject the waiter.
+			// This prevents hanging and makes the test fail fast with the actual error.
+			throw err;
+		}),
+	]);
 	try {
 		expect(session.isBashRunning).toBe(true);
 		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
