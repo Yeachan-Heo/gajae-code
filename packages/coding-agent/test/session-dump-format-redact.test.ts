@@ -682,27 +682,6 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parameterValue(dumped, "b")).toBe("«redacted-private-key»");
 	});
 
-	it("removes a private-key block whose footer is an argument name", () => {
-		const body = "KEY_POSITION_PEM_BODY";
-		const dumped = dump([
-			assistant(
-				[
-					{
-						type: "toolCall",
-						id: "call-key-footer",
-						name: "request",
-						arguments: { body: `${pem("RSA", "BEGIN")}\n${body}`, [pem("RSA", "END")]: "after" },
-					},
-				],
-				1,
-			),
-		] as AgentMessage[]);
-
-		expect(dumped).not.toContain(body);
-		expect(parameterValue(dumped, "body")).toBe("«redacted-private-key»");
-		expect(dumped).toContain("after");
-	});
-
 	it("removes a private-key block whose footer sits in a credential container", () => {
 		const body = "CONTAINER_FOOTER_PEM_BODY";
 		const dumped = dump([

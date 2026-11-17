@@ -113,9 +113,6 @@ function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]):
  */
 function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][] {
 	const spansByValue: PrivateKeySpan[][] = values.map(() => []);
-	// A leaf has to hold part of a banner for any pairing to be possible. That is only a cheap
-	// skip test: a banner can be split mid-token, so the whole run is joined once it applies.
-	if (!values.some(value => value.includes(PEM_MARKER_HINT))) return spansByValue;
 	const offsets: number[] = [];
 	let joined = "";
 	for (const value of values) {
@@ -154,53 +151,17 @@ function collectStringLeaves(value: unknown, out: string[]): void {
 }
 
 /**
- * Part of both private-key banners, used only to skip work when no leaf can hold one.
- * It is deliberately shorter than a banner: a banner split across two leaves leaves
- * the halves without the full text, and the join is what puts them back together.
+ * Apply the spans found for each leaf, in the order the leaf collection produced them.
+ * Field names never take part: a name between two value halves would separate them, and a
+ * rewritten name would destroy the argument identity the dump relies on.
  */
-const PEM_MARKER_HINT = "PRIVATE";
-
-/** Collect string leaves with their field names first, for the rare banner-in-a-name case. */
-function collectStringLeavesWithKeys(value: unknown, out: string[]): void {
-	if (typeof value === "string") {
-		out.push(value);
-		return;
-	}
-	if (Array.isArray(value)) {
-		for (const item of value) collectStringLeavesWithKeys(item, out);
-		return;
-	}
-	if (value === null || typeof value !== "object") return;
-	for (const [key, nested] of Object.entries(value)) {
-		out.push(key);
-		collectStringLeavesWithKeys(nested, out);
-	}
-}
-
-function containsPrivateKeyName(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsPrivateKeyName);
-	if (value === null || typeof value !== "object") return false;
-	return Object.entries(value).some(
-		([key, nested]) => key.includes(PEM_MARKER_HINT) || containsPrivateKeyName(nested),
-	);
-}
-
-/** Apply the spans found for each leaf, in the order the leaf collection produced them. */
-function applyPrivateKeySpans(
-	value: unknown,
-	spans: readonly PrivateKeySpan[][],
-	cursor: { index: number },
-	includeKeys: boolean,
-): unknown {
+function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][], cursor: { index: number }): unknown {
 	if (typeof value === "string") return redactPrivateKeyRanges(value, spans[cursor.index++] ?? []);
-	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor, includeKeys));
+	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor));
 	if (value === null || typeof value !== "object") return value;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	for (const [key, nested] of Object.entries(value)) {
-		// Names locate a block but are never rewritten by it: a scrubbed name would destroy the
-		// argument identity the dump relies on, and a banner on its own is not secret material.
-		if (includeKeys) cursor.index++;
-		redacted[key] = applyPrivateKeySpans(nested, spans, cursor, includeKeys);
+		redacted[key] = applyPrivateKeySpans(nested, spans, cursor);
 	}
 	return redacted;
 }
@@ -217,20 +178,21 @@ function decodeValueStrings(value: unknown): unknown {
 	return decoded;
 }
 
-/** Redact private-key blocks that span sibling argument values, at any nesting depth. */
+/**
+ * Redact private-key blocks that span sibling values, at any nesting depth.
+ * Values are joined in traversal order, so a banner split across adjacent values is found.
+ * Field names never take part: a name between two halves would separate them, and a
+ * rewritten name would destroy the argument identity the dump relies on. A banner split
+ * across two values with another value in between is therefore not paired; each half is
+ * still scrubbed on its own where it forms a complete block.
+ */
 function redactCrossFieldPrivateKeys(values: readonly unknown[]): unknown[] {
 	const decoded = values.map(decodeValueStrings);
-	// Field names join the pairing stream only when one of them holds part of a banner; adding
-	// them unconditionally would break a banner split between two values.
-	const includeKeys = decoded.some(containsPrivateKeyName);
 	const leaves: string[] = [];
-	for (const value of decoded) {
-		if (includeKeys) collectStringLeavesWithKeys(value, leaves);
-		else collectStringLeaves(value, leaves);
-	}
+	for (const value of decoded) collectStringLeaves(value, leaves);
 	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
 	const cursor = { index: 0 };
-	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor, includeKeys));
+	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
 }
 
 function serializeParameterValue(value: unknown): string {
