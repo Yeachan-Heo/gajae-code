@@ -507,6 +507,46 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
+	it("removes a private-key block split across a bash command that assigns a credential key", () => {
+		const firstSecretPart = "MIIEowIB";
+		const secondSecretPart = "AAKCAQEAxGZ0000";
+		const dumped = dump([
+			{
+				role: "bashExecution",
+				command: `export PRIVATE_KEY='${pem("RSA", "BEGIN")}`,
+				output: `${secondSecretPart}\n${pem("RSA", "END")}`,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(firstSecretPart);
+		expect(dumped).not.toContain(secondSecretPart);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("keeps an AST node whose name field is credential-shaped", () => {
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-ast-node",
+						name: "ast_grep",
+						arguments: { node: { name: "token", value: "identifier" } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain('"name": "token"');
+		expect(dumped).toContain('"value": "identifier"');
+	});
+
 	it("removes a private-key block split across python code and its output", () => {
 		const firstSecretPart = "MIIEowIB";
 		const secondSecretPart = "AAKCAQEAxGZ0000";

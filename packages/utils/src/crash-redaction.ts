@@ -352,12 +352,17 @@ const HEADER_COLLECTION_KEYS = new Set([
 /** Context the caller established for a value tree. */
 export interface StructuredRedactionOptions {
 	/**
-	 * Whether the value under `key` is a flat `[name, value, ...]` string array of
-	 * header pairs. `true` treats every such array as header pairs; a predicate keeps
-	 * the heuristic to the field names that really hold header collections, so an
-	 * ordinary argument array such as `["auth", "src"]` keeps its values.
+	 * Whether the value under `key` is a header collection: a flat `[name, value, ...]`
+	 * string array, or records carrying a `name`/`key` and a `value`/`values` field.
+	 * `true` treats every such shape as header pairs; a predicate keeps the heuristic
+	 * to the field names that really hold header collections, so ordinary data such as
+	 * `paths: ["auth", "src"]` or `{ name: "token", value: "identifier" }` keeps its values.
 	 */
 	readonly headerPairs?: boolean | ((key: string | undefined) => boolean);
+}
+
+function allowsHeaderPairs(options: StructuredRedactionOptions | undefined, key: string | undefined): boolean {
+	return typeof options?.headerPairs === "function" ? options.headerPairs(key) : options?.headerPairs === true;
 }
 
 /**
@@ -368,8 +373,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 	if (key !== undefined && isCredentialKey(key)) return "«redacted»";
 	if (typeof value === "string") return redactCrashSecrets(value);
 	if (Array.isArray(value)) {
-		const headerPairs =
-			typeof options?.headerPairs === "function" ? options.headerPairs(key) : options?.headerPairs === true;
+		const headerPairs = allowsHeaderPairs(options, key);
 		const isFlatKeyValueArray =
 			headerPairs &&
 			value.length > 0 &&
@@ -384,7 +388,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 				return redactStructuredSecrets(item, undefined, options);
 			});
 		}
-		return value.map(item => redactStructuredSecrets(item, undefined, options));
+		return value.map(item => redactStructuredSecrets(item, key, options));
 	}
 	if (value === null || typeof value !== "object") return value;
 
@@ -399,7 +403,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 		const headerName = source[field];
 		if (typeof headerName === "string" && isCredentialKey(headerName)) hasCredentialHeaderName = true;
 	}
-	const redactHeaderValue = hasCredentialHeaderName && hasHeaderValue;
+	const redactHeaderValue = allowsHeaderPairs(options, key) && hasCredentialHeaderName && hasHeaderValue;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	const nextSuffixByKey = new Map<string, number>();
 	for (const field of sourceKeys) {

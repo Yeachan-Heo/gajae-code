@@ -169,6 +169,16 @@ function serializeParameterValue(value: unknown): string {
 	return typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
 }
 
+/**
+ * Redact a private-key block that spans an execution message's command (or code)
+ * and its output. The pair is located before field-level credential masking can
+ * remove one of the two banners.
+ */
+function redactExecutionPrivateKey(head: string, tail: string): [string, string] {
+	const spans = crossFieldPrivateKeySpans([head, tail]);
+	return [redactPrivateKeyRanges(head, spans[0]), redactPrivateKeyRanges(tail, spans[1])];
+}
+
 /** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
 function formatArgumentText(value: unknown, key: string): string {
 	const structured = redactStructuredSecrets(value, key, { headerPairs: isHeaderCollectionKey });
@@ -397,16 +407,18 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const bashMsg = msg as BashExecutionMessage;
 			if (!bashMsg.excludeFromContext) {
 				lines.push("## Bash Execution\n");
-				const rendered = bashExecutionToText(redactStructuredSecrets(bashMsg) as BashExecutionMessage);
-				lines.push(redactCrashSecrets(rendered));
+				const [command, output] = redactExecutionPrivateKey(bashMsg.command, bashMsg.output);
+				const structured = redactStructuredSecrets({ ...bashMsg, command, output }) as BashExecutionMessage;
+				lines.push(redactCrashSecrets(bashExecutionToText(structured)));
 				lines.push("\n");
 			}
 		} else if (msg.role === "pythonExecution") {
 			const pythonMsg = msg as PythonExecutionMessage;
 			if (!pythonMsg.excludeFromContext) {
 				lines.push("## Python Execution\n");
-				const rendered = pythonExecutionToText(redactStructuredSecrets(pythonMsg) as PythonExecutionMessage);
-				lines.push(redactCrashSecrets(rendered));
+				const [code, output] = redactExecutionPrivateKey(pythonMsg.code, pythonMsg.output);
+				const structured = redactStructuredSecrets({ ...pythonMsg, code, output }) as PythonExecutionMessage;
+				lines.push(redactCrashSecrets(pythonExecutionToText(structured)));
 				lines.push("\n");
 			}
 		} else if (msg.role === "custom" || msg.role === "hookMessage") {

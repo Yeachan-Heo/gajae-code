@@ -5,4 +5,4 @@
 
 ### Changed
 
-- `redactStructuredSecrets` only reads flat name/value arrays as header pairs when the caller opts in, by boolean or by a field-name predicate such as the new `isHeaderCollectionKey`, so an ordinary argument array keeps its values.
+- `redactStructuredSecrets` only reads a flat name/value array or a `{ name, value }` record as header pairs when the caller opts in, by boolean or by a field-name predicate such as the new `isHeaderCollectionKey`, so ordinary data keeps its values.

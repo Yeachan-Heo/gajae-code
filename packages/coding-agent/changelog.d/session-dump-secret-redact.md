@@ -5,4 +5,5 @@
 - Session dump tool schema definitions keep property names, types, and constraints; only literal data (`default`, `example`, `examples`, `const`) under a credential-named property is masked.
 - A schema default that only becomes a credential-shaped token after `\u` decoding is redacted as well.
 - Credential-shaped tokens split across sibling tool-argument fields, including a credential-named field or a nested argument object, are removed before that field is masked.
-- An ordinary tool-argument array such as `["auth", "src"]` is no longer read as header name/value pairs, while a known header collection keeps its value redaction.
+- An ordinary tool-argument array such as `["auth", "src"]` and an ordinary `{ name, value }` record are no longer read as header pairs, while a known header collection keeps its value redaction.
+- A private-key block split across a Bash or Python command and its output is removed even when the command assigns it to a credential-named variable.
