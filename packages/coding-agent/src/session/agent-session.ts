@@ -35812,6 +35812,9 @@ export class AgentSession {
 			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 				throw new Error("Invalid entry ID for branching");
 			}
+			// A shared session refuses a path-only branch successor. Refuse before the
+			// before-branch hook runs and before the agent is disconnected or settled.
+			if (selectedEntry.parentId) this.sessionManager.assertLegacyMutationAllowed("prepare branched session");
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();

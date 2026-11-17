@@ -11,10 +11,12 @@ import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { loadExtensions } from "../src/extensibility/extensions/loader";
+import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedLockTestHooks, ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -35,7 +37,7 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
-async function fixture() {
+async function fixture(options: { branchHook?: boolean } = {}) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-session-closure-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -51,12 +53,23 @@ async function fixture() {
 	registries.push(registry);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Missing bundled model");
+	let extensionRunner: ExtensionRunner | undefined;
+	if (options.branchHook) {
+		const extensionPath = path.join(root, "branch-hook.ts");
+		await Bun.write(
+			extensionPath,
+			'export default function(pi) { pi.on("session_before_branch", async () => ({})); }\n',
+		);
+		const loaded = await loadExtensions([extensionPath], cwd);
+		extensionRunner = new ExtensionRunner(loaded.extensions, loaded.runtime, cwd, manager, registry);
+	}
 	const agent = new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } });
 	const session = new AgentSession({
 		agent,
 		sessionManager: manager,
 		settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
 		modelRegistry: registry,
+		extensionRunner,
 		rootInteractiveSharedAppend: true,
 		thinkingLevel: ThinkingLevel.Off,
 	});
@@ -68,7 +81,7 @@ async function fixture() {
 	await manager.flush();
 	const file = manager.getSessionFile();
 	if (!file) throw new Error("Missing transcript");
-	return { session, manager, file };
+	return { session, manager, file, extensionRunner };
 }
 
 type Boundary = "post-write" | "release";
@@ -183,4 +196,26 @@ describe("shared publication uncertainty closes the session", () => {
 			await expectClosed(f.session, receipt);
 		});
 	}
+});
+
+describe("shared branch refusal", () => {
+	it("refuses a path-only branch before the hook, teardown, or flush runs", async () => {
+		const f = await fixture({ branchHook: true });
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("branch target") });
+		await f.session.awaitSessionSettlement();
+		const target = f.manager.getLeafId();
+		if (!target || !f.extensionRunner) throw new Error("Missing branch fixture");
+		const emit = vi.spyOn(f.extensionRunner, "emit");
+		const flush = vi.spyOn(f.manager, "flush");
+		const steering = vi.spyOn(f.session.agent, "snapshotSteering");
+		await expect(f.session.branch(target)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+		expect(emit.mock.calls.filter(([event]) => event.type === "session_before_branch")).toHaveLength(0);
+		expect(steering).not.toHaveBeenCalled();
+		expect(flush).not.toHaveBeenCalled();
+		// The session stayed connected: a later canonical message still publishes.
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("after refused branch") });
+		await f.session.awaitSessionSettlement();
+		await f.manager.flush();
+		expect(await Bun.file(f.file).text()).toContain("after refused branch");
+	});
 });
