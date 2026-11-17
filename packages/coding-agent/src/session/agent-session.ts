@@ -22343,31 +22343,37 @@ export class AgentSession {
 			if (manager.getSessionName()) return { kind: "skipped", reason: "named" };
 			if (this.#usesSharedSessionPublication() !== sharedPublication)
 				throw new Error("Session publication protocol changed while generating title");
-			let committedTitle = "";
-			if (sharedPublication) {
-				const outcome = await this.#withStartedSharedControlPublication(
-					() => {
-						if (stale()) throw new SessionTitlePersistenceStaleError();
+			assertNativeRuntimeInvocation(this);
+			const publication = (async (): Promise<AutoSessionTitleResult> => {
+				let committedTitle = "";
+				if (sharedPublication) {
+					const outcome = await this.#withStartedSharedControlPublication(
+						() => {
+							if (stale()) throw new SessionTitlePersistenceStaleError();
+						},
+						() =>
+							manager.setSessionNameSharingSession(title, "auto", {
+								isCurrent: () => !stale(),
+								onlyIfUnnamed: true,
+							}),
+					);
+					if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
+					if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
+					throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
+				}
+				const applied = await manager.setSessionName(title, "auto", {
+					isCurrent: () => !stale(),
+					onlyIfUnnamed: true,
+					onApplied: name => {
+						committedTitle = name;
 					},
-					() =>
-						manager.setSessionNameSharingSession(title, "auto", {
-							isCurrent: () => !stale(),
-							onlyIfUnnamed: true,
-						}),
-				);
-				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
-				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
-				throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
-			}
-			const applied = await manager.setSessionName(title, "auto", {
-				isCurrent: () => !stale(),
-				onlyIfUnnamed: true,
-				onApplied: name => {
-					committedTitle = name;
-				},
-			});
-			if (!applied && stale()) return { kind: "skipped", reason: "stale" };
-			return applied ? { kind: "applied", title: committedTitle } : { kind: "skipped", reason: "named" };
+				});
+				if (!applied && stale()) return { kind: "skipped", reason: "stale" };
+				return applied ? { kind: "applied", title: committedTitle } : { kind: "skipped", reason: "named" };
+			})();
+			// Native cancellation may detach the provider flight, never an admitted write.
+			retainNativeRuntimeWork(this, publication);
+			return await publication;
 		} catch (error) {
 			return error instanceof SessionTitlePersistenceStaleError && stale()
 				? { kind: "skipped", reason: "stale" }

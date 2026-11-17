@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import * as util from "node:util";
-import type { AgentSession } from "../session/agent-session";
+import type { AgentSession, AutoSessionTitleResult } from "../session/agent-session";
 import { captureNativeResumeTranscript } from "../session/native-resume";
 import {
 	admitOwnerMembershipWithAsyncEvidence,
@@ -756,8 +756,22 @@ function createNativeEmbeddedRuntime(
 					return cleared;
 				}),
 			retry: () => invokeNativeRuntime(handle, "session", () => session.retry()),
-			generateAutoSessionTitle: (...args) =>
-				invokeNativeRuntime(handle, "session", () => session.generateAutoSessionTitle(...args)),
+			generateAutoSessionTitle: (text, options) =>
+				invokeNativeRuntime(handle, "session", async () => {
+					const signal = options?.signal;
+					if (!signal) return session.generateAutoSessionTitle(text, options);
+					const aborted = Promise.withResolvers<AutoSessionTitleResult>();
+					const onAbort = () => aborted.resolve({ kind: "skipped", reason: "stale" });
+					if (signal.aborted) return { kind: "skipped", reason: "stale" };
+					signal.addEventListener("abort", onAbort, { once: true });
+					try {
+						// Provider work cannot retain a retiring native owner after cancellation.
+						// The session separately retains any title publication already started.
+						return await Promise.race([session.generateAutoSessionTitle(text, options), aborted.promise]);
+					} finally {
+						signal.removeEventListener("abort", onAbort);
+					}
+				}),
 			exportToHtml: (...args) => invokeNativeRuntime(handle, "session", () => session.exportToHtml(...args)),
 		}),
 	};
