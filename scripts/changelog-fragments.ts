@@ -457,19 +457,53 @@ export async function collectPullRequestFragmentViolations(
 
 const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
 
+/** The subject `scripts/release.ts` writes on the commit that folds and consumes fragments. */
+const RELEASE_BUMP_SUBJECT = "chore: bump version to";
+
+/** Every path in a revision's tree, so a single tree walk answers every per-path lookup. */
+async function pathsAtRevision(revision: string): Promise<Set<string>> {
+	const listed = await $`git ls-tree -r --name-only ${revision}`.quiet().nothrow();
+	if (listed.exitCode !== 0) throw new Error(`git ls-tree ${revision} failed: ${listed.stderr.toString().trim()}`);
+	return new Set(listed.text().split("\n").map(line => line.trim()).filter(Boolean));
+}
+
 /**
- * Fragments consumed by a release that this range brings in, keyed by path.
+ * The release commits this range brings in for `tag`: the non-merge commits between `base`
+ * and the tag whose subject is the exact version bump `scripts/release.ts` writes. The tag
+ * may sit on that commit or on a merge that contains it, so the commit is identified by the
+ * bump it records rather than by tag topology. No pathspec is passed, so git lists every
+ * commit in the range instead of simplifying history and hiding the bump's branch.
+ */
+async function releaseBumpCommits(base: string, tag: string, version: string): Promise<string[]> {
+	const listed = await $`git log --no-merges -z ${`--format=%H %s`} ${`${base}..${tag}`}`.quiet().nothrow();
+	if (listed.exitCode !== 0) throw new Error(`git log ${base}..${tag} failed: ${listed.stderr.toString().trim()}`);
+	const subject = `${RELEASE_BUMP_SUBJECT} ${version}`;
+	const commits: string[] = [];
+	for (const entry of listed.text().split("\0").map(value => value.trim()).filter(Boolean)) {
+		const hash = entry.slice(0, entry.indexOf(" "));
+		if (entry.slice(hash.length + 1) === subject) commits.push(hash);
+	}
+	return commits;
+}
+
+/**
+ * Fragments a release this range brings in consumed, keyed by path.
  *
- * Release provenance is the stable `vX.Y.Z` tag that `scripts/release.ts` places on its
- * version-bump commit, and that commit is where the fragments are folded and deleted. A
- * backmerge merges a tag that is reachable from `head` but not from `base`, so every
- * `changelog.d` deletion a commit reachable from that tag made is legitimate here.
+ * A path counts as consumed only when both hold:
  *
- * The deletions must come from history, not from the tag's first-parent diff: main merges
+ * 1. it is absent from the tag's tree, and
+ * 2. a release bump commit reachable from the tag deleted it there.
+ *
+ * The caller only asks about paths deleted between `base` and `head`, so presence at `base`
+ * is already established. Both halves are load-bearing. Querying the whole `<base>..<tag>`
+ * history for deletions licenses any path ever deleted in the range, so a fragment some
+ * untagged commit deleted and re-added -- and that is still present at the tag -- would be
+ * excused when this pull request deletes it. The absence check rejects exactly that shape;
+ * the bump attribution rejects a deletion an unrelated commit on the release branch made.
+ *
+ * The deletion must come from the bump commit itself, not from `<tag>^1..<tag>`: main merges
  * the release through a merge commit whose first parent never carried the dev-origin
- * fragments, so `git diff <tag>^1 <tag>` reports no deletion at all. History simplification
- * hides the same commits for the same reason, which is why `--full-history` is required for
- * `git log --diff-filter=D` to walk the branch the version bump lives on.
+ * fragments, so that diff reports no fragment deletion at all.
  */
 async function releaseConsumedFragments(base: string, head: string): Promise<Set<string>> {
 	const listed = await $`git tag --list ${"v*"} --merged ${head} --no-merged ${base}`.quiet().nothrow();
@@ -477,12 +511,18 @@ async function releaseConsumedFragments(base: string, head: string): Promise<Set
 	const consumed = new Set<string>();
 	const tags = listed.text().split("\n").map(line => line.trim()).filter(tag => STABLE_RELEASE_TAG.test(tag));
 	for (const tag of tags) {
-		const deleted = await $`git log --full-history --diff-filter=D --name-only --format= ${`${base}..${tag}`}`
-			.quiet()
-			.nothrow();
-		if (deleted.exitCode !== 0) throw new Error(`git log ${base}..${tag} failed: ${deleted.stderr.toString().trim()}`);
-		for (const file of deleted.text().split("\n").map(line => line.trim())) {
-			if (isFragmentPath(file)) consumed.add(file);
+		const presentAtTag = await pathsAtRevision(tag);
+		for (const commit of await releaseBumpCommits(base, tag, tag.slice(1))) {
+			const deleted = await $`git diff-tree -r --no-commit-id --name-only --diff-filter=D ${commit}`
+				.quiet()
+				.nothrow();
+			if (deleted.exitCode !== 0) {
+				throw new Error(`git diff-tree ${commit} failed: ${deleted.stderr.toString().trim()}`);
+			}
+			for (const file of deleted.text().split("\n").map(line => line.trim())) {
+				if (!isFragmentPath(file) || presentAtTag.has(file)) continue;
+				consumed.add(file);
+			}
 		}
 	}
 	return consumed;

@@ -258,6 +258,114 @@ describe("release tag evidence", () => {
 		expect(result.stderr).toContain(`${SHIPPED_FRAGMENT}::is deleted by this pull request`);
 	});
 
+	test("admits a fragment that is gone from the tag when the release bump deleted it", async () => {
+		const { root, base } = await devWithFragment("### Fixed\n\n- Shipped by the bump.\n");
+		const released = CHANGELOG.replace(
+			"## [1.0.0]",
+			"## [1.0.1] - 2026-02-01\n\n### Fixed\n\n- Shipped by the bump.\n\n## [1.0.0]",
+		);
+		// The tag sits on the bump commit itself, the shape scripts/release.ts produces.
+		await git(root, ["checkout", "-q", "-b", "main"]);
+		await put(root, "packages/coding-agent/CHANGELOG.md", released);
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "chore: bump version to 1.0.1");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+		await git(root, ["checkout", "-q", "dev"]);
+		expect((await git(root, ["merge", "--no-ff", "-m", "backmerge v1.0.1 into dev", "v1.0.1"])).exitCode).toBe(0);
+		expect((await git(root, ["cat-file", "-e", `${base}:${SHIPPED_FRAGMENT}`])).exitCode).toBe(0);
+		expect((await git(root, ["cat-file", "-e", `v1.0.1:${SHIPPED_FRAGMENT}`])).exitCode).not.toBe(0);
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.stderr).toBe("");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("rejects a fragment an untagged commit deleted and re-added before the tag", async () => {
+		const { root, base } = await devWithFragment("### Fixed\n\n- Still pending at the tag.\n");
+		// An untagged commit drops the note and a later one restores it, so the release never
+		// consumed it: deleting it here still drops an unreleased note.
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "temporarily drop the pending note");
+		await put(root, SHIPPED_FRAGMENT, "### Fixed\n\n- Still pending at the tag.\n");
+		await commit(root, "restore the pending note");
+
+		await git(root, ["checkout", "-q", "-b", "main"]);
+		await put(
+			root,
+			"packages/coding-agent/CHANGELOG.md",
+			CHANGELOG.replace("## [1.0.0]", "## [1.0.1] - 2026-02-01\n\n### Fixed\n\n- Unrelated release note.\n\n## [1.0.0]"),
+		);
+		await commit(root, "chore: bump version to 1.0.1");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+		await git(root, ["checkout", "-q", "dev"]);
+		expect((await git(root, ["merge", "--no-ff", "-m", "backmerge v1.0.1 into dev", "v1.0.1"])).exitCode).toBe(0);
+
+		// The old range query saw this deletion; the tag still carries the re-added note.
+		const history = await git(root, ["log", "--full-history", "--diff-filter=D", "--name-only", "--format=", `${base}..v1.0.1`]);
+		expect(history.stdout).toContain(SHIPPED_FRAGMENT);
+		expect((await git(root, ["cat-file", "-e", `v1.0.1:${SHIPPED_FRAGMENT}`])).exitCode).toBe(0);
+
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "drop the note no release consumed");
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`${SHIPPED_FRAGMENT}::is deleted by this pull request`);
+	});
+
+	test("rejects a deletion an unrelated commit on the release branch made before the bump", async () => {
+		const { root, base } = await devWithFragment("### Fixed\n\n- Removed without shipping.\n");
+		await git(root, ["checkout", "-q", "-b", "main"]);
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "drop the note during the release");
+		await put(
+			root,
+			"packages/coding-agent/CHANGELOG.md",
+			CHANGELOG.replace("## [1.0.0]", "## [1.0.1] - 2026-02-01\n\n### Fixed\n\n- Unrelated release note.\n\n## [1.0.0]"),
+		);
+		await commit(root, "chore: bump version to 1.0.1");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+		await git(root, ["checkout", "-q", "dev"]);
+		expect((await git(root, ["merge", "--no-ff", "-m", "backmerge v1.0.1 into dev", "v1.0.1"])).exitCode).toBe(0);
+
+		// Absent from the tag, but the bump folded nothing: the deletion was not the release's.
+		expect((await git(root, ["cat-file", "-e", `v1.0.1:${SHIPPED_FRAGMENT}`])).exitCode).not.toBe(0);
+		const bumpDeletions = (await git(root, ["diff-tree", "-r", "--no-commit-id", "--name-only", "--diff-filter=D", "v1.0.1"])).stdout;
+		expect(bumpDeletions).not.toContain(SHIPPED_FRAGMENT);
+
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`${SHIPPED_FRAGMENT}::is deleted by this pull request`);
+	});
+
+	test("rejects a fragment the bump deleted but that is back at the tag", async () => {
+		const { root, base } = await devWithFragment("### Fixed\n\n- Restored after the fold.\n");
+		await git(root, ["checkout", "-q", "-b", "main"]);
+		await put(
+			root,
+			"packages/coding-agent/CHANGELOG.md",
+			CHANGELOG.replace("## [1.0.0]", "## [1.0.1] - 2026-02-01\n\n### Fixed\n\n- Unrelated release note.\n\n## [1.0.0]"),
+		);
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "chore: bump version to 1.0.1");
+		// The note comes back before the tag is cut, so the release did not ship it.
+		await put(root, SHIPPED_FRAGMENT, "### Fixed\n\n- Restored after the fold.\n");
+		await commit(root, "restore the note the bump dropped");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+		await git(root, ["checkout", "-q", "dev"]);
+		expect((await git(root, ["merge", "--no-ff", "-m", "backmerge v1.0.1 into dev", "v1.0.1"])).exitCode).toBe(0);
+
+		// A bump in the tag's history deleted the path, yet the tag carries it: presence at the tag
+		// wins, because the note is pending there no matter which commit once dropped it.
+		const bumpDeletions = (await git(root, ["diff-tree", "-r", "--no-commit-id", "--name-only", "--diff-filter=D", "v1.0.1~1"])).stdout;
+		expect(bumpDeletions).toContain(SHIPPED_FRAGMENT);
+		expect((await git(root, ["cat-file", "-e", `v1.0.1:${SHIPPED_FRAGMENT}`])).exitCode).toBe(0);
+
+		await fs.rm(path.join(root, SHIPPED_FRAGMENT));
+		await commit(root, "drop the restored note");
+		const result = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`${SHIPPED_FRAGMENT}::is deleted by this pull request`);
+	});
+
 	test("guard exits 0 on this worktree with the backmerge deletions in place", async () => {
 		const base =
 			process.env.GITHUB_BASE_SHA?.trim() || (await git(repoRoot, ["merge-base", "HEAD", "origin/dev"])).stdout.trim();
