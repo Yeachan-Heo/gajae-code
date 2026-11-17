@@ -1,5 +1,5 @@
 import type { AgentSession } from "../session/agent-session";
-import { ActivityControls } from "./activity-controls";
+import { ActivityControls, type ActivityMcpSnapshot } from "./activity-controls";
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
@@ -21,6 +21,7 @@ interface SessionControls {
 	authorization: AuthorizationControls;
 	operator: SdkOperatorControls;
 	activity?: ActivityControls;
+	getMcpSnapshot?: () => ActivityMcpSnapshot;
 	side: SideConversationControls;
 	diff: SdkDiffObservation;
 	generation: number;
@@ -98,6 +99,29 @@ function nativeDispatchGuard<T extends object>(session: AgentSession, service: T
 	});
 }
 
+/** Read the exact cached MCP controls without borrowing mutation authority. */
+export function getSessionClientMcpSnapshot(session: AgentSession): ActivityMcpSnapshot {
+	const entry = session.sessionLifecycle.transitioning ? controls.get(session) : getSessionClientControls(session);
+	const assertCurrent = (): void => {
+		if (
+			!entry ||
+			session.sessionLifecycle.disposed ||
+			entry.retired ||
+			entry.identityRejected ||
+			entry.generation !== session.sessionLifecycle.generation ||
+			!entry.sameIdentity()
+		)
+			throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
+		getSessionControlLifetime(session, preserve => controls.get(session)?.retire(preserve)).assertAvailable();
+	};
+	assertCurrent();
+	if (!entry?.getMcpSnapshot)
+		throw Object.assign(new Error("Native activity controls unavailable"), { code: "unavailable" });
+	const snapshot = entry.getMcpSnapshot();
+	assertCurrent();
+	return snapshot;
+}
+
 /** Internal SDK binding shared by interactive and nonvisual hosts. No caller-supplied session handles. */
 export function getSessionClientControls(session: AgentSession): SessionControls {
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
@@ -131,6 +155,8 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const owner = session.getAgentId();
 	const settings = session.settings;
 	const registry = session.modelRegistry;
+	const boundResources = resources.get(session);
+	const activity = boundResources ? new ActivityControls(boundResources) : undefined;
 	const entry: SessionControls = {
 		preferences: nativeDispatchGuard(session, createSdkPreferenceControls(session), [
 			"handle",
@@ -153,9 +179,10 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		retire: preserveAuthorization => retire(preserveAuthorization),
 		authorization: authorization ?? nativeDispatchGuard(session, new AuthorizationControls(session), ["execute"]),
 		operator: nativeDispatchGuard(session, createSdkOperatorControls(session), ["execute", "read", "cancel"]),
-		...(resources.get(session)
+		...(activity
 			? {
-					activity: nativeDispatchGuard(session, new ActivityControls(resources.get(session)!), [
+					getMcpSnapshot: () => activity.getMcpSnapshot(),
+					activity: nativeDispatchGuard(session, activity, [
 						"control",
 						"getActivitySnapshot",
 						"getDetail",

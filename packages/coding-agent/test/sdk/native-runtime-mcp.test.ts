@@ -94,11 +94,9 @@ describe("native runtime MCP family", () => {
 		const snapshot = spyOn(ActivityControls.prototype, "getMcpSnapshot");
 		try {
 			const result = await opened.runtime.mcp.snapshot();
-			expect(result.kind).toBe("applied");
-			if (result.kind !== "applied") throw new Error(`Expected applied, got ${result.kind}`);
 			expect(snapshot).toHaveBeenCalledTimes(1);
-			expect(snapshot.mock.results[0]?.value).toBe(result.value);
-			expect(result.value).toEqual({
+			expect(snapshot.mock.results[0]?.value).toBe(result);
+			expect(result).toEqual({
 				scope: "factory_manager_may_be_shared",
 				servers: [],
 				truncated: false,
@@ -145,8 +143,7 @@ describe("native runtime MCP family", () => {
 		});
 		try {
 			const observed = await opened.runtime.mcp.snapshot();
-			if (observed.kind !== "applied") throw new Error(`Expected applied, got ${observed.kind}`);
-			const server = observed.value.servers[0];
+			const server = observed.servers[0];
 			if (!server) throw new Error("Missing fixture MCP server");
 			expect(await opened.runtime.mcp.operate(server.ref, "reconnect")).toMatchObject({
 				kind: "applied",
@@ -163,7 +160,7 @@ describe("native runtime MCP family", () => {
 	it("returns structured admission refusals after native disconnect", async () => {
 		const opened = await fixture();
 		await disconnect(opened);
-		expect(await opened.runtime.mcp.snapshot()).toMatchObject({ kind: "refused", reason: "manager_closed" });
+		await expect(opened.runtime.mcp.snapshot()).rejects.toMatchObject({ code: "resource_gone" });
 		expect(await opened.runtime.mcp.operate("unknown-server", "reconnect")).toMatchObject({
 			kind: "refused",
 			reason: "manager_closed",

@@ -1342,7 +1342,7 @@ export class DesktopHost {
 			mcp: createDesktopMcpController(candidate.factory, {
 				connectionGeneration: this.#connectionGeneration,
 				redact: text => this.#redact(text),
-			}, createNativeAdmission(candidate.native?.runtime)),
+			}, candidate.native?.runtime),
 			activityRevision: 0,
 			activityPublishedRevision: 0,
 			busy: false,
@@ -1792,7 +1792,7 @@ export class DesktopHost {
 		live.mcp = createDesktopMcpController(live.factory, {
 			connectionGeneration: this.#connectionGeneration,
 			redact: text => this.#redact(text),
-		}, createNativeAdmission(live.native?.runtime));
+		}, live.native?.runtime);
 		this.#cancelQuestions(live);
 		live.titleAbort?.abort();
 		live.titleAbort = undefined;

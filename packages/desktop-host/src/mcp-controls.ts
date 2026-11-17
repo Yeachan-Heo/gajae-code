@@ -2,6 +2,7 @@ import {
 	type ActivityControls,
 	type CreateAgentSessionResult,
 	createActivityControls,
+	type NativeEmbeddedRuntime,
 } from "@gajae-code/coding-agent/sdk";
 import { redactCrashSecrets } from "@gajae-code/utils/crash-redaction";
 import { createNativeAdmission, type NativeAdmission } from "./native-admission";
@@ -114,6 +115,7 @@ function failure(error: unknown): DesktopMcpError {
 export class DesktopMcpController {
 	readonly #controls: ActivityControls;
 	readonly #admit: NativeAdmission;
+	readonly #runtime: NativeEmbeddedRuntime | undefined;
 	readonly #scope: DesktopMcpScope;
 	readonly #redact: (text: string) => string;
 	#disposed = false;
@@ -121,7 +123,7 @@ export class DesktopMcpController {
 	constructor(
 		result: FactoryResult,
 		options: DesktopMcpOptions,
-		admit: NativeAdmission = createNativeAdmission(undefined),
+		runtime?: NativeEmbeddedRuntime,
 	) {
 		if (
 			!options ||
@@ -141,7 +143,8 @@ export class DesktopMcpController {
 			sessionGeneration: result.session.sessionLifecycle.generation,
 		};
 		this.#redact = options.redact;
-		this.#admit = admit;
+		this.#runtime = runtime;
+		this.#admit = createNativeAdmission(runtime);
 	}
 
 	#assertAttached(): void {
@@ -192,7 +195,7 @@ export class DesktopMcpController {
 		try {
 			this.#assertAttached();
 			// Runtime operations must use references issued by the runtime's own controls.
-			const snapshot = await this.#admit(rt => rt.mcp.snapshot(), async () => this.#controls.getMcpSnapshot());
+			const snapshot = this.#runtime ? await this.#runtime.mcp.snapshot() : this.#controls.getMcpSnapshot();
 			const servers: DesktopMcpServer[] = snapshot.servers.slice(0, DESKTOP_MCP_LIMITS.servers).map(server => ({
 				ref: { ...this.#scope, key: server.ref },
 				// Public SDK labels are display-only; opaque refs retain control authority.
@@ -205,7 +208,7 @@ export class DesktopMcpController {
 			}));
 			this.#assertAttached();
 			// Redaction is caller code: repeat the SDK read to fence reentrant lifecycle changes.
-			const current = await this.#admit(rt => rt.mcp.snapshot(), async () => this.#controls.getMcpSnapshot());
+			const current = this.#runtime ? await this.#runtime.mcp.snapshot() : this.#controls.getMcpSnapshot();
 			this.#assertAttached();
 			for (const server of servers) {
 				const live = current.servers.find(row => row.ref === server.ref.key);
@@ -263,7 +266,7 @@ export class DesktopMcpController {
 export function createDesktopMcpController(
 	result: FactoryResult,
 	options: DesktopMcpOptions,
-	admit?: NativeAdmission,
+	runtime?: NativeEmbeddedRuntime,
 ): DesktopMcpController {
-	return new DesktopMcpController(result, options, admit);
+	return new DesktopMcpController(result, options, runtime);
 }

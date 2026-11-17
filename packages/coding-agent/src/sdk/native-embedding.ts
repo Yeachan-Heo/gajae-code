@@ -67,7 +67,7 @@ import { createNativeOwnerInspectors } from "./native-ownership";
 import type { SdkOperatorControls } from "./operator-controls";
 import type { SdkPreferenceControls } from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
-import { getSessionClientControls } from "./session-client-controls";
+import { getSessionClientControls, getSessionClientMcpSnapshot } from "./session-client-controls";
 import { CURRENT_SESSION_VERSION } from "./session-readonly/format";
 import type { ResumeSessionIdentity } from "./session-readonly/storage";
 import type { SideConversationControls } from "./side-conversation";
@@ -140,7 +140,7 @@ export interface NativeEmbeddedRuntime {
 		): Promise<NativeInvocationResult<ActivityControlResult>>;
 	};
 	readonly mcp: {
-		snapshot(): Promise<NativeInvocationResult<ActivityMcpSnapshot>>;
+		snapshot(): Promise<ActivityMcpSnapshot>;
 		operate(
 			ref: ActivityMcpServer["ref"],
 			action: ActivityMcpServer["controls"][number],
@@ -712,12 +712,7 @@ function createNativeEmbeddedRuntime(
 				}),
 		}),
 		mcp: Object.freeze({
-			snapshot: () =>
-				invokeNativeRuntime(handle, "mcp", () => {
-					const activity = getSessionClientControls(session).activity;
-					if (!activity) throw new Error("Native activity controls unavailable");
-					return activity.getMcpSnapshot();
-				}),
+			snapshot: async () => getSessionClientMcpSnapshot(session),
 			operate: (ref, action) =>
 				invokeNativeRuntime(handle, "mcp", () => {
 					const activity = getSessionClientControls(session).activity;
