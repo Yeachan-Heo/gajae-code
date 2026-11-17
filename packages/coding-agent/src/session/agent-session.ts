@@ -14831,9 +14831,12 @@ export class AgentSession {
 		return wrapped;
 	}
 
-	#setGuardedAgentTools(tools: AgentTool[]): void {
+	#setGuardedAgentTools(tools: AgentTool[], onPublished?: () => void): void {
 		this.#activeToolSelectionRevision++;
 		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
+		// Anchor ownership before observers run: a throwing observer must not leave
+		// the published tool set unattributed to this operation.
+		onPublished?.();
 		this.#onToolNamesChanged?.(tools.map(tool => tool.name));
 	}
 
@@ -14957,9 +14960,8 @@ export class AgentSession {
 				}
 				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools);
+				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 				this.#invalidateDiscoveryCaches();
-				options?.fence?.onApplied();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
 				promote();
@@ -15073,9 +15075,8 @@ export class AgentSession {
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-		this.#setGuardedAgentTools(tools);
+		this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 		this.#invalidateDiscoveryCaches();
-		options?.fence?.onApplied();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
 				previousSelectedMCPToolNames,
@@ -35529,7 +35530,7 @@ export class AgentSession {
 		let ownedMessages = previousMessages;
 		let ownedTools = agent.state.tools;
 		let ownedSystemPrompt = agent.state.systemPrompt;
-		let ownedContextRevision = agent.contextRevision;
+		let ownedHistoryRevision = agent.historyRevision;
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
 		let moved = false;
@@ -35566,27 +35567,24 @@ export class AgentSession {
 				now.headerExport === revisions.headerExport &&
 				now.label === revisions.label &&
 				now.replayMetadata === revisions.replayMetadata &&
+				// Message-history only: prompt, tool and model publications must not
+				// suppress a history rollback of an independently drifted view.
+				agent.historyRevision === ownedHistoryRevision &&
 				messages.length === ownedMessages.length &&
 				messages.every((message, index) => message === ownedMessages[index]) &&
 				!busy()
 			);
 		};
 		const current = () => {
-			// Prompt, tools and in-place history edits are independently mutable. A
-			// concurrent publication is drift even when the view identity holds.
-			return (
-				historyIsOurs() &&
-				agent.state.tools === ownedTools &&
-				agent.state.systemPrompt === ownedSystemPrompt &&
-				agent.contextRevision === ownedContextRevision
-			);
+			// Prompt and tools are independently mutable; a concurrent publication is
+			// drift even while the view identity holds.
+			return historyIsOurs() && agent.state.tools === ownedTools && agent.state.systemPrompt === ownedSystemPrompt;
 		};
 		const fence: SessionViewRestoreFence = {
 			isCurrent: current,
 			onApplied: () => {
 				ownedTools = agent.state.tools;
 				ownedSystemPrompt = agent.state.systemPrompt;
-				ownedContextRevision = agent.contextRevision;
 			},
 		};
 		this.#beginSessionTransition("navigate-tree");
@@ -35606,7 +35604,7 @@ export class AgentSession {
 				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
 			});
 			ownedMessages = agent.state.messages.slice();
-			ownedContextRevision = agent.contextRevision;
+			ownedHistoryRevision = agent.historyRevision;
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -35618,55 +35616,67 @@ export class AgentSession {
 			// authority only while this operation still owns them, so an independent
 			// publication is never overwritten.
 			if (moved && sessionStillOurs()) {
-				const historyOurs = historyIsOurs();
-				const selectionOurs =
+				// Re-read ownership at each step: rollback callbacks are fallible and may
+				// publish prompt or history state of their own.
+				const selectionOurs = () =>
 					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
-				const authorityOurs =
-					selectionOurs &&
+				const authorityOurs = () =>
+					selectionOurs() &&
 					!this.#hasExplicitActiveToolSelectionForContext &&
 					this.#explicitMCPToolSelectionForContext === undefined &&
 					this.#explicitMCPToolSelectionPersistsForContext === true;
-				const toolsOurs = agent.state.tools === ownedTools;
-				const promptOurs = agent.state.systemPrompt === ownedSystemPrompt;
+				let toolsReverted = false;
+				let promptReverted = false;
 				try {
-					if (historyOurs) {
+					if (historyIsOurs()) {
 						if (previousLeaf === null) manager.resetLeaf();
 						else manager.branch(previousLeaf);
+						// Re-anchor the cursor we just restored so later ownership reads
+						// reflect our own revert, not foreign drift.
+						ownedLeaf = previousLeaf;
+						revisions = { ...revisions, leaf: revisions.leaf + 1 };
 					}
-					if (authorityOurs) {
+					if (authorityOurs()) {
 						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
 						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
 						this.#explicitMCPToolSelectionPersistsForContext =
 							previousExplicitMCPToolSelectionPersistsForContext;
 						this.#commitExplicitMCPToolSelectionAuthority();
 					}
-					if (historyOurs && selectionOurs && toolsOurs) {
+					if (historyIsOurs() && selectionOurs() && agent.state.tools === ownedTools) {
 						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 						this.#activeToolSelectionRevision++;
 						agent.setTools(previousTools);
+						toolsReverted = true;
+						// The observer runs after the revert is owned: it may itself publish
+						// prompt or history state, which the next checks must observe.
 						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 						this.#invalidateDiscoveryCaches();
-					} else if (selectionOurs && toolsOurs) {
+					} else if (selectionOurs() && agent.state.tools === ownedTools) {
 						// The view moved on, so its live tools stand. Only undo the
 						// discovered-selection staging this operation performed.
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 					}
-					if (historyOurs && promptOurs) {
+					if (historyIsOurs() && agent.state.systemPrompt === ownedSystemPrompt) {
 						this.#baseSystemPrompt = previousBaseSystemPrompt;
 						agent.setSystemPrompt(previousSystemPrompt);
+						promptReverted = true;
 						// Invalidate rebuilds authorized for the abandoned target tools;
 						// otherwise one may publish their guidance over the reverted prompt.
 						this.#reserveBaseSystemPromptGeneration();
 					}
-					if (historyOurs && selectionOurs && toolsOurs && promptOurs) {
+					if (toolsReverted && promptReverted) {
 						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
 						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
 					}
-					if (historyOurs) {
+					if (historyIsOurs()) {
 						agent.replaceMessages(previousMessages, {
 							historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
 						});
+						// Re-anchor the history this rollback just published.
+						ownedMessages = agent.state.messages.slice();
+						ownedHistoryRevision = agent.historyRevision;
 						this.#resetInjectedContextSignatures();
 						this.#syncTodoPhasesFromBranch();
 						this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -35677,7 +35687,7 @@ export class AgentSession {
 						rollbackFailed: true,
 					});
 				}
-				if (!historyOurs) throw gone();
+				if (!historyIsOurs()) throw gone();
 			} else if (moved) {
 				throw gone();
 			}

@@ -46,7 +46,11 @@ describe("SDK exact session view", () => {
 	const restores: Array<() => void> = [];
 	const sessions: AgentSession[] = [];
 
-	async function createSession(manager: SessionManager, discovery = false): Promise<AgentSession> {
+	async function createSession(
+		manager: SessionManager,
+		discovery = false,
+		onToolNamesChanged?: (names: string[]) => void,
+	): Promise<AgentSession> {
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected bundled test model");
 		const runtime = new ExtensionRuntime();
@@ -85,6 +89,7 @@ describe("SDK exact session view", () => {
 			mcpDiscoveryEnabled: discovery,
 			toolRegistry: discovery ? new Map([[MCP_TOOL, lookupTool]]) : new Map(),
 			rebuildSystemPrompt: names => rebuild(names),
+			onToolNamesChanged,
 		});
 		sessions.push(created);
 		return created;
@@ -134,7 +139,9 @@ describe("SDK exact session view", () => {
 		return { sessionId: session.sessionId, leafEntryId };
 	}
 
-	async function seedMcpBranches(): Promise<{ old: string; previous: string }> {
+	async function seedMcpBranches(
+		onToolNamesChanged?: (names: string[]) => void,
+	): Promise<{ old: string; previous: string }> {
 		await session.dispose();
 		const manager = SessionManager.create(dir.path(), path.join(dir.path(), "mcp-sessions"));
 		manager.appendMCPToolSelection([MCP_TOOL]);
@@ -142,7 +149,7 @@ describe("SDK exact session view", () => {
 		manager.resetLeaf();
 		manager.appendMCPToolSelection([]);
 		const previous = manager.appendMessage({ role: "user", content: "previous context", timestamp: 2 });
-		session = await createSession(manager, true);
+		session = await createSession(manager, true, onToolNamesChanged);
 		return { old, previous };
 	}
 
@@ -719,6 +726,51 @@ describe("SDK exact session view", () => {
 		await pendingRefresh;
 		expect(session.getActiveToolNames()).toEqual(tools);
 		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("fails closed when history is edited in place during a failed rebuild", async () => {
+		const { old } = await seedMcpBranches();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			throw new Error("target rebuild failed");
+		};
+		const pending = restoreSessionView(session, target(old));
+		void pending.catch(() => {});
+		await entered.promise;
+		const message = session.agent.state.messages[0];
+		if (message?.role !== "user") throw new Error("Expected user message");
+		message.content = "foreign in-place edit";
+		session.agent.touchContext();
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.agent.state.messages[0]).toMatchObject({ content: "foreign in-place edit" });
+	});
+
+	it("reverts published target tools when a tool observer throws", async () => {
+		let throwOnce = false;
+		const { previous } = await seedMcpBranches(() => {
+			if (!throwOnce) return;
+			throwOnce = false;
+			throw new Error("tool observer failed");
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.agent.state.tools.slice();
+		const systemPrompt = session.systemPrompt.slice();
+		const messages = session.agent.state.messages.slice();
+		throwOnce = true;
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(session.agent.state.messages).toEqual(messages);
 		expect(model.calls).toHaveLength(0);
 	});
 
