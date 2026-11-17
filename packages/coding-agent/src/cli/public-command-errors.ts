@@ -21,6 +21,7 @@ export type PublicFailureKind =
 	| "wait_timeout"
 	| "uncertain_after_send"
 	| "busy"
+	| "not_found"
 	| "daemon_unhealthy"
 	| "daemon_stale"
 	| "daemon_mixed"
@@ -189,7 +190,8 @@ const messages: Record<PublicFailureKind, string> = {
 	timeout: "The operation timed out; its outcome requires reconciliation.",
 	wait_timeout: "Waiting timed out after the operation was accepted. Do not replay it.",
 	uncertain_after_send: "The request was sent but its outcome is uncertain. Reconcile before any replay.",
-	busy: "The session is running a turn and refused the request.",
+	busy: "The session has pending work and refused the request.",
+	not_found: "The target was not found.",
 	daemon_unhealthy: "The selected daemon is unhealthy.",
 	daemon_stale: "The selected daemon has stale runtime state.",
 	daemon_mixed: "Some daemon targets failed. Do not repeat mutations that already succeeded.",
@@ -313,6 +315,8 @@ export function classifyPublicCommandFailure(
 	} else if (kind === "busy") {
 		category = "unavailable";
 		if (outcomeCertainty === "not-applied") retryability = "yes";
+	} else if (kind === "not_found") {
+		retryability = "no";
 	} else if (
 		[
 			"unavailable",

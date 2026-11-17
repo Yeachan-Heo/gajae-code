@@ -163,6 +163,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	tavily: "TAVILY_API_KEY",
 	parallel: "PARALLEL_API_KEY",
 	kagi: "KAGI_API_KEY",
+	keenable: "KEENABLE_API_KEY",
 	// Kiro API keys use the ksk_ prefix; preserve the AWS bearer fallback for OAuth.
 	kiro: () => {
 		const apiKey = $credentialEnv("KIRO_API_KEY");
@@ -1139,6 +1140,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onStreamCreated: options?.onStreamCreated,
+		onProviderDispatch: options?.onProviderDispatch,
 		disableProviderRetries: options?.disableProviderRetries,
 		onSseEvent: options?.onSseEvent,
 		attemptScope: options?.attemptScope,

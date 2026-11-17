@@ -173,13 +173,6 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/notifications-managed-engine.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
 				"packages/coding-agent/test/notifications-map-answer-gate.test.ts"
 			]
 		},

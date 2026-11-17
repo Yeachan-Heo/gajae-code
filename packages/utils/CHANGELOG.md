@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Added
+
+- `logger.close()` flushes every record written so far and closes the rotating log file, resolving once the file stream finishes (bounded by a 2-second deadline). A later log call opens the transports again. The shared test preload calls it before removing each test file's isolated `gjc-test-logs-*` directory, so a test that logs no longer leaves that directory behind in the OS temp root.
+
+### Fixed
+
+- A direct `process.stderr.write` whose reader has gone away (`EPIPE`/`EIO`/`EBADF`, e.g. a closed console on Windows or `gjc ... 2>&1 | head`) now exits quietly with the broken-pipe status 141 instead of being recorded and reported as a crash, matching the existing stdout handling ([#7790](https://github.com/Yeachan-Heo/gajae-code/issues/7790)).
+
+## [0.20.0] - 2026-11-08
+
+### Fixed
+
+- Apply EditorConfig rules to files in child directories whose names begin with two dots, such as `..cache`, instead of mistaking them for parent paths.
+
+- Record Python tool-bridge dotenv provenance with a bounded read, candidate `NODE_ENV` layers, and an incomplete state when a layer cannot be read.
+
+- Honor response-header retry hints without waiting for an error response body to finish, while preserving body-hint fallback when no header hint is available.
+
+- Parse SSE streams with lone carriage-return line endings, including event boundaries split across network chunks, while preserving LF and CRLF framing.
+
 ## [0.19.3] - 2026-11-03
 
 ### Added

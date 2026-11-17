@@ -1413,7 +1413,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 			const localAbortReason = abortTracker.getLocalAbortReason();
 			const normalizedError =
-				!streamConnected && model.provider === "alibaba-token-plan" && error instanceof APIConnectionTimeoutError
+				!streamConnected && error instanceof APIConnectionTimeoutError
 					? new FirstEventTimeoutError(OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE)
 					: error;
 			const capturedErrorResponse = getCapturedErrorResponse?.();

@@ -3,14 +3,16 @@ import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/sdk";
+import type { DurableModelProfileOwnership } from "../src/config/model-profile-ownership";
 import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
-import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
+import { setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
+import { loadTestTheme } from "./helpers/test-theme";
 
 interface FakeAcpBuiltinSession {
 	fastMode: boolean;
@@ -92,6 +94,8 @@ interface FakeAcpBuiltinSession {
 	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
 	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
+	setThinkingLevelForControl(thinkingLevel: ThinkingLevel, persist: boolean): Promise<void>;
+	setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined): Promise<void>;
 }
 
 function createRuntime() {
@@ -226,6 +230,14 @@ function createRuntime() {
 			this.thinkingLevel = thinkingLevel;
 			this.thinkingLevelCalls.push({ thinkingLevel, persist });
 		},
+		// The real controls publish before applying; the fake applies through the
+		// overridable setter so tests can observe the requested level.
+		async setThinkingLevelForControl(thinkingLevel: ThinkingLevel, persist: boolean) {
+			this.setThinkingLevel(thinkingLevel, persist);
+		},
+		async setThinkingLevelForSession(thinkingLevel: ThinkingLevel | undefined) {
+			this.setThinkingLevel(thinkingLevel);
+		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const fakeSessionManager = {
@@ -292,6 +304,7 @@ function createRuntime() {
 	};
 	const typedSession = Object.assign(session, {
 		sessionManager: fakeSessionManager as unknown as SessionManager,
+		setSessionName: (name: string, source: "auto" | "user") => fakeSessionManager.setSessionName(name, source),
 	}) as unknown as AgentSession & FakeAcpBuiltinSession;
 	return {
 		output,
@@ -325,10 +338,16 @@ function createRuntime() {
 	};
 }
 
+// Fresh isolated settings carry no persisted owner, so /model must commit against the inherited v0 owner it observed.
+const INHERITED_OWNERSHIP_V0: DurableModelProfileOwnership = {
+	schemaVersion: 1,
+	version: 0,
+	marker: { kind: "inherit" },
+};
+
 describe("ACP builtin slash commands", () => {
 	it("consumes fast status without returning prompt text", async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for fast status test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 
@@ -343,8 +362,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("renders a provider-aware multiline fast status report and never calls isFastModeEnabled", async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for fast status test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 		const session = runtime.session as unknown as {
@@ -739,6 +757,8 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(session.model).toBe(available[0]);
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: undefined,
@@ -759,6 +779,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet:low"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
@@ -780,6 +802,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet:low"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
@@ -851,13 +875,14 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(reasoningModel, "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-fable-5:xhigh"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-fable-5",
 			thinkingLevel: "xhigh",
 		});
 		expect(session.model).toBe(reasoningModel);
 		expect(output[0]).toContain("Default model set to anthropic/claude-fable-5:xhigh");
-		expect(runtime.settings.getModelRole("default")).toBe("anthropic/claude-fable-5:xhigh");
 	});
 
 	it("model: requires explicit Grok effort for argument-based role assignment", async () => {
@@ -909,6 +934,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(grok, "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "xai/grok-4.6:xhigh"]]),
 			cause: "user-selection",
 			selector: "xai/grok-4.6",
 			thinkingLevel: "xhigh",

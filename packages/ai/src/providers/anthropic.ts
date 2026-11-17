@@ -55,6 +55,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderDispatch,
 	ProviderSessionState,
 	RedactedThinkingContent,
 	ServiceTier,
@@ -1245,6 +1246,7 @@ export type AnthropicClientOptionsArgs = {
 	isOAuth?: boolean;
 	hasTools?: boolean;
 	onSseEvent?: AnthropicOptions["onSseEvent"];
+	onProviderDispatch?: (dispatch: ProviderDispatch) => void;
 	fetch?: FetchImpl;
 	requestMaxRetries?: number;
 	maxRetryDelayMs?: number;
@@ -1610,6 +1612,42 @@ function requestBodyBuffer(body: RequestInit["body"]): Buffer | undefined {
 	if (body instanceof ArrayBuffer) return Buffer.from(body);
 	if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
 	return undefined;
+}
+
+/** Detached copy of a readable request body; `undefined` for absent or non-inspectable (stream, blob, form) bodies. */
+function copyDispatchBody(body: RequestInit["body"]): string | Uint8Array | undefined {
+	if (typeof body === "string") return body;
+	if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+	if (ArrayBuffer.isView(body)) return new Uint8Array(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+	return undefined;
+}
+
+/**
+ * Reports each actual HTTP send to `onProviderDispatch` as a detached copy and
+ * lets a throw reject the send before it reaches `baseFetch`. Request bodies are
+ * never consumed: only a string/ArrayBuffer/view `init.body` is copied.
+ */
+function wrapAnthropicFetchForProviderDispatch(
+	baseFetch: FetchImpl,
+	api: Api,
+	onProviderDispatch: (dispatch: ProviderDispatch) => void,
+): FetchImpl {
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const request = input instanceof Request ? input : undefined;
+			// Fetch semantics: `init.headers` replaces the Request's headers instead of merging with them.
+			const headers = new Headers(init?.headers ?? request?.headers);
+			onProviderDispatch({
+				api,
+				url: request ? request.url : String(input),
+				method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
+				headers,
+				body: copyDispatchBody(init?.body),
+			});
+			return baseFetch(input, init);
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
 }
 
 /** Compresses request bodies with gzip for first-party Anthropic endpoints only. */
@@ -2270,6 +2308,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					extraBetas.push(fastModeBeta);
 				}
 
+				const dispatchObserver = options?.onProviderDispatch;
 				const created = createClient(model, {
 					model,
 					apiKey,
@@ -2282,6 +2321,19 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					hasTools: !!context.tools?.length,
 					onSseEvent: options?.onSseEvent
 						? event => options.onSseEvent!(event, model, options?.attemptScope)
+						: undefined,
+					onProviderDispatch: dispatchObserver
+						? dispatch => {
+								try {
+									dispatchObserver(dispatch);
+								} catch (error) {
+									// A rejected dispatch is terminal: aborting the request signal stops
+									// the SDK's own connection-error retry, and the local abort reason
+									// bypasses the provider retry loop.
+									activeAbortTracker.abortLocally(error instanceof Error ? error : new Error(String(error)));
+									throw error;
+								}
+							}
 						: undefined,
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
@@ -3548,7 +3600,12 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model, args.endpointConfiguration);
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl, args.endpointConfiguration);
 	const baseFetch = args.fetch ?? fetch;
-	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	// Innermost: observes the final wire request after gzip, header decoration and
+	// SDK retries. The bounded-rate-limit wrapper only post-processes responses.
+	const dispatchFetch = args.onProviderDispatch
+		? wrapAnthropicFetchForProviderDispatch(baseFetch, model.api, args.onProviderDispatch)
+		: baseFetch;
+	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(dispatchFetch, args.maxRetryDelayMs);
 	const gzipFetch = wrapAnthropicFetchForGzip(boundedFetch);
 	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, args.providerSessionId, "anthropic");
 	const providerScopedFetch = wrapFetchForOpenCodeGoSession(gzipFetch, openCodeGoSessionId);

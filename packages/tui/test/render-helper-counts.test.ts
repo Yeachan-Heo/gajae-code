@@ -10,7 +10,7 @@ import {
 } from "@gajae-code/tui/terminal-capabilities";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { defaultEditorTheme } from "./test-themes";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal, visible } from "./virtual-terminal";
 
 class MutableLinesComponent implements Component {
 	#lines: string[];
@@ -28,16 +28,6 @@ class MutableLinesComponent implements Component {
 	render(_width: number): string[] {
 		return [...this.#lines];
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 const RENDER_ENV_KEYS = [

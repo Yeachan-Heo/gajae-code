@@ -3,7 +3,8 @@ import { sanitizeDisplayLine } from "@gajae-code/utils";
 import fc from "fast-check";
 import type { ModelProfileConfig } from "../src/config/models-config-schema";
 import { CustomModelPresetWizardComponent } from "../src/modes/components/custom-model-preset-wizard";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const ESC = "\u001b";
 const BEL = "\u0007";
@@ -43,7 +44,7 @@ function renderWizard(snapshot: ModelProfileConfig): { rendered: string; submitt
 
 describe("custom model preset wizard snapshot preview", () => {
 	beforeAll(async () => {
-		const loaded = await getThemeByName("red-claw");
+		const loaded = await loadTestTheme();
 		expect(loaded).toBeDefined();
 		setThemeInstance(loaded!);
 	});

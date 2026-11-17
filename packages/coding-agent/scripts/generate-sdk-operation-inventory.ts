@@ -11,6 +11,8 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 
 /** Reviewed seams deliberately excluded from the public SDK operation surface. */
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
+	"agent_session:prepareCloseIfIdle":
+		"internal Broker-authorized idle close admission fence; not an independent public SDK operation",
 	"agent_session:getSdkPermissionProvider":
 		"internal approval callback inheritance for task descendants; not an independent public SDK operation",
 	"agent_session:reloadSkills":
@@ -23,8 +25,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal run-resource ledger domain lookup for exact consuming-run ownership; not a public SDK operation",
 	"agent_session:cancelPendingPreflightForTerminalAbort":
 		"internal terminal-abort bus seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
-	"agent_session:abortPromptAndWaitWithTerminal":
-		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:pendingToolExecutions":
 		"internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
 	"agent_session:markProfileRoleOverrideManual":
@@ -303,17 +303,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
-	"agent_session:setDefaultModelProfileForControl":
-		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
-	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentModelOverrideState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:retireSessionAgentModelOverrides":
 		"internal session-lifecycle plumbing for agent-model overrides, not an independent public SDK operation",
 	"agent_session:restoreSessionAgentModelOverrides":
 		"internal rollback plumbing for agent-model overrides, not an independent public SDK operation",
-	"agent_session:setSessionAgentModelSelection":
-		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
 	"agent_session:getThinkingLevelMutationRevision":
 		"internal revision fence for thinking-level rollback, not a user-facing control seam",
 	"agent_session:withMcpControlAdmission":
@@ -349,6 +344,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setRetainedMemorySampler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:createBtwConversationScope":
 		"internal privacy-scoped side-chat snapshot factory, not a user-facing SDK control seam",
+	"agent_session:releaseBtwConversationScope":
+		"internal side-chat snapshot lifetime cleanup, not a user-facing SDK control seam",
+	"agent_session:observeMainProviderStream":
+		"internal main provider dispatch observation hook, not a user-facing SDK control seam",
 	"agent_session:recordBashResult": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:executePython": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:assertEvalExecutionAllowed": "internal accessor/plumbing, not a user-facing control seam",
@@ -397,6 +396,39 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
 	"agent_session:generateAutoSessionTitle":
 		"public in-process embedder title lifecycle API; no automatic title-generation transport operation is admitted",
+	"agent_session:setDefaultModelProfileForControl":
+		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
+	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:setSessionAgentModelSelection":
+		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
+	"agent_session:appendCustomEntryForSession":
+		"internal shared-session transcript publication for in-process extension and controller writers, not a user-facing SDK control seam",
+	"agent_session:appendCustomEntryInBackground":
+		"internal shared-session transcript publication from synchronous in-process call sites, not a user-facing SDK control seam",
+	"agent_session:appendMessageInBackground":
+		"internal shared-session transcript publication from synchronous in-process call sites, not a user-facing SDK control seam",
+	"agent_session:appendMessageForSession":
+		"internal shared-session transcript publication for in-process writers, not a user-facing SDK control seam",
+	"agent_session:appendSessionRecapForSession":
+		"internal shared-session recap publication behind the reviewed session recap surfaces, not an independent public SDK operation",
+	"agent_session:appendLabelChangeInBackground":
+		"internal shared-session label publication for the local TUI tree navigator, not a user-facing SDK control seam",
+	"agent_session:appendModeChangeInBackground":
+		"internal shared-session mode-change publication for plan/goal mode persistence, not a user-facing SDK control seam",
+	"agent_session:assertConfiguredModelChainWritable":
+		"internal fail-closed guard before profile/fallback-chain writes on adopted shared sessions, not a user-facing SDK control seam",
+	"agent_session:usesSharedControlPublication":
+		"internal shared-publication eligibility query for in-process control paths, not a user-facing SDK control seam",
+	"agent_session:withModelProfilePublication":
+		"internal shared publication scope behind the reviewed model.profile.set seam, not an independent public SDK operation",
+	"agent_session:appendModelProfileActivationForControl":
+		"internal shared transcript append behind the reviewed model.profile.set seam, not an independent public SDK operation",
+	"agent_session:publishCommittedModelProfileSessionState":
+		"internal receipt-bound live-state publication behind the reviewed model.profile.set seam, not an independent public SDK operation",
+	"agent_session:setThinkingLevelForSession":
+		"internal non-operator session-only thinking follow (plan mode, model assignment) over the reviewed thinking.set seam, not an independent public SDK operation",
+	"agent_session:setConfiguredModelChainForControl":
+		"internal shared-publication wrapper over profile and fallback-chain state for controls that already committed settings, not a user-facing SDK control seam",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -409,7 +441,11 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:clearContext": "context.clear",
 	"agent_session:setSessionName": "session.rename",
 	"agent_session:setModel": "model.set",
-	"agent_session:setDefaultModelSelection": "model.set",
+	"agent_session:setDefaultModelSelection": "model.select",
+	"agent_session:setDefaultModelProfileForControl": "model.profile.select",
+	"agent_session:getAgentModelOverrides": "model.roles.get",
+	"agent_session:setSessionAgentModelSelection": "model.role.set",
+
 	"agent_session:activateModelProfileForControl": "model.profile.set",
 	"agent_session:cycleModel": "model.cycle",
 	"agent_session:setThinkingLevel": "thinking.set",
@@ -436,6 +472,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	// The `/btw` ephemeral side question is a public SDK control (`btw.ask`): the
 	// private seam answers from the live session context and persists nothing.
 	"agent_session:runEphemeralTurn": "btw.ask",
+	"agent_session:joinBtwTurnsForControl": "btw.ask",
 	"agent_session:getAvailableModels": "models.list/current",
 	"agent_session:getSdkConfigItems": "config.list/get",
 	"agent_session:getActiveToolNames": "tools.list",

@@ -9,9 +9,10 @@ import {
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { PreparedProfileModelSelection } from "@gajae-code/coding-agent/session/agent-session";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -23,12 +24,7 @@ function normalizeRenderedText(text: string): string {
 		.trim();
 }
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 const defaultModel = model("provider-a", "default");
 const alternateModel = model("provider-a", "alternate");
@@ -244,14 +240,14 @@ async function selectFirstProfile(controller: SelectorController, setDefault = f
 	const selector = (controller as unknown as { ctx: { editorContainer: { addChild: ReturnType<typeof vi.fn> } } }).ctx
 		.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 	await Bun.sleep(10);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	await selector.__testSelectProfile("profile-a", setDefault);
 	await Bun.sleep(0);
 }
 
 describe("model selector profiles", () => {
 	test("catalog changes rebuild the active preset landing instead of switching to model view", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const profiles = new Map<string, ModelProfileDefinition>([[profile.name, profile]]);
 		const models = [defaultModel, alternateModel, aliasModel, providerBDefault];
 		let catalogChanged: (() => void) | undefined;
@@ -289,7 +285,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("catalog additions refresh preset authentication state", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const liveProfile: ModelProfileDefinition = {
 			name: "registry-auth-refresh",
 			displayName: "Auth Refresh",
@@ -329,7 +325,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("resolves a repeated preset selector once per authentication refresh", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const repeatedProfiles = new Map<string, ModelProfileDefinition>([
 			[
 				"repeated-a",
@@ -408,7 +404,7 @@ describe("model selector profiles", () => {
 			["custom-proxy", kNoAuth, false],
 		] as const) {
 			test(`discovered proxy preset availability: ${proxyMode}, ${provider}, ${apiKey}`, async () => {
-				installTestTheme();
+				setThemeInstance(testTheme);
 				const discoveredProfile: ModelProfileDefinition = {
 					name: "discovered-ocx",
 					providerGroup: "DISCOVERED OCX",
@@ -441,7 +437,7 @@ describe("model selector profiles", () => {
 	}
 
 	test("renders a registry preset unavailable when its configured proxy lacks the model", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const proxyProfile: ModelProfileDefinition = {
 			name: "registry-proxy-missing",
 			displayName: "Proxy Missing",
@@ -468,7 +464,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("renders a registry preset unavailable when a qualified role is absent from the effective catalog", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const registryProfile: ModelProfileDefinition = {
 			name: "registry-role-missing",
 			displayName: "Registry Role Missing",
@@ -492,7 +488,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("renders presets safely when the configured proxy identifier is malformed", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const registry = createRegistry() as unknown as TestModelRegistry & {
 			getModelProfiles: () => ReadonlyMap<string, ModelProfileDefinition>;
 		};
@@ -516,7 +512,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("marks a registry preset unavailable when always-mode proxy auth is missing", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const registry = createRegistry() as unknown as TestModelRegistry;
 		const alwaysProfile: ModelProfileDefinition = {
 			name: "registry-always",
@@ -544,7 +540,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("keeps a registry preset available in fallback mode with direct auth and an unauthenticated proxy", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const fallbackProfile: ModelProfileDefinition = {
 			name: "registry-fallback",
 			displayName: "Registry Fallback",
@@ -578,7 +574,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("fences preset actions and rebuilds availability when disabled providers change", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const settings = Settings.isolated();
 		const profiles = new Map<string, ModelProfileDefinition>([[profile.name, profile]]);
 		const refreshGate = Promise.withResolvers<"key">();
@@ -616,15 +612,15 @@ describe("model selector profiles", () => {
 	});
 
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 
 	test("renders preset landing above model rows", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Model presets");
@@ -635,10 +631,10 @@ describe("model selector profiles", () => {
 	});
 
 	test("provider focus does not auto-expand until right arrow", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("CODEX");
@@ -655,7 +651,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("defers authenticated preset actions while availability refresh is pending", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const gate = Promise.withResolvers<"key">();
 		const registry = createRegistry();
 		registry.getApiKeyForProvider = async () => gate.promise;
@@ -678,7 +674,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("defers preset actions while the initial static catalog refresh is pending", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const gate = Promise.withResolvers<void>();
 		const registry = createRegistry() as unknown as TestModelRegistry & {
 			refreshStatic: () => Promise<void>;
@@ -703,13 +699,13 @@ describe("model selector profiles", () => {
 	});
 
 	test("up and down navigation stays on provider rows while collapsed", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const registry = createRegistry();
 		const getAvailable = vi.fn(registry.getAvailable);
 		registry.getAvailable = getAvailable;
 		const selector = createSelector(() => {}, { registry });
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		getAvailable.mockClear();
 
 		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
@@ -735,7 +731,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("rebuilds preset availability after profiles change in place", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const profiles = new Map<string, ModelProfileDefinition>([[profile.name, profile]]);
 		const registry = createRegistry();
 		registry.getModelProfiles = () => new Map(profiles);
@@ -767,7 +763,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("landing header shows the session's current preset, model, and role assignments", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {}, {
 			currentModel: defaultModel,
 			currentThinkingLevel: ThinkingLevel.High,
@@ -777,7 +773,7 @@ describe("model selector profiles", () => {
 			}),
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Current: preset Profile Alpha · provider-a/default (high)");
@@ -787,7 +783,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("active profile role badges resolve bare aliases without mutating canonical session affinity", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const registry = createRegistry();
 		const selector = createSelector(() => {}, {
 			currentModel: defaultModel,
@@ -799,7 +795,7 @@ describe("model selector profiles", () => {
 			sessionId: "profile-session",
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("EXECUTOR: provider-b/org/flare-alias");
@@ -810,14 +806,14 @@ describe("model selector profiles", () => {
 	});
 
 	test("landing header reflects the active fallback model snapshot", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {}, {
 			currentModel: alternateModel,
 			currentThinkingLevel: ThinkingLevel.Low,
 			activeModelProfile: "profile-a",
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Current: preset Profile Alpha · provider-a/alternate (low)");
@@ -827,10 +823,10 @@ describe("model selector profiles", () => {
 	});
 
 	test("enter toggles a usable provider group's expansion", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("CODEX");
@@ -845,10 +841,10 @@ describe("model selector profiles", () => {
 		expect(rendered).not.toContain("Codex Eco");
 	});
 	test("preset search keeps first typed character before subsequent input", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("c");
 		selector.handleInput("l");
@@ -858,10 +854,10 @@ describe("model selector profiles", () => {
 	});
 
 	test("initial search input appends new typing at the end", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {}, { initialSearchInput: "cla" });
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("u");
 
@@ -869,10 +865,10 @@ describe("model selector profiles", () => {
 	});
 
 	test("temporary-only mode hides Profiles", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const selector = createSelector(() => {}, { temporaryOnly: true });
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).not.toContain("Profiles");
@@ -880,7 +876,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("active profile makes DEFAULT badge follow runtime model instead of stored default", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const settings = Settings.isolated({ modelRoles: { default: "provider-a/alternate" } });
 		const selector = createSelector(() => {}, {
 			settings,
@@ -890,7 +886,7 @@ describe("model selector profiles", () => {
 			initialSearchInput: "provider-a",
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("provider-a/default DEFAULT (high)");
@@ -898,7 +894,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("without active profile DEFAULT badge follows persisted default model", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const settings = Settings.isolated({ modelRoles: { default: "provider-a/alternate" } });
 		const selector = createSelector(() => {}, {
 			settings,
@@ -907,7 +903,7 @@ describe("model selector profiles", () => {
 			initialSearchInput: "provider-a",
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("provider-a/alternate DEFAULT (inherit)");
@@ -915,7 +911,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("direct fallback chains make the runtime fallback both Current and DEFAULT", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const settings = Settings.isolated({
 			modelRoles: { default: ["provider-a/default:high", "provider-a/alternate:low"] },
 		});
@@ -925,7 +921,7 @@ describe("model selector profiles", () => {
 			currentThinkingLevel: ThinkingLevel.Low,
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Current: provider-a/alternate (low)");
@@ -934,7 +930,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("persisted session fallback chains make the active head both Current and DEFAULT", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const settings = Settings.isolated({ modelRoles: { default: "provider-a/default:high" } });
 		const selector = createSelector(() => {}, {
 			settings,
@@ -943,7 +939,7 @@ describe("model selector profiles", () => {
 			configuredDefaultChain: ["provider-a/alternate:low", "provider-a/default:high"],
 		});
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("Current: provider-a/alternate (low)");
@@ -987,7 +983,7 @@ describe("model selector profiles", () => {
 		controller.showModelSelector();
 		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const selection = selector.__testSelectProfile("profile-a", false);
 		await Bun.sleep(0);
@@ -1018,7 +1014,7 @@ describe("model selector profiles", () => {
 		controller.showModelSelector();
 		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const selection = selector.__testSelectProfile("profile-a", false);
 		await Bun.sleep(0);
@@ -1044,7 +1040,7 @@ describe("model selector profiles", () => {
 		controller.showModelSelector();
 		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const selection = selector.__testSelectProfile("profile-a", false);
 		await Bun.sleep(0);
@@ -1082,7 +1078,7 @@ describe("model selector profiles", () => {
 		controller.showModelSelector();
 		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const selection = selector.__testSelectProfile("profile-a", false);
 		await Bun.sleep(0);
@@ -1148,7 +1144,7 @@ describe("model selector profiles", () => {
 		controller.showModelSelector();
 		const first = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const firstSelection = first.__testSelectProfile("profile-a", false);
 		await Bun.sleep(0);
 
@@ -1156,7 +1152,7 @@ describe("model selector profiles", () => {
 		controller.showModelSelector();
 		const second = ctx.editorContainer.addChild.mock.calls[1]?.[0] as ModelSelectorComponent;
 		await Bun.sleep(10);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const secondSelection = second.__testSelectProfile("codex-eco", false);
 		await Bun.sleep(0);
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(2);

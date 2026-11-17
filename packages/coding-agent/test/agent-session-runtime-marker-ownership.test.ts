@@ -4,7 +4,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import { Settings } from "../src/config/settings";
 import { sessionRuntimeDir, sessionRuntimeStatePath } from "../src/gjc-runtime/session-layout";
@@ -17,6 +16,7 @@ import {
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+import { createModel } from "./helpers/mock-model";
 
 // The coordinator pins ONE runtime-state marker per launched session through
 // GJC_COORDINATOR_SESSION_STATE_FILE. That pin is process-wide environment, so every
@@ -40,22 +40,6 @@ afterEach(async () => {
 	else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = ORIGINAL_SESSION_ID;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
-
-function createModel(): Model<"openai-responses"> {
-	return {
-		id: "mock",
-		name: "mock",
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
-}
-
 function createTool(name: string): AgentTool {
 	return {
 		name,

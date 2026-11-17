@@ -239,6 +239,73 @@ function isErrno(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
+/**
+ * The single path-identity rule for gjc workflow state (issue #7562).
+ *
+ * Workflow state records absolute paths (audit caller/callee/active paths,
+ * receipt storage/state paths, checksum covered paths, approval record paths,
+ * journal destinations, spec paths) and verifiers rebuild the expected paths
+ * from their own cwd. A filesystem alias of one root (macOS `/tmp` →
+ * `/private/tmp`, a symlinked checkout) spells the same location differently,
+ * and records written before roots were canonicalized spell whatever alias
+ * the writer ran under.
+ *
+ * The identity of a path is the `realpath` of its deepest existing ancestor
+ * joined with the remaining, not-yet-existing tail. Two spellings of one
+ * location therefore share an identity even when the file does not exist yet
+ * (a pending journal records its destinations before writing them), while a
+ * different root, or an alias that no longer resolves, keeps a different one.
+ * Workflow entrypoints derive their root with this function, and every
+ * comparison of a recorded path against a rebuilt one goes through
+ * {@link isSamePathIdentity} or {@link isPathIdentityWithin}.
+ */
+export async function physicalPathIdentity(target: string): Promise<string> {
+	const resolved = path.resolve(target);
+	const tail: string[] = [];
+	let current = resolved;
+	while (true) {
+		try {
+			const physical = await fs.realpath(current);
+			return tail.length === 0 ? physical : path.join(physical, ...tail.reverse());
+		} catch (error) {
+			if (!isErrno(error, "ENOENT") && !isErrno(error, "ENOTDIR") && !isErrno(error, "ELOOP")) throw error;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return resolved;
+		tail.push(path.basename(current));
+		current = parent;
+	}
+}
+
+/** Whether a recorded path names the same location as `expected` under {@link physicalPathIdentity}. */
+export async function isSamePathIdentity(recorded: unknown, expected: unknown): Promise<boolean> {
+	if (typeof recorded !== "string" || !recorded || typeof expected !== "string" || !expected) return false;
+	const resolvedRecorded = path.resolve(recorded);
+	const resolvedExpected = path.resolve(expected);
+	if (resolvedRecorded === resolvedExpected) return true;
+	const [recordedIdentity, expectedIdentity] = await Promise.all([
+		physicalPathIdentity(resolvedRecorded),
+		physicalPathIdentity(resolvedExpected),
+	]);
+	return recordedIdentity === expectedIdentity;
+}
+
+/**
+ * Whether a recorded path lies strictly inside `directory` under
+ * {@link physicalPathIdentity}. Containment is decided on identities, so a
+ * sibling sharing a name prefix (`specs-evil`) or a foreign root is outside.
+ * Existence is not implied; callers that read the file still verify it.
+ */
+export async function isPathIdentityWithin(recorded: unknown, directory: string): Promise<boolean> {
+	if (typeof recorded !== "string" || !recorded) return false;
+	const [recordedIdentity, directoryIdentity] = await Promise.all([
+		physicalPathIdentity(recorded),
+		physicalPathIdentity(directory),
+	]);
+	const relative = path.relative(directoryIdentity, recordedIdentity);
+	return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
 function cwdForOptions(options?: StateWriterOptions): string {
 	return path.resolve(options?.cwd ?? process.cwd());
 }

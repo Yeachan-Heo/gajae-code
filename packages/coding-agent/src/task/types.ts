@@ -334,6 +334,8 @@ export interface AgentProgress {
 	retryFailure?: {
 		attempt: number;
 		errorMessage: string;
+		/** Typed class of the last failed provider attempt; safe to show the parent. */
+		failureClass?: FallbackTriggerClass;
 	};
 	/** Safe diagnostic retained in terminal progress when setup fails before the first LLM request. */
 	setupFailure?: SetupFailureSummary;
@@ -851,6 +853,8 @@ export interface SingleResult {
 	retryFailure?: {
 		attempt: number;
 		errorMessage: string;
+		/** Typed class of the last failed provider attempt; safe to show the parent. */
+		failureClass?: FallbackTriggerClass;
 	};
 	/** Output metadata for agent:// URL integration */
 	outputMeta?: { lineCount: number; charCount: number; byteSize?: number; sha256?: string };

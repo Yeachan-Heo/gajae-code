@@ -11,6 +11,7 @@ import {
 } from "../src/gjc-runtime/session-state-sidecar";
 import { WorkerIntegrationRequestScheduler } from "../src/session/agent-session";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+import { readJson } from "./helpers/read-json";
 
 // Coordinator state writes serialize on a lock whose removals go through identity-bound
 // native primitives; point them at a working implementation.
@@ -40,10 +41,6 @@ async function tempRoot(): Promise<string> {
 
 async function tick(): Promise<void> {
 	await Promise.resolve();
-}
-
-async function readJson(file: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
 }
 
 async function statSignature(file: string): Promise<{ mtimeMs: number; size: number; text: string }> {

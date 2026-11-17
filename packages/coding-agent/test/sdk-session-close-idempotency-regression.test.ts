@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -25,18 +26,6 @@ afterEach(async () => {
 	for (const broker of brokers.splice(0)) await broker.stop();
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
-
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 function targetHash(target: Record<string, unknown>): string {
 	return createHash("sha256").update(canonicalJson(target)).digest("hex");
 }

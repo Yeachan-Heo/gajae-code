@@ -37,6 +37,8 @@ import {
 	waitForReplayProcessWithTimeout,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+import { PNG_SIGNATURE, pngChunk } from "../helpers/png";
+import { readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -219,29 +221,6 @@ function passingQualityGate(): string {
 		},
 	});
 }
-
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {
-	let crc = index;
-	for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
-	return crc >>> 0;
-});
-
-function pngCrc32(bytes: Buffer): number {
-	let crc = 0xffffffff;
-	for (const byte of bytes) crc = PNG_CRC_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
-	return (crc ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
-	const length = Buffer.alloc(4);
-	length.writeUInt32BE(data.length, 0);
-	const typeBytes = Buffer.from(type, "ascii");
-	const crc = Buffer.alloc(4);
-	crc.writeUInt32BE(pngCrc32(Buffer.concat([typeBytes, data])), 0);
-	return Buffer.concat([length, typeBytes, data, crc]);
-}
-
 function syntheticPng(width: number, height: number, mode: "gradient" | "solid"): Buffer {
 	const ihdr = Buffer.alloc(13);
 	ihdr.writeUInt32BE(width, 0);
@@ -635,10 +614,6 @@ async function appendTestLedgerEntry(root: string, entry: Record<string, unknown
 		ledgerPath,
 		`${JSON.stringify({ eventId: `test-${Date.now()}-${Math.random()}`, timestamp: new Date().toISOString(), ...entry })}\n`,
 	);
-}
-
-async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
-	return (await Bun.file(filePath).json()) as Record<string, unknown>;
 }
 
 async function seedStaleUltragoalWorkflowState(root: string): Promise<void> {
@@ -6119,7 +6094,7 @@ describe("ultragoal @goal decomposition", () => {
 		);
 
 		expect(checkpoint.status).toBe(0);
-		const modeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		const modeState = await readJson(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("complete");
 		expect(modeState.status).toBe("complete");
@@ -6127,7 +6102,7 @@ describe("ultragoal @goal decomposition", () => {
 		expect(modeState.active_goal_id).toBeUndefined();
 		expect(modeState.receipt).toMatchObject({ skill: "ultragoal", owner: "gjc-runtime" });
 
-		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
+		const activeState = await readJson(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
 	});
@@ -6141,13 +6116,13 @@ describe("ultragoal @goal decomposition", () => {
 
 		expect(status.status).toBe(0);
 		expect(status.stdout).toContain("No ultragoal plan found");
-		const modeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		const modeState = await readJson(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("missing");
 		expect(modeState.status).toBe("missing");
 		expect(modeState.active_goal_id).toBeUndefined();
 
-		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
+		const activeState = await readJson(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
 	});
@@ -6176,13 +6151,13 @@ describe("ultragoal @goal decomposition", () => {
 		);
 
 		expect(checkpoint.status).toBe(0);
-		const modeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		const modeState = await readJson(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("complete");
 		expect(modeState.status).toBe("complete");
 		expect(modeState.counts).toMatchObject({ complete: 1, pending: 0, active: 0 });
 
-		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
+		const activeState = await readJson(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
 	});

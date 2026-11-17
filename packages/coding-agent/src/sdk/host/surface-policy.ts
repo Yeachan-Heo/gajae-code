@@ -1,4 +1,13 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
+import {
+	isActivityControlOperation,
+	isSdkComposerObservationOperation,
+	isSdkDiffObservationOperation,
+	isSdkOperatorOperation,
+	isSdkPreferenceOperation,
+	isSecureLocalOperation,
+	isSideConversationOperation,
+} from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
@@ -13,11 +22,12 @@ export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	].every(name => typeof candidate[name] === "function");
 }
 
-const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.register", "host_uri.register"]);
+const UNINSTALLED_CONTROL_OPERATIONS = new Set(["host_tools.register", "host_uri.register"]);
 /** Advertised only when the context carries a real durable workflow-gate bridge. */
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -60,6 +70,10 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"retry.now": "sdkControl",
 	"bash.background": "sdkControl",
 	"btw.ask": "sdkControl",
+	"model.role.set": "sdkControl",
+	"model.select": "sdkControl",
+	"model.profile.select": "sdkControl",
+	"config.write": "sdkControl",
 };
 
 // Resource queries (`artifact.read`, `runtime.jobs.list`) remain dispatchable when their
@@ -68,6 +82,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 // replay authority whose handler returns explicit `unavailable` when the host cannot
 // provide one atomic transcript/ring/idle capture, so it must never be hidden behind a binding gate.
 const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
+	"model.roles.get": "sdkControl",
 	"permission.requests.list": "setSdkPermissionProvider",
 	"skill.list/state": "getSkillState",
 	"config.list/get": "getConfigItems",
@@ -83,9 +98,12 @@ export interface SdkSurfacePolicy {
 
 export interface SdkSurfacePolicyOptions {
 	bindings: Iterable<string>;
+	clientControlOperations?: readonly string[];
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
+	/** True only when the host installs trusted user-local signing authority. */
+	secureLocalAuthorityAvailable?: boolean;
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -102,6 +120,17 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
+					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
+					(!(
+						isSecureLocalOperation(operation.sdkId) ||
+						isSdkOperatorOperation(operation.sdkId) ||
+						isActivityControlOperation(operation.sdkId) ||
+						isSideConversationOperation(operation.sdkId) ||
+						isSdkComposerObservationOperation(operation.sdkId) ||
+						isSdkDiffObservationOperation(operation.sdkId) ||
+						isSdkPreferenceOperation(operation.sdkId)
+					) ||
+						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
 						operation.sdkId,
@@ -117,8 +146,15 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 
 export interface SdkCapabilities {
 	operations: string[];
+	/** Available only with matching trusted-local attachment grants; not ordinary controls. */
+	secureLocalOperations?: string[];
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
+	/**
+	 * `1` when `btw.ask` accepts optional caller-supplied `exchanges` and refuses unknown input
+	 * fields. Older hosts omit it and silently ignore `exchanges`.
+	 */
+	btwAskExchangesVersion: 1;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface: "cli" | "sdk";
 }
@@ -129,9 +165,20 @@ export function createSdkCapabilities(
 	primaryControlSurface: SdkCapabilities["primaryControlSurface"] = "sdk",
 ): SdkCapabilities {
 	return {
-		operations: [...policy.installedControls, ...policy.installedQueries],
+		operations: [...policy.installedControls, ...policy.installedQueries].filter(
+			operation => !isSecureLocalOperation(operation),
+		),
+		...([...policy.installedControls, ...policy.installedQueries].some(isSecureLocalOperation)
+			? {
+					secureLocalOperations: [...policy.installedControls, ...policy.installedQueries].filter(
+						isSecureLocalOperation,
+					),
+				}
+			: {}),
+
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
+		btwAskExchangesVersion: 1,
 		primaryControlSurface,
 	};
 }
@@ -142,13 +189,17 @@ export function createSdkSurfacePolicyForContext(
 	workflowGateAvailable = false,
 	imageUploadsAvailable = false,
 	externalPermissionsAvailable = false,
+	secureLocalAuthorityAvailable?: boolean,
 ): SdkSurfacePolicy {
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
 		bindings,
+		clientControlOperations: ctx.getSdkClientControlOperations?.(),
 		workflowGateAvailable,
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
+		secureLocalAuthorityAvailable,
+
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

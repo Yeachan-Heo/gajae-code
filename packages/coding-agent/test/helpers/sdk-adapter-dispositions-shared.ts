@@ -108,6 +108,33 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	"composer.complete": "invalid_input",
+
+	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
+	"operator.execute": "invalid_input",
+	"operator.cancel": "invalid_input",
+	"operator.read": "invalid_input",
+	"activity.cancel": "invalid_input",
+	"activity.pause": "invalid_input",
+	"activity.resume": "invalid_input",
+	"activity.delete": "invalid_input",
+	"activity.acknowledge": "invalid_input",
+	"activity.detail": "invalid_input",
+	"mcp.snapshot": "operation_not_session_owned",
+	"mcp.suspend": "operation_not_session_owned",
+	"mcp.resume": "operation_not_session_owned",
+	"mcp.reconnect": "operation_not_session_owned",
+	"btw.open": "invalid_input",
+	"btw.submit": "invalid_input",
+	"btw.cancel": "invalid_input",
+	"btw.close": "invalid_input",
+	"btw.read": "invalid_input",
+	"diff.summary": "invalid_input",
+	"diff.file": "invalid_input",
+	"model.role.set": "invalid_input",
+	"model.select": "invalid_input",
+	"model.profile.select": "invalid_input",
+	"config.write": "invalid_input",
 	// The generic disposition probe intentionally supplies no upload payload.
 	// Machine routing reaches the real store, which rejects that invalid input.
 	"turn.image.begin": "invalid_input",
@@ -156,6 +183,7 @@ export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.fork": "invalid_input",
 	"session.resume": "invalid_input",
 	"session.close": "invalid_input",
+	"session.revise": "operation_failed",
 };
 export function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
@@ -284,6 +312,8 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-session" };
 		case "session.branch":
 			return { entryId: "missing-entry" };
+		case "btw.open":
+			return { unexpected: true };
 		case "session.rename":
 			return { name: "adapter disposition" };
 		case "session.handoff":
@@ -343,6 +373,8 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
 		case "session.close":
 			return { sessionId: "missing-session", unexpected: true };
+		case "session.revise":
+			return { sessionId: host.sessionId, entryId: "missing-entry", body: "revision probe" };
 		case "session.delete":
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":
@@ -648,7 +680,9 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 						? "usage"
 						: domainCode === "unavailable"
 							? "unavailable"
-							: "operation_failed";
+							: domainCode === "not_found"
+								? "not_found"
+								: "operation_failed";
 				expect(result.output).toMatchObject({
 					schema: "gjc.command-error",
 					ok: false,
@@ -661,7 +695,8 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 							error: { outcomeCertainty: string; references: { kind: string; value: string }[] };
 						}
 					).error;
-					expect(error.outcomeCertainty).toBe("unknown");
+					const expectedCertainty = domainCode === "not_found" ? "not-applied" : "unknown";
+					expect(error.outcomeCertainty).toBe(expectedCertainty);
 					expect(Array.isArray(error.references)).toBe(true);
 					expect(
 						error.references.some(

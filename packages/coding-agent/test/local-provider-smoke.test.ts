@@ -287,6 +287,23 @@ describe("local provider streaming smoke", () => {
 		expect(result.error).toContain("/models response did not include a data array");
 	});
 
+	test("rejects a top-level array /models payload as a non-object response", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					local: { openaiCompat: { baseUrl: "http://127.0.0.1:1234", apiKey: "local-key" } },
+				},
+			}),
+		);
+		using _hook = hookFetch(() => new Response(JSON.stringify([{ id: "bare-array-shape" }]), { status: 200 }));
+
+		const result = await runLocalProviderDiscover({ modelsPath });
+
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("/models response was not a JSON object");
+	});
+
 	test("does not throw when the configured local endpoint cannot be reached", async () => {
 		fs.writeFileSync(
 			modelsPath,

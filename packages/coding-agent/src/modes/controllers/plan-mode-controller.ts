@@ -140,7 +140,7 @@ export class PlanModeController {
 		if (this.ctx.session.isExplicitEmptyToolSelection()) return;
 		if (!this.ctx.session.settings.get("plan.enabled")) {
 			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused")
-				this.ctx.sessionManager.appendModeChange("none");
+				this.ctx.session.appendModeChangeInBackground("none");
 			return;
 		}
 		if (sessionContext.mode !== "plan" && sessionContext.mode !== "plan_paused") return;
@@ -204,7 +204,7 @@ export class PlanModeController {
 		this.#hasEntered = true;
 		await this.#applyModel();
 		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange("plan", { planFilePath });
+		this.ctx.session.appendModeChangeInBackground("plan", { planFilePath });
 		this.ctx.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
 	}
 
@@ -223,7 +223,7 @@ export class PlanModeController {
 		} else if (this.#previousModelState) {
 			const previous = this.#previousModelState;
 			if (modelsAreEqual(this.ctx.session.model, previous.model))
-				this.ctx.session.setThinkingLevel(previous.thinkingLevel);
+				await this.ctx.session.setThinkingLevelForSession(previous.thinkingLevel);
 			else if (this.ctx.session.isStreaming) this.#pendingModelSwitch = previous;
 			else
 				await this.ctx.session.setModelTemporary(previous.model, previous.thinkingLevel, {
@@ -244,7 +244,7 @@ export class PlanModeController {
 		this.#previousModelState = undefined;
 		if (!this.#paused) this.ctx.modeGate.exit("plan");
 		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange(this.#paused ? "plan_paused" : "none");
+		this.ctx.session.appendModeChangeInBackground(this.#paused ? "plan_paused" : "none");
 		if (!options?.silent) this.ctx.showStatus(this.#paused ? "Plan mode paused." : "Plan mode disabled.");
 	}
 
@@ -352,7 +352,7 @@ export class PlanModeController {
 			? { model: current, thinkingLevel: this.ctx.session.thinkingLevel }
 			: undefined;
 		if (modelsAreEqual(current, resolved.model)) {
-			if (thinkingLevel) this.ctx.session.setThinkingLevel(thinkingLevel);
+			if (thinkingLevel) await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 			return;
 		}
 		if (this.ctx.session.isStreaming) {
@@ -599,11 +599,7 @@ export class PlanModeController {
 			);
 		}
 		const name = humanizePlanTitle(options.title);
-		if (
-			name &&
-			!this.ctx.sessionManager.getSessionName() &&
-			(await this.ctx.sessionManager.setSessionName(name, "auto"))
-		) {
+		if (name && !this.ctx.sessionManager.getSessionName() && (await this.ctx.session.setSessionName(name, "auto"))) {
 			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 			this.ctx.updateEditorChrome();
 		}

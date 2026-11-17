@@ -9,7 +9,7 @@ import { logger, VERSION } from "@gajae-code/utils";
 import { handleCredentialsSetup } from "../src/cli/setup-cli";
 import { ProviderOnboardingSelectorComponent } from "../src/modes/components/provider-onboarding-selector";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import {
 	CREDENTIAL_AUTO_IMPORT_PERSISTENCE_WARNING,
 	CREDENTIAL_AUTO_IMPORT_REFRESH_WARNING,
@@ -27,13 +27,9 @@ import {
 import type { CredentialDiscoveryResult, DiscoveryOptions, ImportableCredential } from "../src/setup/credential-import";
 import * as credentialImport from "../src/setup/credential-import";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import { loadTestTheme } from "./helpers/test-theme";
 
-const testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+const testTheme = await loadTestTheme();
 
 function oauthCredential(overrides: Partial<ImportableCredential> = {}): ImportableCredential {
 	return {
@@ -870,7 +866,7 @@ describe("bare /login external credential import gate", () => {
 		},
 		stateStore?: CredentialAutoImportStateStore,
 	) {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const importCalls: string[] = [];
 		const refreshCalls: string[] = [];
 		const confirmMessages: Array<{ title: string; message: string }> = [];

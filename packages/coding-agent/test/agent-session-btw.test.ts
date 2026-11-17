@@ -13,10 +13,13 @@ import {
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { setShellFactoryForTests } from "@gajae-code/coding-agent/exec/bash-executor";
+import { IsolatedShell } from "@gajae-code/coding-agent/exec/isolated-shell";
 import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import {
 	BTW_HANDOFF_MESSAGE_TYPE,
@@ -26,6 +29,7 @@ import {
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, type TUI } from "@gajae-code/tui";
+import { drainMicrotasks } from "./helpers/microtasks";
 
 registerMockApi();
 const CONTROLLED_BTW_API = "controlled-btw-test";
@@ -131,15 +135,79 @@ function completeControlledStream(call: ControlledStreamCall, text: string): voi
 	emitControlledText(call, text);
 	finishControlledStream(call);
 }
-async function drainSyntheticStart(): Promise<void> {
-	// Include the queued async-generator yield, abort race, and cleanup reactions.
-	for (let i = 0; i < 50; i++) await Promise.resolve();
-}
-
 const sessions: AgentSession[] = [];
+
+it("idle close refuses a btw credential preflight", async () => {
+	const key = Promise.withResolvers<string>();
+	const { session } = createHarness({ getApiKey: () => key.promise });
+	const pending = session.runEphemeralTurn({
+		purpose: "btw",
+		turn: { question: "held", scope: session.createBtwConversationScope("test") },
+	});
+	try {
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		key.resolve("test-key");
+		await pending;
+	}
+});
+
+it("idle close refuses a running btw provider", async () => {
+	const controlled = createControlledStreamModel();
+	const { session } = createHarness({ model: controlled.model });
+	const pending = session.runEphemeralTurn({
+		purpose: "btw",
+		turn: { question: "held", scope: session.createBtwConversationScope("test") },
+	});
+	const call = await controlled.sideStarted;
+	try {
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		completeControlledStream(call, "done");
+		await pending;
+	}
+});
+
+it("idle close refuses a real foreground bash command", async () => {
+	const { session } = createHarness();
+	const entered = Promise.withResolvers<void>();
+	const pending = session.executeBash("printf started; sleep 30", chunk => {
+		if (chunk.includes("started")) entered.resolve();
+	});
+	await entered.promise;
+	try {
+		expect(session.isBashRunning).toBe(true);
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		session.abortBash();
+		await pending;
+	}
+});
+
+it("settles a foreground bash command when its worker exits before output", async () => {
+	if (process.platform === "win32") return;
+	const worker = [
+		"let input = '';",
+		"process.stdin.on('data', chunk => {",
+		"input += chunk;",
+		"for (const line of input.split('\\n').slice(0, -1)) {",
+		"const request = JSON.parse(line);",
+		"if (request.type === 'init') process.stdout.write(JSON.stringify({ type: 'ready', token: request.token }) + '\\n');",
+		"if (request.type === 'run') process.exit(1);",
+		"}",
+		"input = input.slice(input.lastIndexOf('\\n') + 1);",
+		"});",
+	].join(" ");
+	setShellFactoryForTests(options => new IsolatedShell(options, { workerArgv: [process.execPath, "-e", worker] }));
+	const { session } = createHarness();
+	await expect(session.executeBash("printf never-seen")).rejects.toThrow(
+		"Isolated shell worker exited with exit code 1",
+	);
+});
 
 afterEach(async () => {
 	vi.useRealTimers();
+	setShellFactoryForTests(undefined);
 	// Release fixture-owned readers/barriers even when an assertion failed before
 	// the normal release. Session disposal must join them, not release them for us.
 	for (const cleanup of controlledFixtureCleanup.splice(0)) cleanup();
@@ -158,6 +226,7 @@ interface HarnessOptions {
 	providerCacheSessionId?: string;
 	credentialSessionId?: string;
 	tools?: AgentTool[];
+	obfuscator?: SecretObfuscator;
 }
 
 function userMessage(text: string): UserMessage {
@@ -225,6 +294,7 @@ function createHarness(options: HarnessOptions = {}): {
 		providerSessionId: options.providerSessionId,
 		providerCacheSessionId: options.providerCacheSessionId,
 		credentialSessionId: options.credentialSessionId,
+		obfuscator: options.obfuscator,
 	});
 	sessions.push(session);
 	return { session, model, committed, live, getApiKey, sessionManager };
@@ -474,7 +544,7 @@ describe("AgentSession /btw isolation", () => {
 			turn: { question: "deadline", scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 		const sideCall = await controlled.sideStarted;
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 
 		try {
 			vi.advanceTimersByTime(BTW_STREAM_IDLE_TIMEOUT_MS - 1);
@@ -572,6 +642,191 @@ describe("AgentSession /btw isolation", () => {
 		expect(harness.model.calls).toHaveLength(0);
 	});
 
+	it("settles exact resolved credential binding before admitting any provider text", async () => {
+		const harness = createHarness({ getApiKey: async () => "resolved-derived-key" });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		controlledFixtureCleanup.push(() => release.resolve());
+		const order: string[] = [];
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "binding", scope: harness.session.createBtwConversationScope("test") },
+			async onProviderCredential(key) {
+				expect(key).toBe("resolved-derived-key");
+				expect(harness.model.calls).toHaveLength(0);
+				entered.resolve();
+				await release.promise;
+				order.push("bound");
+			},
+			onTextDelta: () => order.push("text"),
+		});
+		await entered.promise;
+		expect(harness.model.calls).toHaveLength(0);
+		release.resolve();
+		expect((await turn).replyText).toBe("side answer");
+		expect(harness.getApiKey).toHaveBeenCalledTimes(1);
+		expect(harness.model.calls[0]?.options?.apiKey).toBe("resolved-derived-key");
+		expect(order[0]).toBe("bound");
+		expect(order).toContain("text");
+	});
+
+	it("rejects credential binding failure before provider admission and permits a settled retry", async () => {
+		const harness = createHarness();
+		const scope = harness.session.createBtwConversationScope("test");
+		const error = new Error("private binding failure");
+		await expect(
+			harness.session.runEphemeralTurn({
+				purpose: "btw",
+				turn: { question: "reject", scope },
+				onProviderCredential: async () => {
+					throw error;
+				},
+			}),
+		).rejects.toBe(error);
+		expect(harness.model.calls).toHaveLength(0);
+		await harness.session.joinBtwTurnsForControl();
+		expect(
+			(await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "retry", scope } })).replyText,
+		).toBe("side answer");
+		expect(harness.getApiKey).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([
+		"abort",
+		"retire",
+		"release",
+	] as const)("rechecks %s from inside credential binding before provider admission", async action => {
+		const harness = createHarness();
+		const controller = new AbortController();
+		const scope = harness.session.createBtwConversationScope("test");
+		let retirement: Promise<boolean> | undefined;
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "reentrant", scope },
+			signal: controller.signal,
+			onProviderCredential() {
+				if (action === "abort") controller.abort(new Error("binding cancelled"));
+				else if (action === "retire") retirement = harness.session.clearContext();
+				else harness.session.releaseBtwConversationScope(scope);
+			},
+		});
+		await expect(turn).rejects.toThrow(
+			action === "abort" ? "binding cancelled" : action === "release" ? "scrubbed" : "retired",
+		);
+		await retirement;
+		await harness.session.joinBtwTurnsForControl();
+		expect(harness.model.calls).toHaveLength(0);
+	});
+
+	it("retains cancelled credential binding preflight until its actual settlement", async () => {
+		const harness = createHarness();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		controlledFixtureCleanup.push(() => release.resolve());
+		const controller = new AbortController();
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "held binding", scope: harness.session.createBtwConversationScope("test") },
+			signal: controller.signal,
+			async onProviderCredential() {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const rejected = turn.then(
+			() => {
+				throw new Error("Cancelled binding unexpectedly completed");
+			},
+			error => error,
+		);
+		await entered.promise;
+		controller.abort(new Error("cancel binding"));
+		const retirement = harness.session.clearContext();
+		let settled = false;
+		void retirement.then(() => {
+			settled = true;
+		});
+		await drainMicrotasks(50);
+		expect(settled).toBe(false);
+		expect(harness.model.calls).toHaveLength(0);
+		release.resolve();
+		expect(await rejected).toMatchObject({ message: "cancel binding" });
+		await retirement;
+		expect(settled).toBe(true);
+		expect(harness.model.calls).toHaveLength(0);
+	});
+
+	it("keeps unknown-effect binding preflight owned until late settlement without starting a provider", async () => {
+		const harness = createHarness();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		controlledFixtureCleanup.push(() => release.resolve());
+		const controller = new AbortController();
+		const scope = harness.session.createBtwConversationScope("test");
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "uncertain binding", scope },
+			signal: controller.signal,
+			async onProviderCredential() {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const rejected = turn.then(
+			() => {
+				throw new Error("Unsettled binding unexpectedly completed");
+			},
+			error => error,
+		);
+		await entered.promise;
+		vi.useFakeTimers();
+		controller.abort(new Error("cancel uncertain binding"));
+		await drainMicrotasks(50);
+		vi.advanceTimersByTime(5_000);
+		expect(await rejected).toMatchObject({ code: "unknown_effect" });
+		expect(() => harness.session.prepareCloseIfIdle()).toThrow("Session is not idle");
+		let joined = false;
+		const join = harness.session.joinBtwTurnsForControl().then(() => {
+			joined = true;
+		});
+		await drainMicrotasks(50);
+		expect(joined).toBe(false);
+		expect(harness.model.calls).toHaveLength(0);
+		release.resolve();
+		await join;
+		expect(joined).toBe(true);
+		expect(harness.model.calls).toHaveLength(0);
+		vi.useRealTimers();
+		expect(
+			(await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "settled retry", scope } }))
+				.replyText,
+		).toBe("side answer");
+	});
+
+	it.each([
+		"missing",
+		"reject",
+	] as const)("does not bind or admit provider when credential lookup is %s", async outcome => {
+		const harness = createHarness({
+			getApiKey: async () => {
+				if (outcome === "reject") throw new Error("lookup failed");
+				return "";
+			},
+		});
+		const binding = vi.fn();
+		await expect(
+			harness.session.runEphemeralTurn({
+				purpose: "btw",
+				turn: { question: "lookup failure", scope: harness.session.createBtwConversationScope("test") },
+				onProviderCredential: binding,
+			}),
+		).rejects.toThrow(outcome === "reject" ? "lookup failed" : "No API key");
+		await harness.session.joinBtwTurnsForControl();
+		expect(binding).not.toHaveBeenCalled();
+		expect(harness.model.calls).toHaveLength(0);
+		expect(harness.getApiKey).toHaveBeenCalledTimes(1);
+	});
+
 	it("checks cancellation after credential lookup", async () => {
 		const key = Promise.withResolvers<string>();
 		controlledFixtureCleanup.push(() => key.resolve("test-key"));
@@ -582,6 +837,9 @@ describe("AgentSession /btw isolation", () => {
 			turn: {
 				question: "cancel during credentials",
 				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
+			onProviderCredential: () => {
+				throw new Error("Cancelled lookup must not bind a key");
 			},
 			signal: controller.signal,
 		});
@@ -671,7 +929,7 @@ describe("AgentSession /btw isolation", () => {
 		void disposal?.then(() => {
 			disposed = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(disposal).toBeDefined();
 		expect(disposed).toBe(false);
 		expect(harness.model.calls).toHaveLength(0);
@@ -702,7 +960,7 @@ describe("AgentSession /btw isolation", () => {
 		void transition.then(() => {
 			retired = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(retired).toBe(false);
 		key.resolve("late-key");
 		await expect(turn).rejects.toThrow("retired");
@@ -735,7 +993,7 @@ describe("AgentSession /btw isolation", () => {
 		);
 		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		const transition = harness.session.clearContext();
 		try {
 			expect(call.options?.signal?.aborted).toBe(true);
@@ -796,7 +1054,7 @@ describe("AgentSession /btw isolation", () => {
 				const call = await controlled.sideStarted;
 				let transition: Promise<unknown> | undefined;
 				try {
-					await drainSyntheticStart();
+					await drainMicrotasks(50);
 					vi.useFakeTimers();
 					transition =
 						transitionKind === "clear" ? harness.session.clearContext() : harness.session.navigateTree(targetId);
@@ -819,7 +1077,7 @@ describe("AgentSession /btw isolation", () => {
 					);
 					void transitionRejected.catch(() => {});
 					expect(call.options?.signal?.aborted).toBe(true);
-					await drainSyntheticStart();
+					await drainMicrotasks(50);
 					expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 					expect(transitionSettled).toBe(false);
 					expect(harness.sessionManager.getLeafId()).toBe(leafId);
@@ -839,19 +1097,24 @@ describe("AgentSession /btw isolation", () => {
 					expect(harness.session.providerSessionState).toBe(providerState);
 					// A failed precommit released admission without retiring valid scopes.
 					expect(harness.session.createBtwConversationScope("lease released").messages).toEqual(scope.messages);
+					const lookups = harness.getApiKey.mock.calls.length;
 					harness.getApiKey.mockImplementationOnce(async () => {
 						throw new Error("existing scope reached credentials");
 					});
-					await expect(
-						harness.session.runEphemeralTurn({
-							purpose: "btw",
-							turn: { question: "existing scope", scope },
-						}),
-					).rejects.toThrow("existing scope reached credentials");
+					const retry = harness.session.runEphemeralTurn({
+						purpose: "btw",
+						turn: { question: "existing scope", scope },
+					});
+					if (cleanupOutcome === "rejection") {
+						// Valid history authority is not permission to reuse an owner whose
+						// actual cleanup rejected. The existing same-identity poison wins.
+						await expect(retry).rejects.toMatchObject({ code: "unknown_effect" });
+						expect(harness.getApiKey).toHaveBeenCalledTimes(lookups);
+					} else await expect(retry).rejects.toThrow("existing scope reached credentials");
 					// Exercise the restored public event bridge without opening another provider.
 					const event = { type: "message_start" as const, message: userMessage("predecessor bridge probe") };
 					harness.session.agent.emitExternalEvent(event);
-					await drainSyntheticStart();
+					await drainMicrotasks(50);
 					expect(listener).toHaveBeenCalledWith(event);
 					if (cleanupOutcome === "deadline") {
 						let idle = false;
@@ -859,7 +1122,7 @@ describe("AgentSession /btw isolation", () => {
 							idle = true;
 						});
 						void idleWait.catch(() => {});
-						await drainSyntheticStart();
+						await drainMicrotasks(50);
 						expect(idle).toBe(false);
 						release.resolve();
 						completeControlledStream(call, "late precommit bytes");
@@ -922,7 +1185,7 @@ describe("AgentSession /btw isolation", () => {
 		let handoffFailure: Promise<unknown> | undefined;
 		let generatedCall: ControlledStreamCall | undefined;
 		try {
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			handoff = harness.session.handoff();
 			handoffFailure = handoff.then(
 				() => {
@@ -943,7 +1206,7 @@ describe("AgentSession /btw isolation", () => {
 			generatedCall = await controlled.mainStarted;
 			const handoffText = "## Goal\nKeep the generated document available for copy/retry.";
 			completeControlledStream(generatedCall, handoffText);
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 			expect(settled).toBe(false);
 			expect(harness.sessionManager.getLeafId()).toBe(leafId);
@@ -1001,7 +1264,7 @@ describe("AgentSession /btw isolation", () => {
 		});
 		const call = await controlled.sideStarted;
 		completeControlledStream(call, "complete but not closed");
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 		let completed = false;
 		let idle = false;
@@ -1014,7 +1277,7 @@ describe("AgentSession /btw isolation", () => {
 		const idleWait = harness.session.waitForIdle().then(() => {
 			idle = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(completed).toBe(false);
 		expect(idle).toBe(false);
 		release.resolve();
@@ -1061,7 +1324,7 @@ describe("AgentSession /btw isolation", () => {
 			},
 		);
 		void incomplete.catch(() => {});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(10);
 		await incomplete;
@@ -1069,7 +1332,7 @@ describe("AgentSession /btw isolation", () => {
 		const completion = harness.session.awaitDisposeCompletion().then(() => {
 			disposed = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(disposed).toBe(false);
 		expect(call.options?.signal?.aborted).toBe(true);
 		release.resolve();
@@ -1106,7 +1369,7 @@ describe("AgentSession /btw isolation", () => {
 		const call = await controlled.sideStarted;
 		let completion: Promise<void> | undefined;
 		try {
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			harness.session.setDisposeTimeoutForTests(10);
 			vi.useFakeTimers();
 			completion = harness.session.awaitDisposeCompletion();
@@ -1131,11 +1394,11 @@ describe("AgentSession /btw isolation", () => {
 				},
 			);
 			void incomplete.catch(() => {});
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 			vi.advanceTimersByTime(10);
 			await incomplete;
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			expect(settled).toBe(false);
 			expect(harness.session.awaitDisposeCompletion()).toBe(completion);
 			expect(call.options?.signal?.aborted).toBe(true);
@@ -1176,10 +1439,10 @@ describe("AgentSession /btw isolation", () => {
 		);
 		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		vi.useFakeTimers();
 		controller.abort(new Error("cancel side"));
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(5_000);
 		await rejected;
@@ -1187,7 +1450,7 @@ describe("AgentSession /btw isolation", () => {
 		const idleWait = harness.session.waitForIdle().then(() => {
 			idle = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(idle).toBe(false);
 		completeControlledStream(call, "late private bytes");
 		await idleWait;
@@ -1463,5 +1726,99 @@ describe("AgentSession /btw isolation", () => {
 		await Bun.sleep(5);
 		expect(controlled.calls).toHaveLength(1);
 		expectNoHandoffRecorded(harness);
+	});
+
+	it("projects typed tool status into the frozen scope without touching main state or exposing tool payloads", async () => {
+		let dispatchedContext: Context | undefined;
+		const model = createMockModel({
+			handler: context => {
+				dispatchedContext = structuredClone(context);
+				return { content: ["side answer"] };
+			},
+		});
+		const harness = createHarness({ model });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "call-status",
+			name: "read",
+			arguments: { path: "src/status.ts" },
+		};
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [{ type: "text", text: "checking the file" }, toolCall],
+			stopReason: "toolUse",
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-status",
+			toolName: "read",
+			content: [{ type: "text", text: "FAKE 999 lines, 9999 bytes PRIVATE_TOOL_OUTPUT" }],
+			isError: false,
+			timestamp: 1,
+		});
+		const mainMessagesBefore = structuredClone(harness.session.agent.state.messages);
+		const committedEntriesBefore = structuredClone(harness.sessionManager.getEntries());
+		const providerStateBefore = harness.session.providerSessionState;
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "what happened?", scope } });
+
+		expect(scope.messages).toContainEqual({
+			role: "assistant",
+			text: "checking the file\n[tool] read src/status.ts: ok",
+		});
+		const call = harness.model.calls[0];
+		const payload = JSON.stringify(dispatchedContext?.messages);
+		expect(payload).toContain("[tool] read src/status.ts: ok");
+		expect(payload).not.toContain("PRIVATE_TOOL_OUTPUT");
+		expect(payload).not.toContain("999 lines");
+		expect(call?.context.tools).toEqual([]);
+		expect(call?.options?.toolChoice).toBe("none");
+		expect(harness.sessionManager.getEntries()).toEqual(committedEntriesBefore);
+		expect(harness.session.agent.state.messages).toEqual(mainMessagesBefore);
+		expect(harness.session.providerSessionState).toBe(providerStateBefore);
+	});
+
+	it("sanitizes tool status with the session's active secret set before budgeting the line", async () => {
+		const canary = "GJCCANARY-BTW-SESSION-5c1e8a40-VALUE";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: canary }], new Uint8Array(32).fill(5));
+		const placeholder = obfuscator.obfuscate(canary);
+		expect(placeholder).not.toBe(canary);
+		const harness = createHarness({ obfuscator });
+		// The canary starts ten characters before the 188-byte head cut of the raw line.
+		const offset = 188 - "[tool] read ".length - 10;
+		const path = `${"x".repeat(offset)}${canary}${"y".repeat(30)}`;
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [
+				{ type: "toolCall", id: "call-secret", name: "read", arguments: { path } },
+				{ type: "toolCall", id: "call-bash", name: "bash", arguments: { command: `${canary} --flag` } },
+			],
+			stopReason: "toolUse",
+		});
+		for (const [id, name] of [
+			["call-secret", "read"],
+			["call-bash", "bash"],
+		] as const) {
+			harness.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: id,
+				toolName: name,
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: 1,
+			});
+		}
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		const projected = JSON.stringify(scope.messages);
+		for (let size = canary.length; size >= 6; size--) {
+			for (let start = 0; start + size <= canary.length; start++) {
+				const window = canary.slice(start, start + size);
+				expect(projected.split(placeholder).join("")).not.toContain(window);
+			}
+		}
+		expect(projected).toContain("[tool] bash ");
+		expect(projected).toContain(placeholder);
 	});
 });

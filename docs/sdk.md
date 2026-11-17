@@ -11,6 +11,47 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Secure-local provider authorization
+
+Trusted local Router attachments use `auth.providers.status`, `auth.status`, `auth.start/read/answer/cancel` and `auth.apiKey.store`. SDK-owned provider flows retain their slot through actual settlement; cancellation is not credential rollback. Saved credentials and catalog refresh are reported separately. Sensitive replies never enter generic observers or replay retention. An independent user-owned authority signs exact frames for the actual receiving connection with bounded expiry and single-use replay checks; an endpoint token is not an authority grant. Sensitive advertisement requires `secureLocalAuthorityAvailable: true`; omitted or false authority evidence excludes these operations, while ordinary hosting remains available. Invalid and replayed grants remain prohibited; a valid grant refused because the bounded replay fence is full returns `unavailable` and can be retried after live proofs expire. Ordinary native command-result notifications remain observable, but SDK replies, including wrapped and late duplicates, remain private. Managed adapters remain prohibited from these operations.
+
+Authority storage retains POSIX mode/UID checks on POSIX systems. On Windows, identity-fenced native ACL checks require a protected current-process-SID-only DACL with the native trusted-owner policy (current SID or BUILTIN Administrators). A trusted shared SDK directory and each new empty temporary key are secured before secret bytes are written; an existing authority key is verified, never repaired or replaced. Missing ACL or descriptor-identity evidence fails closed without a mode-bit fallback. These local storage guarantees do not authenticate remote adapters or make same-user/privileged filesystem races safe.
+
+After a lost `auth.start` reply, an application granted `auth.status` can recover the requested provider's retained session flow through `flow: {flowId,status,providerSettled}`. This is session-wide operator metadata, not an initiating-client receipt, an ownership token, or a promise that retrying `auth.start` is idempotent. It never includes URLs, challenges, prompts, answers or credentials; `auth.providers.status` remains inventory-only. Reading presentation, answering and cancelling still require their own separately granted operations. `providerSettled:false` can accompany a cancelled or timed-out flow: no new enrollment may take its slot until the actual provider task settles. Superseding the retained flow or retiring its exact-session service invalidates the old recovery selector.
+
+## Managed user Bash and Python operators
+
+`operator.execute({text})` accepts `!`/`!!` Bash or `$`/`$$` Python immediately and returns an exact execution ID. Doubled prefixes exclude output from main context. `operator.read({operationId,cursor?})` provides bounded output and streamed cursor deltas; snapshots advertise `controls.cancel` only while that exact operation still owns cancellable admission. `operator.cancel` uses an invocation-owned signal and stays nonterminal until the native executor actually settles; unrelated work is not cancelled. Admitted Python completion survives identity-preserving maintenance while successor/history fences remain intact. No permanently effectless `operator.background` operation is installed. The existing real `bash.background` still folds the current managed foreground tool; direct user operators do not claim that capability.
+
+## Owner-scoped activity and MCP resources
+
+Trusted factory bindings install activity and MCP operations independently only when the corresponding resource exists. `activity.snapshot/detail` return opaque exact-generation targets and supported per-row capabilities for owned jobs, tasks and cron schedules. `activity.cancel/pause/resume/delete` invoke existing resource control paths. `activity.acknowledge` requires a single-use snapshot reference and its captured failure revision; changed or unseen failures cannot be cleared. `mcp.snapshot/suspend/resume/reconnect` use the session's exact manager/configuration generation and existing native admission/cleanup. No raw manager handle or remote configuration is accepted. `cleanup:not_certified` never certifies remote-process cleanup or publication settlement.
+
+## Frozen-context side conversations
+
+`btw.open`, `btw.submit`, `btw.read`, `btw.cancel` and `btw.close` own a frozen native model/context scope and completed private conversation history without adding turns to the main transcript. Public questions, history, final replies and streamed deltas are credential/path-redacted before retention; safe deltas may buffer unfinished sensitive tokens instead of preserving provider chunk boundaries. Before each question admission, a fresh storage-only credential snapshot augments the original and prior-turn protected values, so supported credential rotations do not expose new or previously used keys. Snapshot failure rejects admission before retaining a public question or starting provider work. Opening snapshots storage without resolving a provider key or refreshing OAuth; reads perform neither credential lookups nor provider work. After the native executor's existing key resolution (including OAuth refresh or derived/non-stored keys), a trusted in-process binding adds the exact resolved key and any canonical structured-key token before any provider stream or final text can be retained publicly. This binding is never serialized or exposed as client authority; failed or cancelled binding cannot start a provider, and actual preflight settlement remains owned by the native turn. Retention is bounded to 256 chunks / 32,768 UTF-16 units with opaque cursor recovery. Exact cancellation and retirement retain admission until the actual provider iterator joins. Turns report `cleanup:"pending"|"settled"|"unknown_effect"`; uncertified cleanup reports `status:"unknown_effect"` and poisons same-identity retries across controller recreation. Identity-preserving compaction does not discard admitted completion or clear poison. Existing stateless `btw.ask` remains unchanged.
+
+## Bounded frozen working-tree diffs
+
+NUL-delimited status paths are validated from bounded raw bytes, including both rename endpoints. Invalid UTF-8 rows are withheld with empty bodies and never used as filesystem/Git arguments; valid replacement-character filenames and neighboring rows remain readable with independent frozen UUID refs. The exact case-insensitive `secrets.json` component is sensitive; `secrets.json.txt` is not.
+
+`diff.scopes({})` exposes only the working-tree scope; `diff.summary({scope:"working-tree"})` freezes staged, unstaged and untracked rows and returns opaque references for `diff.file({ref})`. Legacy Q06–Q08 use the same SDK-owned reader. Admission remains owned until the actual Git/read subprocess settles, including cancellation and service retirement. Limits are 100 files, 32,000 UTF-8 bytes per patch, 1 MiB response, 4 MiB command output, 16 MiB raw reads and a 10-second deadline. Stored credentials are redacted before truncation; sensitive files, escaping paths and symlink bodies are withheld, and external drivers/textconv are disabled. Generic secret detection remains best effort. No branch/range scope or submodule-content traversal is advertised; dirty-submodule-only markers may be omitted.
+## Scoped model and configuration preferences
+
+Through the session Router, `model.roles.get` observes configured/effective task roles, `model.role.set` sets or clears a session-owned role, and `model.select` / `model.profile.select` select native session or global defaults. `config.write` supports session, global and project scopes. Project writes report `applied:false, application:"next-session"`; publication is not an engine reload. Session overrides retire only while their exact ownership token remains intact, preserving newer foreign writes. An indeterminate atomic durable write reports redacted `durability:"unknown", application:"recovery-required"`, not a definite failure or successful application. Existing `model.set` and `config.patch` retain their contracts.
+## Session-local control lifetime
+
+Use fresh controls after native transition settlement; previously returned views and opaque references remain retired. SDK invalidation never vetoes native cwd moves or session-transition cleanup. Cached control views renew after context clear, authorized native cwd/transcript moves, or committed native logical-session cleanup, including cold forks. Before-move callbacks retire old views; fresh controls remain retryably unavailable until the native exclusive writer and all callbacks settle. Only actual native commit or restored-predecessor abort evidence authorizes a new relocation checkpoint, never the cwd counter alone. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later cleanup. Canonical native logical-session cleanup can establish a new binding after native settlement; generation changes alone cannot authorize identity changes. Native precommit reentry remains rejected before nested move/abort callbacks. Existing factory-resource ownership and native executor/unknown-effect cleanup admission barriers remain unchanged; view retirement and relocation grant no new capabilities.
+
+Side open/submit preserve typed native `unknown_effect` and `redaction_failed` errors and explicit safe availability failures. Arbitrary dependency messages, including known-error phrases or forged code fields, remain generic `internal` failures. Cancel/close and Q46/streaming contracts are unchanged.
+The full `diff.scopes`/`diff.summary`/`diff.file` family is prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI; Q47 metadata is intentionally grouped, not a claimed path leak. Native full-working-tree observations retain explicit truncation. Legacy Q06–Q08 remain generic-safe and use the same engine's tracked-unstaged selection before body reads, reject incomplete snapshots with `diff_too_large`, and contain credential-store failures behind fixed `git_failure` diagnostics.
+
+## Same-session prompt revisions and exact-entry forks
+
+`SessionLifecycleService.revise` uses actor-scoped request keys and Broker lifecycle authority, never direct endpoint control authority. An edit selects a persisted user `entryId` in the active branch and submits replacement `body` and optional validated canonical `images` through the native prompt engine; image-only edits are supported. Sibling history and session identity remain intact. `action:"select"` accepts only `sessionId` and an answered user `entryId`, navigating to that retained revision's remembered continuation without provider work. Selection returns `selected:true, status:"selected", leafEntryId`; completed edits return the accepted replacement/assistant entry IDs. Concurrent identity/history advancement, busy work and cancellation are explicitly fenced. `session.fork` remains a separate new-session operation: omitted `sourceEntryId` copies the current branch, null forks the root, and an exact string copies inclusive ancestry through that entry.
+
+
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:
@@ -26,6 +67,39 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 `control|query|global` hatch. The CLI resolves the exact attachment through SDK
 core and emits credential-free JSON on success. Add `--json` explicitly for
 machine failures; default ordinary failures are text on stderr, not JSON stdout.
+
+### ACP temporary sessions
+
+ACP clients can request an in-memory conversation with `session/new` metadata
+`{"_meta":{"gjc":{"ephemeral":true}}}` alongside the usual `cwd` and `mcpServers`.
+First require `initialize` response `_meta.gjc.ephemeralSessions === true`; older
+ACP servers can ignore unknown metadata, so clients must not send a temporary
+request to a server that does not explicitly advertise this extension.
+
+The adapter additionally checks broker support on the same connection before
+creation. Unsupported brokers or unverified custom host commands fail with
+`ephemeral_unsupported`; there is no fallback to a saved session. Omitted or
+false metadata retains ordinary creation, and non-boolean values are rejected.
+
+Temporary sessions keep their transcript in memory, are excluded from session
+list results, and cannot be publicly loaded or resumed, even while attached.
+This includes `session.list` with `resolveSessionId` and `sdk serve --session <id>`;
+no request field can opt into discovering or attaching a temporary session.
+The creating client can continue prompting and close the session normally.
+This is a transcript persistence guarantee, not a guarantee of zero disk
+activity: lifecycle/index metadata, tool-created files, and provider-side logs
+are outside it.
+
+**Recovery and error handling.** Initial attachment works for temporary sessions.
+Internal transport recovery is allowed: after a transient network or connection drop,
+the ACP agent that created the temporary session may reattach using its in-process
+Router and attachment state, with no session.list lookup and no wire-visible flag.
+If reattachment is impossible (host gone, or agent has no in-process state),
+recovery fails with a typed `ephemeral_session_unrecoverable` error. This error is
+delivered to any waiting prompt and to idle sessions when they receive a new prompt.
+An earlier transport teardown must not replace this error with `connection_closed`.
+Public APIs (session.list, load, resume, serve --session) must never expose
+a temporary session, even during recovery.
 
 ### External permission approvals
 
@@ -358,6 +432,11 @@ models without provider-specific metadata:
   is rejected) rather than being silently shadowed. Q27 (`models.profiles.list`)
   remains the full profile catalog with explicit `available` status; Q10 is the
   availability-aware facade for client selection.
+`config.patch` rejects `modelProfile.default` and the internal
+`modelProfile.ownership` record before writing any part of the patch. Use the
+profile-selection controls instead: the default projection and its versioned
+owner must be committed together, not patched independently.
+
 `config.patch` mutations are serialized through the same session admission
 boundary as profile activation and default-model selection, so a patch racing
 a synthetic `gajae-code/*` selection (or another patch) is applied in a
@@ -577,10 +656,24 @@ ACP's public contract remains `session/prompt` with `ContentBlock.image`
 (`type: "image"`, base64 `data`, and `mimeType`), negotiated through
 `agentCapabilities.promptCapabilities.image`. See the pinned
 `@agentclientprotocol/sdk` schema and the upstream [content specification](https://agentclientprotocol.com/protocol/content).
-That capability does not advertise `turn.image.*` or `stagedImages`. This SDK
-foundation does **not** change ACP's existing oversized-prompt rejection; a separate
-ACP consumer must bridge standard inline images to staging internally and retain
-the public schema, cancellation, and capability semantics.
+That capability does not advertise `turn.image.*` or `stagedImages`, and the generic
+`_gjc/sdk/control` passthrough keeps refusing them. When a prompt's inline images would
+push the `turn.prompt` frame past 256 KiB, the ACP agent itself stages each image through
+`turn.image.*` (96 KiB chunks, `batchId` = the prompt's `clientRef`) during prompt
+preflight and sends `stagedImages` instead. Images that fit stay inline. Only the
+text-only frame is still bound by the cap: oversized prompt text is rejected before
+dispatch. A cancel, watchdog expiry or staging failure before dispatch discards every
+staged ID, and a definitive `turn.prompt` rejection discards the IDs it was handed.
+
+A turn an ACP client submits through the generic `_gjc/sdk/control` passthrough
+(`turn.prompt`, `turn.follow_up`, `turn.abort_and_prompt`, `skill.invoke`) is owned by
+that client's SDK connection, so the bus sends the turn's frames to it correlated to the
+control response's `commandId`/`turnId`. No `session/prompt` owns that turn, so the ACP
+agent publishes its output as `session/update` notifications until the turn's terminal.
+The agent holds correlated frames that arrive while the control response is in flight
+and publishes them in order once the response names the turn. A replacement that was
+queued as a steer starts no turn of its own. Correlated output of turns the client did
+not submit, and of prompts it cancelled, stays unpublished.
 
 ### Cancellation outcomes and inactivity limits
 
@@ -777,6 +870,112 @@ cursor contract and returns `error.code: "cursor_expired"` with
 `error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
 cross-query or selector mismatches return `invalid_input`.
 
+## Ordinary interactive asks (Q34 / C06)
+
+`ask.requests.list` (`Q34`, new after 0.19.3) lists pending ordinary **attended
+TUI** asks. `ask.answer` (`C06`) answers exactly one listed interaction. Use the
+Router-issued attachment's existing query/control methods; no terminal parsing,
+PTY input, private-registry access, or workflow-gate synthesis is needed.
+`workflow.gates.list` and headless workflow-gate routing are unchanged. An empty
+ask page does not imply that no workflow gate is pending.
+
+Session query request (inside the existing attachment envelope):
+
+```json
+{ "type": "query_request", "id": "q1", "query": "ask.requests.list", "input": {} }
+```
+
+The response uses the normal bounded, revisioned query page and continuation
+cursor contract. Input fields are not accepted. Each item includes `id` (opaque,
+single-use interaction identity), required `questionId` (opaque logical question
+identity), `sessionId`, `question`, `options` (exact answer values),
+`interaction` (`selector`, `custom_editor`, or `clarification_editor`),
+`controls`, and `answerSchema` (JSON Schema for the **answer**, not the envelope).
+Optional state includes `multi`, `selectedOptions`, `recommendedIndex`,
+`timeoutMs`, `transitionCount` (trailing synthetic Other/clarification options),
+and `editor: { title, prefill }`. `prefill` is initial editor content, not a live
+stream of unsubmitted terminal keystrokes. Example response:
+
+```json
+{
+  "id": "q1", "ok": true,
+  "page": {
+    "items": [{
+      "id": "opaque-request-id", "questionId": "opaque-question-id", "sessionId": "session-id",
+      "question": "Which color?", "options": ["Red", "Blue", "Other (type your own)"],
+      "interaction": "selector", "multi": false, "selectedOptions": [],
+      "transitionCount": 1, "controls": [],
+      "answerSchema": { "oneOf": [{
+        "type": "object", "additionalProperties": false, "required": ["kind", "value"],
+        "properties": { "kind": { "const": "value" }, "value": {
+          "type": "string", "enum": ["Red", "Blue", "Other (type your own)"]
+        } }
+      }] }
+    }],
+    "complete": true, "revision": "opaque-revision"
+  }
+}
+```
+
+Answer with an exact listed option, editor text, or enabled typed control:
+
+```json
+{ "type": "control_request", "id": "a1", "operation": "ask.answer",
+  "input": { "id": "opaque-request-id", "answer": { "kind": "value", "value": "Blue" } } }
+```
+
+The only other answer shape is
+`{ "kind": "control", "controlId": "navigation_forward" }`, and only when that
+control is listed and enabled. Multi-select values **toggle one option**; query
+again after each toggle, then use the enabled Next/Done control. Select Other
+or clarification by its exact published value, re-query for the new editor ID,
+then submit non-whitespace text. Entering or leaving the terminal's inline
+editor also rotates the public ID. Never reuse an ID across transitions.
+`questionId` stays stable across toggles, selector/editor/back transitions, and
+revisiting a question within the same invocation. It is minted once per logical
+question per tool execution, so different questions or later tool calls have
+different identities even when their text and author-supplied question IDs match.
+Use `(sessionId, questionId)` to identify a desktop question card and `id` to bind
+an answer to its current interaction. Do not derive either ID from question text.
+
+`ask.answer` waits for the existing AskTool receipt settlement, not just queue
+acceptance. Its response is:
+
+```json
+{ "id": "a1", "ok": true, "result": {
+  "id": "opaque-request-id", "sessionId": "session-id", "settlement": { "kind": "commit" }
+} }
+```
+
+`settlement` can instead be `{ "kind": "resolve_without_commit", "reason": ... }`
+(for example `toggle`, `other_transition`, `clarification_transition`,
+`clarification_submitted`, `empty_navigation`, `aborted`, or `shutdown`) or
+`{ "kind": "invalid", "reason": ... }` when AskTool rejects the submitted
+response under its existing semantic limits. Only `commit` means an answer was
+committed. An SDK receipt does not fabricate a notification-delivery acknowledgement.
+
+Malformed envelopes, unsupported values/controls, extra answer keys, and blank
+editor text return `error.code: "invalid_input"` without consuming the request.
+Unknown, wrong-session, already claimed, completed, or transitioned IDs return
+`"stale_request"`. The control's session comes from its attachment, not a
+caller-supplied session ID. The first valid remote submission claims the ID
+atomically, but a local answer already winning the race can still cause its
+settlement to be `resolve_without_commit/aborted`. Re-query after stale replies
+or uncertain transport outcomes rather than replaying a consumed ID.
+Local renderer rejection also settles a losing submitted SDK receipt without
+commit, including rejection and SDK submission in the same synchronous tick.
+Cancellation and shutdown actively end the wait even when a renderer does not
+reject its promise on abort; shutdown fences already submitted remote replies.
+
+Query pages are snapshots, not leases: continued pages may contain IDs that
+have since become stale. Poll with a fresh query for live state. Local answers,
+notification answers, SDK answers, cancellation, timeout, and session teardown
+remove pending rows; local/remote races use the same AskTool receipt lifecycle
+and cannot both commit. Observation and attachment do not replace terminal or
+notification answer sources, and disconnecting an observing app does not
+cancel the terminal's question. This source change is not an installed-CLI fix
+until a containing release is installed; 0.19.3 does not expose Q34.
+
 ## Project progress snapshot (Q32)
 
 `Q32` / `session.progress` returns one read-only snapshot of the session's
@@ -924,6 +1123,34 @@ const outcome = await lifecycleService.close({
 current endpoint and its incarnation. Do not reconstruct the authority from
 endpoint credentials, process metadata, or a later session lookup; a
 replacement may become current between capture and close.
+
+For idle-only retirement, pass `target: { ...authority, ifIdle: true }` (or
+`ifIdle: true` in the broker `session.close` input). This is independent of the
+endpoint identity fence. The runtime synchronously checks its own turn,
+prompt-queue, continuation, foreground bash, side-question and owned async-job
+state, including side-turn credential preflight, then closes prompt admission
+through disposal. New prompts, completion/continuation delivery, `/btw`, and
+IRC/background side turns are refused.
+If work is pending, the host stays running and returns `busy`, with lifecycle
+certainty `retryable`; retry the identical request and key once idle. No
+broker-side snapshot probes or signal fallback implement the idle check.
+Successful idle-fenced close retains the existing identity-checked teardown
+path, including spawn authority cleanup after the host exits. Ordinary close
+without `ifIdle` remains forced.
+Accepted-close teardown does not depend on delivering its response: dropped or
+rejected acknowledgements still lead to shutdown, while the caller receives an
+honest refused/uncertain result. An already-gone managed spawn substrate settles
+only after the exact generation/owner pin matches proven host exit; mismatches
+remain refused. Other spawn retirement paths retain their existing requirements.
+
+`busy` is not terminally replayed from the lifecycle ledger. `endpoint_stale`
+still is: close can report it on a post-dispatch generation recheck, including
+after shutdown escalation, so it is not a no-effect receipt. Re-resolve the
+endpoint authority and use a new request key for that refusal. The session CLI
+preserves `busy` and an unindexed target's `not_found` as definite public codes
+instead of collapsing them into `operation_failed`.
+The `not_found` no-effect proof applies only to ordinary close's unindexed-target
+check; generic lifecycle `not_found` failures keep unknown effect certainty.
 
 ### Exact generation reconciliation
 
@@ -1610,3 +1837,10 @@ at its readiness cutoff) counts as released once its exact proof reports it
 gone; a live or replaced substrate does not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
+
+## Composer and selected-session observations
+
+`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+
+`composer.complete` and raw `session.info` are prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI. Native SDK completion retains exact shared-provider file paths and replacements; captured cwd is not a filesystem sandbox. `composer.catalog` and legacy Q06–Q08 remain generic-safe.
+

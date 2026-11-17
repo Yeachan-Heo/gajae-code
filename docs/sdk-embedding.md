@@ -242,14 +242,31 @@ register `session.registerToolSessionCleanup(() => service.dispose())` as an
 idempotent safety net: cleanup runs after shutdown handlers, so it cannot unblock
 a handler waiting for an already-disconnected renderer.
 
-`result.jobObservation` lazily returns one stable view captured from the factory's
-actual background manager and agent owner, not the transcript session ID or the
-process-global manager. It is unavailable without a manager, or when first read
-after disposal. Snapshots filter jobs, task identities and cron schedules by owner.
+`result.jobObservation` lazily returns a view captured from the factory's actual
+background manager and agent owner, not the transcript session ID or the
+process-global manager. Repeated settled reads return the same view. A read during
+temporary maintenance retires the cached view without permanently revoking the
+unchanged owner; read the getter again after maintenance to obtain a fresh view
+only after the captured generation, session manager, session ID and control scope
+are revalidated. An ownership mismatch observed during maintenance remains
+invalid even if the old values are later restored; only a committed generation
+advance can authorize a new binding. Retired handles remain disposed and must not
+be reused. It is
+unavailable without a manager, or when first read after disposal. Snapshots filter
+jobs, task identities and cron schedules by owner.
 Monitor actions require observed generations; cron deletion requires observed
 `createdAt`. Folded work is read-only and terminal cancellation refuses with
 `already_terminal`. Session cleanup disposes an existing view; stale handles refuse
-work, and a manually disposed view is never silently recreated.
+work, and a manually disposed view is never silently recreated for that committed binding.
+
+### Operator shell cancellation
+
+`session.abortBash()` also covers a pending asynchronous `user_bash` hook.
+Cancellation or retired session ownership prevents fallback shell execution and
+publication of a later successful hook replacement. `isBashRunning` stays true
+until the actual hook/execution promise settles. Hooks are not forcibly stopped,
+their side effects are not undone, and hook errors still propagate after an abort;
+a cancellation request is not proof that extension work was cleaned up.
 
 ## Session manager behavior (persistent vs in-memory)
 
@@ -300,6 +317,23 @@ const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
 ## Model and auth wiring
 
 `createAgentSession()` uses `ModelRegistry` + `AuthStorage` for model selection and API key resolution.
+
+### Default model and profile selections
+
+Trusted in-process hosts select a profile with
+`session.setDefaultModelProfileForControl(name, { persistDefault: true })` for
+a durable default, or omit `persistDefault` for a session-only selection.
+Use `session.setDefaultModelSelection(model, thinkingLevel)` for a concrete
+durable default. Replacing a durable profile commits its materialized role
+assignments and cleared ownership together, before publishing the live model.
+A newer owner's commit is never overwritten by a stale selection or rollback.
+
+Do not patch `modelProfile.default` independently of `modelProfile.ownership`;
+SDK `config.patch` rejects both paths. Invalid persisted ownership remains an
+error rather than an inferred profile. If publication fails after an ownership
+commit, the durable winner is retained and the requesting session closes;
+reopen and inspect the committed state instead of retrying the old mutation.
+These are in-process controls, not additional transport mutation authority.
 
 ### Live session task-role selections
 

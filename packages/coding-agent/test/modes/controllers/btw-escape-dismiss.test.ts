@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, vi } from "bun:test";
+import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { CustomEditor } from "@gajae-code/coding-agent/modes/components/custom-editor";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
@@ -6,6 +6,7 @@ import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { Container, type TUI } from "@gajae-code/tui";
 import { setKittyProtocolActive } from "@gajae-code/tui/keys";
+import { drainMicrotasks } from "../../helpers/microtasks";
 
 beforeAll(async () => {
 	await initTheme();
@@ -13,20 +14,34 @@ beforeAll(async () => {
 
 const ESC = "\x1b";
 
+interface FakeScope {
+	messages: unknown[];
+	systemPrompt: string[];
+}
+
 interface Harness {
 	editor: CustomEditor;
 	btw: BtwController;
 	btwContainer: Container;
+	scope: FakeScope;
+	releaseBtwConversationScope: Mock<(scope: FakeScope) => void>;
 }
 
 function makeHarness(runEphemeralTurn: () => Promise<unknown>): Harness {
 	const editor = new CustomEditor(getEditorTheme());
 	const btwContainer = new Container();
 	const ui = { requestRender: vi.fn(), followLiveViewport: vi.fn(), onDebug: undefined } as unknown as TUI;
+	const scope: FakeScope = { messages: ["visible text"], systemPrompt: ["instruction"] };
+	// The real session splices the scope arrays and drops its provider-prefix state.
+	const releaseBtwConversationScope = vi.fn((released: FakeScope) => {
+		released.messages.splice(0);
+		released.systemPrompt.splice(0);
+	});
 	const session = {
 		model: { provider: "anthropic", id: "test" },
 		runEphemeralTurn,
-		createBtwConversationScope: vi.fn(() => ({ messages: [], systemPrompt: [] })),
+		createBtwConversationScope: vi.fn(() => scope),
+		releaseBtwConversationScope,
 		isStreaming: false,
 		isBashRunning: false,
 		isEvalRunning: false,
@@ -56,42 +71,45 @@ function makeHarness(runEphemeralTurn: () => Promise<unknown>): Harness {
 	} as unknown as InteractiveModeContext;
 
 	new InputController(ctx).setupKeyHandlers();
-	return { editor, btw, btwContainer };
+	return { editor, btw, btwContainer, scope, releaseBtwConversationScope };
 }
 
 const pending = () => new Promise<never>(() => {});
 
-async function drain(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
-}
-
 describe("btw panel Esc dismissal (issue #455)", () => {
 	it("dismisses a running btw panel on Esc", async () => {
-		const { editor, btw, btwContainer } = makeHarness(() => pending());
+		const { editor, btw, btwContainer, scope, releaseBtwConversationScope } = makeHarness(() => pending());
 		await btw.start("Why?");
 		expect(btw.hasActiveRequest()).toBe(true);
+		expect(releaseBtwConversationScope).not.toHaveBeenCalled();
 
 		editor.handleInput(ESC);
 
 		expect(btw.hasActiveRequest()).toBe(false);
 		expect(btwContainer.children).toHaveLength(0);
+		expect(releaseBtwConversationScope).toHaveBeenCalledTimes(1);
+		expect(releaseBtwConversationScope.mock.calls[0]?.[0]).toBe(scope);
+		expect(scope.messages).toEqual([]);
+		expect(scope.systemPrompt).toEqual([]);
 	});
 
 	it("dismisses a completed btw panel on Esc", async () => {
-		const { editor, btw, btwContainer } = makeHarness(async () => ({
+		const { editor, btw, btwContainer, scope, releaseBtwConversationScope } = makeHarness(async () => ({
 			replyText: "Answer",
 			assistantMessage: {},
 		}));
 		await btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(btw.hasActiveRequest()).toBe(true);
+		// A settled turn keeps the scope for follow-ups; only closing the panel releases it.
+		expect(releaseBtwConversationScope).not.toHaveBeenCalled();
 
 		editor.handleInput(ESC);
 
 		expect(btw.hasActiveRequest()).toBe(false);
 		expect(btwContainer.children).toHaveLength(0);
+		expect(releaseBtwConversationScope).toHaveBeenCalledTimes(1);
+		expect(releaseBtwConversationScope.mock.calls[0]?.[0]).toBe(scope);
 	});
 
 	it("dismisses an errored btw panel on Esc", async () => {
@@ -99,7 +117,7 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			throw new Error("boom");
 		});
 		await btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(btw.hasActiveRequest()).toBe(true);
 
 		editor.handleInput(ESC);
@@ -114,7 +132,7 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			assistantMessage: {},
 		}));
 		await completed.btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(completed.btw.hasOpenPanel()).toBe(true);
 		completed.editor.handleInput(ESC);
 		expect(completed.btw.hasOpenPanel()).toBe(false);
@@ -124,10 +142,12 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			throw new Error("boom");
 		});
 		await errored.btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(errored.btw.hasOpenPanel()).toBe(true);
 		errored.editor.handleInput(ESC);
 		expect(errored.btw.hasOpenPanel()).toBe(false);
+		expect(errored.releaseBtwConversationScope).toHaveBeenCalledTimes(1);
+		expect(errored.releaseBtwConversationScope.mock.calls[0]?.[0]).toBe(errored.scope);
 		expect(errored.btwContainer.children).toHaveLength(0);
 	});
 	it("dismisses under the kitty keyboard protocol encoding of Esc", async () => {
@@ -226,7 +246,7 @@ describe("queued /btw handoff on Esc queue restore", () => {
 		const input = new InputController(ctx);
 
 		await btw.start("Side question?");
-		await drain();
+		await drainMicrotasks();
 		await btw.handoff();
 		editor.setText("main draft");
 

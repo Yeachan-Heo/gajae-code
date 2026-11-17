@@ -13,12 +13,28 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
+import { isActivityControlOperation } from "../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
+import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
+
+import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
+import {
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
+	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
+} from "../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../sdk/operator-controls";
+
+import { isSdkPreferenceOperation } from "../sdk/preference-controls";
+import { reviseSession } from "../sdk/revision-controls";
+import { getSdkClientControlOperations, getSessionClientControls } from "../sdk/session-client-controls";
+import { isSideConversationOperation } from "../sdk/side-conversation";
 import type { AgentSession } from "../session/agent-session";
 import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
@@ -88,10 +104,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return send;
 			},
 			appendEntry: (customType, data) => {
-				session.sessionManager.appendCustomEntry(customType, data);
+				session.appendCustomEntryInBackground(customType, data);
 			},
 			setLabel: (targetId, label) => {
-				session.sessionManager.appendLabelChange(targetId, label);
+				session.appendLabelChangeInBackground(targetId, label);
 			},
 			getActiveTools: () => session.getActiveToolNames(),
 			getAllTools: () => session.getAllToolNames(),
@@ -116,7 +132,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 			getSessionName: () => session.sessionManager.getSessionName(),
 			setSessionName: async name => {
-				await session.sessionManager.setSessionName(name, "user");
+				await session.setSessionName(name, "user");
 			},
 		},
 		// ExtensionContextActions
@@ -209,8 +225,40 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			onSessionEvent: listener => session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(session),
 			sdkControl: async (operation, input) => {
+				if (isAuthorizationControlOperation(operation))
+					return getSessionClientControls(session).authorization.execute(operation, input);
+				if (operation === "auth.login")
+					return getSessionClientControls(session).authorization.execute("auth.start", input);
+				if (isSdkOperatorOperation(operation))
+					return getSessionClientControls(session).operator.dispatch(operation, input);
+				if (isActivityControlOperation(operation)) {
+					const activity = getSessionClientControls(session).activity;
+					if (!activity)
+						throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
+					return activity.control(operation, input);
+				}
+				if (isSideConversationOperation(operation))
+					return getSessionClientControls(session).side.control(operation, input);
+				if (isSdkComposerObservationOperation(operation))
+					return getSessionClientControls(session).composer.dispatch(operation, input);
+				if (isSdkDiffObservationOperation(operation))
+					return getSessionClientControls(session).diff.dispatch(operation, input);
+				if (isSdkPreferenceOperation(operation))
+					return getSessionClientControls(session).preferences.handle(operation, input);
+
 				switch (operation) {
+					case "session.revise": {
+						if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);
+						const { [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: _authority, ...request } = input;
+						return reviseSession(session, request);
+					}
+					case "session.close":
+						if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
+							return prohibitBrokerLifecycleOperation(operation);
+						session.prepareCloseIfIdle();
+						return { closing: true };
 					case "model.set": {
 						const selector = typeof input.id === "string" ? input.id : "";
 						const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;
@@ -268,21 +316,27 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 										session.credentialSessionId,
 									)
 								: undefined;
-						if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
-							throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
-								code: "invalid_input",
-							});
+						if (!model)
+							throw Object.assign(new Error("model.set requires a valid model id."), { code: "invalid_input" });
 						// Internal host hooks (never public SDK fields): the bus surface runs
 						// its Q13 config-shadow capture/reconcile inside this selection
 						// admission so a concurrent config.patch cannot race the snapshot.
-						return await session.setDefaultModelSelection(model, thinkingLevel, {
-							...(typeof input.onBeforeMutation === "function"
-								? { onBeforeMutation: input.onBeforeMutation as () => void }
-								: {}),
-							...(typeof input.onAfterMutation === "function"
-								? { onAfterMutation: input.onAfterMutation as () => void }
-								: {}),
-						});
+						const mutationHooks = {
+							onBeforeMutation:
+								typeof input.onBeforeMutation === "function"
+									? (input.onBeforeMutation as () => void)
+									: undefined,
+							onAfterMutation:
+								typeof input.onAfterMutation === "function" ? (input.onAfterMutation as () => void) : undefined,
+						};
+						// Without an explicit level this is the extension-equivalent selection, which
+						// admits itself; callers must not wrap it in another session admission.
+						if (!hasThinkingLevel) return { changed: await runExtensionSetModel(session, model, mutationHooks) };
+						if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+							throw Object.assign(new Error("model.set requires a concrete thinkingLevel."), {
+								code: "invalid_input",
+							});
+						return await session.setDefaultModelSelection(model, thinkingLevel, mutationHooks);
 					}
 					case "todo.replace": {
 						const phases = input.items;
@@ -331,6 +385,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { changed, mode: session.sdkPermissionMode };
 					}
 					case "bash.execute": {
+						if (getSessionClientControls(session).operator.isBusy())
+							throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 						if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 							throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 						const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });
@@ -395,7 +451,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						await session.reload();
 						return { reloaded: true };
 					case "service_tier.set":
-						session.setServiceTier(input.tier as never);
+						await session.setServiceTier(input.tier as never);
 						return { changed: true };
 					case "queue.message.remove": {
 						const removed = session.removeQueuedMessageForEditing(String(input.id));

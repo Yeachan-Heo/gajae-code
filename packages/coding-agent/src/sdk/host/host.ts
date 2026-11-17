@@ -1,9 +1,15 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
+import {
+	SecureLocalGrantReplayFence,
+	secureLocalFrameOperation,
+	verifySecureLocalFrame,
+} from "../secure-local-controls";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
-import { type EventFrame, SessionEventStream } from "./events";
+import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
+import { RESPONSE_CEILING_BYTES } from "./query/handlers";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
@@ -46,6 +52,8 @@ export type SessionActivationOutcome =
 export type SessionActivationGate = (input: { sessionId: string; generation: number }) => boolean | Promise<boolean>;
 
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
+	/** SDK-owned user-local authority, never endpoint discovery credentials or client claims. */
+	secureLocalAuthority?: string;
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	/** Supplies the durable transcript revision stamped on ordinary emitted events. */
@@ -63,13 +71,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 		response: SdkFrame,
 		sendTerminal: () => Promise<unknown>,
 	) => void | Promise<void>;
-	/** Runs only after a successful control response has been sent to the client. */
+	/** Runs after delivery. An accepted close runs even on a failed write, so teardown is inevitable. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
 	/**
 	 * Classifies the awaited control-response write exactly once: `written`
 	 * (sent), `rejected` (the write threw), or `dropped` (the send adapter
-	 * deliberately skipped delivery). `afterControlResponse` runs only
-	 * on `written`. Used to persist monotonic response-state transitions.
+	 * deliberately skipped delivery). Except for accepted session.close,
+	 * `afterControlResponse` runs only on `written`.
 	 */
 	onControlResponseDelivery?: (
 		connectionId: string,
@@ -144,6 +152,59 @@ const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
 	const requiredCapability = CAP_GATED_FRAME_KINDS.get(kind);
 	return requiredCapability === undefined || capabilities?.has(requiredCapability) === true;
+}
+
+interface EventReplayResult extends SdkFrame {
+	type: "event_replay_result";
+	id: string;
+	ok: true;
+	events: EventFrame[];
+	gap?: EventReplayGap;
+	generation: number;
+	lastSeq: number;
+}
+
+/**
+ * Fit one `event_replay_result` under the directed-frame ceiling of the
+ * transport that will carry it. Retention is bounded by event count, not bytes,
+ * so a few large retained events (an `agent_end` carries up to an eighth of the
+ * 1 MiB native ceiling in UTF-16 units of final text, several times that in
+ * UTF-8 bytes) can push the result over it; the native `sendTo` then rejects the
+ * whole result as `oversized_frame` and the client never completes its replay.
+ * Concede the oldest events the way count retention already does: a
+ * `sequence_gap` from the requested position through the last dropped event, or
+ * the generation reset the result already carries, which already mandates a
+ * resync. A transport that declares no ceiling never calls this and keeps every
+ * event.
+ */
+function boundEventReplayResult(
+	result: EventReplayResult,
+	sinceSeq: number,
+	resyncQueries: readonly string[],
+	ceilingBytes: number,
+): EventReplayResult {
+	const { events } = result;
+	let eventBytes: number[] | undefined;
+	const concede = (start: number): EventReplayResult => {
+		if (start === 0) return result;
+		const gap: EventReplayGap =
+			result.gap?.kind === "generation_reset"
+				? result.gap
+				: {
+						kind: "sequence_gap",
+						fromSeq: result.gap?.fromSeq ?? sinceSeq + 1,
+						toSeq: events[start - 1]!.seq,
+						resyncQueries: [...(result.gap?.resyncQueries ?? resyncQueries)],
+					};
+		return { ...result, events: events.slice(start), gap };
+	};
+	for (let start = 0; ; ) {
+		const candidate = concede(start);
+		let excess = Buffer.byteLength(JSON.stringify(candidate)) - ceilingBytes;
+		if (excess <= 0 || start === events.length) return candidate;
+		eventBytes ??= events.map(event => Buffer.byteLength(JSON.stringify(event)) + 1);
+		while (excess > 0 && start < events.length) excess -= eventBytes[start++]!;
+	}
 }
 
 /** Safe, identifier-free explanations for every refused activation status. */
@@ -245,6 +306,7 @@ export class SessionSdkHost {
 	readonly events: SessionEventStream;
 	readonly reverse: ReverseLeaseRuntime;
 	readonly #options: SessionSdkHostOptions;
+	readonly #secureLocalGrants = new SecureLocalGrantReplayFence();
 	#started = false;
 	#stopping = false;
 	#stopPromise?: Promise<"stopped">;
@@ -263,6 +325,9 @@ export class SessionSdkHost {
 	#generationReserved = true;
 
 	constructor(options: SessionSdkHostOptions) {
+		const ceilingBytes = options.directedFrameCeilingBytes;
+		if (ceilingBytes != null && !(Number.isSafeInteger(ceilingBytes) && ceilingBytes > 0))
+			throw new TypeError("directedFrameCeilingBytes must be a positive safe integer.");
 		this.#options = options;
 		this.events = new SessionEventStream({ revisionProvider: options.eventRevision });
 		this.reverse = new ReverseLeaseRuntime({
@@ -356,7 +421,7 @@ export class SessionSdkHost {
 				generation: this.events.generation,
 			});
 		const disposer = this.#options.onFrame((connectionId, frame) => {
-			this.#options.onFrameAdmitted?.(connectionId, frame);
+			if (!secureLocalFrameOperation(frame)) this.#options.onFrameAdmitted?.(connectionId, frame);
 			void this.#onFrame(connectionId, frame);
 		});
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;
@@ -586,7 +651,45 @@ export class SessionSdkHost {
 
 	async #onFrame(connectionId: string, frame: SdkFrame): Promise<void> {
 		try {
-			const admissionRejection = this.#options.onFrameAdmission?.(connectionId, frame);
+			if (frame.type === "query_request" && Object.hasOwn(frame, "operation")) {
+				await this.#send(connectionId, {
+					type: "query_response",
+					id: frame.id,
+					ok: false,
+					error: { code: "invalid_input", message: "Ambiguous query routing fields." },
+				});
+				return;
+			}
+			const sensitive = secureLocalFrameOperation(frame) !== undefined;
+			if (sensitive) {
+				const grant =
+					typeof connectionId === "string" &&
+					connectionId.length > 0 &&
+					frame.connectionId === connectionId &&
+					this.#options.secureLocalAuthority &&
+					verifySecureLocalFrame(this.#options.secureLocalAuthority, this.#options.token, frame)
+						? this.#secureLocalGrants.consume(frame)
+						: "rejected";
+				if (grant !== "accepted") {
+					await this.#send(connectionId, {
+						type: frame.type === "query_request" ? "query_response" : "control_response",
+						id: typeof frame.id === "string" ? frame.id : "",
+						ok: false,
+						error:
+							grant === "capacity"
+								? { code: "unavailable", message: "Too many recent secure-local SDK requests; retry later." }
+								: {
+										code: "operation_prohibited",
+										message: "This operation requires an exact secure-local SDK grant.",
+									},
+					});
+					return;
+				}
+			}
+			const admissionFrame = sensitive
+				? { type: frame.type, id: frame.id, operation: frame.operation, query: frame.query }
+				: frame;
+			const admissionRejection = this.#options.onFrameAdmission?.(connectionId, admissionFrame);
 			if (admissionRejection !== undefined) {
 				await this.#send(connectionId, admissionRejection);
 				return;
@@ -608,7 +711,7 @@ export class SessionSdkHost {
 					break;
 				}
 				case "control_request": {
-					this.#observeRequest("control", connectionId, frame);
+					if (!sensitive) this.#observeRequest("control", connectionId, frame);
 					// Deferred readiness withholds `session_ready`, but the control
 					// dispatcher was still reachable, so the pre-activation interval made
 					// activation optional for input admission. `session_activate` is a
@@ -628,6 +731,7 @@ export class SessionSdkHost {
 					const result = await this.#options.control?.(connectionId, frame);
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };
+						const acceptedClose = frame.operation === "session.close" && (result as { ok?: unknown }).ok === true;
 						let terminalSent = false;
 						let sendOutcome: "written" | "rejected" | "dropped" = "dropped";
 						const sendTerminal = async (): Promise<"written" | "rejected" | "dropped"> => {
@@ -645,7 +749,8 @@ export class SessionSdkHost {
 							return sendOutcome;
 						};
 						try {
-							await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+							if (!sensitive)
+								await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
 							// Fallback: if the before hook did not send early (identity
 							// rotation), the response is always sent here.
 							if (!terminalSent) sendOutcome = await sendTerminal();
@@ -654,7 +759,8 @@ export class SessionSdkHost {
 							// BEFORE the optional post-write hook, so a rejected/dropped
 							// write (or an afterControlResponse throw) never mislabels it.
 							try {
-								await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
+								if (!sensitive)
+									await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
 							} catch (error) {
 								// Contain observer persistence failures: the response was already
 								// sent (or classified) and its delivery state recorded; rethrowing
@@ -664,8 +770,11 @@ export class SessionSdkHost {
 									error: error instanceof Error ? error.message : String(error),
 								});
 							}
+							// Close acceptance has already fenced admission. Neither a lost
+							// response nor a failing pre-response hook may strand that host.
+							if (acceptedClose) await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
-						if (sendOutcome === "written") {
+						if (!sensitive && !acceptedClose && sendOutcome === "written") {
 							await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
 					}
@@ -714,7 +823,7 @@ export class SessionSdkHost {
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
 					const events = replay.events.filter(event => canDeliverSdkEvent(String(event.kind), capabilities));
-					await this.#send(connectionId, {
+					const result: EventReplayResult = {
 						type: "event_replay_result",
 						id,
 						ok: true,
@@ -722,11 +831,23 @@ export class SessionSdkHost {
 						events,
 						generation: this.events.generation,
 						lastSeq: this.events.sequence,
-					});
+					};
+					const ceilingBytes = this.#options.directedFrameCeilingBytes;
+					await this.#send(
+						connectionId,
+						ceilingBytes === null
+							? result
+							: boundEventReplayResult(
+									result,
+									sinceSeq,
+									this.events.resyncQueries,
+									ceilingBytes ?? RESPONSE_CEILING_BYTES,
+								),
+					);
 					break;
 				}
 				case "query_request": {
-					this.#observeRequest("query", connectionId, frame);
+					if (!sensitive) this.#observeRequest("query", connectionId, frame);
 					const result = await this.#options.query?.(connectionId, frame);
 					if (result !== undefined)
 						await this.#send(connectionId, { type: "query_response", ...(result as SdkFrame) });

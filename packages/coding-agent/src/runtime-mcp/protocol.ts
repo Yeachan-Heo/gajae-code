@@ -19,6 +19,8 @@
  * `Mcp-Method`, and `Mcp-Name` headers.
  */
 
+import { isRecord } from "@gajae-code/utils";
+
 // =============================================================================
 // Protocol versions and eras
 // =============================================================================
@@ -196,10 +198,6 @@ export interface XMcpHeaderBindingsResult {
 	bindings: McpHeaderParamBinding[];
 	/** Human-readable reasons the tool definition is invalid for HTTP mirroring. */
 	violations: string[];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

@@ -91,9 +91,13 @@ export interface AskRemoteControl {
 }
 
 export interface AskAnswerRequest {
+	/** Execution-owned logical question identity, stable across selector/editor waits. */
+	questionId?: string;
 	question: string;
 	options: string[];
 	interaction: "selector" | "custom_editor" | "clarification_editor";
+	/** Editor state when the interaction accepts free text. */
+	editor?: { title: string; prefill: string };
 	controls: readonly AskRemoteControl[];
 	/** Optional zero-based recommendation into the authoritative raw options. */
 	recommendedIndex?: number;

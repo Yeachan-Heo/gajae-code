@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import { logger } from "@gajae-code/utils";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
 import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 
@@ -34,14 +35,8 @@ setInterval(() => {}, 1000);
 `;
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 8_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 describe("MCP startup and the declared connection window", () => {
 	test("reads the declared window per server rather than as one batch budget", () => {

@@ -30,7 +30,7 @@ const cronSchema = z
 			.string()
 			.optional()
 			.describe(
-				"(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. When both day-of-month and day-of-week are constrained, a date matches if either field matches (vixie-cron semantics).",
+				"(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. A day field counts as restricted only when it does not start with '*' (a stepped form like '*/2' starts with '*' and stays unrestricted). When both day-of-month and day-of-week are restricted, a date matches if either field matches (vixie-cron semantics).",
 			),
 		prompt: z
 			.string()
@@ -321,8 +321,11 @@ function parseCronExpression(expression: string): ParsedCronExpression {
 		dayOfMonth: expandCronField(dayOfMonth!, CRON_FIELD_BOUNDS[2]!),
 		month: expandCronField(month!, CRON_FIELD_BOUNDS[3]!),
 		dayOfWeek: expandCronField(dayOfWeek!, CRON_FIELD_BOUNDS[4]!, value => (value === 7 ? 0 : value)),
-		dayOfMonthRestricted: dayOfMonth !== "*",
-		dayOfWeekRestricted: dayOfWeek !== "*",
+		// Vixie cron applies the day-of-month OR day-of-week rule only when both
+		// fields are restricted, and a field that starts with '*' (including stepped
+		// forms like '*/2') counts as unrestricted there, not merely one equal to "*".
+		dayOfMonthRestricted: !dayOfMonth.startsWith("*"),
+		dayOfWeekRestricted: !dayOfWeek.startsWith("*"),
 	};
 }
 

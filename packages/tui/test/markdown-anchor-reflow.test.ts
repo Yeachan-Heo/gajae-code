@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { Container, Markdown, TUI, VIEWPORT_ANCHOR_PREFIX, type ViewportAnchorRow } from "@gajae-code/tui";
 import { defaultMarkdownTheme } from "./test-themes";
-import { VirtualTerminal } from "./virtual-terminal";
+import { VirtualTerminal, visible } from "./virtual-terminal";
 
 // Mirrors TUI #resolveManualAnchor: find the row whose span contains the stored
 // (graphemeIndex, cellOffset) for the matching source id.
@@ -212,10 +212,6 @@ class MarkdownTranscript extends Container {
 
 async function settle(term: VirtualTerminal): Promise<void> {
 	await term.waitForRender();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 describe("TUI holds a Markdown viewport anchor across resize reflow (#2031)", () => {

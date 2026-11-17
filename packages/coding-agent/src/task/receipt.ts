@@ -1,3 +1,4 @@
+import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
 import {
 	assertRoutingEvidenceInvariant,
@@ -44,7 +45,7 @@ export interface TaskResultReceipt {
 	usageCostBreakdownComplete?: true;
 	branchName?: string;
 	persistence?: SingleResult["persistence"];
-	retryFailure?: { attempt: number; errorSummary: string };
+	retryFailure?: { attempt: number; errorSummary: string; failureClass?: FallbackTriggerClass };
 	setupFailure?: { summary: string };
 	localErrorSummary?: SingleResult["localErrorSummary"];
 	errorSummary?: string;
@@ -153,7 +154,10 @@ function buildSafeSynopsis(
 		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
 	}
 	if (raw.retryFailure) {
-		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
+		const failureClass = raw.retryFailure.failureClass;
+		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}${
+			failureClass ? ` (${failureClass})` : ""
+		}.`;
 	}
 	if (raw.persistence?.outcome === "recovery_available") {
 		const recovery = raw.persistence.recoveryRef
@@ -341,7 +345,11 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		persistence: raw.persistence,
 		fastMode: raw.fastMode,
 		retryFailure: raw.retryFailure
-			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
+			? {
+					attempt: raw.retryFailure.attempt,
+					errorSummary: "Retry failure recorded.",
+					...(raw.retryFailure.failureClass ? { failureClass: raw.retryFailure.failureClass } : {}),
+				}
 			: undefined,
 		duplicateDisposition: raw.duplicateDisposition,
 		localErrorSummary: raw.localErrorSummary,

@@ -1,3 +1,4 @@
+import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	type Api,
@@ -7,7 +8,6 @@ import {
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
-	OAuthCredentialSelectorError,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -19,10 +19,16 @@ import type { AutoroutingSetup } from "../../config/autorouting-contract";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
 	activateModelProfile,
-	materializeActiveModelProfileAssignment,
+	commitModelAssignments,
 	materializeActiveModelProfileAssignments,
 } from "../../config/model-profile-activation";
-import { ModelProfileReplacementRequiredError } from "../../config/model-profile-ownership";
+import {
+	type DurableModelProfileOwnership,
+	ModelProfileOwnershipConflictError,
+	ModelProfileReplacementRequiredError,
+	readDurableModelProfileOwnership,
+	readDurableModelProfileOwnershipFromRaw,
+} from "../../config/model-profile-ownership";
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
@@ -70,9 +76,10 @@ import {
 	type RoutingSettingsService,
 } from "../../sdk/routing-settings";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
-import type {
-	AgentSessionProfileInstalledOverrideState,
-	DefaultFallbackRuntimeState,
+import {
+	type AgentSessionProfileInstalledOverrideState,
+	type DefaultFallbackRuntimeState,
+	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
@@ -121,11 +128,12 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
+	assertProviderConfigLoaded,
 	formatProviderSetupResult,
 	probeOpenAIModelsList,
 	reloadAndRefreshDiscoveryCatalog,
 } from "../../setup/provider-onboarding";
-import { getThinkingLevelMetadata } from "../../thinking";
+import { getThinkingLevelMetadata, modelSupportsThinkingOff } from "../../thinking";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -249,7 +257,7 @@ interface DefaultAssignmentRollbackSnapshot {
 	thinkingLevel: ThinkingLevel | undefined;
 	persistedModelRoles: SettingValue<"modelRoles"> | undefined;
 	persistedAgentOverrides: SettingValue<"task.agentModelOverrides"> | undefined;
-	persistedProfile: SettingValue<"modelProfile.default"> | undefined;
+	durableOwnership: DurableModelProfileOwnership;
 	modelRolesOverride: SettingValue<"modelRoles"> | undefined;
 	agentOverridesOverride: SettingValue<"task.agentModelOverrides"> | undefined;
 	profileOverride: SettingValue<"modelProfile.default"> | undefined;
@@ -297,7 +305,7 @@ export class SelectorController {
 			thinkingLevel: this.ctx.session.thinkingLevel,
 			persistedModelRoles: this.ctx.settings.getGlobal("modelRoles"),
 			persistedAgentOverrides: this.ctx.settings.getGlobal("task.agentModelOverrides"),
-			persistedProfile: this.ctx.settings.getGlobal("modelProfile.default"),
+			durableOwnership: readDurableModelProfileOwnership(this.ctx.settings),
 			modelRolesOverride: this.ctx.settings.getOverride("modelRoles"),
 			agentOverridesOverride: this.ctx.settings.getOverride("task.agentModelOverrides"),
 			profileOverride: this.ctx.settings.getOverride("modelProfile.default"),
@@ -317,6 +325,55 @@ export class SelectorController {
 		restoreProfileState: boolean = true,
 	): Promise<never> {
 		if (!restoreLiveModel && !restoreProfileState) throw error;
+		// An unknown or committed-but-unapplied shared outcome already closed the session:
+		// its transcript may hold the forward write, so nothing is compensated over it (#7824).
+		if (
+			this.ctx.session.sessionLifecycle?.disposed ||
+			(error instanceof SharedControlPublicationError &&
+				(error.code === "unknown" || error.code === "committed_not_applied"))
+		)
+			throw error;
+		// A shared session restores the chain, resume default and live model as one admitted
+		// publication of only what actually differs, so a forward write known not to have
+		// happened leaves nothing to compensate.
+		const sharedCompensation = this.ctx.session.usesSharedControlPublication?.() === true;
+		// Validate the durable owner under the same lock as compensation: the
+		// in-memory settings may not have seen another process's winning commit.
+		try {
+			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
+				const actual = readDurableModelProfileOwnershipFromRaw(current);
+				if (!util.isDeepStrictEqual(actual, snapshot.durableOwnership)) {
+					throw new ModelProfileOwnershipConflictError(
+						snapshot.durableOwnership.version,
+						actual.version,
+						actual.marker,
+					);
+				}
+				const task = current.task;
+				const agentOverrides =
+					current["task.agentModelOverrides"] ??
+					(task && typeof task === "object" && !Array.isArray(task)
+						? (task as Record<string, unknown>).agentModelOverrides
+						: undefined);
+				if (
+					!util.isDeepStrictEqual(current.modelRoles, snapshot.persistedModelRoles) ||
+					!util.isDeepStrictEqual(agentOverrides, snapshot.persistedAgentOverrides)
+				) {
+					throw new Error("Model assignments changed before runtime rollback");
+				}
+				// The session transaction owns durable recovery. This controller may
+				// restore UI/runtime snapshots only after that recovery has succeeded.
+				return [];
+			});
+		} catch (rollbackError) {
+			void this.ctx.session.dispose().catch(disposalError => {
+				logger.warn("Committed model assignment session teardown failed", { error: String(disposalError) });
+			});
+			throw new AggregateError(
+				[error, rollbackError],
+				`Model assignment failed and durable rollback was refused: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		const rollbackErrors: unknown[] = [];
 		const restore = (action: () => void): void => {
 			try {
@@ -325,21 +382,6 @@ export class SelectorController {
 				rollbackErrors.push(rollbackError);
 			}
 		};
-		restore(() =>
-			snapshot.persistedModelRoles === undefined
-				? this.ctx.settings.unset("modelRoles")
-				: this.ctx.settings.set("modelRoles", snapshot.persistedModelRoles),
-		);
-		restore(() =>
-			snapshot.persistedAgentOverrides === undefined
-				? this.ctx.settings.unset("task.agentModelOverrides")
-				: this.ctx.settings.set("task.agentModelOverrides", snapshot.persistedAgentOverrides),
-		);
-		restore(() =>
-			snapshot.persistedProfile === undefined
-				? this.ctx.settings.unset("modelProfile.default")
-				: this.ctx.settings.set("modelProfile.default", snapshot.persistedProfile),
-		);
 		restore(() =>
 			snapshot.modelRolesOverride === undefined
 				? this.ctx.settings.clearOverride("modelRoles")
@@ -355,16 +397,32 @@ export class SelectorController {
 				? this.ctx.settings.clearOverride("modelProfile.default")
 				: this.ctx.settings.override("modelProfile.default", snapshot.profileOverride),
 		);
+		if (sharedCompensation) {
+			try {
+				await this.ctx.session.restoreModelSelectionForRollback(
+					restoreLiveModel ? snapshot.model : this.ctx.session.model,
+					restoreLiveModel ? snapshot.thinkingLevel : this.ctx.session.thinkingLevel,
+					{
+						defaultChain: restoreProfileState ? { state: snapshot.chain } : undefined,
+						resumeDefault: restoreLiveModel ? { selector: snapshot.resumeDefaultSelector } : undefined,
+					},
+				);
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		}
 		if (restoreProfileState) {
-			restore(() =>
-				this.ctx.session.setConfiguredModelChain(
-					"default",
-					snapshot.chain?.entries ?? [],
-					snapshot.chain?.origin ?? "rollback",
-					snapshot.chain?.identity,
-					snapshot.chain?.explicitHead ?? true,
-				),
-			);
+			if (!sharedCompensation) {
+				restore(() =>
+					this.ctx.session.setConfiguredModelChain(
+						"default",
+						snapshot.chain?.entries ?? [],
+						snapshot.chain?.origin ?? "rollback",
+						snapshot.chain?.identity,
+						snapshot.chain?.explicitHead ?? true,
+					),
+				);
+			}
 			restore(() => this.ctx.session.restoreDefaultFallbackRuntimeState(snapshot.fallbackRuntimeState));
 			restore(() => {
 				if (snapshot.canonicalVariant) {
@@ -377,7 +435,7 @@ export class SelectorController {
 				}
 			});
 		}
-		if (restoreLiveModel) {
+		if (restoreLiveModel && !sharedCompensation) {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
@@ -391,7 +449,7 @@ export class SelectorController {
 		} catch (rollbackError) {
 			rollbackErrors.push(rollbackError);
 		}
-		if (restoreLiveModel) {
+		if (restoreLiveModel && !sharedCompensation) {
 			try {
 				await this.ctx.session.restoreModelSelectionForRollback(snapshot.model, snapshot.thinkingLevel);
 			} catch (rollbackError) {
@@ -887,6 +945,12 @@ export class SelectorController {
 					} else {
 						await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 					}
+					assertProviderConfigLoaded(
+						this.ctx.session.modelRegistry,
+						result.providerId,
+						result.modelsPath,
+						result.credentialSource,
+					);
 					await this.ctx.notifyConfigChanged?.();
 					// A late settle after Esc-cancel or a mid-submit revision
 					// must not drive completion UI: done() restores the
@@ -933,7 +997,7 @@ export class SelectorController {
 		}
 		const availableLevels = [
 			ThinkingLevel.Inherit,
-			ThinkingLevel.Off,
+			...(modelSupportsThinkingOff(model) ? [ThinkingLevel.Off] : []),
 			...this.ctx.session.getAvailableThinkingLevels(),
 		];
 
@@ -1337,7 +1401,7 @@ export class SelectorController {
 	 * Most settings are saved directly via SettingsManager in the definitions.
 	 * This handles side effects and session-specific settings.
 	 */
-	handleSettingChange(id: string, value: unknown): void {
+	handleSettingChange(id: string, value: unknown): void | Promise<void> {
 		// Discovery provider toggles
 		if (id.startsWith("discovery.")) {
 			const providerId = id.replace("discovery.", "");
@@ -1365,11 +1429,15 @@ export class SelectorController {
 				this.ctx.session.setToolInterruptPolicy(value as "abort_tools" | "finish_tools");
 				break;
 			case "thinkingLevel":
-			case "defaultThinkingLevel":
-				this.ctx.session.setThinkingLevel(value as ThinkingLevel, true);
-				this.ctx.statusLine.invalidate();
-				this.ctx.updateEditorBorderColor();
-				break;
+			case "defaultThinkingLevel": {
+				const session = this.ctx.session;
+				return session.setThinkingLevelForControl(value as ThinkingLevel, true).then(() => {
+					if (this.ctx.session !== session || this.ctx.isStopped?.()) return;
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorBorderColor();
+					this.ctx.ui.requestRender();
+				});
+			}
 
 			case "modelProfile.default": {
 				// Applying the default profile live mirrors the /model preset flow so the
@@ -1715,6 +1783,8 @@ export class SelectorController {
 							return;
 						}
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
+						const observedOwnership =
+							role === null ? undefined : readDurableModelProfileOwnership(this.ctx.settings);
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
 							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
@@ -1731,6 +1801,7 @@ export class SelectorController {
 							done();
 							this.ctx.ui.requestRender();
 						} else if (selection.roles !== undefined) {
+							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
 							const includesDefault = targetRoles.includes("default");
 							const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
@@ -1760,14 +1831,14 @@ export class SelectorController {
 									: selectedSelector;
 							if (includesRoleAgent && !includesDefault) this.ctx.session.markUserModelSelection();
 
-							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
 							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
-							let materializedProfile = false;
 							try {
 								if (includesDefault) {
 									await this.ctx.session.setModel(model, "default", {
+										observedOwnership,
+										assignments,
 										selector: defaultSelector,
 										thinkingLevel,
 										cause: "user-selection",
@@ -1779,23 +1850,22 @@ export class SelectorController {
 										},
 									});
 									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(thinkingLevel);
+										await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 									}
 								}
-								assignmentMutationStarted = true;
-								materializedProfile = materializeActiveModelProfileAssignments({
-									session: this.ctx.session,
-									settings: this.ctx.settings,
-									assignments,
-								});
-								if (!materializedProfile) {
-									for (const targetRole of targetRoles) {
-										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
-										this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, targetRole);
-										if (target.settingsPath === "modelRoles") {
-											this.ctx.settings.setModelRole(targetRole, value);
-										} else {
-											this.ctx.settings.setAgentModelOverride(targetRole, value);
+								if (!includesDefault) {
+									assignmentMutationStarted = true;
+									const materialized = await materializeActiveModelProfileAssignments({
+										session: this.ctx.session,
+										settings: this.ctx.settings,
+										observedOwnership,
+										assignments,
+									});
+									if (!materialized) {
+										await commitModelAssignments(this.ctx.settings, assignments, observedOwnership);
+										for (const targetRole of targetRoles) {
+											const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+											this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, targetRole);
 										}
 									}
 								}
@@ -1832,22 +1902,19 @@ export class SelectorController {
 							done();
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
+							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							// Default: update agent state and persist as the active default model.
 							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
 								model,
 								this.ctx.session.credentialSessionId,
 							);
 							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
 							let defaultUsageSequence: number | undefined;
-							let assignmentMutationStarted = false;
-							const value = formatModelSelectorValue(
-								selectedSelector ?? `${model.provider}/${model.id}`,
-								thinkingLevel,
-							);
+
 							try {
 								await this.ctx.session.setModel(model, role, {
+									observedOwnership,
 									selector: selectedSelector,
 									thinkingLevel,
 									cause: "user-selection",
@@ -1858,25 +1925,16 @@ export class SelectorController {
 										defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 									},
 								});
-								assignmentMutationStarted = true;
-								const materializedProfile = materializeActiveModelProfileAssignment({
-									session: this.ctx.session,
-									settings: this.ctx.settings,
-									role,
-									selector: value,
-								});
-								if (!materializedProfile) {
-									this.ctx.settings.setModelRole(role, value);
-								}
+
 								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
+									await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 								}
 							} catch (error) {
 								await this.#restoreDefaultAssignmentRollback(
 									rollbackSnapshot,
 									error,
 									defaultMutationStarted,
-									defaultMutationStarted || assignmentMutationStarted,
+									defaultMutationStarted,
 								);
 							}
 							refreshRoleAssignments();
@@ -1899,19 +1957,16 @@ export class SelectorController {
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
 							this.ctx.session.markUserModelSelection();
 							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
-							const materializedProfile = materializeActiveModelProfileAssignments({
+							const materializedProfile = await materializeActiveModelProfileAssignments({
 								session: this.ctx.session,
 								settings: this.ctx.settings,
+								observedOwnership,
 								assignments,
 							});
 							if (!materializedProfile) {
+								await commitModelAssignments(this.ctx.settings, assignments, observedOwnership);
 								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 								this.ctx.session.markProfileRoleOverrideManual?.(target.settingsPath, role);
-								if (target.settingsPath === "modelRoles") {
-									this.ctx.settings.setModelRole(role, value);
-								} else {
-									this.ctx.settings.setAgentModelOverride(role, value);
-								}
 							}
 							refreshRoleAssignments();
 							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
@@ -2320,7 +2375,10 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				(entryId, label) => {
-					this.ctx.sessionManager.appendLabelChange(entryId, label);
+					// The tree navigator's submit callback is synchronous, so the label goes
+					// through the session's admitted background path: after a canonical shared
+					// append the legacy append is refused and the label would be lost on reload.
+					void this.ctx.session.appendLabelChangeInBackground(entryId, label);
 					this.ctx.ui.requestRender();
 				},
 				settings.get("treeFilterMode"),
@@ -2844,12 +2902,15 @@ export class SelectorController {
 							},
 							{
 								accountProviderId: selectedProviderId,
+								// The selector fires these callbacks with `void`, so a rejection here is an
+								// unhandled rejection (a recorded GJC crash). Shared sessions refuse a
+								// credential write with SharedControlPublicationError (#7824); report every
+								// failure and keep the selector open so the user can retry or pick another row.
 								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
 									try {
 										await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
 									} catch (error: unknown) {
-										if (!(error instanceof OAuthCredentialSelectorError)) throw error;
-										this.ctx.showError(error.message);
+										this.ctx.showError(error instanceof Error ? error.message : String(error));
 										return;
 									}
 									selector.stopValidation();
@@ -2857,7 +2918,12 @@ export class SelectorController {
 									this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
 								},
 								onAutoSelect: async () => {
-									await this.ctx.session.setCredentialAuto(selectedProviderId);
+									try {
+										await this.ctx.session.setCredentialAuto(selectedProviderId);
+									} catch (error: unknown) {
+										this.ctx.showError(error instanceof Error ? error.message : String(error));
+										return;
+									}
 									selector.stopValidation();
 									done();
 									this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);

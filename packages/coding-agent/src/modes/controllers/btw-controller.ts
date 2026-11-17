@@ -360,11 +360,10 @@ export class BtwController {
 		request.activeTurn = undefined;
 		request.contextExchanges.splice(0);
 		request.inFlight = false;
-		if (request.conversationScope) {
-			request.conversationScope.messages.splice(0);
-			request.conversationScope.systemPrompt.splice(0);
-			request.conversationScope = undefined;
-		}
+		const scope = request.conversationScope;
+		request.conversationScope = undefined;
+		// The session owns the scrub contract: visible-text snapshot and any provider-prefix material.
+		if (scope) this.ctx.session.releaseBtwConversationScope(scope);
 		abortController?.abort();
 		request.component.close();
 	}

@@ -145,6 +145,12 @@ export function modelsAreEqual<TApi extends Api>(
 	return a.id === b.id && a.provider === b.provider;
 }
 
+export function isImageOnlyModel(model: Pick<Model, "output">): boolean {
+	return model.output?.length === 1 && model.output[0] === "image";
+}
+
+export const IMAGE_ONLY_CHAT_MESSAGE = "This model is image-only. Use it as the image role, not as the chat model.";
+
 /**
  * APIs backed by agent-level providers — currently Devin over ACP. An
  * agent-level provider runs its own agent loop and owns the conversation

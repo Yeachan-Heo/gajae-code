@@ -91,6 +91,7 @@ describe("AgentSession state-aware compaction", () => {
 
 	afterEach(async () => {
 		await session.dispose();
+		await session.modelRegistry.dispose();
 		authStorage.close();
 		tempDir.removeSync();
 		vi.restoreAllMocks();

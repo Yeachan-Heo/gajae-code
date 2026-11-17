@@ -35,7 +35,7 @@ export const TtyWriter = nativeBindings.TtyWriter;
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_19_3 = nativeBindings.__piNativesV0_19_3;
+export const __piNativesV0_21_0 = nativeBindings.__piNativesV0_21_0;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -112,6 +112,7 @@ export const renameNoReplacePathAsync = nativeBindings.renameNoReplacePathAsync;
 export const renderMermaidAscii = nativeBindings.renderMermaidAscii;
 export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermissions;
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
+export const restoreConsoleCodePagesForRender = nativeBindings.restoreConsoleCodePagesForRender;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;
 export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride;

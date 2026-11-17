@@ -9,6 +9,19 @@ export const BTW_MAX_ANSWER_UTF8_BYTES = 32 * 1024;
 export const BTW_MAX_ERROR_UTF8_BYTES = 4 * 1024;
 export const BTW_STREAM_IDLE_TIMEOUT_MS = 30_000;
 export const BTW_STREAM_TOTAL_TIMEOUT_MS = 120_000;
+/** Hard cap for one projected tool-status line (`[tool] <name> <target>: <status>`). */
+export const BTW_MAX_TOOL_STATUS_LINE_UTF8_BYTES = 192;
+/**
+ * Hard cap for all projected tool-status lines of one scope. Each line is
+ * charged its UTF-8 bytes plus one byte for its newline separator.
+ */
+export const BTW_MAX_TOOL_STATUS_TOTAL_UTF8_BYTES = 2048;
+
+/** One visible-text turn of the main conversation, as frozen into a side-chat scope. */
+export interface BtwRoleTextMessage {
+	role: "user" | "assistant";
+	text: string;
+}
 
 export interface BtwTextExchange {
 	question: string;

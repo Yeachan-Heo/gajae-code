@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { $which, isEnoent, isRecord, logger } from "@gajae-code/utils";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 interface PackageJsonInfo {
@@ -24,10 +24,6 @@ async function resolvePackageRunner(cwd: string): Promise<string> {
 	if (npmLock || npmShrink) return "npm run";
 	if ($which("bun")) return "bun run";
 	return "npm run";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function shellQuote(value: string): string {

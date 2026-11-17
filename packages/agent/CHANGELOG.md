@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Fixed
+
+- Honor session-owned canonical message acknowledgments before subsequent provider and tool effects, without awaiting ordinary event observers or changing consumers that do not opt in.
+
+- A subscriber abort during the post-acceptance canonical drain no longer rewrites the already-published assistant message to `aborted`, so an accepted turn still ends as completed. Tool dispatch is still fenced by the aborted run signal.
+
+- A managed attempt on an agent-in-a-call provider (Devin ACP) is published live from the first tool call the provider reports as already executed, and a failure after that point is no longer offered for a managed replay. Staging such a run hid side effects that had already happened, a replay would have repeated them, and because the provider re-publishes the whole growing message on every tool update, a long run (30 minutes to hours) overflowed the 16 MiB staging cap and killed the subagent with `local_buffer_overflow`.
+- A `local_buffer_overflow` raised while staging an assistant callback pair reports the pair's real lower bound instead of the constant `maxStagedBytes + 1`. The value was read after `discard()` had zeroed the counters, so every accumulated overflow looked like a single 16 MiB event.
+
+### Performance
+
+- Streaming a multi-line or non-English reply spends less CPU measuring the partial message. A string with a newline or a non-ASCII character was charged one code point at a time on every delta, with a limit check per code point; a well-formed one is now charged its UTF-8 length plus its JSON escapes in two limit checks. The measured size is unchanged.
+
+## [0.20.0] - 2026-11-08
+
 ## [0.19.3] - 2026-11-03
 
 ### Added

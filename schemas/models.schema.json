@@ -25,6 +25,10 @@
 						"type": "string",
 						"minLength": 1
 					},
+					"credential": {
+						"type": "string",
+						"const": "store"
+					},
 					"api": {
 						"type": "string",
 						"enum": [
@@ -39,7 +43,8 @@
 							"google-gemini-cli",
 							"ollama-chat",
 							"cursor-agent",
-							"devin-acp"
+							"devin-acp",
+							"kiro-codewhisperer-stream"
 						]
 					},
 					"headers": {
@@ -383,7 +388,8 @@
 										"google-gemini-cli",
 										"ollama-chat",
 										"cursor-agent",
-										"devin-acp"
+										"devin-acp",
+										"kiro-codewhisperer-stream"
 									]
 								},
 								"baseUrl": {

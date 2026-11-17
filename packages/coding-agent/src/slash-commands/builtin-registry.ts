@@ -6,7 +6,12 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { PET_SKIN_IDS, PET_SKINS, type PetMode, replaceTabs, Spacer, Text } from "@gajae-code/tui";
 import { sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import {
+	activateModelProfile,
+	commitModelAssignments,
+	materializeActiveModelProfileAssignments,
+} from "../config/model-profile-activation";
+import { readDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import { formatModelProfileDisplayLabel } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
@@ -45,6 +50,7 @@ import {
 } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
+	assertProviderConfigLoaded,
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
@@ -183,7 +189,7 @@ async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<Sla
 			return usage("Could not generate a session title — pass one: /rename <title>", runtime);
 		}
 
-		const stored = await runtime.sessionManager.setSessionName(generated, "user");
+		const stored = await runtime.session.setSessionName(generated, "user");
 		if (!stored) {
 			await runtime.output("Session name not changed (a user-set name takes precedence).");
 			return commandConsumed();
@@ -219,7 +225,7 @@ async function updateSessionStar(
 	return commandConsumed();
 }
 
-function parseProviderSetupSlashArgs(args: string): {
+export function parseProviderSetupSlashArgs(args: string): {
 	preset?: string;
 	compat?: string;
 	provider?: string;
@@ -293,7 +299,7 @@ function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
-		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, and runcrate.",
+		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, runcrate, cheaper-inference, standardcompute, uberllm, and requesty.",
 		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
 		"Credential status: /provider status",
@@ -766,7 +772,7 @@ async function handleEffortCommand(
 
 	const levelToApply =
 		requestedLevel === ThinkingLevel.Inherit ? runtime.settings.get("defaultThinkingLevel") : requestedLevel;
-	runtime.session.setThinkingLevel(levelToApply, false);
+	await runtime.session.setThinkingLevelForControl(levelToApply, false);
 	const effectiveLevel = runtime.session.thinkingLevel ?? ThinkingLevel.Off;
 	const requestedLabel =
 		requestedLevel === ThinkingLevel.Inherit ? `${requestedLevel} (${levelToApply})` : requestedLevel;
@@ -1215,6 +1221,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						}
 					}
 				}
+				const observedOwnership = readDurableModelProfileOwnership(runtime.settings);
 				const resolution = await resolveModelCommandSelection(runtime, modelId);
 				if (!resolution.ok) {
 					return usage(modelSelectionUsage(runtime, resolution.failure.message), runtime);
@@ -1267,27 +1274,28 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 
 					if (includesDefault) {
 						await runtime.session.setModel(selection.model, "default", {
+							observedOwnership,
+							assignments,
 							selector: selection.selector,
 							thinkingLevel: existingDefaultThinkingLevel,
 							cause: "user-selection",
 						});
 						if (existingDefaultThinkingLevel) {
-							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+							await runtime.session.setThinkingLevelForSession(existingDefaultThinkingLevel);
 						}
 					}
-					const materializedProfile = materializeActiveModelProfileAssignments({
-						session: runtime.session,
-						settings: runtime.settings,
-						assignments,
-					});
-					if (!materializedProfile) {
-						for (const [targetId, selector] of assignments) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-							runtime.session.markProfileRoleOverrideManual?.(target.settingsPath, targetId);
-							if (target.settingsPath === "modelRoles") {
-								runtime.settings.setModelRole(targetId, selector);
-							} else {
-								runtime.settings.setAgentModelOverride(targetId, selector);
+					if (!includesDefault) {
+						const materializedProfile = await materializeActiveModelProfileAssignments({
+							session: runtime.session,
+							settings: runtime.settings,
+							observedOwnership,
+							assignments,
+						});
+						if (!materializedProfile) {
+							await commitModelAssignments(runtime.settings, assignments, observedOwnership);
+							for (const targetId of assignments.keys()) {
+								const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
+								runtime.session.markProfileRoleOverrideManual?.(target.settingsPath, targetId);
 							}
 						}
 					}
@@ -1368,17 +1376,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			const arg = command.args.toLowerCase();
 			if (!arg || arg === "toggle") {
-				const enabled = runtime.session.toggleFastMode();
+				const enabled = await runtime.session.toggleFastMode();
 				await runtime.output(`Fast mode ${enabled ? "enabled" : "disabled"}.`);
 				return commandConsumed();
 			}
 			if (arg === "on") {
-				runtime.session.setFastMode(true);
+				await runtime.session.setFastMode(true);
 				await runtime.output("Fast mode enabled.");
 				return commandConsumed();
 			}
 			if (arg === "off") {
-				runtime.session.setFastMode(false);
+				await runtime.session.setFastMode(false);
 				await runtime.output("Fast mode disabled.");
 				return commandConsumed();
 			}
@@ -1394,24 +1402,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			return usage("Usage: /fast [on|off|status]", runtime);
 		},
-		handleTui: (command, runtime) => {
+		handleTui: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (!arg || arg === "toggle") {
-				const enabled = runtime.ctx.session.toggleFastMode();
+				const enabled = await runtime.ctx.session.toggleFastMode();
 				refreshStatusLine(runtime.ctx);
 				runtime.ctx.showStatus(`Fast mode ${enabled ? "enabled" : "disabled"}.`);
 				runtime.ctx.editor.setText("");
 				return;
 			}
 			if (arg === "on") {
-				runtime.ctx.session.setFastMode(true);
+				await runtime.ctx.session.setFastMode(true);
 				refreshStatusLine(runtime.ctx);
 				runtime.ctx.showStatus("Fast mode enabled.");
 				runtime.ctx.editor.setText("");
 				return;
 			}
 			if (arg === "off") {
-				runtime.ctx.session.setFastMode(false);
+				await runtime.ctx.session.setFastMode(false);
 				refreshStatusLine(runtime.ctx);
 				runtime.ctx.showStatus("Fast mode disabled.");
 				runtime.ctx.editor.setText("");
@@ -1554,7 +1562,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
-			runtime.ctx.handleCopyCommand(undefined);
+			runtime.ctx.handleCopyCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -2097,6 +2105,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				} else {
 					await runtime.session.modelRegistry.refresh("offline", runtime.session.credentialSessionId);
 				}
+				assertProviderConfigLoaded(
+					runtime.session.modelRegistry,
+					result.providerId,
+					result.modelsPath,
+					result.credentialSource,
+				);
 				await runtime.output(
 					recoveryHint
 						? `${formatProviderSetupResult(result)}\n${recoveryHint}`
@@ -2158,6 +2172,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					} else {
 						await runtime.ctx.session.modelRegistry.refresh("offline", runtime.ctx.session.credentialSessionId);
 					}
+					assertProviderConfigLoaded(
+						runtime.ctx.session.modelRegistry,
+						result.providerId,
+						result.modelsPath,
+						result.credentialSource,
+					);
 					runtime.ctx.showStatus(
 						recoveryHint
 							? `${formatProviderSetupResult(result)}\n${recoveryHint}`
@@ -2575,7 +2595,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			if (!command.args) return regenerateSessionTitle(runtime);
 			invalidateSessionTitleGeneration(runtime.sessionManager);
-			const ok = await runtime.sessionManager.setSessionName(command.args, "user");
+			const ok = await runtime.session.setSessionName(command.args, "user");
 			if (!ok) {
 				await runtime.output("Session name not changed (a user-set name takes precedence).");
 				return commandConsumed();

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentTool, bindDispatchedToolIdentity } from "@gajae-code/agent-core";
-import type { AssistantMessage, Model, StopReason, ToolCall } from "@gajae-code/ai";
+import type { AssistantMessage, StopReason, ToolCall } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
 import { Settings } from "../src/config/settings";
@@ -14,6 +14,7 @@ import {
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+import { createModel } from "./helpers/mock-model";
 
 // The agent loop emits the raw model-supplied `toolCall.name`, including for a
 // call it is about to reject as unknown. Only a label proven against the ACTIVE
@@ -39,22 +40,6 @@ afterEach(async () => {
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
-
-function createModel(): Model<"openai-responses"> {
-	return {
-		id: "mock",
-		name: "mock",
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
-}
-
 function createTool(name: string, extra: Partial<AgentTool> = {}): AgentTool {
 	return {
 		name,
