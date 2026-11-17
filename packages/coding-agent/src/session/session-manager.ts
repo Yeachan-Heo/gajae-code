@@ -1972,7 +1972,7 @@ function isManagedReplaceIdentityMismatch(error: unknown): boolean {
 /** Title publication has patch evidence, not a conversation-graph entry ID. */
 /** Outcome of a shared live-session star patch. `changed: false` means the committed transcript already carried it. */
 export type SharedStarOutcome =
-	| { readonly kind: "committed"; readonly changed: boolean }
+	| { readonly kind: "committed"; readonly changed: boolean; readonly receipt?: ManagedAppendReceipt }
 	| {
 			readonly kind: "stale";
 			readonly reason:
@@ -19140,6 +19140,8 @@ export class SessionManager {
 			return { kind: "rejected", error: new Error("shared_star_requires_managed_destination") };
 		const sessionId = this.#sessionId;
 		const identityGeneration = this.#committedIdentityGeneration;
+		if (SessionManager.#durableThinkingControls.has(sessionId))
+			return { kind: "rejected", error: new Error("shared_star_durable_thinking_control_in_flight") };
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_star_requires_session_file") };
@@ -19201,14 +19203,14 @@ export class SessionManager {
 							if (header?.type !== "session" || header.id !== sessionId || !isRecord(rawHeader))
 								return { kind: "stale", reason: "transcript_moved" };
 							if (snapshot.bytes.at(-1) !== 10) return { kind: "stale", reason: "unsupported_transcript" };
+							predecessorIdentity = snapshot.identity;
+							priorCommittedDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
+							if ((header.starred === true) === starred) return { kind: "committed", changed: false };
 							// Upgrading the header to carry star patches rewrites the whole transcript,
 							// which would move a live peer's transcript identity. Same append-only rule
 							// as the picker's shared star.
 							if (rawHeader.starredPatchVersion !== 1 || Number(rawHeader.version) < 4)
 								return { kind: "stale", reason: "star_patch_upgrade_required" };
-							predecessorIdentity = snapshot.identity;
-							priorCommittedDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
-							if ((header.starred === true) === starred) return { kind: "committed", changed: false };
 							if (!current()) return { kind: "stale", reason: "transcript_moved" };
 							attempted = true;
 							scope.assertOwned();
@@ -19253,7 +19255,7 @@ export class SessionManager {
 									!verified.bytes.subarray(snapshot.bytes.length).equals(patchBytes)))
 						)
 							throw new Error("durability_unproven");
-						return { kind: "committed", changed: true };
+						return { kind: "committed", changed: true, receipt };
 					} catch (error) {
 						if (error instanceof ManagedAppendIdentityMismatchError)
 							return { kind: "stale", reason: "transcript_moved" };
@@ -19351,6 +19353,7 @@ export class SessionManager {
 			this.#assertPickerSessionIsCurrent(session);
 			const outcome = await this.#setSessionStarredSharingSession(starred);
 			if (outcome.kind !== "committed") throw new SessionStarPublicationError(outcome);
+			if (outcome.receipt?.descriptor) pickerDiskIdentities.set(session, outcome.receipt.descriptor);
 			return;
 		}
 		this.assertLegacyMutationAllowed("set live picker star");
