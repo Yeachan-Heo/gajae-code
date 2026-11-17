@@ -3307,7 +3307,7 @@ function createControlSurface(
 			: { changed: true };
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
-	const pendingPreflights = new Map<string, Set<() => void>>();
+	const pendingPreflights = new Map<string, Set<() => void | boolean>>();
 	// The SDK connection that accepted the currently active prompt/skill, if
 	// any: terminal aborts are requester-scoped, so another connection must
 	// never stop it, and an agent-initiated turn (monitor/cron follow-up) has
@@ -3454,13 +3454,14 @@ function createControlSurface(
 		let accepted = false;
 		let settled = false;
 		let submission: Promise<unknown> | undefined;
-		const cancelPreflight = () => {
+		const cancelPreflight = (): boolean => {
 			preflightController.abort();
-			if (settled) return;
+			if (settled) return false; // Already settled, didn't cancel
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			);
+			return true; // Successfully cancelled
 		};
 		const requesterPreflights = currentRequesterPreflights();
 		requesterPreflights.add(cancelPreflight);
@@ -4228,8 +4229,11 @@ function createControlSurface(
 			const admittedRequesterPreflights = new Set(requesterPreflights ?? []);
 			let preflightsCancelledByAbort = false;
 			const cancelRequesterPreflights = () => {
-				for (const cancel of [...admittedRequesterPreflights]) cancel();
-				if (admittedRequesterPreflights.size > 0) {
+				let actualCancellations = 0;
+				for (const cancel of [...admittedRequesterPreflights]) {
+					if (cancel()) actualCancellations++;
+				}
+				if (actualCancellations > 0) {
 					preflightsCancelledByAbort = true;
 					// Remove the admitted callbacks from the live set so a preflight
 					// added by a LATER submission is untouched by this abort (and the
@@ -4867,8 +4871,10 @@ function createControlSurface(
 			const ownedPreflights = connectionId === undefined ? [] : [...(pendingPreflights.get(connectionId) ?? [])];
 			// Capture both phases before cancellation or any awaited terminal work:
 			// acceptance can settle its callback before agent_start owns the run.
-			for (const cancel of ownedPreflights) cancel();
-			let cancelledAdmission = ownedPreflights.length > 0;
+			let cancelledAdmission = false;
+			for (const cancel of ownedPreflights) {
+				if (cancel()) cancelledAdmission = true;
+			}
 			for (const request of ownedAdmissions) {
 				if (request.disposition !== "preflight" || request.controller.signal.aborted) continue;
 				request.controller.abort();

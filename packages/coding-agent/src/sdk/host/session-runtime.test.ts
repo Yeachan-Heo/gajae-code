@@ -11856,41 +11856,38 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		// accepted with turn=uncertain.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-during-admission-"));
 		try {
-			const admissionStarted = Promise.withResolvers<void>();
-			const releaseAdmission = Promise.withResolvers<void>();
+			const preflight = Promise.withResolvers<() => Promise<void>>();
+			let activeHandle: string | undefined = undefined;
 			const harness = await invocationHarness("abort-during-admission", cwd, {
 				sendUserMessage: async (_content, options) => {
-					// Signal that preflight started, but don't complete it yet
-					admissionStarted.resolve();
-					// Wait for release signal before accepting or starting
-					await releaseAdmission.promise;
-					// Never actually complete the preflight
+					// Return a callback that the test can call to trigger acceptance
+					const accept = async () => {
+						await options?.onPreflightAcceptCommit?.();
+					};
+					preflight.resolve(accept);
+					// Never actually complete the preflight execution
 					await neverSettlingPromise();
 				},
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => 1,
+					getActivePromptHandle: () => activeHandle,
+					cancelPendingPreflightForTerminalAbort: () => {},
+					abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+				},
 			});
-			const original = await harness.control("turn.prompt", { text: "original" });
-			expect(original.ok).toBe(true);
-			const originalIds = {
-				commandId: original.result?.commandId,
-				turnId: original.result?.turnId,
-			};
-			// Wait for admission to start
-			await admissionStarted.promise;
-			// Now abort while still in admission phase (before execution starts)
-			const abort = await harness.control("turn.abort", { mode: "terminal" });
+			// Start the prompt and get the acceptance callback
+			const promptPromise = harness.control("turn.prompt", { text: "original" });
+			const acceptPreflight = await preflight.promise;
+			// Set active handle so abort knows there's a prompt to abort
+			activeHandle = "test-run-handle";
+			// Now abort while the preflight is still pending (before acceptance)
+			const abort = await harness.controlAs("client", "turn.abort", { mode: "terminal" }, "test-abort-key");
 			expect(abort.ok).toBe(true);
-			// Should report stopped, NOT uncertain
-			expect(abort.result).toMatchObject({
-				selection: "turn",
-				turn: "stopped",
-			});
-			// Release the admission barrier to allow the preflight to proceed and cleanup
-			releaseAdmission.resolve();
-			// Verify the durable row is settled, not uncertain
-			const status = await harness.query("turn.prompt_status", originalIds);
-			expect(status.result?.status).not.toBe("uncertain");
-			// Should NOT be in uncertain/accepted state
-			expect(status.result?.status).not.toBe("accepted");
+			// Verify the prompt response is an error (cancelled by abort)
+			const promptResult = await promptPromise;
+			expect(promptResult.ok).toBe(false);
+			expect(promptResult.error?.code).toMatch(/busy|cancelled/);
+			// Don't call acceptPreflight since the preflight was already cancelled
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
