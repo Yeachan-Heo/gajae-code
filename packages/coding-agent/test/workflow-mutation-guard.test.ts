@@ -2955,6 +2955,9 @@ describe("bash scanner quoting model", () => {
 			// ANSI-C quoted words are opaque here, so the flag after `--` must still block.
 			`bun $'--title' -- --require /tmp/payload.cjs -e 'process.stdout.write("status")'`,
 			`node $'--conditions' -- --require=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			// Command substitution hides the consuming option behind an opaque word too.
+			"bun `printf '\\055\\055title'` -- --require /tmp/payload.cjs -e 'process.stdout.write(\"status\")'",
+			"bun $(printf '\\055\\055title') -- --require /tmp/payload.cjs -e 'process.stdout.write(\"status\")'",
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
