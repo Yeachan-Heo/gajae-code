@@ -28,6 +28,16 @@ export type NativeConnectionState =
 	| "uncertain_cursor"
 	| "checkpoint_incomplete";
 
+export interface NativeUnresolvedOpen {
+	readonly kind: "unresolved";
+	readonly state: Extract<NativeConnectionState, "uncertain_cursor" | "checkpoint_incomplete">;
+	readonly handle: NativeOpenHandle;
+	readonly op: PendingResumeOp;
+	readonly error?: string;
+	/** Retains the issuer's unpublished-open capability until retirement is proven. */
+	retire(): Promise<void>;
+}
+
 export type NativeOpenOutcome =
 	| { readonly kind: "opened"; readonly session: NativeSession }
 	/** More than one live branch: the caller must ask which one continues. */
@@ -37,13 +47,7 @@ export type NativeOpenOutcome =
 			readonly candidates: readonly string[];
 	  }
 	/** Recovery stayed unresolved. The handle is retained so the caller can reconcile, not reopen. */
-	| {
-			readonly kind: "unresolved";
-			readonly state: Extract<NativeConnectionState, "uncertain_cursor" | "checkpoint_incomplete">;
-			readonly handle: NativeOpenHandle;
-			readonly op: PendingResumeOp;
-			readonly error?: string;
-	  }
+	| NativeUnresolvedOpen
 	| { readonly kind: "refused"; readonly reason: string };
 
 type NativeOpenHandle = Extract<NativeEmbeddedOpenResult, { kind: "opened" }>["handle"];
@@ -77,6 +81,11 @@ function mapOpenOutcome(opened: NativeEmbeddedOpenResult): NativeOpenOutcome {
 				handle: opened.handle,
 				op: opened.op,
 				error: opened.error,
+				async retire() {
+					const result = await opened.abortOpen();
+					if (result.receipt.terminalDisposition.kind !== "retired")
+						throw new Error(`Native open could not be retired (${result.refusal ?? result.outcome.kind})`);
+				},
 			};
 		case "refused":
 			return { kind: "refused", reason: opened.reason };

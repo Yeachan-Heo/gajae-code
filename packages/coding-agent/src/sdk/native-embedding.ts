@@ -197,6 +197,8 @@ export type NativeEmbeddedOpenResult =
 			readonly handle: NativeLifecycleHandle;
 			readonly op: PendingResumeOp;
 			readonly selection: ReconcileResult;
+			/** Issuer-bound cleanup for this unpublished open; never grants runtime TERM. */
+			readonly abortOpen: () => Promise<ReconcileResult>;
 			readonly error?: string;
 	  }
 	| { readonly kind: "refused"; readonly reason: string; readonly checkpoint?: SdkResumeCheckpoint };
@@ -573,6 +575,15 @@ async function constructNativeRuntime(
 	options: EmbeddedAgentSessionOptions,
 ): Promise<NativeEmbeddedOpenResult> {
 	const pending = owner.pending;
+	const abortOpen = async (): Promise<ReconcileResult> => {
+		try {
+			const result = await owner.coordinator.abortOpen(pending);
+			owner.last = result;
+			return result;
+		} finally {
+			await releaseClosedDependencies(owner);
+		}
+	};
 	const selection = await owner.coordinator.resumeOpen(pending);
 	owner.last = selection;
 	if (selection.receipt.routing.action !== "PROCEED")
@@ -581,6 +592,7 @@ async function constructNativeRuntime(
 			handle: owner.coordinator.handle,
 			op: pending,
 			selection,
+			abortOpen,
 		};
 	try {
 		const result = await createEmbeddedAgentSession(options);
@@ -622,6 +634,7 @@ async function constructNativeRuntime(
 			handle: owner.coordinator.handle,
 			op: pending,
 			selection: final,
+			abortOpen,
 			error: error instanceof Error ? error.message : String(error),
 		};
 	}

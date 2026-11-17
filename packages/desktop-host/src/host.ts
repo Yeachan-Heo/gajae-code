@@ -46,7 +46,7 @@ import {
 	type NativeInvocationResult,
 } from "@gajae-code/coding-agent/sdk";
 import { bridgeNativeInteraction, type NativeInteractionQuestion } from "./native-interaction-bridge";
-import { type NativeSession, openNativeSession } from "./native-session";
+import { type NativeSession, type NativeUnresolvedOpen, openNativeSession } from "./native-session";
 import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
@@ -543,6 +543,8 @@ export class DesktopHost {
 	#managedProjectEpochs = new Map<string, number>();
 	/** Unpublished SDK ownership, retained until publication or proven disposal. */
 	#candidates = new Set<SessionCandidate>();
+	/** Opens without a published runtime still own their native manager and dependencies. */
+	#unresolvedNative = new Set<NativeUnresolvedOpen>();
 	/** Retired publications remain owned even after their catalog/live entry is removed. */
 	#retiredLive = new Set<LiveSession>();
 	/** Failed publication callers own catalog compensation, including on later cleanup retries. */
@@ -1259,7 +1261,11 @@ export class DesktopHost {
 						storage: metadata.scope === "managed" ? { managed: true } : { directory },
 					})
 				: undefined;
-		if (native && native.kind !== "opened") throw new Error(`Native open ${native.kind}`);
+		if (native && native.kind !== "opened") {
+			// This result, not a candidate, exclusively owns unpublished native cleanup.
+			if (native.kind === "unresolved") this.#unresolvedNative.add(native);
+			throw new Error(`Native open ${native.kind}`);
+		}
 		const result =
 			native?.kind === "opened"
 				? native.session.result
@@ -4052,6 +4058,14 @@ export class DesktopHost {
 		);
 		this.#live.clear();
 		await Promise.all([...this.#candidates].map(candidate => attempt(() => this.#disposeCandidate(candidate))));
+		await Promise.all(
+			[...this.#unresolvedNative].map(opened =>
+				attempt(async () => {
+					await opened.retire();
+					this.#unresolvedNative.delete(opened);
+				}),
+			),
+		);
 		// Shutdown joins real retained teardown, including timed-out and rolled-back publications.
 		await Promise.all([...this.#cleanupOwners.values()].map(completion => attempt(() => completion)));
 		// Terminal queue observers can require disposal to settle. Join them only after SDK teardown.
@@ -4065,7 +4079,10 @@ export class DesktopHost {
 			authorizationJoined = true;
 		});
 		const sessionsReleased =
-			this.#cleanupOwners.size === 0 && this.#candidates.size === 0 && this.#retiredLive.size === 0;
+			this.#cleanupOwners.size === 0 &&
+			this.#candidates.size === 0 &&
+			this.#unresolvedNative.size === 0 &&
+			this.#retiredLive.size === 0;
 		// The hidden control owner lends auth to local sessions; retire it only after all borrowers and authorization settle.
 		if (authorizationJoined && sessionsReleased && this.#control) {
 			await attempt(() => this.#control!.session.dispose());
