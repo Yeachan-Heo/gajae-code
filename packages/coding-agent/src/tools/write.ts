@@ -232,9 +232,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
+		// Publication needs this session's own local root to bound a `local://`
+		// write. A second live session is not the process-global one, so inferring
+		// the boundary from the global lookup would leave its explicit local tree
+		// uncontained.
+		const getLocalProtocolOptions = () => this.session.getLocalProtocolOptions?.();
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
-			: writethroughNoop;
+			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics, getLocalProtocolOptions })
+			: (dst, content, signal, file) =>
+					writethroughNoop(dst, content, signal, file, undefined, undefined, getLocalProtocolOptions);
 		this.description = prompt.render(writeDescription);
 	}
 

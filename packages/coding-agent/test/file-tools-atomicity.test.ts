@@ -619,6 +619,100 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"bounds an explicit local write with the caller's binding, not the process-global one",
+		async () => {
+			const callerArtifacts = path.join(tmpDir, "caller-artifacts");
+			const globalArtifacts = path.join(tmpDir, "global-artifacts");
+			const localRoot = path.join(callerArtifacts, "local");
+			const outside = path.join(tmpDir, "caller-outside.ts");
+			const link = path.join(localRoot, "alias.ts");
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.mkdir(path.join(globalArtifacts, "local"), { recursive: true });
+			await fs.writeFile(outside, "outside\n");
+			await fs.symlink(outside, link);
+			// The global lookup names a different session's root; without the caller
+			// binding this destination has no boundary at all.
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => globalArtifacts,
+				getSessionId: () => "global-root",
+			});
+			try {
+				await expect(
+					writeFileAtomically(link, "must-not-write\n", {
+						localProtocolOptions: {
+							getArtifactsDir: () => callerArtifacts,
+							isManagedDestination: () => false,
+							getSessionId: () => "caller-root",
+						},
+					}),
+				).rejects.toThrow(/outside trust boundary/);
+				expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+			} finally {
+				LocalProtocolHandler.setOverride(undefined);
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"bounds local:// writes for two explicit roots with escaping symlinks",
+		async () => {
+			const firstArtifacts = path.join(tmpDir, "first-artifacts");
+			const secondArtifacts = path.join(tmpDir, "second-artifacts");
+			const firstBinding = {
+				getArtifactsDir: () => firstArtifacts,
+				isManagedDestination: () => false,
+				getSessionId: () => "first-explicit",
+			};
+			const secondBinding = {
+				getArtifactsDir: () => secondArtifacts,
+				isManagedDestination: () => false,
+				getSessionId: () => "second-explicit",
+			};
+			const firstOutside = path.join(tmpDir, "first-outside.ts");
+			const secondOutside = path.join(tmpDir, "second-outside.ts");
+			for (const [artifacts, outside] of [
+				[firstArtifacts, firstOutside],
+				[secondArtifacts, secondOutside],
+			] as const) {
+				const localRoot = path.join(artifacts, "local");
+				await fs.mkdir(localRoot, { recursive: true });
+				await fs.writeFile(outside, "outside\n");
+				await fs.symlink(outside, path.join(localRoot, "alias.ts"));
+			}
+			const firstTool = new WriteTool(
+				createSession(tmpDir, {
+					enableLsp: false,
+					getLocalProtocolOptions: () => firstBinding,
+					isManagedSessionDestination: () => false,
+					getSessionId: () => "first-explicit",
+				}),
+			);
+			const secondTool = new WriteTool(
+				createSession(tmpDir, {
+					getLocalProtocolOptions: () => secondBinding,
+					isManagedSessionDestination: () => false,
+					getSessionId: () => "second-explicit",
+				}),
+			);
+			// The process-global binding names the FIRST root, so it cannot bound the
+			// second root's explicit local tree.
+			LocalProtocolHandler.setOverride(firstBinding);
+			try {
+				await expect(
+					firstTool.execute("first-local-write", { path: "local://alias.ts", content: "must-not-write\n" }),
+				).rejects.toThrow(/outside trust boundary/);
+				await expect(
+					secondTool.execute("second-local-write", { path: "local://alias.ts", content: "must-not-write\n" }),
+				).rejects.toThrow(/outside trust boundary/);
+				expect(await fs.readFile(firstOutside, "utf8")).toBe("outside\n");
+				expect(await fs.readFile(secondOutside, "utf8")).toBe("outside\n");
+			} finally {
+				LocalProtocolHandler.setOverride(undefined);
+			}
+		},
+	);
+
 	it("rejects a symlink escape from the session-scoped gjc-local root", async () => {
 		if (process.platform === "win32") return;
 		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-trust-test");

@@ -3,6 +3,7 @@ import path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { logger, once, prompt, untilAborted } from "@gajae-code/utils";
 import type { BunFile } from "bun";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
@@ -724,12 +725,19 @@ export interface WritethroughOptions {
 	onDeferredDiagnostics?: (diagnostics: FileDiagnosticsResult) => void;
 	/** Signal to cancel a pending deferred diagnostics fetch. */
 	deferredSignal?: AbortSignal;
+	/**
+	 * The calling session's own `local://` binding. Publication uses it to
+	 * identify the explicit `<artifacts>/local` trust root, so a session whose
+	 * local root is not the process-global one still contains symlink escapes.
+	 */
+	getLocalProtocolOptions?: () => LocalProtocolOptions | undefined;
 }
 
 /** Internal resolved form of {@link WritethroughOptions} that the writethrough machinery operates on. */
 type ResolvedWritethroughOptions = {
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
+	getLocalProtocolOptions?: () => LocalProtocolOptions | undefined;
 };
 
 /** Per-file deferred LSP diagnostics wiring for {@link WritethroughCallback}. */
@@ -757,12 +765,13 @@ export async function writethroughNoop(
 	file?: BunFile,
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
+	getLocalProtocolOptions?: () => LocalProtocolOptions | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
 	if (file !== undefined) {
 		await file.write(content);
 		return undefined;
 	}
-	await writeFileAtomically(dst, content);
+	await writeFileAtomically(dst, content, { localProtocolOptions: getLocalProtocolOptions?.() });
 	return undefined;
 }
 
@@ -929,7 +938,7 @@ async function runLspWritethrough(
 	const config = getConfig(cwd);
 	const servers = getServersForFile(config, dst);
 	if (servers.length === 0) {
-		return writethroughNoop(dst, content, signal, file);
+		return writethroughNoop(dst, content, signal, file, undefined, undefined, options.getLocalProtocolOptions);
 	}
 	const { lspServers, customLinterServers } = splitServers(servers);
 
@@ -938,7 +947,7 @@ async function runLspWritethrough(
 	const writeContent = async (value: string) => {
 		try {
 			if (file !== undefined) await file.write(value);
-			else await writeFileAtomically(dst, value);
+			else await writeFileAtomically(dst, value, { localProtocolOptions: options.getLocalProtocolOptions?.() });
 			publishedContent = true;
 		} catch (error) {
 			if (error instanceof FileWriteNotPublishedError) {
@@ -1082,9 +1091,11 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
+		getLocalProtocolOptions: options?.getLocalProtocolOptions,
 	};
 	if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
-		return writethroughNoop;
+		return (dst, content, signal, file) =>
+			writethroughNoop(dst, content, signal, file, undefined, undefined, resolvedOptions.getLocalProtocolOptions);
 	}
 	return async (
 		dst: string,
@@ -1111,7 +1122,15 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		state.entries.set(dst, { dst, content, file });
 
 		if (!batch.flush) {
-			await writethroughNoop(dst, content, signal, file);
+			await writethroughNoop(
+				dst,
+				content,
+				signal,
+				file,
+				undefined,
+				undefined,
+				state.options.getLocalProtocolOptions,
+			);
 			return undefined;
 		}
 
