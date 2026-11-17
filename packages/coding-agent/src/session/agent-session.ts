@@ -11250,6 +11250,8 @@ export class AgentSession {
 					this.#promptGeneration !== generation
 				) {
 					this.#ttsrAbortPending = false;
+					// Known limit: a reminder saved above stays in the transcript (append-only) without a
+					// ttsr_injection record, so a resumed session sees it and the rule can be injected again.
 					// A newer prompt owns the pending and per-tool state; the abort that preceded
 					// it already released this retry's claims. Same generation: release only the
 					// buckets this retry captured, still identical, and drop only its carried rules.
