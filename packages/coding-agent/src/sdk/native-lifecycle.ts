@@ -134,12 +134,18 @@ export type NativeRuntimeFamily =
 	| "workflow"
 	| "operator"
 	| "activity"
+	| "mcp"
 	| "preferences"
 	| "authorization"
 	| "side"
 	| "composer"
 	| "diff"
 	| "session";
+
+/** MCP dispatch uses the activity effects owned by the existing session control admission. */
+const runtimeEffectFamilies: Partial<Record<NativeRuntimeFamily, NativeRuntimeFamily>> = {
+	mcp: "activity",
+};
 
 export type NativeInvocationResult<T> =
 	| { readonly kind: "applied"; readonly value: T; readonly reconciliation: ReconcileResult }
@@ -387,7 +393,7 @@ export async function invokeNativeRuntime<T>(
 		binding,
 		op: binding.pending(),
 		epoch: member.publicationEpoch,
-		family,
+		family: runtimeEffectFamilies[family] ?? family,
 		active: true,
 		owners: 1,
 		effectsStarted: false,
