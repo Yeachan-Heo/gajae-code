@@ -11185,7 +11185,7 @@ export class SessionManager {
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
-		if (this.usesSharedPublication()) throw new Error("Cannot prepare fork for session that uses shared publication");
+		if (this.usesSharedPublication()) throw new SharedSessionMutationUnsupportedError("prepare fork");
 		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;

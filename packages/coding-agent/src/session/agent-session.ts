@@ -22134,7 +22134,7 @@ export class AgentSession {
 			if (!(this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined)) {
 				this.sessionManager.assertLegacyMutationAllowed("prepare fork");
 				if (this.sessionManager.usesSharedPublication())
-					throw new Error("Cannot fork session that uses shared publication");
+					throw new SharedSessionMutationUnsupportedError("fork");
 			}
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
