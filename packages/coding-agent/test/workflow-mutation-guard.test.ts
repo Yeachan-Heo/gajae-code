@@ -2920,45 +2920,51 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
-	// Regression tests for review findings from #6895
-	it("blocks Node preload (-r) with stdout exemption", async () => {
+	// Regression tests for review findings from #6895 and #6995
+	it("blocks Node/Bun preload spellings that load unscanned code", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
-		// Node -r loads code before -e, which is not scanned
-		const decision = await getWorkflowMutationDecision({
-			cwd,
-			sessionId: "session-a",
-			tool: tool("bash"),
-			args: { command: `node -r /tmp/payload.cjs -e 'process.stdout.write("status")'` },
-		});
-		expect(decision.blocked).toBe(true);
+		// -r/--require load a module before the one-liner runs, and that module is never
+		// scanned, so every spelling fails closed even when the one-liner only writes stdout.
+		for (const command of [
+			`node -r /tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`node -r/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`node --require /tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`node --require=/tmp/payload.cjs -e 'process.stdout.write("status")'`,
+			`bun -r /tmp/payload.cjs script.ts`,
+			`bun --require /tmp/payload.cjs script.ts`,
+			`bun --require=/tmp/payload.cjs script.ts`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason, command).toBe("unknown-target");
+		}
 	});
 
-	it("blocks Node preload (--require=) equals-form bypass", async () => {
+	it("keeps scanning Node/Bun equals-form code options", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
-		// Node --require=/path loads code before -e, which is not scanned
-		// The equals-form (--require=/path) must be caught just like space-separated (-r /path)
-		const decision = await getWorkflowMutationDecision({
-			cwd,
-			sessionId: "session-a",
-			tool: tool("bash"),
-			args: { command: `node --require=/tmp/payload.cjs -e 'process.stdout.write("status")'` },
-		});
-		expect(decision.blocked).toBe(true);
-	});
-
-	it("blocks Bun preload (--require=) equals-form", async () => {
-		const cwd = await makeTempRoot();
-		await writeActiveSkill(cwd, "ultragoal", "planning");
-		// Bun --require=/path also loads code that cannot be scanned
-		const decision = await getWorkflowMutationDecision({
-			cwd,
-			sessionId: "session-a",
-			tool: tool("bash"),
-			args: { command: `bun --require=/tmp/hack.js script.ts` },
-		});
-		expect(decision.blocked).toBe(true);
+		// The equals-form branch must still resolve `--eval=`/`--print=` to the code
+		// operand: preload detection must not swallow ordinary one-liners either way.
+		for (const [command, blocked] of [
+			[`node --eval='process.stdout.write("status")'`, false],
+			[`bun --print='process.stdout.write("status")'`, false],
+			[`node --eval='require("node:fs").writeFileSync("src/product.ts","PWNED")'`, true],
+			[`bun --print='require("node:fs").writeFileSync("src/product.ts","PWNED")'`, true],
+		] as const) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(blocked);
+		}
 	});
 
 	it("blocks assignment aliases of output streams across shell quoting", async () => {

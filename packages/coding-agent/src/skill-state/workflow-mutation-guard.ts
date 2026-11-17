@@ -2171,7 +2171,7 @@ function collectInterpreterOneLinerWrites(
 				return;
 			}
 			let rawScript: string | undefined;
-			const option = options.find(
+			let option = options.find(
 				candidate =>
 					part === candidate || (candidate.length === 2 && part.startsWith(candidate) && part.length > 2),
 			);
@@ -2181,18 +2181,14 @@ function collectInterpreterOneLinerWrites(
 				const rawWord = words[index] ?? "";
 				rawScript = rawWord.startsWith("-") ? rawWord.slice(option.length) : part.slice(option.length);
 			} else {
-				const longOption = options.find(
-					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
-				);
-				if (!longOption) continue;
-				rawScript = words[index]?.slice(longOption.length + 1);
+				option = options.find(candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`));
+				if (!option) continue;
+				rawScript = words[index]?.slice(option.length + 1);
 			}
 			if (rawScript === undefined) continue;
-			// Node preload options (-r/--require) load external files that cannot be scanned,
-			// so fail closed when encountered. Check both space-separated (option) and
-			// equals-form (longOption) spellings.
-			const isPreloadOption = option === "-r" || option === "--require" || longOption === "--require";
-			if (isPreloadOption && /^(?:node|bun)$/.test(binary)) {
+			// Node/Bun preload options load external files that cannot be scanned, so fail
+			// closed for every spelling: `-r mod`, `-rmod`, `--require mod`, `--require=mod`.
+			if ((option === "-r" || option === "--require") && /^(?:node|bun)$/.test(binary)) {
 				targets.explicitMutation = true;
 				targets.unknown = true;
 				return;
