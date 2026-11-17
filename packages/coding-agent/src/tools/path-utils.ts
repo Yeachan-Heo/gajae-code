@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent } from "@gajae-code/utils/fs-error";
-import { InternalUrlRouter } from "../internal-urls";
+import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
 
@@ -724,6 +724,8 @@ export interface ToolScopeOptions {
 	signal?: AbortSignal;
 	/** Calling session settings. Memory roots follow this agent dir, not the process default. */
 	settings?: unknown;
+	/** Calling session local:// root. Local URLs resolve inside this session's scratch tree. */
+	localProtocolOptions?: LocalProtocolOptions;
 }
 
 export interface ToolScopeResolution {
@@ -767,6 +769,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		const resource = await internalRouter.resolve(rawPath, {
 			cwd,
 			settings: opts.settings,
+			localProtocolOptions: opts.localProtocolOptions,
 			getArtifactsDir,
 			getAuthorizedArtifactsDirs,
 			mcpManager: opts.mcpManager,

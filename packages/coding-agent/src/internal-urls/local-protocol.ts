@@ -9,7 +9,7 @@ import { isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 type NativeLocalBindings = Pick<
 	typeof import("@gajae-code/natives"),
@@ -875,8 +875,9 @@ export class LocalProtocolHandler implements ProtocolHandler {
 	}
 
 	/**
-	 * Install a process-global test override that wins over owned and registry
-	 * mappings. Prefer {@link installOverride} for lifecycle-bound production use.
+	 * Install a process-global test override. It wins over every other binding,
+	 * including a caller's own root, so a test can pin resolution without a
+	 * session. Prefer {@link installOverride} for lifecycle-bound production use.
 	 */
 	static setOverride(value: LocalProtocolOptions | undefined): void {
 		LocalProtocolHandler.#override = value;
@@ -899,6 +900,11 @@ export class LocalProtocolHandler implements ProtocolHandler {
 	 * 1. Direct test override installed via {@link setOverride}.
 	 * 2. The most recently installed live owned override.
 	 * 3. A live main session in `AgentRegistry.global()`.
+	 *
+	 * This is the process-global binding used by callers that supply no caller
+	 * context. Router calls from a live session thread their own
+	 * {@link ResolveContext.localProtocolOptions} instead, so this lookup never
+	 * redirects one session's `local://` reads into another session's root.
 	 */
 	static resolveOptions(): LocalProtocolOptions | undefined {
 		const override = LocalProtocolHandler.#override;
@@ -918,10 +924,30 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const opts = LocalProtocolHandler.resolveOptions();
+	/**
+	 * Local-protocol binding for one router call.
+	 *
+	 * A direct test override is a process-global seam and wins outright. A
+	 * caller that names its own session root is otherwise authoritative: the
+	 * handler never substitutes another live session from the registry or from
+	 * another session's installed override. Callers that supply no context at
+	 * all (host inspection, tests) keep {@link resolveOptions}.
+	 */
+	static #forCaller(context?: ResolveContext): LocalProtocolOptions | undefined {
+		const override = LocalProtocolHandler.#override;
+		if (override) return override;
+		if (context) return context.localProtocolOptions;
+		return LocalProtocolHandler.resolveOptions();
+	}
+
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const opts = LocalProtocolHandler.#forCaller(context);
 		if (!opts) {
-			throw new Error("No session - local:// unavailable");
+			throw new Error(
+				context
+					? "local:// is unavailable for this caller: no session local root binding was provided"
+					: "No session - local:// unavailable",
+			);
 		}
 
 		const resolvedRoot = await initializeLocalRoot(opts);

@@ -8,6 +8,7 @@ import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { LocalProtocolOptions } from "../internal-urls";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -276,6 +277,12 @@ export interface ToolSession {
 	getMcpManager?: () => import("../runtime-mcp/manager").MCPManager | undefined;
 	/** Whether local:// must use external managed scratch instead of artifacts/local. */
 	isManagedSessionDestination?: () => boolean;
+	/**
+	 * This session's own `local://` root binding. Router callers must pass it so
+	 * `local://` resolves inside the calling session's scratch tree instead of a
+	 * process-global root that may belong to another live session.
+	 */
+	getLocalProtocolOptions?: () => LocalProtocolOptions;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */

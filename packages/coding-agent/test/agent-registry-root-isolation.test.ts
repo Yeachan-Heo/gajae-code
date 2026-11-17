@@ -3,7 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { InternalUrlRouter, LocalProtocolHandler } from "@gajae-code/coding-agent/internal-urls";
+import {
+	InternalUrlRouter,
+	initializeLocalRoot,
+	LocalProtocolHandler,
+	type LocalProtocolOptions,
+	resolveLocalRoot,
+} from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry, MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -55,6 +61,28 @@ function writeMemoryFile(agentDir: string, cwd: string, name: string, body: stri
 
 function textOf(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
 	return result.content.map(part => part.text ?? "").join("\n");
+}
+
+/** The local:// root this session resolves inside. */
+function localRootOf(session: AgentSession): string {
+	return resolveLocalRoot({
+		getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+		isManagedDestination: () => session.sessionManager.isManagedDestination(),
+		getSessionId: () => session.sessionManager.getSessionId(),
+	});
+}
+
+function writeLocalFile(root: string, name: string, body: string): void {
+	fs.mkdirSync(root, { recursive: true });
+	fs.writeFileSync(path.join(root, name), body);
+}
+
+function managedScratchOptions(sessionId: string): LocalProtocolOptions {
+	return {
+		getArtifactsDir: () => null,
+		isManagedDestination: () => true,
+		getSessionId: () => sessionId,
+	};
 }
 
 async function runSessionTool(
@@ -267,6 +295,31 @@ describe("createAgentSession root registry", () => {
 		}
 	}, 60_000);
 
+	it("keeps a reminted second root registered when the first root stops", async () => {
+		const registry = new AgentRegistry();
+		const first = await openRoot({ agentRegistry: registry });
+		const second = await openRoot({ agentRegistry: registry });
+		let firstDisposed = false;
+		try {
+			stubReply(second.session, "second-still-alive");
+			const secondId = second.session.getAgentId() ?? "";
+			expect(secondId).not.toBe(MAIN_AGENT_ID);
+			await first.session.dispose();
+			firstDisposed = true;
+			expect(registry.get(MAIN_AGENT_ID)).toBeUndefined();
+			expect(registry.get(secondId)?.session).toBe(second.session);
+			const reply = await ircFrom(registry, "1-peer").execute("after-first-stop", {
+				op: "send",
+				to: secondId,
+				message: "ping",
+			});
+			expect(reply.details?.replies?.[0]?.text).toBe("second-still-alive");
+		} finally {
+			if (!firstDisposed) await first.session.dispose();
+			await second.session.dispose();
+		}
+	}, 120_000);
+
 	it("keeps a single registered memory root without a caller cwd", async () => {
 		const opened = await openRoot();
 		try {
@@ -424,4 +477,129 @@ describe("createAgentSession root registry", () => {
 			setAgentDir(previousAgentDir);
 		}
 	}, 120_000);
+
+	it("reads local:// inside the calling root across two default roots", async () => {
+		const first = await openRoot();
+		const second = await openRoot();
+		let firstDisposed = false;
+		try {
+			const firstRoot = localRootOf(first.session);
+			const secondRoot = localRootOf(second.session);
+			expect(path.resolve(firstRoot)).not.toBe(path.resolve(secondRoot));
+			writeLocalFile(firstRoot, "review.txt", "first-root-local\n");
+			writeLocalFile(firstRoot, "only-first.txt", "only-first-local\n");
+			writeLocalFile(secondRoot, "review.txt", "second-root-local\n");
+			writeLocalFile(secondRoot, "only-second.txt", "only-second-local\n");
+
+			const readLocal = async (session: AgentSession, name: string) =>
+				textOf(await runSessionTool(session, "read", { path: `local://${name}` }));
+
+			expect(await readLocal(first.session, "review.txt")).toContain("first-root-local");
+			expect(await readLocal(second.session, "review.txt")).toContain("second-root-local");
+			expect(await readLocal(second.session, "review.txt")).not.toContain("first-root-local");
+			expect(await readLocal(first.session, "review.txt")).not.toContain("second-root-local");
+			// A file that exists only in the other root is never returned here.
+			await expect(readLocal(second.session, "only-first.txt")).rejects.toThrow(/not found/i);
+			await expect(readLocal(first.session, "only-second.txt")).rejects.toThrow(/not found/i);
+
+			await first.session.dispose();
+			firstDisposed = true;
+			expect(await readLocal(second.session, "review.txt")).toContain("second-root-local");
+			expect(await readLocal(second.session, "only-second.txt")).toContain("only-second-local");
+			await expect(readLocal(second.session, "only-first.txt")).rejects.toThrow(/not found/i);
+		} finally {
+			if (!firstDisposed) await first.session.dispose();
+			await second.session.dispose();
+		}
+	}, 120_000);
+
+	it("resolves a caller local binding instead of the process-global root", async () => {
+		// The live default root is what the process-global fallback would pick.
+		const processRoot = await openRoot();
+		const suffix = Snowflake.next();
+		const firstScratchId = `pr7576-scratch-a-${suffix}`;
+		const secondScratchId = `pr7576-scratch-b-${suffix}`;
+		const firstOptions = managedScratchOptions(firstScratchId);
+		const secondOptions = managedScratchOptions(secondScratchId);
+		const firstScratch = path.join(os.tmpdir(), "gjc-local", firstScratchId);
+		const secondScratch = path.join(os.tmpdir(), "gjc-local", secondScratchId);
+		try {
+			// A caller-bound managed root is the reported /tmp/gjc-local/<id> path.
+			expect(resolveLocalRoot(firstOptions)).toBe(firstScratch);
+			expect(resolveLocalRoot(secondOptions)).toBe(secondScratch);
+			const router = InternalUrlRouter.instance();
+			await initializeLocalRoot(firstOptions);
+			await initializeLocalRoot(secondOptions);
+			writeLocalFile(firstScratch, "review.txt", "managed-first\n");
+			writeLocalFile(firstScratch, "only-first.txt", "managed-only-first\n");
+			writeLocalFile(secondScratch, "review.txt", "managed-second\n");
+
+			const firstRead = await router.resolve("local://review.txt", { localProtocolOptions: firstOptions });
+			const secondRead = await router.resolve("local://review.txt", { localProtocolOptions: secondOptions });
+			expect(firstRead.content).toBe("managed-first\n");
+			expect(secondRead.content).toBe("managed-second\n");
+			expect(firstRead.sourcePath?.startsWith(firstScratch)).toBe(true);
+			expect(secondRead.sourcePath?.startsWith(secondScratch)).toBe(true);
+			await expect(
+				router.resolve("local://only-first.txt", { localProtocolOptions: secondOptions }),
+			).rejects.toThrow(/local file not found/i);
+		} finally {
+			await processRoot.session.dispose();
+			fs.rmSync(firstScratch, { recursive: true, force: true });
+			fs.rmSync(secondScratch, { recursive: true, force: true });
+		}
+	}, 120_000);
+
+	it("fails closed when a caller supplies no local binding", async () => {
+		const opened = await openRoot();
+		try {
+			await expect(
+				InternalUrlRouter.instance().resolve("local://review.txt", { cwd: opened.session.sessionManager.getCwd() }),
+			).rejects.toThrow(/no session local root binding/i);
+		} finally {
+			await opened.session.dispose();
+		}
+	}, 120_000);
+
+	it("keeps the first root registered when a second root fails startup", async () => {
+		const first = await openRoot();
+		const sharedRegistry = new AgentRegistry();
+		try {
+			stubReply(first.session, "first-still-alive");
+			const failingExtension = () => {
+				throw new Error("simulated second-root startup failure");
+			};
+			await expect(openRoot({ extensions: [failingExtension] })).rejects.toThrow(
+				/simulated second-root startup failure/,
+			);
+			expect(
+				AgentRegistry.global()
+					.list()
+					.map(ref => ref.id),
+			).toEqual([MAIN_AGENT_ID]);
+			expect(AgentRegistry.global().get(MAIN_AGENT_ID)?.session).toBe(first.session);
+			const reply = await ircFrom(AgentRegistry.global(), "1-peer").execute("after-failure", {
+				op: "send",
+				to: MAIN_AGENT_ID,
+				message: "ping",
+			});
+			expect(reply.details?.replies?.[0]?.text).toBe("first-still-alive");
+
+			// A shared registry is where a newcomer could remint onto a new id; a
+			// failed startup must not leave that entry behind either.
+			const sharedFirst = await openRoot({ agentRegistry: sharedRegistry });
+			try {
+				expect(sharedRegistry.get(MAIN_AGENT_ID)?.session).toBe(sharedFirst.session);
+				await expect(openRoot({ agentRegistry: sharedRegistry, extensions: [failingExtension] })).rejects.toThrow(
+					/simulated second-root startup failure/,
+				);
+				expect(sharedRegistry.list().map(ref => ref.id)).toEqual([MAIN_AGENT_ID]);
+				expect(sharedRegistry.get(MAIN_AGENT_ID)?.session).toBe(sharedFirst.session);
+			} finally {
+				await sharedFirst.session.dispose();
+			}
+		} finally {
+			await first.session.dispose();
+		}
+	}, 180_000);
 });

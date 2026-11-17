@@ -3658,6 +3658,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		// `local://` authority follows the CALLING session. Tools thread this into
+		// the router so a second root's reads never resolve against the first
+		// root's artifacts/local or managed /tmp/gjc-local scratch tree.
+		toolSession.getLocalProtocolOptions = () => session?.getLocalProtocolOptions() ?? localProtocolOptions;
 		toolSession.getAgentModelOverrides = () =>
 			session?.getAgentModelOverrides() ?? settings.get("task.agentModelOverrides");
 		toolSession.hasSessionAgentModelOverride = role => session?.hasSessionAgentModelOverride(role) ?? false;

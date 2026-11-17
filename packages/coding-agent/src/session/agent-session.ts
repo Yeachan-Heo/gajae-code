@@ -8050,6 +8050,17 @@ export class AgentSession {
 	getAgentId(): string | undefined {
 		return this.#agentId;
 	}
+
+	/**
+	 * This session's own `local://` root binding.
+	 *
+	 * Callers that resolve a `local://` URL through the internal URL router must
+	 * pass this as `ResolveContext.localProtocolOptions`; the router otherwise
+	 * has no way to tell this session's scratch tree from another live root's.
+	 */
+	getLocalProtocolOptions(): LocalProtocolOptions {
+		return this.#localProtocolOptions();
+	}
 	get isDisposed(): boolean {
 		return this.#isDisposed;
 	}

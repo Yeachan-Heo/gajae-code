@@ -5,6 +5,8 @@
  * providing access to agent outputs and server resources without exposing filesystem paths.
  */
 
+import type { LocalProtocolOptions } from "./local-protocol";
+
 /**
  * Raw resource payload returned by protocol handlers. The `immutable` flag is
  * applied by the router from {@link ProtocolHandler.immutable}, so handlers do
@@ -69,6 +71,13 @@ export interface ResolveContext {
 	signal?: AbortSignal;
 	/** Scope-held MCP facade used for mcp:// resolution; never inferred from process-global state. */
 	mcpManager?: import("../runtime-mcp/manager").MCPManager;
+	/**
+	 * The calling session's own `local://` root binding. Handlers that resolve
+	 * caller-owned scratch MUST use this instead of inferring a session from
+	 * process-global state: two live roots keep separate scratch trees, and only
+	 * an explicitly configured binding may be shared.
+	 */
+	localProtocolOptions?: LocalProtocolOptions;
 }
 
 /**
