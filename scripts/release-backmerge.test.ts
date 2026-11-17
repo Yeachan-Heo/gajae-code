@@ -119,10 +119,11 @@ function manifest(version: string, digest: string): string {
  * A bare origin whose `main` ships a release that `dev` has not seen, with a diverged
  * build-digest manifest — the shape every release backmerge has to merge. With
  * `devAncestor`, `dev` stays at the base commit so the release tag descends from it and a
- * plain `git merge` would only fast-forward.
+ * plain `git merge` would only fast-forward. `releaseManifest: null` ships a release
+ * commit that carries no manifest at all.
  */
 async function backmergeFixture(
-	options: { releaseManifest?: string; secondConflict?: boolean; devAncestor?: boolean } = {},
+	options: { releaseManifest?: string | null; secondConflict?: boolean; devAncestor?: boolean } = {},
 ) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-backmerge-e2e-"));
 	tempRoots.push(root);
@@ -154,7 +155,11 @@ async function backmergeFixture(
 	await git(work, "push", "origin", "dev");
 
 	await git(work, "checkout", "main");
-	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), options.releaseManifest ?? manifest("0.18.7", "main-digest"));
+	if (options.releaseManifest === null) {
+		await fs.rm(path.join(work, BACKMERGE_CONFLICT_PATH), { force: true });
+	} else {
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), options.releaseManifest ?? manifest("0.18.7", "main-digest"));
+	}
 	if (options.secondConflict === true) await Bun.write(readme, "main\n");
 	await Bun.write(path.join(work, "released.txt"), "released\n");
 	await git(work, "add", "-A");
@@ -191,17 +196,40 @@ async function runRecoveryRecipe(
 	}
 }
 
-/** Push `backmerge/<version>` the way the previous resolver built it: dev's merge, its manifest.
+/**
+ * Push `backmerge/<version>` the way the previous resolver built it: dev's merge, its manifest.
+ * `legacyManifest: null` resolves the merge by deleting the manifest instead, so the branch
+ * carries no manifest at all.
  */
-async function pushLegacyBackmergeBranch(work: string, version: string, legacyManifest: string): Promise<void> {
+async function pushLegacyBackmergeBranch(
+	work: string,
+	version: string,
+	legacyManifest: string | null,
+): Promise<void> {
 	await git(work, "fetch", "origin");
 	await git(work, "checkout", "-b", `legacy-${version}`, "origin/dev");
 	const merge = await gitCommand(work, ["merge", "--no-commit", "--no-ff", `v${version}`]);
 	expect(merge.exitCode).not.toBe(0);
-	await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), legacyManifest);
-	await git(work, "add", BACKMERGE_CONFLICT_PATH);
+	if (legacyManifest === null) {
+		await git(work, "rm", "--force", BACKMERGE_CONFLICT_PATH);
+	} else {
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), legacyManifest);
+		await git(work, "add", BACKMERGE_CONFLICT_PATH);
+	}
 	await git(work, "commit", "-m", `chore(release): sync the v${version} release into dev`);
 	await git(work, "push", "origin", `HEAD:refs/heads/backmerge/${version}`);
+}
+
+/**
+ * Push a pre-existing `backmerge/<version>` branch, then rerun the backmerge against it: the
+ * shape every reopen validation has to decide on before any pull request is opened.
+ */
+async function attemptReopen(work: string, origin: string, version: string, branchManifest: string | null) {
+	await pushLegacyBackmergeBranch(work, version, branchManifest);
+	const tip = await git(origin, "rev-parse", `backmerge/${version}`);
+	const opener = recordingOpener();
+	const outcome = await backmergeReleaseIntoDev(version, { repoDir: work, openPullRequest: opener.openPullRequest });
+	return { outcome, opened: opener.opened, tip };
 }
 
 /** The recipe must publish a two-parent merge of dev's tip and the release commit carrying the tag's manifest. */
@@ -394,6 +422,83 @@ describe("backmerge orchestration", () => {
 			expect(opener.opened).toHaveLength(0);
 			expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(oldTip);
 		}
+	});
+
+	test("blocks a reopen when the release tag's manifest is not JSON", async () => {
+		const { origin, work } = await backmergeFixture({ releaseManifest: '{\n  "schema": "gjc.diagnostic-artifact",\n' });
+		const { outcome, opened, tip } = await attemptReopen(work, origin, "0.18.7", manifest("0.18.7", "main-digest"));
+
+		expect(outcome.action).toBe("blocked");
+		expect(outcome.detail).toContain(`the v0.18.7 release tag's ${BACKMERGE_CONFLICT_PATH} is not valid JSON`);
+		expect(opened).toHaveLength(0);
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
+	});
+
+	test("blocks a reopen on a parseable release-tag manifest that is not a manifest", async () => {
+		// `{}` and `null` are valid JSON, so they never reach the parse-error path. They are
+		// shape-invalid, and the tag side is checked before anything is compared against it.
+		for (const [tagManifest, problem] of [
+			["{}", "has no string version"],
+			["null", "is not a JSON object"],
+		] as const) {
+			const { origin, work } = await backmergeFixture({ releaseManifest: tagManifest });
+			const { outcome, opened, tip } = await attemptReopen(work, origin, "0.18.7", manifest("0.18.7", "main-digest"));
+
+			expect(outcome.action).toBe("blocked");
+			expect(outcome.detail).toContain(`the v0.18.7 release tag's ${BACKMERGE_CONFLICT_PATH} ${problem}`);
+			// Validity is reported, not a stale comparison against an invalid reference.
+			expect(outcome.detail).not.toContain("carries a stale manifest");
+			expect(opened).toHaveLength(0);
+			expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
+		}
+	});
+
+	test("blocks a reopen when the release tag carries no manifest", async () => {
+		const { origin, work } = await backmergeFixture({ releaseManifest: null });
+		const { outcome, opened, tip } = await attemptReopen(work, origin, "0.18.7", manifest("0.18.7", "main-digest"));
+
+		expect(outcome.action).toBe("blocked");
+		expect(outcome.detail).toContain(`the v0.18.7 release tag carries no ${BACKMERGE_CONFLICT_PATH}`);
+		expect(opened).toHaveLength(0);
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
+	});
+
+	test("blocks a reopen when the branch carries no manifest", async () => {
+		const { origin, work } = await backmergeFixture();
+		const { outcome, opened, tip } = await attemptReopen(work, origin, "0.18.7", null);
+
+		expect(outcome.action).toBe("blocked");
+		expect(outcome.detail).toContain(`its ${BACKMERGE_CONFLICT_PATH} is missing`);
+		expect(opened).toHaveLength(0);
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
+	});
+
+	test("does not reopen a branch on the strength of matching degenerate manifests", async () => {
+		// The regression this guards: equality alone let `{}` on both sides, or `null` on both
+		// sides, pass every check and open a pull request carrying no artifacts. It must never
+		// open one.
+		for (const degenerate of ["{}", "null"] as const) {
+			const { origin, work } = await backmergeFixture({ releaseManifest: degenerate });
+			const { outcome, opened, tip } = await attemptReopen(work, origin, "0.18.7", degenerate);
+
+			expect(outcome.action).toBe("blocked");
+			expect(outcome.detail).toContain(`the v0.18.7 release tag's ${BACKMERGE_CONFLICT_PATH}`);
+			expect(opened).toHaveLength(0);
+			expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
+		}
+	});
+
+	test("reopens a branch whose manifest only reorders keys", async () => {
+		const { origin, work } = await backmergeFixture();
+		// Same three fields and digest as the tag, serialized in a different key order.
+		const released = JSON.parse(manifest("0.18.7", "main-digest")) as Record<string, unknown>;
+		const reordered = `${JSON.stringify({ artifacts: released.artifacts, version: released.version, schema: released.schema })}\n`;
+		const { outcome, opened, tip } = await attemptReopen(work, origin, "0.18.7", reordered);
+
+		expect(outcome.action).toBe("opened");
+		expect(opened).toHaveLength(1);
+		expect(outcome.detail).toContain(`backmerge/0.18.7 -> dev is open`);
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
 	});
 
 	test("a rerun opens the pull request a failed run left behind without rebuilding the branch", async () => {

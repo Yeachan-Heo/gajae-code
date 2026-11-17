@@ -1027,6 +1027,26 @@ export function backmergeRecoverySteps(
 const BACKMERGE_PUSH_ATTEMPTS = 3;
 
 /**
+ * Why a parsed manifest is not one the backmerge can rely on, or `undefined` when it is:
+ * a string `version`, a string `schema`, and an `artifacts` map. The conflict resolver and
+ * the reopen comparison both depend on exactly these fields, so they share this check;
+ * two notions of validity would let one path open what the other would have rejected.
+ *
+ * This is a shape check on an already-parsed value on purpose. `null`, `{}`, and an object
+ * with no `artifacts` all parse successfully, so no parse-error path can reject them: they
+ * are caught here, and only here.
+ */
+function diagnosticArtifactManifestProblem(manifest: unknown): string | undefined {
+	if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) return "is not a JSON object";
+	const fields = manifest as Record<string, unknown>;
+	if (typeof fields.version !== "string") return "has no string version";
+	if (typeof fields.schema !== "string") return "has no string schema";
+	const artifacts = fields.artifacts;
+	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) return "has no artifacts map";
+	return undefined;
+}
+
+/**
  * Resolve the known diagnostic-artifact backmerge conflict by taking the release tag's
  * manifest wholesale: its `version` and its `artifacts`. A version label may only cover
  * the bytes that release built, so a digest dev built for another version is dropped
@@ -1035,16 +1055,8 @@ const BACKMERGE_PUSH_ATTEMPTS = 3;
  */
 export function resolveDiagnosticArtifactBackmerge(released: string): string {
 	const manifest = JSON.parse(released) as Record<string, unknown>;
-	if (typeof manifest.version !== "string") {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on the release tag`);
-	}
-	if (typeof manifest.schema !== "string") {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on the release tag`);
-	}
-	const artifacts = manifest.artifacts;
-	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on the release tag`);
-	}
+	const problem = diagnosticArtifactManifestProblem(manifest);
+	if (problem !== undefined) throw new Error(`${BACKMERGE_CONFLICT_PATH} ${problem} on the release tag`);
 	return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
@@ -1126,6 +1138,10 @@ function manifestVersionLabel(manifest: unknown): string {
  * under the released version. Reopening it would publish bytes the release never built, and
  * this script never rewrites a branch that may already carry review fixes, so a manifest
  * that differs from the tag's fails closed with delete-and-rerun guidance instead.
+ *
+ * Both manifests must be shape-valid before they are compared: equality alone would let a
+ * parseable degenerate manifest — `{}` or `null`, on either side — satisfy the comparison
+ * and reopen a branch that carries no artifacts at all.
  */
 async function existingBackmergeManifestProblem(
 	repoDir: string,
@@ -1146,11 +1162,21 @@ async function existingBackmergeManifestProblem(
 	} catch {
 		return `the v${version} release tag's ${BACKMERGE_CONFLICT_PATH} is not valid JSON`;
 	}
+	// `null` and `{}` reach this point: they are valid JSON, so the shape check below, not
+	// the parse-error path above, is what rejects them.
+	const tagProblem = diagnosticArtifactManifestProblem(tagManifest);
+	if (tagProblem !== undefined) return `the v${version} release tag's ${BACKMERGE_CONFLICT_PATH} ${tagProblem}`;
 	let branchManifest: unknown;
 	try {
 		branchManifest = JSON.parse(onBranch);
 	} catch {
 		return `its ${BACKMERGE_CONFLICT_PATH} cannot be read as JSON; delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
+	}
+	// Same asymmetry as the tag side: a degenerate branch manifest parses, so it is refused
+	// here instead of passing by matching an equally degenerate tag manifest.
+	const branchProblem = diagnosticArtifactManifestProblem(branchManifest);
+	if (branchProblem !== undefined) {
+		return `its ${BACKMERGE_CONFLICT_PATH} ${branchProblem}; delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
 	}
 	if (canonicalJson(branchManifest) === canonicalJson(tagManifest)) return undefined;
 	return `its ${BACKMERGE_CONFLICT_PATH} carries a stale manifest (branch version ${manifestVersionLabel(branchManifest)}, released version ${manifestVersionLabel(tagManifest)}) that does not match the v${version} release tag. Delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
