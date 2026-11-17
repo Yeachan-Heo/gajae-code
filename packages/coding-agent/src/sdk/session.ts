@@ -191,6 +191,7 @@ import {
 	isSessionDisposalIncompleteError,
 	type SessionMcpControlPort,
 	type SessionMcpDeclaredServer,
+	SharedControlPublicationError,
 } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
@@ -662,7 +663,7 @@ export interface CreateAgentSessionOptions {
 	discoverableToolAllowedNames?: readonly string[];
 	/**
 	 * Discoverable built-in tools that must stay in the initial active set even when
-	 * `tools.discoveryMode === "all"` would otherwise hide them behind `search_tool_bm25`.
+	 * `tools.effectiveDiscoveryMode === "all"` would otherwise hide them behind `search_tool_bm25`.
 	 * Used for coordination tools (e.g. `irc`) that a subagent must be able to use
 	 * immediately without first spending a discovery round-trip to find them.
 	 */
@@ -1631,6 +1632,27 @@ function nativeProjectMcpAutoload(settings: Settings): {
 	return { enableProjectConfig: true, allowProjectStdio: false };
 }
 
+/**
+ * Persist a tool selection written while the session is bootstrapped. An admitted root
+ * publishes it through the shared lease, because a resumed transcript may already be live
+ * in another process; any other opener appends it as before. A shared publication that
+ * does not commit fails startup with its typed outcome rather than writing outside the lease.
+ */
+async function persistBootstrapToolSelections(
+	manager: SessionManager,
+	mcpToolNames: string[] | undefined,
+	builtinToolNames: string[] | undefined,
+): Promise<void> {
+	if (mcpToolNames === undefined && builtinToolNames === undefined) return;
+	if (!manager.usesSharedPublication()) {
+		if (mcpToolNames !== undefined) manager.appendMCPToolSelection(mcpToolNames);
+		if (builtinToolNames !== undefined) manager.appendDiscoveredBuiltinToolSelection(builtinToolNames);
+		return;
+	}
+	const outcome = await manager.appendToolSelectionsSharingSession(mcpToolNames, builtinToolNames, () => true);
+	if (outcome.kind !== "committed") throw new SharedControlPublicationError("restore tool selection", outcome);
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const automationTools = validateAutomationTools(options);
 	const primaryControlSurface = primaryControlSurfaceFor(options);
@@ -2088,6 +2110,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
 		liveSessionManager = sessionManager;
+		// The trusted root interactive opener publishes through the shared lease (#7711).
+		// Admit it before any bootstrap write: a resumed transcript may already be live in
+		// another process, so even startup writes must go through admission.
+		const rootInteractiveSharedAppend =
+			primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession;
+		if (rootInteractiveSharedAppend) sessionManager.admitRootSharedPublication();
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
@@ -5351,7 +5379,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				existingSession.hasPersistedMCPToolSelection &&
 				restoredSelectedMCPToolNames.length !== existingSession.selectedMCPToolNames.length
 			) {
-				sessionManager.appendMCPToolSelection(restoredSelectedMCPToolNames);
+				await persistBootstrapToolSelections(sessionManager, restoredSelectedMCPToolNames, undefined);
 			}
 			defaultSelectedMCPToolNames = [
 				...new Set([
@@ -5398,7 +5426,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
-		// When tools.discoveryMode === "all", hide non-essential built-in discoverable tools
+		// When tools.effectiveDiscoveryMode === "all", hide non-essential built-in discoverable tools
 		// from the initial set unless they were explicitly requested or restored from persistence.
 		// The model finds them via search_tool_bm25 and activates them on demand.
 		if (effectiveDiscoveryMode === "all") {
@@ -5911,10 +5939,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			: undefined;
 
+		// A published transcript of an admitted root (a header-only resume) cannot take the
+		// constructor's legacy staging append; publish the explicit selection first.
+		const stageInitialToolSelections =
+			!sessionManager.usesSharedPublication() || !sessionManager.isTranscriptPublished();
+		if (!stageInitialToolSelections && !hasExistingSession)
+			await persistBootstrapToolSelections(
+				sessionManager,
+				hasExplicitMCPToolSelection && mcpDiscoveryEnabled ? selectableExplicitMCPToolNames : undefined,
+				hasExplicitDiscoveredBuiltinToolSelection && effectiveDiscoveryMode === "all"
+					? explicitlyRequestedDiscoveredBuiltinToolNames
+					: undefined,
+			);
 		session = new AgentSession({
 			agent,
-			rootInteractiveSharedAppend:
-				primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession,
+			rootInteractiveSharedAppend,
 			thinkingLevel,
 			sessionManager,
 			settings,
@@ -6013,8 +6052,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			defaultSelectedMCPToolNames,
 			defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload ? [] : conventionalMcpToolNames,
 			mandatoryMCPToolNames: pluginMcpToolNames,
-			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
-			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
+			persistInitialMCPToolSelection:
+				stageInitialToolSelections && !hasExistingSession && hasExplicitMCPToolSelection,
+			persistInitialDiscoveredBuiltinToolSelection:
+				stageInitialToolSelections && !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
 			initialPersistedMCPToolNames: selectableExplicitMCPToolNames,
 			initialPersistedDiscoveredBuiltinToolNames: explicitlyRequestedDiscoveredBuiltinToolNames,
 			defaultSelectedMCPServerNames: settings.get("mcp.discoveryDefaultServers") ?? [],

@@ -5208,6 +5208,11 @@ export class AgentSession {
 
 	#assertSessionAdmissionOpen(): void {
 		this.#assertSharedSessionOpen();
+		// A writer outside shared admission whose append was fenced because another
+		// process wrote this transcript accepts no more work: report that typed rejection
+		// before any effect instead of growing live state its transcript cannot record.
+		const fenced = this.sessionManager.getAppendIdentityMismatch();
+		if (fenced) throw fenced;
 		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
 			throw this.#sessionAdmissionBusyError();
 		}
@@ -5215,7 +5220,11 @@ export class AgentSession {
 
 	/** Atomically refuse busy retirement or fence every prompt admission until disposal. */
 	prepareCloseIfIdle(): void {
-		this.#assertSessionAdmissionOpen();
+		// A fenced writer may still retire; only a closed or busy session refuses here.
+		this.#assertSharedSessionOpen();
+		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
+			throw this.#sessionAdmissionBusyError();
+		}
 		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
 		if (
@@ -24665,6 +24674,87 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
+	/**
+	 * A CLI `--model`/`--thinking` startup override in a shared session. A resumed opener
+	 * may share its transcript with a live peer, so the model change, the effective
+	 * thinking and (for a session default) the configured chain publish as one admitted
+	 * append before any live state changes, mirroring the legacy startup override.
+	 */
+	async #setSharedStartupOverrideModel(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+		persistAsSessionDefault: boolean,
+	): Promise<void> {
+		const operation = "apply startup model override";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const expectedSessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const previousEditMode = this.#resolveActiveEditMode();
+		const selector = `${model.provider}/${model.id}`;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === expectedSessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.#defaultModelSelectionMutationRevision === expectedMutationRevision &&
+				this.#thinkingLevelMutationRevision === thinkingRevision
+			);
+		};
+		const assertCurrent = () => {
+			if (!current()) throw new Error("Session changed while applying the startup model override");
+		};
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+		assertCurrent();
+		if (!apiKey) throw new Error(`No API key for ${selector}`);
+		const requestedLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
+		const effectiveLevel = resolveThinkingLevelForModel(model, requestedLevel);
+		const entries: SharedControlEntry[] = [
+			{ type: "model_change", model: selector, role: persistAsSessionDefault ? "default" : "temporary" },
+		];
+		if (effectiveLevel !== this.#thinkingLevel)
+			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
+		if (persistAsSessionDefault)
+			entries.push({
+				type: "configured_model_chain",
+				chain: {
+					role: "default",
+					entries: [formatModelSelectorValue(selector, requestedLevel)],
+					origin: "startup-override",
+					explicitHead: true,
+					cleared: false,
+				},
+			});
+		const outcome = await this.#withStartedSharedControlPublication(assertCurrent, () =>
+			manager.appendControlEntriesSharingSession(entries, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		try {
+			assertCurrent();
+			this.#btwPrefixLedger.clear();
+			this.#setModelAuthoritatively(model, "startup-override");
+			if (persistAsSessionDefault) {
+				this.#seedSessionCanonicalVariant(model);
+				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+				this.#defaultFallbackController = undefined;
+				this.#defaultFallbackExhaustedLastTurn = false;
+			}
+			this.#applyThinkingLevel(requestedLevel, false, false, undefined, true);
+		} catch (error) {
+			return this.#failClosedSharedControl(operation, outcome, error);
+		}
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
 	async #setSharedTemporaryModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
@@ -24835,6 +24925,8 @@ export class AgentSession {
 		) {
 			return this.#setSharedSessionDefaultModel(model, thinkingLevel, options);
 		}
+		if (this.#usesSharedSessionPublication() && options?.cause === "startup-override")
+			return this.#setSharedStartupOverrideModel(model, thinkingLevel, options.persistAsSessionDefault === true);
 		if (options?.signal?.aborted) return;
 		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		this.#btwPrefixLedger.clear();

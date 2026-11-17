@@ -760,7 +760,15 @@ async function applyStartupModelProfilesWithPolicy(
 			cause: "startup-override",
 		});
 		const selector = `${explicitModel.provider}/${explicitModel.id}`;
-		args.session.setConfiguredModelChain("default", [selector], "startup-override", undefined, true);
+		// Shared-aware: a resumed root TUI publishes the chain through the admitted lease.
+		await args.session.setConfiguredModelChainForControl(
+			"default",
+			[selector],
+			"startup-override",
+			undefined,
+			true,
+			() => true,
+		);
 		args.session.seedDefaultFallbackResolution(0, []);
 	} else if (!modelSelectionChangedDuringRecovery && args.parsedArgs.thinking && args.session.model) {
 		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking, { cause: "startup-override" });

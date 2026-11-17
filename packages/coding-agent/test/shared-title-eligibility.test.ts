@@ -100,7 +100,7 @@ async function fixture(options?: { sharedAppend?: boolean }) {
 }
 
 describe("shared publication admission split", () => {
-	it("keeps ordinary appends and message_end persistence available after an automatic title", async () => {
+	it("keeps message_end persistence available after an automatic title publishes the root", async () => {
 		const f = await fixture();
 		vi.spyOn(titleGenerator, "generateSessionTitle").mockResolvedValue("Automatic title");
 		expect(await f.session.generateAutoSessionTitle("first input")).toEqual({
@@ -108,10 +108,12 @@ describe("shared publication admission split", () => {
 			title: "Automatic title",
 		});
 		expect(f.manager.getSessionName()).toBe("Automatic title");
-		expect(() => f.manager.assertLegacyAppendAllowed("ordinary append")).not.toThrow();
-
-		const custom = f.manager.appendCustomEntry("post-title", { value: 1 });
-		expect(f.manager.getLeafId()).toBe(custom);
+		// The title published this admitted root's transcript, so a legacy writer would
+		// bypass the lease a live peer may now hold; the session's own producers publish.
+		expect(() => f.manager.appendCustomEntry("post-title", { value: 1 })).toThrow(
+			SharedSessionMutationUnsupportedError,
+		);
+		await f.session.appendCustomEntryForSession("post-title", { value: 1 });
 
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("ordinary user message") });
 		await f.session.awaitSessionSettlement();
@@ -135,7 +137,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("still rejects a concurrent legacy mutation while the title publication is in flight", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		const title = f.manager.setSessionNameSharingSession("In flight", "user");
 		expect(() => f.manager.appendMessage(user("concurrent"))).toThrow(SharedSessionMutationUnsupportedError);
 		expect(await title).toEqual({ kind: "committed", title: "In flight" });
@@ -143,7 +145,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("keeps rewrite authority barred after a title adopts a sibling snapshot", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -177,7 +179,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("holds the in-flight fence until every queued title publication settles", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -210,7 +212,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("releases scoped admission when publication setup throws before the transaction", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -233,7 +235,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("scopes temporary-model append admission while retaining rewrite authority", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -251,7 +253,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("scopes thinking append admission while retaining rewrite authority", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -267,7 +269,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("scopes discovered-tool append admission while retaining rewrite authority", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -781,7 +783,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("keeps rewrite authority when a title adopts this manager's own transcript", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();
@@ -815,7 +817,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("scopes mode-change append admission while retaining the rewrite fence", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		f.manager.appendMessage(user("local root"));
 		await f.manager.ensureOnDisk();
 		await f.manager.flush();

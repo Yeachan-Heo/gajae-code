@@ -13208,6 +13208,10 @@ export class SessionManager {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
 	}
 
+	#sharedPublicationUnknownError(): SharedPublicationUnknownError | undefined {
+		return this.#persistError instanceof SharedPublicationUnknownError ? this.#persistError : undefined;
+	}
+
 	/** The retained receipt of the shared publication that latched persistence with an unknown outcome. */
 	getUnknownSharedPublication(): SharedPublicationUncertainty | undefined {
 		return this.#persistError instanceof SharedPublicationUnknownError ? this.#persistError.uncertainty : undefined;
@@ -20834,6 +20838,15 @@ export class SessionManager {
 		this.#rootSharedPublication = true;
 	}
 
+	/** Whether this manager's current transcript exists on disk. */
+	isTranscriptPublished(): boolean {
+		return this.#flushed || this.#ensuredOnDisk || this.#managedPersistExpectedIdentity !== undefined;
+	}
+
+	#rootSharedPublicationOwnsTranscript(): boolean {
+		return this.#rootSharedPublication && this.isManagedDestination() && this.isTranscriptPublished();
+	}
+
 	/**
 	 * The single publication-eligibility rule (#7824): a managed destination whose opener is
 	 * the admitted root, or whose logical session already requires shared admission.
@@ -20877,7 +20890,19 @@ export class SessionManager {
 	}
 
 	#assertLogicalSessionMutationAllowed(sessionId: string, operation: string, includeRewrite: boolean): void {
+		// A fenced or uncertain transcript takes no further write: refuse with the latched
+		// typed error before the caller changes live state the transcript cannot record.
+		if (sessionId === this.#sessionId) {
+			const latched = this.getAppendIdentityMismatch() ?? this.#sharedPublicationUnknownError();
+			if (latched) throw latched;
+		}
 		if ((this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0)
+			throw new SharedSessionMutationUnsupportedError(operation);
+		// An admitted root publishes only through the shared lease once its transcript
+		// exists on disk: a legacy write there skips the lease a live peer may hold, and
+		// fails later on a stale identity. Unpublished bootstrap staging stays legacy and
+		// becomes part of the first shared publication.
+		if (sessionId === this.#sessionId && this.#rootSharedPublicationOwnsTranscript())
 			throw new SharedSessionMutationUnsupportedError(operation);
 		if (this.#sharedAppendBarSessionIds.has(sessionId)) throw new SharedSessionMutationUnsupportedError(operation);
 		if (includeRewrite && this.#sharedRewriteBarSessionIds.has(sessionId))
