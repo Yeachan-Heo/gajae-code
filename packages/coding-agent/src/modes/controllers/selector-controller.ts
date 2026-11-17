@@ -8,7 +8,6 @@ import {
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
-	OAuthCredentialSelectorError,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -2903,12 +2902,15 @@ export class SelectorController {
 							},
 							{
 								accountProviderId: selectedProviderId,
+								// The selector fires these callbacks with `void`, so a rejection here is an
+								// unhandled rejection (a recorded GJC crash). Shared sessions refuse a
+								// credential write with SharedControlPublicationError (#7824); report every
+								// failure and keep the selector open so the user can retry or pick another row.
 								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
 									try {
 										await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
 									} catch (error: unknown) {
-										if (!(error instanceof OAuthCredentialSelectorError)) throw error;
-										this.ctx.showError(error.message);
+										this.ctx.showError(error instanceof Error ? error.message : String(error));
 										return;
 									}
 									selector.stopValidation();
@@ -2916,7 +2918,12 @@ export class SelectorController {
 									this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
 								},
 								onAutoSelect: async () => {
-									await this.ctx.session.setCredentialAuto(selectedProviderId);
+									try {
+										await this.ctx.session.setCredentialAuto(selectedProviderId);
+									} catch (error: unknown) {
+										this.ctx.showError(error instanceof Error ? error.message : String(error));
+										return;
+									}
 									selector.stopValidation();
 									done();
 									this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
