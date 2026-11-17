@@ -1,7 +1,6 @@
 import * as crypto from "node:crypto";
 import * as util from "node:util";
 import type { AgentSession } from "../session/agent-session";
-import { CURRENT_SESSION_VERSION } from "./session-readonly/format";
 import { captureNativeResumeTranscript } from "../session/native-resume";
 import {
 	admitOwnerMembershipWithAsyncEvidence,
@@ -10,8 +9,8 @@ import {
 	getOwnerMembershipEvidence,
 	type LegacyTakeoverAttestation,
 	OwnerAuthorityError,
-	type OwnerMembership,
 	type OwnerFreshCreation,
+	type OwnerMembership,
 	probeSessionOwnershipWithAsyncEvidence,
 	retireOwnerMembershipSync,
 	type SessionOwnerPolicy,
@@ -24,7 +23,7 @@ import type {
 	ResumeRetirementEvidence,
 	ResumeTerminationAuthorization,
 } from "../session/resume-operation";
-import { SessionManager, type PreparedNewSession } from "../session/session-manager";
+import { type PreparedNewSession, SessionManager } from "../session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
 import type {
 	ActivityControlOperation,
@@ -69,6 +68,7 @@ import type { SdkOperatorControls } from "./operator-controls";
 import type { SdkPreferenceControls } from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
 import { getSessionClientControls } from "./session-client-controls";
+import { CURRENT_SESSION_VERSION } from "./session-readonly/format";
 import type { ResumeSessionIdentity } from "./session-readonly/storage";
 import type { SideConversationControls } from "./side-conversation";
 
@@ -282,10 +282,20 @@ export function nativeEmbeddedOwnerOperation(manager: SessionManager): PendingRe
 }
 
 /** The manager has registered and durably published this exact moved operation. */
-export function nativeEmbeddedOperationMoved(manager: SessionManager, previous: PendingResumeOp, pending: PendingResumeOp): void {
+export function nativeEmbeddedOperationMoved(
+	manager: SessionManager,
+	previous: PendingResumeOp,
+	pending: PendingResumeOp,
+): void {
 	const owner = nativeOwners.get(manager);
-	if (!owner || !owner.session || owner.pending !== previous || manager.getOwnerMembership() !== owner.membership ||
-		!manager.isRegisteredNativeResumeOperation(pending)) throw new Error("context_mismatch");
+	if (
+		!owner ||
+		!owner.session ||
+		owner.pending !== previous ||
+		manager.getOwnerMembership() !== owner.membership ||
+		!manager.isRegisteredNativeResumeOperation(pending)
+	)
+		throw new Error("context_mismatch");
 	adoptNativeRuntimeSelection(owner.session, pending);
 }
 
@@ -296,16 +306,28 @@ export async function admitNativePreparedSuccessor(
 	freshCreation: OwnerFreshCreation,
 ): Promise<OwnerMembership> {
 	const owner = nativeOwners.get(manager);
-	if (!owner || manager.getOwnerMembership() !== owner.membership || !prepared.sessionFile ||
-		freshCreation.headerId !== prepared.sessionId) throw new Error("context_mismatch");
+	if (
+		!owner ||
+		manager.getOwnerMembership() !== owner.membership ||
+		!prepared.sessionFile ||
+		freshCreation.headerId !== prepared.sessionId
+	)
+		throw new Error("context_mismatch");
 	const target = captureOwnerTargetSync({ transcriptPath: prepared.sessionFile, headerId: prepared.sessionId });
 	if (target.transcriptExists) throw new Error("stale_snapshot");
-	const header = { type: "session" as const, version: CURRENT_SESSION_VERSION, id: prepared.sessionId,
-		timestamp: new Date().toISOString(), cwd: manager.getCwd() };
+	const header = {
+		type: "session" as const,
+		version: CURRENT_SESSION_VERSION,
+		id: prepared.sessionId,
+		timestamp: new Date().toISOString(),
+		cwd: manager.getCwd(),
+	};
 	const resolved = resolveResumeCheckpoint([header], target.snapshotDigest);
-	return admitOwnerMembershipWithAsyncEvidence(target,
+	return admitOwnerMembershipWithAsyncEvidence(
+		target,
 		{ kind: "exclusive_native", expected: { snapshotDigest: target.snapshotDigest, resolved }, freshCreation },
-		{ ...createNativeOwnerInspectors(owner.options), runtime: "embedded_native", capabilities: ["native_resume"] });
+		{ ...createNativeOwnerInspectors(owner.options), runtime: "embedded_native", capabilities: ["native_resume"] },
+	);
 }
 
 /** Internal baseline-factory hook: only a coordinator already owning this exact manager participates. */
@@ -323,7 +345,8 @@ export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result
 	const setToolUIContext = result.setToolUIContext;
 	let boundUI: typeof service.ui | undefined;
 	result.setToolUIContext = (ui, hasUI) => {
-		if (ui !== owner.interaction?.service.ui || !hasUI) throw new Error("Native UI must use its registered interaction service");
+		if (ui !== owner.interaction?.service.ui || !hasUI)
+			throw new Error("Native UI must use its registered interaction service");
 		if (boundUI === ui) return;
 		setToolUIContext(ui, hasUI);
 		boundUI = ui;

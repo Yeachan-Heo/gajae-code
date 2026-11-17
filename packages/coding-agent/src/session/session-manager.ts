@@ -73,7 +73,11 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
-import { admitNativePreparedSuccessor, nativeEmbeddedOwnerOperation, nativeEmbeddedOperationMoved } from "../sdk/native-embedding";
+import {
+	admitNativePreparedSuccessor,
+	nativeEmbeddedOperationMoved,
+	nativeEmbeddedOwnerOperation,
+} from "../sdk/native-embedding";
 import { createCooperativeOwnerInspectors } from "../sdk/native-ownership";
 import {
 	applyHeaderPatch,
@@ -441,10 +445,12 @@ const committedSessionEvidence = new WeakSet<CommittedSessionEvidence>();
 export function consumeCommittedSessionEvidence(manager: SessionManager, receipt: CommittedSessionEvidence): boolean {
 	if (!committedSessionEvidence.has(receipt) || receipt.manager !== manager) return false;
 	committedSessionEvidence.delete(receipt);
-	return manager.getSessionId() === receipt.successor.sessionId &&
+	return (
+		manager.getSessionId() === receipt.successor.sessionId &&
 		manager.getSessionFile() === receipt.successor.sessionFile &&
 		manager.getSessionIdentityGeneration() === receipt.successor.generation &&
-		manager.getOwnerMembership() === receipt.membership;
+		manager.getOwnerMembership() === receipt.membership
+	);
 }
 
 interface PreparedSessionIndex {
@@ -461,6 +467,7 @@ interface PreparedNewSessionState extends PreparedNewSession {
 	readonly titleSource: "auto" | "user" | undefined;
 	readonly freshCreation?: OwnerFreshCreation;
 	executionTargetLeafId?: string | null;
+	executionAppendBase?: string | null;
 	membership?: OwnerMembership;
 	ownerMarker?: { entry: CustomEntry; marker: OwnerFirstWriteMarker };
 	pending?: PendingResumeOp;
@@ -11384,7 +11391,10 @@ export class SessionManager {
 			this.#assertPreparedGraphPublicationAllowed(stage);
 			if (this.destination.kind === "managed") {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-				const identity = await this.#managedTranscriptStore(sessionFile).publishNoReplace(path.basename(sessionFile), bytes);
+				const identity = await this.#managedTranscriptStore(sessionFile).publishNoReplace(
+					path.basename(sessionFile),
+					bytes,
+				);
 				stage.publication = this.#preparedPublicationIdentity(stage, identity);
 			} else if (stage.membership) {
 				if (!this.#storage.openStagedWriter) throw new Error("durability_repair_unavailable");
@@ -11401,7 +11411,9 @@ export class SessionManager {
 						size: receipt.stat.size, mtimeMs: receipt.stat.mtimeMs, mtimeNs: receipt.stat.mtimeNs,
 						ctimeNs: receipt.stat.ctimeNs, sha256: receipt.sha256,
 					});
-				} finally { writer.closeSync(); }
+				} finally {
+					writer.closeSync();
+				}
 			} else {
 				const staleCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
 				if (staleCleanupError) throw staleCleanupError;
@@ -11431,16 +11443,27 @@ export class SessionManager {
 			stage.flushed = true;
 			if (stage.membership) this.#completePreparedNativePublication(stage);
 		};
-		await this.#publication.publish(() => stage.membership ? withOwnerPublication(stage.membership, publish) : publish());
+		await this.#publication.publish(() =>
+			stage.membership ? withOwnerPublication(stage.membership, publish) : publish(),
+		);
 	}
 
-	#preparedPublicationIdentity(stage: PreparedNewSessionState, identity: ManagedFileIdentity): Readonly<ResumeSessionIdentity> {
+	#preparedPublicationIdentity(
+		stage: PreparedNewSessionState,
+		identity: ManagedFileIdentity,
+	): Readonly<ResumeSessionIdentity> {
 		if (!stage.sessionFile || !identity.sha256 || identity.ctimeNs === undefined) throw new Error("stale_snapshot");
 		return Object.freeze({
-			canonicalPath: resolveEquivalentPath(stage.sessionFile), sessionId: stage.sessionId,
-			dev: identity.dev, ino: identity.ino, nlink: identity.nlink, size: identity.size,
-			mtimeMs: Number(identity.mtimeNs / 1_000_000n), mtimeNs: identity.mtimeNs,
-			ctimeNs: identity.ctimeNs, sha256: identity.sha256,
+			canonicalPath: resolveEquivalentPath(stage.sessionFile),
+			sessionId: stage.sessionId,
+			dev: identity.dev,
+			ino: identity.ino,
+			nlink: identity.nlink,
+			size: identity.size,
+			mtimeMs: Number(identity.mtimeNs / 1_000_000n),
+			mtimeNs: identity.mtimeNs,
+			ctimeNs: identity.ctimeNs,
+			sha256: identity.sha256,
 		});
 	}
 
@@ -11455,11 +11478,21 @@ export class SessionManager {
 			const marker = ownerFirstWriteMarkerSync(token);
 			if (!marker) throw new Error("participation_lost");
 			const entry: CustomEntry = {
-				type: "custom", customType: OWNER_ENROLL_CUSTOM_TYPE,
-				id: this.#nextPreparedNewSessionEntryId(stage), parentId: target,
+				type: "custom",
+				customType: OWNER_ENROLL_CUSTOM_TYPE,
+				id: this.#nextPreparedNewSessionEntryId(stage),
+				parentId: target,
 				timestamp: new Date().toISOString(),
-				data: { v: 1, bind: stage.sessionId, member: marker.memberId, runtime: marker.runtime,
-					pid: marker.pid, processIncarnation: marker.processIncarnation, hostId: marker.hostId, epoch: marker.epoch },
+				data: {
+					v: 1,
+					bind: stage.sessionId,
+					member: marker.memberId,
+					runtime: marker.runtime,
+					pid: marker.pid,
+					processIncarnation: marker.processIncarnation,
+					hostId: marker.hostId,
+					epoch: marker.epoch,
+				},
 			};
 			stage.ownerMarker = { entry, marker };
 			stage.fileEntries.push(entry);
@@ -11470,15 +11503,25 @@ export class SessionManager {
 			let parent = target;
 			for (let start = 0; start < candidates.length; start += 256) {
 				const cursor: CustomEntry = {
-					type: "custom", customType: RESUME_CURSOR_CUSTOM_TYPE,
-					id: this.#nextPreparedNewSessionEntryId(stage), parentId: parent,
+					type: "custom",
+					customType: RESUME_CURSOR_CUSTOM_TYPE,
+					id: this.#nextPreparedNewSessionEntryId(stage),
+					parentId: parent,
 					timestamp: new Date().toISOString(),
-					data: { v: 1, bind: stage.sessionId, op, idx: start / 256,
-						member: marker.memberId, reason: "fork_init", supersedes: candidates.slice(start, start + 256) },
+					data: {
+						v: 1,
+						bind: stage.sessionId,
+						op,
+						idx: start / 256,
+						member: marker.memberId,
+						reason: "fork_init",
+						supersedes: candidates.slice(start, start + 256),
+					},
 				};
 				stage.fileEntries.push(cursor);
 				parent = cursor.id;
 			}
+			stage.executionAppendBase = parent;
 		});
 	}
 
@@ -11487,6 +11530,8 @@ export class SessionManager {
 		const observed = captureNativeResumeTranscript(stage.sessionFile!, this.#storage);
 		if (observed.capture.kind !== "captured" || !observed.identity || !stage.publication ||
 			!util.isDeepStrictEqual(observed.identity, stage.publication)) throw new Error("stale_snapshot");
+		if (stage.executionAppendBase === undefined || observed.executionTail !== stage.executionAppendBase)
+			throw new Error("uncertain_cursor");
 		const marker = stage.ownerMarker!;
 		confirmOwnerFirstWriteMarkerSync(token, marker.marker, () => observed.capture.kind === "captured" &&
 			observed.capture.entries.some(entry => entry.id === marker.entry.id &&
@@ -11500,7 +11545,7 @@ export class SessionManager {
 			op: crypto.randomUUID(),
 			plan: Object.freeze({ enroll: null, selectionRequested: false, cursorIds: Object.freeze([] as string[]),
 				dependentIds: Object.freeze([] as string[]), target: stage.executionTargetLeafId! }),
-			manifest: Object.freeze([]), CB: observed.executionTail ?? null,
+			manifest: Object.freeze([]), CB: stage.executionAppendBase,
 			g0: Object.freeze({ fileEntriesIndex0: stage.fileEntries.length, entryRevision0: 0 }),
 			durabilityDebt: Object.freeze({ ids: Object.freeze([] as string[]), fileIdentity: Object.freeze(capture.fileIdentity),
 				snapshotDigest: capture.snapshotDigest, snapshotByteLength: resumeCaptureByteLength(capture), attempts: 0 }),
@@ -11508,7 +11553,7 @@ export class SessionManager {
 		bindNativeResumeOperation(pending, {
 			path: stage.sessionFile!, storage: this.#storage,
 			preOpEntries: capture.entries.map(entry => ({ ...entry, kind: "dependent" })),
-			preOpCommittedTail: observed.executionTail ?? null, prepared: [], ledger: new Map(), proofs: [],
+			preOpCommittedTail: stage.executionAppendBase, prepared: [], ledger: new Map(), proofs: [],
 			publicationSuccessions: [], durabilityState: "proven", attempts: 0, residentTip: pending.CB,
 		});
 		const repaired = repairNativeResumeDurability(pending, observed);

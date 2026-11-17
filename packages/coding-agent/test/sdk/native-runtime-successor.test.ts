@@ -104,6 +104,29 @@ for (const managed of [true, false]) {
 			await session.waitForIdle();
 		});
 
+		it("consumes checked same-file model-publication successions without rebinding identity", async () => {
+			const opened = await fixture(managed);
+			const session = opened.result.session;
+			const manager = session.sessionManager;
+			expect((await opened.runtime.prompt.prompt("before selection")).kind).toBe("applied");
+			await session.waitForIdle();
+			const original = currentEmbeddedResumeOperation(opened.handle);
+			const sessionId = session.sessionId;
+			const file = manager.getSessionFile();
+			const generation = manager.getSessionIdentityGeneration();
+			for (const id of ["claude-haiku-4-5", "claude-sonnet-4-5"]) {
+				const model = getBundledModel("anthropic", id);
+				if (!model) throw new Error(`Missing model ${id}`);
+				expect(await opened.runtime.model.setDefaultModelSelection(model, session.thinkingLevel)).toMatchObject({ kind: "applied" });
+			}
+			expect(session.sessionId).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getSessionIdentityGeneration()).toBe(generation);
+			expect(currentEmbeddedResumeOperation(opened.handle)).toBe(original);
+			expect(await opened.runtime.prompt.prompt("after selection")).toMatchObject({ kind: "applied" });
+			await session.waitForIdle();
+		});
+
 		it("advances the immutable operation and binding after an authenticated move", async () => {
 			const opened = await fixture(managed);
 			const session = opened.result.session;
@@ -131,7 +154,13 @@ for (const managed of [true, false]) {
 			await session.waitForIdle();
 			const oldId = session.sessionId;
 			const target = session.sessionManager.getLeafId();
-			const forked = await invokeNativeRuntime(opened.handle, "session", () => session.fork());
+			expect((await opened.runtime.prompt.prompt("a later branch")).kind).toBe("applied");
+			await session.waitForIdle();
+			expect(session.sessionManager.getLeafId()).not.toBe(target);
+			const forked = await invokeNativeRuntime(opened.handle, "session", () => {
+				session.sessionManager.restorePresentationLeaf(target);
+				return session.fork();
+			});
 			expect(forked.kind).toBe("applied");
 			expect(forked.kind === "applied" && forked.value).toBe(true);
 			expect(session.sessionId).not.toBe(oldId);

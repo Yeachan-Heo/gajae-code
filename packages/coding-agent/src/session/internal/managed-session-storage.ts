@@ -2862,6 +2862,7 @@ export class ManagedSessionDescendantStore {
 			if (!successor.ok || !successor.identity || !successor.data ||
 				successor.identity.dev !== captured.identity.dev || successor.identity.ino !== captured.identity.ino ||
 				successor.identity.size !== captured.identity.size || successor.identity.mtimeNs !== captured.identity.mtimeNs ||
+				BigInt(successor.identity.nlink) !== 1n ||
 				createHash("sha256").update(successor.data).digest("hex") !== digest)
 				throw new Error("managed_publish_identity_mismatch");
 			return { ...managedFileIdentityFromNative(successor.identity), sha256: digest };
@@ -4068,8 +4069,8 @@ export async function publishManagedFileNoReplace(
 			await nativeSessionStorage().renameNoReplacePathAsync(staging, destination),
 		);
 		if (renameFlagsUnsupported(outcome)) {
-			// See publishManagedFileNoReplaceSync: the staging link outlives this
-			// publication and is removed only after the secured descriptor is closed.
+			// Keep the secured descriptor through fallback-link removal, so the
+			// producer receipt includes the final one-link identity and rename ctime.
 			outcome = classifyNativePublishOutcome(
 				await nativeSessionStorage().linkNoReplacePathAsync(staging, destination),
 			);
@@ -4089,6 +4090,8 @@ export async function publishManagedFileNoReplace(
 		}
 		secureFileDescriptor(destination, handle.fd, "verify");
 		if (linkPublished) {
+			const linked = await fsp.lstat(staging, { bigint: true });
+			if (linked.dev !== staged.dev || linked.ino !== staged.ino) throw new Error("staging_identity_changed");
 			await fsp.unlink(staging);
 			linkPublished = false;
 			stagingIdentity = undefined;
@@ -4096,7 +4099,7 @@ export async function publishManagedFileNoReplace(
 		await fsyncDirectoryAsync(parent);
 		const committed = await handle.stat({ bigint: true });
 		const current = await fsp.lstat(destination, { bigint: true });
-		if (!current.isFile() || current.isSymbolicLink() || !sameFileIdentity(committed, current) ||
+		if (!current.isFile() || current.isSymbolicLink() || !sameManagedIdentity(identity(committed), identity(current)) ||
 			committed.dev !== staged.dev || committed.ino !== staged.ino || committed.nlink !== 1n ||
 			committed.size !== staged.size || committed.mtimeNs !== staged.mtimeNs)
 			throw new Error("destination_identity_changed");
@@ -4169,8 +4172,8 @@ export function publishManagedFileNoReplaceSync(
 
 		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(staging, destination));
 		if (renameFlagsUnsupported(outcome)) {
-			// See publishManagedFileNoReplace: the staging link outlives this publication
-			// and is removed only after the secured descriptor is closed.
+			// Keep the secured descriptor through fallback-link removal; the receipt
+			// must describe the published one-link identity, not the staging object.
 			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
@@ -4182,6 +4185,8 @@ export function publishManagedFileNoReplaceSync(
 		}
 		secureFileDescriptor(destination, fd, "verify");
 		if (linkPublished) {
+			const linked = fs.lstatSync(staging, { bigint: true });
+			if (linked.dev !== staged.dev || linked.ino !== staged.ino) throw new Error("staging_identity_changed");
 			fs.unlinkSync(staging);
 			linkPublished = false;
 			stagingIdentity = undefined;
@@ -4189,7 +4194,7 @@ export function publishManagedFileNoReplaceSync(
 		fsyncDirectory(parent);
 		const committed = fs.fstatSync(fd, { bigint: true });
 		const current = fs.lstatSync(destination, { bigint: true });
-		if (!current.isFile() || current.isSymbolicLink() || !sameFileIdentity(committed, current) ||
+		if (!current.isFile() || current.isSymbolicLink() || !sameManagedIdentity(identity(committed), identity(current)) ||
 			committed.dev !== staged.dev || committed.ino !== staged.ino || committed.nlink !== 1n ||
 			committed.size !== staged.size || committed.mtimeNs !== staged.mtimeNs)
 			throw new Error("destination_identity_changed");

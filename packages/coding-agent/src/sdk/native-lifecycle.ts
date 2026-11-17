@@ -302,16 +302,19 @@ export function bindNativeRuntimeInvocation(
 					throw new NativeRuntimeRefusal("context_mismatch");
 				sessionFile = nativeResumeBinding(selected).path;
 			}
+			const previousInteraction = member.workSource?.interaction;
 			const interaction = adopt(selected, membership);
-			if (interaction && member.workSource) {
-				member.workSource = snapshotSource({ ...member.workSource, interaction }, manager);
-				member.workSource.result.setToolUIContext(interaction.service.ui, true);
-			}
-			const current = member.currentInvocation;
-			if (!current || current.binding !== member.runtimeBinding) return;
-			// The selecting dispatch stays current; every other in-flight dispatch is fenced.
+			const current = runtimeInvocation.getStore();
+			if (!current || current.member !== member || current.binding !== member.runtimeBinding)
+				throw new NativeRuntimeRefusal("context_mismatch");
+			// Publish all owner/binding state before UI callbacks can admit another dispatch.
 			current.op = selected;
 			current.epoch = ++member.publicationEpoch;
+			if (interaction && member.workSource) {
+				member.workSource = snapshotSource({ ...member.workSource, interaction }, manager);
+				previousInteraction?.service.dispose();
+				member.workSource.result.setToolUIContext(interaction.service.ui, true);
+			}
 		},
 	};
 	member.publicationEpoch++;
@@ -540,11 +543,7 @@ export function noteNativeRuntimeViewTransition(session: AgentSession): void {
 	member.runtimeBinding?.settle();
 }
 
-/**
- * A durable execution selection committed inside an admitted native dispatch registers
- * a new resume operation in the manager. Point this runtime at it, otherwise every later
- * dispatch keeps reconciling the superseded cursor and reports an unknown suffix.
- */
+/** Internal producer hook; only a one-shot receipt from this dispatch's exact commit can adopt an identity. */
 export function adoptNativeRuntimeCommit(session: AgentSession, receipt: CommittedSessionEvidence): void {
 	const member = managers.get(session.sessionManager);
 	if (!member || member.context !== "runtime") return;
@@ -552,6 +551,7 @@ export function adoptNativeRuntimeCommit(session: AgentSession, receipt: Committ
 	member.runtimeBinding.adoptCommit(receipt);
 }
 
+/** Adopt a registered durable selection made by this runtime's own admitted dispatch. */
 export function adoptNativeRuntimeSelection(session: AgentSession, pending: PendingResumeOp): void {
 	const member = managers.get(session.sessionManager);
 	if (!member || member.context !== "runtime") return;
