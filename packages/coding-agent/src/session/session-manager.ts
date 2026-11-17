@@ -8206,6 +8206,8 @@ export class SessionManager {
 	);
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
+	/** Unknown native promotion retains its exact attempt; old transcript proofs cannot settle it. */
+	#unknownDefaultModelPublication: { readonly stage: DefaultModelSelectionStage; readonly error: Error } | undefined;
 	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
 	#sharedAppendOnly = false;
 	/**
@@ -11269,8 +11271,8 @@ export class SessionManager {
 	}
 
 	async #allocatePreparedNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
-		const freshCreation = this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native"
-			? allocateFreshOwnerCreation() : undefined;
+		const freshCreation =
+			this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native" ? allocateFreshOwnerCreation() : undefined;
 		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
 		const sessionId = freshCreation?.headerId ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
@@ -11406,10 +11408,16 @@ export class SessionManager {
 					const receipt = writer.publishNoReplace();
 					if (receipt.kind !== "fsync" || !receipt.namespaceSynced) throw new Error("durability_unproven");
 					stage.publication = Object.freeze({
-						canonicalPath: resolveEquivalentPath(sessionFile), sessionId: stage.sessionId,
-						dev: receipt.stat.dev, ino: receipt.stat.ino, nlink: receipt.stat.nlink,
-						size: receipt.stat.size, mtimeMs: receipt.stat.mtimeMs, mtimeNs: receipt.stat.mtimeNs,
-						ctimeNs: receipt.stat.ctimeNs, sha256: receipt.sha256,
+						canonicalPath: resolveEquivalentPath(sessionFile),
+						sessionId: stage.sessionId,
+						dev: receipt.stat.dev,
+						ino: receipt.stat.ino,
+						nlink: receipt.stat.nlink,
+						size: receipt.stat.size,
+						mtimeMs: receipt.stat.mtimeMs,
+						mtimeNs: receipt.stat.mtimeNs,
+						ctimeNs: receipt.stat.ctimeNs,
+						sha256: receipt.sha256,
 					});
 				} finally {
 					writer.closeSync();
@@ -11528,33 +11536,70 @@ export class SessionManager {
 	#completePreparedNativePublication(stage: PreparedNewSessionState): void {
 		const token = stage.membership!;
 		const observed = captureNativeResumeTranscript(stage.sessionFile!, this.#storage);
-		if (observed.capture.kind !== "captured" || !observed.identity || !stage.publication ||
-			!util.isDeepStrictEqual(observed.identity, stage.publication)) throw new Error("stale_snapshot");
+		if (
+			observed.capture.kind !== "captured" ||
+			!observed.identity ||
+			!stage.publication ||
+			!util.isDeepStrictEqual(observed.identity, stage.publication)
+		)
+			throw new Error("stale_snapshot");
 		if (stage.executionAppendBase === undefined || observed.executionTail !== stage.executionAppendBase)
 			throw new Error("uncertain_cursor");
 		const marker = stage.ownerMarker!;
-		confirmOwnerFirstWriteMarkerSync(token, marker.marker, () => observed.capture.kind === "captured" &&
-			observed.capture.entries.some(entry => entry.id === marker.entry.id &&
-				entry.payloadDigest === resumeDigest(JSON.stringify(marker.entry))));
+		confirmOwnerFirstWriteMarkerSync(
+			token,
+			marker.marker,
+			() =>
+				observed.capture.kind === "captured" &&
+				observed.capture.entries.some(
+					entry =>
+						entry.id === marker.entry.id && entry.payloadDigest === resumeDigest(JSON.stringify(marker.entry)),
+				),
+		);
 		const owner = getOwnerMembershipEvidence(token);
 		const capture = observed.capture;
 		const pending: PendingResumeOp = Object.freeze({
-			memberToken: owner.memberId, authorityKey: owner.authorityKey, epoch: owner.epoch,
-			policy: Object.freeze({ kind: "exclusive_native", memberKind: owner.memberKind, rev: owner.rev,
-				authorityKey: owner.authorityKey, epoch: owner.epoch }),
+			memberToken: owner.memberId,
+			authorityKey: owner.authorityKey,
+			epoch: owner.epoch,
+			policy: Object.freeze({
+				kind: "exclusive_native",
+				memberKind: owner.memberKind,
+				rev: owner.rev,
+				authorityKey: owner.authorityKey,
+				epoch: owner.epoch,
+			}),
 			op: crypto.randomUUID(),
-			plan: Object.freeze({ enroll: null, selectionRequested: false, cursorIds: Object.freeze([] as string[]),
-				dependentIds: Object.freeze([] as string[]), target: stage.executionTargetLeafId! }),
-			manifest: Object.freeze([]), CB: stage.executionAppendBase,
+			plan: Object.freeze({
+				enroll: null,
+				selectionRequested: false,
+				cursorIds: Object.freeze([] as string[]),
+				dependentIds: Object.freeze([] as string[]),
+				target: stage.executionTargetLeafId!,
+			}),
+			manifest: Object.freeze([]),
+			CB: stage.executionAppendBase,
 			g0: Object.freeze({ fileEntriesIndex0: stage.fileEntries.length, entryRevision0: 0 }),
-			durabilityDebt: Object.freeze({ ids: Object.freeze([] as string[]), fileIdentity: Object.freeze(capture.fileIdentity),
-				snapshotDigest: capture.snapshotDigest, snapshotByteLength: resumeCaptureByteLength(capture), attempts: 0 }),
+			durabilityDebt: Object.freeze({
+				ids: Object.freeze([] as string[]),
+				fileIdentity: Object.freeze(capture.fileIdentity),
+				snapshotDigest: capture.snapshotDigest,
+				snapshotByteLength: resumeCaptureByteLength(capture),
+				attempts: 0,
+			}),
 		});
 		bindNativeResumeOperation(pending, {
-			path: stage.sessionFile!, storage: this.#storage,
+			path: stage.sessionFile!,
+			storage: this.#storage,
 			preOpEntries: capture.entries.map(entry => ({ ...entry, kind: "dependent" })),
-			preOpCommittedTail: stage.executionAppendBase, prepared: [], ledger: new Map(), proofs: [],
-			publicationSuccessions: [], durabilityState: "proven", attempts: 0, residentTip: pending.CB,
+			preOpCommittedTail: stage.executionAppendBase,
+			prepared: [],
+			ledger: new Map(),
+			proofs: [],
+			publicationSuccessions: [],
+			durabilityState: "proven",
+			attempts: 0,
+			residentTip: pending.CB,
 		});
 		const repaired = repairNativeResumeDurability(pending, observed);
 		const state = nativeResumeBinding(pending);
@@ -11641,8 +11686,8 @@ export class SessionManager {
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
 		const timestamp = new Date().toISOString();
-		const freshCreation = this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native"
-			? allocateFreshOwnerCreation() : undefined;
+		const freshCreation =
+			this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native" ? allocateFreshOwnerCreation() : undefined;
 		const sessionId = freshCreation?.headerId ?? createSessionId();
 		const sessionFile = path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
 		const header: SessionHeader = {
@@ -11713,8 +11758,8 @@ export class SessionManager {
 		await this.#closePersistWriter();
 		this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session", true);
 		const timestamp = new Date().toISOString();
-		const freshCreation = this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native"
-			? allocateFreshOwnerCreation() : undefined;
+		const freshCreation =
+			this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native" ? allocateFreshOwnerCreation() : undefined;
 		const sessionId = freshCreation?.headerId ?? createSessionId();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
@@ -11832,9 +11877,11 @@ export class SessionManager {
 				if (!util.isDeepStrictEqual(observed.identity, stage.publication)) throw new Error("stale_snapshot");
 				const identity = stage.publication;
 				if (identity.ctimeNs === undefined) throw new Error("stale_snapshot");
-				if (this.destination.kind === "managed") expectedIdentity = {
-					...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }), sha256: identity.sha256,
-				};
+				if (this.destination.kind === "managed")
+					expectedIdentity = {
+						...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }),
+						sha256: identity.sha256,
+					};
 			} else if (stage.flushed && stage.sessionFile && this.destination.kind === "managed")
 				expectedIdentity = this.#captureManagedPersistIdentity(stage.sessionFile);
 		} catch (error) {
@@ -11910,11 +11957,22 @@ export class SessionManager {
 			this.#leafRevision++;
 		}
 		const receipt: CommittedSessionEvidence = Object.freeze({
-			manager: this, prepared: Object.freeze({ sessionId: stage.sessionId, sessionFile: stage.sessionFile }),
+			manager: this,
+			prepared: Object.freeze({ sessionId: stage.sessionId, sessionFile: stage.sessionFile }),
 			targetLeafId: stage.executionTargetLeafId === undefined ? index.leafId : stage.executionTargetLeafId,
-			predecessor: Object.freeze({ sessionId: previousId, sessionFile: previousFile, generation: predecessorGeneration }),
-			successor: Object.freeze({ sessionId: stage.sessionId, sessionFile: stage.sessionFile, generation: this.#committedIdentityGeneration }),
-			membership: stage.membership, pending: stage.pending, publication: stage.publication,
+			predecessor: Object.freeze({
+				sessionId: previousId,
+				sessionFile: previousFile,
+				generation: predecessorGeneration,
+			}),
+			successor: Object.freeze({
+				sessionId: stage.sessionId,
+				sessionFile: stage.sessionFile,
+				generation: this.#committedIdentityGeneration,
+			}),
+			membership: stage.membership,
+			pending: stage.pending,
+			publication: stage.publication,
 		});
 		committedSessionEvidence.add(receipt);
 		return receipt;
@@ -12941,7 +12999,8 @@ export class SessionManager {
 		this.#ownerMarker = undefined;
 		if (outcome === "success" && this.getSessionOwnerEvidence()?.policy.kind === "exclusive_native") {
 			const previous = nativeEmbeddedOwnerOperation(this);
-			if (!previous || this.#nativeResumeOperations.get(previous.op) !== previous) throw new Error("context_mismatch");
+			if (!previous || this.#nativeResumeOperations.get(previous.op) !== previous)
+				throw new Error("context_mismatch");
 			// This is the exact producer-recorded execution tip, not an eventual manager leaf.
 			const target = nativeResumeBinding(previous).residentTip;
 			this.#nativeResumeOperations.clear();
@@ -13670,10 +13729,6 @@ export class SessionManager {
 		const malformedUsageSample: string[] = [];
 		for (const entry of fileEntries) {
 			if (entry.type === "session") continue;
-			if (entry.parentId !== null) {
-				const canonicalParent = byId.get(entry.parentId);
-				if (canonicalParent) entry.parentId = canonicalParent.id;
-			}
 			byId.set(entry.id, entry);
 			if (!(entry.type === "custom" && entry.customType === OWNER_ENROLL_CUSTOM_TYPE)) leafId = entry.id;
 			if (entry.type === "label") {
@@ -14435,12 +14490,17 @@ export class SessionManager {
 		const fresh = captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending));
 		if (fresh.capture.kind !== "captured" || state.durabilityState !== "proven") return;
 		const capture = fresh.capture;
-		if (this.destination.kind === "managed" && state.publicationIdentity && fresh.identity &&
-			util.isDeepStrictEqual(state.publicationIdentity, fresh.identity)) {
+		if (
+			this.destination.kind === "managed" &&
+			state.publicationIdentity &&
+			fresh.identity &&
+			util.isDeepStrictEqual(state.publicationIdentity, fresh.identity)
+		) {
 			const identity = state.publicationIdentity;
 			if (identity.ctimeNs === undefined) throw new Error("stale_snapshot");
 			this.#managedPersistExpectedIdentity = {
-				...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }), sha256: identity.sha256,
+				...managedIdentityFromDescriptor({ ...identity, ctimeNs: identity.ctimeNs }),
+				sha256: identity.sha256,
 			};
 		}
 		const durable = new Set(
@@ -14475,6 +14535,7 @@ export class SessionManager {
 	}
 
 	async #publishNativeResumeSuffix(pending: PendingResumeOp): Promise<void> {
+		if (this.#unknownDefaultModelPublication) throw this.#unknownDefaultModelPublication.error;
 		if (this.#rewriteCloseUnknownError) throw this.#rewriteCloseUnknownError;
 		const state = nativeResumeBinding(pending);
 		const publish = async (): Promise<void> => {
@@ -15145,11 +15206,11 @@ export class SessionManager {
 				generation: this.capturePublicationGeneration(),
 				entries: structuredClone(entries),
 				preparedEntries,
-				rewriteDebt: this.#needsFullRewriteOnNextPersist,
+				rewriteDebt: this.#needsFullRewriteOnNextPersist || this.#unknownDefaultModelPublication !== undefined,
 				heldIds: [...new Set([...heldIds, ...this.#heldPublicationEntries])],
 				heldReason: this.#persistError
 					? "persist_debt"
-					: this.#needsFullRewriteOnNextPersist
+					: this.#needsFullRewriteOnNextPersist || this.#unknownDefaultModelPublication
 						? "rewrite_debt"
 						: holding
 							? "freeze_parked"
@@ -19854,6 +19915,23 @@ export class SessionManager {
 	}
 
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
+		const unknown = (cause: unknown): DefaultModelSelectionPromotion => {
+			const error = toError(cause);
+			if (this.#nativeResumeOperations.size > 0) {
+				// Keep the attempt separate from rewrite scheduling: rewriting the old
+				// resident view would erase evidence of a possibly published successor.
+				this.#unknownDefaultModelPublication ??= { stage, error };
+				this.#recordPersistError(error);
+				for (const pending of this.#nativeResumeOperations.values()) {
+					const state = nativeResumeBinding(pending);
+					state.error ??= error;
+					state.lastError = String(error);
+					state.durabilityState = "sync_failed";
+				}
+				this.#nativeResumeReadiness = "fenced";
+			}
+			return { kind: "unknown", error };
+		};
 		if (this.#publication.blocked) {
 			return { kind: "not_promoted", error: new Error("publication_freeze_parked") };
 		}
@@ -19892,13 +19970,13 @@ export class SessionManager {
 				"retain-and-throw",
 			);
 		} catch (error) {
-			return { kind: "unknown", error: toError(error) };
+			return unknown(error);
 		}
 		let publicationPredecessor: ManagedFileIdentity | undefined;
 		if (stage.persistsToExistingFile) {
 			if (!this.#sessionFile) {
 				transition.dispose();
-				return { kind: "unknown", error: new Error("Missing staged session replacement") };
+				return unknown(new Error("Missing staged session replacement"));
 			}
 			if (this.#nativeResumeOperations.size > 0) {
 				try {
@@ -19912,7 +19990,7 @@ export class SessionManager {
 					};
 				} catch (error) {
 					transition.dispose();
-					return { kind: "unknown", error: toError(error) };
+					return unknown(error);
 				}
 			}
 			if (this.destination.kind === "managed") {
@@ -19946,12 +20024,12 @@ export class SessionManager {
 						this.#recordResumePublicationSuccession(publicationPredecessor, publicationSuccessor);
 				} catch (error) {
 					transition.dispose();
-					return { kind: "unknown", error: toError(error) };
+					return unknown(error);
 				}
 			} else {
 				if (!stage.tempPath) {
 					transition.dispose();
-					return { kind: "unknown", error: new Error("Missing staged session replacement") };
+					return unknown(new Error("Missing staged session replacement"));
 				}
 				try {
 					this.#closePersistWriterInternalSync();
@@ -19970,7 +20048,7 @@ export class SessionManager {
 					if (stage.boundedCold) {
 						if (!this.#storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
 							transition.dispose();
-							return { kind: "unknown", error: new Error("Exact staged replacement is unavailable") };
+							return unknown(new Error("Exact staged replacement is unavailable"));
 						}
 						if (
 							!this.#storage.replaceExactSync(stage.tempPath, this.#sessionFile, {
@@ -19995,7 +20073,7 @@ export class SessionManager {
 					if (this.#persistWriter?.getCloseState() === "close_failed_retryable") {
 						return { kind: "not_promoted", error: new Error("Session replacement could not be completed.") };
 					}
-					return { kind: "unknown", error: toError(error) };
+					return unknown(error);
 				}
 			}
 		}
