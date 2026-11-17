@@ -497,7 +497,9 @@ function mintUnoccupiedRootId(registry: AgentRegistry): string {
 		const id = `main-${Snowflake.next()}`;
 		if (id !== MAIN_AGENT_ID && !registry.get(id)) return id;
 	}
-	throw new Error(`Agent id is already registered: ${MAIN_AGENT_ID}`);
+	throw new Error(
+		`Cannot mint a free agent id: every candidate collided on this registry, and the default id ${MAIN_AGENT_ID} is held by another session`,
+	);
 }
 
 function resolveAgentRosterLabel(label: string | undefined, agentId: string, displayName: string): string {
