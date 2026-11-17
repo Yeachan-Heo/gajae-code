@@ -11185,6 +11185,7 @@ export class SessionManager {
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
+		if (this.usesSharedPublication()) throw new Error("Cannot prepare fork for session that uses shared publication");
 		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
@@ -19273,12 +19274,14 @@ export class SessionManager {
 			if (result.changed && predecessorIdentity && predecessorIdentity.sha256 !== priorCommittedDigest)
 				this.#latchSharedRewriteBar(sessionId);
 			// The committed transcript now carries the requested star even when a peer had
-			// already set it; the resident header follows it.
-			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			if (header && (header.starredPatchVersion !== 1 || (header.starred === true) !== starred)) {
-				header.starredPatchVersion = 1;
-				applyHeaderPatch(header, patch);
-				this.#headerExportRevision++;
+			// already set it; the resident header follows it only after a verified write.
+			if (result.changed) {
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header && (header.starredPatchVersion !== 1 || (header.starred === true) !== starred)) {
+					header.starredPatchVersion = 1;
+					applyHeaderPatch(header, patch);
+					this.#headerExportRevision++;
+				}
 			}
 			if (result.changed) {
 				if (receipt) {

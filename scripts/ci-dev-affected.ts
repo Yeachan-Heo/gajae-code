@@ -494,7 +494,7 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	const normalizedPaths = normalizeChangedPaths(paths);
 	const packages = await getWorkspacePackages();
 	const legacy = resolvePlanMode() === "pr"
-		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true, loadReverseDependencyIndex(packages))
+		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true, await loadReverseDependencyIndex(packages))
 		: planTasks(normalizedPaths, packages, true);
 	if (normalizedPaths.length > 0 && normalizedPaths.every(isDocOrChangelogPath)) return legacy;
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
@@ -1542,7 +1542,7 @@ export function buildReverseDependencyIndex(
 }
 
 /** Index the checked-out workspace's package trees, never installed dependencies or build output. */
-export function loadReverseDependencyIndex(packages: readonly WorkspacePackage[], root: string = repoRoot): ReverseDependencyIndex {
+export async function loadReverseDependencyIndex(packages: readonly WorkspacePackage[], root: string = repoRoot): Promise<ReverseDependencyIndex> {
 	const files: string[] = [];
 	for (const workspacePackage of packages) {
 		const packageRoot = path.join(root, workspacePackage.dir);
@@ -1554,7 +1554,13 @@ export function loadReverseDependencyIndex(packages: readonly WorkspacePackage[]
 		}
 	}
 	files.sort();
-	return buildReverseDependencyIndex(packages, files, file => fsSync.readFileSync(path.join(root, file), "utf8"));
+	// Load file contents asynchronously using Bun.file() before passing to synchronous graph builder
+	const fileContents = new Map<string, string>();
+	for (const file of files) {
+		const content = await Bun.file(path.join(root, file)).text();
+		fileContents.set(file, content);
+	}
+	return buildReverseDependencyIndex(packages, files, file => fileContents.get(file) ?? "");
 }
 
 /** Test files that transitively load any changed path, in breadth-first then lexical order. */

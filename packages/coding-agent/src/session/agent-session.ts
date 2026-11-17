@@ -22131,8 +22131,11 @@ export class AgentSession {
 			// session under shared admission cannot do. Take prepareFork's admission decision
 			// before the hook, the agent disconnect, and the flush, so a refusal leaves the live
 			// session untouched. The bounded cold fork only reads the committed source.
-			if (!(this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined))
+			if (!(this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined)) {
 				this.sessionManager.assertLegacyMutationAllowed("prepare fork");
+				if (this.sessionManager.usesSharedPublication())
+					throw new Error("Cannot fork session that uses shared publication");
+			}
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
 			const predecessorQueuedSdkWork = this.#queuedMessagesForSessionTransition();
