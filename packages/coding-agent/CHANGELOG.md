@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-11-17
+
+### Added
+
+- Added an optional Keenable `web_search` provider. Select it with `providers.webSearch = "keenable"` or list it in `web_search.fallback`. It works without an API key; `KEENABLE_API_KEY` (or a stored `keenable` credential) only raises rate limits. `auto` resolution and the DuckDuckGo terminal fallback are unchanged.
+
+### Changed
+
+- Ctrl+V / Cmd+V attaches image files copied in Finder on macOS, and pastes the clipboard text when the clipboard holds no image instead of reporting "No image in clipboard".
+
+### Removed
+
+- Removed the unreachable `/copy` code, all and cmd branches; `/copy` takes no arguments and copies the last agent message.
+
+### Fixed
+
+- Automatic and manual session titles no longer bar ordinary transcript appends for the rest of the session: title admission is scoped to its publication, while canonical shared appends keep their permanent append and rewrite fences (#7815).
+- A title that adopts a transcript already holding state this session never committed keeps whole-transcript rewrite authority barred, so fork, star, and rewrite paths refuse instead of republishing a partial resident graph over the sibling branch. Renaming a transcript this session wrote itself keeps full authority (#7815).
+- One-shot publications in a shared session (temporary model change, explicit thinking-level append, discovered-tool selection, mode change) scope append admission to their own transaction and keep only the whole-transcript rewrite fence, so they no longer bar later appends for the rest of the session (#7815).
+- In-turn producers in a shared session publish through the session's admitted path instead of the legacy append, so they persist instead of aborting the turn once a canonical message has been published: extension and hook `appendEntry`/`setLabel` (interactive and subagent executors), tree-navigator labels, todo entries and reminders, goal entries, mode changes, credential pins, session recaps, TTSR injection markers, bash/Python results and deferred command results (#7815).
+- A refused background publication is now operator-visible: the entry is reported with a `session-publication` warning naming the operation and cause, command results keep their deferred queue slot for retry, and `onPersisted` fires only when the entry is durable (#7815).
+- A shared session that hits the managed per-file limit while its only recovery is the barred whole-transcript rewrite now keeps the typed near-limit outcome and its recovery guidance instead of degrading into a generic rewrite-required abort (#7815).
+- Still refused by design in a shared session, unchanged: whole-transcript rewrites, forks, stars, branch switches, session drop/delete/move, staged-selection promotion, `/clear` roots, and the legacy public append API. Callers that need durability must use the session's `*ForSession`/`*InBackground` seams (#7815).
+
+- Publish model presets through managed shared-session admission after ordinary messages or title changes, preserving sibling branches and the configured fallback chain, effective thinking, and resume default (#7823).
+- Keep known refused preset publications from attempting an unneeded rollback; preserve publication receipts and close the session when a shared preset write has an uncertain outcome or cannot be applied after commit (#7823).
+
+- `/clear` now works in a shared root TUI session. It publishes a new parentless context-clear root, followed by the model, effort and service tier, as an append-only shared write. Sibling branches published by other openers are kept. A refused write leaves the conversation unchanged, and an uncertain write closes the session (#7824).
+- A default fallback that changes the thinking level now saves that level through admitted shared publication before switching the model, instead of refusing in a shared session (#7824).
+- Assigning a model role while a profile is active now saves the session's configured model chain through admitted shared publication after the settings commit. If that write is refused, the session closes and the message says the settings were saved but the session was not updated (#7824).
+- A configuration reload that changes the active profile or the live model now publishes the profile chain, model and effort as one shared write before applying anything. A refused write rolls back only the staged catalog. A failure after the transcript commit restores settings and the catalog and closes the session (#7824).
+- When a model selection fails in a shared session, the selector now undoes it with one shared write that contains only the values that actually changed. If nothing changed, nothing is written and no incomplete-rollback message is shown. The selector never undoes an uncertain or committed-but-unapplied write (#7824).
+- Starring a previous session from the picker after `/new` now appends the star under that session's transaction lease when this process published to it through shared admission. A star that would rewrite the whole transcript is refused instead of moving a live peer's transcript (#7824).
+
+- Fixed `/fast`, the service tier, the settings-screen default thinking level, `/effort <level>`, model selection (`/model`, selector, cycling, SDK/ACP `model.set`), explicit tool selection and OAuth credential pin/AUTO in shared root TUI sessions after an ordinary message. They no longer fail with "Shared session mutation requires transaction admission"; each publishes its entries additively through admitted shared publication before changing live state (#7824).
+- Credential pin/AUTO now records the session intent before changing the live account selection, so a refused write leaves the account unchanged (#7824).
+- In a shared session, `/drop` now refuses before it switches. It used to switch and then report a drop that never happened. Internal MCP, `/ssh` and plugin tool refreshes record their selection through admitted shared publication (#7824).
+- `/rename`, automatic titles, plan-mode titles and the extension `setSessionName` now save the title through admitted shared title publication. Previously they called the session manager's legacy writer, which is refused once the session is shared (#7824).
+- Per-tool TTSR reminder records are now saved through admitted shared publication instead of being silently dropped (#7824).
+- An uncertain or committed-but-unapplied shared control write now closes the session with a message that says what happened, instead of retrying or rolling back (#7824).
+- Shared tool selection now follows the same rule: an uncertain write, or a saved selection the session could not apply, closes the session and keeps the saved entry IDs, and an uncertain write blocks further writes from that session (#7824).
+- A deferred bash or Python result whose shared write is uncertain is no longer retried under a new entry ID. The session closes and reports the attempted ID (#7824).
+- Overlapping deferred bash or Python result flushes, such as forced abort recovery and a prompt, now share one flush, so each result is written and reported once (#7824).
+
+- In the ask prompt and the inline "Other" answer, a bare line feed (Ctrl+J, or a Shift+Enter→LF terminal mapping) inserts a newline on every platform instead of submitting.
+
+- Providers that need no API key by design (Devin, which logs in through its own CLI, and other `allowUnauthenticated` providers such as LM Studio and oMLX) are now treated as credentialless from the first model load. Before, they were marked credentialless only during the online discovery sweep, so a subagent or an offline refresh failed them with "No credentials found" and a fallback chain such as `deepseek → devin/swe-2 → …` skipped Devin. A provider configured in `models.yml` keeps the auth mode configured there.
+
+- Cmd+V with an image-only clipboard attaches the image in terminals that send it as an empty bracketed paste instead of doing nothing.
+
+- Fixed session wedge after threshold auto-compaction when user prompts again. The `checkCompaction` method was using stale assistant message usage from before a compaction completed, causing re-entry into `runAutoCompaction("threshold")` with no-op compaction. The `errorIsFromBeforeCompaction` guard—which prevents compaction triggers from messages already compacted—is now also applied to the threshold branch (previously it was only applied to the overflow branch). This ensures that after a threshold compaction completes and a user prompts, the stale message does not trigger another unnecessary compaction attempt.
+
+- Pasting a custom provider API key during onboarding now writes `credential: store` to `models.yml` and the loader accepts it, so the generated provider loads and resolves the stored key instead of being rejected as credential-less while setup reported success. Setup also runs the loader's semantic validation before its atomic rename and surfaces load failures instead of the success banner, and model discovery resolves a stored `!<command>` or env-name value through the same resolver requests use — for both a caller-supplied credential store and the store setup opens itself — treating an unresolvable value as absent instead of sending it as a bearer token. A pasted literal is resolved the same way for the pre-write probe, so a `!<command>` or env-name-shaped paste probes with the secret the runtime would send and an unresolvable reference fails the add before anything is written. Headless setup inspects only the local credential store, so a broker-owned key is neither probed nor disclosed; run setup on the broker host or use the interactive wizard.
+- `credential: store` is rejected when combined with another credential source, `openaiCompat` (its descriptor marks the provider keyless, so the declaration would not be enforced), `auth: none`/`auth: oauth`, or the Bedrock credential chain (provider or model api), an override-only provider entry may declare it on its own, and a declared but missing stored key now logs a load-time warning instead of only failing later as a generic missing-API-key error.
+- Replacing a `credential: store` provider with an `apiKeyEnv` one via `--force` now disables the stale stored API key only when that entry declared `credential: store` and the env reference resolves, verifies the row no longer resolves, and reports the confirmed disable count; OAuth rows and env-pinned providers are untouched. The success banner says the credentials were disabled (not removed) and names `gjc accounts logout <provider> --all`, which removes every stored credential for the provider including OAuth logins, for permanent deletion. A cleanup failure restores the previous provider settings (re-serialized) but leaves already-disabled rows disabled; rows whose disable was not confirmed still resolve and remain the provider's credential. It reports a store-rejected disable and an unconfirmable removal as separate diagnoses, and points at `/provider` with no arguments in the interactive TUI for a pasted literal key or `/provider add ... --api-key-env <ENV> --force` (the same flags work on `gjc setup provider`) to restore usability, because the add commands reject a raw `--api-key`. The surviving-key warning names the broker form (`gjc auth-broker logout <provider>`) for broker configurations. Any env add that leaves a stored API key in place warns that it still takes precedence with the same removal breadth; broker-owned stores fail with host-side guidance that covers every credential type for the provider.
+
+- Interactive runs no longer abort with `shared_session_mutation_unsupported` ("Agent run failed.") when an extension, hook or system reminder adds a custom message after the first message was saved. Custom messages are now saved through the shared session path, like other messages.
+
+- Copying to the clipboard on Termux no longer freezes the TUI while `termux-clipboard-set` runs.
+
 ## [0.21.0] - 2026-11-16
 
 ### Added
