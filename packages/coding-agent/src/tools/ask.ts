@@ -62,11 +62,18 @@ import {
 	questionToGate,
 } from "../modes/shared/agent-wire/deep-interview-gate";
 
+import type {
+	WorkflowGateCallerLease,
+	WorkflowGateCallFence,
+	WorkflowGateEmitter,
+} from "../modes/shared/agent-wire/workflow-gate-broker";
+
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
 import type {
 	AskAnswerRequest,
+	AskAnswerSource,
 	AskRemoteControl,
 	AskRemoteInteraction,
 	AskRemoteReceipt,
@@ -163,6 +170,20 @@ const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
 export const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
 const EMPTY_CUSTOM_RETRY_MESSAGE = "Custom input cannot be empty. Enter text or cancel the ask.";
+
+function runOwnedAskWork<T>(
+	caller: WorkflowGateCallerLease | undefined,
+	id: string,
+	kind: "caller" | "delivery" | "durable_write",
+	start: () => T | PromiseLike<T>,
+): Promise<T> {
+	if (caller) return caller.runRaw(id, kind, start);
+	try {
+		return Promise.resolve(start());
+	} catch (error) {
+		return Promise.reject(error);
+	}
+}
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -849,7 +870,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		q: AskParams["questions"][number],
 		selectedOptions: string[],
 		customInput: string | undefined,
+		caller?: WorkflowGateCallerLease,
+		assertActive: () => void = () => {},
 	): Promise<void> {
+		assertActive();
 		const meta = q.deepInterview;
 		if (customInput !== undefined && (meta || isDeepInterviewAskQuestion(q.question)))
 			assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
@@ -860,26 +884,34 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const statePath = deepInterviewStatePath(cwd, sessionId);
 		await awaitDeepInterviewRecorderPersistence(
-			appendOrMergeDeepInterviewRound(
-				cwd,
-				statePath,
-				{
-					round: meta.round,
-					round_id: meta.round_id,
-					questionId: q.id,
-					questionText: q.question,
-					component: meta.component,
-					dimension: meta.dimension,
-					ambiguity: meta.ambiguity,
-					selectedOptions,
-					customInput,
-					intent_contract: intentContract(meta),
-					intent_review: intentReview(meta),
-				},
-				{ sessionId },
-			).then(async () => {
-				await syncDeepInterviewRecorderHud(cwd, statePath, sessionId);
-			}),
+			runOwnedAskWork(caller, "recorder-lifecycle", "durable_write", () =>
+				runOwnedAskWork(caller, "recorder-persistence", "durable_write", () =>
+					appendOrMergeDeepInterviewRound(
+						cwd,
+						statePath,
+						{
+							round: meta.round,
+							round_id: meta.round_id,
+							questionId: q.id,
+							questionText: q.question,
+							component: meta.component,
+							dimension: meta.dimension,
+							ambiguity: meta.ambiguity,
+							selectedOptions,
+							customInput,
+							intent_contract: intentContract(meta),
+							intent_review: intentReview(meta),
+						},
+						{ sessionId },
+					),
+				).then(async () => {
+					assertActive();
+					await runOwnedAskWork(caller, "recorder-hud", "durable_write", () =>
+						syncDeepInterviewRecorderHud(cwd, statePath, sessionId),
+					);
+					assertActive();
+				}),
+			),
 			intentContract(meta) !== undefined || intentReview(meta) !== undefined,
 		);
 	}
@@ -897,7 +929,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		toolCallId: string,
 		executionGateId?: string,
 		executionPresentation?: ExecutionApprovalPresentation,
+		assertActive: () => void = () => {},
 	): Promise<void> {
+		assertActive();
 		const deepInterviewExecution = q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution";
 		const ralplanApproval = q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval";
 		if (!deepInterviewExecution && !ralplanApproval) return;
@@ -906,6 +940,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		if (!target || customInput !== undefined) {
 			if (sessionId) {
 				await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
+				assertActive();
 				await revokeNonCrystalExecutionApproval(
 					this.session.cwd,
 					sessionId,
@@ -919,10 +954,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			throw new ToolAbortError("Execution approval publication could not be authenticated before consent");
 		const approvalStage = ralplanApproval ? "ralplan" : "deep-interview";
 		const lineage = await executionApprovalLineage(this.session.cwd, sessionId, approvalStage);
+		assertActive();
 		const transcriptEvidence =
 			lineage === "crystal"
 				? await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId, deepInterviewExecution)
 				: await authoritativeConversationSnapshot(this.session.cwd, sessionId);
+		assertActive();
 		const recordApproval =
 			lineage === "crystal" ? recordDeepInterviewExecutionApproval : recordNonCrystalExecutionApproval;
 		await recordApproval({
@@ -938,18 +975,45 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			approvalStage,
 			presentation: executionPresentation,
 		});
+		assertActive();
 		// Ralplan approval is consumed by the subsequent handoff, after the agent
 		// persists this Ask tool result. Consuming here would validate the boundary
 		// before the matching provider toolResult exists in the transcript.
 	}
 
-	async execute(
+	execute(
+		toolCallId: string,
+		params: AskParams,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<AskToolDetails>> {
+		// This future exists before even the first async validation/preflight starts.
+		const emitter = this.session.getWorkflowGateEmitter?.();
+		const caller = emitter?.beginOwnedCaller?.(toolCallId);
+		try {
+			return this.#executeOwned(toolCallId, params, signal, onUpdate, context, emitter, caller).finally(() =>
+				caller?.finishInvocation(),
+			);
+		} catch (error) {
+			caller?.finishInvocation();
+			return Promise.reject(error);
+		}
+	}
+
+	async #executeOwned(
 		_toolCallId: string,
 		params: AskParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
+		gateEmitter?: WorkflowGateEmitter,
+		caller?: WorkflowGateCallerLease,
 	): Promise<AgentToolResult<AskToolDetails>> {
+		const ownedFences: WorkflowGateCallFence[] = [];
+		const assertOwnedActive = () => {
+			for (const fence of ownedFences) fence.assertActive();
+		};
 		await assertUltragoalAskAllowed(
 			this.session.cwd,
 			{ sessionId: this.session.getSessionId?.() ?? null },
@@ -991,9 +1055,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const settleActiveRemote = async (settlement: AskSettlement): Promise<void> => {
 			const receipt = activeRemoteReceipt;
 			activeRemoteReceipt = undefined;
-			if (receipt) await receipt.settle(settlement);
+			if (receipt) await runOwnedAskWork(caller, "receipt-settlement", "delivery", () => receipt.settle(settlement));
 		};
-		const gateEmitter = this.session.getWorkflowGateEmitter?.();
 		// A durable workflow-gate emitter now exists for every session, and its
 		// supportsRemoteGateAnswers() is always true, so it can no longer signal
 		// "no local UI". The workflow gate is only the headless (non-TUI) answer
@@ -1040,6 +1103,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				});
 				await settleActiveRemote({ kind: "resolve_without_commit", reason: "aborted" });
 				activeRemoteRequest = undefined;
+				assertOwnedActive();
 				context?.abort();
 				throw new ToolAbortError(
 					`Ask was aborted: no answer was received within ${askAnswerDeadlineMs / 1000}s of the headless ask answer deadline`,
@@ -1054,11 +1118,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		let logicalQuestionId: string | undefined;
 		const publicSessionId = hasInteractiveUi ? this.session.getSessionId?.() : undefined;
 		const invokeLocal = <T>(work: () => Promise<T>): Promise<T> => {
-			try {
-				return work();
-			} catch (error) {
-				return Promise.reject(error);
-			}
+			return runOwnedAskWork(caller, "local-input", "caller", work);
 		};
 		const awaitRemoteAnswer = (
 			request: AskAnswerRequest,
@@ -1068,22 +1128,55 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			onShutdown?: () => void,
 		) => {
 			const source = this.session.getAskAnswerSource?.();
+			const ownedSource: AskAnswerSource | undefined =
+				source && caller
+					? {
+							awaitAnswer: (question, options, sourceSignal) =>
+								runOwnedAskWork(caller, "answer-source", "caller", () =>
+									source.awaitAnswer(question, options, sourceSignal),
+								),
+							...(source.awaitAnswerRequest
+								? {
+										awaitAnswerRequest: (nextRequest: AskAnswerRequest, sourceSignal?: AbortSignal) =>
+											runOwnedAskWork(caller, "answer-source", "caller", async () => {
+												const answer = await source.awaitAnswerRequest!(nextRequest, sourceSignal);
+												if (!answer || typeof answer === "string") return answer;
+												// Keep discovery open across the registry's promise layers until the
+												// actual receipt is settled, including a late losing answer.
+												const receiptDone = Promise.withResolvers<void>();
+												caller?.trackRaw("source-receipt-lifetime", "delivery", receiptDone.promise);
+												let settlement: Promise<AskSettlementResult> | undefined;
+												return {
+													...answer,
+													settle: (value: AskSettlement) =>
+														(settlement ??= runOwnedAskWork(caller, "source-receipt", "delivery", () =>
+															answer.settle(value),
+														).finally(receiptDone.resolve)),
+												};
+											}),
+									}
+								: {}),
+						}
+					: source;
 			if (publicSessionId) {
 				if (!logicalQuestionId) throw new ToolError("Ask interaction has no logical question binding");
-				const handle = openPendingAsk(
-					publicSessionId,
-					{ ...request, questionId: logicalQuestionId },
-					source,
-					remoteSignal,
-					onShutdown,
-				);
-				onOpen?.(handle);
-				return handle.promise;
+				const questionId = logicalQuestionId;
+				return runOwnedAskWork(caller, "pending-answer", "caller", () => {
+					const handle = openPendingAsk(
+						publicSessionId,
+						{ ...request, questionId },
+						ownedSource,
+						remoteSignal,
+						onShutdown,
+					);
+					onOpen?.(handle);
+					return handle.promise;
+				});
 			}
-			if (!source) throw new ToolAbortError("Ask tool requires an answer source");
-			return source.awaitAnswerRequest
-				? source.awaitAnswerRequest(request, remoteSignal)
-				: source.awaitAnswer(legacy.question, legacy.options, remoteSignal);
+			if (!ownedSource) throw new ToolAbortError("Ask tool requires an answer source");
+			return ownedSource.awaitAnswerRequest
+				? ownedSource.awaitAnswerRequest(request, remoteSignal)
+				: ownedSource.awaitAnswer(legacy.question, legacy.options, remoteSignal);
 		};
 		const throwRemoteCancellation = (remoteSignal: AbortSignal, toolSignal?: AbortSignal): never => {
 			// A headless remote answer source owns the only interactive surface. When it
@@ -1101,7 +1194,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				let inlineMode: "custom_editor" | "clarification_editor" | undefined;
 				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
-					return extensionUi.select(prompt, options, dialogOptions);
+					return invokeLocal(() => extensionUi.select(prompt, options, dialogOptions));
 				}
 				// Race the local UI against a remote answer (e.g. an SDK reply) so asks
 				// can be answered without local UI interaction. The first valid answer
@@ -1148,9 +1241,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						observedReceipt = receipt;
 						if (raceClosed || generation !== remoteGeneration) {
 							receiptSettled = true;
-							return receipt
-								.settle({ kind: "resolve_without_commit", reason: "aborted" })
-								.then(() => new Promise<never>(() => {}));
+							return runOwnedAskWork(caller, "late-receipt", "delivery", () =>
+								receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+							).then(() => new Promise<never>(() => {}));
 						}
 						const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
 						if (inlineMode && remoteValue !== undefined) {
@@ -1273,7 +1366,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 									input?.onSubmit(result.receipt.interaction.value);
 								}
 								localController.abort();
-								if (result.settlement) await result.receipt.settle(result.settlement);
+								if (result.settlement)
+									await runOwnedAskWork(caller, "receipt-transition", "delivery", () =>
+										result.receipt.settle(result.settlement!),
+									);
 								else activeRemoteReceipt = result.receipt;
 								receiptTransferred = true;
 							}
@@ -1286,7 +1382,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							toolSignal?.removeEventListener("abort", abortRace);
 							if (!receiptTransferred && !receiptSettled && observedReceipt) {
 								receiptSettled = true;
-								await observedReceipt.settle({ kind: "resolve_without_commit", reason: "aborted" });
+								const receipt = observedReceipt;
+								await runOwnedAskWork(caller, "receipt-cleanup", "delivery", () =>
+									receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+								);
 							}
 						}),
 				);
@@ -1294,7 +1393,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			editor: (title, prefill, dialogOptions, editorOptions) => {
 				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
-					return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+					return invokeLocal(() => extensionUi.editor(title, prefill, dialogOptions, editorOptions));
 				}
 				// Race the local editor against a remote free-text answer so "Other / type
 				// your own" custom input can be provided remotely (e.g. a typed Telegram
@@ -1344,9 +1443,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						observedReceipt = receipt;
 						if (raceClosed || generation !== remoteGeneration) {
 							receiptSettled = true;
-							return receipt
-								.settle({ kind: "resolve_without_commit", reason: "aborted" })
-								.then(() => new Promise<never>(() => {}));
+							return runOwnedAskWork(caller, "late-receipt", "delivery", () =>
+								receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+							).then(() => new Promise<never>(() => {}));
 						}
 						const value =
 							receipt.interaction.kind === "control" ? REMOTE_NAVIGATION_FORWARD : receipt.interaction.value;
@@ -1395,7 +1494,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							toolSignal?.removeEventListener("abort", abortRace);
 							if (!receiptTransferred && !receiptSettled && observedReceipt) {
 								receiptSettled = true;
-								await observedReceipt.settle({ kind: "resolve_without_commit", reason: "aborted" });
+								const receipt = observedReceipt;
+								await runOwnedAskWork(caller, "receipt-cleanup", "delivery", () =>
+									receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+								);
 							}
 						}),
 				);
@@ -1428,6 +1530,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				emptyCustomAttempt?: number;
 			},
 		) => {
+			assertOwnedActive();
 			const rawOptionLabels = q.options.map(o => o.label);
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
@@ -1490,10 +1593,18 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				// answer cannot advance it. The answer deadline aborts it too.
 				const revokeGate = new AbortController();
 				try {
+					assertOwnedActive();
 					const gateAnswer = gateEmitter.emitGate(questionToGate(gateQuestion), {
 						signal: signal ? AbortSignal.any([signal, revokeGate.signal]) : revokeGate.signal,
+						caller,
+						revokeCallerGate: () => revokeGate.abort(),
+						onOpened: fence => {
+							ownedFences.push(fence);
+							executionGateId = fence.target.id;
+						},
 					});
 					answer = await awaitAskAnswer(() => untilAborted(signal, gateAnswer));
+					assertOwnedActive();
 				} catch (error) {
 					revokeGate.abort();
 					if (error instanceof Error && error.name === "AbortError") {
@@ -1730,6 +1841,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q);
+			assertOwnedActive();
 
 			if (
 				!timedOut &&
@@ -1743,16 +1855,23 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				clarificationQuestion === undefined &&
 				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
 			) {
-				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
+				assertOwnedActive();
+				await this.#recordDeepInterviewRound(q, selectedOptions, customInput, caller, assertOwnedActive);
+				assertOwnedActive();
 			}
-			await this.#recordDeepInterviewExecutionApproval(
-				q,
-				selectedOptions,
-				customInput,
-				_toolCallId,
-				executionGateId,
-				executionPresentation,
+			assertOwnedActive();
+			await runOwnedAskWork(caller, "execution-approval", "durable_write", () =>
+				this.#recordDeepInterviewExecutionApproval(
+					q,
+					selectedOptions,
+					customInput,
+					_toolCallId,
+					executionGateId,
+					executionPresentation,
+					assertOwnedActive,
+				),
 			);
+			assertOwnedActive();
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -1818,6 +1937,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q, { previous, navigation });
+			assertOwnedActive();
 
 			if (cancelled && !timedOut) {
 				context?.abort();
@@ -1840,7 +1960,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				clarificationQuestion === undefined &&
 				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
 			) {
-				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
+				assertOwnedActive();
+				await this.#recordDeepInterviewRound(q, selectedOptions, customInput, caller, assertOwnedActive);
+				assertOwnedActive();
 			}
 
 			if (navAction === "back") {
@@ -1863,15 +1985,21 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		});
 
 		const details: AskToolDetails = { results };
-		for (const [index, result] of results.entries())
-			await this.#recordDeepInterviewExecutionApproval(
-				params.questions[index]!,
-				result.selectedOptions,
-				result.customInput,
-				_toolCallId,
-				executionGateIdsByIndex[index],
-				executionPresentationsByIndex[index],
+		for (const [index, result] of results.entries()) {
+			assertOwnedActive();
+			await runOwnedAskWork(caller, "execution-approval", "durable_write", () =>
+				this.#recordDeepInterviewExecutionApproval(
+					params.questions[index]!,
+					result.selectedOptions,
+					result.customInput,
+					_toolCallId,
+					executionGateIdsByIndex[index],
+					executionPresentationsByIndex[index],
+					assertOwnedActive,
+				),
 			);
+			assertOwnedActive();
+		}
 		const responseLines = results.map(formatQuestionResult);
 		const responseText = `User answers:\n${responseLines.join("\n")}`;
 

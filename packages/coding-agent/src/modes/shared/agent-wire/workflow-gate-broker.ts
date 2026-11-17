@@ -61,6 +61,8 @@ export interface GateResolutionOptions {
 export type WorkflowGateTerminalProof = "retired" | "already_terminal" | "not_published";
 
 export interface WorkflowGateTerminalController {
+	/** Allocate the real producer lifetime before emitted listeners can publish or answer. */
+	captureGateWork?(fence: WorkflowGateCallFence): WorkflowGateDeliveryProducer;
 	completeGateInteractions(gateId: string): WorkflowGateTerminalProof | Promise<WorkflowGateTerminalProof>;
 	cancelGateInteractions(gateId: string, reason: string): void | Promise<void>;
 }
@@ -77,8 +79,8 @@ export interface NotificationGateResolutionOptions {
 		daemonDeadlineAt: number;
 		hostTimeoutMs: number;
 	}): Promise<AskSelectedAckOutcome>;
-	resolveClaim(): void;
-	closeClaimInvalid(reason: string): void;
+	resolveClaim(): void | Promise<void>;
+	closeClaimInvalid(reason: string): void | Promise<void>;
 }
 
 export class NotificationGatePolicyChangedError extends Error {
@@ -98,6 +100,102 @@ export interface AskSelectedAckRecoveryParticipant {
 	}): Promise<AskSelectedAckOutcome>;
 }
 
+export type WorkflowWorkTarget = Readonly<{
+	kind: "workflow";
+	workflowKind: "skill" | "gate";
+	id: string;
+	generation: string;
+}>;
+
+export interface WorkflowPendingProducer {
+	readonly id: string;
+	readonly kind: "caller" | "resolution" | "delivery" | "prompt" | "continuation" | "durable_write";
+}
+
+export type WorkflowCancellationProof =
+	| {
+			readonly target: WorkflowWorkTarget;
+			readonly status: "settled";
+			readonly pending: readonly [];
+			readonly fence: "durable";
+			readonly discovery: "closed";
+	  }
+	| {
+			readonly target: WorkflowWorkTarget;
+			readonly status: "pending";
+			readonly pending: readonly WorkflowPendingProducer[];
+			readonly reason: string;
+	  }
+	| { readonly target: WorkflowWorkTarget; readonly status: "rejected"; readonly reason: string };
+
+export interface PreparedWorkflowCancellation {
+	readonly targets: readonly WorkflowWorkTarget[];
+}
+
+export interface WorkflowGateWorkSnapshot {
+	readonly revision: number;
+	readonly completeness: "complete" | "incomplete";
+	readonly targets: readonly WorkflowWorkTarget[];
+	readonly capabilities: readonly {
+		readonly target: WorkflowWorkTarget;
+		readonly cancellable: boolean;
+		readonly reason?: string;
+	}[];
+}
+
+export interface WorkflowGateCallerLease {
+	readonly toolCallId: string;
+	readonly completion: Promise<void>;
+	trackRaw(id: string, kind: "caller" | "delivery" | "durable_write", work: Promise<unknown>): void;
+	/** Reserve physical ownership before invoking a possibly reentrant callback. */
+	runRaw<T>(id: string, kind: "caller" | "delivery" | "durable_write", start: () => T | PromiseLike<T>): Promise<T>;
+	finishInvocation(): void;
+}
+
+export interface WorkflowGateCallFence {
+	readonly target: WorkflowWorkTarget;
+	readonly signal: AbortSignal;
+	assertActive(): void;
+}
+
+/** Completion covers actual publication/ack/retirement children, not a presentation proof. */
+export interface WorkflowGateDeliveryProducer {
+	readonly completion: Promise<void>;
+	/** Synchronously close admission for this exact generation; never cancel borrowed UI. */
+	fence(): void;
+}
+
+interface OwnedPendingProducer {
+	readonly producer: WorkflowPendingProducer;
+	readonly completion: Promise<unknown>;
+}
+
+interface OwnedGateCallerRecord {
+	readonly lease: WorkflowGateCallerLease;
+	readonly pending: Map<object, OwnedPendingProducer>;
+	readonly done: () => void;
+	returned: boolean;
+	completed: boolean;
+}
+
+interface OwnedGateWorkRecord {
+	readonly target: WorkflowWorkTarget;
+	readonly caller: OwnedGateCallerRecord | undefined;
+	readonly controller: AbortController;
+	readonly callFence: WorkflowGateCallFence;
+	readonly revoke: (() => void) | undefined;
+	readonly terminalController: WorkflowGateTerminalController | undefined;
+	readonly pending: Map<object, OwnedPendingProducer>;
+	readonly deliveries: Set<WorkflowGateDeliveryProducer>;
+	readonly completion: Promise<void>;
+	readonly complete: () => void;
+	cancelling: boolean;
+	durable: boolean;
+	cancellationStarted: boolean;
+	cancellationClosed: boolean;
+	failure?: string;
+}
+
 export interface EmitGateOptions {
 	/**
 	 * Aborting it revokes the gate this call opened and rejects the returned
@@ -106,10 +204,22 @@ export interface EmitGateOptions {
 	 * a cancelled or expired ask.
 	 */
 	signal: AbortSignal;
+	caller?: WorkflowGateCallerLease;
+	revokeCallerGate?: () => void;
+	onOpened?: (fence: WorkflowGateCallFence) => void;
 }
 
 /** SDK-native surface for emitting a workflow gate and awaiting its answer. */
 export interface WorkflowGateEmitter {
+	beginOwnedCaller?(toolCallId: string): WorkflowGateCallerLease;
+	snapshotOwnedGateWork?(): WorkflowGateWorkSnapshot;
+	prepareGateCancellation?(targets: WorkflowWorkTarget | readonly WorkflowWorkTarget[]): PreparedWorkflowCancellation;
+	cancelPreparedGateWork?(
+		prepared: PreparedWorkflowCancellation,
+		timeoutMs: number,
+	): Promise<readonly WorkflowCancellationProof[]>;
+	/** Requires the exact onOpened/captureGateWork fence, not a deserialized target. */
+	registerGateDeliveryProducer?(fence: WorkflowGateCallFence, producer: WorkflowGateDeliveryProducer): void;
 	supportsRemoteGateAnswers(): boolean;
 	/** Opens a gate and awaits its answer. Revocation through `options.signal` is required. */
 	emitGate(input: OpenGateInput, options: EmitGateOptions): Promise<unknown>;
@@ -167,6 +277,12 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	readonly #store: GateStore;
 	readonly #emitterHooks: Pick<BrokerHooks, "advance">;
 	#runtimeTurnProvider: (() => string | undefined) | undefined;
+	readonly #ownedCallers = new WeakMap<WorkflowGateCallerLease, OwnedGateCallerRecord>();
+	readonly #gateWork = new Map<string, OwnedGateWorkRecord>();
+	readonly #gateFences = new WeakMap<WorkflowGateCallFence, OwnedGateWorkRecord>();
+	readonly #prepared = new WeakMap<PreparedWorkflowCancellation, readonly OwnedGateWorkRecord[]>();
+	#workRevision = 0;
+	#producerSequence = 0;
 
 	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance" | "continuationLost"> = {}) {
 		this.#runId = runId;
@@ -176,11 +292,286 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			emit: gate => {
 				for (const listener of this.#listeners) listener(gate);
 			},
-			advance: (gate, answer) => this.#emitterHooks.advance?.(gate, answer),
+			advance: (gate, answer) =>
+				this.#dispatch(gate.gate_id, "advance", "resolution", () => this.#emitterHooks.advance?.(gate, answer)),
+			recoverGate: (gateId, start) => this.#dispatch(gateId, "recover", "resolution", start),
 			completeAccepted: record => this.#completeAccepted(record),
 			finalizeAccepted: record => this.#finalizeAccepted(record),
 			terminalizeAccepted: record => this.#terminalizeAccepted(record),
 			continuationLost: record => emitterHooks.continuationLost?.(record),
+		});
+	}
+
+	#changed(): void {
+		for (const record of this.#gateWork.values()) {
+			if (
+				record.cancelling &&
+				record.durable &&
+				record.cancellationClosed &&
+				!record.failure &&
+				this.#pending(record).length === 0
+			)
+				record.complete();
+		}
+		this.#workRevision++;
+	}
+
+	#checkCaller(caller: OwnedGateCallerRecord): void {
+		if (!caller.completed && caller.returned && caller.pending.size === 0) {
+			caller.completed = true;
+			caller.done();
+		}
+		this.#changed();
+	}
+
+	beginOwnedCaller(toolCallId: string): WorkflowGateCallerLease {
+		const completion = Promise.withResolvers<void>();
+		const pending = new Map<object, OwnedPendingProducer>();
+		const lease: WorkflowGateCallerLease = Object.freeze({
+			toolCallId,
+			completion: completion.promise,
+			trackRaw: (id: string, kind: "caller" | "delivery" | "durable_write", work: Promise<unknown>) => {
+				if (caller.completed) throw new Error("workflow caller discovery is closed");
+				const token = {};
+				pending.set(token, {
+					producer: { id: `${toolCallId}:${id}:${++this.#producerSequence}`, kind },
+					completion: work,
+				});
+				this.#changed();
+				const finish = () => {
+					pending.delete(token);
+					// Promise reactions may synchronously register finite descendants of this raw branch.
+					queueMicrotask(() => this.#checkCaller(caller));
+				};
+				work.then(finish, finish);
+			},
+			runRaw: <T>(
+				id: string,
+				kind: "caller" | "delivery" | "durable_write",
+				start: () => T | PromiseLike<T>,
+			): Promise<T> => {
+				const raw = Promise.withResolvers<T>();
+				lease.trackRaw(id, kind, raw.promise);
+				try {
+					raw.resolve(start());
+				} catch (error) {
+					raw.reject(error);
+				}
+				return raw.promise;
+			},
+			finishInvocation: () => {
+				caller.returned = true;
+				this.#checkCaller(caller);
+			},
+		});
+		const caller: OwnedGateCallerRecord = {
+			lease,
+			pending,
+			done: completion.resolve,
+			returned: false,
+			completed: false,
+		};
+		this.#ownedCallers.set(lease, caller);
+		return lease;
+	}
+
+	#dispatch<T>(
+		gateId: string,
+		id: string,
+		kind: WorkflowPendingProducer["kind"],
+		start: () => T | PromiseLike<T>,
+		allowCancelled = false,
+	): Promise<T> {
+		const record = this.#gateWork.get(gateId);
+		if (record?.cancelling && !allowCancelled)
+			return Promise.reject(new Error(`workflow gate ${gateId} was cancelled`));
+		const raw = Promise.withResolvers<T>();
+		if (record) {
+			const token = {};
+			record.pending.set(token, {
+				producer: { id: `${gateId}:${id}:${++this.#producerSequence}`, kind },
+				completion: raw.promise,
+			});
+			this.#changed();
+			const finish = () => {
+				record.pending.delete(token);
+				this.#changed();
+			};
+			raw.promise.then(finish, finish);
+		}
+		try {
+			raw.resolve(start());
+		} catch (error) {
+			raw.reject(error);
+		}
+		return raw.promise;
+	}
+
+	registerGateDeliveryProducer(fence: WorkflowGateCallFence, producer: WorkflowGateDeliveryProducer): void {
+		const record = this.#gateFences.get(fence);
+		if (!record || record.cancelling || record.caller?.completed)
+			throw new Error("workflow gate delivery admission is closed");
+		if (record.deliveries.has(producer)) throw new Error("workflow gate delivery producer is already registered");
+		if (!producer || typeof producer.fence !== "function" || !(producer.completion instanceof Promise))
+			throw new Error("workflow gate delivery producer has no physical completion");
+		record.deliveries.add(producer);
+		const token = {};
+		record.pending.set(token, {
+			producer: { id: `${record.target.id}:delivery:${++this.#producerSequence}`, kind: "delivery" },
+			completion: producer.completion,
+		});
+		const finish = () => {
+			record.pending.delete(token);
+			this.#changed();
+		};
+		producer.completion.then(finish, finish);
+		this.#changed();
+	}
+
+	#capability(record: OwnedGateWorkRecord, fresh = true): string | undefined {
+		if (!record.caller) return "gate has no authenticated whole-invocation caller";
+		if (record.deliveries.size === 0) return "gate has no registered physical delivery producer";
+		if (!this.#store.peek) return "gate store has no read-only inspection capability";
+		if (this.#gateWork.get(record.target.id) !== record) return "gate generation changed";
+		if (fresh && !this.#broker.ownsGeneration(record.target))
+			return "durable gate generation changed or store has no read-only inspection capability";
+		if (!record.cancelling && record.caller.completed && record.pending.size === 0)
+			return "gate physical work already completed";
+		return undefined;
+	}
+
+	#pending(record: OwnedGateWorkRecord): WorkflowPendingProducer[] {
+		return [
+			...(record.caller && !record.caller.completed
+				? [
+						{ id: `${record.caller.lease.toolCallId}:invocation`, kind: "caller" as const },
+						...Array.from(record.caller.pending.values(), work => work.producer),
+					]
+				: []),
+			...Array.from(record.pending.values(), work => work.producer),
+		];
+	}
+
+	snapshotOwnedGateWork(): WorkflowGateWorkSnapshot {
+		const records = [...this.#gateWork.values()].filter(record =>
+			record.cancelling
+				? !record.durable || !!record.failure || this.#pending(record).length > 0
+				: !record.caller?.completed || record.pending.size > 0,
+		);
+		return Object.freeze({
+			revision: this.#workRevision,
+			completeness: "complete" as const,
+			targets: Object.freeze(records.map(record => record.target)),
+			capabilities: Object.freeze(
+				records.map(record => {
+					const reason = this.#capability(record, false);
+					return Object.freeze({ target: record.target, cancellable: !reason, ...(reason ? { reason } : {}) });
+				}),
+			),
+		});
+	}
+
+	prepareGateCancellation(targets: WorkflowWorkTarget | readonly WorkflowWorkTarget[]): PreparedWorkflowCancellation {
+		const selected: readonly WorkflowWorkTarget[] = "kind" in targets ? [targets] : targets;
+		const seen = new Set<string>();
+		const records = selected.map(target => {
+			const record = this.#gateWork.get(target.id);
+			if (
+				!record ||
+				target.kind !== "workflow" ||
+				target.workflowKind !== "gate" ||
+				record.target.generation !== target.generation ||
+				seen.has(target.id)
+			)
+				throw new Error("stale, duplicate or unknown workflow gate target");
+			seen.add(target.id);
+			const reason = this.#capability(record);
+			if (reason) throw new Error(reason);
+			return record;
+		});
+		const prepared = Object.freeze({ targets: Object.freeze(records.map(record => record.target)) });
+		this.#prepared.set(prepared, records);
+		return prepared;
+	}
+
+	async cancelPreparedGateWork(
+		prepared: PreparedWorkflowCancellation,
+		timeoutMs: number,
+	): Promise<readonly WorkflowCancellationProof[]> {
+		const records = this.#prepared.get(prepared);
+		if (!records) throw new Error("unauthenticated workflow gate cancellation preparation");
+		if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("invalid workflow gate cancellation timeout");
+		// Validate the entire batch again at the final synchronous admission boundary.
+		for (const record of records) {
+			const reason = this.#capability(record);
+			if (reason) throw new Error(reason);
+		}
+		for (const record of records) record.cancelling = true;
+		this.#changed();
+		for (const record of records) {
+			if (!record.durable) {
+				try {
+					this.#broker.persistCancellationIntent(record.target);
+					record.durable = true;
+					record.failure = undefined;
+				} catch (error) {
+					record.failure = `cancellation intent is not durable: ${error instanceof Error ? error.message : String(error)}`;
+					continue;
+				}
+			}
+			if (record.cancellationStarted) continue;
+			record.cancellationStarted = true;
+			try {
+				for (const producer of record.deliveries) producer.fence();
+				record.controller.abort(new Error("workflow gate cancellation requested"));
+				record.revoke?.();
+				this.#broker.revokeCancelledContinuation(record.target.id);
+				void this.#dispatch(
+					record.target.id,
+					"cancel-presentation",
+					"delivery",
+					() =>
+						record.terminalController?.cancelGateInteractions(
+							record.target.id,
+							"workflow gate cancellation requested",
+						),
+					true,
+				).catch(error => {
+					record.failure = `presentation cancellation failed: ${String(error)}`;
+					this.#changed();
+				});
+			} catch (error) {
+				record.failure = `cancellation fence failed: ${String(error)}`;
+			} finally {
+				record.cancellationClosed = true;
+			}
+		}
+		this.#changed();
+		if (timeoutMs > 0 && records.some(record => this.#pending(record).length > 0)) {
+			const expired = Promise.withResolvers<void>();
+			const timer = setTimeout(expired.resolve, Math.min(timeoutMs, 2_147_483_647));
+			try {
+				await Promise.race([Promise.all(records.map(record => record.completion)), expired.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+		return records.map(record => {
+			const pending = this.#pending(record);
+			if (!record.durable || record.failure || pending.length > 0)
+				return {
+					target: record.target,
+					status: "pending" as const,
+					pending,
+					reason: record.failure ?? "physical workflow gate producers are still running",
+				};
+			return {
+				target: record.target,
+				status: "settled" as const,
+				pending: [] as const,
+				fence: "durable" as const,
+				discovery: "closed" as const,
+			};
 		});
 	}
 
@@ -195,6 +586,10 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 		if (this.#fenced || this.#suspended) return Promise.reject(new Error("workflow gate emitter is unavailable"));
 		const signal = options?.signal;
 		if (signal?.aborted) return Promise.reject(signal.reason);
+		const caller = options?.caller ? this.#ownedCallers.get(options.caller) : undefined;
+		if (options?.caller && (!caller || caller.returned))
+			return Promise.reject(new Error("unauthenticated or closed workflow caller"));
+		const generation = crypto.randomUUID();
 		const waiter = Promise.withResolvers<unknown>();
 		let openedGateId: string | undefined;
 		let gate: WorkflowGate;
@@ -202,14 +597,53 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			gate = this.#broker.openGate(
 				{
 					...input,
+					generation,
 					...(input.runtimeTurnId === undefined ? { runtimeTurnId: this.#runtimeTurnProvider?.() } : {}),
 				},
 				{
 					activate: opened => {
 						this.#waiters.set(opened.gate_id, waiter);
 						openedGateId = opened.gate_id;
+						const target: WorkflowWorkTarget = Object.freeze({
+							kind: "workflow",
+							workflowKind: "gate",
+							id: opened.gate_id,
+							generation,
+						});
+						const controller = new AbortController();
+						const callFence: WorkflowGateCallFence = Object.freeze({
+							target,
+							signal: controller.signal,
+							assertActive: () => {
+								if (record.cancelling || controller.signal.aborted)
+									throw new Error(`workflow gate ${target.id} was cancelled`);
+							},
+						});
+						const completion = Promise.withResolvers<void>();
+						const record: OwnedGateWorkRecord = {
+							target,
+							caller,
+							controller,
+							callFence,
+							revoke: options?.revokeCallerGate,
+							terminalController: this.#terminalController,
+							completion: completion.promise,
+							complete: completion.resolve,
+							pending: new Map(),
+							deliveries: new Set(),
+							cancelling: false,
+							durable: false,
+							cancellationStarted: false,
+							cancellationClosed: false,
+						};
+						this.#gateWork.set(target.id, record);
+						this.#gateFences.set(callFence, record);
+						this.#changed();
+						const delivery = this.#terminalController?.captureGateWork?.(callFence);
+						if (delivery) this.registerGateDeliveryProducer(callFence, delivery);
+						options?.onOpened?.(callFence);
 					},
-					isLive: gateId => this.#waiters.has(gateId),
+					isLive: gateId => this.#waiters.has(gateId) && !this.#gateWork.get(gateId)?.cancelling,
 					release: gateId => {
 						const activeWaiter = this.#waiters.get(gateId);
 						if (!activeWaiter) return;
@@ -254,9 +688,14 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	resolveGate(response: WorkflowGateResponse): Promise<WorkflowGateResolution> {
 		if (this.#fenced || this.#suspended)
 			return Promise.reject(new WorkflowGateBrokerError("unknown_gate", `workflow gate emitter is unavailable`));
-		return this.#broker.resolve(response).catch(error => {
-			if (!this.#fenced && !this.#suspended) this.#scheduleRecovery();
-			throw error;
+		return this.#dispatch(response.gate_id, "resolve", "resolution", async () => {
+			try {
+				return await this.#broker.resolve(response);
+			} catch (error) {
+				if (!this.#fenced && !this.#suspended && !this.#gateWork.get(response.gate_id)?.cancelling)
+					this.#scheduleRecovery();
+				throw error;
+			}
 		});
 	}
 	lookupCompletedResolution(response: WorkflowGateResponse): WorkflowGateCompletedResolutionLookup {
@@ -358,25 +797,41 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 		return recovered;
 	}
 
-	async resolveGateFromNotification(
+	resolveGateFromNotification(
+		response: WorkflowGateResponse,
+		options: NotificationGateResolutionOptions,
+	): Promise<WorkflowGateResolution> {
+		return this.#dispatch(response.gate_id, "notification-resolution", "resolution", () =>
+			this.#resolveGateFromNotification(response, options),
+		);
+	}
+
+	async #resolveGateFromNotification(
 		response: WorkflowGateResponse,
 		options: NotificationGateResolutionOptions,
 	): Promise<WorkflowGateResolution> {
 		let claimSettled = false;
-		const resolveClaim = () => {
+		const resolveClaim = async () => {
 			if (claimSettled) return;
+			this.#gateWork.get(response.gate_id)?.callFence.assertActive();
 			claimSettled = true;
-			options.resolveClaim();
+			await this.#dispatch(response.gate_id, "resolve-claim", "delivery", () => options.resolveClaim());
 		};
-		const closeClaimInvalid = (reason: string) => {
+		const closeClaimInvalid = async (reason: string) => {
 			if (claimSettled) return;
 			claimSettled = true;
-			options.closeClaimInvalid(reason);
+			await this.#dispatch(
+				response.gate_id,
+				"close-claim",
+				"delivery",
+				() => options.closeClaimInvalid(reason),
+				true,
+			);
 		};
 		try {
 			JSON.parse(options.answerJson);
 		} catch {
-			closeClaimInvalid("invalid_structured_answer");
+			await closeClaimInvalid("invalid_structured_answer");
 			return {
 				gate_id: response.gate_id,
 				status: "rejected",
@@ -390,7 +845,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			semanticDisposition = this.#broker.classifyDisposition(response.gate_id, response.answer);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "invalid answer";
-			closeClaimInvalid(message);
+			await closeClaimInvalid(message);
 			return {
 				gate_id: response.gate_id,
 				status: "rejected",
@@ -416,6 +871,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 				ackPolicy,
 				semanticDisposition,
 				beforeAdvance: async () => {
+					this.#gateWork.get(response.gate_id)?.callFence.assertActive();
 					if (ackPolicy.kind === "telegram_selected_v1") {
 						this.#broker.updateAckPolicy(response.gate_id, {
 							...ackPolicy,
@@ -424,13 +880,15 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 						});
 						let outcome: AskSelectedAckOutcome;
 						try {
-							outcome = await options.requestSelectedAck({
-								replyReceiptId: options.replyReceiptId,
-								actionId: options.interactionActionId,
-								commitKey,
-								daemonDeadlineAt: Date.now() + 8_000,
-								hostTimeoutMs: 10_000,
-							});
+							outcome = await this.#dispatch(response.gate_id, "selected-ack", "delivery", () =>
+								options.requestSelectedAck({
+									replyReceiptId: options.replyReceiptId,
+									actionId: options.interactionActionId,
+									commitKey,
+									daemonDeadlineAt: Date.now() + 8_000,
+									hostTimeoutMs: 10_000,
+								}),
+							);
 						} catch (error) {
 							if (error instanceof NotificationGatePolicyChangedError) throw error;
 							outcome = { status: "unknown", reason: "host_timeout" };
@@ -442,50 +900,58 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 							updatedAt: new Date().toISOString(),
 						});
 					}
-					resolveClaim();
+					this.#gateWork.get(response.gate_id)?.callFence.assertActive();
+					await resolveClaim();
 				},
 			});
-			if (resolution.status === "accepted") resolveClaim();
-			else closeClaimInvalid(resolution.error?.code ?? "invalid_answer");
+			if (resolution.status === "accepted") await resolveClaim();
+			else await closeClaimInvalid(resolution.error?.code ?? "invalid_answer");
 			return resolution;
 		} catch (error) {
 			if (error instanceof NotificationGatePolicyChangedError) {
 				try {
-					closeClaimInvalid(error.message);
+					await closeClaimInvalid(error.message);
 				} finally {
 					this.quarantineGate(response.gate_id);
 				}
 				throw error;
 			}
-			closeClaimInvalid(error instanceof Error ? error.message : "invalid_answer");
+			await closeClaimInvalid(error instanceof Error ? error.message : "invalid_answer");
 			this.#scheduleRecovery();
 			throw error;
 		}
 	}
 
 	async #completeAccepted(record: PersistedGate): Promise<void> {
+		this.#gateWork.get(record.gate.gate_id)?.callFence.assertActive();
 		const waiter = this.#waiters.get(record.gate.gate_id);
 		if (!waiter) throw new Error(`workflow gate ${record.gate.gate_id} lost its continuation owner`);
 		waiter.resolve(record.answer);
 	}
 
 	async #terminalizeAccepted(record: PersistedGate): Promise<WorkflowGateTerminalProof> {
-		const controller = this.#terminalController;
+		const controller = this.#gateWork.get(record.gate.gate_id)?.terminalController ?? this.#terminalController;
 		if (!controller) {
 			this.quarantineGate(record.gate.gate_id);
 			throw new Error(`workflow gate ${record.gate.gate_id} has no terminal controller`);
 		}
 		try {
-			const proof = await controller.completeGateInteractions(record.gate.gate_id);
+			const proof = await this.#dispatch(record.gate.gate_id, "terminalize", "delivery", () =>
+				controller.completeGateInteractions(record.gate.gate_id),
+			);
+			this.#gateWork.get(record.gate.gate_id)?.callFence.assertActive();
 			if (proof !== "retired" && proof !== "already_terminal" && proof !== "not_published")
 				throw new Error(`workflow gate ${record.gate.gate_id} terminalization returned no exact proof`);
 			return proof;
 		} catch (error) {
 			try {
-				await controller.cancelGateInteractions(
-					record.gate.gate_id,
-					"workflow gate presentation terminalization failed",
-				);
+				if (!this.#gateWork.get(record.gate.gate_id)?.cancelling)
+					await this.#dispatch(record.gate.gate_id, "terminalize-failure", "delivery", () =>
+						controller.cancelGateInteractions(
+							record.gate.gate_id,
+							"workflow gate presentation terminalization failed",
+						),
+					);
 			} finally {
 				this.quarantineGate(record.gate.gate_id);
 			}
@@ -494,6 +960,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	}
 
 	async #finalizeAccepted(record: PersistedGate): Promise<void> {
+		this.#gateWork.get(record.gate.gate_id)?.callFence.assertActive();
 		const policy = record.ackPolicy;
 		if (policy?.kind === "telegram_selected_v1" && policy.state === "pending") {
 			let outcome: AskSelectedAckOutcome;
@@ -506,13 +973,15 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 					updatedAt: new Date().toISOString(),
 				});
 				try {
-					outcome = await participant.requestRecoveredAskSelectedAck({
-						sessionId: this.#runId,
-						actionId: policy.actionId,
-						commitKey: policy.commitKey,
-						deadlineAt: Date.now() + 8_000,
-						hostTimeoutMs: 10_000,
-					});
+					outcome = await this.#dispatch(record.gate.gate_id, "recovered-ack", "delivery", () =>
+						participant.requestRecoveredAskSelectedAck({
+							sessionId: this.#runId,
+							actionId: policy.actionId,
+							commitKey: policy.commitKey,
+							deadlineAt: Date.now() + 8_000,
+							hostTimeoutMs: 10_000,
+						}),
+					);
 				} catch {
 					outcome = { status: "unknown", reason: "host_timeout" };
 				}
@@ -567,6 +1036,9 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 
 export interface PersistedGate {
 	gate: WorkflowGate;
+	generation?: string;
+	/** Admission fence, not successful workflow advancement. Accepted evidence is retained. */
+	cancellationIntent?: { generation: string; requestedAt: string };
 	status: "pending" | "accepted" | "quarantined";
 	ownerInstanceId?: string;
 	idempotencyKey?: string;
@@ -589,6 +1061,8 @@ export interface GateStore {
 	nextSeq(stage: WorkflowStage): number;
 	put(record: PersistedGate): void;
 	get(gateId: string): PersistedGate | undefined;
+	/** Pure in-memory inspection: no reload, reconciliation, repair or filesystem writes. */
+	peek?(gateId: string): PersistedGate | undefined;
 	/** Atomically quarantines records owned by a prior runtime before exposure. */
 	beginRuntimeInstance(instanceId: string): void;
 	/** All persisted gate records (used for same-process recovery and Q12). */
@@ -606,6 +1080,10 @@ export class MemoryGateStore implements GateStore {
 	}
 	put(record: PersistedGate): void {
 		this.gates.set(record.gate.gate_id, structuredClone(record));
+	}
+	peek(gateId: string): PersistedGate | undefined {
+		const r = this.gates.get(gateId);
+		return r ? structuredClone(r) : undefined;
 	}
 	get(gateId: string): PersistedGate | undefined {
 		const r = this.gates.get(gateId);
@@ -895,6 +1373,19 @@ function assertPersistedGate(
 		!isNonEmptyString(value.ownerInstanceId)
 	)
 		invalidFileState(filePath);
+	if (value.generation !== undefined && !isNonEmptyString(value.generation)) invalidFileState(filePath);
+	if (value.cancellationIntent !== undefined) {
+		const intent = value.cancellationIntent;
+		if (
+			!isObject(intent) ||
+			Object.keys(intent).some(key => key !== "generation" && key !== "requestedAt") ||
+			!isNonEmptyString(value.generation) ||
+			intent.generation !== value.generation ||
+			!isIsoDate(intent.requestedAt) ||
+			new Date(intent.requestedAt).toISOString() !== intent.requestedAt
+		)
+			invalidFileState(filePath);
+	}
 	const gate = value.gate;
 	const stage = gate.stage as WorkflowStage;
 	const schema = gate.schema as WorkflowGate["schema"];
@@ -1162,6 +1653,10 @@ export class FileGateStore implements GateStore {
 		candidate.gates[record.gate.gate_id] = structuredClone(record);
 		this.commit(candidate);
 	}
+	peek(gateId: string): PersistedGate | undefined {
+		const record = this.state.gates[gateId];
+		return record ? structuredClone(record) : undefined;
+	}
 	get(gateId: string): PersistedGate | undefined {
 		this.reconcileCertainty();
 		const r = this.state.gates[gateId];
@@ -1218,6 +1713,8 @@ export type GateAuditEvent =
 	| { event: "gate_advance_recovered"; gate_id: string };
 
 export interface BrokerHooks {
+	/** Tracks the entire original per-gate recovery future, including lock/finally. */
+	recoverGate?(gateId: string, start: () => Promise<void>): Promise<void>;
 	/** Called once when a pending gate has been persisted and should be emitted. */
 	emit?(gate: WorkflowGate): void;
 	/**
@@ -1252,6 +1749,8 @@ export interface GateContinuation {
 }
 
 export interface OpenGateInput {
+	/** Immutable producer activation, persisted independently of presentation identity. */
+	generation?: string;
 	stage: WorkflowStage;
 	kind: WorkflowGateKind;
 	schema: WorkflowGate["schema"];
@@ -1276,7 +1775,8 @@ export class WorkflowGateBrokerError extends Error {
 			| "already_resolved"
 			| "idempotency_conflict"
 			| "invalid_workflow_stage"
-			| "invalid_runtime_turn",
+			| "invalid_runtime_turn"
+			| "invalid_gate_generation",
 		message: string,
 	) {
 		super(message);
@@ -1323,7 +1823,8 @@ export class WorkflowGateBroker {
 
 	classifyDisposition(gateId: string, answer: unknown): PersistedSemanticDisposition {
 		const record = this.store.get(gateId);
-		if (!record) throw new WorkflowGateBrokerError("unknown_gate", `no pending gate ${gateId}`);
+		if (!record || record.cancellationIntent)
+			throw new WorkflowGateBrokerError("unknown_gate", `no pending gate ${gateId}`);
 		return classifyAskGateDisposition(record.gate, answer);
 	}
 	validationError(gateId: string, keyword: string, message: string): WorkflowGateValidationError {
@@ -1338,14 +1839,14 @@ export class WorkflowGateBroker {
 
 	updateAckPolicy(gateId: string, ackPolicy: PersistedAckPolicy): void {
 		const record = this.store.get(gateId);
-		if (record?.status !== "accepted")
+		if (record?.status !== "accepted" || record.cancellationIntent)
 			throw new WorkflowGateBrokerError("unknown_gate", `no accepted gate ${gateId}`);
 		this.store.put({ ...record, ackPolicy });
 	}
 
 	lookupCompletedResolution(response: WorkflowGateResponse): WorkflowGateCompletedResolutionLookup {
 		const record = this.store.get(response.gate_id);
-		if (!record) return { kind: "none" };
+		if (!record || record.cancellationIntent) return { kind: "none" };
 		const responseHash = answerHashOf({ gate_id: response.gate_id, answer: response.answer });
 		if (record.status !== "accepted" && record.status !== "quarantined") return { kind: "none" };
 		if (record.responseHash === undefined) return { kind: "none" };
@@ -1398,7 +1899,11 @@ export class WorkflowGateBroker {
 		if (proof !== "retired" && proof !== "already_terminal" && proof !== "not_published")
 			throw new Error(`workflow gate ${record.gate.gate_id} has no terminalization proof`);
 		const terminalized = this.store.get(record.gate.gate_id);
-		if (terminalized?.status !== "accepted" || terminalized.advanced)
+		if (
+			terminalized?.status !== "accepted" ||
+			terminalized.advanced ||
+			!this.hasLiveContinuation(record.gate.gate_id)
+		)
 			throw new WorkflowGateBrokerError(
 				"unknown_gate",
 				`accepted gate ${record.gate.gate_id} disappeared before advance`,
@@ -1411,13 +1916,48 @@ export class WorkflowGateBroker {
 	}
 
 	private hasLiveContinuation(gateId: string): boolean {
-		return this.continuations.get(gateId)?.isLive(gateId) === true;
+		return !this.store.get(gateId)?.cancellationIntent && this.continuations.get(gateId)?.isLive(gateId) === true;
+	}
+
+	ownsGeneration(target: WorkflowWorkTarget): boolean {
+		const record = this.store.peek?.(target.id);
+		return (
+			target.kind === "workflow" &&
+			target.workflowKind === "gate" &&
+			record?.ownerInstanceId === this.instanceId &&
+			record.generation === target.generation
+		);
+	}
+
+	persistCancellationIntent(target: WorkflowWorkTarget): void {
+		const record = this.store.get(target.id);
+		if (
+			target.workflowKind !== "gate" ||
+			record?.ownerInstanceId !== this.instanceId ||
+			record.generation !== target.generation
+		)
+			throw new Error("workflow gate cancellation generation changed");
+		// Re-write even an existing intent after an uncertain fsync; its presence alone is not durability.
+		this.store.put({
+			...record,
+			cancellationIntent: record.cancellationIntent ?? {
+				generation: target.generation,
+				requestedAt: new Date().toISOString(),
+			},
+		});
+	}
+
+	/** Deliberate cancellation is not unexpected continuation loss and never aborts the ambient run. */
+	revokeCancelledContinuation(gateId: string): void {
+		this.continuations.get(gateId)?.release?.(gateId);
+		this.continuations.delete(gateId);
+		this.#terminalProofs.delete(gateId);
 	}
 
 	private recordContinuationLoss(gateId: string): void {
 		this.#continuationLost.add(gateId);
 		const lost = this.store.get(gateId);
-		if (!lost) return;
+		if (!lost || lost.cancellationIntent) return;
 		try {
 			this.hooks.continuationLost?.(lost);
 		} catch {
@@ -1580,6 +2120,8 @@ export class WorkflowGateBroker {
 				`stage "${input.stage}" is not a v1 workflow stage`,
 			);
 		}
+		if (input.generation !== undefined && !isNonEmptyString(input.generation))
+			throw new WorkflowGateBrokerError("invalid_gate_generation", "gate generation must be a nonempty string");
 		if (input.runtimeTurnId !== undefined && !isNonEmptyString(input.runtimeTurnId))
 			throw new WorkflowGateBrokerError("invalid_runtime_turn", "runtime turn id must be a nonempty string");
 		// Asserts schema shape (throws WorkflowGateSchemaError on unsupported keywords).
@@ -1602,6 +2144,7 @@ export class WorkflowGateBroker {
 		if (!continuation) {
 			this.store.put({
 				gate,
+				generation: input.generation ?? crypto.randomUUID(),
 				status: "quarantined",
 				ownerInstanceId: this.instanceId,
 				advanced: false,
@@ -1613,10 +2156,17 @@ export class WorkflowGateBroker {
 			});
 			return gate;
 		}
-		this.store.put({ gate, status: "pending", ownerInstanceId: this.instanceId, advanced: false });
-		continuation.activate(gate);
-		if (continuation.terminalProof === "not_published") this.#terminalProofs.set(gateId, "not_published");
+		this.store.put({
+			gate,
+			generation: input.generation ?? crypto.randomUUID(),
+			status: "pending",
+			ownerInstanceId: this.instanceId,
+			advanced: false,
+		});
 		this.continuations.set(gateId, continuation);
+		continuation.activate(gate);
+		if (!this.hasLiveContinuation(gateId)) return gate;
+		if (continuation.terminalProof === "not_published") this.#terminalProofs.set(gateId, "not_published");
 		if (input.supersedesGateId) {
 			const superseded = this.store.get(input.supersedesGateId);
 			if (superseded?.status === "quarantined" && superseded.lifecycle) {
@@ -1654,7 +2204,7 @@ export class WorkflowGateBroker {
 		options: GateResolutionOptions = {},
 	): Promise<WorkflowGateResolution> {
 		const record = this.store.get(response.gate_id);
-		if (!record || record.status === "quarantined") {
+		if (!record || record.status === "quarantined" || record.cancellationIntent) {
 			this.hooks.audit?.({ event: "gate_response_unknown_gate", gate_id: response.gate_id });
 			throw new WorkflowGateBrokerError("unknown_gate", `no live pending gate ${response.gate_id}`);
 		}
@@ -1725,6 +2275,7 @@ export class WorkflowGateBroker {
 		// recovered via recover().
 		this.store.put({
 			gate: record.gate,
+			generation: record.generation,
 			status: "accepted",
 			ownerInstanceId: record.ownerInstanceId,
 			idempotencyKey: response.idempotency_key,
@@ -1738,10 +2289,14 @@ export class WorkflowGateBroker {
 			ackPolicy,
 		});
 		this.hooks.audit?.({ event: "gate_response_accepted", gate_id: response.gate_id, answer_hash: answerHash });
+		if (!this.hasLiveContinuation(response.gate_id))
+			throw new WorkflowGateBrokerError("unknown_gate", `no live continuation for gate ${response.gate_id}`);
 		await options.beforeAdvance?.();
+		if (!this.hasLiveContinuation(response.gate_id))
+			throw new WorkflowGateBrokerError("unknown_gate", `no live continuation for gate ${response.gate_id}`);
 		await this.hooks.finalizeAccepted?.(this.store.get(response.gate_id) as PersistedGate);
 		const finalized = this.store.get(response.gate_id);
-		if (finalized?.status !== "accepted") {
+		if (finalized?.status !== "accepted" || !this.hasLiveContinuation(response.gate_id)) {
 			throw new WorkflowGateBrokerError(
 				"unknown_gate",
 				`accepted gate ${response.gate_id} disappeared before terminalization`,
@@ -1801,45 +2356,52 @@ export class WorkflowGateBroker {
 				continue;
 			this.recovering.add(listed.gate.gate_id);
 			try {
-				await this.withGateLock(listed.gate.gate_id, async () => {
-					const rec = this.store.get(listed.gate.gate_id);
-					if (rec?.status !== "accepted" || rec.advanced) return;
-					await this.hooks.finalizeAccepted?.(rec);
-					const finalized = this.store.get(listed.gate.gate_id);
-					if (
-						finalized?.status !== "accepted" ||
-						finalized.advanced ||
-						!this.hasLiveContinuation(listed.gate.gate_id)
-					)
-						return;
-					if (!finalized.terminalized) await this.#terminalize(finalized);
-					const terminalized = this.store.get(listed.gate.gate_id);
-					if (
-						terminalized?.status !== "accepted" ||
-						terminalized.advanced ||
-						!this.hooks.advance ||
-						!this.hasLiveContinuation(listed.gate.gate_id)
-					)
-						return;
-					await this.hooks.advance(terminalized.gate, terminalized.answer);
-					const latest = this.store.get(listed.gate.gate_id);
-					if (latest?.status !== "accepted" || latest.advanced || !this.hasLiveContinuation(listed.gate.gate_id))
-						return;
-					this.store.put({ ...latest, advanced: true });
-					// Same durable-commit-then-resolve ordering as `resolve()`; mark the
-					// loss so a recovery attempt cannot leave behind a record that claims
-					// completion its continuation never received (#5599).
-					try {
-						await this.hooks.completeAccepted?.(this.store.get(latest.gate.gate_id) as PersistedGate);
-					} catch (error) {
-						this.recordContinuationLoss(latest.gate.gate_id);
-						throw error;
-					}
-					this.continuations.get(latest.gate.gate_id)?.release?.(latest.gate.gate_id);
-					this.continuations.delete(latest.gate.gate_id);
-					this.hooks.audit?.({ event: "gate_advance_recovered", gate_id: latest.gate.gate_id });
-					recovered.push(latest.gate.gate_id);
-				});
+				const recover = () =>
+					this.withGateLock(listed.gate.gate_id, async () => {
+						const rec = this.store.get(listed.gate.gate_id);
+						if (rec?.status !== "accepted" || rec.advanced || !this.hasLiveContinuation(listed.gate.gate_id))
+							return;
+						await this.hooks.finalizeAccepted?.(rec);
+						const finalized = this.store.get(listed.gate.gate_id);
+						if (
+							finalized?.status !== "accepted" ||
+							finalized.advanced ||
+							!this.hasLiveContinuation(listed.gate.gate_id)
+						)
+							return;
+						if (!finalized.terminalized) await this.#terminalize(finalized);
+						const terminalized = this.store.get(listed.gate.gate_id);
+						if (
+							terminalized?.status !== "accepted" ||
+							terminalized.advanced ||
+							!this.hooks.advance ||
+							!this.hasLiveContinuation(listed.gate.gate_id)
+						)
+							return;
+						await this.hooks.advance(terminalized.gate, terminalized.answer);
+						const latest = this.store.get(listed.gate.gate_id);
+						if (
+							latest?.status !== "accepted" ||
+							latest.advanced ||
+							!this.hasLiveContinuation(listed.gate.gate_id)
+						)
+							return;
+						this.store.put({ ...latest, advanced: true });
+						// Same durable-commit-then-resolve ordering as `resolve()`; mark the
+						// loss so a recovery attempt cannot leave behind a record that claims
+						// completion its continuation never received (#5599).
+						try {
+							await this.hooks.completeAccepted?.(this.store.get(latest.gate.gate_id) as PersistedGate);
+						} catch (error) {
+							this.recordContinuationLoss(latest.gate.gate_id);
+							throw error;
+						}
+						this.continuations.get(latest.gate.gate_id)?.release?.(latest.gate.gate_id);
+						this.continuations.delete(latest.gate.gate_id);
+						this.hooks.audit?.({ event: "gate_advance_recovered", gate_id: latest.gate.gate_id });
+						recovered.push(latest.gate.gate_id);
+					});
+				await (this.hooks.recoverGate ? this.hooks.recoverGate(listed.gate.gate_id, recover) : recover());
 			} finally {
 				this.recovering.delete(listed.gate.gate_id);
 			}

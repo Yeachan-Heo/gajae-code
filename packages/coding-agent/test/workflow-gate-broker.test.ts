@@ -732,6 +732,133 @@ describe("WorkflowGateBroker", () => {
 			},
 		]);
 	});
+	it("persists a strict generation-bound cancellation intent without manufacturing workflow advancement", async () => {
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-cancel-intent-")), "gates.json");
+		const store = new FileGateStore(file);
+		const advanced = vi.fn();
+		const continuationLost = vi.fn();
+		const broker = new WorkflowGateBroker("cancel-intent", store, { advance: advanced, continuationLost });
+		const gate = broker.openGate(
+			{ generation: "physical-generation", stage: "deep-interview", kind: "question", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const target = {
+			kind: "workflow",
+			workflowKind: "gate",
+			id: gate.gate_id,
+			generation: "physical-generation",
+		} as const;
+		expect(() => broker.persistCancellationIntent({ ...target, generation: "stale" })).toThrow("generation changed");
+		expect(store.get(gate.gate_id)?.cancellationIntent).toBeUndefined();
+		broker.persistCancellationIntent(target);
+		broker.revokeCancelledContinuation(target.id);
+		expect(new FileGateStore(file).get(gate.gate_id)).toMatchObject({
+			status: "pending",
+			advanced: false,
+			generation: target.generation,
+			cancellationIntent: { generation: target.generation, requestedAt: expect.any(String) },
+		});
+		expect(broker.listPendingGates()).toEqual([]);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "late" })).rejects.toThrow("no live pending gate");
+		expect(await broker.recover()).toEqual([]);
+		expect(advanced).not.toHaveBeenCalled();
+		expect(continuationLost).not.toHaveBeenCalled();
+	});
+
+	it("repeats the durability barrier after an uncertain cancellation write instead of trusting the visible intent", () => {
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-cancel-fsync-")), "gates.json");
+		let failDirectory = false;
+		let successfulBarriers = 0;
+		const store = new FileGateStore(file, fd => {
+			if (fs.fstatSync(fd).isDirectory()) {
+				if (failDirectory) throw new Error("directory fsync failed");
+				successfulBarriers++;
+			}
+			fs.fsyncSync(fd);
+		});
+		const broker = new WorkflowGateBroker("cancel-fsync", store);
+		const gate = broker.openGate(
+			{ generation: "fsync-generation", stage: "deep-interview", kind: "question", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const target = {
+			kind: "workflow",
+			workflowKind: "gate",
+			id: gate.gate_id,
+			generation: "fsync-generation",
+		} as const;
+		const before = successfulBarriers;
+		failDirectory = true;
+		expect(() => broker.persistCancellationIntent(target)).toThrow("uncertain");
+		expect(store.peek(gate.gate_id)?.cancellationIntent).toMatchObject({ generation: target.generation });
+		expect(successfulBarriers).toBe(before);
+		failDirectory = false;
+		broker.persistCancellationIntent(target);
+		expect(successfulBarriers).toBe(before + 1);
+		expect(new FileGateStore(file).get(gate.gate_id)).toMatchObject({
+			status: "pending",
+			advanced: false,
+			cancellationIntent: { generation: target.generation },
+		});
+	});
+
+	it("retains actual accepted-answer evidence when a later cancellation intent is written", async () => {
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-cancel-accepted-")), "gates.json");
+		const store = new FileGateStore(file);
+		const broker = new WorkflowGateBroker("cancel-accepted", store, {
+			advance: () => {},
+			terminalizeAccepted: () => "not_published",
+		});
+		const gate = broker.openGate(
+			{ generation: "accepted-generation", stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const response = { gate_id: gate.gate_id, answer: "yes", idempotency_key: "accepted-before-cancel" };
+		await broker.resolve(response);
+		const accepted = store.get(gate.gate_id)!;
+		broker.persistCancellationIntent({
+			kind: "workflow",
+			workflowKind: "gate",
+			id: gate.gate_id,
+			generation: "accepted-generation",
+		});
+		const persisted = new FileGateStore(file).get(gate.gate_id)!;
+		expect(persisted).toMatchObject(JSON.parse(JSON.stringify(accepted)));
+		expect(persisted.cancellationIntent).toMatchObject({ generation: "accepted-generation" });
+		expect(broker.lookupCompletedResolution(response)).toEqual({ kind: "none" });
+		await expect(broker.resolve(response)).rejects.toThrow("no live pending gate");
+	});
+
+	it("rejects malformed, unbound and extended cancellation intents on durable reload", () => {
+		const file = path.join(tempDirs.mkdtempSync(path.join(tmpdir(), "gate-cancel-invalid-")), "gates.json");
+		const broker = new WorkflowGateBroker("cancel-invalid", new FileGateStore(file));
+		const gate = broker.openGate(
+			{ generation: "bound-generation", stage: "deep-interview", kind: "question", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const validState = JSON.parse(readFileSync(file, "utf8"));
+		for (const intent of [
+			null,
+			{},
+			{ generation: "other-generation", requestedAt: "2026-11-16T00:00:00.000Z" },
+			{ generation: "bound-generation", requestedAt: "not-a-date" },
+			{ generation: "bound-generation", requestedAt: "2026-11-16T00:00:00.000Z", advanced: true },
+		]) {
+			const state = structuredClone(validState);
+			state.gates[gate.gate_id].cancellationIntent = intent;
+			writeFileSync(file, JSON.stringify(state));
+			expect(() => new FileGateStore(file)).toThrow("invalid gate store");
+		}
+		const missingGeneration = structuredClone(validState);
+		delete missingGeneration.gates[gate.gate_id].generation;
+		missingGeneration.gates[gate.gate_id].cancellationIntent = {
+			generation: "bound-generation",
+			requestedAt: "2026-11-16T00:00:00.000Z",
+		};
+		writeFileSync(file, JSON.stringify(missingGeneration));
+		expect(() => new FileGateStore(file)).toThrow("invalid gate store");
+	});
+
 	it("refuses a direct resolveGate replay the runtime cannot prove resolved (#5599 review)", async () => {
 		// `lookupCompletedResolution` is not the only way back in: `resolve()` has its own
 		// accepted-record idempotency branch that returned `record.resolution` directly. A

@@ -35,6 +35,8 @@ import {
 	MemoryGateStore,
 	type OpenGateInput,
 	type WorkflowGateEmitter,
+	type WorkflowGateTerminalController,
+	type WorkflowGateTerminalProof,
 } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../../src/modes/types";
@@ -66,6 +68,61 @@ async function waitForAskGate(emitter: BrokerWorkflowGateEmitter, questionId: st
 		await Bun.sleep(5);
 	}
 	throw new Error(`ask gate ${questionId} was never opened`);
+}
+
+function installPhysicalGateController(
+	emitter: BrokerWorkflowGateEmitter,
+	callbacks: { complete?: (gateId: string) => Promise<void>; cancel?: (gateId: string) => Promise<void> } = {},
+) {
+	const records = new Map<string, { done: () => void; pending: number; terminal: boolean; fenced: boolean }>();
+	const completed: string[] = [];
+	const cancelled: string[] = [];
+	const fenced: string[] = [];
+	const finish = (record: { done: () => void; pending: number; terminal: boolean }) => {
+		if (record.terminal && record.pending === 0) record.done();
+	};
+	const controller: WorkflowGateTerminalController = {
+		captureGateWork: fence => {
+			const completion = Promise.withResolvers<void>();
+			const record = { done: completion.resolve, pending: 0, terminal: false, fenced: false };
+			records.set(fence.target.id, record);
+			return {
+				completion: completion.promise,
+				fence: () => {
+					record.fenced = true;
+					fenced.push(fence.target.id);
+				},
+			};
+		},
+		completeGateInteractions: async (gateId): Promise<WorkflowGateTerminalProof> => {
+			const record = records.get(gateId)!;
+			if (record.fenced) throw new Error("fixture delivery generation is fenced");
+			completed.push(gateId);
+			record.pending++;
+			try {
+				await callbacks.complete?.(gateId);
+				return "not_published";
+			} finally {
+				record.pending--;
+				record.terminal = true;
+				finish(record);
+			}
+		},
+		cancelGateInteractions: async gateId => {
+			const record = records.get(gateId)!;
+			cancelled.push(gateId);
+			record.pending++;
+			try {
+				await callbacks.cancel?.(gateId);
+			} finally {
+				record.pending--;
+				record.terminal = true;
+				finish(record);
+			}
+		},
+	};
+	emitter.registerGateTerminalController(controller);
+	return { completed, cancelled, fenced };
 }
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
@@ -3341,6 +3398,403 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(renderedText).toContain("1. CSV");
 		expect(renderedText).toContain("2. PDF");
 		expect(renderedText).not.toContain("Round 2 | Component:");
+	});
+});
+
+describe("AskTool owned workflow gate physical lifetime", () => {
+	function recorderResult(): AppendOrMergeResult {
+		const q = singleDeepInterviewQuestion();
+		return deepInterviewRecorder.appendOrMergeRound(
+			[],
+			deepInterviewRecorder.buildAnswerShell(
+				{
+					...q.deepInterview,
+					questionId: q.id,
+					questionText: q.question,
+					selectedOptions: ["Budget"],
+				},
+				"2026-11-16T00:00:00.000Z",
+			),
+		);
+	}
+	const question = (id: string) => ({ id, question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] });
+	function start(
+		emitter: BrokerWorkflowGateEmitter,
+		id: string,
+		questions: AskToolInput["questions"] = [question(id)],
+		overrides: Partial<ToolSession> = {},
+	) {
+		const abort = vi.fn();
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getSessionId: () => id, getWorkflowGateEmitter: () => emitter, ...overrides }),
+		)
+			.execute(id, { questions }, undefined, undefined, { hasUI: false, abort } as unknown as AgentToolContext)
+			.then(
+				result => ({ kind: "returned" as const, result }),
+				(error: unknown) => ({ kind: "failed" as const, error }),
+			);
+		return { outcome, abort };
+	}
+
+	it("retains an accepted gate until the actual recorder and the whole Ask body finish, without late HUD or approval effects", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("owned-recorder", store);
+		const controller = installPhysicalGateController(emitter);
+		const entered = Promise.withResolvers<void>();
+		const raw = Promise.withResolvers<AppendOrMergeResult>();
+		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockImplementation(() => {
+			entered.resolve();
+			return raw.promise;
+		});
+		const hud = spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue();
+		const invocation = start(emitter, "owned-recorder-call", [singleDeepInterviewQuestion()], {
+			getDeepInterviewAskStage: () => "post-topology",
+		});
+		const gate = await waitForAskGate(emitter, "q-deep");
+		await emitter.resolveGate({ gate_id: gate.gate_id, answer: { selected: ["Budget"] } });
+		await entered.promise;
+		const target = emitter.snapshotOwnedGateWork().targets[0]!;
+		expect(store.get(target.id)).toMatchObject({ status: "accepted", advanced: true });
+		const before = store.list();
+		const put = spyOn(store, "put");
+		const get = spyOn(store, "get");
+		const prepared = emitter.prepareGateCancellation(target);
+		expect(emitter.snapshotOwnedGateWork().targets).toEqual([target]);
+		expect(emitter.snapshotOwnedGateWork().targets).toEqual([target]);
+		expect(put).not.toHaveBeenCalled();
+		expect(get).not.toHaveBeenCalled();
+		expect(store.list()).toEqual(before);
+		expect(controller.cancelled).toEqual([]);
+		const [pending] = await emitter.cancelPreparedGateWork(prepared, 0);
+		expect(pending).toMatchObject({
+			target,
+			status: "pending",
+			pending: expect.arrayContaining([
+				expect.objectContaining({ kind: "caller" }),
+				expect.objectContaining({ kind: "durable_write" }),
+			]),
+		});
+		expect(store.get(target.id)).toMatchObject({
+			status: "accepted",
+			advanced: true,
+			cancellationIntent: { generation: target.generation },
+		});
+		expect(emitter.snapshotOwnedGateWork().targets).toEqual([target]);
+		expect(invocation.abort).not.toHaveBeenCalled();
+		raw.resolve(recorderResult());
+		expect((await invocation.outcome).kind).toBe("failed");
+		expect(hud).not.toHaveBeenCalled();
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toEqual([
+			{ target, status: "settled", pending: [], fence: "durable", discovery: "closed" },
+		]);
+		expect(controller.cancelled).toEqual([target.id]);
+		expect(controller.fenced).toEqual([target.id]);
+		expect(emitter.snapshotOwnedGateWork().targets).toEqual([]);
+	});
+
+	it("owns the original timed-out recorder, not its expired timeout wrapper, and retries the same physical future", async () => {
+		spyOn(logger, "warn").mockImplementation(() => {});
+		const emitter = new BrokerWorkflowGateEmitter("owned-timeout", new MemoryGateStore());
+		const controller = installPhysicalGateController(emitter);
+		const raw = Promise.withResolvers<AppendOrMergeResult>();
+		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockImplementation(() => raw.promise);
+		const hud = spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue();
+		const invocation = start(emitter, "owned-timeout-call", [singleDeepInterviewQuestion()], {
+			getDeepInterviewAskStage: () => "post-topology",
+		});
+		const gate = await waitForAskGate(emitter, "q-deep");
+		await emitter.resolveGate({ gate_id: gate.gate_id, answer: { selected: ["Budget"] } });
+		expect((await invocation.outcome).kind).toBe("returned");
+		const target = emitter.snapshotOwnedGateWork().targets[0]!;
+		const prepared = emitter.prepareGateCancellation(target);
+		const [first] = await emitter.cancelPreparedGateWork(prepared, 0);
+		const [retry] = await emitter.cancelPreparedGateWork(prepared, 0);
+		expect(first).toMatchObject({
+			status: "pending",
+			pending: expect.arrayContaining([expect.objectContaining({ kind: "durable_write" })]),
+		});
+		expect(retry).toMatchObject({ status: "pending", target });
+		expect(controller.cancelled).toEqual([target.id]);
+		raw.resolve(recorderResult());
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toMatchObject([{ status: "settled", pending: [] }]);
+		expect(hud).not.toHaveBeenCalled();
+		expect(invocation.abort).not.toHaveBeenCalled();
+	});
+
+	it("joins a held original terminal-controller call while leaving another gate and a successor usable", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("owned-controller", store);
+		const entered = Promise.withResolvers<void>();
+		const raw = Promise.withResolvers<void>();
+		let selectedId: string | undefined;
+		const controller = installPhysicalGateController(emitter, {
+			complete: gateId => {
+				if (gateId !== selectedId) return Promise.resolve();
+				entered.resolve();
+				return raw.promise;
+			},
+		});
+		const selected = start(emitter, "held-controller");
+		const gate = await waitForAskGate(emitter, "held-controller");
+		selectedId = gate.gate_id;
+		const other = start(emitter, "other-controller");
+		const otherGate = await waitForAskGate(emitter, "other-controller");
+		const resolution = emitter.resolveGate({ gate_id: gate.gate_id, answer: { selected: ["Yes"] } }).then(
+			() => "returned",
+			() => "failed",
+		);
+		await entered.promise;
+		const target = emitter.snapshotOwnedGateWork().targets.find(item => item.id === gate.gate_id)!;
+		const prepared = emitter.prepareGateCancellation(target);
+		const [pending] = await emitter.cancelPreparedGateWork(prepared, 0);
+		expect(pending).toMatchObject({
+			status: "pending",
+			pending: expect.arrayContaining([
+				expect.objectContaining({ kind: "resolution" }),
+				expect.objectContaining({ kind: "delivery" }),
+			]),
+		});
+		expect((await selected.outcome).kind).toBe("failed");
+		expect(store.get(otherGate.gate_id)).toMatchObject({ status: "pending" });
+		expect(controller.cancelled).toEqual([gate.gate_id]);
+		await emitter.resolveGate({ gate_id: otherGate.gate_id, answer: { selected: ["Yes"] } });
+		expect((await other.outcome).kind).toBe("returned");
+		raw.resolve();
+		expect(await resolution).toBe("failed");
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toMatchObject([{ status: "settled" }]);
+		const successor = start(emitter, "successor-controller");
+		const successorGate = await waitForAskGate(emitter, "successor-controller");
+		await emitter.resolveGate({ gate_id: successorGate.gate_id, answer: { selected: ["Yes"] } });
+		expect((await successor.outcome).kind).toBe("returned");
+		expect(selected.abort).not.toHaveBeenCalled();
+		expect(other.abort).not.toHaveBeenCalled();
+		expect(successor.abort).not.toHaveBeenCalled();
+	});
+
+	it("does not abort another unsettled gate of the same real Ask invocation to manufacture a join", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("owned-shared-caller", store);
+		const controller = installPhysicalGateController(emitter);
+		const invocation = start(emitter, "shared-caller", [question("first-question"), question("second-question")]);
+		const first = await waitForAskGate(emitter, "first-question");
+		await emitter.resolveGate({ gate_id: first.gate_id, answer: { selected: ["Yes"] } });
+		const second = await waitForAskGate(emitter, "second-question");
+		const target = emitter.snapshotOwnedGateWork().targets.find(item => item.id === first.gate_id)!;
+		const prepared = emitter.prepareGateCancellation(target);
+		expect(await emitter.cancelPreparedGateWork(prepared, 0)).toMatchObject([
+			{ status: "pending", pending: expect.arrayContaining([expect.objectContaining({ kind: "caller" })]) },
+		]);
+		expect(store.get(second.gate_id)).toMatchObject({ status: "pending" });
+		expect(store.get(second.gate_id)?.cancellationIntent).toBeUndefined();
+		expect(controller.cancelled).toEqual([first.gate_id]);
+		expect(emitter.listPendingGates().map(gate => gate.gate_id)).toEqual([second.gate_id]);
+		await emitter.resolveGate({ gate_id: second.gate_id, answer: { selected: ["Yes"] } });
+		expect((await invocation.outcome).kind).toBe("failed");
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toMatchObject([{ status: "settled" }]);
+		expect(invocation.abort).not.toHaveBeenCalled();
+	});
+
+	it("joins original selected-ack and claim-cleanup futures without delivering a late resolved claim", async () => {
+		const emitter = new BrokerWorkflowGateEmitter("owned-notification", new MemoryGateStore());
+		installPhysicalGateController(emitter);
+		const invocation = start(emitter, "notification-physical");
+		const gate = await waitForAskGate(emitter, "notification-physical");
+		const entered = Promise.withResolvers<void>();
+		const ack = Promise.withResolvers<{ status: "delivered"; messageId: number }>();
+		const closeEntered = Promise.withResolvers<void>();
+		const cleanup = Promise.withResolvers<void>();
+		const resolveClaim = vi.fn();
+		const resolution = emitter
+			.resolveGateFromNotification(
+				{ gate_id: gate.gate_id, answer: { selected: ["Yes"] } },
+				{
+					interactionActionId: "owned-action",
+					replyReceiptId: "owned-receipt",
+					answerJson: JSON.stringify({ selected: ["Yes"] }),
+					requestSelectedAck: () => {
+						entered.resolve();
+						return ack.promise;
+					},
+					resolveClaim,
+					closeClaimInvalid: () => {
+						closeEntered.resolve();
+						return cleanup.promise;
+					},
+				},
+			)
+			.then(
+				() => "returned",
+				() => "failed",
+			);
+		await entered.promise;
+		const target = emitter.snapshotOwnedGateWork().targets[0]!;
+		const prepared = emitter.prepareGateCancellation(target);
+		expect(await emitter.cancelPreparedGateWork(prepared, 0)).toMatchObject([
+			{
+				status: "pending",
+				pending: expect.arrayContaining([
+					expect.objectContaining({ kind: "delivery" }),
+					expect.objectContaining({ kind: "resolution" }),
+				]),
+			},
+		]);
+		expect((await invocation.outcome).kind).toBe("failed");
+		ack.resolve({ status: "delivered", messageId: 1 });
+		await closeEntered.promise;
+		expect(await emitter.cancelPreparedGateWork(prepared, 0)).toMatchObject([
+			{
+				status: "pending",
+				pending: expect.arrayContaining([
+					expect.objectContaining({ id: expect.stringContaining("close-claim"), kind: "delivery" }),
+				]),
+			},
+		]);
+		cleanup.resolve();
+		expect(await resolution).toBe("failed");
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toMatchObject([{ status: "settled" }]);
+		expect(resolveClaim).not.toHaveBeenCalled();
+		expect(invocation.abort).not.toHaveBeenCalled();
+	});
+
+	it("installs caller ownership and its gate fence before an emitted listener cancels synchronously", async () => {
+		const emitter = new BrokerWorkflowGateEmitter("owned-sync-listener", new MemoryGateStore());
+		const controller = installPhysicalGateController(emitter);
+		const completed = Promise.withResolvers<void>();
+		emitter.onGateEmitted(gate => {
+			const target = emitter.snapshotOwnedGateWork().targets.find(item => item.id === gate.gate_id)!;
+			const prepared = emitter.prepareGateCancellation(target);
+			void emitter.cancelPreparedGateWork(prepared, 1_000).then(proofs => {
+				expect(proofs).toMatchObject([{ target, status: "settled" }]);
+				completed.resolve();
+			}, completed.reject);
+		});
+		const invocation = start(emitter, "sync-listener");
+		expect((await invocation.outcome).kind).toBe("failed");
+		await completed.promise;
+		expect(controller.cancelled).toHaveLength(1);
+		expect(emitter.snapshotOwnedGateWork().targets).toEqual([]);
+		expect(invocation.abort).not.toHaveBeenCalled();
+	});
+
+	it("fences late execution approval between real awaited phases", async () => {
+		const emitter = new BrokerWorkflowGateEmitter("owned-approval", new MemoryGateStore());
+		installPhysicalGateController(emitter);
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: askFixture.path("owned-state.json"),
+			state_revision: 1,
+			artifact_path: askFixture.path("owned-spec.md"),
+			artifact_sha256: "a".repeat(64),
+			run_id: null,
+		});
+		const entered = Promise.withResolvers<void>();
+		const lineage = Promise.withResolvers<"crystal">();
+		spyOn(stateRuntime, "executionApprovalLineage").mockImplementation(() => {
+			entered.resolve();
+			return lineage.promise;
+		});
+		const transcript = spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript");
+		const crystalApproval = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval");
+		const nonCrystalApproval = spyOn(stateRuntime, "recordNonCrystalExecutionApproval");
+		const invocation = start(emitter, "owned-approval-call", [
+			{
+				id: "owned-execution",
+				question: "Execute?",
+				options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+				workflowGate: { stage: "deep-interview", kind: "execution" },
+			},
+		]);
+		const gate = await waitForAskGate(emitter, "owned-execution");
+		await emitter.resolveGate({ gate_id: gate.gate_id, answer: { selected: ["Execute with ultragoal"] } });
+		await entered.promise;
+		const prepared = emitter.prepareGateCancellation(emitter.snapshotOwnedGateWork().targets[0]!);
+		expect(await emitter.cancelPreparedGateWork(prepared, 0)).toMatchObject([{ status: "pending" }]);
+		lineage.resolve("crystal");
+		expect((await invocation.outcome).kind).toBe("failed");
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toMatchObject([{ status: "settled" }]);
+		expect(transcript).not.toHaveBeenCalled();
+		expect(crystalApproval).not.toHaveBeenCalled();
+		expect(nonCrystalApproval).not.toHaveBeenCalled();
+		expect(invocation.abort).not.toHaveBeenCalled();
+	});
+
+	it("rejects forged and mixed stale preparations before any selected gate effect", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("owned-batch", store);
+		const controller = installPhysicalGateController(emitter);
+		const first = start(emitter, "batch-first");
+		const second = start(emitter, "batch-second");
+		await waitForAskGate(emitter, "batch-first");
+		await waitForAskGate(emitter, "batch-second");
+		const targets = emitter.snapshotOwnedGateWork().targets;
+		const before = store.list();
+		expect(() => emitter.prepareGateCancellation([targets[0]!, { ...targets[1]!, generation: "forged" }])).toThrow(
+			"stale",
+		);
+		expect(() => emitter.prepareGateCancellation([targets[0]!, targets[0]!])).toThrow("duplicate");
+		await expect(emitter.cancelPreparedGateWork({ targets }, 0)).rejects.toThrow("unauthenticated");
+		const prepared = emitter.prepareGateCancellation(targets);
+		const changed = store.get(targets[1]!.id)!;
+		store.put({ ...changed, generation: "successor-generation" });
+		await expect(emitter.cancelPreparedGateWork(prepared, 0)).rejects.toThrow("generation changed");
+		expect(store.get(targets[0]!.id)).toEqual(before.find(record => record.gate.gate_id === targets[0]!.id));
+		expect(controller.cancelled).toEqual([]);
+		expect(controller.fenced).toEqual([]);
+		expect(emitter.listPendingGates()).toHaveLength(2);
+		store.put(changed);
+		await emitter.cancelPreparedGateWork(prepared, 1_000);
+		expect((await first.outcome).kind).toBe("failed");
+		expect((await second.outcome).kind).toBe("failed");
+		expect(first.abort).not.toHaveBeenCalled();
+		expect(second.abort).not.toHaveBeenCalled();
+	});
+
+	it("keeps a failed durable cancellation intent owned and noncomplete, and retries persistence before draining", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("owned-durable-failure", store);
+		const controller = installPhysicalGateController(emitter);
+		const invocation = start(emitter, "durable-failure");
+		await waitForAskGate(emitter, "durable-failure");
+		const target = emitter.snapshotOwnedGateWork().targets[0]!;
+		const prepared = emitter.prepareGateCancellation(target);
+		const originalPut = store.put.bind(store);
+		const write = spyOn(store, "put").mockImplementation(record => {
+			if (record.cancellationIntent) throw new Error("disk full");
+			originalPut(record);
+		});
+		expect(await emitter.cancelPreparedGateWork(prepared, 0)).toMatchObject([
+			{ status: "pending", reason: expect.stringContaining("not durable") },
+		]);
+		expect(store.get(target.id)?.cancellationIntent).toBeUndefined();
+		expect(store.get(target.id)?.advanced).toBe(false);
+		expect(emitter.snapshotOwnedGateWork().targets).toEqual([target]);
+		expect(controller.cancelled).toEqual([]);
+		expect(controller.fenced).toEqual([]);
+		write.mockRestore();
+		expect(await emitter.cancelPreparedGateWork(prepared, 1_000)).toMatchObject([
+			{ status: "settled", fence: "durable" },
+		]);
+		expect((await invocation.outcome).kind).toBe("failed");
+		expect(controller.cancelled).toEqual([target.id]);
+		expect(invocation.abort).not.toHaveBeenCalled();
+	});
+
+	it("does not confuse terminal presentation evidence with physical controller coverage", async () => {
+		const emitter = new BrokerWorkflowGateEmitter("owned-unknown-delivery", new MemoryGateStore());
+		const cancel = vi.fn();
+		emitter.registerGateTerminalController({
+			completeGateInteractions: () => "not_published",
+			cancelGateInteractions: cancel,
+		});
+		const invocation = start(emitter, "unknown-delivery");
+		const gate = await waitForAskGate(emitter, "unknown-delivery");
+		const snapshot = emitter.snapshotOwnedGateWork();
+		expect(snapshot.capabilities).toMatchObject([
+			{ cancellable: false, reason: expect.stringContaining("physical delivery") },
+		]);
+		expect(() => emitter.prepareGateCancellation(snapshot.targets)).toThrow("physical delivery");
+		expect(cancel).not.toHaveBeenCalled();
+		await emitter.resolveGate({ gate_id: gate.gate_id, answer: { selected: ["Yes"] } });
+		expect((await invocation.outcome).kind).toBe("returned");
 	});
 });
 
