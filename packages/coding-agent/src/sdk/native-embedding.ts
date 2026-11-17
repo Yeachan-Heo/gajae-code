@@ -272,7 +272,7 @@ export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result
 	};
 	result.setToolUIContext(service.ui, true);
 	owner.interaction = interaction;
-	owner.coordinator.recordRuntimeStarted({ result, interaction });
+	owner.coordinator.recordRuntimeStarted({ result, interaction, asyncJobs: owner.options.asyncJobs });
 }
 /** Internal baseline-factory hook; ordinary callers retain their existing cleanup path. */
 export async function nativeEmbeddedStartupFailed(

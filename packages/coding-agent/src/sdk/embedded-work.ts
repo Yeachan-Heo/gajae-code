@@ -18,6 +18,7 @@ import type { CreateAgentSessionResult } from "./session";
 /** Trusted local captures, not renderer-selected session, owner or manager handles. */
 export interface EmbeddedWorkSource {
 	readonly result: CreateAgentSessionResult;
+	readonly asyncJobs?: "none";
 	readonly interaction?: {
 		readonly service: ExtensionInteractionService;
 		readonly connectionId: string;
@@ -47,7 +48,10 @@ export interface EmbeddedQueuedWork {
 	readonly inputs: readonly EmbeddedQueuedInput[];
 }
 
-export type EmbeddedWorkAvailability<T> = { status: "available"; value: T } | { status: "unavailable"; reason: string };
+export type EmbeddedWorkAvailability<T> =
+	| { status: "available"; value: T }
+	| { status: "unavailable"; reason: string }
+	| { status: "not_applicable"; reason: string };
 
 export interface EmbeddedWorkBlocker {
 	readonly kind: EmbeddedWorkTarget["kind"] | "hidden_context" | "unavailable";
@@ -156,7 +160,9 @@ export function getEmbeddedOwnedWork(source: EmbeddedWorkSource): EmbeddedOwnedW
 		observation = result.jobObservation;
 		jobs = observation
 			? { status: "available", value: observation.getSnapshot() }
-			: { status: "unavailable", reason: "job_observation_unavailable" };
+			: source.asyncJobs === "none"
+				? { status: "not_applicable", reason: "no_async_job_manager" }
+				: { status: "unavailable", reason: "job_observation_unavailable" };
 	} catch (error) {
 		jobs = {
 			status: "unavailable",
@@ -164,7 +170,7 @@ export function getEmbeddedOwnedWork(source: EmbeddedWorkSource): EmbeddedOwnedW
 		};
 	}
 	if (jobs.status === "unavailable") blockers.push({ kind: "unavailable", id: "jobs", reason: jobs.reason });
-	else {
+	else if (jobs.status === "available") {
 		for (const job of jobs.value.jobs) {
 			if (job.status === "running" || job.status === "paused" || job.deliveryState !== "delivered")
 				add(

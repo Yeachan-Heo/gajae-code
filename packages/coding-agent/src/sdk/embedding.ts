@@ -188,6 +188,8 @@ export interface EmbeddedAgentSessionOptions
 		| { directory: string; file?: string; manager?: CreateAgentSessionResult["session"]["sessionManager"] }
 		| { managed: true; file?: string; manager?: CreateAgentSessionResult["session"]["sessionManager"] }
 		| { persist: false };
+	/** The host supplies no async job manager. */
+	readonly asyncJobs?: "none";
 	/** Trusted factory injection for embedding integration tests. */
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	/** Control-only sessions own no transcript, extensions, MCP connections or project discovery. */
