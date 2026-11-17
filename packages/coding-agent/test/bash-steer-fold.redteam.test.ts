@@ -17,16 +17,11 @@ import {
 import type { AsyncJobSnapshotItem } from "@gajae-code/coding-agent/session/agent-session";
 import { BashTool, STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "@gajae-code/coding-agent/tools/bash";
 import { Snowflake } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { createSteerHarness, type SteerHarness, textOf, turnContext } from "./helpers/steer-fold-harness";
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 describe("steer-fold red team", () => {
 	let cwd = "";

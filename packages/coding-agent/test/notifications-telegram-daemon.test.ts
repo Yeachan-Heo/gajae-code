@@ -5,12 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
+import { allocateSessionEventGeneration } from "../src/sdk/broker/session-index";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
 import type { NotificationOperatorRuntime } from "../src/sdk/bus/operator-runtime";
 import { pendingTopicFilePath, TELEGRAM_ADOPTION_INTENT_VERSION } from "../src/sdk/bus/telegram-adoption-intent";
 import {
+	type AttachmentSession,
 	acquireDaemonOwnership,
 	type BotApi,
 	DAEMON_GENERATION,
@@ -33,14 +35,20 @@ import {
 } from "../src/sdk/bus/telegram-daemon";
 import { createDaemonControlHooks } from "../src/sdk/bus/telegram-daemon-cli";
 import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
+import { SessionSdkHost } from "../src/sdk/host";
+import { RESPONSE_CEILING_BYTES } from "../src/sdk/host/query/handlers";
 import type { NotificationSubscription } from "../src/sdk/router";
 
-function notificationSubscription(sessionId: string, generation = 1): NotificationSubscription {
+function notificationSubscription(
+	sessionId: string,
+	generation = 1,
+	subscriptionId = `test:${sessionId}:${generation}`,
+): NotificationSubscription {
 	let active = true;
 	const cursor = { generation, seq: 0 };
 	return {
 		sessionId,
-		subscriptionId: `test:${sessionId}:${generation}`,
+		subscriptionId,
 		cursor,
 		isActive: () => active,
 		send: () => undefined,
@@ -2031,6 +2039,170 @@ test("awaiting input sends once to a topic under redact without buttons and is n
 	}
 });
 
+test("a closed session resumed by a new attachment rebinds a fresh topic while the closed attachment stays fenced", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = (() => {
+		const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+		let nextTopicId = 700;
+		const botApi: BotApi = {
+			call: async (method, body) => {
+				calls.push({ method, body: body as Record<string, unknown> });
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+				if (method === "createForumTopic") return { ok: true, result: { message_thread_id: ++nextTopicId } };
+				if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+				return { ok: true, result: true };
+			},
+		};
+		return {
+			calls,
+			instance: new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				botApi,
+			}),
+		};
+	})();
+	const { calls, instance } = daemon;
+	const sent = (text: string) =>
+		calls.filter(call => call.method === "sendMessage" && String(call.body.text).includes(text));
+	try {
+		await instance.loadTopics();
+		const routing = instance.attachmentRoutingHarnessForTest();
+		const sessionId = "resumed-after-close";
+		// The resumed process is a new host registration: Router publishes it as a
+		// new subscription with its own SDK event generation.
+		const closing = notificationSubscription(sessionId, 1, "router:first-process");
+		routing.attach(closing);
+		const closed = instance.sessions.get(sessionId);
+		if (!closed) throw new Error("Expected the first routed attachment session.");
+		await instance.handleSessionMessage(closed, {
+			type: "event_replay_result",
+			id: closed.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ seq: 1, payload: { type: "identity_header", sessionId } }],
+		});
+		await instance.handleSessionMessage(closed, {
+			type: "turn_stream",
+			sessionId,
+			phase: "finalized",
+			text: "before close",
+		});
+		const firstTopic = sent("before close")[0]?.body.message_thread_id;
+		expect(firstTopic).toBe(701);
+
+		await instance.handleSessionMessage(closed, { type: "session_closed", sessionId });
+		expect(instance.sessions.has(sessionId)).toBe(false);
+		await expect(
+			instance.handleSessionMessage(closed, {
+				type: "turn_stream",
+				sessionId,
+				phase: "finalized",
+				text: "late frame from the closed process",
+			}),
+		).rejects.toThrow("trusted attachment lease is stale");
+		expect(sent("late frame from the closed process")).toHaveLength(0);
+
+		const resumed = notificationSubscription(sessionId, 2, "router:resumed-process");
+		routing.attach(resumed);
+		const successor = instance.sessions.get(sessionId);
+		if (!successor || successor === closed) throw new Error("Expected the resumed attachment session.");
+		await instance.handleSessionMessage(successor, {
+			type: "event_replay_result",
+			id: successor.replayId,
+			ok: true,
+			generation: 2,
+			lastSeq: 1,
+			events: [{ seq: 1, payload: { type: "identity_header", sessionId } }],
+		});
+		expect(instance.sessions.get(sessionId)).toBe(successor);
+		expect(resumed.isActive()).toBe(true);
+		await instance.handleSessionMessage(successor, {
+			type: "turn_stream",
+			sessionId,
+			phase: "finalized",
+			text: "after resume",
+		});
+		const resumedMessages = sent("after resume");
+		expect(resumedMessages).toHaveLength(1);
+		expect(resumedMessages[0]?.body.message_thread_id).toBe(702);
+
+		await expect(
+			instance.handleSessionMessage(closed, {
+				type: "turn_stream",
+				sessionId,
+				phase: "finalized",
+				text: "second late frame from the closed process",
+			}),
+		).rejects.toThrow("trusted attachment lease is stale");
+		expect(sent("second late frame from the closed process")).toHaveLength(0);
+	} finally {
+		instance.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a refused replay recovery leaves a diagnostic instead of dropping the attachment silently", async () => {
+	const agentDir = tempAgentDir();
+	const warn = spyOn(logger, "warn").mockImplementation(() => undefined);
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+		installationHostId: "provider-owner",
+	});
+	try {
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		fs.writeFileSync(
+			statePath,
+			`${JSON.stringify({
+				version: 2,
+				installationHostId: "provider-owner",
+				topics: {
+					"other-chat": {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "other-chat-topic",
+						identitySent: true,
+						createdAt: 1,
+						authorityState: "active",
+						chatId: "99",
+					},
+				},
+			})}\n`,
+		);
+		await daemon.loadTopics();
+		const attachment = notificationSubscription("other-chat");
+		daemon.attachmentRoutingHarnessForTest().attach(attachment);
+		const session = daemon.sessions.get(attachment.sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		// Identity-less replay cannot resume a topic bound to another chat.
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 0,
+			events: [],
+		});
+		expect(attachment.isActive()).toBe(false);
+		expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
+		expect(warn.mock.calls.map(call => String(call[0]))).toContainEqual(
+			expect.stringContaining("Telegram refused attachment recovery for session other-chat: no admissible identity"),
+		);
+	} finally {
+		warn.mockRestore();
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("awaiting input refuses flat fallback into a non-private chat", async () => {
 	const agentDir = tempAgentDir();
 	try {
@@ -2065,5 +2237,561 @@ test("awaiting input refuses flat fallback into a non-private chat", async () =>
 		expect(calls).not.toContain("sendMessage");
 	} finally {
 		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("attachment handshake resumes a stored replay cursor only within its host generation", async () => {
+	const agentDir = tempAgentDir();
+	const now = Date.now();
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+		installationHostId: "provider-owner",
+	});
+	try {
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		fs.writeFileSync(
+			statePath,
+			`${JSON.stringify({
+				version: 2,
+				installationHostId: "provider-owner",
+				topics: {
+					"cursor-session": {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "cursor-topic",
+						identitySent: true,
+						createdAt: now,
+						authorityState: "active",
+						chatId: "42",
+						leaseOwner: "provider-owner",
+						leaseHeartbeatAt: now,
+						leaseExpiresAt: now + 60_000,
+						replayGeneration: 5_000,
+						replaySeq: 726,
+					},
+				},
+			})}\n`,
+		);
+		await daemon.loadTopics();
+		const routing = daemon.attachmentRoutingHarnessForTest();
+		const replayRequest = async (generation: number) => {
+			const sent: Record<string, unknown>[] = [];
+			const subscription = {
+				...notificationSubscription("cursor-session", generation),
+				send: (frame: Record<string, unknown>) => {
+					sent.push(frame);
+				},
+			};
+			routing.attach(subscription);
+			await routing.ready(subscription);
+			return sent.find(frame => frame.type === "event_replay");
+		};
+		// A reconnect to the same host continues after the durably consumed event.
+		expect(await replayRequest(5_000)).toMatchObject({ sinceGeneration: 5_000, sinceSeq: 726 });
+		// A resumed session's host restarted its sequence in a new generation; the
+		// previous host's position must not be replayed against it.
+		expect(await replayRequest(9_000)).toMatchObject({ sinceGeneration: 9_000, sinceSeq: 0 });
+	} finally {
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a restarted host's events are not suppressed by the previous host's publication receipts", async () => {
+	const agentDir = tempAgentDir();
+	const { bot, calls } = topicAdmissionBot();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: bot,
+	});
+	const sessionId = "restarted-host-session";
+	const hosts: SessionSdkHost[] = [];
+	// Each process hosts the session with a fresh SDK event stream, exactly as
+	// `gjc --resume` does after the previous process exited, and takes its
+	// generation from the production per-session authority.
+	const startHost = async (question: string): Promise<SessionSdkHost> => {
+		const host = new SessionSdkHost({
+			sessionId,
+			stateRoot: path.join(agentDir, "state"),
+			token: "token",
+			allocateEventGeneration: (id, floor) => allocateSessionEventGeneration(agentDir, id, floor),
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		hosts.push(host);
+		await host.start();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		host.emitEvent({
+			kind: "action_needed",
+			payload: { type: "action_needed", id: "ask-1", kind: "ask", sessionId, question, options: ["Yes", "No"] },
+		});
+		return host;
+	};
+	const replayInto = async (host: SessionSdkHost, subscriptionId: string): Promise<void> => {
+		const subscription = notificationSubscription(sessionId, host.generation, subscriptionId);
+		daemon.attachmentRoutingHarnessForTest().attach(subscription);
+		const session = daemon.sessions.get(sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: host.generation,
+			lastSeq: host.events.sequence,
+			events: host.events.replay(0).events,
+		});
+	};
+	const asked = (question: string) =>
+		calls.filter(
+			call =>
+				(call.method === "sendMessage" || call.method === "sendRichMessage") &&
+				JSON.stringify(call.body).includes(question),
+		).length;
+	try {
+		await daemon.loadTopics();
+		const first = await startHost("first process question");
+		await replayInto(first, "router:first");
+		expect(asked("first process question")).toBe(1);
+		await first.stop();
+
+		const resumed = await startHost("resumed process question");
+		await replayInto(resumed, "router:resumed");
+		expect(asked("resumed process question")).toBe(1);
+
+		// A second attachment to the same host replays the same publications.
+		await replayInto(resumed, "router:resumed-reattach");
+		expect(asked("resumed process question")).toBe(1);
+		expect(asked("first process question")).toBe(1);
+	} finally {
+		for (const host of hosts) await host.stop();
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+// The bus host bounds a replay to the directed-frame ceiling and concedes the
+// dropped prefix as a sequence gap (#7564). Telegram admits the retained suffix
+// instead of ending the attachment (#7582).
+test("an oversized host replay is admitted across its size gap", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+	});
+	const routing = daemon.attachmentRoutingHarnessForTest();
+	const hosts: SessionSdkHost[] = [];
+	// 40,000 Hangul syllables are 120,000 UTF-8 bytes; twelve of them exceed the ceiling.
+	type ReplayHost = {
+		sessionId: string;
+		host: SessionSdkHost;
+		receive: (connectionId: string, frame: Record<string, unknown>) => void;
+		delivered: Record<string, unknown>[];
+	};
+	// Each scenario uses its own session so a stored replay cursor never carries over.
+	const startHost = async (
+		sessionId: string,
+		finalText: string,
+		directedFrameCeilingBytes?: null,
+	): Promise<ReplayHost> => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const delivered: Record<string, unknown>[] = [];
+		const host = new SessionSdkHost({
+			sessionId,
+			stateRoot: path.join(agentDir, "state", String(hosts.length)),
+			token: "token",
+			...(directedFrameCeilingBytes === undefined ? {} : { directedFrameCeilingBytes }),
+			sendFrame: (_connectionId, frame) => {
+				// The bus `sendTo` throws on a directed frame over the native ceiling.
+				if (Buffer.byteLength(JSON.stringify(frame)) > RESPONSE_CEILING_BYTES)
+					throw new Error("sdk directed delivery rejected: cause=oversized_frame");
+				delivered.push(frame);
+				return "written";
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+		});
+		hosts.push(host);
+		await host.start();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		for (let turn = 0; turn < 12; turn++)
+			host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText } });
+		return { sessionId, host, receive, delivered };
+	};
+	// Attach the way the Router does and forward Telegram's own replay request to the host.
+	const replayThrough = async (started: ReplayHost) => {
+		const { sessionId } = started;
+		const sent: Record<string, unknown>[] = [];
+		const cancelReasons: Array<string | undefined> = [];
+		const base = notificationSubscription(sessionId, started.host.generation);
+		const subscription = {
+			...base,
+			send: (frame: Record<string, unknown>) => {
+				sent.push(frame);
+			},
+			cancel: (reason?: string) => {
+				cancelReasons.push(reason);
+				base.cancel();
+			},
+		};
+		routing.attach(subscription);
+		await routing.ready(subscription);
+		const request = sent.find(frame => frame.type === "event_replay");
+		const session = daemon.sessions.get(sessionId);
+		if (!request || !session) throw new Error("Expected a pending replay attachment.");
+		expect(request).toMatchObject({ sinceSeq: 0, id: session.replayId });
+		const before = started.delivered.length;
+		started.receive("telegram", request);
+		await Bun.sleep(0);
+		// Everything the host delivers on the connection reaches Telegram, error frames included.
+		const responses = started.delivered.slice(before);
+		for (const frame of responses) await daemon.handleSessionMessage(session, frame);
+		const result = responses.find(frame => frame.type === "event_replay_result");
+		return { session, result, responses, cancelReasons };
+	};
+	try {
+		await daemon.loadTopics();
+
+		// A gapless replay under the ceiling is admitted.
+		const small = await replayThrough(await startHost("replay-small", "short"));
+		expect(small.result?.gap).toBeUndefined();
+		expect(small.session.replayPending).toBe(false);
+		expect(small.cancelReasons).toEqual([]);
+		expect(daemon.sessions.get("replay-small")).toBe(small.session);
+
+		// Unbounded, the writer refuses the replay; Telegram gets only an error and keeps waiting.
+		const unbounded = await replayThrough(await startHost("replay-unbounded", "가".repeat(40_000), null));
+		expect(unbounded.result).toBeUndefined();
+		expect(unbounded.responses).toMatchObject([{ type: "reverse_response", ok: false }]);
+		expect(unbounded.session.replayPending).toBe(true);
+		expect(unbounded.cancelReasons).toEqual([]);
+		expect(daemon.sessions.get("replay-unbounded")).toBe(unbounded.session);
+
+		// Bounded by default, the replay arrives with a size gap that conceded the
+		// identity header. The unbound endpoint bootstraps from the retained suffix.
+		const bounded = await replayThrough(await startHost("replay-bounded", "가".repeat(40_000)));
+		expect(bounded.result?.gap).toMatchObject({ kind: "sequence_gap", fromSeq: 1 });
+		const boundedEvents = bounded.result?.events as Array<{ kind?: unknown }>;
+		expect(boundedEvents.some(event => event.kind === "agent_end")).toBe(true);
+		expect(boundedEvents.some(event => event.kind === "identity_header")).toBe(false);
+		expect(bounded.session.replayPending).toBe(false);
+		expect(bounded.cancelReasons).toEqual([]);
+		expect(daemon.sessions.get("replay-bounded")).toBe(bounded.session);
+	} finally {
+		for (const host of hosts) await host.stop();
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+// #7582: Telegram's durable replay cursor only advances on admission, so a
+// session whose host ring retained-out more than 256 events while it was
+// attached answers the next re-attach with a retention gap. The harness below
+// forwards Telegram's own replay request to a real host ring and returns the
+// host's answer to the daemon, exactly as Router delivery does.
+type GapHarnessAttachment = {
+	session: AttachmentSession;
+	request: Record<string, unknown>;
+	result: Record<string, unknown>;
+	cancelReasons: Array<string | undefined>;
+};
+async function attachThroughHost(
+	daemon: TelegramNotificationDaemon,
+	host: SessionSdkHost,
+	sessionId: string,
+	subscriptionId: string,
+	receive: (connectionId: string, frame: Record<string, unknown>) => void,
+	delivered: Record<string, unknown>[],
+): Promise<GapHarnessAttachment> {
+	const routing = daemon.attachmentRoutingHarnessForTest();
+	const sent: Record<string, unknown>[] = [];
+	const cancelReasons: Array<string | undefined> = [];
+	const base = notificationSubscription(sessionId, host.generation, subscriptionId);
+	const subscription = {
+		...base,
+		send: (frame: Record<string, unknown>) => {
+			sent.push(frame);
+		},
+		cancel: (reason?: string) => {
+			cancelReasons.push(reason);
+			base.cancel();
+		},
+	};
+	routing.attach(subscription);
+	await routing.ready(subscription);
+	const request = sent.find(frame => frame.type === "event_replay");
+	const session = daemon.sessions.get(sessionId);
+	if (!request || !session) throw new Error("Expected a pending replay attachment.");
+	const before = delivered.length;
+	receive("telegram", request);
+	await Bun.sleep(0);
+	const result = delivered.slice(before).find(frame => frame.type === "event_replay_result");
+	if (!result) throw new Error("Expected the host to answer the replay request.");
+	await daemon.handleSessionMessage(session, result);
+	return { session, request, result, cancelReasons };
+}
+
+async function startGapHost(agentDir: string, sessionId: string) {
+	let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+	const delivered: Record<string, unknown>[] = [];
+	const host = new SessionSdkHost({
+		sessionId,
+		stateRoot: path.join(agentDir, "state", sessionId),
+		token: "token",
+		sendFrame: (_connectionId, frame) => {
+			delivered.push(frame);
+			return "written";
+		},
+		onFrame: handler => {
+			receive = handler;
+			return () => {};
+		},
+	});
+	await host.start();
+	return {
+		host,
+		delivered,
+		receive: (connectionId: string, frame: Record<string, unknown>) => receive(connectionId, frame),
+	};
+}
+
+async function persistedTopic(agentDir: string, sessionId: string): Promise<Record<string, unknown> | undefined> {
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const file = Bun.file(statePath);
+	if (!(await file.exists())) return undefined;
+	const content = await file.text();
+	const state = JSON.parse(content) as { topics?: Record<string, Record<string, unknown>> };
+	return state.topics?.[sessionId];
+}
+
+const gapAsk = (sessionId: string, id: string, question: string) => ({
+	kind: "action_needed",
+	payload: { type: "action_needed", id, kind: "ask", sessionId, question, options: ["Yes", "No"] },
+});
+
+test("a retention gap accumulated while attached is admitted and the next attach resumes from the advanced cursor", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+	});
+	const sessionId = "retention-gap-session";
+	const { host, delivered, receive } = await startGapHost(agentDir, sessionId);
+	try {
+		await daemon.loadTopics();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		const first = await attachThroughHost(daemon, host, sessionId, "router:first", receive, delivered);
+		expect(first.request).toMatchObject({ sinceSeq: 0 });
+		expect(first.result.gap).toBeUndefined();
+		expect(first.session.replayPending).toBe(false);
+		const firstCursor = first.result.lastSeq as number;
+
+		// More than the 256-event ring accumulates past the durable cursor. Each
+		// idle re-asserts the identity header, as the notifications extension does.
+		for (let turn = 0; turn < 150; turn++) {
+			host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: `turn ${turn}` } });
+			host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		}
+
+		const second = await attachThroughHost(daemon, host, sessionId, "router:second", receive, delivered);
+		expect(second.request).toMatchObject({ sinceGeneration: host.generation, sinceSeq: firstCursor });
+		expect(second.result.gap).toMatchObject({ kind: "sequence_gap", fromSeq: firstCursor + 1 });
+		expect(second.cancelReasons).toEqual([]);
+		expect(second.session.replayPending).toBe(false);
+		expect(daemon.sessions.get(sessionId)).toBe(second.session);
+		expect(await persistedTopic(agentDir, sessionId)).toMatchObject({
+			replayGeneration: host.generation,
+			replaySeq: second.result.lastSeq,
+		});
+
+		// The admitted gap moved the durable cursor, so the next attach is gapless.
+		host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: "after" } });
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		const third = await attachThroughHost(daemon, host, sessionId, "router:third", receive, delivered);
+		expect(third.request).toMatchObject({ sinceSeq: second.result.lastSeq });
+		expect(third.result.gap).toBeUndefined();
+		expect(third.cancelReasons).toEqual([]);
+		expect(third.session.replayPending).toBe(false);
+	} finally {
+		await host.stop();
+		daemon.requestStop();
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a gapped replay that conceded the identity header still fails closed on an endpoint it cannot resume or bootstrap", async () => {
+	const agentDir = tempAgentDir();
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+		installationHostId: "provider-owner",
+	});
+	try {
+		// The session's durable topic lives in another chat: this transport is
+		// neither the exact owner (resume) nor an unbound endpoint (bootstrap).
+		await Bun.write(
+			statePath,
+			`${JSON.stringify({
+				version: 2,
+				installationHostId: "provider-owner",
+				topics: {
+					"gap-other-chat": {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "gap-other-chat-topic",
+						identitySent: true,
+						createdAt: 1,
+						authorityState: "active",
+						chatId: "99",
+					},
+				},
+			})}\n`,
+		);
+		await daemon.loadTopics();
+		const cancelReasons: Array<string | undefined> = [];
+		const base = notificationSubscription("gap-other-chat");
+		const attachment = {
+			...base,
+			cancel: (reason?: string) => {
+				cancelReasons.push(reason);
+				base.cancel();
+			},
+		};
+		daemon.attachmentRoutingHarnessForTest().attach(attachment);
+		const session = daemon.sessions.get(attachment.sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 400,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 144, resyncQueries: ["Q01", "Q02", "Q03"] },
+			events: [{ seq: 145, payload: { type: "agent_end", finalText: "retained" } }],
+		});
+		expect(cancelReasons).toEqual(["invalid_replay"]);
+		expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
+		expect((await persistedTopic(agentDir, attachment.sessionId))?.replaySeq).toBeUndefined();
+	} finally {
+		daemon.requestStop();
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("an identity conflict in a gapped replay rejects while the same gap with one identity is admitted", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+	});
+	const replay = async (sessionId: string, identities: string[]) => {
+		const cancelReasons: Array<string | undefined> = [];
+		const base = notificationSubscription(sessionId);
+		const attachment = {
+			...base,
+			cancel: (reason?: string) => {
+				cancelReasons.push(reason);
+				base.cancel();
+			},
+		};
+		daemon.attachmentRoutingHarnessForTest().attach(attachment);
+		const session = daemon.sessions.get(sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 152,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 150, resyncQueries: ["Q01", "Q02", "Q03"] },
+			events: identities.map((identity, index) => ({
+				seq: 151 + index,
+				payload: { type: "identity_header", sessionId: identity },
+			})),
+		});
+		return { session, cancelReasons };
+	};
+	try {
+		await daemon.loadTopics();
+		const admitted = await replay("gap-single-identity", ["gap-single-identity"]);
+		expect(admitted.cancelReasons).toEqual([]);
+		expect(admitted.session.replayPending).toBe(false);
+		expect(daemon.sessions.get("gap-single-identity")).toBe(admitted.session);
+
+		const conflicted = await replay("gap-conflict", ["gap-conflict", "someone-else"]);
+		expect(conflicted.cancelReasons).toEqual(["invalid_replay"]);
+		expect(daemon.sessions.has("gap-conflict")).toBe(false);
+		expect(await persistedTopic(agentDir, "gap-single-identity")).toMatchObject({ replaySeq: 152 });
+		expect(await persistedTopic(agentDir, "gap-conflict")).toBeUndefined();
+		expect(await persistedTopic(agentDir, "someone-else")).toBeUndefined();
+	} finally {
+		daemon.requestStop();
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("an action_needed whose request fell inside an admitted gap is not re-surfaced as live", async () => {
+	const agentDir = tempAgentDir();
+	const { bot, calls } = topicAdmissionBot();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: bot,
+	});
+	const sessionId = "gap-action-session";
+	const { host, delivered, receive } = await startGapHost(agentDir, sessionId);
+	const asked = (question: string) =>
+		calls.filter(
+			call =>
+				(call.method === "sendMessage" || call.method === "sendRichMessage") &&
+				JSON.stringify(call.body).includes(question),
+		).length;
+	try {
+		await daemon.loadTopics();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		host.emitEvent(gapAsk(sessionId, "ask-conceded", "conceded question"));
+		for (let turn = 0; turn < 300; turn++)
+			host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: `turn ${turn}` } });
+		host.emitEvent(gapAsk(sessionId, "ask-retained", "retained question"));
+
+		const attached = await attachThroughHost(daemon, host, sessionId, "router:gap-action", receive, delivered);
+		expect(attached.result.gap).toMatchObject({ kind: "sequence_gap", fromSeq: 1 });
+		const events = attached.result.events as Array<{ payload?: { id?: unknown } }>;
+		expect(events.some(event => event.payload?.id === "ask-conceded")).toBe(false);
+		expect(attached.cancelReasons).toEqual([]);
+		expect(attached.session.replayPending).toBe(false);
+		// Only the retained suffix reconstructs pending actions.
+		expect(asked("retained question")).toBe(1);
+		expect(attached.session.pending.has("ask-retained")).toBe(true);
+		expect(asked("conceded question")).toBe(0);
+		expect(attached.session.pending.has("ask-conceded")).toBe(false);
+	} finally {
+		await host.stop();
+		daemon.requestStop();
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
 	}
 });

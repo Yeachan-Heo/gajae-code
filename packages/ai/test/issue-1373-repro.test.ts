@@ -4,6 +4,7 @@ import { getBundledModel } from "../src/models";
 import { streamBedrock } from "../src/providers/amazon-bedrock";
 import { streamSimple } from "../src/stream";
 import type { Context, Model, SimpleStreamOptions } from "../src/types";
+import { createAbortedSignal } from "./helpers";
 
 const originalSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
 
@@ -53,12 +54,6 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
 };
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 interface ThinkingPayload {
 	inferenceConfig?: { maxTokens?: number };
 	additionalModelRequestFields?: {
@@ -79,7 +74,7 @@ function captureBedrockPayload(
 ): Promise<ThinkingPayload> {
 	const { promise, resolve } = Promise.withResolvers<ThinkingPayload>();
 	void streamBedrock(model, baseContext, {
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		...options,
 		onPayload: payload => {
 			resolve(payload as ThinkingPayload);
@@ -96,7 +91,7 @@ function captureSimpleBedrockPayload(
 	const { promise, resolve } = Promise.withResolvers<ThinkingPayload>();
 	void streamSimple(model, baseContext, {
 		...options,
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		onPayload: payload => {
 			resolve(payload as ThinkingPayload);
 			return undefined;
@@ -201,7 +196,7 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 					],
 				},
 				{
-					signal: abortedSignal(),
+					signal: createAbortedSignal(),
 					reasoning,
 					toolChoice: { type: "tool", name: "resolve" },
 					onPayload: payload => {
@@ -229,7 +224,7 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 				],
 			},
 			{
-				signal: abortedSignal(),
+				signal: createAbortedSignal(),
 				toolChoice: { type: "tool", name: "resolve" },
 				onPayload: payload => {
 					resolve(payload as ThinkingPayload & { toolConfig?: { toolChoice?: unknown } });

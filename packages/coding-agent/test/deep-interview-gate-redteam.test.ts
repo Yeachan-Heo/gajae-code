@@ -196,9 +196,9 @@ describe("deep-interview question gates red-team", () => {
 	it("marks the recommended option description", () => {
 		const gate = questionToGate(singleQ);
 		expect(gate.options?.map(o => ({ value: o.value, label: o.label, description: o.description }))).toEqual([
-			{ value: "JWT", label: "JWT", description: undefined },
-			{ value: "OAuth2", label: "OAuth2", description: "recommended" },
-			{ value: "Session cookies", label: "Session cookies", description: undefined },
+			{ value: { selected: ["JWT"] }, label: "JWT", description: undefined },
+			{ value: { selected: ["OAuth2"] }, label: "OAuth2", description: "recommended" },
+			{ value: { selected: ["Session cookies"] }, label: "Session cookies", description: undefined },
 		]);
 		expect(gate.context?.stage_state).toMatchObject({ other_option: "Other (type your own)" });
 	});

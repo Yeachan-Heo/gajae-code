@@ -1,14 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
+import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
+import type { AssistantMessage, AssistantMessageEvent } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
-import { createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createUserMessage, identityConverter } from "./helpers";
 
 function incapabilityEvent(): Extract<AssistantMessageEvent, { type: "toolChoiceIncapability" }> {
 	return {
@@ -30,7 +26,7 @@ describe("agent-loop toolChoiceIncapability handling", () => {
 
 		const received: Array<Extract<AssistantMessageEvent, { type: "toolChoiceIncapability" }>> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onToolChoiceIncapability: event => {
 				received.push(event);
@@ -84,7 +80,7 @@ describe("agent-loop toolChoiceIncapability handling", () => {
 	it("ignores the event silently when no callback is configured", async () => {
 		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
 		const mock = createMockModel({ responses: [{ content: ["fine"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const streamFn = (...args: Parameters<typeof mock.stream>) => {
 			const inner = mock.stream(...args);

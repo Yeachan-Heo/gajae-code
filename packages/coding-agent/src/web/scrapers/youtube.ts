@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ptree, Snowflake } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Settings } from "../../config/settings";
 import type { AgentStorage } from "../../session/agent-storage";
 import { throwIfAborted } from "../../tools/tool-errors";
@@ -174,6 +175,8 @@ export const handleYouTube: SpecialHandler = async (
 
 	const execOptions = {
 		mode: "group" as const,
+		// Without `env`, Bun hands yt-dlp the autoloaded project `.env` (hook variables included).
+		env: projectSafeSpawnEnv(),
 		signal,
 		allowNonZero: true,
 		allowAbort: true,

@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/components/bash-execution";
 import { IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { sanitizeWithOptionalSixelPassthrough } from "@gajae-code/coding-agent/utils/sixel";
 import { ImageProtocol, TERMINAL, type TUI } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const SIXEL = "\x1bPqabc\x1b\\";
 
@@ -17,7 +18,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 	const terminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
 
 	beforeEach(async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});
@@ -208,7 +209,7 @@ describe("BashExecutionComponent streaming throttle", () => {
 	const ui = { requestRender: () => {} } as unknown as TUI;
 
 	beforeEach(async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});

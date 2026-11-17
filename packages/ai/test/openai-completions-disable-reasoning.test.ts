@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import type { Context, Model } from "../src/types";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 
@@ -12,15 +13,6 @@ const testContext: Context = {
 afterEach(() => {
 	global.fetch = originalFetch;
 });
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function createReasoningEffortModel(): Model<"openai-completions"> {
 	return {
 		id: "minimal-reasoner",

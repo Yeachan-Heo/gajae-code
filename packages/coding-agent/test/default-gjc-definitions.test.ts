@@ -604,6 +604,28 @@ Project executor override body.
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 
+	it("requires visible decision context before every ask (#7324)", async () => {
+		const promptsDir = path.join(repoRoot, "packages", "coding-agent", "src", "prompts");
+		const askPrompt = await Bun.file(path.join(promptsDir, "tools", "ask.md")).text();
+		const systemPrompt = await Bun.file(path.join(promptsDir, "system", "system-prompt.md")).text();
+		const askCritical = extractPromptSection(askPrompt, "critical");
+		const routing = extractPromptSection(systemPrompt, "routing");
+		const communication = extractPromptSection(systemPrompt, "communication");
+
+		expect(askCritical).toContain("**Explain before you ask.**");
+		expect(askCritical).toContain("The `ask` call must never be the first thing the user sees about this decision");
+		expect(askCritical).toContain("conciseness rules do not waive this explanation");
+		expect(askCritical).toContain("keep each question body self-contained");
+		expect(communication).toContain("Conciseness never means a silent `ask`");
+		expect(routing).toContain("first stating in your reply why the workflow fits and what proceeding directly skips");
+
+		// Examples must model context-bearing bodies, not bare one-line questions.
+		const examples = extractPromptSection(askPrompt, "examples");
+		const bodies = [...examples.matchAll(/"question": "([^"]+)"/g)].map(match => match[1] ?? "");
+		expect(bodies.length).toBeGreaterThan(0);
+		for (const body of bodies) expect(body.split(". ").length).toBeGreaterThan(1);
+	});
+
 	it("locks ralplan automatic-admission approval and handoff paths", async () => {
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),

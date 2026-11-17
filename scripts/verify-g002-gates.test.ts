@@ -42,7 +42,9 @@ const exactMcpTuiEntry = [
 	'\t\tname: "mcp",',
 	"\t\thandleTui: async (command, runtime) => {",
 	"\t\t\t// MCP controls are unavailable to ordinary sessions.",
-	"\t\t\tif (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+	"\t\t\tif (!runtime.ctx.session.hasExactMcpControls && !runtime.ctx.session.hasSessionMcpControls)",
+	"\t\t\t\treturn { prompt: command.text };",
+	"\t\t\tif (!runtime.ctx.session.hasExactMcpControls) return handleSessionMcpTui(command, runtime);",
 	"\t\t\treturn false;",
 	"\t\t},",
 ].join("\n");
@@ -63,14 +65,30 @@ describe("MCP command quarantine", () => {
 		expect(findMcpBuiltinQuarantineFindings(registry)).toEqual([]);
 	});
 
+	test("allows the canonical combined MCP capability guard", () => {
+		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry]))).toEqual([]);
+	});
+
 	test("rejects a TUI handler that does not fall through before handling the command", () => {
 		const unguarded = registryWithEntries([
 			exactMcpTuiEntry.replace(
-				"if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+				"if (!runtime.ctx.session.hasExactMcpControls && !runtime.ctx.session.hasSessionMcpControls)",
 				"return false;",
 			),
 		]);
 		expect(findMcpBuiltinQuarantineFindings(unguarded)).toContain(
+			"root /mcp TUI handler must fall through without exact MCP controls",
+		);
+	});
+
+	test("rejects a session-capability handler without the combined fallthrough guard", () => {
+		const sessionHandlerWithoutCombinedGuard = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"if (!runtime.ctx.session.hasExactMcpControls && !runtime.ctx.session.hasSessionMcpControls)\n\t\t\t\treturn { prompt: command.text };",
+				"if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(sessionHandlerWithoutCombinedGuard)).toContain(
 			"root /mcp TUI handler must fall through without exact MCP controls",
 		);
 	});
@@ -422,9 +440,13 @@ describe("MCP command quarantine", () => {
 		expect(findMcpTuiMetadataFindings(`${staleComment}\n${unfilteredSlashCommands}`, interactiveMode)).toContain(
 			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
 		);
+		const sessionCapabilityBypassed = slashCommands.replace("session?.hasSessionMcpControls", "true");
+		expect(findMcpTuiMetadataFindings(sessionCapabilityBypassed, interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
 		const computedPropertySlashCommands = slashCommands.replace(
-			'command.name !== "mcp"',
-			"command[name] !== \"mcp\"",
+			'return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp");',
+			'return BUILTIN_SLASH_COMMANDS.filter(command => command[name] !== "mcp");',
 		);
 		expect(findMcpTuiMetadataFindings(computedPropertySlashCommands, interactiveMode)).toContain(
 			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",

@@ -1,5 +1,0 @@
-### Fixed
-
-- Deliver a background IRC exchange to a busy session at the live run's next tool boundary instead of at the end of the turn, and keep the incoming question and the reply already sent on the model's behalf in one steering cohort (`Agent.steerCohort`) so a later model step cannot see the question without its reply. A goal-mode turn keeps the session streaming from its first prompt to its last message, so a subagent's message could sit outside the model's history for many minutes while the transcript already showed it.
-- Keep that cohort together when a user interrupt re-arms the exchange as a follow-up of the next turn: the cohort metadata now follows the records into the follow-up batch, so the next turn cannot open on the question alone.
-- Keep an accepted exchange when the run it was admitted into ends before its next tool boundary: admission is not persistence, so the batch stays queued until its records are committed, and a session switch — which aborts the outgoing turn and drops unconsumed steering — still appends the exchange to the outgoing session's history instead of losing it.

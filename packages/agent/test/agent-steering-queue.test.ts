@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
@@ -197,33 +198,40 @@ describe("Agent steering admission", () => {
 	it("waitForSteeringArrival resolves only on a NEW arrival or abort, never on a pre-queued steer", async () => {
 		const h = liveRunHarness();
 		const run = h.agent.prompt("go");
-		await h.entered;
-
-		const pending = h.agent.waitForSteeringArrival(new AbortController().signal);
-		expect(h.agent.steer(userMessage("arrived")).admitted).toBe(true);
-		await pending;
-		expect(h.agent.hasQueuedSteering()).toBe(true);
-
-		// Already queued: a fresh wait must NOT resolve (a stale message must not
-		// interrupt the next observation window); only abort settles it.
+		const arrival = new AbortController();
 		const stale = new AbortController();
-		let staleResolved = false;
-		const staleWait = h.agent.waitForSteeringArrival(stale.signal).then(() => {
-			staleResolved = true;
-		});
-		await Bun.sleep(5);
-		expect(staleResolved).toBe(false);
-		stale.abort();
-		await staleWait;
-
-		h.agent.clearSteeringQueue();
 		const controller = new AbortController();
-		const abortable = h.agent.waitForSteeringArrival(controller.signal);
-		controller.abort();
-		await abortable;
-		expect(h.agent.hasQueuedSteering()).toBe(false);
-		h.release();
-		await run;
+		try {
+			await h.entered;
+			const pending = h.agent.waitForSteeringArrival(arrival.signal);
+			expect(h.agent.steer(userMessage("arrived")).admitted).toBe(true);
+			await pending;
+			expect(h.agent.hasQueuedSteering()).toBe(true);
+
+			// Already queued: a fresh wait must NOT resolve (a stale message must not
+			// interrupt the next observation window); only abort settles it.
+			let staleResolved = false;
+			const staleWait = h.agent.waitForSteeringArrival(stale.signal).then(() => {
+				staleResolved = true;
+			});
+			// Let an incorrectly settled wait's callbacks run without a timed delay.
+			await scheduler.yield();
+			expect(staleResolved).toBe(false);
+			stale.abort();
+			await staleWait;
+
+			h.agent.clearSteeringQueue();
+			const abortable = h.agent.waitForSteeringArrival(controller.signal);
+			controller.abort();
+			await abortable;
+			expect(h.agent.hasQueuedSteering()).toBe(false);
+		} finally {
+			arrival.abort();
+			stale.abort();
+			controller.abort();
+			h.release();
+			await run;
+		}
 	});
 
 	it("steeringMode all batches adjacent steers and isolates a sequential-marked one", async () => {

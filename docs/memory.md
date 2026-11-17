@@ -27,8 +27,10 @@ Generated local-memory artifacts are private runtime state, not a public tool or
 | Subcommand            | Effect                                         |
 | --------------------- | ---------------------------------------------- |
 | `view`                | Show the current memory injection payload      |
-| `clear` / `reset`     | Delete all memory data and generated artifacts |
+| `clear` / `reset`     | Delete every memory row and memory job in the shared database, and only the current project's directory |
 | `enqueue` / `rebuild` | Force consolidation to run at next startup     |
+
+`/memory clear` and `/memory reset` delete every memory row and memory job in the shared local database; the delete is not limited to the current project. Filesystem cleanup removes only the memory directory for the current project path. That directory name replaces `/`, `\`, and `:` with `-`, so project paths that differ only in those characters (for example `/var/proj/alpha` and `/var/proj-alpha`) share one directory, and clearing either removes it. Backend `clear` follows the same rule for the local store.
 
 ## How it works
 
@@ -61,12 +63,12 @@ Memory extraction and consolidation behavior is driven by static prompt files in
 
 Memory piggybacks on the model role system.
 
-| Phase                   | Role                                                                | Purpose                          |
-| ----------------------- | ------------------------------------------------------------------- | -------------------------------- |
-| Phase 1 (extraction)    | `default`                                                           | Per-session knowledge extraction |
-| Phase 2 (consolidation) | `smol` (falls back to `default`, then current/first registry model) | Cross-session synthesis          |
+| Phase                   | Role      | Purpose                          |
+| ----------------------- | --------- | -------------------------------- |
+| Phase 1 (extraction)    | `default` | Per-session knowledge extraction |
+| Phase 2 (consolidation) | `default` | Cross-session synthesis          |
 
-If the requested memory role is not configured, memory model resolution falls back to the `default` role, then the active session model, then the first model in the registry.
+If the `default` role is not configured or does not resolve, memory model resolution falls back to the active session model, then the most recently used model, then the first model in the registry.
 
 ## Configuration
 

@@ -183,7 +183,11 @@ describe("ACP /progress builtin", () => {
 			await expect(ordinary()).rejects.toMatchObject({ code: "conflict" });
 			expect(preflights).toBe(0);
 			gate.resolve();
-			await expect(succeeding).resolves.toEqual({ stopReason: "end_turn" });
+			const succeeded = await succeeding.then(
+				value => ({ value }),
+				error => ({ error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) }),
+			);
+			expect(succeeded).toEqual({ value: { stopReason: "end_turn" } });
 			expect(progressText()).toBe(1);
 			await expect(ordinary()).rejects.toMatchObject({ code: "invalid_input" });
 			expect(preflights).toBe(1);

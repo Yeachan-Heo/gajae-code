@@ -5,13 +5,21 @@ import {
 } from "../../../session/default-model-selection";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
+import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
-import type { ControlInput, ControlSurface, ControlValue } from "./operations";
+import { SdkSideConversationError } from "../../side-conversation";
+import {
+	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
+	type ControlInput,
+	type ControlSurface,
+	type ControlValue,
+} from "./operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	brokerRuntimeCloseCapability,
 	hasBrokerRuntimeAbortCapability,
 	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
 } from "./runtime-gate";
 
 export interface ControlRequest {
@@ -21,6 +29,8 @@ export interface ControlRequest {
 	expectedRevision?: string;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	/** Internal request lifetime; never populated from a wire frame. */
+	signal?: AbortSignal;
 }
 
 export type ControlErrorCode = string;
@@ -80,6 +90,7 @@ const SHARED_ERROR_CODES = new Set([
 
 /** Lifecycle mutations must enter through the Broker-backed lifecycle service. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -253,11 +264,29 @@ function invoke(
 	input: ControlInput,
 	confirm: boolean | undefined,
 	idempotencyKey: string | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
-			return surface.prompt(text(input), input.images, input.clientRef as string | undefined);
+			return surface.prompt(text(input), input.images, input.clientRef as string | undefined, input.stagedImages);
+		case "turn.image.begin":
+			if (!surface.imageBegin) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageBegin(input);
+		case "turn.image.append":
+			if (!surface.imageAppend) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageAppend(input);
+		case "turn.image.finish":
+			if (!surface.imageFinish) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageFinish(input);
+		case "turn.image.discard":
+			if (!surface.imageDiscard) invalidInput("Image uploads are not installed for this session.");
+			return surface.imageDiscard(input);
 		case "turn.steer":
+			if (
+				typeof input.clientRef === "string" &&
+				input.clientRef.trim().startsWith(ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX)
+			)
+				invalidInput("The abort-and-prompt: clientRef prefix is reserved for fallback steers.");
 			return surface.steer(
 				text(input),
 				typeof input.clientRef === "string" ? input.clientRef : undefined,
@@ -268,8 +297,15 @@ function invoke(
 		case "turn.abort":
 			return invokeAbort(surface, input, confirm, idempotencyKey);
 		case "turn.abort_and_prompt":
-			return surface.abortAndPrompt(text(input));
+			return surface.abortAndPrompt(text(input), idempotencyKey);
 		case "ask.answer":
+			if (
+				Object.keys(input).some(key => key !== "id" && key !== "answer") ||
+				typeof input.id !== "string" ||
+				!input.id.trim() ||
+				!Object.hasOwn(input, "answer")
+			)
+				invalidInput("ask.answer requires exactly id and answer.");
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
 			if (idempotencyKey === undefined)
@@ -294,6 +330,13 @@ function invoke(
 			return surface.operateGoal(text(input, "op"), input.objective as string | undefined);
 		case "todo.replace":
 			return surface.replaceTodo(input.items);
+		case "model.role.set":
+		case "model.select":
+		case "model.profile.select":
+		case "config.write":
+			if (!surface.preferenceControl)
+				throw new TypedControlError("unavailable", "Scoped preferences are unavailable.");
+			return surface.preferenceControl(operation, input);
 		case "model.set":
 			return surface.setModel(text(input, "id"), input.thinkingLevel);
 		case "model.profile.set":
@@ -306,6 +349,12 @@ function invoke(
 			return surface.cycleThinking();
 		case "permission_mode.set":
 			return surface.setPermissionMode(input.mode);
+		case "permission.channel.set":
+			if (!surface.configurePermissionChannel) invalidInput("External permissions are unavailable.");
+			return surface.configurePermissionChannel(input);
+		case "permission.respond":
+			if (!surface.respondPermission) invalidInput("External permissions are unavailable.");
+			return surface.respondPermission(input);
 		case "queue.steering_mode.set":
 			return surface.setQueueMode("steering", input.mode);
 		case "queue.follow_up_mode.set":
@@ -320,12 +369,38 @@ function invoke(
 			return surface.setAutoRetry(input.on as boolean);
 		case "retry.abort":
 			return surface.abortRetry();
+
+		case "operator.execute":
+		case "operator.cancel":
+			if (!surface.operatorControl) throw new TypedControlError("unavailable", "Operator controls are unavailable.");
+			return surface.operatorControl(operation, input);
+		case "activity.cancel":
+		case "activity.pause":
+		case "activity.resume":
+		case "activity.delete":
+		case "activity.acknowledge":
+		case "mcp.suspend":
+		case "mcp.resume":
+		case "mcp.reconnect":
+			if (!surface.activityControl)
+				throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
+			return surface.activityControl(operation, input);
+		case "btw.open":
+		case "btw.submit":
+		case "btw.cancel":
+		case "btw.close":
+			if (!surface.sideControl) throw new TypedControlError("unavailable", "Side conversations unavailable.");
+			return surface.sideControl(operation, input);
+		case "session.revise":
+			if (!surface.reviseSession) throw new TypedControlError("unavailable", "Revision runtime unavailable.");
+			return surface.reviseSession(input);
+
 		case "bash.execute":
 			return surface.executeBash(text(input, "cmd"));
 		case "bash.abort":
 			return surface.abortBash();
 		case "session.close":
-			return surface.closeSession(brokerRuntimeCloseCapability(input));
+			return surface.closeSession(brokerRuntimeCloseCapability(input), input.ifIdle === true);
 		case "session.rename":
 			return surface.renameSession(text(input, "name"));
 		case "session.export_html":
@@ -336,6 +411,13 @@ function invoke(
 			return surface.reloadRuntime(input.components);
 		case "auth.login":
 			return surface.login(text(input, "provider"));
+		case "auth.start":
+		case "auth.answer":
+		case "auth.cancel":
+		case "auth.apiKey.store":
+			if (!surface.authorizationControl)
+				throw new TypedControlError("unavailable", "Authorization controls are unavailable.");
+			return surface.authorizationControl(operation, input);
 		case "host_tools.register":
 			return surface.registerHostTools(input.defs);
 		case "host_uri.register":
@@ -365,12 +447,22 @@ function invoke(
 			return surface.retryNow();
 		case "bash.background":
 			return surface.backgroundBash();
+		case "btw.ask":
+			return surface.askBtw(input, signal);
 		default:
 			throw new Error("unknown operation");
 	}
 }
 
 function errorResponse(id: string, row: Operation, error: unknown): ControlResponse {
+	if (row.sdkId === "btw.open" || row.sdkId === "btw.submit") {
+		if (
+			(error instanceof SdkSideConversationError || error instanceof TypedControlError) &&
+			(row.errorCodes.includes(error.code) || SHARED_ERROR_CODES.has(error.code))
+		)
+			return failure(id, error.code, error.message);
+		return failure(id, "internal", "Control operation failed.");
+	}
 	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown; handoffDocument?: unknown };
 	const code = typeof candidate?.code === "string" ? candidate.code : undefined;
 	const message = typeof candidate?.message === "string" ? candidate.message : "Control operation failed.";
@@ -419,6 +511,7 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 				request.input as ControlInput,
 				request.confirm,
 				request.idempotencyKey,
+				request.signal,
 			),
 		};
 	} catch (error) {
@@ -489,12 +582,17 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
+	if (isSecureLocalOperation(row.sdkId) && request.idempotencyKey !== undefined)
+		return Promise.resolve(
+			failure(request.id, "invalid_input", "Authorization controls do not accept idempotency keys."),
+		);
 	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
+	const brokerReviseAuthorized = row.sdkId === "session.revise" && hasBrokerRuntimeReviseCapability(request.input);
 	const brokerAbortInput = row.sdkId === "turn.abort" && isInput(request.input) ? request.input : undefined;
 	const brokerAbortFieldPresent =
 		brokerAbortInput !== undefined && Object.hasOwn(brokerAbortInput, BROKER_RUNTIME_ABORT_CAPABILITY_FIELD);
 	const brokerAbortAuthorized = row.sdkId === "turn.abort" && hasBrokerRuntimeAbortCapability(request.input);
-	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized)
+	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized && !brokerReviseAuthorized)
 		return Promise.resolve(
 			failure(
 				request.id,
@@ -527,6 +625,7 @@ export function dispatchControl(
 		);
 	if (
 		!brokerCloseAuthorized &&
+		!brokerReviseAuthorized &&
 		surface.installedOperations instanceof Set &&
 		!surface.installedOperations.has(row.sdkId)
 	)
@@ -589,7 +688,19 @@ export function dispatchControl(
 	// Active feedback must reach the worker even while an earlier ordered control
 	// waits for that worker. Correlated steer admission remains deduplicated by
 	// the runtime reconciliation store, independently of this dispatch chain.
-	return row.idempotency === "ordered" && row.sdkId !== "retry.now" && row.sdkId !== "turn.steer"
+	//
+	// An ask answer is the same kind of feedback: the turn waits for the pending
+	// ask, so an ordered control that waits for the turn (model.set during a run
+	// waits at the session admission boundary) would otherwise hold the chain
+	// while the turn waits for the answer queued behind it. The answer is
+	// addressed by ask id and the pending-ask registry refuses a stale id, so it
+	// needs no ordering against other controls. Unlike turn.steer it does not
+	// wait for a pending replacement barrier: a replacement queued behind that
+	// same control would hold the answer in the same way.
+	return row.idempotency === "ordered" &&
+		row.sdkId !== "retry.now" &&
+		row.sdkId !== "turn.steer" &&
+		row.sdkId !== "ask.answer"
 		? serialize(surface, work)
 		: work();
 }

@@ -138,11 +138,9 @@ describe("runtime deletion guard: interceptable surfaces", () => {
 		expect(require("node:fs").rmSync).toBe(first);
 	});
 
-	test.skip("KNOWN GAP (Bun 1.4.0): ESM top-level fs.rmSync is a snapshot binding and is NOT intercepted — the static guard (check-unsafe-rmrf) covers repository source for this surface", () => {
-		// Intentionally skipped: this documents the boundary. If Bun ever makes
-		// namespace bindings live, move this to a real assertion and extend the
-		// guard to patch them.
-	});
+	// KNOWN GAP (Bun 1.4.0): ESM top-level fs.rmSync is a snapshot binding and is NOT intercepted.
+	// The static guard (check-unsafe-rmrf) covers repository source for this surface.
+	// If Bun ever makes namespace bindings live, add a real assertion and extend the guard to patch them.
 
 	test("uninstall removes the guard wrapping and is idempotent", () => {
 		sandbox = tempDir("gjc-guard-sbx-");

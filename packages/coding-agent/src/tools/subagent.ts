@@ -4,11 +4,13 @@ import { formatDuration, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
+import { modelFallbackLabel } from "../task/provider-retry-status";
 import type { AgentProgress, AgentSource, LocalErrorSummary } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import { wrapUntrustedContent } from "./fetch";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
+import { parseReportMetricDetails, type ReportMetricDetails } from "./report-metric";
 import { ToolError } from "./tool-errors";
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
@@ -106,6 +108,8 @@ export interface SubagentSnapshot {
 	requestedModel?: string;
 	/** True when the requested model lacked credentials and fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** Why the subagent left its requested model (see {@link SubagentRecord.modelFallbackReason}). */
+	modelFallbackReason?: string;
 	/** True when the effective subagent provider is in fast mode. */
 	fastMode?: boolean;
 }
@@ -137,9 +141,17 @@ export interface SubagentLiveProgress {
 		startedAtMs: number;
 	};
 	retryFailure?: { attempt: number };
+	/** Bounded, sanitized `report_metric` charts: labels and numbers only. */
+	metrics?: ReportMetricDetails[];
+}
+
+function liveMetrics(progress: AgentProgress): ReportMetricDetails[] {
+	const reported = progress.extractedToolData?.report_metric ?? [];
+	return reported.map(parseReportMetricDetails).filter((metric): metric is ReportMetricDetails => !!metric);
 }
 
 function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
+	const metrics = liveMetrics(progress);
 	return {
 		id: progress.id,
 		status: progress.status,
@@ -176,6 +188,7 @@ function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
 				}
 			: {}),
 		...(progress.retryFailure ? { retryFailure: { attempt: progress.retryFailure.attempt } } : {}),
+		...(metrics.length > 0 ? { metrics } : {}),
 	};
 }
 
@@ -794,7 +807,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (snapshot.effectiveModel) {
 				lines.push(
 					snapshot.modelFellBack && snapshot.requestedModel
-						? `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`
+						? `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, ${modelFallbackLabel(snapshot.modelFallbackReason)})`
 						: `Model: ${snapshot.effectiveModel}`,
 				);
 			}
@@ -912,6 +925,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (record.effectiveModel) fields.effectiveModel = record.effectiveModel;
 		if (record.requestedModel) fields.requestedModel = record.requestedModel;
 		if (record.modelFellBack) fields.modelFellBack = true;
+		if (record.modelFallbackReason) fields.modelFallbackReason = record.modelFallbackReason;
 		if (record.fastMode) fields.fastMode = true;
 		return fields;
 	}
@@ -1272,6 +1286,7 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		effectiveModel: snapshot.effectiveModel ?? null,
 		requestedModel: snapshot.requestedModel ?? null,
 		modelFellBack: snapshot.modelFellBack ?? false,
+		modelFallbackReason: snapshot.modelFallbackReason ?? null,
 		fastMode: snapshot.fastMode ?? false,
 		// durationMs intentionally excluded (time-derived; would defeat idle gating).
 		progress: snapshot.progress ? canonicalizeProgressForSignature(snapshot.progress) : null,
@@ -1307,5 +1322,6 @@ function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unkno
 					delayMs: progress.retryState.delayMs,
 				}
 			: null,
+		metrics: progress.metrics ?? null,
 	};
 }

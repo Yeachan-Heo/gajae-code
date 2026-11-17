@@ -16,8 +16,8 @@ import {
 	emptyAgentRunSummary,
 } from "@gajae-code/agent-core/run-collector";
 import { EXECUTE_TOOL_STATUS_ATTR, GenAIAttr, PiGenAIAggregateAttr } from "@gajae-code/agent-core/telemetry";
-import type { AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AgentEvent, AgentLoopConfig, AgentTool } from "@gajae-code/agent-core/types";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type {
@@ -29,7 +29,7 @@ import type {
 	TimeInput,
 	Tracer,
 } from "@opentelemetry/api";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 interface RecordedSpan {
 	readonly name: string;
@@ -97,10 +97,6 @@ function makeFakeSpan(record: RecordedSpan): Span {
 		},
 	};
 	return span;
-}
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
 function makeUsage(
@@ -180,8 +176,7 @@ describe("AgentRunSummary delivery", () => {
 		expect(endEvent?.telemetry?.usage.totalTokens).toBe(10);
 	});
 
-	it("emits no spans and no summary when telemetry is unset", async () => {
-		const tracer = new RecordingTracer();
+	it("emits agent_end without telemetry or coverage when telemetry is unset", async () => {
 		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
 		const config: AgentLoopConfig = {
 			model: mock.model,
@@ -197,8 +192,8 @@ describe("AgentRunSummary delivery", () => {
 			mock.stream,
 		);
 		for await (const event of stream) events.push(event);
-		expect(tracer.spans.length).toBe(0);
 		const endEvent = events.find((e): e is Extract<AgentEvent, { type: "agent_end" }> => e.type === "agent_end");
+		expect(endEvent).toBeDefined();
 		expect(endEvent?.telemetry).toBeUndefined();
 		expect(endEvent?.coverage).toBeUndefined();
 	});

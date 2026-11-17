@@ -155,6 +155,7 @@ Artifacts and side channels:
    - expand `exec` to `eval` and `bash`
    - strip parent-owned `todo_write` after session creation
 17. `runSubprocess(...)` subscribes to child agent events, coalesces progress updates every 150 ms, forwards lifecycle/progress events on the parent event bus, and extracts tool data through `subprocessToolRegistry`.
+    - Every subagent also gets the hidden, display-only `report_metric` tool (`packages/coding-agent/src/tools/report-metric.ts`). Its `{ title, rows: [{ label, value }] }` charts land in `AgentProgress.extractedToolData.report_metric`, keeping the latest chart per title. The live task card and the `subagent` await panel render them as width-fitted bars, or as one text line when the terminal is too narrow. Charts never enter the parent model's context.
 18. The child must finish through the hidden `yield` tool. If it does not, `runSubprocess(...)` sends up to 3 reminder prompts; the last reminder forces `toolChoice = yield` when supported.
 19. Finalization uses `finalizeSubprocessOutput(...)` to reconcile raw assistant text, `yield` payloads, structured schemas, `report_finding` data, and abort states. Output is truncated with `MAX_OUTPUT_BYTES` / `MAX_OUTPUT_LINES` before returning to the parent, but the full raw output is still written to `<id>.md`.
 20. After sync task work finishes, `#executeSync(...)` aggregates receipts and reconciles isolation:
@@ -233,6 +234,7 @@ With autorouting disabled, model resolution is byte-for-byte unchanged.
 - Per-subagent output truncation: `MAX_OUTPUT_BYTES = 500_000` and `MAX_OUTPUT_LINES = 5000` in `packages/coding-agent/src/task/types.ts`. Full raw output is still written to `<id>.md` before truncation is returned to the caller.
 - Progress coalescing in child execution: `PROGRESS_COALESCE_MS = 150` in `packages/coding-agent/src/task/executor.ts`.
 - Recent output tail for progress: `RECENT_OUTPUT_TAIL_BYTES = 8 * 1024` and `recentOutput` keeps the last 8 non-empty lines in `packages/coding-agent/src/task/executor.ts`.
+- `report_metric`: at most 8 rows per chart, non-negative finite values, and the 4 most recently reported titles per subagent (`METRIC_MAX_ROWS` / `METRIC_MAX_CHARTS`). The collapsed card shows the latest chart; the expanded view shows all of them.
 - Missing-`yield` reminder retries: `MAX_YIELD_RETRIES = 3` in `packages/coding-agent/src/task/executor.ts`.
 - Task id schema cap: `tasks[].id` `maxLength: 48` in `packages/coding-agent/src/task/types.ts`.
 - Prompt text says ids should be `≤32` chars, but the runtime schema allows 48; this mismatch is real.

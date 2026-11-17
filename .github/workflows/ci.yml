@@ -410,7 +410,7 @@ jobs:
                - { os: ubuntu-22.04, platform: linux, arch: x64, variant: baseline, rust_checks: true }
                - { os: ubuntu-22.04, platform: linux, arch: x64, variant: modern }
                - { os: ubuntu-22.04, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
-               - { os: macos-14, platform: darwin, arch: arm64 }
+               - { os: macos-15, platform: darwin, arch: arm64 }
                - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
                - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
       steps:
@@ -437,7 +437,7 @@ jobs:
             include:
                - { os: ubuntu-22.04, platform: linux, arch: x64, target_id: linux-x64, binary_path: packages/coding-agent/binaries/gjc-linux-x64 }
                - { os: ubuntu-24.04-arm, platform: linux, arch: arm64, target_id: linux-arm64, binary_path: packages/coding-agent/binaries/gjc-linux-arm64 }
-               - { os: macos-14, platform: darwin, arch: arm64, target_id: darwin-arm64, binary_path: packages/coding-agent/binaries/gjc-darwin-arm64 }
+               - { os: macos-15, platform: darwin, arch: arm64, target_id: darwin-arm64, binary_path: packages/coding-agent/binaries/gjc-darwin-arm64 }
                - { os: macos-15-intel, platform: darwin, arch: x64, target_id: darwin-x64, binary_path: packages/coding-agent/binaries/gjc-darwin-x64 }
                - { os: windows-latest, platform: win32, arch: x64, target_id: win32-x64, binary_path: packages/coding-agent/binaries/gjc-windows-x64.exe }
       steps:

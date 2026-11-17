@@ -1,0 +1,12 @@
+{
+	"sourceTextReads": [
+		{
+			"path": "packages/coding-agent/test/docs-utility-surface-cleanup.test.ts",
+			"reason": "Generated-source freshness: asserts the generated src/internal-urls/docs-index.generated.ts no longer embeds the removed utility docs."
+		},
+		{
+			"path": "scripts/telegram-daemon-generation-guard.test.ts",
+			"reason": "Generated-source freshness: the committed topic-registry fixture must pin the DAEMON_GENERATION declared in src/sdk/bus/telegram-daemon-contract.ts."
+		}
+	]
+}

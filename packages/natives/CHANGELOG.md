@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Fixed
+
+- Windows `exactRemoveDirectoryTree` no longer fails every non-empty removal with `sharing_violation` by holding the directory it quarantines children into with DELETE, and no longer leaks child handles on failed removals. This stops the SDK broker from wedging its session index after the first lock contention on Windows 10.
+
+- Windows process-tree walks (`Process.children()`, `killTree()`, `terminate()` and the bash tool's timeout/cancel cleanup) no longer adopt unrelated processes through a recycled parent PID. Windows keeps a dead parent's PID number on its orphans and reuses that number, so a cleanup walk from a command process that received such a number treated the orphan (for example the SDK broker, which is started through a short-lived hop) and its whole subtree as the command's descendants and terminated them. A process is now walked only when its own handle confirms the parent number and it was created strictly after that parent; the current process and its provable ancestors are never selected; PID 0/4, unreadable processes, equal creation times and processes whose handle reports a different parent number than the snapshot are skipped together with their subtrees.
+
+## [0.20.0] - 2026-11-08
+
+### Fixed
+
+- Isolation git commands drop `GIT_CONFIG_*` from the child environment, so a repository `.env` cannot set `core.hooksPath` while a task worktree is created.
+
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Added Unix-only `reassertRawTty(fd)`. It applies the `setRawMode(true)` raw transform (libuv `UV_TTY_MODE_RAW`) to the live termios with `TCSANOW`, so the tty never enters an echoing state. It returns `true` when it had to restore raw mode, returns `false` without calling `tcsetattr` when the tty is already raw, and throws when `fd` is not a tty.
+
+- `readOwnerOnlyFile(path, maxBytes)` reads a private regular file (`0600`, single link, owned by the effective user, no extended ACL) under a private `0700` directory on macOS and Linux with a bounded, descriptor-retaining double read. Failures return only a bounded code, never paths or partial bytes. The loader and the addon embedder reject a candidate addon without it, so a retained same-version variant built before the reader is skipped in favor of a compatible one.
+
+### Fixes
+
+- Windows `gjc update` failures on `acl_present` now return structured diagnostic details: the offending principal (account name when resolvable, SID string otherwise) and whether the ACE is inherited. JavaScript layer formats these into actionable error messages that explain the security issue and how to remediate it (e.g. disable inheritance on `%LOCALAPPDATA%\gjc` and remove the offending principal's ACE). The stable error code `acl_present` remains unchanged for compatibility with existing callers and tests (issue #7469).
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Accept a Windows executable owned by `BUILTIN\Administrators` and carrying the default profile DACL (`SYSTEM`/`Administrators` full control, read/execute for others) during exact replacement, so `gjc update` no longer fails with `owner_mismatch` or `acl_present` on elevated or stock `%LOCALAPPDATA%` installs. Write grants to any other principal are still refused (issues #6096, #6916).
+
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- `astMatch` runs ast-grep patterns against an in-memory source string with an explicit language (a language alias, or a file extension resolved like a path's, e.g. `scss` as CSS), returning paged matches, the total match count, and non-fatal parse diagnostics.
+
+### Fixed
+
+- Expose Windows `access_denied` in canonical-directory identity and owner-only security result types so callers represent ACL-denied operations and classify them accurately (issue #6618).
+- Add handle-derived exact unlink for empty staged files whose host-side identity capture fails, preserving replacement files installed at the original pathname.
+
+- Native builds reject `CROSS_TARGET`, `TARGET_PLATFORM`, and `TARGET_ARCH` values that would place the addon or the temporary build directory outside the package `native` directory.
+
+- Report a denied staged-source or destination-parent open in Windows `renameNoReplacePath` as a pre-mutation `access_denied` instead of `owner_mismatch`, so file-lock publication retries the transient denial rather than failing with `Failed to publish file lock: owner_mismatch` (for example `terminal_persistence` notices on cloud-synced or Administrators-owned `.gjc` directories).
+
 ## [0.18.12] - 2026-10-16
 
 ### Fixed

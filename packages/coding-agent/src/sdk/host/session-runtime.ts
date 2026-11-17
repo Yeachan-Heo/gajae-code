@@ -1,13 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
-import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	isContinuingMidRunMaintenanceOutcome,
+	isNonDispatchedToolEvent,
+	type RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
-
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
@@ -39,16 +41,16 @@ import { tagSdkLifecycleObserver } from "../../extensibility/extensions/function
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
 import type { SdkRunCapability } from "../../session/sdk-run-capability";
 import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
-	MAX_DURABLE_TERMINAL_RESERVATIONS,
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
+import { answerPendingAsk, closePendingAsks, listPendingAsks } from "../../tools/pending-asks";
 import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
@@ -59,12 +61,16 @@ import {
 	sdkInternalRuntimeImage,
 } from "../broker/runtime";
 import {
+	allocateSessionEventGeneration,
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
 	SessionIndex,
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
+import { collectSdkStoredSecrets } from "../credential-secrets";
+import { readSdkWorkingTreeDiff, SdkDiffObservationError } from "../diff-observation";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -86,6 +92,7 @@ import {
 	failureEvidence,
 	failureProviderDiagnostic,
 	formatPromptFailureForLocalLog,
+	isPreservedProviderFailure,
 	PROMPT_FAILURE_MESSAGE_SUBMISSION,
 	type PromptFailureEvidence,
 	providerDiagnosticField,
@@ -96,8 +103,9 @@ import {
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
-import { validateRequiredPromptText } from "../protocol/adapter-validation";
+import { containsSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { MAX_DURABLE_TERMINAL_RESERVATIONS } from "../protocol/terminal-abort-contract";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
 	createKindAwareReconciliation,
@@ -106,25 +114,32 @@ import {
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 import {
 	reduceTurnResultContent,
 	reportableTurnResultContent,
 	sanitizeTurnResultContent,
 	type TurnResultContent,
 } from "../turn-result";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl, terminalAbortIdentity } from "./control";
+import {
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	controlRequestFromFrame,
+	createBtwAskHandler,
+	dispatchControl,
+	type EphemeralQuestionRunner,
+	terminalAbortIdentity,
+} from "./control";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
-import {
-	SESSION_HOST_OBSERVER_CAPABILITY,
-	SessionSdkHost,
-	type SessionSdkHostOptions,
-	TURN_STREAM_CAPABILITY,
-} from "./host";
+import { ExternalPermissionRuntime } from "./external-permissions";
+import { SessionSdkHost, type SessionSdkHostOptions, TURN_STREAM_CAPABILITY } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
+import { PromptImageUploadStore, retirePromptImageReservation } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import { createSdkRunCapability } from "./sdk-run-capability";
 import {
@@ -137,7 +152,6 @@ import {
 
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
-const execFileAsync = promisify(execFile);
 const sdkControlRequesterContext = new AsyncLocalStorage<string>();
 
 /**
@@ -308,15 +322,6 @@ const LIFECYCLE_QUIESCENCE_MS = 1_000;
  */
 export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
 
-class DiffQueryError extends Error {
-	constructor(
-		readonly code: "not_git_repository" | "diff_too_large",
-		message: string,
-	) {
-		super(message);
-	}
-}
-
 /**
  * Normalize an agent-loop stop reason into the published terminal outcome.
  *
@@ -340,23 +345,47 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
+	/**
+	 * Largest directed frame, in UTF-8 bytes, that `sendFrame` delivers. Omitted
+	 * means the native server's ceiling; `null` declares a transport without one.
+	 */
+	readonly directedFrameCeilingBytes?: number | null;
 	sendFrame(
 		connectionId: string,
 		frame: SdkFrame,
 	): void | "written" | "dropped" | Promise<void> | Promise<"written" | "dropped">;
+	/**
+	 * Deliver an already serialized frame. Optional: when present, a frame fanned
+	 * out to several connections is serialized once instead of once per
+	 * connection. Streamed `message_update` frames carry the whole message so
+	 * far, so per-connection serialization multiplies an O(message) cost by the
+	 * number of attached stream observers on every provider delta. Synchronous:
+	 * a connection that is no longer available throws. It replaces the
+	 * `sendFrame` call for that connection, so implement it only when `sendFrame`
+	 * does nothing but write the serialized frame.
+	 */
+	sendSerializedFrame?(connectionId: string, serialized: string): void;
 	onFrame(handler: (connectionId: string, frame: SdkFrame) => void): undefined | (() => void);
 	onMalformedFrame?(handler: (connectionId: string, message: string) => void): undefined | (() => void);
 	start(): Promise<{ url: string }>;
 	stop(): Promise<void>;
 	broadcastFrame?(frame: SdkFrame): void;
 	onConnectionClose?(handler: (connectionId: string) => void): undefined | (() => void);
+	/** Authoritative live socket membership, not a cache of previously observed frames. */
+	isConnectionOpen?(connectionId: string): boolean;
 	onNegotiatedCapabilities?(
 		handler: (connectionId: string, capabilities: readonly string[]) => void,
 	): undefined | (() => void);
 }
 
 export interface SessionSdkRuntimeOptions
-	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
+	extends Omit<
+		SessionSdkHostOptions,
+		"sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control" | "directedFrameCeilingBytes"
+	> {
+	/** The signal is supplied internally only for connection-owned BTW requests. */
+	control?: (connectionId: string, frame: SdkFrame, signal?: AbortSignal) => unknown | Promise<unknown>;
+	onDisconnected?: (connectionId: string) => void;
 	transport: SessionSdkTransport;
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
@@ -443,6 +472,10 @@ export interface SdkOnlyReconciliationStore {
 }
 
 export interface SdkOnlyTerminalAbortSeams {
+	/** Factory-owned identity for shared image budgets; never supplied by a client or extension context. */
+	getImageAdmissionSession?: () => object;
+	/** Definitive event-driven observation: never abort, seal or quarantine a run to reclaim images. */
+	waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
 	getTerminalTurnEpoch: () => number | undefined;
 	getActivePromptHandle: () => string | undefined;
@@ -530,6 +563,8 @@ export class SessionSdkSessionRuntime {
 	readonly transport: SessionSdkTransport;
 	readonly #connectionCapabilities = new Map<string, ReadonlySet<string>>();
 	readonly #connectionIds = new Set<string>();
+	readonly #btwControllers = new Map<string, Set<AbortController>>();
+	#btwStopping = false;
 	readonly #connectionCapabilitiesProvider: (connectionId: string) => ReadonlySet<string> | undefined;
 	readonly #connectionDisposer?: () => void;
 	readonly #malformedDisposer?: () => void;
@@ -543,10 +578,31 @@ export class SessionSdkSessionRuntime {
 			options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId));
 		this.host = new SessionSdkHost({
 			...options,
+			...(options.control
+				? {
+						control: async (connectionId: string, frame: SdkFrame) => {
+							if (frame.operation !== "btw.ask") return await options.control!(connectionId, frame);
+							const controller = new AbortController();
+							const controllers = this.#btwControllers.get(connectionId) ?? new Set<AbortController>();
+							controllers.add(controller);
+							this.#btwControllers.set(connectionId, controllers);
+							if (this.#btwStopping || !this.#connectionIds.has(connectionId)) controller.abort();
+							try {
+								return await options.control!(connectionId, frame, controller.signal);
+							} finally {
+								controllers.delete(controller);
+								if (controllers.size === 0) this.#btwControllers.delete(connectionId);
+							}
+						},
+					}
+				: {}),
 			connectionCapabilities: this.#connectionCapabilitiesProvider,
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
+			...(options.transport.directedFrameCeilingBytes === undefined
+				? {}
+				: { directedFrameCeilingBytes: options.transport.directedFrameCeilingBytes }),
 			sendFrame: (connectionId, frame) => {
 				const result = options.transport.sendFrame(connectionId, frame);
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
@@ -571,6 +627,8 @@ export class SessionSdkSessionRuntime {
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
 			this.#connectionIds.delete(connectionId);
 			this.#connectionCapabilities.delete(connectionId);
+			for (const controller of this.#btwControllers.get(connectionId) ?? []) controller.abort();
+			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
@@ -647,9 +705,26 @@ export class SessionSdkSessionRuntime {
 		frame: SdkFrame,
 		excluding: ReadonlySet<string> = new Set(),
 	): void {
-		for (const connectionId of this.connectionIdsWithCapabilities(required)) {
-			if (excluding.has(connectionId)) continue;
-			this.sendFrameTo(connectionId, frame);
+		const recipients = this.connectionIdsWithCapabilities(required).filter(
+			connectionId => !excluding.has(connectionId),
+		);
+		if (recipients.length < 2 || !this.transport.sendSerializedFrame) {
+			for (const connectionId of recipients) this.sendFrameTo(connectionId, frame);
+			return;
+		}
+		let serialized: string;
+		try {
+			serialized = JSON.stringify(frame);
+		} catch {
+			// Same contract as sendFrameTo: delivery failure never disturbs the turn.
+			return;
+		}
+		for (const connectionId of recipients) {
+			try {
+				this.transport.sendSerializedFrame(connectionId, serialized);
+			} catch {
+				// A dead connection is reaped by the transport's own close handling.
+			}
 		}
 	}
 
@@ -706,7 +781,16 @@ export class SessionSdkSessionRuntime {
 		}
 	}
 
+	/** Fence new BTW work and cancel existing questions without touching durable turns. */
+	abortBtwQuestions(): void {
+		this.#btwStopping = true;
+		for (const controllers of this.#btwControllers.values()) {
+			for (const controller of controllers) controller.abort();
+		}
+	}
+
 	async stop(options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {}): Promise<void> {
+		this.abortBtwQuestions();
 		this.#connectionDisposer?.();
 		this.#capabilitiesDisposer?.();
 		this.#malformedDisposer?.();
@@ -737,12 +821,16 @@ export class SessionSdkSessionRuntime {
 export interface CreateSdkSessionRuntimeOptions {
 	/** Authoritative broker state root for this session's endpoint lifecycle. */
 	agentDir: string;
+	/** Temporary session intent retained on every broker registration. */
+	ephemeral?: boolean;
 	/** Lifecycle-owned sessions require broker publication before they become usable. */
 	brokerRegistrationRequired?: boolean;
 	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
 	lifecycleRequestId?: string;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface?: "cli" | "sdk";
+	/** Called after each host broker registration, for every session this runtime hosts across switches. */
+	onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -762,6 +850,12 @@ export interface CreateSdkSessionRuntimeOptions {
 	masterOwnerSessionId?: string;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
+	/**
+	 * Private session-owned ephemeral side-question runner (`/btw`); never exposed
+	 * on ExtensionContext. Absent on hosts that cannot serve one, in which case
+	 * `btw.ask` reports `unavailable` instead of admitting turn work.
+	 */
+	askEphemeralQuestion?: EphemeralQuestionRunner;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
 	/** Timer seams for deterministic broker-recovery lifecycle tests. */
@@ -853,18 +947,6 @@ type InvocationOutcomeInput = {
 	provenance?: unknown;
 };
 const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
-const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
-	"provider_down",
-	"provider_unavailable",
-	"provider_rejected",
-	"upstream_stream_interrupted",
-	"argument_validation",
-	"execution",
-	"upstream_error",
-	"transport_reset",
-]);
-const isPreservedProviderFailure = (code: string | undefined): boolean =>
-	code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
 
 /**
  * Durable reconciliation accepts only the bounded outcome vocabulary from
@@ -2232,6 +2314,10 @@ export interface SdkSurfaceFactoryOptions {
 	api: ExtensionAPI;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface?: "cli" | "sdk";
+	/** Private staging controls are advertised only with authoritative transport liveness. */
+	imageUploadsAvailable?: boolean;
+	/** True only when the host has installed trusted local authority; omission excludes secure-local operations. */
+	secureLocalAuthorityAvailable?: boolean;
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -2247,6 +2333,7 @@ export interface SdkSurfaceFactoryOptions {
 	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
 	getRuntimeHost?: () => SessionSdkHost | undefined;
+	externalPermissions?: ExternalPermissionRuntime;
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -2277,6 +2364,7 @@ function createQuerySurface(
 		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 		getRuntimeHost?: () => SessionSdkHost | undefined;
+		externalPermissions?: ExternalPermissionRuntime;
 		primaryControlSurface?: "cli" | "sdk";
 	} = {},
 ): SessionSurface {
@@ -2459,26 +2547,17 @@ function createQuerySurface(
 	};
 	const getDiff = async () => {
 		try {
-			const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff"], {
-				cwd: ctx.cwd,
-				maxBuffer: 1024 * 1024,
+			const snapshot = await readSdkWorkingTreeDiff(ctx.cwd, {
+				knownSecrets: collectSdkStoredSecrets(ctx.modelRegistry.authStorage),
+				selection: "tracked-unstaged",
 			});
-			return stdout
-				.split(/^diff --git /m)
-				.filter(Boolean)
-				.map(section => {
-					const header = section.split("\n", 1)[0] ?? "";
-					const match = /a\/(.+?) b\/(.+)$/.exec(header);
-					return { id: match?.[2] ?? header, path: match?.[2] ?? header, body: `diff --git ${section}` };
-				});
+			// Legacy responses have no aggregate omission contract. Never retain a
+			// partial array as though it were the complete revision for pagination.
+			if (snapshot.truncated) throw new SdkDiffObservationError("diff_too_large");
+			return snapshot.files;
 		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
-			if (/not a git repository/i.test(`${detail}\n${stderr}`))
-				throw new DiffQueryError("not_git_repository", "diff queries require a Git working tree");
-			if (/maxbuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER/i.test(detail))
-				throw new DiffQueryError("diff_too_large", "diff exceeds the 1 MiB query limit");
-			throw error;
+			if (error instanceof SdkDiffObservationError) throw error;
+			throw new SdkDiffObservationError("git_failure");
 		}
 	};
 	const getDurableGoalState = (): { kind: "state"; state: unknown } | { kind: "empty" } | { kind: "unavailable" } => {
@@ -2655,11 +2734,27 @@ function createQuerySurface(
 				? { ...(items as Record<string, unknown>), ...Object.fromEntries(options.configOverrides ?? []) }
 				: items;
 		},
+		readComposer: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		getAuthorization: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readActivity: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
+
+		readOperator: input => (ctx.sdkControl ? ctx.sdkControl("operator.read", input) : unavailable("operator.read")()),
+		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
+
+		getRoleModels: input =>
+			ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
 		getSessionMetadata: metadata,
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
 		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
+		getAskRequests: () => listPendingAsks(id),
+		getPermissionRequests: input =>
+			options.externalPermissions?.list(input) ?? unavailable("permission.requests.list")(),
 		getAuthProviders: () => [
 			...new Set(ctx.modelRegistry.getAll(getProfileCredentialSessionId()).map(model => model.provider)),
 		],
@@ -2740,7 +2835,13 @@ export function createSdkSurfaceFactory(
 ): SdkSurfaceFactory {
 	const policy =
 		options.policy ??
-		createSdkSurfacePolicyForContext(options.ctx, hasSdkWorkflowGateCapability(options.ctx.workflowGate));
+		createSdkSurfacePolicyForContext(
+			options.ctx,
+			hasSdkWorkflowGateCapability(options.ctx.workflowGate),
+			options.imageUploadsAvailable,
+			options.externalPermissions !== undefined,
+			options.secureLocalAuthorityAvailable,
+		);
 	const reconciliation =
 		options.reconciliation ??
 		createInvocationReconciliation({
@@ -2757,6 +2858,7 @@ export function createSdkSurfaceFactory(
 		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
 		getRuntimeHost: options.getRuntimeHost,
+		externalPermissions: options.externalPermissions,
 		primaryControlSurface: options.primaryControlSurface,
 	});
 	return {
@@ -2766,61 +2868,6 @@ export function createSdkSurfaceFactory(
 	};
 }
 
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
-}
-
-/** True when a patch contains any secret-shaped key, recursively. */
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
-	);
-}
 async function resolveSdkWorkflowGate(
 	ctx: ExtensionContext,
 	operation: "workflow.gate_answer" | "workflow.plan_approve",
@@ -3126,6 +3173,7 @@ function createControlSurface(
 	) => void,
 	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
+	imageUploads: PromptImageUploadStore | undefined,
 	onPromotedTurn?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -3153,7 +3201,18 @@ function createControlSurface(
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	publishLifecycleFrame?: (frame: SdkFrame) => void,
+	retainAcceptedImage?: (correlation: InvocationCorrelation, release: () => void) => void,
+	settleAcceptedImageSubmission?: (correlation: InvocationCorrelation) => void,
+	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
 	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
+	onQueuedRunStartFailed?: (
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		failure: QueuedRunStartFailure,
+	) => boolean,
+	askEphemeralQuestion?: EphemeralQuestionRunner,
+	/** Connections of accepted own-run submissions whose agent_start has not adopted them yet. */
+	pendingRunOwnerConnectionIds?: () => ReadonlyArray<string | undefined>,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3174,6 +3233,9 @@ function createControlSurface(
 	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
 		sdkRunCapability?: SdkRunCapability;
 		expectedSdkRunToken?: string;
+		/** undefined: unbounded; string: exact captured run; null: no active run, reject. */
+		expectedPromptHandle?: string | null;
+		onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 	};
 	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
 		sendUserMessage: (
@@ -3184,7 +3246,7 @@ function createControlSurface(
 	const internalApi = api as InternalSdkApi;
 	const sendSdkUserMessage = (
 		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
-		options?: Record<string, unknown>,
+		options?: InternalSendOptions,
 	): Promise<void> => internalApi.sendUserMessage(content, options);
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -3306,6 +3368,17 @@ function createControlSurface(
 			? (activePromptOwner.connectionIds?.has(connectionId) ?? false)
 			: seamOwner === connectionId;
 	};
+	// An accepted own-run prompt is adopted as the active owner only at its
+	// agent_start. Between acceptance and that start the session is already busy
+	// with the requester's own work, so it may still replace it. Foreign pending
+	// work, or any run another connection or the host owns, is never replaced.
+	const requesterOwnsReplaceableWork = (connectionId: string): boolean => {
+		if (requesterOwnsActiveRun(connectionId)) return true;
+		const seamOwner = terminalAbortSeams?.getActivePromptOwnerConnectionId?.();
+		if (seamOwner !== undefined || (activePromptOwner.connectionIds?.size ?? 0) > 0) return false;
+		const pendingOwners = pendingRunOwnerConnectionIds?.() ?? [];
+		return pendingOwners.length > 0 && pendingOwners.every(owner => owner === connectionId);
+	};
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
 		if (clientRef === undefined) return undefined;
 		const trimmed = clientRef.trim();
@@ -3327,11 +3400,13 @@ function createControlSurface(
 			onDispatchDisposition: (promotion: { startsOwnRun: boolean }) => void;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
 			onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onQueuedRunStartFailed: (failure: QueuedRunStartFailure) => void;
 			queuedAtDispatch: boolean;
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
 		allowCompletionFallback = false,
 		alwaysQueued = false,
+		onCreated?: (correlation: InvocationCorrelation) => void,
 	): Promise<unknown> => {
 		// Capture the REQUESTING connection at admission: a terminal abort from
 		// another SDK connection must never stop the prompt this one accepts
@@ -3340,9 +3415,11 @@ function createControlSurface(
 		const retainedClientRef = normalizeClientRef(clientRef);
 		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
+		onCreated?.(correlation);
 		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
 		const publishTerminal = (outcome: InvocationOutcome): void => {
+			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			publishLifecycleFrame?.({
 				type: "agent_end",
@@ -3376,6 +3453,7 @@ function createControlSurface(
 		};
 		let accepted = false;
 		let settled = false;
+		let submission: Promise<unknown> | undefined;
 		const cancelPreflight = () => {
 			preflightController.abort();
 			if (settled) return;
@@ -3435,14 +3513,16 @@ function createControlSurface(
 		if (kind === "prompt")
 			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
+		let queuedRunStartRefused = false;
 		try {
-			const submission = Promise.resolve(
+			submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
 					preflightSignal: preflightController.signal,
 					sdkRunCapability,
 					onPreflightAcceptCommit: accept,
 					onDispatchDisposition: promotion => {
+						if (queuedRunStartRefused) return;
 						promotionStartsOwnRun = promotion.startsOwnRun;
 						if (promotion.startsOwnRun === false) {
 							queueCancellation.queueCandidate = true;
@@ -3462,6 +3542,7 @@ function createControlSurface(
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
 					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => {
+						if (queuedRunStartRefused) return;
 						promotionStartsOwnRun = promotion?.startsOwnRun;
 						if (promotion?.removed) {
 							queueCancellation.disposition = "removed";
@@ -3495,11 +3576,29 @@ function createControlSurface(
 						}
 						void onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion);
 					},
+					onQueuedRunStartFailed: failure => {
+						if (
+							queuedRunStartRefused ||
+							!accepted ||
+							!queueCancellation.queueCandidate ||
+							failure.disposition !== "not-started"
+						)
+							return;
+						// Only the private Core decision for this selected queue entry is proof.
+						// The lifecycle owner rejects contradictory decisions after adoption.
+						queuedRunStartRefused = onQueuedRunStartFailed?.(kind, correlation, failure) === true;
+						if (queuedRunStartRefused) {
+							queueCancellation.disposition = "consumed";
+							queueCancellation.resolveDisposition("consumed");
+						}
+					},
 					queuedAtDispatch,
 				}),
 			);
 			void submission.then(
 				result => {
+					settleAcceptedImageSubmission?.(correlation);
+					if (queuedRunStartRefused) return;
 					if (settled) {
 						// A resolved submission after preflight acceptance means the work is over
 						// for every kind. `noteTransition` ignores an already-terminal record, so
@@ -3510,7 +3609,9 @@ function createControlSurface(
 						// a delayed preflight diverted to steering fires onQueuedPromoted
 						// with startsOwnRun:false and is now attached to the in-flight run.
 						// Do not terminalize from the stale snapshot — the run will.
-						if (!queuedAtDispatch && promotionStartsOwnRun !== false) {
+						// Remember actual diversion even after own-run promotion changes
+						// promotionStartsOwnRun: enqueue completion is still not run completion.
+						if (!queueCancellation.queueCandidate && promotionStartsOwnRun !== false) {
 							// The accepted work settled without its own run still pending:
 							// retire the pending ownership entry (and with it the
 							// acceptance-anchored deadline lease, #4668 review) BEFORE
@@ -3579,7 +3680,10 @@ function createControlSurface(
 					);
 				},
 				error => {
+					settleAcceptedImageSubmission?.(correlation);
+					if (queuedRunStartRefused) return;
 					if (settled) {
+						releaseAcceptedImage?.(correlation);
 						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 						// The submission promise rejects after preflight acceptance only when the
 						// work itself is over (provider stream interrupt, abort, queue failure).
@@ -3701,6 +3805,9 @@ function createControlSurface(
 				...(acceptedFields?.() ?? {}),
 			};
 		} catch (error) {
+			if (!accepted) preflightController.abort();
+			if (!submission) settleAcceptedImageSubmission?.(correlation);
+			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
@@ -4618,54 +4725,112 @@ function createControlSurface(
 			}
 		}
 	};
+	/**
+	 * Ephemeral side question (`/btw`): answered from the session-owned runner,
+	 * owning no turn and appending nothing to the transcript.
+	 */
+	const askBtw = createBtwAskHandler(askEphemeralQuestion);
+	// A steer with a clientRef is reserved durably before dispatch, so a retry of
+	// the same clientRef replays the recorded outcome instead of queueing again.
+	// When a steer is queued as a fallback for a non-owning connection, it must
+	// target only the run it was intended for: if the run ends before the steer
+	// is dispatched, the steer must be rejected to prevent it reaching a new run.
+	const sendSteer = async (
+		text: string,
+		clientRef: string | undefined,
+		expectedSdkRunToken?: string,
+		expectedPromptHandle?: string | null,
+	) => {
+		const dispatch = () =>
+			sendSdkUserMessage(text, {
+				deliverAs: "steer",
+				...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
+				...(expectedPromptHandle === undefined ? {} : { expectedPromptHandle }),
+			});
+		if (clientRef === undefined) {
+			const correlation = newCorrelation();
+			await dispatch();
+			return { accepted: true, ...correlation };
+		}
+		const durable = steerReconciliation;
+		const reservation = await durable.reserveSteer(clientRef, text);
+		if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
+		try {
+			await dispatch();
+		} catch (error) {
+			const settled = await durable.settleSteer(clientRef, "rejected", error);
+			if (expectedSdkRunToken !== undefined) throw error;
+			return { accepted: false, ...settled };
+		}
+		try {
+			return { accepted: true, ...(await durable.settleSteer(clientRef, "accepted")) };
+		} catch (error) {
+			// The steer is already queued in the session. A failed acceptance write
+			// must not become a durable rejection that invites a second delivery:
+			// record the outcome as uncertain, or keep the in-flight dispatching
+			// record (which replays as uncertain) when that write fails as well.
+			const uncertain = await durable
+				.settleSteer(clientRef, "uncertain", error)
+				.catch(() => durable.lookupSteer(clientRef));
+			return { accepted: false, ...uncertain };
+		}
+	};
 	return {
-		prompt: async (text, images, clientRef) => {
-			const invalid = validateRequiredPromptText("turn.prompt", { text, images });
+		prompt: async (text, images, clientRef, stagedImages) => {
+			const invalid = validateRequiredPromptText("turn.prompt", { text, images, stagedImages });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
-			return await submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunCapability, ...options }) =>
-				sendSdkUserMessage(
-					typeof images === "undefined"
-						? text
-						: ([{ type: "text", text }, ...normalizePromptImages(images)] as [
-								{ type: "text"; text: string },
-								...ImageContent[],
-							]),
-					{
-						...options,
-						sdkRunCapability,
-						// ACP terminal settlement is owned by the correlated agent_end
-						// publication. Post-prompt recovery may include independent
-						// subagent work and must not hold that client-facing boundary.
-						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
+			if (stagedImages !== undefined && images !== undefined)
+				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
+			if (stagedImages !== undefined && !imageUploads)
+				throw Object.assign(new Error("Image uploads are unavailable."), { code: "operation_prohibited" });
+			let reservation: { images: ImageContent[]; release: () => void } | undefined;
+			let imageCorrelation: InvocationCorrelation | undefined;
+			try {
+				return await submit(
+					"prompt",
+					clientRef,
+					({ queuedAtDispatch, sdkRunCapability, ...options }) => {
+						// submit has reserved reconciliation/clientRef before consuming staged IDs.
+						if (stagedImages !== undefined) {
+							reservation = imageUploads!.redeem(sdkControlRequesterContext.getStore(), stagedImages);
+							if (imageCorrelation && retainAcceptedImage)
+								retainAcceptedImage(imageCorrelation, reservation.release);
+						}
+						return sendSdkUserMessage(
+							typeof images === "undefined" && !reservation
+								? text
+								: ([{ type: "text", text }, ...(reservation?.images ?? normalizePromptImages(images))] as [
+										{ type: "text"; text: string },
+										...ImageContent[],
+									]),
+							{ ...options, sdkRunCapability, ...(queuedAtDispatch ? { queuedAtDispatch: true } : {}) },
+						);
 					},
-				),
-			);
+					undefined,
+					false,
+					false,
+					correlation => {
+						if (retainAcceptedImage) imageCorrelation = correlation;
+					},
+				);
+			} catch (error) {
+				if (imageCorrelation) releaseAcceptedImage?.(imageCorrelation);
+				else reservation?.release();
+				throw error;
+			}
 		},
+		...(imageUploads
+			? {
+					imageBegin: (input: unknown) => imageUploads.begin(sdkControlRequesterContext.getStore(), input),
+					imageAppend: (input: unknown) => imageUploads.append(sdkControlRequesterContext.getStore(), input),
+					imageFinish: (input: unknown) => imageUploads.finish(sdkControlRequesterContext.getStore(), input),
+					imageDiscard: (input: unknown) => imageUploads.discard(sdkControlRequesterContext.getStore(), input),
+				}
+			: {}),
 		steer: async (text, clientRef, expectedSdkRunToken) => {
 			const invalid = validateRequiredPromptText("turn.steer", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
-			const retainedClientRef = normalizeClientRef(clientRef);
-			const sendSteer = () =>
-				sendSdkUserMessage(text, {
-					deliverAs: "steer",
-					...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
-				});
-			if (retainedClientRef === undefined) {
-				const correlation = newCorrelation();
-				await sendSteer();
-				return { accepted: true, ...correlation };
-			}
-			const durable = steerReconciliation;
-			const reservation = await durable.reserveSteer(retainedClientRef, text);
-			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
-			try {
-				await sendSteer();
-				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
-			} catch (error) {
-				const settled = await durable.settleSteer(retainedClientRef, "rejected", error);
-				if (expectedSdkRunToken !== undefined) throw error;
-				return { accepted: false, ...settled };
-			}
+			return await sendSteer(text, normalizeClientRef(clientRef), expectedSdkRunToken);
 		},
 		followUp: async text => {
 			const invalid = validateRequiredPromptText("turn.follow_up", { text });
@@ -4710,15 +4875,47 @@ function createControlSurface(
 			return { aborted: true };
 		},
 		abortTerminal: terminalAbort,
-		abortAndPrompt: async text => {
+		abortAndPrompt: async (text, idempotencyKey) => {
 			const invalid = validateRequiredPromptText("turn.abort_and_prompt", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
+			// A retry of a request that already degraded to a steer replays that steer,
+			// even when the run it targeted has since ended: the text was delivered once
+			// and must neither be queued again nor start a replacement run. The replay is
+			// fenced to no run: retention can evict the record between this lookup and
+			// the durable reservation, and a fresh reservation must then be refused at
+			// queue admission instead of reaching whatever run is current.
+			const steerClientRef = abortAndPromptSteerClientRef(idempotencyKey);
+			if (steerClientRef !== undefined) {
+				const prior = steerReconciliation.lookupSteer(steerClientRef);
+				if (prior.status !== "unknown")
+					return {
+						...(await sendSteer(text, steerClientRef, undefined, null)),
+						aborted: false,
+						queuedAs: "steer",
+					};
+			}
+			// Replacement is the same authority as turn.abort: a connection that
+			// does not own the active run (another client's prompt, or a turn the
+			// host itself started) must not stop it. The replacement text degrades
+			// to a queued steer for that run instead.
+			// Capture the real run identity synchronously, before any await (including
+			// the durable reservation), so the session can reject the steer if that
+			// run ends first instead of delivering it to a successor.
+			const connectionId = sdkControlRequesterContext.getStore();
+			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsReplaceableWork(connectionId)) {
+				const expectedPromptHandle = ctx.getActivePromptHandle() ?? null;
+				return {
+					...(await sendSteer(text, steerClientRef, undefined, expectedPromptHandle)),
+					aborted: false,
+					queuedAs: "steer",
+				};
+			}
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
 			);
 		},
-		answerAsk: unavailable("ask.answer"),
+		answerAsk: (requestId, answer) => answerPendingAsk(ctx.sessionManager.getSessionId(), requestId, answer),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
 			await trackGateResolution(
 				resolveSdkWorkflowGate(
@@ -4764,6 +4961,14 @@ function createControlSurface(
 		operateGoal: (op, objective) =>
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
+		preferenceControl: (operation, input) => typed(operation, input),
+
+		authorizationControl: (operation, input) => typed(operation, input),
+		operatorControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
+
+		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, thinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
 			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)
@@ -4793,8 +4998,8 @@ function createControlSurface(
 			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
-		cycleThinking: () =>
-			ctx.cycleThinkingLevel ? { level: ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
+		cycleThinking: async () =>
+			ctx.cycleThinkingLevel ? { level: await ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
 		setQueueMode: (kind, mode) =>
 			ctx.setQueueMode(kind as never, mode) ? { changed: true } : unavailable(`queue.${kind}_mode.set`)(),
@@ -4810,11 +5015,11 @@ function createControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: capability =>
-			typed(
-				"session.close",
-				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
-			),
+		closeSession: (capability, ifIdle) =>
+			typed("session.close", {
+				...(capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability }),
+				...(ifIdle === true ? { ifIdle: true } : {}),
+			}),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -4895,7 +5100,10 @@ function createControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
-		installedOperations: surfacePolicy.installedControls,
+		askBtw,
+		installedOperations: imageUploads
+			? surfacePolicy.installedControls
+			: new Set([...surfacePolicy.installedControls].filter(operation => !operation.startsWith("turn.image."))),
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
 }
@@ -4993,6 +5201,7 @@ function sameMasterAttestation(left: MasterRoleAttestationV2, right: MasterRoleA
 export async function reattestMasterSessionIdentity(input: {
 	index: SessionIndex;
 	locator: SessionLocatorV2;
+	ephemeral?: boolean;
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
 	ownerSessionId?: string;
@@ -5009,6 +5218,7 @@ export async function reattestMasterSessionIdentity(input: {
 			row.endpointGeneration === 0 &&
 			row.pid === input.pid &&
 			processIdentity === input.processIncarnation &&
+			(!input.ephemeral || row.ephemeral === true) &&
 			row.masterRole !== undefined &&
 			sameMasterAttestation(row.masterRole, masterRole)
 		);
@@ -5021,6 +5231,7 @@ export async function reattestMasterSessionIdentity(input: {
 			endpointGeneration: 0,
 			pid: input.pid,
 			processIncarnation: input.processIncarnation,
+			...(input.ephemeral ? { ephemeral: true } : {}),
 			masterRole,
 		});
 	}
@@ -5045,6 +5256,89 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
+	const acceptedImages = new Map<
+		string,
+		{
+			store: PromptImageUploadStore;
+			release: () => void;
+			handle?: string;
+			executionStarted?: boolean;
+			submissionPending?: boolean;
+			awaitingAdoption?: boolean;
+			releaseRequested?: boolean;
+			retiring?: boolean;
+		}
+	>();
+	const imageKey = (correlation: InvocationCorrelation): string => `${correlation.commandId}:${correlation.turnId}`;
+	const retireAcceptedImage = (key: string): void => {
+		const reservation = acceptedImages.get(key);
+		if (!reservation) return;
+		if ((reservation.submissionPending || reservation.awaitingAdoption) && !reservation.executionStarted) {
+			reservation.releaseRequested = true;
+			return;
+		}
+		if (reservation.retiring) return;
+		const release = (): void => {
+			if (acceptedImages.get(key) !== reservation) return;
+			acceptedImages.delete(key);
+			reservation.release();
+		};
+		if (!reservation.handle) {
+			if (reservation.executionStarted) {
+				reservation.retiring = true;
+				logger.warn("SDK image capacity retained for execution without an exact resource handle");
+				return;
+			}
+			release();
+			return;
+		}
+		const waitForSettlement = options.terminalAbortSeams?.waitForRunSettlement;
+		if (!waitForSettlement) return;
+		reservation.retiring = true;
+		retirePromptImageReservation(
+			reservation.handle,
+			waitForSettlement,
+			() => acceptedImages.get(key) === reservation,
+			release,
+		);
+	};
+	const releaseAcceptedImage = (correlation: InvocationCorrelation): void =>
+		retireAcceptedImage(imageKey(correlation));
+	const settleAcceptedImageSubmission = (correlation: InvocationCorrelation): void => {
+		const key = imageKey(correlation);
+		const reservation = acceptedImages.get(key);
+		if (!reservation) return;
+		reservation.submissionPending = false;
+		if (reservation.releaseRequested) {
+			reservation.releaseRequested = false;
+			retireAcceptedImage(key);
+		}
+	};
+	const bindAcceptedImage = (correlation: InvocationCorrelation, handle: string | undefined): void => {
+		const reservation = acceptedImages.get(imageKey(correlation));
+		if (!reservation) return;
+		reservation.awaitingAdoption = false;
+		reservation.executionStarted = true;
+		if (handle && reservation.handle === undefined) reservation.handle = handle;
+		if (reservation.releaseRequested) retireAcceptedImage(imageKey(correlation));
+	};
+	// Promotion commits a queued image to its next own-run before agent_start supplies the exact resource handle.
+	const awaitAcceptedImageAdoption = (correlation: InvocationCorrelation): void => {
+		const reservation = acceptedImages.get(imageKey(correlation));
+		if (reservation) reservation.awaitingAdoption = true;
+	};
+	const releaseImagesForStore = (store: PromptImageUploadStore | undefined): void => {
+		for (const [key, reservation] of acceptedImages) {
+			if (reservation.store !== store) continue;
+			retireAcceptedImage(key);
+		}
+	};
+	const pendingImageCleanups = new Set<PromptImageUploadStore>();
+	const completeImageCleanups = (): void => {
+		for (const store of pendingImageCleanups) releaseImagesForStore(store);
+		pendingImageCleanups.clear();
+	};
+	let currentImageUploads: PromptImageUploadStore | undefined;
 	const acceptedQueueCancellations = new Map<string, AcceptedQueueCancellation>();
 	const disposeAcceptedQueueCancellations = async (): Promise<void> => {
 		const cancellations = [...acceptedQueueCancellations.values()];
@@ -5223,6 +5517,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		}
 		if (active?.sessionIdentity === sessionIdentity) return active;
+		// The same session id on another session file is the live session after its file
+		// was relocated without a session_switch, as a committed rescope (`/move`,
+		// `move_session`, `session.cwd.move`) does. The runtime still carries the
+		// identity of the file it started on, so its routing identity follows the file
+		// instead of dropping every later turn, tool and stream event of that session.
+		// A different transcript arrives through session_switch or session_branch, which
+		// restart the runtime. A retired owner of the same session id keeps the
+		// fail-closed behavior: a tokenless event could be its delayed one.
+		if (active && active.sessionId === sessionId && !retiredLifecycleOwners.has(sessionId)) {
+			active.sessionIdentity = sessionIdentity;
+			return active;
+		}
 		return retired[0];
 	};
 	const lifecycleStateForEvent = (
@@ -5499,8 +5805,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	/**
 	 * Publish one correlated content frame per owning invocation, plus one
-	 * unpositioned copy for connections that explicitly negotiated observer
-	 * streaming. A shared run therefore lets every submitter attribute the content
+	 * unpositioned copy for connections that negotiated turn streaming. A shared run therefore lets every submitter attribute the content
 	 * to its own prompt without exposing it to ordinary attached clients.
 	 * Content is best-effort and bypasses the lifecycle replay ring; the turn
 	 * producing it is authoritative.
@@ -5523,11 +5828,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					...invocation.correlation,
 				});
 			}
-			// A relay or dashboard can observe a turn submitted by another client. It
-			// explicitly negotiates both the stream and observer capabilities, so give it
-			// the same live content frames without inventing a submitter correlation.
+			// A relay, dashboard or ACP client can follow a turn submitted by another
+			// client or typed in the host's terminal. It negotiates the stream capability,
+			// so give it the same live content frames without inventing a submitter
+			// correlation. Whether it also counts as demand is the observer capability's
+			// concern, not delivery's.
 			current.runtime.sendFrameToCapabilities(
-				[TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY],
+				[TURN_STREAM_CAPABILITY],
 				{ type: "event", kind: event.type, payload },
 				delivered,
 			);
@@ -5575,6 +5882,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
+		const imageRunHandle =
+			type === "agent_start" && acceptedImages.size > 0
+				? options.terminalAbortSeams?.getActivePromptHandle()
+				: undefined;
 		const failureBatch = lifecycleOwner?.batch;
 		const adoptLifecycleBatch = (batch: LifecycleBatch | undefined): void => {
 			current.activeInvocation = batch?.invocations[0];
@@ -5692,6 +6003,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			adoptLifecycleBatch(batch);
 			for (const entry of drained) {
 				if (entry.kind !== "prompt") continue;
+				bindAcceptedImage(entry.correlation, imageRunHandle);
 				if (current.deadlineManager.isExpiring(entry.correlation))
 					current.deadlineManager.captureExpiringRun(entry.correlation);
 				else current.deadlineManager.onRunStarted(entry.correlation);
@@ -6201,8 +6513,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
-			for (const invocation of transitions)
+			for (const invocation of transitions) {
+				// A deadline can capture this event while the exact run still owns
+				// pending tools. Its settlement owner, not event capture, releases quota.
+				if (!current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation))
+					releaseAcceptedImage(invocation.correlation);
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, invocation.correlation);
+			}
 			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
 				// A successor agent_start won the lifecycle race while this event's
 				// durable transitions were awaiting persistence. Retire the ended
@@ -6539,9 +6856,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * answer.
 	 *
 	 * Correlated content is scoped to the owning invocations of the batch that is
-	 * actually running. Explicit observer connections additionally receive the
-	 * uncorrelated copy, including for agent-owned runs with no SDK submitter.
-	 * A session with no owner or eligible observer pays one capability-map lookup.
+	 * actually running. Connections that negotiated turn streaming additionally
+	 * receive the uncorrelated copy, including for agent-owned runs with no SDK
+	 * submitter. A session with no owner or stream connection pays one
+	 * capability-map lookup.
 	 */
 	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
 		"message_update",
@@ -6554,10 +6872,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
-		const observerConnections = current.runtime.connectionIdsWithCapabilities([
-			TURN_STREAM_CAPABILITY,
-			SESSION_HOST_OBSERVER_CAPABILITY,
-		]);
+		const streamConnections = current.runtime.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]);
 		const batch = activeInvocation
 			? current.openLifecycleBatches.find(candidate =>
 					candidate.invocations.some(
@@ -6572,7 +6887,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			: current.lifecycleActive
 				? (current.attachedInvocations ?? [])
 				: [];
-		if (invocations.length === 0 && observerConnections.length === 0) return;
+		if (invocations.length === 0 && streamConnections.length === 0) return;
 		// Content bypasses the lifecycle replay ring and must never interrupt its producer.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
 		// emitLifecycle("agent_start") awaits durable persistence before it
@@ -6622,6 +6937,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
 		if (acceptedQueueCancellations.size > 0) await disposeAcceptedQueueCancellations();
+		completeImageCleanups();
 		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
@@ -6973,6 +7289,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				await autosaveWorktreeOnPromptDeadline(ctx.cwd, options.settings, { isCurrent, signal });
 			},
 			onExpired: correlation => {
+				// The manager invokes retirement only after confirmed settlement and
+				// durable terminalization (including recovered queue removals), never
+				// merely because an inactivity timer fired or execution is uncertain.
+				releaseAcceptedImage(correlation);
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);
 				const owner = lifecycleOwnerHolder.state;
 				if (owner) {
@@ -7027,22 +7347,29 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const waitForGateResolutionQuiescence = async (): Promise<void> => {
 			const settled = Promise.allSettled(inFlightGateResolutions);
-			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => {
+			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => "timed_out" as const);
+			if ((await Promise.race([settled, timeout])) === "timed_out") {
 				logger.warn("SDK workflow gate resolution drain timed out; proceeding with uncertain outcomes.");
-			});
-			await Promise.race([settled, timeout]);
+			}
 		};
 		let runtime: SessionSdkSessionRuntime;
+		const externalPermissions = new ExternalPermissionRuntime(sessionId);
+		const secureLocalAuthority = await tryGetSecureLocalAuthority(options.agentDir);
 		const surfaceFactory = createSdkSurfaceFactory({
+			secureLocalAuthorityAvailable: Boolean(secureLocalAuthority),
 			ctx,
 			id: sessionId,
 			api,
+			imageUploadsAvailable:
+				typeof transport.isConnectionOpen === "function" &&
+				typeof options.terminalAbortSeams?.waitForRunSettlement === "function",
 			reconciliation,
 			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
 			steerStatusLookup: selector => steerReconciliation.lookupSteer(selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 			getRuntimeHost: () => runtime?.host,
+			externalPermissions,
 			// Origin is explicit at the session bootstrap boundary. The low-level
 			// runtime defaults to SDK for existing embedders; CLI roots pass cli.
 			primaryControlSurface: options.primaryControlSurface ?? "sdk",
@@ -7167,7 +7494,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					});
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
-					if (kind === "prompt") retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
+					if (kind === "prompt") {
+						releaseAcceptedImage(correlation);
+						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
+					}
 					return true;
 				} catch (transitionError) {
 					// Keep prompt recovery leased; skill recovery has no prompt lease.
@@ -7185,6 +7515,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			return attempt(3);
 		};
 
+		// This is a private SDK transport facility. A frame-observer cache cannot
+		// establish that the authenticated connection still exists at redemption.
+		const imageUploads =
+			typeof transport.isConnectionOpen === "function" &&
+			typeof options.terminalAbortSeams?.waitForRunSettlement === "function"
+				? new PromptImageUploadStore(
+						connectionId => transport.isConnectionOpen?.(connectionId) === true,
+						options.terminalAbortSeams?.getImageAdmissionSession?.(),
+					)
+				: undefined;
+		currentImageUploads = imageUploads;
 		const controlSurface = createControlSurface(
 			ctx,
 			api,
@@ -7221,7 +7562,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			correlation => deadlineManager.onAccepted(correlation),
 			steerReconciliation,
+			imageUploads,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
+				if (!promotion?.removed) {
+					if (promotion?.startsOwnRun === false)
+						bindAcceptedImage(correlation, options.terminalAbortSeams?.getActivePromptHandle());
+					else awaitAcceptedImageAdoption(correlation);
+				}
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
 					const owner = lifecycleOwnerHolder.state;
 					if (sdkRunToken && owner)
@@ -7277,6 +7624,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// with it.
 				const current = active;
 				if (current?.lifecycleActive) {
+					bindAcceptedImage(correlation, options.terminalAbortSeams?.getActivePromptHandle());
 					// If this correlation was already admitted as own-run via the
 					// idle snapshot (onAccepted -> pending) but later diverted to
 					// steering and consumed in-run, move it from pending to the
@@ -7437,10 +7785,62 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					throw error;
 				}
 			},
+			(correlation, release) => {
+				if (imageUploads)
+					acceptedImages.set(imageKey(correlation), {
+						store: imageUploads,
+						release,
+						submissionPending: true,
+					});
+			},
+			settleAcceptedImageSubmission,
+			releaseAcceptedImage,
 			acceptedQueueCancellations,
+			(kind, correlation, failure) => {
+				const record = reconciliation.lookup(kind, correlation) as { status?: string };
+				const reservation = acceptedImages.get(imageKey(correlation));
+				const terminal = record.status === "terminal_ok" || record.status === "failed";
+				if (record.status !== "accepted" && !(terminal && reservation)) return false;
+				// A known execution/handle retains exact-ledger authority even if a
+				// contradictory callback arrives later. Never downgrade adoption.
+				if (reservation?.executionStarted || reservation?.handle) return false;
+				const adopted = active?.openLifecycleBatches.some(batch =>
+					[...batch.invocations, ...batch.attachedInvocations].some(
+						entry => entry.kind === kind && imageKey(entry.correlation) === imageKey(correlation),
+					),
+				);
+				if (adopted) return false;
+				const index = pending.findIndex(entry => entry.kind === kind && entry.correlation === correlation);
+				if (index >= 0) {
+					const [removed] = pending.splice(index, 1);
+					if (removed) lifecycleRunOwners.delete(removed.sdkRunToken);
+				}
+				if (reservation) {
+					reservation.awaitingAdoption = false;
+					// Ordinary retirement still waits for an outstanding enqueue producer.
+					retireAcceptedImage(imageKey(correlation));
+				}
+				// Keep the existing durable-first failure/recovery owner; this is not
+				// queue removal, and cannot publish cancellation or synthetic success.
+				if (!terminal)
+					void terminalizeAbandonedSubmission(kind, correlation, rejectionRecoveryIntent(failure.error));
+				return true;
+			},
+			// INTERNAL session-owned ephemeral side-question runner (`/btw`),
+			// threaded from the owning session (NOT on the public context).
+			options.askEphemeralQuestion,
+			() => pending.map(entry => entry.connectionId),
+		);
+		// The person at this terminal did not stop the turn, so say who did.
+		const attributeOperatorTerminalAbort = createOperatorTerminalAbortAttribution(message =>
+			ctx.ui.notify(message, "warning"),
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
 					const result = await runtime.host.reverse.request(
 						"permission",
@@ -7450,13 +7850,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
 							outcome: "selected",
 							optionId: response.optionId,
 							...(typeof response.kind === "string" ? { kind: response.kind as never } : {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -7503,8 +7904,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 		};
+		externalPermissions.installControls(
+			controlSurface,
+			provider => ctx.setSdkPermissionProvider?.(provider),
+			() => Boolean(runtime.host.reverse.getLease("permission")),
+		);
 		runtime = new SessionSdkSessionRuntime({
+			secureLocalAuthority,
 			transport,
+			onBrokerRegistered: options.onBrokerRegistered,
+			allocateEventGeneration: (sessionId, floor) =>
+				allocateSessionEventGeneration(options.agentDir, sessionId, floor),
+			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),
 			eventRevision: () =>
 				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function"
 					? ctx.getTranscript().length
@@ -7518,9 +7929,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}),
 			onFrameAdmission: (_connectionId, frame) =>
 				inputGate.quiescing ? quiescingFrame(frame as Record<string, unknown>) : undefined,
-			control: async (connectionId, frame) => {
+			control: async (connectionId, frame, signal) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
+				request.signal = signal;
 				// Scope preflight cancellation to the REQUESTING SDK connection: the
 				// requester preflight buckets are keyed by this context, so a
 				// terminal abort from one client must never cancel another client's
@@ -7535,6 +7947,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
+				if (
+					["permission.requests.list", "Q33", "ask.requests.list", "Q34"].includes(String(request.query)) &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						id: request.id,
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message:
+								request.query === "ask.requests.list" || request.query === "Q34"
+									? "Ask query input must be an empty object."
+									: "Permission query input must be an empty object.",
+						},
+					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -7548,6 +7976,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			onRequest: options.onSdkRequest,
 			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
+				attributeOperatorTerminalAbort(request, response);
 				// Strict key validation: a malformed retry (e.g. numeric
 				// idempotencyKey) rejected by dispatch must NEVER hash to the same
 				// key as a legitimate stored string and advance its response state
@@ -7653,6 +8082,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (STREAMED_TURN_EVENT_TYPES.has(event.type)) streamTurnEvent(event, ctx);
 		});
 		const disposeGate = (): void => {
+			const externalPermissionsEnabled = externalPermissions.enabled;
+			externalPermissions.dispose();
+			if (externalPermissionsEnabled) ctx.setSdkPermissionProvider?.(undefined);
 			disposeWorkflowGate?.();
 			disposeFold?.();
 			disposeStream?.();
@@ -7717,6 +8149,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					const direct = await reattestMasterSessionIdentity({
 						index,
 						locator,
+						ephemeral: options.ephemeral,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -7760,6 +8193,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								pid: process.pid,
 								endpointMtimeMs,
 								endpointFileId,
+								...(options.ephemeral ? { ephemeral: true } : {}),
 								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 								...(masterRole ? { masterRole } : {}),
 							});
@@ -7955,6 +8389,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		} catch (error) {
 			runtimeOwner.quiesceInput();
 			runtimeOwner.fenceGateResolutions();
+			imageUploads?.close();
 			active = undefined;
 			let queueCancellationFailure: unknown;
 			try {
@@ -8013,7 +8448,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 			cursors.close();
 			await revisions.close().catch(() => undefined);
-			if (queueCancellationFailure !== undefined)
+			if (queueCancellationFailure !== undefined) {
+				if (imageUploads) pendingImageCleanups.add(imageUploads);
 				throw Object.assign(
 					new AggregateError(
 						[error, queueCancellationFailure],
@@ -8021,14 +8457,26 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					),
 					{ code: "sdk_reconciliation_teardown_failed" },
 				);
+			}
+			if (currentImageUploads === imageUploads) currentImageUploads = undefined;
+			releaseImagesForStore(imageUploads);
 			throw error;
 		}
 	};
 	const stopActive = async (cancelSkillRecovery = false, unregisterReason?: "detached_idle"): Promise<void> => {
 		const current = active;
-		if (!current) return;
+		if (!current) {
+			if (pendingImageCleanups.size > 0) {
+				await disposeAcceptedQueueCancellations();
+				completeImageCleanups();
+			}
+			return;
+		}
 		current.quiesceInput();
 		current.fenceGateResolutions();
+		current.runtime.abortBtwQuestions();
+		const imageUploads = currentImageUploads;
+		imageUploads?.close();
 		let queueCancellationFailure: unknown;
 		try {
 			await disposeAcceptedQueueCancellations();
@@ -8094,6 +8542,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				allowLockContention: cancelSkillRecovery,
 				...(unregisterReason === undefined ? {} : { unregisterReason }),
 			});
+			if (queueCancellationFailure === undefined) {
+				if (currentImageUploads === imageUploads) currentImageUploads = undefined;
+				releaseImagesForStore(imageUploads);
+			} else if (imageUploads) pendingImageCleanups.add(imageUploads);
 		} catch (error) {
 			// Keep the immutable owner available for a retry when transport teardown
 			// fails after quiescing. Clearing `active` before stop prevents a second
@@ -8125,7 +8577,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await stopActive();
 		await startRuntime(ctx);
 	});
-	api.on("session_shutdown", async event => {
+	api.on("session_shutdown", async (event, ctx) => {
+		closePendingAsks(ctx.sessionManager.getSessionId());
 		await stopActive(true, event.reason);
 	});
 }

@@ -34,25 +34,131 @@ function standalone(word: string): RegExp {
 	return new RegExp(`(?<![A-Za-z0-9_-])${word}(?![A-Za-z0-9_-])`, "i");
 }
 
-/** Source/config file extensions treated as concrete file-path anchors. */
-const FILE_EXT =
-	"(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|rb|md|markdown|json|jsonl|yml|yaml|toml|xml|sql|sh|bash|css|scss|html|vue|svelte|java|kt|scala|c|cpp|h|hpp|csv|txt|env|tf)";
+/** Source and config extensions treated as file-path anchors. */
+const FILE_EXTENSIONS = (
+	"ts|tsx|js|jsx|mjs|cjs|py|rs|go|rb|md|markdown|json|jsonl|yml|yaml|toml|xml|sql|" +
+	"sh|bash|css|scss|html|vue|svelte|java|kt|scala|c|cpp|h|hpp|csv|txt|env|tf"
+).split("|");
 
-/** Regex matching one concrete file-path anchor (also used to count distinct paths). */
-const FILE_PATH_PATTERN = new RegExp(
-	`(?:(?:[A-Za-z0-9_@.+~\\-]+/)*[A-Za-z0-9_.@+\\-]+|(?:[A-Za-z0-9_@.+~\\-]+/)*\\.[A-Za-z0-9_-]+|(?:[A-Za-z0-9_@.+~\\-]+/)*)\\.${FILE_EXT}(?![A-Za-z0-9])`,
-	"i",
-);
+/** `[A-Za-z0-9_@.+~-]` — a path segment character, excluding `/`. */
+function isSegChar(code: number): boolean {
+	return (
+		(code >= 48 && code <= 57) ||
+		(code >= 65 && code <= 90) ||
+		(code >= 97 && code <= 122) ||
+		code === 95 ||
+		code === 64 ||
+		code === 46 ||
+		code === 43 ||
+		code === 126 ||
+		code === 45
+	);
+}
 
-/** Global variant of FILE_PATH_PATTERN for counting distinct file-path anchors. */
-const FILE_PATH_PATTERN_GLOBAL = new RegExp(FILE_PATH_PATTERN.source, "gi");
+/** `[A-Za-z0-9_.@+-]` — final stem. `~` stays in segments only. */
+function isStemChar(code: number): boolean {
+	return isSegChar(code) && code !== 126;
+}
+
+function isAlnum(code: number): boolean {
+	return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+/** End index of `.EXT` at `dot`, or -1. Comparison is ASCII case-insensitive. */
+function extensionEnd(text: string, dot: number): number {
+	const start = dot + 1;
+	if (start >= text.length) return -1;
+	for (const ext of FILE_EXTENSIONS) {
+		const end = start + ext.length;
+		if (end > text.length) continue;
+		let matched = true;
+		for (let index = 0; index < ext.length; index += 1) {
+			const code = text.charCodeAt(start + index)!;
+			const folded = code >= 65 && code <= 90 ? code + 32 : code;
+			if (folded !== ext.charCodeAt(index)) {
+				matched = false;
+				break;
+			}
+		}
+		if (!matched) continue;
+		if (end < text.length && isAlnum(text.charCodeAt(end)!)) continue;
+		return end;
+	}
+	return -1;
+}
+
+/** File-path anchors in this task text. A slash run with no extension is scanned once. */
+function filePathAnchors(text: string): string[] {
+	if (!text.includes(".")) return [];
+	const n = text.length;
+	const segmentAfter = new Int32Array(n);
+	const stemEnd = new Int32Array(n);
+	const extEndAt = new Int32Array(n);
+	const altStem = new Int32Array(n);
+	const altBare = new Int32Array(n);
+	segmentAfter.fill(-1);
+	stemEnd.fill(-1);
+	extEndAt.fill(-1);
+	altStem.fill(-1);
+	altBare.fill(-1);
+
+	let slash = -1;
+	for (let index = n - 1; index >= 0; index -= 1) {
+		const code = text.charCodeAt(index)!;
+		if (code === 47) {
+			slash = index;
+			continue;
+		}
+		if (!isSegChar(code)) {
+			slash = -1;
+			continue;
+		}
+		if (slash > index && slash + 1 < n) segmentAfter[index] = slash + 1;
+	}
+
+	let bestEnd = -1;
+	let bestDot = -1;
+	for (let index = n - 1; index >= 0; index -= 1) {
+		const code = text.charCodeAt(index)!;
+		if (!isStemChar(code)) {
+			bestEnd = -1;
+			bestDot = -1;
+			continue;
+		}
+		if (code === 46) extEndAt[index] = extensionEnd(text, index);
+		if (bestDot > index) stemEnd[index] = bestEnd;
+		const extEnd = extEndAt[index]!;
+		if (extEnd >= 0 && bestDot < 0) {
+			bestDot = index;
+			bestEnd = extEnd;
+		}
+	}
+
+	for (let index = n - 1; index >= 0; index -= 1) {
+		const next = segmentAfter[index]!;
+		altStem[index] = next >= 0 && altStem[next]! >= 0 ? altStem[next]! : stemEnd[index]!;
+		altBare[index] = next >= 0 && altBare[next]! >= 0 ? altBare[next]! : extEndAt[index]!;
+	}
+
+	const anchors: string[] = [];
+	for (let index = 0; index < n; ) {
+		const stemMatch = altStem[index]!;
+		const end = stemMatch >= 0 ? stemMatch : altBare[index]!;
+		if (end > index) {
+			anchors.push(text.slice(index, end));
+			index = end;
+			continue;
+		}
+		index += 1;
+	}
+	return anchors;
+}
 
 /** Concrete anchors that establish quick-lane eligibility. */
-const QUICK_SIGNALS: ReadonlyArray<{ id: string; label: string; pattern: RegExp }> = [
+const QUICK_SIGNALS: ReadonlyArray<{ id: string; label: string; pattern?: RegExp }> = [
 	{
 		id: "file-path",
 		label: "explicit file path",
-		pattern: FILE_PATH_PATTERN,
 	},
 	{
 		id: "issue-number",
@@ -232,7 +338,8 @@ export function classifyQuickLane(input: string): QuickLaneDecision {
 			exclusions.push(`${group.label} (matched keyword group "${group.id}")`);
 		}
 	}
-	const distinctFilePaths = new Set(Array.from(text.matchAll(FILE_PATH_PATTERN_GLOBAL), match => match[0]));
+	const filePaths = filePathAnchors(text);
+	const distinctFilePaths = new Set(filePaths);
 	if (distinctFilePaths.size >= 2) {
 		exclusions.push("multi-file / cross-contract breadth (matched 2 or more distinct file paths)");
 	}
@@ -242,9 +349,11 @@ export function classifyQuickLane(input: string): QuickLaneDecision {
 
 	const reasons: string[] = [];
 	for (const signal of QUICK_SIGNALS) {
-		if (signal.pattern.test(text)) {
-			reasons.push(signal.label);
+		if (signal.id === "file-path") {
+			if (filePaths.length > 0) reasons.push(signal.label);
+			continue;
 		}
+		if (signal.pattern?.test(text)) reasons.push(signal.label);
 	}
 	if (reasons.length === 0) {
 		return {

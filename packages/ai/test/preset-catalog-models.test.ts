@@ -4,6 +4,7 @@ import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
 import modelsJson from "../src/models.json" with { type: "json" };
+import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 
 function gemini37SiblingId(modelId: string): string {
 	return modelId.replaceAll("gemini-3.6-flash", "gemini-3.7-flash").replaceAll("gemini-3-6-flash", "gemini-3-7-flash");
@@ -43,6 +44,31 @@ describe("preset catalog model entries", () => {
 			Effort.Medium,
 			Effort.High,
 			Effort.XHigh,
+		]);
+	});
+
+	test("bundles Claude Fable 5.2 as a first-party Anthropic model with published pricing", () => {
+		const fable = getBundledModel("anthropic", "claude-fable-5-2");
+		expect(fable).toMatchObject({
+			id: "claude-fable-5-2",
+			name: "Anthropic Fable 5.2",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+			compat: { toolChoiceSupport: "auto" },
+		});
+		expect(fable.cost).toEqual({ input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 });
+		expect(getSupportedEfforts(fable)).toEqual([
+			Effort.Minimal,
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+			Effort.Max,
 		]);
 	});
 
@@ -248,5 +274,19 @@ describe("preset catalog model entries", () => {
 		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(512_000);
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.High, maxLevel: Effort.High });
+	});
+
+	// #830
+	test("uses Sonnet 5 as the first-class Anthropic default while preserving older Sonnet entries", () => {
+		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "anthropic");
+		expect(descriptor).toBeDefined();
+		expect(descriptor?.defaultModel).toBe("claude-sonnet-5");
+		expect(DEFAULT_MODEL_PER_PROVIDER.anthropic).toBe("claude-sonnet-5");
+
+		const sonnet5 = getBundledModel("anthropic", "claude-sonnet-5");
+		const sonnet46 = getBundledModel("anthropic", "claude-sonnet-4-6");
+		expect(sonnet5?.api).toBe("anthropic-messages");
+		expect(sonnet5?.reasoning).toBe(true);
+		expect(sonnet46?.api).toBe("anthropic-messages");
 	});
 });

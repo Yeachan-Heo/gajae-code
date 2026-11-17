@@ -2,6 +2,62 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Fixed
+
+- Honor session-owned canonical message acknowledgments before subsequent provider and tool effects, without awaiting ordinary event observers or changing consumers that do not opt in.
+
+- A subscriber abort during the post-acceptance canonical drain no longer rewrites the already-published assistant message to `aborted`, so an accepted turn still ends as completed. Tool dispatch is still fenced by the aborted run signal.
+
+- A managed attempt on an agent-in-a-call provider (Devin ACP) is published live from the first tool call the provider reports as already executed, and a failure after that point is no longer offered for a managed replay. Staging such a run hid side effects that had already happened, a replay would have repeated them, and because the provider re-publishes the whole growing message on every tool update, a long run (30 minutes to hours) overflowed the 16 MiB staging cap and killed the subagent with `local_buffer_overflow`.
+- A `local_buffer_overflow` raised while staging an assistant callback pair reports the pair's real lower bound instead of the constant `maxStagedBytes + 1`. The value was read after `discard()` had zeroed the counters, so every accumulated overflow looked like a single 16 MiB event.
+
+### Performance
+
+- Streaming a multi-line or non-English reply spends less CPU measuring the partial message. A string with a newline or a non-ASCII character was charged one code point at a time on every delta, with a limit check per code point; a well-formed one is now charged its UTF-8 length plus its JSON escapes in two limit checks. The measured size is unchanged.
+
+## [0.20.0] - 2026-11-08
+
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Forward a caller-supplied opaque endpoint configuration through native compaction, split summaries, fallback summaries, handoffs and branch maintenance. Omitted standalone scopes retain live trusted routing; no automatic session capture is introduced.
+
+### Fixed
+
+- Handoff generation tail-clips caller focus and prompt-extension text, then wraps that excerpt in an untrusted-content fence so a closer inside it cannot leave the handoff prompt.
+
+- Compaction update prompts wrap the stored previous summary in an untrusted-content fence after outbound conversion, and break previous-summary, fence, and conversation closers in that text without HTML-entity encoding.
+
+- Preserve the credential type through all local maintenance completions so captured alternate endpoints cannot bypass canonical OpenAI OAuth routing during native fallback or disabled remote compaction.
+- Preserve endpoint query routing when constructing OpenAI and Codex native compaction paths.
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Compaction summary and turn-prefix prompts wrap the clipped conversation in an untrusted-content fence after the head or tail cut, and encode fence and conversation closers inside that excerpt.
+
+## [0.19.0] - 2026-10-22
+
+### Added
+
+- `AgentTool` accepts optional `matcherDigest` and `matcherEntries` hooks that project the source a call introduces (combined, or per file) for pre-execution stream matchers such as TTSR `astCondition` rules.
+
+### Fixed
+
+- A tool call whose run is cancelled while an asynchronous `beforeToolCall` hook is pending no longer dispatches after the hook settles; non-abortable tools previously still executed after the aborted result was emitted.
+
+- Compaction and branch summaries reinserted into the next turn are encoded inside the summary template, so markup in the summary cannot close that block.
+
+- GenAI telemetry no longer enables message-content capture from project dotenv values whose escape sequences Bun decodes before provenance checks.
+
+- Tool results that include an image carry a host trust notice beside the image on the provider request, while text-only tool results and user-attached images stay unchanged.
+
 ## [0.18.12] - 2026-10-16
 
 ### Fixed

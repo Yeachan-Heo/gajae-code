@@ -211,13 +211,6 @@ describe("codex wake finally/diagnostic error masking (#4545)", () => {
 		// turn/start") that must never reach the diagnostic log verbatim: the
 		// codec reduces non-snake_case messages to a bounded code. Persisted
 		// last_error obeys the same codec.
-		const realAppendFile = fs.appendFile;
-		trackSpy(
-			spyOn(fs, "appendFile").mockImplementation(async (file, data) => {
-				if (String(file).endsWith("event-journal.jsonl")) return undefined;
-				return realAppendFile(file, data as string);
-			}),
-		);
 
 		await appendCoordinatorEventForTest(namespace, {
 			kind: "turn.completed",
@@ -229,9 +222,13 @@ describe("codex wake finally/diagnostic error masking (#4545)", () => {
 
 		const logFile = path.join(namespace, "codex-wake-errors.log");
 		const logText = (await Bun.file(logFile).exists()) ? await Bun.file(logFile).text() : "";
+		// The wake must actually fail, or the negative assertions below pass vacuously.
+		expect(logText).toContain("error=codex_wake_publish_failed");
 		expect(logText).not.toContain("disk died during turn/start");
 		expect(logText).not.toContain(secret);
-		for (const failed of (await listCodexWakeEvents(namespace)).filter(event => event.status === "failed"))
+		const failedWakes = (await listCodexWakeEvents(namespace)).filter(event => event.status === "failed");
+		expect(failedWakes).toHaveLength(1);
+		for (const failed of failedWakes)
 			if (failed.last_error !== null) expect(/^[a-z0-9_]+$/.test(failed.last_error)).toBe(true);
 	});
 

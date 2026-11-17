@@ -5,9 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
+import { MANAGED_ARTIFACT_MAX_FILES } from "../src/sdk/session-readonly/inspection";
 import { ArtifactManager } from "../src/session/artifacts";
 import {
-	MANAGED_ARTIFACT_MAX_FILES,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,

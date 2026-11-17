@@ -169,6 +169,156 @@ await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
 	await release();
 });
 
+const HOSTLESS_ORPHAN_AGE_MS = 5_000;
+
+async function setTreeMtime(root: string, when: Date): Promise<void> {
+	for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+		const entryPath = path.join(root, entry.name);
+		if (entry.isDirectory()) await setTreeMtime(entryPath, when);
+		else await fs.utimes(entryPath, when, when);
+	}
+	await fs.utimes(root, when, when);
+}
+
+async function ageRetainedRemoval(transition: string, ageMs = HOSTLESS_ORPHAN_AGE_MS * 2): Promise<void> {
+	const old = new Date(Date.now() - ageMs);
+	await setTreeMtime(transition, old);
+	await fs.utimes(`${transition}.owner`, old, old);
+}
+
+async function snapshotRetainedRemoval(transition: string): Promise<Record<string, string>> {
+	const files: Record<string, string> = { ".owner": await Bun.file(`${transition}.owner`).text() };
+	const walk = async (dir: string, prefix: string): Promise<void> => {
+		for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+			const relative = `${prefix}${entry.name}`;
+			if (entry.isDirectory()) await walk(path.join(dir, entry.name), `${relative}/`);
+			else files[relative] = await Bun.file(path.join(dir, entry.name)).text();
+		}
+	};
+	await walk(transition, "");
+	return files;
+}
+
+const hostQualified = {
+	ownerHostId: "local-host",
+	orphanTransitionAgeMs: HOSTLESS_ORPHAN_AGE_MS,
+	retries: 2,
+	retryDelayMs: 1,
+} as const;
+
+/** SIGKILL a hostless owner (a build that predates host-id stamping) at `phase` of its own release. */
+async function crashHostlessRemover(
+	file: string,
+	phase: "after-rename" | "after-scrub",
+): Promise<{ pid: number; transition: string }> {
+	const child = Bun.spawn(
+		[process.execPath, path.join(import.meta.dir, "fixtures", "hostless-lock-remover.ts"), file, phase],
+		{
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	expect(await child.exited).not.toBe(0);
+	expect(child.signalCode).toBe("SIGKILL");
+	const transition = `${file}.lock.removing`;
+	const recorded = ((await Bun.file(`${transition}.owner`).json()) as { owner: FileLockOwnerToken }).owner;
+	expect(recorded.pid).toBe(child.pid);
+	expect(recorded.owner_host_id).toBeUndefined();
+	expect(await fs.exists(transition)).toBe(true);
+	return { pid: child.pid, transition };
+}
+
+test.each([
+	"after-rename",
+	"after-scrub",
+] as const)("host-qualified acquire keeps a fresh hostless remover %s foreign, then adopts it once quiescent", async phase => {
+	const { file } = await fixture();
+	const { pid, transition } = await crashHostlessRemover(file, phase);
+	const before = await snapshotRetainedRemoval(transition);
+	const kill = vi.spyOn(process, "kill");
+
+	await expect(acquireFileLock(file, hostQualified)).rejects.toMatchObject({
+		code: "acquire_timeout",
+		orphanPath: transition,
+	});
+	expect(kill.mock.calls.filter(([probed]) => probed === pid)).toHaveLength(0);
+	expect(await snapshotRetainedRemoval(transition)).toEqual(before);
+
+	await ageRetainedRemoval(transition);
+	const release = await acquireFileLock(file, hostQualified);
+	expect(kill.mock.calls.some(([probed]) => probed === pid)).toBe(true);
+	expect(await fs.exists(transition)).toBe(false);
+	expect(await fs.exists(`${transition}.owner`)).toBe(false);
+	await release();
+});
+
+test("a quiescent hostless remover record stays foreign while any captured entry is recent", async () => {
+	const { file } = await fixture();
+	const { transition } = await crashHostlessRemover(file, "after-rename");
+	await ageRetainedRemoval(transition);
+	const now = new Date();
+	await fs.utimes(path.join(transition, "info"), now, now);
+	const before = await snapshotRetainedRemoval(transition);
+
+	await expect(acquireFileLock(file, hostQualified)).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(await snapshotRetainedRemoval(transition)).toEqual(before);
+});
+
+test("a hostless remover record dated in the future stays foreign", async () => {
+	const { file } = await fixture();
+	const { transition } = await crashHostlessRemover(file, "after-scrub");
+	await ageRetainedRemoval(transition, -HOSTLESS_ORPHAN_AGE_MS * 20);
+	const before = await snapshotRetainedRemoval(transition);
+
+	await expect(acquireFileLock(file, hostQualified)).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(await snapshotRetainedRemoval(transition)).toEqual(before);
+});
+
+test("a quiescent hostless remover record naming a live process is never adopted", async () => {
+	const { file, transition } = await fixture();
+	await fs.mkdir(transition);
+	await Bun.write(path.join(transition, "info"), "");
+	const incarnation = nativeProcessBindings().Process.fromPid(process.pid)?.incarnation;
+	expect(incarnation).toBeString();
+	await record(transition, { pid: process.pid, timestamp: Date.now(), process_incarnation: incarnation });
+	await ageRetainedRemoval(transition);
+	const before = await snapshotRetainedRemoval(transition);
+
+	await expect(acquireFileLock(file, hostQualified)).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(await snapshotRetainedRemoval(transition)).toEqual(before);
+});
+
+test("a quiescent hostless remover record bound to another tree is never adopted", async () => {
+	const { file, transition } = await fixture();
+	await fs.mkdir(transition);
+	await Bun.write(path.join(transition, "info"), "");
+	const stat = await fs.lstat(transition, { bigint: true });
+	await Bun.write(
+		`${transition}.owner`,
+		JSON.stringify({ owner: deadOwner, rootDev: stat.dev.toString(), rootIno: (stat.ino + 1n).toString() }),
+	);
+	await ageRetainedRemoval(transition);
+	const before = await snapshotRetainedRemoval(transition);
+
+	await expect(acquireFileLock(file, hostQualified)).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(await snapshotRetainedRemoval(transition)).toEqual(before);
+});
+
+test("a quiescent foreign-host remover record stays foreign", async () => {
+	const { file, transition } = await fixture();
+	await fs.mkdir(transition);
+	await Bun.write(path.join(transition, "info"), "");
+	await record(transition, { ...deadOwner, owner_host_id: "foreign-host" });
+	await ageRetainedRemoval(transition);
+	const before = await snapshotRetainedRemoval(transition);
+	const kill = vi.spyOn(process, "kill");
+
+	await expect(acquireFileLock(file, hostQualified)).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(kill.mock.calls.filter(([probed]) => probed === deadOwner.pid)).toHaveLength(0);
+	expect(await snapshotRetainedRemoval(transition)).toEqual(before);
+});
+
 test("real acquire reclaims an empty stale ownerless transition", async () => {
 	const { file, transition } = await fixture();
 	await fs.mkdir(transition);

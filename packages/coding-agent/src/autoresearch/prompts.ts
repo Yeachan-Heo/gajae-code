@@ -12,8 +12,17 @@
  * state under `.gjc/_session-{id}/autoresearch/`.
  */
 import { prompt } from "@gajae-code/utils";
+import { escapePromptMetadata, wrapUntrustedContent } from "../session/messages";
 import iteratePromptTemplate from "./prompts/prompt.md" with { type: "text" };
 import setupPromptTemplate from "./prompts/prompt-setup.md" with { type: "text" };
+
+/**
+ * Repository branch names reach the model only through these two renders.
+ * Encode markup first, then fence the name at the render boundary.
+ */
+function frameAutoresearchBranch(branch: string): string {
+	return wrapUntrustedContent(escapePromptMetadata(branch));
+}
 
 export interface AutoresearchSetupPromptInput {
 	baseSystemPrompt: string;
@@ -34,7 +43,7 @@ export function renderAutoresearchSetupPrompt(input: AutoresearchSetupPromptInpu
 		goal,
 		working_dir: input.workingDir,
 		has_branch: Boolean(input.branch),
-		branch: input.branch ?? "",
+		branch: input.branch ? frameAutoresearchBranch(input.branch) : "",
 		has_baseline_warning: Boolean(baselineWarning),
 		baseline_warning: baselineWarning ?? "",
 	});
@@ -90,7 +99,7 @@ export function renderAutoresearchIteratePrompt(input: AutoresearchIteratePrompt
 		goal,
 		working_dir: input.workingDir,
 		has_branch: Boolean(input.branch),
-		branch: input.branch ?? "",
+		branch: input.branch ? frameAutoresearchBranch(input.branch) : "",
 		has_baseline_commit: Boolean(input.baselineCommit),
 		baseline_commit: input.baselineCommit ? input.baselineCommit.slice(0, 12) : "",
 		has_notes: notes.length > 0,

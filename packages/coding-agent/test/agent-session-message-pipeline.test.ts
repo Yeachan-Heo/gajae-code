@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentMessage, isNonDispatchedToolEvent, markNonDispatchedToolEvent } from "@gajae-code/agent-core";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentPromptOptions,
+	isNonDispatchedToolEvent,
+	markNonDispatchedToolEvent,
+} from "@gajae-code/agent-core";
 import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -25,6 +33,10 @@ const testModelRegistry = {
 	getAuthStorageOwner: () => undefined,
 	withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 };
+
+function createIsolatedSessionManager(): SessionManager {
+	return SessionManager.inMemory(path.join(os.tmpdir(), `gjc-agent-session-pipeline-${Bun.randomUUIDv7()}`));
+}
 
 function createAgent(): Agent {
 	return new Agent({
@@ -888,7 +900,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 		});
@@ -1066,7 +1078,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 		});
@@ -1149,7 +1161,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 			workerIntegrationRequest: signal => {
@@ -1271,7 +1283,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 			workerIntegrationRequest: async () => {
@@ -1312,6 +1324,70 @@ describe("AgentSession message pipeline", () => {
 		expect(await promptOutcome).toMatchObject({ kind: "rejected", error: { code: "cancelled" } });
 	});
 
+	it("rejects an in-flight SDK terminal when disposal starts during extension delivery", async () => {
+		const extensionStarted = Promise.withResolvers<void>();
+		const releaseExtension = Promise.withResolvers<void>();
+		const model: Model = {
+			id: "dispose-slow-extension-model",
+			name: "dispose-slow-extension-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: createIsolatedSessionManager(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emitBeforeAgentStart: async () => undefined,
+				emit: async (event: { type: string }) => {
+					if (event.type !== "agent_end") return;
+					extensionStarted.resolve();
+					await releaseExtension.promise;
+				},
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+			} as never,
+		});
+		sessions.push(session);
+
+		const prompt = session.sendUserMessage("dispose during terminal delivery", {
+			sdkRunCapability: createSdkRunCapability("dispose-slow-extension"),
+		} as never);
+		await extensionStarted.promise;
+		const disposal = session.dispose();
+		const promptOutcome = await Promise.race([
+			prompt.then(
+				() => "resolved",
+				error => error,
+			),
+			Bun.sleep(100).then(() => "timeout"),
+		]);
+		expect(promptOutcome).not.toBe("timeout");
+		expect(promptOutcome).not.toBe("resolved");
+		expect(promptOutcome).toMatchObject({ code: "cancelled" });
+
+		releaseExtension.resolve();
+		await disposal;
+	});
+
 	it("drains deferred agent_end extension delivery before session shutdown", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
 		const releaseExtension = Promise.withResolvers<void>();
@@ -1342,7 +1418,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
@@ -1378,13 +1454,8 @@ describe("AgentSession message pipeline", () => {
 	});
 
 	it("does not publish SDK terminal before continuation decision settles", async () => {
-		// Regression test for PR #6668 P1: ensure SDK terminals are not published
-		// before the async handler has recorded its continuation decision.
-		// This test verifies the continuation-decision guard prevents premature publication
-		// when the handler is still awaiting async work like goal/retry/compaction processing.
-
-		const handlerStarted = Promise.withResolvers<void>();
-		const releaseHandler = Promise.withResolvers<void>();
+		// Regression test for PR #6668 P1: a real SDK-owned terminal stays pending
+		// while post-turn handling is unfinished, even when settlement attempts a flush.
 
 		const model: Model = {
 			id: "continuation-decision-guard-model",
@@ -1412,16 +1483,29 @@ describe("AgentSession message pipeline", () => {
 			},
 		});
 
+		const isolatedSessionCwd = path.join(os.tmpdir(), `agent-session-sdk-terminal-${Bun.randomUUIDv7()}`);
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(isolatedSessionCwd),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
+		const decisionStarted = Promise.withResolvers<void>();
+		const releaseDecision = Promise.withResolvers<void>();
+		const agentPromptReturned = Promise.withResolvers<void>();
+		const releaseAgentPrompt = Promise.withResolvers<void>();
 		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(async () => {
-			handlerStarted.resolve();
-			await releaseHandler.promise;
+			decisionStarted.resolve();
+			await releaseDecision.promise;
+		});
+		const originalAgentPrompt = agent.prompt.bind(agent);
+		vi.spyOn(agent, "prompt").mockImplementation(async (...args) => {
+			const [messages, options] = args;
+			if (!Array.isArray(messages)) throw new Error("Expected AgentSession to submit an SDK message batch.");
+			await originalAgentPrompt(messages, options as AgentPromptOptions | undefined);
+			agentPromptReturned.resolve();
+			await releaseAgentPrompt.promise;
 		});
 
 		const events: AgentSessionEvent[] = [];
@@ -1431,24 +1515,193 @@ describe("AgentSession message pipeline", () => {
 			if (event.type === "agent_end") sdkAgentEnds.push(event as never);
 		});
 
-		// Send an SDK message to trigger the agent on the SDK path.
-		// This ensures the agent_end enters #pendingSdkAgentEnds and exercises the decision guard.
-		const sdkPromise = session.sendUserMessage("test", {
+		const prompt = session.sendUserMessage("sdk terminal", {
 			sdkRunCapability: createSdkRunCapability("continuation-decision-guard"),
 		} as never);
-
 		try {
-			await handlerStarted.promise;
-			await session.agent.waitForIdle();
-			while (session.isStreaming) await Bun.sleep(0);
-			// The prompt has ended while the real terminal handler is still blocked,
-			// so its continuation decision has not yet been recorded.
+			await decisionStarted.promise;
+			session.flushParkedAgentEndForCoordinatorPersistForTests();
+			expect(sdkAgentEnds).toHaveLength(0);
+			releaseDecision.resolve();
+			await agentPromptReturned.promise;
+			await session.waitForAgentEndHandlingForTests();
+			session.flushParkedAgentEndForCoordinatorPersistForTests();
 			expect(sdkAgentEnds).toHaveLength(0);
 		} finally {
-			releaseHandler.resolve();
+			releaseDecision.resolve();
+			releaseAgentPrompt.resolve();
 		}
 
-		await sdkPromise;
+		await prompt;
+		await session.waitForIdle();
 		expect(sdkAgentEnds).toHaveLength(1);
+	});
+
+	it("does not delay an SDK terminal for a later admitted event handler", async () => {
+		const laterEventStarted = Promise.withResolvers<void>();
+		const releaseLaterEvent = Promise.withResolvers<void>();
+		const terminalPublished = Promise.withResolvers<void>();
+		const laterMessage = createAssistantMessage("unrelated external event");
+		let laterEventSettled = false;
+		const model: Model = {
+			id: "later-event-terminal-model",
+			name: "later-event-terminal-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: createIsolatedSessionManager(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emitBeforeAgentStart: async () => undefined,
+				hasHandlers: (eventType: string) => eventType === "message_end",
+				emit: async (event: { type: string; message?: unknown }) => {
+					if (event.type !== "message_end" || event.message !== laterMessage) return;
+					laterEventStarted.resolve();
+					await releaseLaterEvent.promise;
+					laterEventSettled = true;
+				},
+			} as never,
+		});
+		sessions.push(session);
+		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(async () => {
+			agent.emitExternalEvent({ type: "message_end", message: laterMessage } as never);
+			await laterEventStarted.promise;
+		});
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminalPublished.resolve();
+		});
+
+		const prompt = session.sendUserMessage("sdk terminal before unrelated work", {
+			sdkRunCapability: createSdkRunCapability("terminal-admission-boundary"),
+		} as never);
+		try {
+			await laterEventStarted.promise;
+			const publishedBeforeLaterEvent = await Promise.race([
+				terminalPublished.promise.then(() => true),
+				Bun.sleep(1_000).then(() => false),
+			]);
+			expect(publishedBeforeLaterEvent).toBe(true);
+			expect(laterEventSettled).toBe(false);
+			releaseLaterEvent.resolve();
+			await prompt;
+			await session.waitForIdle();
+		} finally {
+			releaseLaterEvent.resolve();
+		}
+	});
+
+	it("serializes a batched SDK terminal publication through the earlier extension delivery", async () => {
+		const firstExtensionStarted = Promise.withResolvers<void>();
+		const releaseFirstExtension = Promise.withResolvers<void>();
+		const secondExtensionStarted = Promise.withResolvers<void>();
+		const releaseSecondExtension = Promise.withResolvers<void>();
+		let extensionPublicationCount = 0;
+		const model: Model = {
+			id: "batched-sdk-terminal-model",
+			name: "batched-sdk-terminal-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("test") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: createIsolatedSessionManager(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emitBeforeAgentStart: async () => ({}),
+				emit: async (event: { type: string }) => {
+					if (event.type !== "agent_end") return;
+					extensionPublicationCount++;
+					if (extensionPublicationCount === 1) {
+						firstExtensionStarted.resolve();
+						await releaseFirstExtension.promise;
+					} else if (extensionPublicationCount === 2) {
+						secondExtensionStarted.resolve();
+						await releaseSecondExtension.promise;
+					}
+				},
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+			} as never,
+		});
+		sessions.push(session);
+		const agentPromptReturned = Promise.withResolvers<void>();
+		const releaseAgentPrompt = Promise.withResolvers<void>();
+		const originalAgentPrompt = agent.prompt.bind(agent);
+		vi.spyOn(agent, "prompt").mockImplementation(async (...args) => {
+			const [messages, options] = args;
+			if (!Array.isArray(messages)) throw new Error("Expected AgentSession to submit an SDK message batch.");
+			await originalAgentPrompt(messages, options as AgentPromptOptions | undefined);
+			// A second terminal can be queued while this SDK prompt's finalizer is
+			// still in flight, which reproduces the two-entry flush batch.
+			agent.emitExternalEvent({ type: "agent_end", messages: [], stopReason: "stop" } as never);
+			agentPromptReturned.resolve();
+			await releaseAgentPrompt.promise;
+		});
+
+		const sdkAgentEnds: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_end") sdkAgentEnds.push(event);
+		});
+		const prompt = session.sendUserMessage("sdk terminal batch", {
+			sdkRunCapability: createSdkRunCapability("batched-sdk-terminal"),
+		} as never);
+		try {
+			await agentPromptReturned.promise;
+			releaseAgentPrompt.resolve();
+			await firstExtensionStarted.promise;
+			await Bun.sleep(0);
+			expect(extensionPublicationCount).toBe(1);
+			expect(sdkAgentEnds).toHaveLength(1);
+			releaseFirstExtension.resolve();
+			await secondExtensionStarted.promise;
+			expect(extensionPublicationCount).toBe(2);
+		} finally {
+			releaseAgentPrompt.resolve();
+			releaseFirstExtension.resolve();
+			releaseSecondExtension.resolve();
+		}
+		await prompt;
+		await session.waitForIdle();
+		expect(extensionPublicationCount).toBe(2);
+		expect(sdkAgentEnds).toHaveLength(2);
 	});
 });

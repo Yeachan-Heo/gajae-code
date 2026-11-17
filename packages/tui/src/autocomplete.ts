@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { fuzzyFind as fuzzyFindFn } from "@gajae-code/natives";
-import { getProjectDir } from "@gajae-code/utils";
+import { getProjectDir, sanitizeDisplayLine } from "@gajae-code/utils";
 
 type NativeFuzzyFind = typeof fuzzyFindFn;
 let nativeFuzzyFind: NativeFuzzyFind | undefined;
@@ -120,6 +120,15 @@ function buildCompletionValue(
 	const openQuote = `${prefix}"`;
 	const closeQuote = options.isDirectory ? "" : '"';
 	return `${openQuote}${path}${closeQuote}`;
+}
+
+// Repository names are untrusted display text. The completion value stays the
+// on-disk path so accepting a row still inserts that file.
+const FILE_AUTOCOMPLETE_PLACEHOLDER = "\uFFFD";
+
+function fileAutocompleteDisplay(text: string): string {
+	const cleaned = sanitizeDisplayLine(text);
+	return cleaned.length > 0 ? cleaned : FILE_AUTOCOMPLETE_PLACEHOLDER;
 }
 
 const HANGUL_INITIAL_COMPAT_JAMO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ";
@@ -848,7 +857,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 				suggestions.push({
 					value,
-					label: name + (isDirectory ? "/" : ""),
+					label: `${fileAutocompleteDisplay(name)}${isDirectory ? "/" : ""}`,
 				});
 			}
 
@@ -902,8 +911,8 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				});
 				suggestions.push({
 					value,
-					label: entryName + (isDirectory ? "/" : ""),
-					description: displayPath,
+					label: `${fileAutocompleteDisplay(entryName)}${isDirectory ? "/" : ""}`,
+					description: fileAutocompleteDisplay(displayPath),
 				});
 			}
 			return suggestions;

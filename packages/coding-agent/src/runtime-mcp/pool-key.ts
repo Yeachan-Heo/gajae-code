@@ -172,6 +172,12 @@ function headerIdentity(
 						"Shared MCP Authorization entries require non-secret auth binding kind and scope",
 					);
 				}
+				// A shared API key is a caller-supplied label, not a stored credential.
+				// The header value joins the identity so another token cannot reuse the connection.
+				// OAuth keeps the label-only identity so a refresh reuses the open connection.
+				if (sharingMode === "shared" && authBindingKind === "apikey") {
+					return `${name}:${authBindingKind}:${authScopeId}:${sha256(headers[originalName] ?? "")}`;
+				}
 				return `${name}:${authBindingKind}:${authScopeId}`;
 			}
 			return `${name}:${sha256(headers[originalName] ?? "")}`;

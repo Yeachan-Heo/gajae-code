@@ -1,11 +1,19 @@
 import { expect, test } from "bun:test";
 import { type ControlRequest, type ControlSurface, dispatchControl, TypedControlError } from "../src/sdk/host/control";
+import { abortAndPromptSteerClientRef } from "../src/sdk/host/control/operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
+	OPERATOR_TERMINAL_ABORT_NOTICE,
 	redactBrokerRuntimeCapabilities,
 	setBrokerRuntimeAbortCapabilityForTest,
 } from "../src/sdk/host/control/runtime-gate";
-import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import { adapterDispositionError, OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import {
+	MAX_DURABLE_TERMINAL_RESERVATIONS,
+	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
+} from "../src/sdk/protocol/terminal-abort-contract";
+import { SdkSideConversationError } from "../src/sdk/side-conversation";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
@@ -13,6 +21,10 @@ const methodByOperation: Record<string, string> = {
 	"turn.follow_up": "followUp",
 	"turn.abort": "abort",
 	"turn.abort_and_prompt": "abortAndPrompt",
+	"turn.image.begin": "imageBegin",
+	"turn.image.append": "imageAppend",
+	"turn.image.finish": "imageFinish",
+	"turn.image.discard": "imageDiscard",
 	"ask.answer": "answerAsk",
 	"workflow.gate_answer": "answerGate",
 	"workflow.plan_approve": "approvePlan",
@@ -20,12 +32,19 @@ const methodByOperation: Record<string, string> = {
 	"mode.plan.set": "setPlanMode",
 	"mode.goal.operate": "operateGoal",
 	"todo.replace": "replaceTodo",
+
 	"model.set": "setModel",
+	"model.role.set": "preferenceControl",
+	"model.select": "preferenceControl",
+	"model.profile.select": "preferenceControl",
+	"config.write": "preferenceControl",
 	"model.profile.set": "setModelProfile",
 	"model.cycle": "cycleModel",
 	"thinking.set": "setThinking",
 	"thinking.cycle": "cycleThinking",
 	"permission_mode.set": "setPermissionMode",
+	"permission.channel.set": "configurePermissionChannel",
+	"permission.respond": "respondPermission",
 	"queue.steering_mode.set": "setQueueMode",
 	"queue.follow_up_mode.set": "setQueueMode",
 	"queue.tool_interrupt_policy.set": "setQueueMode",
@@ -33,6 +52,18 @@ const methodByOperation: Record<string, string> = {
 	"compaction.auto.set": "setAutoCompaction",
 	"retry.auto.set": "setAutoRetry",
 	"retry.abort": "abortRetry",
+	"activity.cancel": "activityControl",
+	"activity.pause": "activityControl",
+	"activity.resume": "activityControl",
+	"activity.delete": "activityControl",
+	"activity.acknowledge": "activityControl",
+	"mcp.suspend": "activityControl",
+	"mcp.resume": "activityControl",
+	"mcp.reconnect": "activityControl",
+
+	"operator.execute": "operatorControl",
+	"operator.cancel": "operatorControl",
+
 	"bash.execute": "executeBash",
 	"bash.abort": "abortBash",
 	"session.new": "newSession",
@@ -47,6 +78,10 @@ const methodByOperation: Record<string, string> = {
 	"config.patch": "patchConfig",
 	"runtime.reload": "reloadRuntime",
 	"auth.login": "login",
+	"auth.start": "authorizationControl",
+	"auth.answer": "authorizationControl",
+	"auth.cancel": "authorizationControl",
+	"auth.apiKey.store": "authorizationControl",
 	"host_tools.register": "registerHostTools",
 	"host_uri.register": "registerHostUri",
 	"service_tier.set": "setServiceTier",
@@ -61,9 +96,15 @@ const methodByOperation: Record<string, string> = {
 	"retry.last": "retryLast",
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
+	"btw.ask": "askBtw",
+	"btw.open": "sideControl",
+	"btw.submit": "sideControl",
+	"btw.cancel": "sideControl",
+	"btw.close": "sideControl",
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -78,37 +119,40 @@ function request(row: (typeof OPERATIONS)[number]): ControlRequest {
 	// turn.abort validates strictly: the generic kitchen-sink input carries
 	// `mode: "all"`, which is an invalid mode. Legacy C04 sends `{}` (omitted
 	// mode), so the broad fixture uses `{}` for turn.abort.
+	// ask.answer validates that input contains only 'id' and 'answer'.
 	const input =
 		row.sdkId === "turn.abort"
 			? {}
-			: {
-					text: "text",
-					images: [],
-					id: "id",
-					answer: "answer",
-					response: "response",
-					choice: "choice",
-					name: "name",
-					args: [],
-					on: true,
-					op: "create",
-					objective: "goal",
-					items: [],
-					level: "high",
-					mode: "all",
-					cmd: "echo hi",
-					entryId: "entry",
-					target: "target",
-					patch: {},
-					components: [],
-					provider: "provider",
-					defs: [],
-					tier: "pro",
-					names: [],
-					before: "before",
-					after: "after",
-					path: "/tmp",
-				};
+			: row.sdkId === "ask.answer"
+				? { id: "id", answer: "answer" }
+				: {
+						text: "text",
+						images: [],
+						id: "id",
+						answer: "answer",
+						response: "response",
+						choice: "choice",
+						name: "name",
+						args: [],
+						on: true,
+						op: "create",
+						objective: "goal",
+						items: [],
+						level: "high",
+						mode: "all",
+						cmd: "echo hi",
+						entryId: "entry",
+						target: "target",
+						patch: {},
+						components: [],
+						provider: "provider",
+						defs: [],
+						tier: "pro",
+						names: [],
+						before: "before",
+						after: "after",
+						path: "/tmp",
+					};
 	return {
 		id: row.id,
 		operation: row.sdkId,
@@ -136,6 +180,96 @@ test("dispatches every control registry operation to its ControlSurface method",
 		expect(response).toEqual({ id: row.id, ok: true, result: methodByOperation[row.sdkId] });
 	}
 	expect(calls).toEqual(rows.map(row => methodByOperation[row.sdkId]));
+});
+
+test("dispatches image staging controls and keeps them private to machine SDK clients", async () => {
+	const inputs = [
+		{ mimeType: "image/png", byteLength: 3, sha256: "a".repeat(64) },
+		{ id: "upload", sequence: 0, data: "YWJj" },
+		{ id: "upload" },
+		{ id: "upload" },
+	];
+	const calls: Array<{ operation: string; input: unknown }> = [];
+	const surface = Object.fromEntries(
+		["imageBegin", "imageAppend", "imageFinish", "imageDiscard"].map(method => [
+			method,
+			(input: unknown) => {
+				calls.push({ operation: method, input });
+				return method;
+			},
+		]),
+	) as unknown as ControlSurface;
+	const operationIds = ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"];
+	for (const [index, operation] of operationIds.entries()) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		const response = await dispatchControl(surface, row, { ...request(row), input: inputs[index] });
+		expect(response).toEqual({
+			id: row.id,
+			ok: true,
+			result: ["imageBegin", "imageAppend", "imageFinish", "imageDiscard"][index],
+		});
+	}
+	expect(calls).toEqual([
+		{ operation: "imageBegin", input: inputs[0] },
+		{ operation: "imageAppend", input: inputs[1] },
+		{ operation: "imageFinish", input: inputs[2] },
+		{ operation: "imageDiscard", input: inputs[3] },
+	]);
+	for (const operation of operationIds) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		expect(row.adapterDispositions.mcp).toBe("prohibited");
+		expect(row.adapterDispositions.acp).toBe("prohibited");
+		expect(row.adapterDispositions.daemonCli).toBe("machine_only");
+		expect(adapterDispositionError("mcp", "control", operation)?.code).toBe("adapter_operation_prohibited");
+		expect(adapterDispositionError("acp", "control", operation)?.code).toBe("adapter_operation_prohibited");
+		expect(adapterDispositionError("daemonCli", "control", operation, true)?.code).toBe("adapter_machine_only");
+	}
+});
+
+test("rejects image staging controls when the current surface has no image store", async () => {
+	for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"]) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		const response = await dispatchControl({} as ControlSurface, row, { ...request(row), input: {} });
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+});
+
+test("accepts textless staged-image prompts and rejects empty, invalid, or mixed image descriptors", async () => {
+	const prompt = OPERATIONS.find(row => row.sdkId === "turn.prompt")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		prompt: (...args: unknown[]) => {
+			calls.push(args);
+			return "prompted";
+		},
+	} as unknown as ControlSurface;
+	const stagedImages = [{ id: "upload-1" }, { id: "upload-2" }];
+	const accepted = await dispatchControl(surface, prompt, {
+		...request(prompt),
+		input: { text: "  ", stagedImages },
+	});
+	expect(accepted).toEqual({ id: prompt.id, ok: true, result: "prompted" });
+	expect(calls).toEqual([["  ", undefined, undefined, stagedImages]]);
+
+	for (const invalidStagedImages of [
+		[],
+		[{}],
+		[{ id: "" }],
+		[{ id: "same" }, { id: "same" }],
+		[{ id: "valid", extra: true }],
+	]) {
+		const rejected = await dispatchControl(surface, prompt, {
+			...request(prompt),
+			input: { text: "nonempty text", stagedImages: invalidStagedImages },
+		});
+		expect(rejected).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+	const mixed = await dispatchControl(surface, prompt, {
+		...request(prompt),
+		input: { text: "nonempty text", images: [], stagedImages },
+	});
+	expect(mixed).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(calls).toHaveLength(1);
 });
 
 test("forwards expectedSessionId only to durable workflow controls", async () => {
@@ -398,6 +532,44 @@ test("steering reaches an active worker before an earlier ordered control settle
 	}
 });
 
+test("an ask answer reaches the waiting turn before an earlier ordered control settles", async () => {
+	const setModel = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const answer = OPERATIONS.find(row => row.sdkId === "ask.answer")!;
+	const entered = Promise.withResolvers<void>();
+	// The turn ends only once its pending ask is answered, and model.set waits for the turn.
+	const turnEnded = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		setModel: async () => {
+			entered.resolve();
+			await turnEnded.promise;
+			calls.push("model-set");
+			return { changed: true };
+		},
+		answerAsk: (id: string) => {
+			calls.push(`answer:${id}`);
+			turnEnded.resolve();
+			return { answered: true };
+		},
+	} as unknown as ControlSurface;
+	const pending = dispatchControl(surface, setModel, { ...request(setModel), input: { id: "provider/model" } });
+	await entered.promise;
+	const answered = dispatchControl(surface, answer, {
+		...request(answer),
+		input: { id: "ask-1", answer: { kind: "value", value: "yes" } },
+	});
+	try {
+		await Bun.sleep(0);
+		expect(calls[0]).toBe("answer:ask-1");
+		expect(await answered).toMatchObject({ ok: true, result: { answered: true } });
+		expect(await pending).toMatchObject({ ok: true, result: { changed: true } });
+		expect(calls).toEqual(["answer:ask-1", "model-set"]);
+	} finally {
+		turnEnded.resolve();
+		await Promise.all([pending, answered]);
+	}
+});
+
 test("rejects malformed expected SDK run tokens before steering", async () => {
 	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
 	let calls = 0;
@@ -413,6 +585,55 @@ test("rejects malformed expected SDK run tokens before steering", async () => {
 	);
 	expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
 	expect(calls).toBe(0);
+});
+
+test("reserves abort-and-prompt steer references before dispatching caller steers", async () => {
+	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
+	const calls: Array<string | undefined> = [];
+	const surface = {
+		steer: (_text: string, clientRef?: string) => {
+			calls.push(clientRef);
+			return { accepted: true };
+		},
+	} as unknown as ControlSurface;
+	const reserved = abortAndPromptSteerClientRef("fallback-request-key")!;
+	for (const clientRef of [reserved, `  ${reserved}\t`, "abort-and-prompt:caller-chosen"]) {
+		const response = await dispatchControl(surface, steer, {
+			...request(steer),
+			input: { text: "caller steer", clientRef },
+		});
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+	expect(calls).toEqual([]);
+	expect(
+		await dispatchControl(surface, steer, {
+			...request(steer),
+			input: { text: "caller steer", clientRef: "caller-steer" },
+		}),
+	).toMatchObject({ ok: true, result: { accepted: true } });
+	expect(calls).toEqual(["caller-steer"]);
+});
+
+test.each([
+	"turn_not_active",
+	"client_ref_conflict",
+	"reconciliation_capacity",
+	"reconciliation_persist_failed",
+])("preserves abort-and-prompt reconciliation error %s", async code => {
+	const replacement = OPERATIONS.find(row => row.sdkId === "turn.abort_and_prompt")!;
+	const response = await dispatchControl(
+		{
+			abortAndPrompt: () => {
+				throw new TypedControlError(code, "Fallback steer reconciliation failed.");
+			},
+		} as unknown as ControlSurface,
+		replacement,
+		{ ...request(replacement), idempotencyKey: "fallback-request-key" },
+	);
+	expect(response).toMatchObject({
+		ok: false,
+		error: { code, message: "Fallback steer reconciliation failed." },
+	});
 });
 
 test("steering waits for a pending abort-and-prompt replacement to settle", async () => {
@@ -565,6 +786,78 @@ test("preserves typed registry errors and maps unknown failures to internal", as
 		message: "clientRef is already bound to different steer text.",
 	});
 });
+
+for (const [id, operation, input] of [
+	["C80", "btw.open", { question: "Side question" }],
+	["C81", "btw.submit", { conversationId: "side-conversation", question: "Follow-up question" }],
+] as const) {
+	for (const [code, message] of [
+		["unknown_effect", "Side provider cleanup is unresolved; new side questions are refused."],
+		["redaction_failed", "Side conversation redaction failed; output was withheld."],
+	] as const) {
+		test(`${id} ${operation} preserves native ${code} as an exact top-level failure`, async () => {
+			const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+			expect(row.id).toBe(id);
+			const surface = {
+				sideControl: () => {
+					throw new SdkSideConversationError(code, message);
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code, message },
+			});
+		});
+	}
+
+	test(`${id} ${operation} retains typed native validation and unavailable failures`, async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		for (const code of ["invalid_input", "resource_gone", "busy"] as const) {
+			const message = `Safe native side ${code}.`;
+			const surface = {
+				sideControl: () => {
+					throw new SdkSideConversationError(code, message);
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code, message },
+			});
+		}
+		expect(await dispatchControl({} as ControlSurface, row, { id, operation, input })).toEqual({
+			id,
+			ok: false,
+			error: { code: "unavailable", message: "Side conversations unavailable." },
+		});
+	});
+
+	test(`${id} ${operation} hides arbitrary dependency exceptions behind generic internal failure`, async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		for (const error of [
+			new Error("SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("not found SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("gone SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("invalid input SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			...(
+				["invalid_input", "resource_gone", "busy", "unavailable", "unknown_effect", "redaction_failed"] as const
+			).map(code => Object.assign(new Error("SIDE_DEPENDENCY_PRIVATE_SENTINEL"), { code })),
+			{ code: "dependency_failure", message: "SIDE_DEPENDENCY_PRIVATE_SENTINEL", details: { token: "private" } },
+		]) {
+			const surface = {
+				sideControl: () => {
+					throw error;
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code: "internal", message: "Control operation failed." },
+			});
+		}
+	});
+}
 
 test("preserves action_claimed workflow fences through control dispatch", async () => {
 	const gate = OPERATIONS.find(row => row.sdkId === "workflow.gate_answer")!;
@@ -1052,4 +1345,48 @@ test("turn.abort terminal conflict surfaces as a top-level control error", async
 	});
 	expect(response.ok).toBe(false);
 	expect(response.error).toMatchObject({ code: "idempotency_conflict" });
+});
+
+test("operator abort attribution dedups same-key replays for the whole durable replay window", () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	// Keys the durable store can replay: retained completed rows plus evicted-key tombstones.
+	const durableReplayWindow = MAX_DURABLE_TERMINAL_RESERVATIONS + MAX_RETAINED_TERMINAL_KEY_TOMBSTONES;
+	try {
+		const notices: string[] = [];
+		const attribute = createOperatorTerminalAbortAttribution(message => notices.push(message));
+		const deliver = (key: string): void =>
+			attribute(
+				{
+					operation: "turn.abort",
+					idempotencyKey: key,
+					input: {
+						mode: "terminal",
+						scope: "turn",
+						operator: true,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+					},
+				},
+				{ ok: true, result: { ok: true, selection: "turn", turn: "stopped" } },
+			);
+		deliver("first");
+		expect(notices).toEqual([OPERATOR_TERMINAL_ABORT_NOTICE]);
+		// The durable store still replays "first" as stopped after hundreds of later
+		// distinct aborts (retained rows, then evicted-key tombstones).
+		for (let index = 0; index < MAX_DURABLE_TERMINAL_RESERVATIONS; index++) deliver(`later-${index}`);
+		const announced = notices.length;
+		deliver("first");
+		expect(notices).toHaveLength(announced);
+		// Past the durable window the oldest key is forgotten first, while a recent
+		// key stays remembered.
+		for (let index = MAX_DURABLE_TERMINAL_RESERVATIONS; index < durableReplayWindow; index++)
+			deliver(`later-${index}`);
+		const beforeExpiry = notices.length;
+		deliver(`later-${durableReplayWindow - 1}`);
+		expect(notices).toHaveLength(beforeExpiry);
+		deliver("first");
+		expect(notices).toHaveLength(beforeExpiry + 1);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+	}
 });

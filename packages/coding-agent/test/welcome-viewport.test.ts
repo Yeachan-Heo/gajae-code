@@ -2,7 +2,8 @@ import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@gajae-code/tui";
 import { resolveWelcomeIntroTickMs, WelcomeComponent } from "../src/modes/components/welcome";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const originalBuildChannel = process.env.GJC_BUILD_CHANNEL;
 
@@ -14,8 +15,7 @@ afterEach(() => {
 	}
 });
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Failed to load red-claw theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

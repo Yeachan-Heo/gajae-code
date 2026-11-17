@@ -5,11 +5,12 @@ import type { RenderResultOptions } from "@gajae-code/agent-core";
 import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import { type IrcSidebarTheme, IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { bashToolRenderer } from "@gajae-code/coding-agent/tools/bash";
 import { getOutputBlockContentWidth } from "@gajae-code/coding-agent/tui/output-block";
 import { getKeybindings, ImageProtocol, setKeybindings, TERMINAL, visibleWidth } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import { loadTestTheme } from "../helpers/test-theme";
 
 type MutableTerminalInfo = {
 	imageProtocol: ImageProtocol | null;
@@ -38,7 +39,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("shows rendered env assignments in the command preview", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const component = bashToolRenderer.renderCall(
@@ -52,7 +53,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("shows partial env assignments while tool args are still streaming", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const component = bashToolRenderer.renderCall(
@@ -69,7 +70,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("sanitizes command tabs and shortens home cwd in previews", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const component = bashToolRenderer.renderCall(
@@ -87,7 +88,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("bounds pending commands to five visual rows and expands inline", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 		const options = {
 			expanded: false,
@@ -115,7 +116,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("bounds completed commands at the output block content width", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 		const command = Array.from({ length: 12 }, (_, index) => `echo line-${index}`).join("\n");
 		const component = bashToolRenderer.renderResult(
@@ -160,7 +161,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("updates the collapsed hint when the expand binding changes", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 		const command = Array.from({ length: 8 }, (_, index) => `echo line-${index}`).join("\n");
 		const component = bashToolRenderer.renderCall({ command }, { expanded: false, isPartial: true }, uiTheme!);
@@ -178,7 +179,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("keeps the omission sentinel bounded at narrow widths", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "ctrl+shift+alt+x" }));
 		const command = Array.from({ length: 12 }, (_, index) => `echo line-${index}`).join("\n");
@@ -194,14 +195,14 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("exposes the output block's actual section width", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 		expect(getOutputBlockContentWidth(0, uiTheme!)).toBe(0);
 		expect(getOutputBlockContentWidth(20, uiTheme!)).toBe(17);
 	});
 
 	it("shows the effective timeout from result details when it differs from call args", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const component = bashToolRenderer.renderResult(
@@ -217,7 +218,7 @@ describe("bashToolRenderer", () => {
 
 	it("bypasses truncation/styling for SIXEL lines", async () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const sixel = "\x1bPqabc\x1b\\";
@@ -250,7 +251,7 @@ describe("bashToolRenderer", () => {
 	});
 	it("replaces SIXEL output with bordered text while rendered through the visible IRC split", async () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const sixel = "\x1bPqabc\x1b\\";
 		const component = bashToolRenderer.renderResult(
@@ -271,7 +272,7 @@ describe("bashToolRenderer", () => {
 	});
 
 	it("highlights every line of a multi-line bash command in renderResult", async () => {
-		const uiTheme = await getThemeByName("red-claw");
+		const uiTheme = await loadTestTheme();
 		expect(uiTheme).toBeDefined();
 		setThemeInstance(uiTheme!);
 		const command = 'for f in a b; do\n\techo "$f"\ndone';

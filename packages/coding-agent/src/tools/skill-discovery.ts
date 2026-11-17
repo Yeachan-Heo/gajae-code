@@ -10,6 +10,7 @@ import {
 } from "../extensibility/runtime-skill-discovery";
 import skillDiscoveryDescription from "../prompts/tools/skill-discovery.md" with { type: "text" };
 import type { ToolSession } from ".";
+import { wrapUntrustedContent } from "./fetch";
 
 const skillDiscoverySchema = z
 	.object({
@@ -113,8 +114,10 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 						: undefined);
 				if (notice) details.notice = notice;
 			}
+			// Page slice and diagnostics are already applied. Frame that text once,
+			// after those cuts, so a later tail window can keep this opening fence.
 			return {
-				content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+				content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(details, null, 2)) }],
 				details,
 			};
 		});

@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import {
 	describeRetainedLockTransition,
@@ -12,7 +13,9 @@ import {
 } from "../../config/file-lock";
 import { repo } from "../../utils/git";
 import { endpointIncarnation } from "./endpoint-authority";
+import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
+import { publishableRuntimeAbortCapability } from "./runtime-abort-capability";
 import {
 	assertSupportedSessionIndexEventVersion,
 	assertSupportedSnapshotVersion,
@@ -53,6 +56,8 @@ export interface RetentionPolicy {
 	maxAgeMs?: number;
 	maxRows?: number;
 	tombstoneRule?: SessionTombstoneRule;
+	/** Rejection-audit size past which the next write rotates it to `index-audit.jsonl.1`. */
+	auditRotateBytes?: number;
 }
 export interface SessionIndexObservationDeps {
 	/** Test seam for an exact retained process-identity observation. */
@@ -136,6 +141,8 @@ export interface SessionIndexEvent {
 	indexSeq: number;
 	type: SessionIndexEventType;
 	sessionId: string;
+	/** Temporary launch/registration intent, retained only for this host identity. */
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -150,6 +157,12 @@ export interface SessionIndexEvent {
 	/** Immutable endpoint file identity captured by the broker at registration. */
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
+	/**
+	 * Operator-abort marker a host without a lifecycle request publishes in its own
+	 * endpoint registration (`runtime-abort-capability.ts`). Broker-private: never
+	 * returned by session list or any SDK response.
+	 */
+	abortCapability?: string;
 	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/**
@@ -169,6 +182,8 @@ export interface SessionIndexEvent {
 }
 export interface IndexedSession {
 	sessionId: string;
+	/** Temporary hosts are internal inventory only, never public list/resume targets. */
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -180,6 +195,8 @@ export interface IndexedSession {
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
+	/** Broker-private operator-abort marker of a host without a lifecycle request. */
+	abortCapability?: string;
 	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
@@ -381,12 +398,14 @@ interface ResolvedRetentionPolicy {
 	maxAgeMs: number;
 	maxRows: number;
 	tombstoneRule: SessionTombstoneRule;
+	auditRotateBytes: number;
 }
 const resolvePolicy = (policy: RetentionPolicy): ResolvedRetentionPolicy => ({
 	clock: policy.clock ?? Date.now,
 	maxAgeMs: policy.maxAgeMs ?? DEFAULT_SESSION_RETENTION_MAX_AGE_MS,
 	maxRows: policy.maxRows ?? DEFAULT_SESSION_RETENTION_MAX_ROWS,
 	tombstoneRule: policy.tombstoneRule ?? "retain",
+	auditRotateBytes: policy.auditRotateBytes ?? ROTATE_BYTES,
 });
 
 interface RejectedEvent {
@@ -509,6 +528,8 @@ function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAudi
 interface SessionIdentityState {
 	identity: string;
 	latest: SessionIndexEvent;
+	registration: SessionIndexEvent | undefined;
+	ephemeralLaunch: boolean;
 	heartbeat: SessionIndexEvent | undefined;
 }
 
@@ -624,6 +645,7 @@ function projectIdentity(
 		endpointMtimeMs: latest.endpointMtimeMs,
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
+		...(latest.abortCapability === undefined ? {} : { abortCapability: latest.abortCapability }),
 		...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
 		terminalUncertain,
 		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
@@ -633,6 +655,7 @@ function projectIdentity(
 		identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 		activity: heartbeat?.activity,
 		lastHeartbeatAt: heartbeat?.ts,
+		...(state.registration?.ephemeral || (!state.registration && state.ephemeralLaunch) ? { ephemeral: true } : {}),
 		ambiguous,
 		terminal,
 		live:
@@ -687,8 +710,15 @@ function reduceEvents(
 	);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
+	const registrationByIdentity = new Map<string, SessionIndexEvent>();
+	const ephemeralLaunchIdentities = new Set<string>();
 	for (const event of admitted) {
 		const identity = identityKey(event);
+		// Pre-registration cleanup records launch intent, never host authority.
+		if (event.type === "lifecycle_terminal" && event.endpointGeneration === 0 && event.ephemeral === true)
+			ephemeralLaunchIdentities.add(identity);
+		// Registration owns this marker; later broker/host events may omit it.
+		if (event.type === "host_registered") registrationByIdentity.set(identity, event);
 		if (event.type === "host_heartbeat") {
 			latestHeartbeatByIdentity.set(identity, event);
 			continue;
@@ -699,7 +729,13 @@ function reduceEvents(
 	const statesBySession = new Map<string, SessionIdentityState[]>();
 	const rootsBySession = new Map<string, Map<string, SessionIdentityState[]>>();
 	for (const [identity, latest] of latestByIdentity) {
-		const state: SessionIdentityState = { identity, latest, heartbeat: latestHeartbeatByIdentity.get(identity) };
+		const state: SessionIdentityState = {
+			identity,
+			latest,
+			registration: registrationByIdentity.get(identity),
+			ephemeralLaunch: ephemeralLaunchIdentities.has(identity),
+			heartbeat: latestHeartbeatByIdentity.get(identity),
+		};
 		let states = statesBySession.get(latest.sessionId);
 		if (states === undefined) {
 			states = [];
@@ -848,6 +884,7 @@ const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
  * heartbeat for long enough that live hosts project as dead.
  */
 const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+const SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS = 60_000;
 /** One elapsed budget for queueing, probing and every reacquisition in a pass. */
 export const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
 const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
@@ -860,13 +897,26 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * is named in a slow-operation warning when it holds the lock beyond the
  * observation window and (b) the lock budget cannot silently drift per call
  * site.
+ *
+ * Every acquisition also carries this installation's host identity.
+ * `staleLockSnapshot` treats a host-qualified owner as foreign when the acquirer
+ * omits `ownerHostId`, so a same-host process that died holding the lock is never
+ * reclaimed and broker startup burns its whole retry budget. Identity is applied
+ * under the options a caller passed for budget and cancellation, so startup,
+ * heartbeat, and ordinary index transactions share one reclaim rule: a proven-dead
+ * same-host owner can be recovered, and a live or cross-host owner cannot.
  */
-function withSessionIndexLock<T>(
+async function sessionIndexLockOptions(agentDir: string, options: FileLockOptions): Promise<FileLockOptions> {
+	return { ...options, ...(await brokerLockHostIdentity(agentDir)) };
+}
+
+async function withSessionIndexLock<T>(
 	operation: string,
 	agentDir: string,
 	callback: () => Promise<T>,
 	options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS,
 ): Promise<T> {
+	const lockOptions = await sessionIndexLockOptions(agentDir, options);
 	return withFileLock(
 		logFor(agentDir),
 		async () => {
@@ -886,7 +936,7 @@ function withSessionIndexLock<T>(
 				clearTimeout(note);
 			}
 		},
-		options,
+		lockOptions,
 	);
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
@@ -919,7 +969,8 @@ function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; eve
  * (whole-session eviction keeps the projection deterministic: a dropped session
  * contributes no events to re-derive). Tombstone rule "retain" exempts deleted sessions
  * from age/row eviction (C4 audit evidence retained); "expire" evicts them like any
- * other session.
+ * other session. Registration events retain identity-scoped metadata such as the
+ * ephemeral marker.
  */
 function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPolicy): SessionIndexEvent[] {
 	if (events.length === 0) return events;
@@ -984,6 +1035,49 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 		return kept.filter(event => !evicted.has(event.sessionId));
 	}
 	return kept;
+}
+
+/**
+ * Adds the indexSeq of every audit row in [start, end) to `seqs` and returns the
+ * bytes through the last newline (`complete`) and the bytes after it (`tail`).
+ * Callers hold the index lock, so a tail is left by a crashed write, never one in
+ * flight; it is parsed too, so a record that lost only its newline still dedupes.
+ */
+async function readAuditedSeqs(
+	file: string,
+	start: number,
+	end: number,
+	seqs: Set<number>,
+): Promise<{ complete: number; tail: number }> {
+	let h: fs.FileHandle;
+	try {
+		h = await fs.open(file, "r");
+	} catch (error) {
+		if (isEnoent(error)) return { complete: 0, tail: 0 };
+		throw error;
+	}
+	try {
+		const data = Buffer.alloc(end - start);
+		let read = 0;
+		while (read < data.length) {
+			const { bytesRead } = await h.read(data, read, data.length - read, start + read);
+			if (bytesRead <= 0) break;
+			read += bytesRead;
+		}
+		const complete = data.subarray(0, read).lastIndexOf(0x0a) + 1;
+		for (const line of data.subarray(0, read).toString("utf8").split("\n")) {
+			if (!line) continue;
+			try {
+				const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
+				if (typeof record.indexSeq === "number") seqs.add(record.indexSeq);
+			} catch {
+				// Best-effort dedupe seed; a corrupt audit row never blocks the index.
+			}
+		}
+		return { complete, tail: read - complete };
+	} finally {
+		await h.close();
+	}
 }
 
 async function appendSync(file: string, value: string): Promise<void> {
@@ -1074,6 +1168,83 @@ async function replaceAtomically(file: string, contents: Buffer | string): Promi
 		throw new AggregateError([primaryError, cleanupError], "session-index replace and cleanup failed");
 	if (primaryError) throw primaryError;
 	if (cleanupError) throw cleanupError;
+}
+
+const EVENT_GENERATION_RECORD_VERSION = 1;
+const eventGenerationFor = (agentDir: string, sessionId: string) =>
+	path.join(agentDir, "sdk", "event-generations", `${createHash("sha256").update(sessionId).digest("hex")}.json`);
+
+/**
+ * Allocate the event generation for one SDK host start of `sessionId`.
+ *
+ * Every host start opens a fresh event stream, and this index orders a session's
+ * identities by endpoint generation before registration order. A generation
+ * taken from wall time alone falls behind a retained identity once the clock
+ * steps backward — the resumed host then loses authority to the retained row and
+ * disappears from Router consumers — and repeats for two starts in one
+ * millisecond. Allocation therefore reads and advances a durable per-session
+ * high-water mark under a cross-process file lock, so every result is strictly
+ * above every generation previously allocated for the session in this agent
+ * dir. The result is at least `floor`: a host start passes its wall time, which
+ * keeps a session without a high-water mark ahead of hosts that predate it, and
+ * a host reserving a generation it already serves passes that generation, which
+ * comes back unchanged only while no host has been issued it or anything above.
+ */
+export async function allocateSessionEventGeneration(
+	agentDir: string,
+	sessionId: string,
+	floor: number,
+): Promise<number> {
+	if (sessionId.length === 0) throw new Error("SDK event generation allocation requires a session id.");
+	if (!Number.isSafeInteger(floor) || floor < 0)
+		throw new Error("SDK event generation floor must be a non-negative safe integer.");
+	const file = eventGenerationFor(agentDir, sessionId);
+	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	return await withFileLock(
+		file,
+		async () => {
+			// Generation 0 is reserved for the direct-session GC fence row.
+			const next = Math.max((await readEventGenerationHighWater(file, sessionId)) + 1, floor, 1);
+			if (!Number.isSafeInteger(next)) throw new Error("SDK event generation is exhausted.");
+			await replaceAtomically(
+				file,
+				`${JSON.stringify({ version: EVENT_GENERATION_RECORD_VERSION, sessionId, generation: next })}\n`,
+			);
+			return next;
+		},
+		await sessionIndexLockOptions(agentDir, SESSION_INDEX_LOCK_OPTIONS),
+	);
+}
+
+/**
+ * A missing record is the only bootstrap state. A record that cannot be read
+ * back exactly is never treated as empty: restarting from the wall-clock floor
+ * would reopen the regression the high-water mark exists to close.
+ */
+async function readEventGenerationHighWater(file: string, sessionId: string): Promise<number> {
+	let source: string;
+	try {
+		source = await fs.readFile(file, "utf8");
+	} catch (error) {
+		if (isEnoent(error)) return 0;
+		throw error;
+	}
+	let record: unknown;
+	try {
+		record = JSON.parse(source);
+	} catch {
+		record = undefined;
+	}
+	const { version, sessionId: recordedSessionId, generation } = (record ?? {}) as Record<string, unknown>;
+	if (
+		version !== EVENT_GENERATION_RECORD_VERSION ||
+		recordedSessionId !== sessionId ||
+		typeof generation !== "number" ||
+		!Number.isSafeInteger(generation) ||
+		generation < 1
+	)
+		throw new Error(`SDK event generation record is unreadable: ${file}`);
+	return generation;
 }
 
 function alive(pid: number): boolean {
@@ -1194,6 +1365,7 @@ export class SessionIndex {
 	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
+	#lastHeartbeatStaleWarningAt = Number.NEGATIVE_INFINITY;
 	#logOffset = 0;
 	#corruptSuffix = false;
 	/**
@@ -1201,8 +1373,8 @@ export class SessionIndex {
 	 * polling refresh path prove "index unchanged" with two stats.
 	 */
 	#changeStamp: SessionIndexChangeStamp | undefined;
-	/** indexSeqs already recorded in the durable audit; null until lazily seeded. */
-	#auditedSeq: Set<number> | null = null;
+	/** indexSeqs recorded in the audit file `ino`, read up to `offset`; null until lazily seeded. */
+	#audited: { seqs: Set<number>; ino: bigint; offset: number } | null = null;
 	constructor(agentDir: string, policy: RetentionPolicy = {}, observationDeps: SessionIndexObservationDeps = {}) {
 		this.#agentDir = agentDir;
 		this.#policy = resolvePolicy(policy);
@@ -1392,33 +1564,60 @@ export class SessionIndex {
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
 		if (this.#corruptSuffix) this.#warnings.push("Corrupt session index entry; replay truncated");
 	}
-	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
+	/**
+	 * Append records for newly-rejected events, deduped against the audit file on disk.
+	 *
+	 * Every audit writer holds the index lock, so catching up on rows other processes
+	 * appended needs only the bytes past this reader's last offset. A view seeded once
+	 * per process went stale in long-lived readers (broker, hosts), which re-archived
+	 * every rejection another process had already written: one install held 1.66 M rows
+	 * for 114 k distinct indexSeqs. An audit larger than the rotation bound and than
+	 * twice the current rejections moves to `index-audit.jsonl.1`, replacing the previous
+	 * generation, before anything reads it, so a cold reader never parses an unbounded
+	 * file; the new generation re-records only what the index still rejects.
+	 */
 	async #writeAuditUnderLock(): Promise<void> {
 		const candidates = auditRecords(this.#events, this.#policy.clock());
 		// The audit log only dedupes rejections, so a reader with none never pays
 		// for loading it.
 		if (candidates.length === 0) return;
-		if (this.#auditedSeq === null) {
-			this.#auditedSeq = new Set();
+		const file = auditFor(this.#agentDir);
+		let stat = await statIndexFile(file);
+		if (
+			stat.exists &&
+			stat.size > this.#policy.auditRotateBytes &&
+			stat.size > 2 * candidates.reduce((sum, record) => sum + JSON.stringify(record).length + 1, 0)
+		) {
 			try {
-				const contents = await fs.readFile(auditFor(this.#agentDir), "utf8");
-				for (const line of contents.split("\n")) {
-					if (!line) continue;
-					try {
-						const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
-						if (typeof record.indexSeq === "number") this.#auditedSeq.add(record.indexSeq);
-					} catch {
-						// Best-effort dedupe seed; a corrupt audit row never blocks the index.
-					}
-				}
+				await fs.rename(file, `${file}.1`);
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				// Rotation only bounds a later read; a failed one must not fail the index operation.
+				logger.warn("sdk broker: session index audit rotation failed", { error: String(error) });
 			}
+			stat = await statIndexFile(file);
 		}
-		const pending = candidates.filter(record => !this.#auditedSeq!.has(record.indexSeq));
+		const seeded = this.#audited;
+		const audited =
+			seeded && stat.exists && seeded.ino === stat.ino && stat.size >= seeded.offset
+				? seeded
+				: { seqs: new Set<number>(), ino: stat.ino, offset: 0 };
+		this.#audited = audited;
+		let tail = 0;
+		if (stat.size > audited.offset) {
+			const read = await readAuditedSeqs(file, audited.offset, stat.size, audited.seqs);
+			audited.offset += read.complete;
+			tail = read.tail;
+		}
+		const pending = candidates.filter(record => !audited.seqs.has(record.indexSeq));
 		if (pending.length === 0) return;
-		await appendSync(auditFor(this.#agentDir), pending.map(record => JSON.stringify(record)).join("\n"));
-		for (const record of pending) this.#auditedSeq.add(record.indexSeq);
+		const rows = pending.map(record => JSON.stringify(record)).join("\n");
+		// Start a new line after a crashed write's tail, so these rows never join it.
+		await appendSync(file, tail > 0 ? `\n${rows}` : rows);
+		for (const record of pending) audited.seqs.add(record.indexSeq);
+		// Nothing else appends while the lock is held, so the file now ends at this write.
+		const written = await statIndexFile(file);
+		audited.ino = written.ino;
+		audited.offset = written.size;
 	}
 	async #scan(): Promise<SessionIndexScan> {
 		let snapshotContents: Buffer | undefined;
@@ -1752,6 +1951,21 @@ export class SessionIndex {
 				// persisted binding instead.
 				if (ownIncarnation !== undefined && unsigned.hostIncarnation === undefined)
 					unsigned.hostIncarnation = ownIncarnation;
+				// A host registering its own endpoint without a lifecycle request publishes
+				// its operator-abort marker, so the Broker can route an operator terminal
+				// abort to a TUI or direct CLI session (a lifecycle host proves the same
+				// routing with its lifecycle request id). Generation 0 is the transcript-only
+				// direct registration, which has no endpoint to route to.
+				if (
+					unsigned.type === "host_registered" &&
+					unsigned.pid === process.pid &&
+					unsigned.endpointGeneration > 0 &&
+					unsigned.lifecycleRequestId === undefined &&
+					unsigned.abortCapability === undefined
+				) {
+					const abortCapability = publishableRuntimeAbortCapability();
+					if (abortCapability !== undefined) unsigned.abortCapability = abortCapability;
+				}
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				const serialized = JSON.stringify(event);
 				// Publish to memory only after the complete append and fsync succeed.
@@ -2259,6 +2473,11 @@ export class SessionIndex {
 			{
 				identity: identityKey(latest),
 				latest,
+				registration: matching.findLast(event => event.type === "host_registered"),
+				ephemeralLaunch: matching.some(
+					event =>
+						event.type === "lifecycle_terminal" && event.endpointGeneration === 0 && event.ephemeral === true,
+				),
 				heartbeat: matching.findLast(event => event.type === "host_heartbeat"),
 			},
 			false,
@@ -2434,9 +2653,22 @@ export class SessionIndex {
 			for (let attempt = 0; ; attempt++) {
 				if (signal.aborted || performance.now() >= deadline) return 0;
 				const result = await this.#checkpointLiveHeartbeatsOnce(now, signal, deadline);
-				if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
-					return result === STALE_OBSERVATION ? 0 : result;
-				now = Date.now();
+				if (result === STALE_OBSERVATION) {
+					if (attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS) {
+						const warningAt = performance.now();
+						if (warningAt - this.#lastHeartbeatStaleWarningAt >= SESSION_HEARTBEAT_STALE_WARNING_INTERVAL_MS) {
+							this.#lastHeartbeatStaleWarningAt = warningAt;
+							logger.warn("sdk broker: skipped session heartbeat checkpoint after repeated stale observations", {
+								indexPath: path.resolve(logFor(this.#agentDir)),
+								attempts: attempt + 1,
+							});
+						}
+						return 0;
+					}
+					now = Date.now();
+					continue;
+				}
+				return result;
 			}
 		};
 		try {
@@ -2452,7 +2684,7 @@ export class SessionIndex {
 				// an idle cycle: the blocked-renewal caller needs the reason and path.
 				const blocked = await describeRetainedLockTransition(
 					path.resolve(logFor(this.#agentDir)),
-					SESSION_INDEX_LOCK_OPTIONS,
+					await sessionIndexLockOptions(this.#agentDir, SESSION_INDEX_LOCK_OPTIONS),
 				);
 				if (blocked) throw blocked;
 				return 0;
@@ -2666,6 +2898,7 @@ export class SessionIndex {
 					indexSeq: event.indexSeq,
 					hostIncarnation: event.hostIncarnation,
 					masterRole: event.masterRole,
+					...(event.ephemeral ? { ephemeral: true } : {}),
 					identityProvenance: event.hostIncarnation === undefined ? "legacy" : "composite",
 					ambiguous: false,
 					live: alive(event.pid),

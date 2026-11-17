@@ -31,6 +31,7 @@ import {
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { buildChildEnv } from "./helpers/acp-child-env";
 import {
 	cleanupFixtureRoots,
 	createFixtureRootCleanup,
@@ -113,36 +114,6 @@ async function teardown(oracle: Oracle): Promise<void> {
 afterEach(async () => {
 	await cleanupFixtureRoots(cleanupRoots);
 });
-
-/**
- * Explicit minimal environment allowlist. NEVER spreads `process.env`: only
- * `PATH` and the locale/timezone vars (`LANG`/`LC_ALL`/`TZ`) are forwarded, and
- * the locale/timezone vars only "as available" (present and non-empty). `HOME`,
- * `TMPDIR`, every XDG dir, and the agent dirs are owned by the test and rooted
- * under the isolated temp root. This function performs no process-global env
- * mutation — it only constructs and returns a fresh object handed to the child.
- */
-function buildChildEnv(root: string): Record<string, string> {
-	const env: Record<string, string> = {
-		PATH: process.env.PATH ?? "/usr/bin:/bin",
-		HOME: root,
-		TMPDIR: path.join(root, "tmp"),
-		XDG_DATA_HOME: path.join(root, ".local", "share"),
-		XDG_CONFIG_HOME: path.join(root, ".config"),
-		XDG_STATE_HOME: path.join(root, ".local", "state"),
-		XDG_CACHE_HOME: path.join(root, ".cache"),
-		XDG_RUNTIME_DIR: path.join(root, ".run"),
-		GJC_CODING_AGENT_DIR: path.join(root, "agent"),
-		PI_CODING_AGENT_DIR: path.join(root, "agent"),
-		PI_NO_TITLE: "1",
-		NO_COLOR: "1",
-	};
-	for (const key of ["LANG", "LC_ALL", "TZ"] as const) {
-		const value = process.env[key];
-		if (value !== undefined && value !== "") env[key] = value;
-	}
-	return env;
-}
 
 interface Oracle {
 	proc: AcpProc;
@@ -316,51 +287,53 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 		}
 	}, 60_000);
 
-	it("fails closed when artifact payload deletion remains cleanup_pending", async () => {
-		const oracle = await spawnOracle();
-		const { connection, workspace, root } = oracle;
-		try {
-			await connection.initialize({ protocolVersion: 1, clientCapabilities: {} });
-			const { sessionId } = await connection.newSession({ cwd: workspace, mcpServers: [] });
-			const transcripts = await Array.fromAsync(
-				new Bun.Glob("**/*.jsonl").scan({
-					cwd: path.join(root, "agent", "sessions"),
-					absolute: true,
-					onlyFiles: true,
-				}),
-			);
-			expect(transcripts).toHaveLength(1);
-			const sessionPath = transcripts[0]!;
-			const artifactsDir = sessionPath.slice(0, -6);
-			await fs.promises.mkdir(artifactsDir, { recursive: true });
-			await fs.promises.writeFile(path.join(artifactsDir, ".oracle.txt"), "artifact");
+	/**
+	 * Issue #7749: on POSIX the native exact tree removal durably scrubs every
+	 * artifact payload but retains the authorized `.removing` namespace. That
+	 * payload-free namespace is completed artifact cleanup, so `session/delete`
+	 * must finish the transcript phase instead of failing `cleanup_pending`
+	 * forever. Covers the empty artifacts directory every TUI-hosted session has
+	 * and a directory whose file payload is scrubbed.
+	 */
+	for (const artifactFile of [undefined, ".oracle.txt"] as const) {
+		it(`deletes a saved session whose artifacts directory is ${artifactFile ? "non-empty" : "empty"}`, async () => {
+			const oracle = await spawnOracle();
+			const { connection, workspace, root } = oracle;
+			try {
+				await connection.initialize({ protocolVersion: 1, clientCapabilities: {} });
+				const { sessionId } = await connection.newSession({ cwd: workspace, mcpServers: [] });
+				const transcripts = await Array.fromAsync(
+					new Bun.Glob("**/*.jsonl").scan({
+						cwd: path.join(root, "agent", "sessions"),
+						absolute: true,
+						onlyFiles: true,
+					}),
+				);
+				expect(transcripts).toHaveLength(1);
+				const sessionPath = transcripts[0]!;
+				const sessionDir = path.dirname(sessionPath);
+				const artifactsDir = sessionPath.slice(0, -6);
+				await fs.promises.mkdir(artifactsDir, { recursive: true });
+				if (artifactFile) await fs.promises.writeFile(path.join(artifactsDir, artifactFile), "artifact");
 
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts: Exact detached artifact removal rejected: cleanup_pending",
-			);
-			expect(fs.existsSync(sessionPath)).toBe(true);
-			expect(fs.existsSync(artifactsDir)).toBe(false);
-			const retainedPayloads = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
-				entry => entry.endsWith(".oracle.txt"),
-			);
-			expect(retainedPayloads).toHaveLength(1);
-			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe(
-				"",
-			);
+				await expect(connection.deleteSession({ sessionId })).resolves.toEqual({});
+				expect(fs.existsSync(sessionPath)).toBe(false);
+				expect(fs.existsSync(artifactsDir)).toBe(false);
+				const listAfterDelete = await connection.listSessions({ cwd: workspace });
+				expect(listAfterDelete.sessions.map(session => session.sessionId)).not.toContain(sessionId);
 
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts: Exact detached artifact removal rejected: cleanup_pending",
-			);
-			expect(fs.existsSync(sessionPath)).toBe(true);
-			const payloadsAfterRetry = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
-				entry => entry.endsWith(".oracle.txt"),
-			);
-			expect(payloadsAfterRetry).toHaveLength(1);
-			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
-				"",
-			);
-		} catch (error) {
-			rethrowWithStderr(oracle, error);
-		}
-	}, 60_000);
+				// Only a payload-free retained namespace may remain: no artifact bytes survive.
+				const remaining = await fs.promises.readdir(sessionDir, { recursive: true });
+				for (const entry of remaining.filter(entry => entry.startsWith(".gjc-delete-"))) {
+					const stat = await fs.promises.lstat(path.join(sessionDir, entry));
+					if (stat.isFile()) expect({ entry, size: stat.size }).toEqual({ entry, size: 0 });
+				}
+				expect(remaining.filter(entry => entry.endsWith(".jsonl"))).toEqual([]);
+
+				await expect(connection.deleteSession({ sessionId })).resolves.toEqual({});
+			} catch (error) {
+				rethrowWithStderr(oracle, error);
+			}
+		}, 60_000);
+	}
 });

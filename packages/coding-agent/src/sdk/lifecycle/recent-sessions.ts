@@ -27,13 +27,13 @@ function verifyOwnerOnlyPathSecurityNative(
 }
 
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
-import { FileSessionStorage, type SessionStorageSnapshot } from "../../session/session-storage";
 import {
 	type LogicalSessionCandidate,
 	listManagedSessionCandidates,
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { FileSessionReader, type SessionStorageSnapshot } from "../session-readonly/storage";
 
 /** One ranked recent-session entry surfaced to the picker. */
 export interface RecentSessionEntry {
@@ -99,7 +99,7 @@ function readCandidateInitialLines(
 	}
 	let snapshot: SessionStorageSnapshot;
 	try {
-		snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
+		snapshot = new FileSessionReader().readSnapshotSync(candidate.path);
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR")
@@ -157,21 +157,34 @@ export type ListRecentSessionsResult =
 	| { kind: "complete"; entries: RecentSessionEntry[]; warnings: readonly string[] }
 	| { kind: "error"; code: "scope_unavailable" | "managed_scan_failed"; message: string };
 
-async function resolveRecentScopes(
-	deps: RecentActivityDeps,
+/**
+ * Resolve the managed scopes a recent-session listing reads: the `cwd` scope, plus every
+ * validated workspace scope below the session root when `allWorkspaces` is set. `cwd` is
+ * optional only for all-workspace listings.
+ */
+export async function resolveRecentSessionScopes(
+	deps: Pick<RecentActivityDeps, "agentDir" | "sessionsRoot" | "allWorkspaces"> & { cwd?: string },
 ): Promise<
 	| { kind: "complete"; scopes: ManagedSessionScope[]; warnings: string[] }
 	| { kind: "error"; code: "scope_unavailable"; message: string }
 > {
 	const agentDir = deps.agentDir ?? getAgentDir();
 	const sessionsRoot = deps.sessionsRoot ?? getSessionsDir(agentDir);
-	const current = await resolveManagedSessionScope({
-		cwd: deps.cwd,
-		agentDir,
-		sessionsRoot,
-	});
+	const current =
+		deps.cwd === undefined
+			? undefined
+			: await resolveManagedSessionScope({
+					cwd: deps.cwd,
+					agentDir,
+					sessionsRoot,
+				});
 	if (!deps.allWorkspaces) {
-		if (current.kind !== "resolved") return { kind: "error", code: "scope_unavailable", message: current.message };
+		if (current?.kind !== "resolved")
+			return {
+				kind: "error",
+				code: "scope_unavailable",
+				message: current?.message ?? "A workspace cwd is required.",
+			};
 		return { kind: "complete", scopes: [current.scope], warnings: [] };
 	}
 	try {
@@ -192,7 +205,7 @@ async function resolveRecentScopes(
 		return { kind: "error", code: "scope_unavailable", message: "The managed sessions root could not be inspected." };
 	}
 	const warnings: string[] = [];
-	const scopes = current.kind === "resolved" ? [current.scope] : [];
+	const scopes = current?.kind === "resolved" ? [current.scope] : [];
 	const seen = new Set(scopes.map(scope => scope.directoryPath));
 
 	const addResolvedScope = async (cwd: string, expectedDirectory?: string): Promise<void> => {
@@ -241,7 +254,7 @@ async function resolveRecentScopes(
 				for (const file of files) {
 					if (!file.isFile() || file.isSymbolicLink() || !file.name.endsWith(".jsonl")) continue;
 					try {
-						const snapshot = new FileSessionStorage().readSnapshotSync(
+						const snapshot = new FileSessionReader().readSnapshotSync(
 							path.join(sessionsRoot, directory.name, file.name),
 						);
 						const newline = snapshot.bytes.indexOf(0x0a);
@@ -271,7 +284,7 @@ export async function listRecentSessions(deps: RecentActivityDeps): Promise<List
 	const includeInternal = deps.includeInternal ?? true;
 	const readInitialLines = deps.readInitialLines;
 	const breadcrumbs = new Set((deps.breadcrumbPaths ?? []).map(candidate => path.resolve(candidate)));
-	const resolved = await resolveRecentScopes(deps);
+	const resolved = await resolveRecentSessionScopes(deps);
 	if (resolved.kind === "error") return resolved;
 	const warnings = [...resolved.warnings];
 	const candidates: Array<{ scope: ManagedSessionScope; candidate: LogicalSessionCandidate }> = [];

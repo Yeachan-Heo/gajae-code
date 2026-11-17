@@ -14,6 +14,7 @@ import {
 	ensureSlackDaemon,
 } from "../sdk/bus/chat-daemon-control";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/config";
+import { requireDaemonInternalOwnerId } from "../sdk/bus/daemon-internal-cli-args";
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
@@ -279,6 +280,7 @@ export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyComma
 			if (cmd.smoke) {
 				await runDaemonInternal(["--smoke"]);
 			} else {
+				requireDaemonInternalOwnerId(cmd.rawArgs);
 				await runDaemonInternal(cmd.rawArgs);
 			}
 			return;

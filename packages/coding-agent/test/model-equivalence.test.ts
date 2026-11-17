@@ -261,3 +261,14 @@ describe("buildCanonicalModelIndex alias indexing", () => {
 		expect(index.aliases.get("shared-model")).toBeUndefined();
 	});
 });
+
+describe("buildCanonicalModelIndex resolution reuse", () => {
+	test("keeps provider and id apart when their joined selectors coincide", () => {
+		const slashedProvider = makeModel("vendor/region", "custom-model");
+		const slashedId = makeModel("vendor", "region/custom-model");
+		const index = buildCanonicalModelIndex([slashedProvider, slashedId]);
+
+		expect(index.byId.get("custom-model")!.variants.map(entry => entry.model)).toEqual([slashedProvider]);
+		expect(index.byId.get("region/custom-model")!.variants.map(entry => entry.model)).toEqual([slashedId]);
+	});
+});

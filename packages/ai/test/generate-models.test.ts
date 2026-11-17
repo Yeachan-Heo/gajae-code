@@ -6,6 +6,7 @@ import {
 	fetchAntigravityModels,
 	injectAlibabaTokenPlanModels,
 	injectCodexGpt6Models,
+	injectGemini4CarbonModels,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 	restoreSeedLimits,
@@ -95,6 +96,17 @@ describe("injectCodexGpt6Models", () => {
 				preferWebsockets: true,
 			}),
 			expect.objectContaining({
+				id: "gpt-6.1-terra",
+				name: "GPT-6.1 Terra",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
 				id: "gpt-6-luna",
 				name: "GPT-6 Luna",
 				api: "openai-codex-responses",
@@ -110,6 +122,8 @@ describe("injectCodexGpt6Models", () => {
 		expect(models.find(model => model.id === "gpt-6-sol")).not.toHaveProperty("priority");
 		expect(models.filter(model => model.id === "gpt-6.1-sol")).toHaveLength(1);
 		expect(models.find(model => model.id === "gpt-6.1-sol")).not.toHaveProperty("priority");
+		expect(models.filter(model => model.id === "gpt-6.1-terra")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6.1-terra")).not.toHaveProperty("priority");
 	});
 
 	it("preserves authenticated discovery metadata", () => {
@@ -225,7 +239,7 @@ describe("injectImageGenerationModels", () => {
 	const imageModelMetadata: Omit<Model, "id" | "name" | "api" | "provider" | "baseUrl"> = {
 		reasoning: false,
 		input: ["text"],
-		output: ["text", "image"],
+		output: ["image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
@@ -264,6 +278,22 @@ describe("injectImageGenerationModels", () => {
 			},
 			{
 				...imageModelMetadata,
+				id: "gpt-image-2.6-sunburst",
+				name: "GPT Image 2.6 Sunburst",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.6-flare",
+				name: "GPT Image 2.6 Flare",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
 				id: "gpt-image-2",
 				name: "GPT Image 2",
 				api: "openai-codex-responses",
@@ -286,10 +316,26 @@ describe("injectImageGenerationModels", () => {
 				provider: "openai-codex",
 				baseUrl: "",
 			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.6-sunburst",
+				name: "GPT Image 2.6 Sunburst",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.6-flare",
+				name: "GPT Image 2.6 Flare",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			},
 		]);
 	});
 
-	it("keeps the GPT Image 2.5 rows mirroring the GPT Image 2 metadata", () => {
+	it("keeps later GPT Image rows mirroring the GPT Image 2 metadata", () => {
 		const models: Model[] = [];
 
 		injectImageGenerationModels(models);
@@ -301,7 +347,12 @@ describe("injectImageGenerationModels", () => {
 		for (const provider of ["openai", "openai-codex"] as const) {
 			const legacy = models.find(model => model.provider === provider && model.id === "gpt-image-2");
 			if (!legacy) throw new Error(`expected gpt-image-2 under ${provider}`);
-			for (const id of ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"] as const) {
+			for (const id of [
+				"gpt-image-2.5-sunburst",
+				"gpt-image-2.5-flare",
+				"gpt-image-2.6-sunburst",
+				"gpt-image-2.6-flare",
+			] as const) {
 				const candidate = models.find(model => model.provider === provider && model.id === id);
 				if (!candidate) throw new Error(`expected ${id} under ${provider}`);
 				expect(metadataOf(candidate)).toEqual(metadataOf(legacy));
@@ -327,17 +378,37 @@ describe("injectImageGenerationModels", () => {
 
 		injectImageGenerationModels(models);
 
+		const preservedDiscovered: Model<"openai-responses"> = {
+			...discovered,
+			output: ["image"],
+		};
 		expect(models.filter(model => model.provider === "openai" && model.id === "gpt-image-2.5-sunburst")).toEqual([
-			discovered,
+			preservedDiscovered,
 		]);
 		expect(models.map(model => `${model.provider}/${model.id}`)).toEqual([
 			"openai/gpt-image-2.5-sunburst",
 			"openai/gpt-image-2",
 			"openai/gpt-image-2.5-flare",
+			"openai/gpt-image-2.6-sunburst",
+			"openai/gpt-image-2.6-flare",
 			"openai-codex/gpt-image-2",
 			"openai-codex/gpt-image-2.5-sunburst",
 			"openai-codex/gpt-image-2.5-flare",
+			"openai-codex/gpt-image-2.6-sunburst",
+			"openai-codex/gpt-image-2.6-flare",
 		]);
+	});
+	it("commits the GPT Image 2.6 rows with the injector shape", () => {
+		const injected: Model[] = [];
+		injectImageGenerationModels(injected);
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		for (const provider of ["openai", "openai-codex"] as const) {
+			for (const id of ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] as const) {
+				const expected = injected.find(model => model.provider === provider && model.id === id);
+				if (!expected) throw new Error(`expected ${id} under ${provider}`);
+				expect(catalog[provider]?.[id]).toEqual(expected);
+			}
+		}
 	});
 });
 
@@ -515,5 +586,63 @@ describe("pricing normalization", () => {
 			expect(jevRouter.cost.input).toBe(0);
 			expect(jevRouter.cost.output).toBe(0);
 		}
+	});
+});
+
+describe("injectGemini4CarbonModels", () => {
+	it("bundles Carbon models for google, google-gemini-cli, and google-vertex providers", () => {
+		const models: Model[] = [];
+		injectGemini4CarbonModels(models);
+
+		expect(models.length).toBe(3);
+		expect(models.map(m => m.provider)).toEqual(["google", "google-gemini-cli", "google-vertex"]);
+		expect(models.every(m => m.id === "gemini-4-carbon")).toBe(true);
+	});
+
+	it("commits the Gemini 4 Carbon rows with correct transport specifications", () => {
+		const injected: Model[] = [];
+		injectGemini4CarbonModels(injected);
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+
+		const specs = [
+			{ provider: "google", maxTokens: 32768, baseUrl: "https://generativelanguage.googleapis.com/v1beta" },
+			{ provider: "google-gemini-cli", maxTokens: 65536, baseUrl: "https://cloudcode-pa.googleapis.com" },
+			{ provider: "google-vertex", maxTokens: 65536, baseUrl: "https://{location}-aiplatform.googleapis.com" },
+		];
+
+		for (const spec of specs) {
+			const actual = catalog[spec.provider]?.["gemini-4-carbon"];
+
+			expect(actual).toBeDefined();
+			expect(actual?.maxTokens).toBe(spec.maxTokens);
+			expect(actual?.baseUrl).toBe(spec.baseUrl);
+			expect(actual?.contextWindow).toBe(1_048_576);
+			expect(actual?.cost.input).toBe(2);
+			expect(actual?.cost.output).toBe(10);
+			expect(actual?.cost.cacheRead).toBe(0.1);
+			expect(actual?.reasoning).toBe(true);
+			expect(actual?.thinking).toMatchObject({ mode: "google-level", minLevel: "low", maxLevel: "high" });
+			expect(actual?.input).toEqual(["text", "image"]);
+			expect(actual?.output).toEqual(["text"]);
+		}
+	});
+
+	it("is idempotent and preserves discovered cost on re-injection", () => {
+		const models: Model[] = [];
+		injectGemini4CarbonModels(models);
+
+		// Simulate discovery updating the cost
+		const googleCarbon = models.find(m => m.provider === "google");
+		if (googleCarbon) {
+			googleCarbon.cost = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 };
+		}
+
+		// Re-inject should preserve the discovered cost
+		injectGemini4CarbonModels(models);
+
+		expect(googleCarbon?.cost.input).toBe(4);
+		expect(googleCarbon?.cost.output).toBe(20);
+		expect(googleCarbon?.cost.cacheRead).toBe(0.2);
+		expect(models.length).toBe(3); // No duplicates
 	});
 });
