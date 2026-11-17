@@ -1146,7 +1146,7 @@ describe("AgentSession auto-compaction continuation", () => {
 		// With the fix, the errorIsFromBeforeCompaction guard prevents the re-trigger.
 
 		// Use default settings and messages to trigger threshold compaction naturally
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		const compactionEvents: { type: string; reason?: string }[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_compaction_start") {

@@ -19,7 +19,7 @@ import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
-import { SessionManager, type SessionDestination } from "../src/session/session-manager";
+import { type SessionDestination, SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
