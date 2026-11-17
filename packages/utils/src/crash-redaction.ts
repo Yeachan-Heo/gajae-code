@@ -444,7 +444,9 @@ function uniqueStructuredKey(
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
+	// A complete block wins over the container rule: `private_key={footer: "…END…"}`
+	// would otherwise mask the footer first and leave an opener and body unpaired.
+	return redactCrashSecretsWithRules(redactPemPrivateKeys(text), CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
 /** Historical redaction rules used only to validate v1 crash fingerprints. */
@@ -661,8 +663,7 @@ function redactCredentialValue(
  * Lookahead the nested-container scan may spend on one scrub call, in characters.
  * Proportional to the input so ordinary text always receives a complete scan while
  * repeated unterminated containers cannot force a quadratic rescan. Once spent,
- * later containers are bounded to a fixed lookahead that still lets a nearby
- * closing brace be found.
+ * later containers are treated as unterminated and end at their line.
  */
 const CONTAINER_SCAN_BUDGET_FACTOR = 16;
 

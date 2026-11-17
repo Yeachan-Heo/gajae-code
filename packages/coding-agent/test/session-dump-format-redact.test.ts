@@ -636,6 +636,49 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
+	it("pairs a private-key block split across sibling schema definitions", () => {
+		const body = "CROSS_PROPERTY_PEM_BODY";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						properties: {
+							a: { type: "string", default: `${pem("RSA", "BEGIN")}\n${body}` },
+							b: { type: "string", default: pem("RSA", "END") },
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		expect(dumped).not.toContain('"type": "«redacted-private-key»"');
+	});
+
+	it("removes a private-key block whose footer sits in a credential container", () => {
+		const body = "CONTAINER_FOOTER_PEM_BODY";
+		const dumped = dump([
+			{
+				role: "bashExecution",
+				command: `echo ${pem("RSA", "BEGIN")}`,
+				output: `${body}\nprivate_key={footer:"${pem("RSA", "END")}"}`,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
 	it("bounds unclosed credential containers in the session dump", () => {
 		const line = "secret={unclosed\n";
 		const measure = (lines: number): number => {

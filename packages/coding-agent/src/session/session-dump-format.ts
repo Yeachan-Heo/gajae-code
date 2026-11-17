@@ -207,6 +207,36 @@ function scrubSchemaData(value: unknown, propertyName?: string): unknown {
 	return redactStructuredSecrets(decodeValueStrings(value), propertyName, { headerPairs: isHeaderCollectionKey });
 }
 
+/**
+ * Pair a private-key block that spans the data of sibling property definitions.
+ * Only data keywords take part, so a neighbour's type and description stay intact
+ * while an opener in one definition's `default` and a footer in another's are paired.
+ */
+function pairSiblingSchemaData(schemas: readonly unknown[]): unknown[] {
+	const owners: number[] = [];
+	const fields: string[] = [];
+	const values: unknown[] = [];
+	schemas.forEach((schema, index) => {
+		if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return;
+		for (const [field, nested] of Object.entries(schema as Record<string, unknown>)) {
+			if (!SCHEMA_VALUE_KEYWORDS.has(field)) continue;
+			owners.push(index);
+			fields.push(field);
+			values.push(nested);
+		}
+	});
+	if (values.length < 2) return [...schemas];
+	const paired = redactCrossFieldPrivateKeys(values);
+	return schemas.map((schema, index) => {
+		if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return schema;
+		const copy = { ...(schema as Record<string, unknown>) };
+		owners.forEach((owner, position) => {
+			if (owner === index) copy[fields[position]] = paired[position];
+		});
+		return copy;
+	});
+}
+
 /** Replace every leaf of a data value with the marker, preserving its shape. */
 function maskSchemaData(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(maskSchemaData);
@@ -256,8 +286,14 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const properties = Object.create(null) as Record<string, unknown>;
 			const propertyKeys = new Map<string, number>();
-			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
-				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = redactSchemaValue(schema, name);
+			const entries = Object.entries(nested as Record<string, unknown>);
+			const pairedDefinitions = pairSiblingSchemaData(entries.map(([, schema]) => schema));
+			for (let index = 0; index < entries.length; index++) {
+				const [name] = entries[index];
+				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = redactSchemaValue(
+					pairedDefinitions[index],
+					name,
+				);
 			}
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = properties;
 			continue;
