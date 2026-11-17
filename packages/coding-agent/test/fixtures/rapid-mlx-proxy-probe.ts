@@ -24,11 +24,13 @@ try {
 	// The descriptor is the library-level path a consumer would call directly.
 	await rapidMlxModelManagerOptions({ apiKey: $credentialEnv("RAPID_MLX_API_KEY") }).fetchDynamicModels?.();
 	const models = registry.getAll().filter(model => model.provider === "rapid-mlx");
+	const aliasModels = registry.getAll().filter(model => model.provider === "alias-mlx");
 	const discovery = registry.getProviderDiscoveryState("rapid-mlx");
 	process.stdout.write(
 		JSON.stringify({
 			proxyVariablesCleared: proxyVariables.every(name => Bun.env[name] === undefined),
 			modelIds: models.map(model => model.id),
+			aliasModelIds: aliasModels.map(model => model.id),
 			baseUrl: models[0]?.baseUrl,
 			discoveryStatus: discovery?.status,
 			discoveryError: discovery?.error,

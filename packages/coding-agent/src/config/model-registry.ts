@@ -6219,10 +6219,14 @@ export class ModelRegistry {
 		// Other explicitly configured providers keep their existing transport; any
 		// provider that declares Rapid-MLX discovery is covered, including a custom
 		// alias named in models.json.
+		// Any header outside the audited reusable set may carry a credential —
+		// `Authorization`, `X-API-Key`, or an unrecognized header. `isSensitiveDiscoveryHeader`
+		// already draws that line for cache provenance, so the transport uses the same rule.
+		const carriesCredentialHeader = Object.keys(requestHeaders).some(isSensitiveDiscoveryHeader);
 		const response =
 			(providerConfig.implicitProbe === true || providerConfig.discovery.type === "rapid-mlx") &&
 			loopbackDiscovery &&
-			headerValue(requestHeaders, "Authorization") !== undefined
+			carriesCredentialHeader
 				? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
 				: await fetch(modelsUrl, {
 						headers: requestHeaders,

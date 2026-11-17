@@ -459,14 +459,23 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		// A project `.env` can set HTTP_PROXY, and Bun applies it to loopback
 		// requests too. The discovery request carries RAPID_MLX_API_KEY, so it must
 		// reach the server directly instead of handing the bearer to the proxy.
-		const serverAuthorizations: (string | null)[] = [];
+		const serverHeaders: { authorization: string | null; aliasKey: string | null }[] = [];
 		const rapidMlxServer = Bun.serve({
 			port: 0,
 			hostname: "127.0.0.1",
 			fetch(request) {
 				if (new URL(request.url).pathname !== "/v1/models") return new Response(null, { status: 404 });
-				serverAuthorizations.push(request.headers.get("authorization"));
-				return Response.json({ object: "list", data: [{ id: "proxy-probe-model", context_window: 131072 }] });
+				serverHeaders.push({
+					authorization: request.headers.get("authorization"),
+					aliasKey: request.headers.get("x-api-key"),
+				});
+				return Response.json({
+					object: "list",
+					data: [
+						{ id: "proxy-probe-model", context_window: 131072 },
+						{ id: "alias-model", context_window: 131072 },
+					],
+				});
 			},
 		});
 		const proxyRequests: string[] = [];
@@ -483,8 +492,27 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		try {
 			const projectDir = path.join(tempDir, "proxy-project");
 			const agentDir = path.join(tempDir, "proxy-agent");
+			const scratchDir = path.join(tempDir, "proxy-scratch");
 			await fs.mkdir(projectDir);
 			await fs.mkdir(agentDir);
+			await fs.mkdir(scratchDir);
+			// A custom alias that declares Rapid-MLX discovery and carries a secret in a
+			// non-Authorization header. `auth: none` keeps the provider keyless, so the
+			// header is its only credential.
+			await Bun.write(
+				path.join(scratchDir, "models.json"),
+				JSON.stringify({
+					providers: {
+						"alias-mlx": {
+							api: "openai-completions",
+							auth: "none",
+							baseUrl: `http://127.0.0.1:${rapidMlxServer.port}/v1`,
+							headers: { "X-API-Key": "header-secret" },
+							discovery: { type: "rapid-mlx" },
+						},
+					},
+				}),
+			);
 			const inheritedEnv: Record<string, string> = {};
 			for (const [name, value] of Object.entries(process.env)) {
 				if (value === undefined) continue;
@@ -501,11 +529,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			}
 			const proxyUrl = `http://127.0.0.1:${proxyServer.port}`;
 			const child = Bun.spawn(
-				[
-					process.execPath,
-					path.join(import.meta.dir, "fixtures", "rapid-mlx-proxy-probe.ts"),
-					path.join(tempDir, "proxy-scratch"),
-				],
+				[process.execPath, path.join(import.meta.dir, "fixtures", "rapid-mlx-proxy-probe.ts"), scratchDir],
 				{
 					cwd: projectDir,
 					env: {
@@ -531,20 +555,24 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			]);
 			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
 			const result = JSON.parse(stdout);
-			expect(result.modelIds).toEqual(["proxy-probe-model"]);
+			expect(result.modelIds).toContain("proxy-probe-model");
+			expect(result.aliasModelIds).toContain("alias-model");
 			expect(result.baseUrl).toBe(`http://127.0.0.1:${rapidMlxServer.port}/v1`);
 			// Bun keeps using a proxy it has already used, so the fixture clears the proxy
-			// variables before discovery; the credential still takes the direct socket
+			// variables before discovery; the credentials still take the direct socket
 			// because the transport does not depend on reading them.
 			expect(result.proxyVariablesCleared).toBe(true);
-			// Registry discovery and the library descriptor both send the bearer, and both
-			// reached the server directly.
-			expect(serverAuthorizations).toEqual(["Bearer proxy-probe-key", "Bearer proxy-probe-key"]);
+			// Registry discovery and the library descriptor both send the bearer.
+			expect(serverHeaders.filter(headers => headers.authorization === "Bearer proxy-probe-key")).toHaveLength(2);
+			// The alias carries its secret in a non-Authorization header and also arrived
+			// directly, so the credential rule is not limited to `Authorization`.
+			expect(serverHeaders.filter(headers => headers.aliasKey === "header-secret")).toHaveLength(1);
 			// The fixture's control `fetch` to the same loopback origin went through the
 			// proxy, proving the proxy configuration was live for the child; the
 			// credentialed discovery requests did not.
 			expect(proxyRequests.some(request => request.includes("/v1/control"))).toBe(true);
 			expect(proxyRequests.filter(request => request.includes("proxy-probe-key"))).toEqual([]);
+			expect(proxyRequests.filter(request => request.includes("header-secret"))).toEqual([]);
 			expect(proxyRequests.filter(request => request.includes(`:${rapidMlxServer.port}/v1/models`))).toEqual([]);
 		} finally {
 			rapidMlxServer.stop(true);
