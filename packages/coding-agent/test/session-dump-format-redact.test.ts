@@ -520,6 +520,29 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain("«redacted-api-key»");
 	});
 
+	it("keeps both schema definitions when two keys scrub to the same marker", () => {
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						$defs: { "sk-aaaaaaaaaaaaaaaa": { type: "string" }, "sk-bbbbbbbbbbbbbbbb": { type: "number" } },
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain("sk-aaaaaaaaaaaaaaaa");
+		expect(dumped).not.toContain("sk-bbbbbbbbbbbbbbbb");
+		expect(dumped).toContain('"type": "string"');
+		expect(dumped).toContain('"type": "number"');
+		expect(dumped).toContain("#2");
+	});
+
 	it("keeps header-pair redaction inside a schema default", () => {
 		const secret = "OPAQUE_SCHEMA_HEADER_SECRET";
 		const dumped = formatSessionDumpText({

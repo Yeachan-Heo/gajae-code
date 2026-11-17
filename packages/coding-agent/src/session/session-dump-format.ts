@@ -235,6 +235,19 @@ function maskSchemaData(value: unknown): unknown {
 }
 
 /**
+ * Scrubbed form of a schema key, kept distinct when two keys scrub to the same marker
+ * so one property definition cannot silently replace another.
+ */
+function uniqueScrubbedKey(target: Record<string, unknown>, key: string, nextSuffix: Map<string, number>): string {
+	const scrubbed = redactCrashSecrets(key);
+	if (!Object.hasOwn(target, scrubbed)) return scrubbed;
+	let suffix = nextSuffix.get(scrubbed) ?? 2;
+	while (Object.hasOwn(target, `${scrubbed}#${suffix}`)) suffix += 1;
+	nextSuffix.set(scrubbed, suffix + 1);
+	return `${scrubbed}#${suffix}`;
+}
+
+/**
  * Scrub a tool schema without destroying its definitions.
  * Property names are schema structure, not credential assignments, so they stay
  * readable; only string leaves and data-carrying keywords are redacted. The whole
@@ -248,6 +261,7 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
+	const scrubbedKeys = new Map<string, number>();
 	// Data-carrying keywords render as separate parameters, so a private-key block is paired
 	// across all of them before any credential-named field inside them is masked.
 	const dataFields = Object.keys(source).filter(field => SCHEMA_VALUE_KEYWORDS.has(field));
@@ -257,21 +271,22 @@ function redactSchemaValue(value: unknown, propertyName?: string): unknown {
 		const dataIndex = dataFields.indexOf(field);
 		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const properties = Object.create(null) as Record<string, unknown>;
+			const propertyKeys = new Map<string, number>();
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
-				properties[redactCrashSecrets(name)] = redactSchemaValue(schema, name);
+				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = redactSchemaValue(schema, name);
 			}
-			redacted[redactCrashSecrets(field)] = properties;
+			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = properties;
 			continue;
 		}
 		if (dataIndex >= 0) {
 			const paired = dataValues[dataIndex];
-			redacted[redactCrashSecrets(field)] =
+			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] =
 				propertyName !== undefined && isCredentialKey(propertyName)
 					? maskSchemaData(paired)
 					: scrubSchemaData(paired);
 			continue;
 		}
-		redacted[redactCrashSecrets(field)] = redactSchemaValue(nested, propertyName);
+		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = redactSchemaValue(nested, propertyName);
 	}
 	return redacted;
 }
