@@ -6147,11 +6147,15 @@ export class ModelRegistry {
 		}
 
 		const hardenedLocalDiscovery =
-			(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang") &&
+			(providerConfig.discovery.type === "rapid-mlx" ||
+				providerConfig.discovery.type === "vllm" ||
+				providerConfig.discovery.type === "sglang") &&
 			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 		const response = await fetch(modelsUrl, {
 			headers: requestHeaders,
-			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
+			...(providerConfig.discovery.type === "rapid-mlx" ||
+			providerConfig.discovery.type === "vllm" ||
+			providerConfig.discovery.type === "sglang"
 				? { redirect: "error" as const }
 				: {}),
 			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS),

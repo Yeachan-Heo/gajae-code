@@ -372,7 +372,10 @@ describe("Rapid-MLX model discovery", () => {
 		}).fetchDynamicModels?.();
 		expect(fetchSpy).toHaveBeenCalledWith(
 			"http://localhost:8000/v1/models",
-			expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+			expect.objectContaining({
+				redirect: "error",
+				headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
+			}),
 		);
 	});
 });

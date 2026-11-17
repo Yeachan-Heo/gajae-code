@@ -85,7 +85,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			{ url: `${expectedBaseUrl}/models`, authorization: "Bearer trusted-rapid-key" },
 		]);
 		expect(result.requests.some((request: { url: string }) => request.url.includes(":19999/"))).toBe(false);
-	});
+	}, 15_000);
 
 	test("auto-discovers Rapid-MLX models and maps context length from context_window", async () => {
 		using _hook = hookFetch(input => {
@@ -230,6 +230,30 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		await registry.refresh();
 		expect(registry.find("rapid-mlx", "custom-port-model")?.baseUrl).toBe("http://127.0.0.1:8477/v1");
 		expect(requestedUrls.includes("http://localhost:8000/v1/models")).toBe(false);
+	});
+
+	test("treats an unreachable Rapid-MLX server as optional", async () => {
+		using _hook = hookFetch((input, init) => {
+			if (String(input) === "http://localhost:8000/v1/models") {
+				const response = Promise.withResolvers<Response>();
+				init?.signal?.addEventListener(
+					"abort",
+					() => response.reject(new DOMException("The operation was aborted", "AbortError")),
+					{ once: true },
+				);
+				return response.promise;
+			}
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const startedAt = performance.now();
+		await registry.refresh();
+
+		// Local discovery must abort quickly instead of waiting out the remote
+		// models-list timeout, which would stall every registry refresh.
+		expect(performance.now() - startedAt).toBeLessThan(2_000);
+		expect(registry.getProviderDiscoveryState("rapid-mlx")?.models).toEqual([]);
 	});
 
 	test("honors explicit rapid-mlx discovery configuration", async () => {

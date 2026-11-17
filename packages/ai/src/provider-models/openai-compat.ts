@@ -1683,6 +1683,16 @@ export function rapidMlxModelManagerOptions(
 				provider: "rapid-mlx",
 				baseUrl,
 				apiKey,
+				// The endpoint is always loopback (rewritten above), so a stalled
+				// server must not hold registry refresh for the full remote timeout,
+				// and a redirect must not forward RAPID_MLX_API_KEY off-host. Mirrors
+				// the local vLLM/SGLang discovery hardening.
+				fetch: (input, init) =>
+					fetch(input, {
+						...init,
+						redirect: "error",
+						signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(500)]) : init?.signal,
+					}),
 			}),
 	};
 }
