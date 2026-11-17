@@ -113,34 +113,27 @@ function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]):
  */
 function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][] {
 	const spansByValue: PrivateKeySpan[][] = values.map(() => []);
-	// Only the leaves between the first and the last banner can take part, so a lone banner
-	// in one place cannot pull unrelated structure into a span.
-	let first = -1;
-	let last = -1;
-	for (let index = 0; index < values.length; index++) {
-		if (!values[index].includes(PEM_MARKER_HINT)) continue;
-		if (first < 0) first = index;
-		last = index;
-	}
-	if (first < 0 || last === first) return spansByValue;
+	// A leaf has to hold part of a banner for any pairing to be possible. That is only a cheap
+	// skip test: a banner can be split mid-token, so the whole run is joined once it applies.
+	if (!values.some(value => value.includes(PEM_MARKER_HINT))) return spansByValue;
 	const offsets: number[] = [];
 	let joined = "";
-	for (let index = first; index <= last; index++) {
+	for (const value of values) {
 		offsets.push(joined.length);
-		joined += values[index];
+		joined += value;
 	}
 	// Spans and leaves are both ordered, so the walk advances one leaf pointer instead of
 	// visiting every leaf for every span.
 	let leaf = 0;
 	for (const span of findPrivateKeySpans(joined)) {
-		while (leaf < offsets.length && offsets[leaf] + values[first + leaf].length <= span.start) leaf++;
-		for (let index = leaf; index < offsets.length; index++) {
+		while (leaf < values.length && offsets[leaf] + values[leaf].length <= span.start) leaf++;
+		for (let index = leaf; index < values.length; index++) {
 			const valueStart = offsets[index];
 			if (valueStart >= span.end) break;
-			const valueEnd = valueStart + values[first + index].length;
+			const valueEnd = valueStart + values[index].length;
 			const start = Math.max(span.start, valueStart) - valueStart;
 			const end = Math.min(span.end, valueEnd) - valueStart;
-			if (end > start) spansByValue[first + index].push({ start, end });
+			if (end > start) spansByValue[index].push({ start, end });
 		}
 	}
 	return spansByValue;
@@ -157,27 +150,57 @@ function collectStringLeaves(value: unknown, out: string[]): void {
 		return;
 	}
 	if (value === null || typeof value !== "object") return;
-	// Field names take part too: a banner split between a value and a name is still a block.
+	for (const nested of Object.values(value)) collectStringLeaves(nested, out);
+}
+
+/**
+ * Part of both private-key banners, used only to skip work when no leaf can hold one.
+ * It is deliberately shorter than a banner: a banner split across two leaves leaves
+ * the halves without the full text, and the join is what puts them back together.
+ */
+const PEM_MARKER_HINT = "PRIVATE";
+
+/** Collect string leaves with their field names first, for the rare banner-in-a-name case. */
+function collectStringLeavesWithKeys(value: unknown, out: string[]): void {
+	if (typeof value === "string") {
+		out.push(value);
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectStringLeavesWithKeys(item, out);
+		return;
+	}
+	if (value === null || typeof value !== "object") return;
 	for (const [key, nested] of Object.entries(value)) {
 		out.push(key);
-		collectStringLeaves(nested, out);
+		collectStringLeavesWithKeys(nested, out);
 	}
 }
 
-/** Part of both private-key banners; used to pick the leaves that can take part in a span. */
-const PEM_MARKER_HINT = "PRIVATE KEY-----";
+function containsPrivateKeyName(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(containsPrivateKeyName);
+	if (value === null || typeof value !== "object") return false;
+	return Object.entries(value).some(
+		([key, nested]) => key.includes(PEM_MARKER_HINT) || containsPrivateKeyName(nested),
+	);
+}
 
-/** Apply the spans found for each leaf, in the order `collectStringLeaves` produced them. */
-function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][], cursor: { index: number }): unknown {
+/** Apply the spans found for each leaf, in the order the leaf collection produced them. */
+function applyPrivateKeySpans(
+	value: unknown,
+	spans: readonly PrivateKeySpan[][],
+	cursor: { index: number },
+	includeKeys: boolean,
+): unknown {
 	if (typeof value === "string") return redactPrivateKeyRanges(value, spans[cursor.index++] ?? []);
-	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor));
+	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor, includeKeys));
 	if (value === null || typeof value !== "object") return value;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	for (const [key, nested] of Object.entries(value)) {
 		// Names locate a block but are never rewritten by it: a scrubbed name would destroy the
 		// argument identity the dump relies on, and a banner on its own is not secret material.
-		cursor.index++;
-		redacted[key] = applyPrivateKeySpans(nested, spans, cursor);
+		if (includeKeys) cursor.index++;
+		redacted[key] = applyPrivateKeySpans(nested, spans, cursor, includeKeys);
 	}
 	return redacted;
 }
@@ -197,11 +220,17 @@ function decodeValueStrings(value: unknown): unknown {
 /** Redact private-key blocks that span sibling argument values, at any nesting depth. */
 function redactCrossFieldPrivateKeys(values: readonly unknown[]): unknown[] {
 	const decoded = values.map(decodeValueStrings);
+	// Field names join the pairing stream only when one of them holds part of a banner; adding
+	// them unconditionally would break a banner split between two values.
+	const includeKeys = decoded.some(containsPrivateKeyName);
 	const leaves: string[] = [];
-	for (const value of decoded) collectStringLeaves(value, leaves);
+	for (const value of decoded) {
+		if (includeKeys) collectStringLeavesWithKeys(value, leaves);
+		else collectStringLeaves(value, leaves);
+	}
 	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
 	const cursor = { index: 0 };
-	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
+	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor, includeKeys));
 }
 
 function serializeParameterValue(value: unknown): string {

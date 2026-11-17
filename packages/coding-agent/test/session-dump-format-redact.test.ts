@@ -662,6 +662,26 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"type": "string"');
 	});
 
+	it("removes a private-key block split mid-token across arguments", () => {
+		const body = "MID_BANNER_BODY";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-mid-token",
+						name: "request",
+						arguments: { a: "-----BEGIN RSA ", b: `PRIVATE KEY-----\n${body}\n${pem("RSA", "END")}` },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(parameterValue(dumped, "b")).toBe("«redacted-private-key»");
+	});
+
 	it("removes a private-key block whose footer is an argument name", () => {
 		const body = "KEY_POSITION_PEM_BODY";
 		const dumped = dump([
