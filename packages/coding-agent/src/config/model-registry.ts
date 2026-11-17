@@ -5449,12 +5449,21 @@ export class ModelRegistry {
 					this.#authStorageConfigOwner,
 				);
 				// Record pre-refresh state to detect unrelated concurrent credential changes.
-				// Only the credential selector/override should matter; the token will change during refresh.
+				// Capture both the credential type and OAuth account identity to detect if a different
+				// account was selected during the refresh window.
 				const preRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
 					descriptor.providerId,
 					credentialSessionId,
 					{ owner: this.#authStorageConfigOwner },
 				);
+				// Capture the OAuth account identity to detect if a different OAuth account is selected during refresh.
+				// This catches the case where account A's refresh is awaiting network I/O while user switches to account B (also OAuth).
+				const preRefreshOAuthAccountId =
+					preRefreshCredentialType === "oauth"
+						? this.authStorage.getOAuthAccountId(descriptor.providerId, credentialSessionId, {
+								owner: this.#authStorageConfigOwner,
+							})
+						: undefined;
 				// When OAuth token is expired, refresh it so discovery can proceed with valid
 				// credentials. For fresh tokens, use cheap peek without refresh.
 				// Never refresh for offline strategy, which must not make network calls.
@@ -5484,14 +5493,36 @@ export class ModelRegistry {
 				// If we did NOT trigger an OAuth refresh, any generation change is unexpected.
 				// If we DID trigger an OAuth refresh, only allow the generation change if the credential
 				// selector/type stayed the same (meaning only the token changed, not the credential source).
+				// Always verify that the OAuth account didn't change during refresh, even if generation didn't bump.
+				// Session-scoped selector changes don't necessarily bump generation, but indicate a concurrent
+				// unrelated credential change that should cause discovery to be discarded.
+				if (refreshOAuth && preRefreshCredentialType === "oauth") {
+					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
+						descriptor.providerId,
+						credentialSessionId,
+						{ owner: this.#authStorageConfigOwner },
+					);
+					const postRefreshOAuthAccountId =
+						postRefreshCredentialType === "oauth"
+							? this.authStorage.getOAuthAccountId(descriptor.providerId, credentialSessionId, {
+									owner: this.#authStorageConfigOwner,
+								})
+							: undefined;
+					// Discard if the OAuth account changed during refresh (indicates concurrent account switch)
+					if (preRefreshOAuthAccountId !== postRefreshOAuthAccountId) {
+						return { apiKey: undefined, authGeneration: undefined };
+					}
+				}
+				// Also check for unrelated generation changes that indicate concurrent credential changes
 				const generationAfter = this.authStorage.getProviderConfigurationGeneration(
 					descriptor.providerId,
 					this.#authStorageConfigOwner,
 				);
 				if (configurationGeneration !== generationAfter) {
 					// Generation bumped. Check if it was caused by the refresh or by something else.
-					// Verify the credential selector/type didn't change (which would indicate a concurrent
-					// unrelated credential change, not just the OAuth token rotation).
+					// If we did NOT trigger an OAuth refresh, any generation change is unexpected.
+					// If we DID trigger an OAuth refresh, only allow the generation change if the credential
+					// type stayed the same (for identity-less credentials that bump generation on refresh).
 					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
 						descriptor.providerId,
 						credentialSessionId,
