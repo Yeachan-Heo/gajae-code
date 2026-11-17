@@ -6836,7 +6836,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await attemptCleanup(() => {
 					// Only the factory's new cooperative admission may be retired here.
 					// The manager retains it unless exact closure and settled debt are proven.
-					failedSessionManager.retireFactoryCooperativeOwnerAfterClose(membership);
+					failedSessionManager.retireCooperativeOwnerAfterClose(membership);
 				});
 			}
 			await attemptCleanup(() => startupPythonCleanup);
@@ -6894,7 +6894,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							? await failedSessionManager.closeStrict()
 							: state;
 				if (outcome.kind !== "closed") throw outcome.error;
-				failedSessionManager.retireFactoryCooperativeOwnerAfterClose(membership);
+				failedSessionManager.retireCooperativeOwnerAfterClose(membership);
 			});
 		}
 		if (cleanupDiagnostic !== undefined) {

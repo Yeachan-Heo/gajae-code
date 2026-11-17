@@ -467,6 +467,12 @@ export async function createEmbeddedAgentSession(
 				if (releasing) return releasing;
 				releasing = (async () => {
 					await created.session.awaitDisposeCompletion();
+					// The factory owns this manager: once its own closure actually closed, a
+					// cooperative member is no longer live and must not veto later deletion.
+					// Exclusive native members retire only through their reconciled lifecycle.
+					const ownedManager = created.session.sessionManager;
+					const membership = ownedManager.getOwnerMembership();
+					if (membership) ownedManager.retireCooperativeOwnerAfterClose(membership);
 					const outcomes = await Promise.allSettled([registry?.dispose(), closeSettings()]);
 					const failures: unknown[] = outcomes.flatMap(outcome =>
 						outcome.status === "rejected" ? [outcome.reason] : [],

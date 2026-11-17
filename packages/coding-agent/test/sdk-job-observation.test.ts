@@ -1197,7 +1197,7 @@ describe("owner-scoped SDK job observation", () => {
 			const flush = spyOn(sessionManager, "flush");
 			const ensureOnDisk = spyOn(sessionManager, "ensureOnDisk");
 			const close = spyOn(sessionManager, "closeStrict");
-			const retire = spyOn(sessionManager, "retireFactoryCooperativeOwnerAfterClose");
+			const retire = spyOn(sessionManager, "retireCooperativeOwnerAfterClose");
 			const settings = Settings.isolated({
 				"bash.autoBackground.enabled": false,
 				"memory.backend": "off",
@@ -1289,7 +1289,7 @@ describe("owner-scoped SDK job observation", () => {
 					await sessionManager.flushAndCloseStrict();
 				}
 				const membership = sessionManager.getOwnerMembership();
-				if (membership) sessionManager.retireFactoryCooperativeOwnerAfterClose(membership);
+				if (membership) sessionManager.retireCooperativeOwnerAfterClose(membership);
 				AsyncJobManager.setInstance(priorManager);
 				await modelRegistry.dispose();
 				await settings.close();
@@ -1398,7 +1398,7 @@ describe("owner-scoped SDK job observation", () => {
 										expect(sessionManager.getSessionOwnerEvidence()?.policy.kind).toBe("cooperative");
 										const header = JSON.parse((await Bun.file(file).text()).split("\n")[0]!) as FileEntry;
 										expect(header).toMatchObject({ type: "session", id: sessionManager.getSessionId() });
-										expect(sessionManager.retireFactoryCooperativeOwnerAfterClose(membership)).toBe(false);
+										expect(sessionManager.retireCooperativeOwnerAfterClose(membership)).toBe(false);
 										expect(sessionManager.getOwnerMembership()).toBe(membership);
 										expect(() => revalidateOwnerMembershipSync(membership)).not.toThrow();
 										// Default endpoint hooks remain registered, but no host starts
@@ -1490,7 +1490,7 @@ describe("owner-scoped SDK job observation", () => {
 					ensureOnDisk.mockRestore();
 					close.mockRestore();
 					await sessionManager.closeStrict();
-					if (initialMembership) sessionManager.retireFactoryCooperativeOwnerAfterClose(initialMembership);
+					if (initialMembership) sessionManager.retireCooperativeOwnerAfterClose(initialMembership);
 					AsyncJobManager.setInstance(priorManager);
 					auth.close();
 					await temp.remove();

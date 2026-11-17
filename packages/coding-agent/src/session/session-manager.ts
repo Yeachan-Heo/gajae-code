@@ -13599,8 +13599,8 @@ export class SessionManager {
 			? this.#freshOwnerCreation
 			: undefined;
 	}
-	/** Startup cleanup only: never infer settlement from an empty resident projection. */
-	retireFactoryCooperativeOwnerAfterClose(token: OwnerMembership): boolean {
+	/** Requires this manager's actual closed closure; never infers settlement from an empty resident projection. */
+	retireCooperativeOwnerAfterClose(token: OwnerMembership): boolean {
 		if (this.#ownerMembership !== token) return false;
 		let policy: SessionOwnerPolicy;
 		try {
