@@ -11884,6 +11884,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				selection: "turn",
 				turn: "stopped",
 			});
+			// Release the admission barrier to allow the preflight to proceed and cleanup
+			releaseAdmission.resolve();
 			// Verify the durable row is settled, not uncertain
 			const status = await harness.query("turn.prompt_status", originalIds);
 			expect(status.result?.status).not.toBe("uncertain");
