@@ -29778,13 +29778,23 @@ export class AgentSession {
 		const now = Date.now();
 		this.#concurrencyWaitStartedAt ??= now;
 		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
-		if (remainingMs <= 0) return undefined;
+		if (remainingMs <= 0) {
+			// Record deadline on early exit when budget exhausted, before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
 		// If the provider's Retry-After exceeds the remaining budget, mark the condition
 		// to prevent same-entry credential rotations (which would retry before deadline),
 		// and exit the concurrency wait to take the ordinary rate-limit path instead.
 		// This ensures we either advance to another entry or wait until budget expiry.
 		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
 			this.#concurrencyWaitRetryAfterExceededBudgetEntry = selector;
+			// Record deadline before no-poll return when budget would be exceeded.
+			if (selector !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
 			return undefined;
 		}
 		// Bound poll count independently of elapsed time to prevent unbounded retries
@@ -29822,6 +29832,10 @@ export class AgentSession {
 		// If capped result falls below the minimum, exit concurrency wait
 		// to avoid sub-1s bursts at budget expiry.
 		if (cappedDelayMs < minPollMs) {
+			// Record deadline on early exit before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
 			return undefined;
 		}
 		return cappedDelayMs;

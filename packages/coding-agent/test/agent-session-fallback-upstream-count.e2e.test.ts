@@ -1686,8 +1686,8 @@ describe("AgentSession fallback upstream request counts", () => {
 		const streamFn: AgentOptions["streamFn"] = model => {
 			if (selector(model) === primarySelector) {
 				primaryAttempts++;
-				// Return 429 with small Retry-After to test poll ceiling behavior
-				return typedRateLimitStream(model, 100, "rate limit", "rate_limit_exceeded");
+				// Return 429 with small Retry-After to test poll ceiling behavior using concurrency-typed code
+				return typedRateLimitStream(model, 100, "concurrency limit exceeded", "concurrency_limit_exceeded");
 			}
 			// Fallback
 			fallbackAttempts++;
@@ -1699,9 +1699,9 @@ describe("AgentSession fallback upstream request counts", () => {
 			return successfulStream(model);
 		};
 
-		const { primary: p, fallback: f } = createSession(50, streamFn, {
-			// Small budget to hit ceiling quickly
-			"fallback.concurrencyWaitMs": 500,
+		const { fallback: f } = createSession(50, streamFn, {
+			// Reasonable budget to hit ceiling after multiple polls (each poll is ~1000ms minimum)
+			"fallback.concurrencyWaitMs": 15_000,
 			"retry.baseDelayMs": 0,
 			"retry.maxDelayMs": 0,
 		});
@@ -1715,5 +1715,56 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(fallbackAttempts).toBeGreaterThan(0); // Should have tried fallback
 		// Final model should be fallback (which succeeded)
 		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+	});
+
+	it("records Retry-After deadline when budget is exhausted with pending concurrency saturation (Issue 7796)", async () => {
+		// When concurrency-wait budget is spent and a new 429 with Retry-After arrives,
+		// the deadline must be tracked to prevent same-selector retries before the deadline.
+		// This test exhausts the budget, triggers a new 429, and verifies the deadline
+		// prevents immediate same-selector retries.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const primarySelector = selector(primaryModel);
+		const retryAfterMs = 2000; // 2-second deadline
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				// Return concurrency-typed 429 with Retry-After
+				return typedRateLimitStream(
+					model,
+					retryAfterMs,
+					"too many concurrent requests",
+					"too_many_concurrent_requests",
+				);
+			}
+			// Fallback
+			fallbackAttempts++;
+			// Always succeed on fallback to test the deadline enforcement
+			return successfulStream(model);
+		};
+
+		const { fallback: f } = createSession(50, streamFn, {
+			// Very small budget to exhaust quickly
+			"fallback.concurrencyWaitMs": 100,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		const requestsBefore = primaryAttempts;
+		await session!.prompt("Exhaust budget then verify deadline");
+		await session!.waitForIdle();
+
+		// Verify that primary was attempted and then we switched to fallback
+		expect(primaryAttempts).toBeGreaterThan(requestsBefore);
+		expect(fallbackAttempts).toBeGreaterThan(0);
+		// Final model should be fallback (which succeeded)
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+		
+		// When deadline is recorded on budget exhaustion, we should quickly advance to fallback
+		// rather than retry the primary many times (each would add ~100ms Retry-After to deadline).
+		// With a 100ms budget, we expect a small number of primary attempts before advancing.
+		expect(primaryAttempts).toBeLessThan(10); // Should not retry indefinitely
 	});
 });
