@@ -185,17 +185,14 @@ function decodeEscapedIdentity(input: string): string {
 	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input, true), true);
 }
 
-/** An integer-like key is enumerated before every other field, so it must keep its spelling. */
-
 /**
  * Decode `\u` escapes in every string leaf and every field name, so banner detection,
  * credential-name recognition and the printed value all see the characters a reader sees.
  * Tool arguments can carry one encoded layer and the value itself can spell another, which
  * the renderer used to decode after this prepass; decoding twice here keeps banner pairing
  * and the printed value on the same characters instead of materialising a banner later.
- * Field names are part of that decoded representation: a name spelled with an escape is only
- * credential-shaped once resolved, and it is this prepass — not a later pass over the
- * serialized text — that has to recognize it.
+ * A field name is only credential-shaped once its escapes are resolved, so recognition reads
+ * the resolved spelling; the name itself is stored and printed as it arrived.
  * The spelling each entry keeps is the one it arrived with, so the pairing stream stays in its
  * original order and no entry is dropped, renamed or moved. Credential recognition resolves the
  * spelling instead, so an encoded name classifies like the name it stands for.
@@ -395,9 +392,9 @@ function formatArgsAsXml(
 	const schema = mode === "schema" ? redactSchemaEntry(args) : undefined;
 	// A scrubbed schema key no longer matches the original argument name, so each mode walks its
 	// own entries: arguments over the value-paired tree, schemas over the sanitized schema.
-	// The intent field is the field that resolves to its name, so an escaped spelling of it is
-	// not dumped as an ordinary argument either. A schema root is not an argument, so a
-	// definition named `_i` stays part of the schema.
+	// The intent field is the literal key the agent loop destructures: a field whose name
+	// merely resolves to it is an ordinary argument, so only that exact spelling is dropped.
+	// A schema root is not an argument, so a definition named `_i` stays part of the schema.
 	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
 	const entries = Object.entries(paired ?? args).filter(([key]) => mode === "schema" || key !== INTENT_FIELD);
 	const parts: string[] = [];
