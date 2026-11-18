@@ -3824,16 +3824,17 @@ function createControlSurface(
 			// Issue #7853: Keep the preflight in the set until the submission completes
 			// or is aborted, so that a terminal abort can still cancel an accepted preflight.
 			// Delete only happens after submission completes or abort successfully cancels it.
+			const connectionId = sdkControlRequesterContext.getStore() ?? "";
 			void submission?.then(
 				() => {
 					requesterPreflights.delete(cancelPreflight);
-					if (requesterPreflights.size === 0)
-						pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+					if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+						pendingPreflights.delete(connectionId);
 				},
 				() => {
 					requesterPreflights.delete(cancelPreflight);
-					if (requesterPreflights.size === 0)
-						pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+					if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+						pendingPreflights.delete(connectionId);
 				},
 			);
 		}
@@ -3917,20 +3918,26 @@ function createControlSurface(
 							code: "idempotency_conflict",
 						});
 					const persisted = stored(existing);
-					if (existing.turnDisposition === "stopped")
+					if (existing.turnDisposition === "stopped") {
+						const isPrefCancelled = existing.ownedWorkDisposition === "not_requested";
 						return {
 							ok: true,
 							selection: scope,
 							turn: "stopped",
 							...(scope === "owned"
 								? {
-										ownedWork: existing.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+										ownedWork: isPrefCancelled
+											? "stopped"
+											: existing.ownedWorkDisposition === "stopped"
+												? "stopped"
+												: "uncertain",
 										automaticDelivery: "none",
 										resumeOnOwnedCompletion: false,
 									}
 								: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
 							replay: persisted,
 						};
+					}
 					if (existing.turnDisposition === "no_effect")
 						return {
 							ok: true,

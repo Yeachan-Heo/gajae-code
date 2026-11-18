@@ -11862,12 +11862,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sessionFile: path.join(cwd, "session.json"),
 				sessionId: transport.sessionId,
 			});
+			let executionBlocked: { resolve: () => void } | undefined;
 			const harness = await invocationHarness("abort-after-preflight-accept", cwd, {
 				sendUserMessage: async (_content, options) => {
-					// Accept the preflight (triggering durable write), then keep execution pending
-					// This exercises the abort-after-accept-but-before-execution case
+					// Accept the preflight (triggering durable write), then block on execution
 					await options?.onPreflightAcceptCommit?.();
-					await neverSettlingPromise();
+					await new Promise<void>(resolve => {
+						executionBlocked = { resolve };
+					});
 				},
 				terminalAbortSeams: {
 					getTerminalTurnEpoch: () => 1,
@@ -11910,6 +11912,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// not uncertain (preflights may still be pending)
 			expect(row.turnDisposition).toBe("stopped");
 			expect(row.ownedWorkDisposition).toBe("not_requested");
+			// Unblock the execution so the prompt completes
+			executionBlocked?.resolve();
+			await Bun.sleep(50);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
