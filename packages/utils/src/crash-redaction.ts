@@ -125,7 +125,7 @@ function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[])
 	// A block whose opening banner sits inside a container or scalar was hidden by that masking,
 	// and the re-scan already pairs the block that survives; keeping the raw range would swallow
 	// the diagnostics between the hidden banner and the footer it happened to reach.
-	const visible = spans.filter(span => !isInsideMaskedRange(span.start, containerApplied));
+	const visible = visibleSpans(spans, containerApplied);
 	return applyMaskRanges(
 		text,
 		mergeMaskRanges([
@@ -168,15 +168,19 @@ function applyMaskRanges(text: string, ranges: readonly AppliedRange[]): string 
 }
 
 /**
- * Whether a position falls inside a range this pass masks. Applied ranges ascend and do not
- * overlap, so the scan stops at the first range that starts at or after the position.
+ * The block ranges whose opening banner this pass does not mask.
+ * Both lists ascend and do not overlap, so one forward cursor keeps the check linear; a banner
+ * that starts inside a masked range was hidden by that masking, so its raw range is dropped.
  */
-function isInsideMaskedRange(position: number, applied: readonly AppliedRange[]): boolean {
-	for (const range of applied) {
-		if (range.start > position) return false;
-		if (position < range.end) return true;
+function visibleSpans(spans: readonly PrivateKeySpan[], applied: readonly AppliedRange[]): TextRange[] {
+	const visible: TextRange[] = [];
+	let cursor = 0;
+	for (const span of spans) {
+		while (cursor < applied.length && (applied[cursor] as AppliedRange).end <= span.start) cursor += 1;
+		const range = applied[cursor] as AppliedRange | undefined;
+		if (range === undefined || span.start < range.start) visible.push({ start: span.start, end: span.end });
 	}
-	return false;
+	return visible;
 }
 
 /**
