@@ -117,6 +117,23 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain("system with");
 	});
 
+	it("removes a URL password that an auth-token prefix would otherwise hide", () => {
+		const password = "SYNTHETIC_PG_PASSWORD";
+		const dumped = dump([
+			{
+				role: "user",
+				content: `connect with Token postgres://app:${password}@db.example.com:5432/prod`,
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		// The auth-token rule matches the scheme word, so the URL has to be classified from the
+		// original text before that rule consumes the authority delimiter it needs.
+		expect(dumped).not.toContain(password);
+		expect(dumped).toContain("db.example.com");
+		expect(dumped).toContain("connect with");
+	});
+
 	it("redacts opaque values under credential-labeled tool argument keys", () => {
 		const apiKey = "opaque-api-key-value";
 		const clientSecret = "opaque-client-secret-value";
@@ -1440,7 +1457,53 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parameterValue(dumped, "payload")).toContain("null");
 	});
 
-	it("documents the rendered-schema trade-off for covered typed constraints", () => {
+	it("removes a private-key block whose footer sits inside a parameter name", () => {
+		const body = "PARAMETER_NAME_PEM_BODY";
+		// A name is not joined with the value leaves, so it needs its own single detection pass:
+		// a container mask that eats the footer first would leave the banner and body printed inside
+		// the `<parameter name="...">` attribute.
+		const name = `note ${pem("RSA", "BEGIN")}\n${body} private_key={footer:"${pem("RSA", "END")}"}`;
+		const dumped = dump([
+			assistant([{ type: "toolCall", id: "call-name", name: "read", arguments: { [name]: "visible-value" } }], 1),
+		]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		expect(dumped).toContain("visible-value");
+		expect(XMLValidator.validate(`<dump>${dumped}</dump>`)).toBe(true);
+	});
+
+	it("keeps the line after a credential container inside a YAML scalar", () => {
+		const body = "YAML_OVERLAP_PEM_BODY";
+		const sibling = "YAML_OVERLAP_SIBLING";
+		const fixture = [
+			"secret: |",
+			`  ${pem("RSA", "BEGIN")}`,
+			body,
+			`private_key={"footer":"${pem("RSA", "END")}","sibling":"${sibling}"}`,
+			"  keep-me",
+			"public: visible",
+		].join("\n");
+		const dumped = dump([{ role: "user", content: fixture, timestamp: 1 }] as AgentMessage[]);
+
+		// The masked block and its container are gone.
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(sibling);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		// Removing the unindented lines must not let a later pass reinterpret the remaining
+		// indented lines as the scalar: `keep-me` is outside every detected range and survives, and
+		// the output is still a YAML document the block scalar belongs to.
+		expect(dumped).toContain("\n  keep-me\npublic: visible");
+		const parsed = Bun.YAML.parse(dumped) as { secret?: unknown; public?: unknown };
+		expect(typeof parsed.secret).toBe("string");
+		expect(parsed.secret).toContain("keep-me");
+		expect(parsed.secret).not.toContain(body);
+		expect(parsed.public).toBe("visible");
+	});
+
+	it("keeps a covered typed constraint out of the rendered schema", () => {
 		const body = "SCHEMA_TYPED_PEM_BODY";
 		const dumped = formatSessionDumpText({
 			messages: [],
@@ -1455,6 +1518,7 @@ describe("formatSessionDumpText credential scrub", () => {
 						properties: {
 							first: { type: "string", default: `${pem("RSA", "BEGIN")}\n${body}` },
 							limit: { type: "integer", minimum: 10, maximum: 20 },
+							kind: { type: ["string", "null"] },
 							flag: false,
 							second: { type: "string", default: `tail\n${pem("RSA", "END")}` },
 						},
@@ -1463,17 +1527,23 @@ describe("formatSessionDumpText credential scrub", () => {
 			],
 		});
 
-		const properties = JSON.parse(parameterValue(dumped, "properties") ?? "null");
-		expect(properties.first.default).toBe("«redacted-private-key»");
-		expect(properties.second.default).toBe("«redacted-private-key»");
-		// Documented trade-off: a covered number or boolean keeps its place but prints as the marker
-		// string. The rendered schema is a readable record of the declaration, not a schema that
-		// parses back to an equivalent one — keeping the type would mean printing the covered value.
-		expect(properties.limit.minimum).toBe("«redacted-private-key»");
-		expect(properties.limit.maximum).toBe("«redacted-private-key»");
-		expect(properties.flag).toBe("«redacted-private-key»");
+		const properties = JSON.parse(parameterValue(dumped, "properties") ?? "null") as Record<string, unknown>;
 		expect(dumped).not.toContain(body);
 		expect(dumped).not.toContain(pem("RSA", "END"));
+		// The covered defaults keep their marker.
+		expect((properties.first as { default: string }).default).toBe("«redacted-private-key»");
+		expect((properties.second as { default: string }).default).toBe("«redacted-private-key»");
+		// A covered keyword is omitted rather than printed as a string, and a covered boolean
+		// subschema becomes the neutral schema. What survives is still a JSON Schema document:
+		// `{}` constrains nothing, and every remaining value has the shape its keyword requires.
+		expect(properties.limit).toEqual({});
+		expect(Object.hasOwn(properties.limit as object, "minimum")).toBe(false);
+		expect(Object.hasOwn(properties.limit as object, "maximum")).toBe(false);
+		// A `type` list accepts only type names, so a covered member is dropped instead of printed.
+		expect(properties.kind).toEqual({});
+		expect(Object.hasOwn(properties.second as object, "type")).toBe(false);
+		expect(properties.flag).toEqual({});
+		expect((properties.first as { type: string }).type).toBe("string");
 	});
 
 	it("bounds unclosed credential containers in the session dump", () => {

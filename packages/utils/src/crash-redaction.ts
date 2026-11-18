@@ -188,6 +188,12 @@ const V1_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
 );
 const COOKIE_VALUE_PATTERN =
 	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+// Basic-auth credentials embedded in a URL. Scheme and host stay readable because they are the
+// diagnostic value; only the userinfo is dropped. The left boundary is consumed so the unbounded
+// scheme scan starts only at the start of a scheme-character run, avoiding quadratic retries while
+// accepting long standards-compliant schemes. The greedy authority scan consumes raw `@`
+// characters in userinfo through its delimiter.
+const URL_CREDENTIAL_SOURCE = String.raw`(^|[^A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]*@`;
 // Cap key inspection; YAML permits the chomping and indentation indicators in either order.
 const YAML_BLOCK_SCALAR_HEADER_PATTERN =
 	/^([ \t]*(?:-[ \t]+)?)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*(?:[ \t]+(?:&[^ \t\r\n]{1,128}|![^ \t\r\n]{1,128}))*[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
@@ -216,9 +222,14 @@ function lineBounds(text: string, start: number): { contentEnd: number; nextLine
 	return { contentEnd, nextLineStart };
 }
 
-function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): string {
-	const output: string[] = [];
-	let copiedUntil = 0;
+/**
+ * Locate the printed body text of every credential-named block scalar, one span per non-empty
+ * body line. The spans exclude the line's indentation and trailing whitespace, exactly the text
+ * the YAML rule replaces, so a caller can mask them alongside its own structural ranges instead
+ * of letting a later pass re-read structure this one already classified.
+ */
+function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedactionRules): PrivateKeySpan[] {
+	const spans: PrivateKeySpan[] = [];
 	let lineStart = 0;
 
 	while (lineStart < text.length) {
@@ -229,9 +240,7 @@ function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): 
 			continue;
 		}
 
-		output.push(text.slice(copiedUntil, nextLineStart));
 		let bodyLineStart = nextLineStart;
-		let copiedBodyUntil = bodyLineStart;
 		while (bodyLineStart < text.length) {
 			const bodyLine = lineBounds(text, bodyLineStart);
 			let indentation = 0;
@@ -248,7 +257,6 @@ function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): 
 			}
 			if (indentation <= header.indentation) break;
 
-			output.push(text.slice(copiedBodyUntil, bodyLineStart));
 			let bodyTextEnd = bodyLine.contentEnd;
 			while (
 				bodyTextEnd > bodyLineStart + indentation &&
@@ -256,21 +264,23 @@ function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): 
 			) {
 				bodyTextEnd--;
 			}
-			output.push(
-				text.slice(bodyLineStart, bodyLineStart + indentation),
-				"«redacted»",
-				text.slice(bodyTextEnd, bodyLine.nextLineStart),
-			);
-			copiedBodyUntil = bodyLine.nextLineStart;
+			spans.push({ start: bodyLineStart + indentation, end: bodyTextEnd });
 			bodyLineStart = bodyLine.nextLineStart;
 		}
 
-		output.push(text.slice(copiedBodyUntil, bodyLineStart));
-		copiedUntil = bodyLineStart;
 		lineStart = bodyLineStart;
 	}
 
-	return copiedUntil === 0 ? text : output.join("") + text.slice(copiedUntil);
+	return spans;
+}
+
+/** Locate the credential-named YAML block-scalar bodies of `text` without mutating it. */
+export function findYamlBlockScalarSpans(text: string): PrivateKeySpan[] {
+	return findYamlBlockScalarSpansWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
+}
+
+function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): string {
+	return applyContainerSpans(text, findYamlBlockScalarSpansWithRules(text, rules));
 }
 
 function isCookieFieldWhitespace(character: string | undefined): boolean {
@@ -466,8 +476,11 @@ export function redactCrashSecrets(text: string): string {
 
 /**
  * Scrub the line-bounded rules only, for a caller that already replaced the structural masks
- * (credential containers and private-key blocks) from one detection pass over its original text.
- * Re-running the structural passes here would classify output a previous stage produced, which is
+ * (credential containers, private-key blocks, URL userinfo and YAML block-scalar bodies) from one
+ * detection pass over its original text.
+ * Every rule left here reads one physical line: none of them re-parses indentation or pairs a
+ * banner with a footer, so this pass cannot reinterpret structure outside the range it edits.
+ * Re-running the structural passes would classify output a previous stage produced, which is
  * exactly the evidence loss a single detection pass exists to avoid.
  */
 export function redactResidualCrashSecrets(text: string): string {
@@ -481,8 +494,15 @@ export function redactCrashSecretsV1(text: string): string {
 
 function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules, structures = true): string {
 	let redacted = structures ? redactCredentialContainers(text, rules, rules !== V1_CREDENTIAL_REDACTION_RULES) : text;
-	// Block scalar bodies span lines and must be masked before line-bounded rules handle the header.
-	redacted = redactYamlBlockScalars(redacted, rules);
+	if (structures) {
+		// Block scalar bodies span lines and must be masked before line-bounded rules handle the
+		// header. A residual caller detected and masked those bodies itself, so this pass may not
+		// reinterpret the indentation its output left behind.
+		redacted = redactYamlBlockScalars(redacted, rules);
+	}
+	// URL userinfo runs before the auth-token rule: `Token postgres://user:secret@host` would
+	// otherwise lose its scheme word to the token rule and leave the authority unrecognizable.
+	redacted = redacted.replace(new RegExp(URL_CREDENTIAL_SOURCE, "gi"), "$1$2«redacted-url-credential»@");
 	redacted = redacted.replace(
 		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
 		"«redacted-auth»",
@@ -514,16 +534,6 @@ function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRul
 	redacted = redacted.replace(
 		/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g,
 		"«redacted-google-api-key»",
-	);
-	// Basic-auth credentials embedded in a URL. Scheme and host stay readable
-	// because they are the diagnostic value; only the userinfo is dropped. The
-	// boundary is consumed so the unbounded scheme scan starts only at the start
-	// of a scheme-character run, avoiding quadratic retries while accepting long
-	// standards-compliant schemes. The greedy authority scan consumes raw `@`
-	// characters in userinfo through its delimiter.
-	redacted = redacted.replace(
-		/(^|[^A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]*@/gi,
-		"$1$2«redacted-url-credential»@",
 	);
 	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is
 	// the shape that actually shows up in a crashed request. ABIA (bearer) and
@@ -720,6 +730,26 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
 	}
 	const camelMasked = redactCredentialContainersWithPattern(generic, camel, bounded, state);
 	return state.exhausted ? "«redacted»" : camelMasked;
+}
+
+/**
+ * Locate the userinfo of every URL that carries one, without mutating the text.
+ * Only the userinfo is a range: the scheme and host stay readable because they say which remote
+ * failed. Detection has to read the original text, because an auth-token rule that runs first can
+ * consume the scheme word and leave `://user:secret@host` without an authority the URL rule
+ * recognizes.
+ */
+export function findUrlCredentialSpans(text: string): PrivateKeySpan[] {
+	if (!text.includes("://")) return [];
+	const spans: PrivateKeySpan[] = [];
+	const pattern = new RegExp(URL_CREDENTIAL_SOURCE, "gi");
+	for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
+		const userinfoStart = match.index + match[1].length + match[2].length;
+		// The match ends with the `@` that closes the userinfo; it stays printed.
+		const userinfoEnd = match.index + match[0].length - 1;
+		if (userinfoEnd > userinfoStart) spans.push({ start: userinfoStart, end: userinfoEnd });
+	}
+	return spans;
 }
 
 /**

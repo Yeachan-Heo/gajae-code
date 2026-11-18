@@ -7,6 +7,8 @@ import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import {
 	findCredentialContainerSpans,
 	findPrivateKeySpans,
+	findUrlCredentialSpans,
+	findYamlBlockScalarSpans,
 	isCredentialKey,
 	isHeaderCollectionKey,
 	PRIVATE_KEY_REDACTION_MARKER,
@@ -80,6 +82,8 @@ function takeRedactedTextRun(parts: string[]): string | undefined {
 			offset += parts[index].length + 1;
 		}
 		ranges.push(...containerRanges(joined));
+		ranges.push(...urlRanges(joined));
+		ranges.push(...yamlBlockScalarRanges(joined));
 		redacted = redactResidualCrashSecrets(applyRedactionRanges(joined, ranges));
 	}
 	parts.length = 0;
@@ -165,14 +169,47 @@ function containerRanges(text: string): RedactionRange[] {
 	}));
 }
 
+const URL_CREDENTIAL_REDACTION_MARKER = "«redacted-url-credential»";
+
+/** URL-userinfo ranges of one original text; the scheme and host stay printed. */
+function urlRanges(text: string): RedactionRange[] {
+	return findUrlCredentialSpans(text).map(span => ({
+		start: span.start,
+		end: span.end,
+		marker: URL_CREDENTIAL_REDACTION_MARKER,
+	}));
+}
+
+/** Printed body ranges of the credential-named YAML block scalars of one original text. */
+function yamlBlockScalarRanges(text: string): RedactionRange[] {
+	return findYamlBlockScalarSpans(text).map(span => ({
+		start: span.start,
+		end: span.end,
+		marker: CONTAINER_REDACTION_MARKER,
+	}));
+}
+
 /**
  * Structural masks of one piece of text, applied in one pass over the text the caller detected
  * them on, then the line-bounded rules that need no structural evidence.
+ * URL userinfo and YAML scalar bodies are detected here too: by the time the line-bounded rules
+ * run, the auth-token rule has consumed the URL scheme word and a structural mask has removed the
+ * lines that delimited the YAML scalar, so neither can be classified from the output.
  */
 function scrubText(text: string, privateKeys: readonly PrivateKeySpan[]): string {
 	return redactResidualCrashSecrets(
-		applyRedactionRanges(text, [...privateKeyRanges(privateKeys), ...containerRanges(text)]),
+		applyRedactionRanges(text, [
+			...privateKeyRanges(privateKeys),
+			...containerRanges(text),
+			...urlRanges(text),
+			...yamlBlockScalarRanges(text),
+		]),
 	);
+}
+
+/** A field name is scrubbed through the same original-text detection as a value. */
+function scrubName(name: string): string {
+	return scrubText(name, findPrivateKeySpans(name));
 }
 
 /** Scrub one block of dump text, detecting its private-key blocks in that same text. */
@@ -261,6 +298,11 @@ function createValueRedactionPlan(value: unknown): ValueRedactionPlan {
 /** Take the next printed scalar's private-key ranges; every scalar consumes exactly one entry. */
 function takeLeafSpans(plan: ValueRedactionPlan): readonly PrivateKeySpan[] {
 	return plan.spansByLeaf[plan.cursor.index++] ?? [];
+}
+
+/** Read the next printed scalar's ranges without consuming its plan entry. */
+function peekLeafSpans(plan: ValueRedactionPlan): readonly PrivateKeySpan[] {
+	return plan.spansByLeaf[plan.cursor.index] ?? [];
 }
 
 /**
@@ -415,11 +457,42 @@ const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"
 const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
 
 /**
+ * Keywords whose value is one schema, or whose boolean form is also a schema boolean.
+ * A covered boolean under one of these is replaced by the neutral `{}` schema so the emitted
+ * document stays a valid JSON Schema without printing the covered value.
+ */
+const SCHEMA_SINGLE_KEYWORDS = new Set([
+	"items",
+	"additionalItems",
+	"additionalProperties",
+	"unevaluatedProperties",
+	"unevaluatedItems",
+	"contains",
+	"not",
+	"if",
+	"then",
+	"else",
+	"propertyNames",
+	"contentSchema",
+]);
+
+/** Keywords whose value is an array of schemas. */
+const SCHEMA_LIST_KEYWORDS = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+
+/**
+ * A covered scalar that may not print. In schema position it becomes the neutral `{}` schema; as an
+ * object keyword value it is dropped, because every keyword a scalar can carry is optional and an
+ * absence is valid where the covered value would have changed the keyword's meaning.
+ */
+const OMIT_SCHEMA_VALUE = Symbol("omit-schema-value");
+
+/**
  * Replace every leaf of a data value with the marker, preserving its shape.
  * The shape is kept so the dump still shows what the caller declared; a number or boolean that a
- * mask covers prints as the string marker. The rendered schema is therefore a readable record of
- * the declaration, not a schema that parses back to an equivalent one — keeping the covered
- * value's type would mean printing the covered value.
+ * mask covers prints as the string marker. Data keywords (`default`, `example`, `examples`,
+ * `const`) accept any JSON value, so the marker keeps the document valid JSON Schema; the literal
+ * no longer equals what the caller declared, because keeping the covered value's type would mean
+ * printing the covered value.
  */
 function maskSchemaData(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(maskSchemaData);
@@ -435,11 +508,11 @@ function maskSchemaData(value: unknown): unknown {
 }
 
 /**
- * Scrubbed form of a schema key, kept distinct when two keys scrub to the same marker
+ * Scrubbed form of a field name, kept distinct when two names scrub to the same marker
  * so one property definition cannot silently replace another.
  */
 function uniqueScrubbedKey(target: Record<string, unknown>, key: string, nextSuffix: Map<string, number>): string {
-	const scrubbed = redactCrashSecrets(key);
+	const scrubbed = scrubName(key);
 	if (!Object.hasOwn(target, scrubbed)) return scrubbed;
 	let suffix = nextSuffix.get(scrubbed) ?? 2;
 	while (Object.hasOwn(target, `${scrubbed}#${suffix}`)) suffix += 1;
@@ -454,12 +527,31 @@ function uniqueScrubbedKey(target: Record<string, unknown>, key: string, nextSuf
  * readable; only string leaves and data-carrying keywords are redacted. Every keyword and every
  * name is classified on the original schema, and each printed scalar takes its one plan entry in
  * the same walk, so a masked leaf can never change how a later entry is read.
+ *
+ * A covered non-string scalar cannot print its type without printing evidence of the value it
+ * masked. In schema position it becomes `{}` (a valid schema that constrains nothing); as a
+ * keyword value it is omitted. Both keep the emitted document valid JSON Schema instead of
+ * turning `minLength: 7` or `flag: false` into a marker string.
  */
-function sanitizeSchemaValue(value: unknown, propertyName: string | undefined, plan: ValueRedactionPlan): unknown {
+function sanitizeSchemaValue(
+	value: unknown,
+	propertyName: string | undefined,
+	plan: ValueRedactionPlan,
+	schemaPosition: boolean,
+): unknown {
 	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan));
-	if (Array.isArray(value)) return value.map(item => sanitizeSchemaValue(item, propertyName, plan));
+	if (Array.isArray(value)) {
+		return value.map(item => {
+			const sanitized = sanitizeSchemaValue(item, propertyName, plan, schemaPosition);
+			// An array slot cannot be omitted without shifting later slots, so a covered scalar keeps
+			// its marker form here; the arrays that reach this branch hold literal data (`enum`,
+			// `examples`) or schemas, and a string is valid in both.
+			return sanitized === OMIT_SCHEMA_VALUE ? PRIVATE_KEY_REDACTION_MARKER : sanitized;
+		});
+	}
 	if (value === null || typeof value !== "object") {
-		return takeLeafSpans(plan).length > 0 ? PRIVATE_KEY_REDACTION_MARKER : value;
+		if (takeLeafSpans(plan).length === 0) return value;
+		return schemaPosition ? Object.create(null) : OMIT_SCHEMA_VALUE;
 	}
 
 	const source = value as Record<string, unknown>;
@@ -479,6 +571,7 @@ function sanitizeSchemaValue(value: unknown, propertyName: string | undefined, p
 					schema,
 					fieldIdentity(name),
 					plan,
+					true,
 				);
 			}
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = schemas;
@@ -495,7 +588,34 @@ function sanitizeSchemaValue(value: unknown, propertyName: string | undefined, p
 			}
 			continue;
 		}
-		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitizeSchemaValue(nested, propertyName, plan);
+		const childIsSchema = SCHEMA_SINGLE_KEYWORDS.has(keyword) || SCHEMA_LIST_KEYWORDS.has(keyword);
+		if (keyword === "type" && Array.isArray(nested) && nested.every(item => typeof item === "string")) {
+			// A `type` list accepts only type names, so a covered member cannot print as the marker.
+			// Members the mask touches are dropped; a list that loses every member is omitted.
+			const kept: string[] = [];
+			for (const item of nested) {
+				const covered = peekLeafSpans(plan).length > 0;
+				takeLeafSpans(plan);
+				if (!covered) kept.push(scrubText(item, []));
+			}
+			if (kept.length > 0) redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = kept;
+			continue;
+		}
+		if (typeof nested === "string" && !childIsSchema) {
+			// A keyword value the mask covers in full has to go: a string marker is valid JSON but not
+			// a valid value for an enumerated keyword such as `type`. The keyword itself is optional,
+			// so dropping it is the one replacement that cannot print the covered value.
+			const covered = peekLeafSpans(plan).some(span => span.start === 0 && span.end === nested.length);
+			if (covered) {
+				takeLeafSpans(plan);
+				continue;
+			}
+		}
+		const sanitized = sanitizeSchemaValue(nested, propertyName, plan, childIsSchema);
+		// A covered scalar under an ordinary keyword is dropped: the keyword is optional, and the
+		// covered value would otherwise have to print as something it is not.
+		if (sanitized === OMIT_SCHEMA_VALUE) continue;
+		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitized;
 	}
 	return redacted;
 }
@@ -536,9 +656,11 @@ function formatArgsAsXml(
 	if (mode === "schema") {
 		// A schema root is not an argument, so a definition named `_i` stays part of the schema,
 		// and every root entry is walked by the one structural pass.
-		const sanitized = sanitizeSchemaValue(decoded, undefined, plan) as Record<string, unknown>;
+		const sanitized = sanitizeSchemaValue(decoded, undefined, plan, true) as Record<string, unknown>;
 		for (const [key, value] of Object.entries(sanitized)) {
-			const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
+			// The structural walk already scrubbed every key; scrubbing it again would classify a
+			// marker this pass produced instead of the name the caller declared.
+			const escapedKey = escapeXmlAttribute(key);
 			parts.push(formatParameter(indent, escapedKey, formatSchemaText(value)));
 		}
 		return parts.join("\n");
@@ -551,7 +673,7 @@ function formatArgsAsXml(
 			skipValueLeaves(plan, value);
 			continue;
 		}
-		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
+		const escapedKey = escapeXmlAttribute(scrubName(key));
 		const text = escapeXmlText(serializeParameterValue(sanitizeDataValue(value, key, plan)));
 		parts.push(formatParameter(indent, escapedKey, text));
 	}

@@ -1238,6 +1238,7 @@ after=keep`;
 		const wrappedUrlSecret = "wrapped-s3cr3t";
 		const rawAtUrlPassword = "correct@horse";
 		const longSchemeUrlPassword = "opaque-database-password";
+		const tokenPrefixedUrlPassword = "token-prefixed-url-password";
 		const err = new Error(
 			[
 				`fetch failed: ${googleApiKey} ${trailingHyphenGoogleApiKey}`,
@@ -1246,6 +1247,7 @@ after=keep`;
 				`wrapped: _https://deploy:${wrappedUrlSecret}@git.example.com/x.git_`,
 				`raw-at: https://alice:${rawAtUrlPassword}@example.com/repo.git?keep=1`,
 				`database: postgresql+asyncpg://alice:${longSchemeUrlPassword}@example.com/db`,
+				`token-url: Token postgres://app:${tokenPrefixedUrlPassword}@example.com/db`,
 				`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
 			].join(" "),
 		);
@@ -1262,6 +1264,7 @@ after=keep`;
 		expect(contents).not.toContain(wrappedUrlSecret);
 		expect(contents).not.toContain(rawAtUrlPassword);
 		expect(contents).not.toContain(longSchemeUrlPassword);
+		expect(contents).not.toContain(tokenPrefixedUrlPassword);
 		expect(contents).not.toContain(pemBody);
 		expect(contents).toContain("«redacted-google-api-key»");
 		expect(contents).toContain("«redacted-private-key»");
@@ -1270,6 +1273,7 @@ after=keep`;
 		expect(contents).toContain("_https://«redacted-url-credential»@git.example.com/x.git_");
 		expect(contents).toContain("raw-at: https://«redacted-url-credential»@example.com/repo.git?keep=1");
 		expect(contents).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
+		expect(contents).toContain("token-url: «redacted-auth»://«redacted-url-credential»@example.com/db");
 	});
 
 	it("scans a large credential-free crash body in linear time", () => {
