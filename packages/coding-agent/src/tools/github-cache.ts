@@ -795,7 +795,7 @@ function scrubCacheText(text: string, diff = false): string {
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
 			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
 				containerDepthAt(text, offset) > 0 &&
-				((/["']/.test(match) && !/[=:][ \t]*["']/.test(match)) || closesMatchingContainer(text, offset, match))
+				((/["']/.test(match) && !/(["'])[^"']*\1/.test(match)) || closesMatchingContainer(text, offset, match))
 					? match
 					: `${lineStart}${marker}${label}«redacted»`,
 		)
