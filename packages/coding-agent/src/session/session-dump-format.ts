@@ -220,6 +220,13 @@ function formatArgumentText(value: unknown, key: string): string {
 const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"]);
 
 /**
+ * Keywords whose value maps arbitrary names to schemas rather than being a schema itself.
+ * Their entry names are definition identifiers, so an entry called `default` or `const`
+ * must not be read as the literal-data keyword of the same spelling.
+ */
+const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
+
+/**
  * Scrub a data value inside a schema (a `default`, `example`, or `const`).
  * The value is data, not schema structure, so it is scrubbed with the same rules as tool
  * arguments: credential-named fields are masked, text is scrubbed, and a known header
@@ -264,10 +271,11 @@ function redactSchemaEntry(value: Record<string, unknown>): Record<string, unkno
 
 /**
  * Scrub a paired tool schema without destroying its definitions.
- * Property names are schema structure, not credential assignments, so they stay
+ * Names in a schema map (`properties`, `patternProperties`, `$defs`, `definitions`,
+ * `dependentSchemas`) are schema structure, not credential assignments, so they stay
  * readable; only string leaves and data-carrying keywords are redacted. The entry
- * pairing already covered every value, so a property map nested under `properties`
- * keeps its property names as context without another pass.
+ * pairing already covered every value, so a map nested under one of those keywords
+ * keeps its names as context without another pass.
  */
 function sanitizeSchemaValue(value: unknown, propertyName?: string): unknown {
 	if (typeof value === "string") return redactCrashSecrets(value);
@@ -280,13 +288,13 @@ function sanitizeSchemaValue(value: unknown, propertyName?: string): unknown {
 	const dataFields = Object.keys(source).filter(field => SCHEMA_VALUE_KEYWORDS.has(field));
 	for (const [field, nested] of Object.entries(source)) {
 		const dataIndex = dataFields.indexOf(field);
-		if (field === "properties" && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
-			const properties = Object.create(null) as Record<string, unknown>;
-			const propertyKeys = new Map<string, number>();
+		if (SCHEMA_MAP_KEYWORDS.has(field) && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+			const schemas = Object.create(null) as Record<string, unknown>;
+			const nameSuffixes = new Map<string, number>();
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
-				properties[uniqueScrubbedKey(properties, name, propertyKeys)] = sanitizeSchemaValue(schema, name);
+				schemas[uniqueScrubbedKey(schemas, name, nameSuffixes)] = sanitizeSchemaValue(schema, name);
 			}
-			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = properties;
+			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = schemas;
 			continue;
 		}
 		if (dataIndex >= 0) {

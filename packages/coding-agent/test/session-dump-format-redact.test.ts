@@ -628,6 +628,34 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain("#2");
 	});
 
+	it("keeps a schema definition named after a data keyword", () => {
+		const secret = "OPAQUE_DEFINITION_DEFAULT";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						$defs: {
+							default: { type: "object", properties: { token: { type: "string", minLength: 10 } } },
+						},
+						properties: {
+							payload: { $ref: "#/$defs/default" },
+							token: { type: "string", default: secret },
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).toContain('"minLength": 10');
+		expect(dumped).toContain('"$ref": "#/$defs/default"');
+		expect(dumped).not.toContain(secret);
+	});
+
 	it("keeps header-pair redaction inside a schema default", () => {
 		const secret = "OPAQUE_SCHEMA_HEADER_SECRET";
 		const dumped = formatSessionDumpText({
