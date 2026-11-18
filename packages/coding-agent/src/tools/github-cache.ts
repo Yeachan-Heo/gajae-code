@@ -732,6 +732,33 @@ function closesMatchingContainer(text: string, end: number, match: string): bool
 	return false;
 }
 
+/** Double-quote state from the outermost open container to a match. */
+function insideContainerQuote(text: string, end: number): boolean {
+	const stack: number[] = [];
+	for (let i = 0; i < end; i++) {
+		const ch = text[i];
+		if (ch === "{" || ch === "[") stack.push(i);
+		else if (ch === "}" || ch === "]") stack.pop();
+	}
+	const start = stack.length > 0 ? (stack[0] ?? 0) : 0;
+	let quoted = false;
+	for (let i = start + 1; i < end; i++) {
+		if (text[i] !== '"' || text[i - 1] === "\\") continue;
+		quoted = !quoted;
+	}
+	return quoted;
+}
+
+/** True when the match itself contains a paired double-quoted value. */
+function hasLocalDoubleQuotePair(match: string): boolean {
+	const first = match.indexOf('"');
+	if (first < 0) return false;
+	for (let i = first + 1; i < match.length; i++) {
+		if (match[i] === '"' && match[i - 1] !== "\\") return true;
+	}
+	return false;
+}
+
 /** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
 function containerDepthAt(text: string, end: number): number {
 	let depth = 0;
@@ -795,7 +822,9 @@ function scrubCacheText(text: string, diff = false): string {
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
 			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
 				containerDepthAt(text, offset) > 0 &&
-				((/["']/.test(match) && !/(["'])[^"']*\1/.test(match)) || closesMatchingContainer(text, offset, match))
+				(insideContainerQuote(text, offset) ||
+					closesMatchingContainer(text, offset, match) ||
+					(match.includes('"') && !hasLocalDoubleQuotePair(match)))
 					? match
 					: `${lineStart}${marker}${label}«redacted»`,
 		)
