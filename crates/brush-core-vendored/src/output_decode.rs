@@ -170,33 +170,36 @@ impl OutputDecoder {
 
 	fn drain(&mut self, eof: bool) -> String {
 		let mut out = String::new();
+		let mut consumed = 0;
 
 		// Single iterative loop that switches mode as needed, avoiding mutual recursion.
 		// Mode switching happens at line boundaries when in ACP mode (switch to UTF-8),
 		// or when invalid UTF-8 is encountered (switch to ACP on Windows).
 		loop {
-			if self.pending.is_empty() {
+			let remaining = &self.pending[consumed..];
+			if remaining.is_empty() {
+				self.pending.drain(..consumed);
 				return out;
 			}
 
 			match self.state.mode {
 				Mode::Utf8 => {
-					match str::from_utf8(&self.pending) {
+					match str::from_utf8(remaining) {
 						Ok(text) => {
 							out.push_str(text);
-							self.pending.clear();
+							self.pending.drain(..consumed + remaining.len());
 							return out;
-						},
+					},
 						Err(error) => {
 							let valid_up_to = error.valid_up_to();
 							let error_len = error.error_len();
 							if valid_up_to > 0 {
-								// SAFETY: [..valid_up_to] is valid UTF-8 by valid_up_to().
-								out.push_str(unsafe { str::from_utf8_unchecked(&self.pending[..valid_up_to]) });
+								// SAFETY: [valid_up_to] is valid UTF-8 by valid_up_to().
+								out.push_str(unsafe { str::from_utf8_unchecked(&remaining[..valid_up_to]) });
 							}
 
 							if error_len.is_none() && !eof {
-								self.pending.drain(..valid_up_to);
+								self.pending.drain(..consumed + valid_up_to);
 								return out;
 							}
 
@@ -205,7 +208,7 @@ impl OutputDecoder {
 								// One encoding per command. Do not resume UTF-8 after
 								// a bad byte: later UTF-8 would be ACP-mojibake, but
 								// cmd/chcp emit ACP for the whole stream.
-								self.pending.drain(..valid_up_to);
+								consumed += valid_up_to;
 								// Loop continues in ACP mode; do not return.
 								continue;
 							}
@@ -214,20 +217,21 @@ impl OutputDecoder {
 							// UTF-8 for the next chunk (unless EOF).
 							let error_end = valid_up_to + error_len.unwrap_or(0);
 							if error_end > valid_up_to {
-								out.push_str(&String::from_utf8_lossy(&self.pending[valid_up_to..error_end]));
+								out.push_str(&String::from_utf8_lossy(&remaining[valid_up_to..error_end]));
 							}
 							if eof {
 								// At EOF, lossy-decode any remaining incomplete sequence.
-								if error_end < self.pending.len() {
-									out.push_str(&String::from_utf8_lossy(&self.pending[error_end..]));
+								if error_end < remaining.len() {
+									out.push_str(&String::from_utf8_lossy(&remaining[error_end..]));
 								}
-								self.pending.clear();
+								self.pending.drain(..consumed + remaining.len());
 								return out;
 							} else {
 								// Not EOF: keep incomplete sequence for next chunk.
-								self.pending.drain(..error_end);
+								consumed += error_end;
 								// Continue looping to process any remaining malformed bytes in pending.
-								if self.pending.is_empty() {
+								if consumed >= self.pending.len() {
+									self.pending.drain(..consumed);
 									return out;
 								}
 							}
@@ -240,25 +244,26 @@ impl OutputDecoder {
 					// Once we find a newline, reset back to UTF-8 mode for the next line.
 					let mut line_end = None;
 					let mut index = 0;
-					while index < self.pending.len() {
-						if self.pending[index] == b'\n' {
+					while index < remaining.len() {
+						if remaining[index] == b'\n' {
 							line_end = Some(index + 1);
 							break;
 						}
-						let Some(char_len) = acp_character_len(self.state.fallback_codepage, &self.pending[index..], eof) else {
+						let Some(char_len) = acp_character_len(self.state.fallback_codepage, &remaining[index..], eof) else {
 							break;
 						};
 						index += char_len;
 					}
 
-					let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, &self.pending, eof));
+					let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, remaining, eof));
 					if len == 0 {
+						self.pending.drain(..consumed);
 						return out;
 					}
 
-					let decoded = decode_codepage(self.state.fallback_codepage, &self.pending[..len])
-						.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
-					self.pending.drain(..len);
+					let decoded = decode_codepage(self.state.fallback_codepage, &remaining[..len])
+						.unwrap_or_else(|| String::from_utf8_lossy(&remaining[..len]).into_owned());
+					consumed += len;
 					out.push_str(&decoded);
 
 					// If we found a line ending (newline), reset back to UTF-8 mode for the next line.
@@ -270,6 +275,7 @@ impl OutputDecoder {
 
 					// No newline found and we've processed all complete ACP sequences.
 					// Return and wait for more data or EOF.
+					self.pending.drain(..consumed);
 					return out;
 				},
 			}
@@ -720,6 +726,53 @@ mod tests {
 				// Valid line should be 'A'
 				assert_eq!(line, "A", "Line {} should be 'A'", i);
 			}
+		}
+	}
+
+	#[test]
+	fn many_short_alternating_lines_decode_efficiently() {
+		// Regression test for quadratic decode performance with many short lines.
+		// Before fix: each drain() is O(n), so processing 200k lines becomes O(n²)
+		// and takes many seconds even in debug mode.
+		// After fix: single drain at the end makes it O(n), should be < 1s in debug.
+		//
+		// This test feeds 200,000 short alternating UTF-8 lines (each 2 bytes: a char + \n)
+		// to the decoder. The old implementation would drain the buffer after each line,
+		// causing O(n) operations for each of 200k lines = O(n²) total.
+		let mut decoder = OutputDecoder::new();
+
+		let mut buffer = Vec::new();
+		const NUM_LINES: usize = 200_000;
+		let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+		for i in 0..NUM_LINES {
+			// Add a character (cycling through the available set) followed by newline
+			buffer.push(chars[i % chars.len()]);
+			buffer.push(b'\n');
+		}
+
+		// Decode the entire buffer
+		let result = decoder.push(&buffer);
+		let finish = decoder.finish();
+		let total_output = result + &finish;
+
+		// Verify correctness: should have exactly 200k lines
+		let line_count = total_output.lines().count();
+		assert_eq!(
+			line_count, NUM_LINES,
+			"Expected {} lines, got {}",
+			NUM_LINES, line_count
+		);
+
+		// Verify each line is a single character from our character set
+		for (i, line) in total_output.lines().enumerate() {
+			let expected_char = chars[i % chars.len()] as char;
+			assert_eq!(
+				line, expected_char.to_string().as_str(),
+				"Line {} should contain character at index {}, got '{}'",
+				i,
+				i % chars.len(),
+				line
+			);
 		}
 	}
 }
