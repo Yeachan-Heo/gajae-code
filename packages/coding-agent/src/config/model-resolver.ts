@@ -18,9 +18,11 @@ import chalk from "chalk";
 import { parseThinkingLevel, resolveThinkingLevelForModel, splitSelectorThinkingSuffix } from "../thinking";
 import { isAuthenticatedOrKeyless } from "./model-auth";
 import { compareEquivalentModelVariants, getFinalSlashSegmentAliasKey } from "./model-equivalence";
-import { MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
+import type { ModelRegistry, ModelRole } from "./model-registry";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
+
+export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
 
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = DEFAULT_MODEL_PER_PROVIDER;

@@ -75,7 +75,12 @@ function normalizeVllmApiKey(provider: string, apiKey: string | undefined): stri
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import { $pickCredentialEnv, $rotatingCredentialEnv, getAgentDir, isRecord, logger } from "@gajae-code/utils";
-import { parseModelString, resolveProviderModelReference, splitSelectorThinkingSuffix } from "../config/model-resolver";
+import {
+	MODEL_ROLE_IDS,
+	parseModelString,
+	resolveProviderModelReference,
+	splitSelectorThinkingSuffix,
+} from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import {
 	type ActiveProviderDescriptor,
@@ -294,7 +299,7 @@ export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 	default: { tag: "DEFAULT", name: "Default", color: "success" },
 };
 
-export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
+export { MODEL_ROLE_IDS };
 export const MODEL_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 export const MODEL_PROFILE_NAME_PATTERN_DESCRIPTION = "lowercase letters, numbers, dots, underscores, or hyphens";
 export type GjcModelAssignmentTargetId = (typeof GJC_MODEL_ASSIGNMENT_TARGET_IDS)[number];
