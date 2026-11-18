@@ -3321,7 +3321,7 @@ function createControlSurface(
 			: { changed: true };
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
-	const pendingPreflights = new Map<string, Set<() => void | boolean>>();
+	const pendingPreflights = new Map<string, Set<() => undefined | boolean>>();
 	// The SDK connection that accepted the currently active prompt/skill, if
 	// any: terminal aborts are requester-scoped, so another connection must
 	// never stop it, and an agent-initiated turn (monitor/cron follow-up) has
