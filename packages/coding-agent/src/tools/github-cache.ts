@@ -513,34 +513,43 @@ function tableRowFlags(lines: string[]): boolean[] {
 	// top-level four-space line is code. Track list continuations so the two are
 	// distinguished without a full Markdown parser.
 	const inList = new Array<boolean>(rows.length).fill(false);
+	const listIndentAt = new Array<number | null>(rows.length).fill(null);
 	let listIndent: number | null = null;
 	for (let i = 0; i < rows.length; i++) {
+		// Markers inside a fence are literal text, not list structure.
+		if (fenced[i] === true) continue;
 		const row = rows[i] ?? "";
 		const marker = /^(\s*)(?:[-+*]|\d+[.)])\s+/.exec(row);
 		if (marker) {
 			listIndent = (marker[0] ?? "").length;
 			inList[i] = true;
+			listIndentAt[i] = listIndent;
 			continue;
 		}
 		if (row.trim() === "") {
 			inList[i] = listIndent !== null;
+			listIndentAt[i] = listIndent;
 			continue;
 		}
 		if (listIndent !== null && indentOf(row) >= listIndent) {
 			inList[i] = true;
+			listIndentAt[i] = listIndent;
 			continue;
 		}
 		listIndent = null;
 	}
-	for (let i = 0; i < lines.length; i++) {
-		if (fenced[i] === true) continue;
-		const raw = rows[i] ?? "";
-		// Four or more columns outside a list is an indented code block, never a
-		// table row.
-		if (indentOf(raw) >= 4 && inList[i] !== true) continue;
-		const trimmed = raw.trim();
-		if (trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"))) flags[i] = true;
-	}
+	// Four columns past the list content baseline is an indented code block
+	// nested in the item, just as four columns past column 0 is top-level code.
+	const isIndentedCode = (index: number): boolean => {
+		const indent = indentOf(rows[index] ?? "");
+		if (inList[index] === true) {
+			const base = listIndentAt[index];
+			return base !== null && indent >= base + 4;
+		}
+		return indent >= 4;
+	};
+	// A GFM table always has a delimiter row; a pipe-delimited line without one
+	// is plain text, so the delimiter pass below is the only table signal.
 	let covered = -1;
 	for (let i = 1; i < lines.length; i++) {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
@@ -556,7 +565,7 @@ function tableRowFlags(lines: string[]): boolean[] {
 		for (; j < lines.length; j++) {
 			if (fenced[j] === true) break;
 			const row = rows[j] ?? "";
-			if (row.trim() === "" || !row.includes("|") || (indentOf(row) >= 4 && inList[j] !== true)) break;
+			if (row.trim() === "" || !row.includes("|") || isIndentedCode(j)) break;
 			flags[j] = true;
 		}
 		covered = j - 1;

@@ -847,12 +847,12 @@ describe("github view cache persistence", () => {
 	it("strips userinfo from escaped scheme-relative links and keeps table cells apart", () => {
 		const body = [
 			"json \\/\\/user:opaque@host/x",
-			"|//docs.example|'person@example.test'|",
 			"https://alice:demo|value@example.test/x",
 			"https://alice:opaque|canary|value@example.test/y",
 			"first|second",
 			"---|---",
 			"https://docs.example|'person@example.test'",
+			"|//docs.example|'person@example.test'|",
 			"|https://alice:pa\\|ss@example.test/z|keep|",
 			"~~~",
 			"```",
@@ -867,6 +867,9 @@ describe("github view cache persistence", () => {
 			"- item\n\n    ```text\n    |https://alice:demo|value@example.test/x|\n    ```\n",
 			"plain text\n\n    |https://alice:demo|value@example.test/x|\r\n",
 			"10. Item\n\n    | URL | Contact |\n    |---|---|\n    |https://docs.example|person@example.test|",
+			"- item\n\n      |https://alice:demo|value@example.test/x|",
+			"- item\n\n    |https://alice:demo|value@example.test/x|",
+			"```\n- item\n  ```\n\n    |https://alice:demo|value@example.test/x|",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
@@ -1016,6 +1019,8 @@ describe("github view cache persistence", () => {
 
 	it("does not merge two compact table cells into one URL", () => {
 		const body = [
+			"| left | right |",
+			"|---|---|",
 			"|//example.test|dev@else.test|",
 			"|https://docs.example|dev@else.test|",
 			"|https://docs.example|'person@example.test'|",
@@ -1036,6 +1041,8 @@ describe("github view cache persistence", () => {
 		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 78, true, TEST_AUTH_KEY);
 		expect(cached?.payload.body).toBe(
 			[
+				"| left | right |",
+				"|---|---|",
 				"|//example.test|dev@else.test|",
 				"|https://docs.example|dev@else.test|",
 				"|https://docs.example|'person@example.test'|",
