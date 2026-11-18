@@ -741,10 +741,9 @@ function scrubCacheText(text: string, diff = false): string {
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutParameterizedAuth);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
-	const withoutCookies = withoutBearer.replace(
-		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)[^\r\n]+/gi,
-		"$1«redacted»",
-	);
+	const withoutCookies = withoutBearer
+		.replace(/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)[^\r\n]+/gi, "$1$2$3«redacted»")
+		.replace(/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)[^\r\n]+/gi, "$1«redacted»");
 	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);
 	let scrubbed = redactCrashSecrets(withoutAtSigns);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
