@@ -331,28 +331,26 @@ const AT_SIGN_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-at-\u0000`;
 
 /**
  * Find the end of a JSON object or array, honoring quoted strings and escapes so
- * a `}` or `]` inside a string cannot end the value early.
+ * a `}` or `]` inside a string cannot end the value early. String structure is
+ * read by the same serialization-layer helpers the container scanner uses, so
+ * a `\"`-delimited inner representation is balanced here too.
  */
 function findBalancedValueEnd(text: string, start: number): number {
 	const stack: string[] = [];
-	let quote: string | null = null;
-	let escaped = false;
 	for (let index = start; index < text.length; index += 1) {
 		const character = text.charAt(index);
-		if (quote) {
-			if (escaped) {
-				escaped = false;
-				continue;
-			}
-			if (character === "\\") {
-				escaped = true;
-				continue;
-			}
-			if (character === quote) quote = null;
+		const opener = containerStringAt(text, index, text.length);
+		if (opener !== null) {
+			const quote = text.charAt(opener.quoteIndex);
+			const close = findStringEnd(text, opener.quoteIndex, quote, opener.layer, text.length);
+			if (close === -1) return -1;
+			index = close;
 			continue;
 		}
-		if (character === '"' || (character === "'" && !isWordApostrophe(text, index))) {
-			quote = character;
+		if (character === "\\") {
+			let run = 1;
+			while (text[index + run] === "\\") run++;
+			index += run % 2 === 1 ? run : run - 1;
 			continue;
 		}
 		if (character === "{") {
@@ -386,10 +384,11 @@ function maskCredentialJsonContainers(
 	let out = "";
 	let last = 0;
 	for (const match of text.matchAll(
-		/(?<![A-Za-z0-9])"((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)"\s*:\s*/gi,
+		/(?<![A-Za-z0-9])(\\?)"((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)\\?"\s*:\s*/gi,
 	)) {
 		const matchIndex = match.index ?? 0;
 		if (matchIndex < last) continue;
+		const quoteEscape = match[1] ?? "";
 		const valueStart = matchIndex + match[0].length;
 		const first = text.charAt(valueStart);
 		if (first !== "{" && first !== "[") continue;
@@ -407,7 +406,7 @@ function maskCredentialJsonContainers(
 			// has no safe intermediate stop: fail closed to the end of the text.
 			end = section === -1 ? text.length : valueStart + section;
 		}
-		out += text.slice(last, valueStart) + '"«redacted»"';
+		out += text.slice(last, valueStart) + `${quoteEscape}"«redacted»${quoteEscape}"`;
 		last = end;
 	}
 	out += text.slice(last);
@@ -775,17 +774,39 @@ function isWordApostrophe(text: string, index: number): boolean {
 	return /[A-Za-z0-9]/.test(text[index - 1] ?? "") && /[A-Za-z0-9]/.test(text[index + 1] ?? "");
 }
 
-/** True when the current line starts a credential header. */
-function lineStartsCredentialHeader(text: string, index: number): boolean {
-	const start = text.lastIndexOf("\n", index) + 1;
-	const end = text.indexOf("\n", index);
-	return startsCredentialHeader(text.slice(start, end === -1 ? text.length : end));
+/** Facts about the physical line that holds `index`, cached across one scan. */
+interface LineFacts {
+	start: number;
+	end: number;
+	header: boolean;
+	/** Offset of the first byte that is neither indentation nor the diff marker. */
+	firstContent: number;
 }
 
-/** True when only indentation/marker precedes a single quote on its line. */
-function isSingleQuoteItemStart(text: string, index: number): boolean {
-	const start = text.lastIndexOf("\n", index) + 1;
-	return /^[ \t]*[-+]?[ \t]*$/.test(text.slice(start, index));
+/**
+ * Resolve the facts of the line containing `index`. The scan only moves
+ * forward, so the previous line's facts are reused until the offset leaves it;
+ * the per-line work (slice + regex + prefix walk) happens once per line instead
+ * of once per quote, which keeps a long prose line with many quotes linear.
+ */
+function lineFactsAt(text: string, index: number, cache: { value: LineFacts | null }): LineFacts {
+	const cached = cache.value;
+	if (cached !== null && index >= cached.start && (cached.end === -1 || index <= cached.end)) return cached;
+	const start = text.lastIndexOf("\n", index - 1) + 1;
+	const newline = text.indexOf("\n", index);
+	const end = newline === -1 ? -1 : newline;
+	const line = text.slice(start, end === -1 ? text.length : end);
+	let firstContent = line.length;
+	for (let offset = 0; offset < line.length; offset++) {
+		const ch = line[offset] as string;
+		if (ch === " " || ch === "\t") continue;
+		if ((ch === "+" || ch === "-") && offset === 0) continue;
+		firstContent = offset;
+		break;
+	}
+	const value: LineFacts = { start, end, header: startsCredentialHeader(line), firstContent };
+	cache.value = value;
+	return value;
 }
 
 /**
@@ -1062,6 +1083,7 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 	const stack: { closer: string; credential: CredentialHeaderMatch | null }[] = [];
 	let openCredentialContainers = 0;
 	let string: { quote: string; layer: number } | null = null;
+	const lineFacts: { value: LineFacts | null } = { value: null };
 	let pending: CredentialHeaderMatch | null = null;
 	for (let index = 0; index < text.length; index++) {
 		const ch = text[index] as string;
@@ -1138,13 +1160,15 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 			string = { quote: ch, layer: 1 };
 			continue;
 		}
-		if (
-			ch === "'" &&
-			!isWordApostrophe(text, index) &&
-			(stack.length > 0 || lineStartsCredentialHeader(text, index) || isSingleQuoteItemStart(text, index))
-		) {
-			string = { quote: ch, layer: 1 };
-			continue;
+		if (ch === "'") {
+			const facts = lineFactsAt(text, index, lineFacts);
+			if (
+				!isWordApostrophe(text, index) &&
+				(stack.length > 0 || facts.header || index - facts.start <= facts.firstContent)
+			) {
+				string = { quote: ch, layer: 1 };
+				continue;
+			}
 		}
 		if (ch === "[" || ch === "{") {
 			const credential = pending !== null && pending.valueStart === index ? pending : null;
@@ -1192,6 +1216,14 @@ function redactSkeletonRegion(text: string, start: number, end: number): string 
 	let index = start;
 	while (index < end) {
 		const ch = text[index] as string;
+		// A physical line break is always framing, never content: the redacted
+		// text must keep the region's line count or a projection write-back
+		// shifts every following line.
+		if (ch === "\n" || ch === "\r") {
+			out += ch;
+			index++;
+			continue;
+		}
 		// `\X` is one content escape, never structure: an escaped bracket or
 		// quote must not be emitted as a real one, or the next scrub misreads it.
 		if (isLineLeadingDiffMarker(text, index) || (isContainerSkeleton(ch) && !isEscapedAt(text, index))) {
@@ -1201,7 +1233,9 @@ function redactSkeletonRegion(text: string, start: number, end: number): string 
 		}
 		let runEnd = index + 1;
 		while (runEnd < end) {
+			if (text[runEnd] === "\n" || text[runEnd] === "\r") break;
 			if (text[runEnd] === "\\") {
+				if (text[runEnd + 1] === "\n" || text[runEnd + 1] === "\r") break;
 				runEnd += 2;
 				continue;
 			}
@@ -1254,12 +1288,15 @@ function redactContainerBody(text: string, span: CredentialContainerSpan): strin
 }
 
 /**
- * Mask every credential header container in one text region and return the
- * restore function. The header itself is masked too, so no later line-level or
- * shared rule can collapse it, delete its opener, or reformat a diff hunk.
+ * Mask every given credential container span in one text region. The header
+ * itself is masked too, so no later line-level or shared rule can collapse it,
+ * delete its opener, or reformat a diff hunk.
  */
-function redactCredentialContainersInSection(text: string, masked: string[]): string {
-	const spans = findCredentialContainerSpans(text);
+function maskCredentialContainersInSection(
+	text: string,
+	spans: readonly CredentialContainerSpan[],
+	masked: string[],
+): string {
 	if (spans.length === 0) return text;
 	let out = "";
 	let last = 0;
@@ -1289,12 +1326,17 @@ function redactCredentialContainersInSection(text: string, masked: string[]): st
 	return out + text.slice(last);
 }
 
+/** Mask every credential container in one text region. */
+function redactCredentialContainersInSection(text: string, masked: string[]): string {
+	return maskCredentialContainersInSection(text, findCredentialContainerSpans(text), masked);
+}
+
 /** One physical line of unified-diff hunk content. `end` excludes the newline. */
 interface UnifiedDiffLine {
 	start: number;
 	contentStart: number;
 	end: number;
-	prefix: " " | "+" | "-";
+	prefix: " " | "+" | "-" | "\\";
 }
 
 interface UnifiedDiffHunk {
@@ -1323,9 +1365,13 @@ function lexUnifiedDiff(text: string): UnifiedDiffHunk[] {
 			const prefix = text[start];
 			if (current !== null && (prefix === " " || prefix === "+" || prefix === "-")) {
 				current.lines.push({ start, contentStart: start + 1, end, prefix });
+			} else if (current !== null && prefix === "\\") {
+				// `\ No newline at end of file` is hunk framing, not content. It stays
+				// in the hunk so the following side keeps the same projection, but it
+				// is excluded from every projection and copied verbatim.
+				current.lines.push({ start, contentStart: start, end, prefix: "\\" });
 			} else {
-				// A blank separator or `\ No newline at end of file` marker closes the
-				// hunk body; the remaining text is scanned as prose.
+				// A blank separator closes the hunk body; the remaining text is prose.
 				current = null;
 			}
 		}
@@ -1343,51 +1389,122 @@ function lexUnifiedDiff(text: string): UnifiedDiffHunk[] {
  * opener that closes on one side leaves the other side open (and therefore
  * fails closed through the end of its hunk). The redacted projection line is
  * written back into its own physical line, keeping prefixes and framing.
+ *
+ * A line can be masked by more than one projection with different coverage:
+ * the tail of an old-only container and a header later on the same context
+ * line are two disjoint redactions of one physical line. Choosing either
+ * variant would leave the other side's content behind, so disagreeing variants
+ * fall back to the union of their covered character ranges.
  */
 function redactDiffProjections(text: string, masked: string[]): string {
 	const hunks = lexUnifiedDiff(text);
 	if (hunks.length === 0) return redactCredentialContainersInSection(text, masked);
 	const projections: ((line: UnifiedDiffLine) => boolean)[] = [
 		line => line.prefix === " ",
-		line => line.prefix !== "+",
-		line => line.prefix !== "-",
+		line => line.prefix === " " || line.prefix === "-",
+		line => line.prefix === " " || line.prefix === "+",
 	];
 	let out = "";
 	let cursor = 0;
 	for (const hunk of hunks) {
 		out += redactCredentialContainersInSection(text.slice(cursor, hunk.lines[0]!.start), masked);
-		const redacted: (string | null)[] = new Array(hunk.lines.length).fill(null);
+		// One candidate per projection that masked the line. A `null` text means
+		// the projection could not be written back line for line; its coverage is
+		// still authoritative.
+		const variants: { text: string | null; coverage: [number, number][] }[][] = hunk.lines.map(() => []);
 		for (const include of projections) {
 			const rawIndex: number[] = [];
+			const offsets: number[] = [];
+			const widths: number[] = [];
 			let projection = "";
 			for (let index = 0; index < hunk.lines.length; index++) {
 				const line = hunk.lines[index]!;
 				if (!include(line)) continue;
+				const content = text.slice(line.contentStart, line.end);
 				rawIndex.push(index);
-				projection += `${text.slice(line.contentStart, line.end)}\n`;
+				offsets.push(projection.length);
+				widths.push(content.length);
+				projection += `${content}\n`;
 			}
 			if (projection.length === 0) continue;
-			const section = redactCredentialContainersInSection(projection, masked);
-			if (section === projection) continue;
+			const spans = findCredentialContainerSpans(projection);
+			if (spans.length === 0) continue;
+			const section = maskCredentialContainersInSection(projection, spans, masked);
 			const sectionLines = section.split("\n");
+			const aligned = sectionLines.length === rawIndex.length + 1;
 			for (let position = 0; position < rawIndex.length; position++) {
 				const index = rawIndex[position]!;
-				if (redacted[index] !== null) continue;
+				const line = hunk.lines[index]!;
+				const original = text.slice(line.contentStart, line.end);
 				const content = sectionLines[position];
-				if (content === undefined) continue;
-				const original = text.slice(hunk.lines[index]!.contentStart, hunk.lines[index]!.end);
-				if (content !== original) redacted[index] = content;
+				const coverage: [number, number][] = [];
+				const lineStart = offsets[position]!;
+				const lineEnd = lineStart + widths[position]!;
+				for (const span of spans) {
+					if (span.valueEnd <= lineStart || span.valueStart > lineEnd) continue;
+					const start = Math.max(0, span.valueStart - lineStart);
+					const end = Math.min(widths[position]!, span.valueEnd - lineStart);
+					if (end > start) coverage.push([start, end]);
+				}
+				if (coverage.length === 0) continue;
+				variants[index]!.push({ text: aligned ? (content ?? null) : null, coverage });
 			}
 		}
 		for (let index = 0; index < hunk.lines.length; index++) {
 			const line = hunk.lines[index]!;
-			out +=
-				text.slice(line.start, line.contentStart) + (redacted[index] ?? text.slice(line.contentStart, line.end));
+			const original = text.slice(line.contentStart, line.end);
+			const lineVariants = variants[index]!;
+			let content = original;
+			if (lineVariants.length === 1) {
+				const only = lineVariants[0]!;
+				content = only.text ?? redactCoveredRuns(original, only.coverage);
+			} else if (lineVariants.length > 1) {
+				const first = lineVariants[0]!;
+				const same = first.text !== null && lineVariants.every(variant => variant.text === first.text);
+				content = same
+					? (first.text as string)
+					: redactCoveredRuns(
+							original,
+							lineVariants.flatMap(variant => variant.coverage),
+						);
+			}
+			out += text.slice(line.start, line.contentStart) + content;
 			if (index < hunk.lines.length - 1) out += "\n";
 		}
 		cursor = hunk.lines.at(-1)!.end;
 	}
 	return out + redactCredentialContainersInSection(text.slice(cursor), masked);
+}
+
+/** Merge overlapping or adjacent character ranges of one line. */
+function mergeLineRanges(ranges: readonly [number, number][]): [number, number][] {
+	const sorted = [...ranges].sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+	const merged: [number, number][] = [];
+	for (const [start, end] of sorted) {
+		const top = merged.at(-1);
+		if (top !== undefined && start <= top[1]) {
+			if (end > top[1]) top[1] = end;
+			continue;
+		}
+		merged.push([start, end]);
+	}
+	return merged;
+}
+
+/**
+ * Redact the union of covered character ranges of one physical line. Used when
+ * projections disagree about what a shared line contains: whatever any side
+ * covers is credential material, so nothing a side redacted can survive.
+ */
+function redactCoveredRuns(line: string, ranges: readonly [number, number][]): string {
+	let out = "";
+	let index = 0;
+	for (const [start, end] of mergeLineRanges(ranges)) {
+		if (start > index) out += line.slice(index, start);
+		out += redactSkeletonRegion(line, start, end);
+		index = end;
+	}
+	return out + line.slice(index);
 }
 
 /**

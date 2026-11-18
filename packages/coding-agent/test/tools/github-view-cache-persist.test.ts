@@ -2029,13 +2029,39 @@ describe("github view cache persistence", () => {
 		});
 
 		it("redacts through a doubly escaped serialization layer", () => {
-			const body = 'Auth: [\n  \\\\"deep]fragment\\\\",\n  "deep-layer-opaque"\n]';
+			// Layer 3 delimiters are three backslashes plus a quote, so the fixture
+			// is built from an explicit run instead of a hard-to-count literal.
+			const layer3 = "\\".repeat(3);
+			const body = `Auth: [\n  ${layer3}"deep]fragment${layer3}",\n  "deep-layer-opaque"\n]`;
 			storeBody(1332, body);
 			const stored = readBody(1332) ?? "";
 			expect(stored).not.toContain("deep]fragment");
 			expect(stored).not.toContain("deep-layer-opaque");
 			expect(cacheFileBytes()).not.toContain("deep-layer-opaque");
+			expect(stored).toContain(`${layer3}"«redacted»${layer3}"`);
 			expect(stored).not.toContain("\u0000");
+		});
+
+		it("keeps the line count when a quoted item holds a line continuation", () => {
+			// A backslash before a line break is content, not an escape of the
+			// break. Consuming the break dropped a physical line and shifted every
+			// following write-back line.
+			const body = 'Cookie: [\n  "line-one \\\n  line-two continuation-opaque"\n]\nafter=keep';
+			storeBody(1339, body);
+			const stored = readBody(1339) ?? "";
+			expect(stored).not.toContain("continuation-opaque");
+			expect(stored).toContain("after=keep");
+			expect(stored.split("\n")).toHaveLength(body.split("\n").length);
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("redacts a JSON container whose key is inside an escaped layer", () => {
+			const body = 'payload: {\\"token\\": [\\"escaped-json-opaque\\", 2], \\"keep\\": 1}';
+			storeBody(1340, body);
+			const stored = readBody(1340) ?? "";
+			expect(stored).not.toContain("escaped-json-opaque");
+			expect(stored).toContain('\\"keep\\": 1');
+			expect(stored).toContain('\\"«redacted»\\"');
 		});
 
 		it("crosses a marked blank line between a header and its opener", () => {
@@ -2094,6 +2120,135 @@ describe("github view cache persistence", () => {
 			expect(cacheFileBytes()).not.toContain("context-closed-opaque");
 			expect(unified).toContain("@@ -1,2 +1,3 @@");
 			expect(unified.split("\n")).toContain("-]");
+			expect(unified).not.toContain("\u0000");
+		});
+
+		it("unions disjoint redactions of one shared context line", () => {
+			// The context line is the tail of an old-only container and also holds an
+			// independent header. Taking either projection's line would leave the
+			// other side's item behind, so both covered ranges are redacted.
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1,2 +1,2 @@",
+				"-Cookie: [",
+				' "old-tail-opaque"]; Auth: ["shared-line-opaque"]',
+				"+new",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1341,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1341, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("old-tail-opaque");
+			expect(unified).not.toContain("shared-line-opaque");
+			expect(cacheFileBytes()).not.toContain("old-tail-opaque");
+			expect(cacheFileBytes()).not.toContain("shared-line-opaque");
+			expect(unified).not.toContain("\u0000");
+		});
+
+		it("projects interleaved old-side and new-side containers separately", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1,3 +1,3 @@",
+				"-Cookie: [",
+				'-  "old-side-projection-opaque"',
+				"-]",
+				"+Cookie: [",
+				'+  "new-side-projection-opaque"',
+				"+]",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1336,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1336, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("old-side-projection-opaque");
+			expect(unified).not.toContain("new-side-projection-opaque");
+			expect(unified.split("\n")).toContain("-]");
+			expect(unified.split("\n")).toContain("+]");
+		});
+
+		it("keeps no-newline markers while redacting both sides of a hunk", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1,2 +1,2 @@",
+				"-Cookie: [",
+				"-old-marker-opaque",
+				"\\ No newline at end of file",
+				"+Cookie: [",
+				"+new-marker-opaque",
+				"\\ No newline at end of file",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1337,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1337, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("old-marker-opaque");
+			expect(unified).not.toContain("new-marker-opaque");
+			expect(unified.split("\n").filter(line => line === "\\ No newline at end of file")).toHaveLength(2);
+		});
+
+		it("restores both containers when two sit on one line", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1,2 +1,2 @@",
+				'- Cookie: ["first-slot-opaque"]; Auth: ["second-slot-opaque"]',
+				" ctx",
+				"+added",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1338,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1338, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("first-slot-opaque");
+			expect(unified).not.toContain("second-slot-opaque");
+			expect(unified).toContain("; Auth: ");
 			expect(unified).not.toContain("\u0000");
 		});
 	});
