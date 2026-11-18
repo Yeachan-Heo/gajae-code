@@ -1495,6 +1495,8 @@ describe("github view cache persistence", () => {
 			'Authorization: Token token="fixture-param-auth-54"\nrest',
 			'echo "Authorization=NTLM TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA="',
 			String.raw`trace "Authorization=Token token='prefix\' fixture-param-tail-55'"`,
+			String.raw`echo "Authorization=Token token='prefix\' fixture-param-tail-55'"`,
+			String.raw`{"Authorization":"Token token=\\"fixture-param-json-55\\""}`,
 		];
 		for (const [index, body] of bodies.entries()) {
 			putCached({
@@ -1527,6 +1529,7 @@ describe("github view cache persistence", () => {
 				"fixture-param-auth-54",
 				"TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA=",
 				"fixture-param-tail-55",
+				"fixture-param-json-55",
 				"fixture-opaque-session",
 				"cookie-array-private-canary",
 				"fixture-second-opaque",
