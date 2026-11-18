@@ -1501,6 +1501,9 @@ describe("github view cache persistence", () => {
 			String.raw`Authorization: Token token=\"display\" Cookie: mode=\"light\"; sid=fixture-session-57`,
 			String.raw`{"Authorization":"Token token=\"left\\\"x,review58-opaque\""}`,
 			String.raw`{"Authorization":"Token token=\"prefix\\path,fixture-param-tail-58\""}`,
+			String.raw`{"Authorization":"Token token=\"left\\\",fixture-round59-opaque\""}`,
+			JSON.stringify({ Authorization: 'Token token="prefix,fixture-round59-opaque"\\t' }),
+			String.raw`Authorization: Token token=\"display\"|Cookie: mode=\"light\"; sid=review59-cookie-opaque`,
 		];
 		for (const [index, body] of bodies.entries()) {
 			putCached({
@@ -1538,6 +1541,8 @@ describe("github view cache persistence", () => {
 				"fixture-session-57",
 				"review58-opaque",
 				"fixture-param-tail-58",
+				"fixture-round59-opaque",
+				"review59-cookie-opaque",
 				"fixture-opaque-session",
 				"cookie-array-private-canary",
 				"fixture-second-opaque",
