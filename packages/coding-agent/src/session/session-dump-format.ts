@@ -270,7 +270,21 @@ const STRUCTURED_REDACTION = {
  */
 function formatArgumentText(value: unknown, key: string): string {
 	const structured = redactStructuredSecrets(value, key, STRUCTURED_REDACTION);
-	return escapeXmlText(redactCrashSecrets(serializeParameterValue(structured)));
+	// Scrub each string before serialization: a value that itself spells a credential assignment
+	// would otherwise be masked after the serializer wrote its quotes, and the masked value would
+	// swallow the quote that closes the JSON string.
+	return escapeXmlText(serializeParameterValue(scrubStringLeaves(structured)));
+}
+
+/** Replace the text of every string leaf with its scrubbed form, preserving the shape. */
+function scrubStringLeaves(value: unknown): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (Array.isArray(value)) return value.map(scrubStringLeaves);
+	if (value === null || typeof value !== "object") return value;
+	const source = value as Record<string, unknown>;
+	const scrubbed = Object.create(null) as Record<string, unknown>;
+	for (const [key, nested] of Object.entries(source)) scrubbed[key] = scrubStringLeaves(nested);
+	return scrubbed;
 }
 
 /** Keywords whose value is one concrete literal, so a credential-named property's own data can be masked. */

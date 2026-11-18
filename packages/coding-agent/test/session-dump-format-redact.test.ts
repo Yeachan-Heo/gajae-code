@@ -545,6 +545,25 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(payload).toContain('"name": "Authorization"');
 	});
 
+	it("keeps the JSON delimiters of an argument value that spells a credential assignment", () => {
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-json-delimiter",
+						name: "request",
+						arguments: { data: { note: 'password="fake"', next: "ordinary" } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		const value = parameterValue(dumped, "data") ?? "";
+		expect(JSON.parse(value)).toEqual({ note: 'password="«redacted»"', next: "ordinary" });
+	});
+
 	it("prints an argument name with the spelling it arrived with", () => {
 		const dumped = dump([
 			assistant(
