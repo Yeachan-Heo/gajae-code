@@ -14,7 +14,6 @@ describe("ModelRegistry oMLX Discovery", () => {
 	let authStorage: AuthStorage;
 	let origApiKey: string | undefined;
 	let origBaseUrl: string | undefined;
-	const servers: ReturnType<typeof Bun.serve>[] = [];
 
 	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-test-omlx-discovery-${Snowflake.next()}`);
@@ -30,7 +29,6 @@ describe("ModelRegistry oMLX Discovery", () => {
 	});
 
 	afterEach(() => {
-		for (const server of servers.splice(0)) server.stop(true);
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
@@ -104,28 +102,35 @@ describe("ModelRegistry oMLX Discovery", () => {
 
 	test("forwards configured oMLX auth during discovery when configured", async () => {
 		authStorage.setRuntimeApiKey("omlx", "test-omlx-key");
+		const endpoint = "http://127.0.0.1:18117/v1";
+		Bun.env.OMLX_BASE_URL = endpoint;
+		const requestedUrls: string[] = [];
 		const authorizations: (string | null)[] = [];
-		const server = Bun.serve({
-			port: 0,
-			hostname: "127.0.0.1",
-			fetch(request) {
-				if (!new URL(request.url).pathname.endsWith("/models")) return new Response(null, { status: 404 });
-				authorizations.push(request.headers.get("authorization"));
-				return Response.json({
-					object: "list",
-					data: [{ id: "authenticated-omlx-model", max_model_len: 131072 }],
-				});
-			},
+		// Observe the discovery request through the fetch hook: a credentialed oMLX
+		// probe is not a transport exemption, so it takes the ordinary `fetch` path
+		// that an ambient proxy can redirect. The hook keeps this assertion about the
+		// bearer independent of that configuration; the fresh-child inverse test in
+		// model-registry.test.ts remains the wire-level proof that the request target
+		// is the configured proxy. `bun test` strips proxy variables in its preload, but
+		// preload-free and E2E invocations do not, so those must control
+		// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY explicitly.
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url !== `${endpoint}/models`) return new Response(null, { status: 404 });
+			authorizations.push(new Headers(init?.headers).get("authorization"));
+			return Response.json({
+				object: "list",
+				data: [{ id: "authenticated-omlx-model", max_model_len: 131072 }],
+			});
 		});
-		servers.push(server);
-		// No proxy is configured in this process, so the ordinary discovery `fetch`
-		// reaches the real server; the assertion is the bearer on the wire, not a
-		// transport bypass.
-		Bun.env.OMLX_BASE_URL = `http://127.0.0.1:${server.port}/v1`;
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		await registry.refresh();
+		// Provider-scoped so this case cannot probe Ollama, llama.cpp, LM Studio, or
+		// the implicit Rapid-MLX hook (whose direct socket bypasses the fetch hook).
+		await registry.refreshProvider("omlx", "online");
 
+		expect(requestedUrls).toEqual([`${endpoint}/models`]);
 		expect(authorizations).toEqual(["Bearer test-omlx-key"]);
 		const model = registry.find("omlx", "authenticated-omlx-model");
 		expect(model?.provider).toBe("omlx");
@@ -150,7 +155,8 @@ describe("ModelRegistry oMLX Discovery", () => {
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		await registry.refresh();
+		// Provider-scoped refresh: the oMLX probe is the only one this case observes.
+		await registry.refreshProvider("omlx", "online");
 
 		expect(registry.find("omlx", "loopback-omlx-model")).toBeDefined();
 		expect(requestedUrls).toContain("http://127.0.0.1:8080/v1/models");

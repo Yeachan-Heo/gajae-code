@@ -4964,7 +4964,7 @@ describe("ModelRegistry", () => {
 				shadowServer.stop(true);
 			}
 		});
-		test("keeps a credentialed Rapid-MLX discovery probe on the direct transport", async () => {
+		test("routes a Rapid-MLX discovery probe to the loopback endpoint directly", async () => {
 			// The transport exemption follows provider identity, not the absence of a
 			// credential: a Rapid-MLX entry that carries a secret header still probes
 			// over the direct socket, so no proxy can read the header or inject a
@@ -5007,33 +5007,27 @@ describe("ModelRegistry", () => {
 				server.stop(true);
 			}
 		});
-		test("keeps an authenticated non-Rapid-MLX implicit probe on the configured proxy", async () => {
-			// Credential presence is not a transport exemption: the direct-socket rule
-			// is Rapid-MLX identity. An authenticated oMLX probe must keep using the
-			// ordinary `fetch` path, which honours the operator's proxy exactly as
-			// inference does. Bun resolves and caches the proxy decision at startup,
-			// so the probe runs in a fresh process with the variables planted.
-			const endpointProbes: { pathname: string; authorization: string | null }[] = [];
+		test("routes a non-Rapid-MLX implicit probe to the configured proxy target, not the loopback endpoint", async () => {
+			// The destination is the criterion: only a loopback Rapid-MLX probe is
+			// direct, so an oMLX probe must address the configured proxy target and
+			// never the implicit endpoint. Bun resolves and caches the proxy decision
+			// at startup, so the probe runs in a fresh process with the variables
+			// planted.
+			const endpointProbes: string[] = [];
 			const endpointServer = Bun.serve({
 				port: 0,
 				hostname: "127.0.0.1",
 				fetch(request) {
-					endpointProbes.push({
-						pathname: new URL(request.url).pathname,
-						authorization: request.headers.get("authorization"),
-					});
+					endpointProbes.push(new URL(request.url).pathname);
 					return Response.json({ data: [{ id: "omlx-proxy-probe-model" }] });
 				},
 			});
-			const proxiedRequests: { url: string; authorization: string | null }[] = [];
+			const proxiedRequests: string[] = [];
 			const proxyServer = Bun.serve({
 				port: 0,
 				hostname: "127.0.0.1",
 				fetch(request) {
-					proxiedRequests.push({
-						url: request.url,
-						authorization: request.headers.get("authorization"),
-					});
+					proxiedRequests.push(request.url);
 					return new Response("forwarded through the proxy", { status: 502 });
 				},
 			});
@@ -5086,11 +5080,10 @@ describe("ModelRegistry", () => {
 					child.exited,
 				]);
 				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-				// The credentialed probe reached the configured proxy...
-				expect(proxiedRequests.filter(request => request.url === `${endpointBaseUrl}/models`)).toEqual([
-					{ url: `${endpointBaseUrl}/models`, authorization: "Bearer omlx-proxy-probe-key" },
-				]);
-				// ...and never opened a direct socket to the implicit endpoint.
+				// The request target was the configured proxy, addressed with the
+				// absolute endpoint URL...
+				expect(proxiedRequests).toEqual([`${endpointBaseUrl}/models`]);
+				// ...and no direct socket was opened to the implicit endpoint.
 				expect(endpointProbes).toEqual([]);
 				// The proxy refused the request, so no direct-socket catalog may slip in.
 				expect(JSON.parse(stdout)).toEqual({ modelIds: [] });
