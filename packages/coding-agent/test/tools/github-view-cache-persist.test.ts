@@ -942,10 +942,7 @@ describe("github view cache persistence", () => {
 			" {\n-Cookie: theme=light; sid=round40-cookie-canary\n+x\n }",
 			" {\n-Cookie: theme=light] sid=suffix-round42-canary\n+x\n }",
 			' {\n-Cookie: sid="round42-opaque-session"\n+Cookie: sid=ordinary\n }',
-			'Cookie: [\n  "first\n-Cookie: sid=",\n  "outer-opaque-canary-43"\n]',
-			'Cookie: [\n  "first\n-Cookie: sid=inner \'theme\'",\n  "round44-opaque-array-cookie"\n]',
 			' {\n-Cookie: sid="round44\'opaque-cookie"\n+x\n }',
-			' {\n"path": "ends\\\\",\n-Cookie: theme=\'light\'; sid=round45-opaque-session\n }',
 			'Cookie: [\n  "first\n-Cookie: sid=inner",\n  "outer-opaque-canary"\n]',
 			'Cookie:\u00A0\r\n [\r\n   "sid=fixture-cookie-Q8m4"\r\n ]',
 			"Cookie: \u00A0\nEncryptionKey:\n  synthetic-opaque-Q8m4",
@@ -1027,10 +1024,6 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("round40-cookie-canary");
 		expect(cacheFileBytes()).not.toContain("suffix-round42-canary");
 		expect(cacheFileBytes()).not.toContain("round42-opaque-session");
-		expect(cacheFileBytes()).not.toContain("outer-opaque-canary-43");
-		expect(cacheFileBytes()).not.toContain("round44-opaque-array-cookie");
-		expect(cacheFileBytes()).not.toContain("round44'opaque-cookie");
-		expect(cacheFileBytes()).not.toContain("round45-opaque-session");
 		expect(cacheFileBytes()).not.toContain("outer-opaque-canary");
 		expect(cacheFileBytes()).not.toContain("synthetic-opaque-Q8m4");
 		expect(cacheFileBytes()).not.toContain("/root/config");
@@ -1476,5 +1469,39 @@ describe("github view cache persistence", () => {
 			),
 			{ seed: 71481023, numRuns: 64 },
 		);
+	});
+	it("scrubs multiline quoted Cookie arrays in isolation", () => {
+		const bodies = [
+			'Cookie: [\n  "first\n-Cookie: sid=",\n  "outer-opaque-canary-43"\n]',
+			'Cookie: [\n  "first\n-Cookie: sid=inner \'theme\'",\n  "round44-opaque-array-cookie"\n]',
+			' {\n-Cookie: sid="round44\'opaque-cookie"\n+x\n }',
+			' {\n"path": "ends\\\\",\n-Cookie: theme=\'light\'; sid=round45-opaque-session\n }',
+			'"path": "prefix{ends\\\\",\n-Cookie: theme=\'light\'; sid=round46-opaque-session',
+			' {\n"path": "}{ends\\\\",\n-Cookie: theme=\'light\'; sid=cache-review46-opaque-id\n }',
+		];
+		for (const [index, body] of bodies.entries()) {
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "issue",
+				number: 120 + index,
+				includeComments: false,
+				payload: { body },
+				rendered: body,
+				fetchedAt: 1,
+			});
+			const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 120 + index, false, TEST_AUTH_KEY);
+			for (const marker of [
+				"outer-opaque-canary-43",
+				"round44-opaque-array-cookie",
+				"round44'opaque-cookie",
+				"round45-opaque-session",
+				"round46-opaque-session",
+				"cache-review46-opaque-id",
+			]) {
+				expect(cacheFileBytes()).not.toContain(marker);
+				expect(cached?.payload.body).not.toContain(marker);
+			}
+		}
 	});
 });

@@ -711,27 +711,6 @@ function scrubHostPaths(text: string): string {
 }
 
 /** Text-level scrub for everything the view cache persists or serves back. */
-/** True when a match carries the closer matching the innermost open container. */
-function closesMatchingContainer(text: string, end: number, match: string): boolean {
-	const stack: string[] = [];
-	const push = (ch: string) => stack.push(ch);
-	const close = (ch: string) => {
-		const top = stack.at(-1);
-		if ((ch === "]" && top === "[") || (ch === "}" && top === "{")) return stack.pop() !== undefined;
-		return false;
-	};
-	for (let i = 0; i < end; i++) {
-		const ch = text[i];
-		if (ch === "{" || ch === "[") push(ch);
-		else if (ch === "}" || ch === "]") close(ch);
-	}
-	for (const ch of match) {
-		if (ch === "{" || ch === "[") push(ch);
-		else if ((ch === "}" || ch === "]") && close(ch)) return true;
-	}
-	return false;
-}
-
 /** True when the character at `index` is preceded by an odd backslash run. */
 function isEscapedAt(text: string, index: number): boolean {
 	let slashes = 0;
@@ -739,21 +718,62 @@ function isEscapedAt(text: string, index: number): boolean {
 	return slashes % 2 === 1;
 }
 
-/** Double-quote state from the outermost open container to a match. */
-function insideContainerQuote(text: string, end: number): boolean {
-	const stack: number[] = [];
+/** Quote-aware bracket scan up to `end`. */
+function scanStructure(text: string, end: number): { stack: string[]; quoted: boolean } {
+	const stack: string[] = [];
+	let quoted = false;
 	for (let i = 0; i < end; i++) {
 		const ch = text[i];
-		if (ch === "{" || ch === "[") stack.push(i);
+		if (quoted) {
+			if (ch === '"' && !isEscapedAt(text, i)) quoted = false;
+			continue;
+		}
+		if (ch === '"') {
+			quoted = true;
+			continue;
+		}
+		if (ch === "{" || ch === "[") stack.push(ch);
 		else if (ch === "}" || ch === "]") stack.pop();
 	}
-	const start = stack.length > 0 ? (stack[0] ?? 0) : 0;
+	return { stack, quoted };
+}
+
+/** True when a match carries the closer matching the innermost open container. */
+function closesMatchingContainer(text: string, end: number, match: string): boolean {
+	const scan = scanStructure(text, end);
+	if (scan.quoted) return false;
+	const stack = [...scan.stack];
 	let quoted = false;
-	for (let i = start + 1; i < end; i++) {
-		if (text[i] !== '"' || isEscapedAt(text, i)) continue;
-		quoted = !quoted;
+	for (let i = 0; i < match.length; i++) {
+		const ch = match[i];
+		if (quoted) {
+			if (ch === '"' && !isEscapedAt(match, i)) quoted = false;
+			continue;
+		}
+		if (ch === '"') {
+			quoted = true;
+			continue;
+		}
+		if (ch === "{" || ch === "[") stack.push(ch);
+		else if (ch === "}" || ch === "]") {
+			const top = stack.at(-1);
+			if ((ch === "]" && top === "[") || (ch === "}" && top === "{")) {
+				stack.pop();
+				return true;
+			}
+		}
 	}
-	return quoted;
+	return false;
+}
+
+/** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
+function containerDepthAt(text: string, end: number): number {
+	return scanStructure(text, end).stack.length;
+}
+
+/** True when the match starts inside a double-quoted string. */
+function insideContainerQuote(text: string, end: number): boolean {
+	return scanStructure(text, end).quoted;
 }
 
 /** True when the match itself contains a paired double-quoted value. */
@@ -764,17 +784,6 @@ function hasLocalDoubleQuotePair(match: string): boolean {
 		if (match[i] === '"' && !isEscapedAt(match, i)) return true;
 	}
 	return false;
-}
-
-/** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
-function containerDepthAt(text: string, end: number): number {
-	let depth = 0;
-	for (let i = 0; i < end; i++) {
-		const ch = text[i];
-		if (ch === "{" || ch === "[") depth++;
-		else if (ch === "}" || ch === "]") depth = Math.max(0, depth - 1);
-	}
-	return depth;
 }
 
 function scrubCacheText(text: string, diff = false): string {
