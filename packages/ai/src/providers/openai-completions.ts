@@ -83,6 +83,7 @@ import {
 	isCompleteJson,
 	parseStreamingJson,
 } from "../utils/json-parse";
+import { createLoopbackDirectFetch } from "../utils/loopback-transport";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -1589,7 +1590,7 @@ async function createClient(
 	// has an opaque identity owned by the agent's conversation lifecycle.
 	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
-	const baseFetch = fetchOverride ?? fetch;
+	const baseFetch = fetchOverride ?? createLoopbackDirectFetch(fetch);
 	const wrappedFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const response = await baseFetch(

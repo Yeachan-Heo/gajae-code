@@ -14,6 +14,7 @@ describe("ModelRegistry oMLX Discovery", () => {
 	let authStorage: AuthStorage;
 	let origApiKey: string | undefined;
 	let origBaseUrl: string | undefined;
+	const servers: ReturnType<typeof Bun.serve>[] = [];
 
 	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-test-omlx-discovery-${Snowflake.next()}`);
@@ -29,6 +30,7 @@ describe("ModelRegistry oMLX Discovery", () => {
 	});
 
 	afterEach(() => {
+		for (const server of servers.splice(0)) server.stop(true);
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
@@ -102,30 +104,28 @@ describe("ModelRegistry oMLX Discovery", () => {
 
 	test("forwards configured oMLX auth during discovery when configured", async () => {
 		authStorage.setRuntimeApiKey("omlx", "test-omlx-key");
-
-		using _hook = hookFetch((input, init) => {
-			const url = String(input);
-			if (url.includes(":8080/v1/models")) {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authHeader).toBe("Bearer test-omlx-key");
-				return new Response(
-					JSON.stringify({
-						object: "list",
-						data: [{ id: "authenticated-omlx-model", max_model_len: 131072 }],
-					}),
-					{
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					},
-				);
-			}
-			return new Response(null, { status: 404 });
+		const authorizations: (string | null)[] = [];
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (!new URL(request.url).pathname.endsWith("/models")) return new Response(null, { status: 404 });
+				authorizations.push(request.headers.get("authorization"));
+				return Response.json({
+					object: "list",
+					data: [{ id: "authenticated-omlx-model", max_model_len: 131072 }],
+				});
+			},
 		});
+		servers.push(server);
+		// A credentialed loopback probe is issued over a direct socket, so the
+		// assertion runs against a real server instead of a fetch hook.
+		Bun.env.OMLX_BASE_URL = `http://127.0.0.1:${server.port}/v1`;
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
 
+		expect(authorizations).toEqual(["Bearer test-omlx-key"]);
 		const model = registry.find("omlx", "authenticated-omlx-model");
 		expect(model?.provider).toBe("omlx");
 		expect(await registry.getApiKey(model!)).toBe("test-omlx-key");
@@ -134,17 +134,23 @@ describe("ModelRegistry oMLX Discovery", () => {
 	test("rejects a remote implicit endpoint so its provider credential cannot be exfiltrated", async () => {
 		Bun.env.OMLX_BASE_URL = "https://untrusted.example/v1";
 		authStorage.setRuntimeApiKey("omlx", "test-omlx-key");
+		const authorizations: (string | null)[] = [];
+		// The remote endpoint is rewritten to the loopback default; serve it so the
+		// positive half of the assertion is real traffic.
+		const server = Bun.serve({
+			port: 8080,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (!new URL(request.url).pathname.endsWith("/models")) return new Response(null, { status: 404 });
+				authorizations.push(request.headers.get("authorization"));
+				return Response.json({ data: [{ id: "loopback-omlx-model" }] });
+			},
+		});
+		servers.push(server);
 		const requestedUrls: string[] = [];
 
-		using _hook = hookFetch((input, init) => {
-			const url = String(input);
-			requestedUrls.push(url);
-			if (url.includes(":8080/v1/models")) {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authorization = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authorization).toBe("Bearer test-omlx-key");
-				return new Response(JSON.stringify({ data: [{ id: "loopback-omlx-model" }] }), { status: 200 });
-			}
+		using _hook = hookFetch(input => {
+			requestedUrls.push(String(input));
 			return new Response(null, { status: 404 });
 		});
 
@@ -152,6 +158,7 @@ describe("ModelRegistry oMLX Discovery", () => {
 		await registry.refresh();
 
 		expect(registry.find("omlx", "loopback-omlx-model")).toBeDefined();
+		expect(authorizations).toEqual(["Bearer test-omlx-key"]);
 		expect(requestedUrls.some(url => url.includes("untrusted.example"))).toBe(false);
 	});
 

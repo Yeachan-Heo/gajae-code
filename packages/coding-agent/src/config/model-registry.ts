@@ -45,7 +45,7 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
-import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
+import { fetchModelsDevPayload, isRapidMlxCatalogRecord } from "@gajae-code/ai/provider-models/openai-compat";
 import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
 import { getAntigravityDiscoveryUserAgent } from "@gajae-code/ai/utils/discovery/antigravity";
 import {
@@ -56,6 +56,7 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+import { isLoopbackEndpointUrl } from "@gajae-code/ai/utils/loopback-transport";
 // Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
 import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 import { JSONC, YAML } from "bun";
@@ -516,27 +517,6 @@ function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: R
 		admitsAdvertisedModalities(discovery.outputModalities, item.output_modalities) &&
 		admitsAdvertisedModalities(discovery.inputModalities, item.input_modalities)
 	);
-}
-
-/**
- * Rapid-MLX-native `/v1/models` fields. The bare OpenAI shape is shared with
- * vLLM and SGLang, which also live on loopback port 8000, so the response alone
- * cannot name the implementation. Rapid-MLX publishes these runtime-fact fields
- * (and, because its model card does not drop nulls, `reasoning_parser` is
- * present even when it is null); vLLM/SGLang never do. An entry that carries
- * none of them is not admitted by the implicit probe.
- */
-const RAPID_MLX_NATIVE_MODEL_FIELDS = [
-	"context_window",
-	"reasoning_parser",
-	"tool_call_parser",
-	"recommended_sampling",
-	"is_hybrid",
-	"is_moe",
-] as const;
-
-function isRapidMlxDiscoveryRecord(item: Record<string, unknown>): boolean {
-	return RAPID_MLX_NATIVE_MODEL_FIELDS.some(field => Object.hasOwn(item, field));
 }
 
 /**
@@ -1448,6 +1428,24 @@ function fingerprintConfiguredDiscoveryRequestShape(
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
 
+/**
+ * Descriptor discovery provenance predates the reciprocal Rapid-MLX identity
+ * guard. A cached vLLM/SGLang catalog written before it could carry rows the
+ * current admission rule refuses, and cache reuse skips admission, so tag the
+ * provenance and invalidate those rows once on the first refresh after upgrade.
+ */
+const RAPID_MLX_IDENTITY_GUARD_VERSION = "rapid-mlx-identity-v1";
+
+function localIdentityGuardVersion(providerId: string, endpoint: string): string | undefined {
+	if (providerId !== "vllm" && providerId !== "sglang") return undefined;
+	try {
+		if (!isLoopbackEndpointUrl(new URL(endpoint))) return undefined;
+	} catch {
+		return undefined;
+	}
+	return RAPID_MLX_IDENTITY_GUARD_VERSION;
+}
+
 function fingerprintDescriptorDiscoveryProvenance(
 	providerId: string,
 	authEvidence: string,
@@ -1464,6 +1462,7 @@ function fingerprintDescriptorDiscoveryProvenance(
 		providerId === "google-antigravity" || providerId === "google-gemini-cli"
 			? getAntigravityDiscoveryUserAgent()
 			: undefined;
+	const localIdentityGuard = localIdentityGuardVersion(providerId, endpoint);
 	return crypto
 		.createHash("sha256")
 		.update("gajae:model-discovery-provenance\0")
@@ -1473,6 +1472,7 @@ function fingerprintDescriptorDiscoveryProvenance(
 				endpoint,
 				...(projectId !== undefined ? { projectId } : {}),
 				...(discoveryIdentity !== undefined ? { discoveryIdentity } : {}),
+				...(localIdentityGuard !== undefined ? { localIdentityGuard } : {}),
 			}),
 		)
 		.digest("hex");
@@ -5638,6 +5638,7 @@ export class ModelRegistry {
 				previousEvidence.projectId !== projectId);
 		const isGoogleProjectScopedProvider =
 			options.providerId === "google-antigravity" || options.providerId === "google-gemini-cli";
+		const requiresAdmissionProvenance = localIdentityGuardVersion(options.providerId, endpoint) !== undefined;
 		const canUseCredentialDerivedXiaomiEndpoint =
 			options.providerId === "xiaomi" &&
 			apiKey?.startsWith("tp-") === true &&
@@ -5690,13 +5691,19 @@ export class ModelRegistry {
 				}
 			}
 			if (strategy === "offline") {
+				// A descriptor cache whose admission depends on wire evidence must be bound to
+				// the current provenance: a vLLM/SGLang loopback row written before the
+				// reciprocal Rapid-MLX identity guard would otherwise skip the filter, since
+				// the model manager deliberately serves a mismatched row on an offline
+				// refresh. Google project-scoped caches already require this binding.
+				const requiresBoundCache = isGoogleProjectScopedProvider || requiresAdmissionProvenance;
 				const cache =
-					reusableCacheProvenance !== undefined && isGoogleProjectScopedProvider
+					reusableCacheProvenance !== undefined && requiresBoundCache
 						? readModelCache<Api>(options.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath)
 						: null;
-				const hasCurrentProjectCache =
+				const hasBoundCache =
 					cache?.dynamicModelIds !== undefined && cache.dynamicModelProvenance === reusableCacheProvenance;
-				if (reusableCacheProvenance === undefined || (isGoogleProjectScopedProvider && !hasCurrentProjectCache)) {
+				if (reusableCacheProvenance === undefined || (requiresBoundCache && !hasBoundCache)) {
 					if (discoveryContextChanged) {
 						this.#providerEvidenceApiKeys.set(options.providerId, apiKey);
 						this.#descriptorDiscoveryEvidence.set(options.providerId, {
@@ -6231,32 +6238,37 @@ export class ModelRegistry {
 				providerConfig.discovery.type === "sglang") &&
 			loopbackDiscovery;
 		const signal = AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS);
-		// A credentialed probe of a local endpoint the user did not configure must
-		// not go through `fetch`: Bun applies HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to
-		// loopback requests — including a proxy a project `.env` declared — caches
-		// that decision per process, and offers no per-request bypass, so only a
-		// direct socket proves the Authorization header cannot reach a proxy.
-		// Other explicitly configured providers keep their existing transport; any
-		// provider that declares Rapid-MLX discovery is covered, including a custom
-		// alias named in models.json.
-		// Any header outside the audited reusable set may carry a credential —
-		// `Authorization`, `X-API-Key`, or an unrecognized header. `isSensitiveDiscoveryHeader`
-		// already draws that line for cache provenance, so the transport uses the same rule.
+		// A probe of a local endpoint must not go through `fetch`: Bun applies
+		// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to loopback requests — including a proxy
+		// a project `.env` declared — caches that decision per process, and offers
+		// no per-request bypass, so only a direct socket proves the probe cannot
+		// reach a proxy.
+		//
+		// Rapid-MLX is always direct, keyed or keyless: a proxy that can answer
+		// `/models` can inject a catalog just as easily as it can read a bearer, and
+		// the provider endpoint is always loopback. The canonical provider id covers
+		// a configured `providers.rapid-mlx` entry that auto-selects
+		// `openai-models-list` because it has no discovery stanza; the discovery type
+		// covers an alias named in models.json. Other implicit providers keep the
+		// previous rule (direct only when a credential header is present) so this
+		// repair does not widen their transport.
 		const carriesCredentialHeader = Object.keys(requestHeaders).some(isSensitiveDiscoveryHeader);
-		const response =
-			(providerConfig.implicitProbe === true || providerConfig.discovery.type === "rapid-mlx") &&
+		const directLoopbackProbe =
 			loopbackDiscovery &&
-			carriesCredentialHeader
-				? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
-				: await fetch(modelsUrl, {
-						headers: requestHeaders,
-						...(providerConfig.discovery.type === "rapid-mlx" ||
-						providerConfig.discovery.type === "vllm" ||
-						providerConfig.discovery.type === "sglang"
-							? { redirect: "error" as const }
-							: {}),
-						signal,
-					});
+			(providerConfig.provider === "rapid-mlx" ||
+				providerConfig.discovery.type === "rapid-mlx" ||
+				(providerConfig.implicitProbe === true && carriesCredentialHeader));
+		const response = directLoopbackProbe
+			? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
+			: await fetch(modelsUrl, {
+					headers: requestHeaders,
+					...(providerConfig.discovery.type === "rapid-mlx" ||
+					providerConfig.discovery.type === "vllm" ||
+					providerConfig.discovery.type === "sglang"
+						? { redirect: "error" as const }
+						: {}),
+					signal,
+				});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
 				// Redacted by construction: name the provider, endpoint, and the
@@ -6294,7 +6306,7 @@ export class ModelRegistry {
 			if (
 				providerConfig.discovery.type === "rapid-mlx" &&
 				rapidMlxAdmissionPolicy(providerConfig) === "identity-required" &&
-				!isRapidMlxDiscoveryRecord(item)
+				!isRapidMlxCatalogRecord(item)
 			) {
 				continue;
 			}

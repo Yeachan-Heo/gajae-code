@@ -14,6 +14,30 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 	let authStorage: AuthStorage;
 	let origApiKey: string | undefined;
 	let origBaseUrl: string | undefined;
+	const servers: ReturnType<typeof Bun.serve>[] = [];
+
+	/**
+	 * Serves an OpenAI `/models` catalog on a real loopback socket.
+	 *
+	 * Rapid-MLX discovery uses a direct socket rather than `fetch` (Bun applies
+	 * `HTTP_PROXY` to loopback requests and caches that choice per process), so a
+	 * fetch hook can no longer stand in for the server it discovers.
+	 */
+	function serveCatalog(catalog: () => unknown, port = 0): string {
+		const server = Bun.serve({
+			port,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (!new URL(request.url).pathname.endsWith("/models")) return new Response(null, { status: 404 });
+				const payload = catalog();
+				return typeof payload === "string"
+					? new Response(payload, { headers: { "content-type": "application/json" } })
+					: Response.json(payload);
+			},
+		});
+		servers.push(server);
+		return `http://127.0.0.1:${server.port}/v1`;
+	}
 
 	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-test-rapid-mlx-discovery-${Snowflake.next()}`);
@@ -29,6 +53,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 	});
 
 	afterEach(async () => {
+		for (const server of servers.splice(0)) server.stop(true);
 		authStorage.close();
 		if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
 		if (origApiKey !== undefined) {
@@ -107,28 +132,10 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 	}, 15_000);
 
 	test("auto-discovers Rapid-MLX models and maps context length from context_window", async () => {
-		using _hook = hookFetch(input => {
-			const url = String(input);
-			if (url === "http://localhost:8000/v1/models") {
-				return new Response(
-					JSON.stringify({
-						object: "list",
-						data: [
-							{
-								id: "mlx-community/Qwen3.5-4B-MLX-4bit",
-								object: "model",
-								context_window: 262144,
-							},
-						],
-					}),
-					{
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					},
-				);
-			}
-			return new Response(null, { status: 404 });
-		});
+		Bun.env.RAPID_MLX_BASE_URL = serveCatalog(() => ({
+			object: "list",
+			data: [{ id: "mlx-community/Qwen3.5-4B-MLX-4bit", object: "model", context_window: 262144 }],
+		}));
 
 		const hasAuthSpy = spyOn(authStorage, "hasAuth").mockReturnValue(false);
 		const hasSpy = spyOn(authStorage, "has").mockReturnValue(false);
@@ -193,37 +200,28 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 
 	test("rejects a remote implicit endpoint so discovery stays on loopback", async () => {
 		Bun.env.RAPID_MLX_BASE_URL = "https://untrusted.example/v1";
+		// A remote implicit endpoint is rewritten to the default loopback endpoint, so
+		// that is the only host the probe may reach.
+		serveCatalog(() => ({ data: [{ id: "loopback-rapid-mlx-model", context_window: 131072 }] }), 8000);
 		const requestedUrls: string[] = [];
 
 		using _hook = hookFetch(input => {
-			const url = String(input);
-			requestedUrls.push(url);
-			if (url === "http://localhost:8000/v1/models") {
-				return new Response(
-					JSON.stringify({ data: [{ id: "loopback-rapid-mlx-model", context_window: 131072 }] }),
-					{
-						status: 200,
-					},
-				);
-			}
+			requestedUrls.push(String(input));
 			return new Response(null, { status: 404 });
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
 
-		expect(registry.find("rapid-mlx", "loopback-rapid-mlx-model")).toBeDefined();
+		expect(registry.find("rapid-mlx", "loopback-rapid-mlx-model")?.baseUrl).toBe("http://localhost:8000/v1");
 		expect(requestedUrls.some(url => url.includes("untrusted.example"))).toBe(false);
 	});
 
 	test("skips malformed records and bounds Rapid-MLX limits to finite positive values", async () => {
-		using _hook = hookFetch(input => {
-			if (String(input) !== "http://localhost:8000/v1/models") return new Response(null, { status: 404 });
-			return new Response(
+		Bun.env.RAPID_MLX_BASE_URL = serveCatalog(
+			() =>
 				'{"data":[{"id":"invalid-limits","context_window":1e400,"context_length":-1,"max_tokens":0},{"id":42},{"id":"valid-model","context_window":"131072","max_tokens":"8192"}]}',
-				{ status: 200, headers: { "Content-Type": "application/json" } },
-			);
-		});
+		);
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
@@ -236,35 +234,25 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 	});
 
 	test("uses a loopback endpoint override without probing the default port", async () => {
-		Bun.env.RAPID_MLX_BASE_URL = "http://127.0.0.1:8477/v1";
+		const overrideUrl = serveCatalog(() => ({ data: [{ id: "custom-port-model", context_window: 131072 }] }));
+		Bun.env.RAPID_MLX_BASE_URL = overrideUrl;
 		const requestedUrls: string[] = [];
 		using _hook = hookFetch(input => {
-			const url = String(input);
-			requestedUrls.push(url);
-			if (url === "http://127.0.0.1:8477/v1/models") {
-				return Response.json({ data: [{ id: "custom-port-model", context_window: 131072 }] });
-			}
+			requestedUrls.push(String(input));
 			return new Response(null, { status: 404 });
 		});
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
-		expect(registry.find("rapid-mlx", "custom-port-model")?.baseUrl).toBe("http://127.0.0.1:8477/v1");
+		expect(registry.find("rapid-mlx", "custom-port-model")?.baseUrl).toBe(overrideUrl);
 		expect(requestedUrls.includes("http://localhost:8000/v1/models")).toBe(false);
 	});
 
 	test("treats an unreachable Rapid-MLX server as optional", async () => {
-		using _hook = hookFetch((input, init) => {
-			if (String(input) === "http://localhost:8000/v1/models") {
-				const response = Promise.withResolvers<Response>();
-				init?.signal?.addEventListener(
-					"abort",
-					() => response.reject(new DOMException("The operation was aborted", "AbortError")),
-					{ once: true },
-				);
-				return response.promise;
-			}
-			return new Response(null, { status: 404 });
-		});
+		// Reserve a port, then release it so the probe targets a closed loopback socket.
+		const reservation = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+		const deadPort = reservation.port;
+		reservation.stop(true);
+		Bun.env.RAPID_MLX_BASE_URL = `http://127.0.0.1:${deadPort}/v1`;
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		const startedAt = performance.now();
@@ -277,6 +265,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 	});
 
 	test("honors explicit rapid-mlx discovery configuration", async () => {
+		const explicitUrl = serveCatalog(() => ({ data: [{ id: "explicit-model", context_window: 131072 }] }));
 		await Bun.write(
 			modelsJsonPath,
 			JSON.stringify({
@@ -284,7 +273,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 					"rapid-mlx": {
 						api: "openai-completions",
 						auth: "none",
-						baseUrl: "http://localhost:8123/v1",
+						baseUrl: explicitUrl,
 						discovery: { type: "rapid-mlx" },
 					},
 				},
@@ -292,17 +281,40 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		);
 		const requestedUrls: string[] = [];
 		using _hook = hookFetch(input => {
-			const url = String(input);
-			requestedUrls.push(url);
-			if (url === "http://localhost:8123/v1/models") {
-				return Response.json({ data: [{ id: "explicit-model", context_window: 131072 }] });
-			}
+			requestedUrls.push(String(input));
 			return new Response(null, { status: 404 });
 		});
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
 		expect(registry.find("rapid-mlx", "explicit-model")?.contextWindow).toBe(131072);
 		expect(requestedUrls.includes("http://localhost:8000/v1/models")).toBe(false);
+	});
+
+	test("keeps a configured rapid-mlx provider without a discovery stanza on the direct transport", async () => {
+		// A configured `providers.rapid-mlx` entry with no `discovery` block
+		// auto-selects `openai-models-list`, so the transport must key off the
+		// canonical provider id as well as the declared discovery type.
+		const endpoint = serveCatalog(() => ({ data: [{ id: "configured-model", context_window: 131072 }] }));
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"rapid-mlx": { api: "openai-completions", auth: "none", baseUrl: endpoint },
+				},
+			}),
+		);
+		const requestedUrls: string[] = [];
+		using _hook = hookFetch(input => {
+			requestedUrls.push(String(input));
+			// A proxy answer would be published as this provider's catalog.
+			return Response.json({ data: [{ id: "proxy-model", context_window: 131072 }] });
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		expect(registry.find("rapid-mlx", "configured-model")).toBeDefined();
+		expect(registry.find("rapid-mlx", "proxy-model")).toBeUndefined();
+		expect(requestedUrls.some(url => url.startsWith(endpoint))).toBe(false);
 	});
 
 	test("does not publish a vLLM-only endpoint on the shared default port", async () => {
@@ -315,13 +327,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			object: "list",
 			data: [{ id: "meta-llama/Llama-3.1-8B-Instruct", object: "model", max_model_len: 131072 }],
 		};
-		using _hook = hookFetch(input => {
-			const url = String(input);
-			if (url === "http://localhost:8000/v1/models" || url === "http://127.0.0.1:8000/v1/models") {
-				return Response.json(vllmCatalog);
-			}
-			return new Response(null, { status: 404 });
-		});
+		serveCatalog(() => vllmCatalog, 8000);
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
@@ -332,10 +338,28 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 		expect(registry.getProviderDiscoveryState("rapid-mlx")?.models).toEqual([]);
 	});
 
+	test("does not publish a Rapid-MLX endpoint as vLLM on the shared default port", async () => {
+		// The identity guard has to work in both directions: an unrequested vLLM
+		// probe of port 8000 must not label a Rapid-MLX server as vLLM either, or
+		// one endpoint is published under two providers.
+		const rapidMlxCatalog = {
+			object: "list",
+			data: [{ id: "mlx-community/Qwen3.5-4B-MLX-4bit", object: "model", context_window: 262144 }],
+		};
+		serveCatalog(() => rapidMlxCatalog, 8000);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		expect(registry.find("rapid-mlx", "mlx-community/Qwen3.5-4B-MLX-4bit")?.contextWindow).toBe(262144);
+		expect(registry.find("vllm", "mlx-community/Qwen3.5-4B-MLX-4bit")).toBeUndefined();
+	});
+
 	test("takes an explicit rapid-mlx selection at its word when the catalog is unidentified", async () => {
 		// The identity check exists to keep an unrequested vLLM endpoint from being
 		// attributed to Rapid-MLX. An operator who names rapid-mlx in models.json
 		// has made that attribution themselves.
+		const explicitUrl = serveCatalog(() => ({ data: [{ id: "operator-selected-model" }] }));
 		await Bun.write(
 			modelsJsonPath,
 			JSON.stringify({
@@ -343,18 +367,12 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 					"rapid-mlx": {
 						api: "openai-completions",
 						auth: "none",
-						baseUrl: "http://localhost:8123/v1",
+						baseUrl: explicitUrl,
 						discovery: { type: "rapid-mlx" },
 					},
 				},
 			}),
 		);
-		using _hook = hookFetch(input => {
-			if (String(input) === "http://localhost:8123/v1/models") {
-				return Response.json({ data: [{ id: "operator-selected-model" }] });
-			}
-			return new Response(null, { status: 404 });
-		});
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
 		expect(registry.find("rapid-mlx", "operator-selected-model")).toBeDefined();
@@ -370,6 +388,12 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			object: "list",
 			data: [{ id: "bare-vllm-row", object: "model", max_model_len: 8192 }],
 		};
+		// One mutable catalog behind one real loopback socket: discovery no longer goes
+		// through `fetch`, and both the explicit and the implicit phase must reach the
+		// same endpoint.
+		let catalog: unknown = bareVllmCatalog;
+		const endpoint = serveCatalog(() => catalog);
+		Bun.env.RAPID_MLX_BASE_URL = endpoint;
 		await Bun.write(
 			modelsJsonPath,
 			JSON.stringify({
@@ -377,19 +401,17 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 					"rapid-mlx": {
 						api: "openai-completions",
 						auth: "none",
-						baseUrl: "http://localhost:8000/v1",
+						baseUrl: endpoint,
 						discovery: { type: "rapid-mlx" },
 					},
 				},
 			}),
 		);
-		using _explicitSelectionFetch = hookFetch(() => Response.json(bareVllmCatalog));
 		const explicitRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 		await explicitRegistry.refresh();
 		expect(explicitRegistry.find("rapid-mlx", "bare-vllm-row")).toBeDefined();
 
 		await Bun.write(modelsJsonPath, JSON.stringify({ providers: {} }));
-		using _implicitProbeFetch = hookFetch(() => Response.json(bareVllmCatalog));
 		// Both cache-consuming strategies read the row the operator selection wrote,
 		// not a row rewritten by an earlier iteration, so each strategy is tested
 		// against the foreign-policy cache independently.
@@ -424,9 +446,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			});
 		}
 
-		using _nativeRowFetch = hookFetch(() =>
-			Response.json({ object: "list", data: [{ id: "native-row", context_window: 131072 }] }),
-		);
+		catalog = { object: "list", data: [{ id: "native-row", context_window: 131072 }] };
 		// Control 1: a row that WAS admitted under the implicit policy keeps serving an
 		// offline refresh, so opening the model selector (which refreshes offline) does
 		// not blank an admitted Rapid-MLX catalog.
@@ -451,7 +471,7 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 					"rapid-mlx": {
 						api: "openai-completions",
 						auth: "none",
-						baseUrl: "http://localhost:8000/v1",
+						baseUrl: endpoint,
 						discovery: { type: "rapid-mlx" },
 					},
 				},

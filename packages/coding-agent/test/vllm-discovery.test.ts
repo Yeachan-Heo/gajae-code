@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
+import { writeModelCache } from "@gajae-code/ai/model-cache";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
 import { kNoAuth } from "../src/config/model-auth";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -15,6 +16,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 	let authStorage: AuthStorage;
 	let origApiKey: string | undefined;
 	let origBaseUrl: string | undefined;
+	const servers: ReturnType<typeof Bun.serve>[] = [];
 
 	beforeEach(async () => {
 		resetSettingsForTest();
@@ -31,6 +33,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 	});
 
 	afterEach(() => {
+		for (const server of servers.splice(0)) server.stop(true);
 		resetSettingsForTest();
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
@@ -386,5 +389,61 @@ describe("ModelRegistry vLLM Discovery", () => {
 		expect(model?.reasoning).toBeFalsy();
 		expect(model?.thinking).toBeUndefined();
 		expect(model?.compat).toBeUndefined();
+	});
+
+	test("refuses a loopback vLLM cache row predating the identity guard on an offline refresh", async () => {
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (!new URL(request.url).pathname.endsWith("/models")) return new Response(null, { status: 404 });
+				return Response.json({
+					object: "list",
+					data: [{ id: "cached-vllm-model", max_model_len: 131072 }],
+				});
+			},
+		});
+		servers.push(server);
+		const endpointB = `http://127.0.0.1:${server.port}/v1`;
+		const endpointA = "http://127.0.0.1:1/v1";
+		// A catalog cached before the reciprocal Rapid-MLX identity guard carries a
+		// provenance this build no longer produces. The model manager deliberately
+		// serves a provenance-mismatched row on an offline refresh, so the guarded
+		// descriptor path must refuse it before the row can be republished.
+		writeModelCache<"openai-completions">(
+			"vllm",
+			Date.now(),
+			[
+				{
+					id: "cached-vllm-model",
+					name: "cached-vllm-model",
+					api: "openai-completions",
+					provider: "vllm",
+					baseUrl: endpointB,
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 131072,
+					maxTokens: 4096,
+				},
+			],
+			true,
+			"",
+			path.join(tempDir, "models.db"),
+			["cached-vllm-model"],
+			"pre-identity-guard-provenance",
+		);
+
+		// Fail an online refresh against a different loopback endpoint so the stale
+		// row stays on disk with empty evidence for A.
+		Bun.env.VLLM_BASE_URL = endpointA;
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refreshProvider("vllm", "online");
+		expect(registry.find("vllm", "cached-vllm-model")).toBeUndefined();
+
+		// Switching back to B must not republish the stale row on an offline refresh.
+		Bun.env.VLLM_BASE_URL = endpointB;
+		await registry.refreshProvider("vllm", "offline");
+		expect(registry.find("vllm", "cached-vllm-model")).toBeUndefined();
 	});
 });

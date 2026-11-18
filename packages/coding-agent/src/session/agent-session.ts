@@ -149,6 +149,7 @@ import {
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
@@ -1872,16 +1873,13 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 	}
 	try {
 		const hostname = new URL(model.baseUrl).hostname.toLowerCase();
-		if (
-			hostname === "localhost" ||
-			hostname === "0.0.0.0" ||
-			hostname === "::1" ||
-			hostname === "[::1]" ||
-			hostname.endsWith(".local")
-		) {
+		// Share the transport's loopback definition so a fully qualified
+		// `localhost.` (now admitted for local providers) keeps local-overload
+		// handling instead of being treated as a remote endpoint.
+		if (isLoopbackHost(hostname) || hostname === "0.0.0.0" || hostname.endsWith(".local")) {
 			return true;
 		}
-		if (/^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname)) {
+		if (/^10\./.test(hostname) || /^192\.168\./.test(hostname)) {
 			return true;
 		}
 		const private172 = /^172\.(\d{1,2})\./.exec(hostname);

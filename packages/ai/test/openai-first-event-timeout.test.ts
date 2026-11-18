@@ -912,6 +912,10 @@ describe("OpenAI-family first-event timeouts", () => {
 			const pending = streamOpenAICompletions(lmStudioCompletionsModel, baseContext(), {
 				apiKey: "test-key",
 				requestMaxRetries: 0,
+				// A loopback endpoint no longer goes through the ambient `fetch`: the
+				// provider uses the proxy-bypassing loopback transport. Inject the delayed
+				// transport explicitly so this test still exercises the timeout.
+				fetch: delayedFetch,
 			}).result();
 			await flushMicrotasks();
 
