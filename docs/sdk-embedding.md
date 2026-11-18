@@ -697,12 +697,25 @@ For exact presentation across session recreation, persist the public
 `captureSessionView(session)` result in the application's existing catalog:
 `SdkSessionView = { sessionId: string; leafEntryId: string | null }`. Capture only
 settled, idle sessions after transcript persistence, and save before acknowledging
-view-changing operations. On reopening the same admitted transcript, call
-`await restoreSessionView(session, savedView)` before publishing the session or
-replacing catalog metadata. Restore selects that exact cursor without provider
-requests or navigation hooks; it does not infer a continuation, edit the transcript,
-or fall back to its latest branch. Invalid, missing or foreign targets fail explicitly;
-retain the saved descriptor and dispose an unpublished candidate on failure.
+view-changing operations. On reopening the same admitted transcript, restore before
+publishing the application view or replacing catalog metadata. Non-native embeddings
+use `await restoreSessionView(session, savedView)`. Native owners must instead call
+`await opened.runtime.session.restoreSessionView(savedView)` and require an `applied`
+result; the raw helper has no native invocation authority. This closed facade runs
+the same helper under session admission, retaining its target, session, manager,
+file, identity-generation and view-transition checks. Admission refusal returns a
+`refused` result; helper validation failures retain their `SdkRevisionError` contract.
+
+Restore selects that exact cursor, including `leafEntryId: null`, without provider
+requests or navigation hooks. It does not infer a continuation, edit the transcript,
+publish an execution cursor, replace the current logical resume operation, or rebind
+its historical proofs. Its own legitimate view-generation change remains admitted
+for subsequent operations and authorized disconnect; stale or foreign runtime
+bindings do not gain authority. Invalid, missing or foreign targets fail explicitly;
+retain the saved descriptor and clean up an unpublished candidate through its
+owner's authorized lifecycle on failure. The saved DTO is presentation metadata,
+not a generation-bound source capability: the current admitted runtime authenticates
+the live source, and a descriptor for the same transcript can survive recreation.
 
 The selector is application-owned presentation metadata, not writer admission or
 control authority. Keep transcript identity distinct from the application's catalog

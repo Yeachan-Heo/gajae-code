@@ -66,6 +66,7 @@ import {
 import { createNativeOwnerInspectors } from "./native-ownership";
 import type { SdkOperatorControls } from "./operator-controls";
 import type { SdkPreferenceControls } from "./preference-controls";
+import { restoreSessionView, type SdkSessionView } from "./revision-controls";
 import type { CreateAgentSessionResult } from "./session";
 import { getSessionClientControls, getSessionClientMcpSnapshot } from "./session-client-controls";
 import { CURRENT_SESSION_VERSION } from "./session-readonly/format";
@@ -158,6 +159,8 @@ export interface NativeEmbeddedRuntime {
 	 * the transcript or the execution view, so none may run outside admission.
 	 */
 	readonly session: {
+		/** Exact presentation restore only; does not publish an execution selection. */
+		readonly restoreSessionView: (view: SdkSessionView) => Promise<NativeInvocationResult<SdkSessionView>>;
 		readonly revise: (
 			input: EmbeddedRevisionInput,
 			options?: EmbeddedRevisionOptions,
@@ -761,6 +764,7 @@ function createNativeEmbeddedRuntime(
 				invokeNativeRuntime(handle, "side", () => getSessionClientControls(session).side.control(...args)),
 		}),
 		session: Object.freeze({
+			restoreSessionView: view => invokeNativeRuntime(handle, "session", () => restoreSessionView(session, view)),
 			revise: (input, options) => invokeNativeRuntime(handle, "session", () => result.revise(input, options)),
 			branch: entryId => invokeNativeRuntime(handle, "session", () => result.branch(entryId)),
 			refreshCommands: () => invokeNativeRuntime(handle, "session", () => result.refreshCommands()),

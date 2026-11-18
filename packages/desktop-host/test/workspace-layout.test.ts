@@ -20,6 +20,8 @@ import {
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DeliveryJournal } from "../src/delivery-journal";
 import { DesktopHost } from "../src/host";
+import type { NativeSession } from "../src/native-session";
+import * as nativeSessions from "../src/native-session";
 import {
 	type DesktopFrame,
 	type DesktopProject,
@@ -696,6 +698,13 @@ describe("desktop workspace layout", () => {
 		"root",
 		"superseded",
 	] as const)("workspace close drains an exclusive %s view behind its pending terminal receipt", async selection => {
+		const owners = new Map<CreateAgentSessionResult["session"], NativeSession>();
+		const openNativeSession = nativeSessions.openNativeSession;
+		vi.spyOn(nativeSessions, "openNativeSession").mockImplementation(async input => {
+			const opened = await openNativeSession(input);
+			if (opened.kind === "opened") owners.set(opened.session.sdk, opened.session);
+			return opened;
+		});
 		const contexts = [0, 1, 2].map(() => Promise.withResolvers<ExtensionContext>());
 		let starts = 0;
 		const { call, open, created, model, readCatalog, dataDir } = await launchFinalView({
@@ -725,11 +734,17 @@ describe("desktop workspace layout", () => {
 		const release = Promise.withResolvers<void>();
 		const disposed = Promise.withResolvers<void>();
 		const requestId = "close-final-prompt";
+		const owner = owners.get(sdk);
+		if (!owner) throw new Error("Missing fixture-owned native session");
+		const rootView: SdkSessionView = Object.freeze({ sessionId: sdk.sessionId, leafEntryId: null });
 		let final: SdkSessionView | undefined;
 		const update = journalOwner.update.bind(journalOwner);
 		const terminalWrite = vi.spyOn(journalOwner, "update").mockImplementation(async (id, changes) => {
 			if (id === requestId && changes.disposition === "completed") {
-				if (selection === "root") await restoreSessionView(sdk, { sessionId: sdk.sessionId, leafEntryId: null });
+				if (selection === "root") {
+					const restored = await owner.runtime.session.restoreSessionView(rootView);
+					expect(restored).toMatchObject({ kind: "applied", value: rootView });
+				}
 				final = captureSessionView(sdk);
 				entered.resolve();
 				await release.promise;
