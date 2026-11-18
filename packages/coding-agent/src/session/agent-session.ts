@@ -33,6 +33,7 @@ import {
 	type AgentState,
 	type AgentTerminalOwnerContext,
 	type AgentTool,
+	type AgentToolContext,
 	activeToolForCallName,
 	assertImagePlaceholdersHavePayload,
 	type BeforeToolCallContext,
@@ -452,6 +453,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import ttsrToolBlockedReminderTemplate from "../prompts/system/ttsr-tool-blocked-reminder.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
@@ -493,7 +495,7 @@ import {
 	selectDiscoverableToolNamesByServer,
 	selectRestorableDiscoveredBuiltinToolNames,
 } from "../tool-discovery/tool-index";
-import type { AskAnswerSource, ToolSession } from "../tools";
+import type { AskAnswerSource, NestedToolScope, ToolSession } from "../tools";
 import { computeEssentialBuiltinNames } from "../tools";
 import { AskTool } from "../tools/ask";
 import {
@@ -3061,6 +3063,16 @@ type PreparedExactMcpRetirement = {
 };
 
 /**
+ * Ownership fence for an exact session-view restoration. `isCurrent` authorizes the
+ * next publication; `onApplied` re-anchors ownership after this operation publishes
+ * its own tools and prompt, so a foreign publication is still detected as drift.
+ */
+interface SessionViewRestoreFence {
+	isCurrent: () => boolean;
+	onApplied: () => void;
+}
+
+/**
  * An entry states its transport with `type`, or implies it: a `command` entry is
  * stdio and a `url` entry is http. Only the discriminator is read — the command
  * string and URL themselves stay inside the config.
@@ -3934,6 +3946,13 @@ export class AgentSession {
 		| { kind: "held" }
 		| undefined;
 
+	/**
+	 * Steers a run left unconsumed and `#settleDisownedSteering` re-routed onto the
+	 * follow-up queue. They are still steering for the Esc-on-steer gesture: a
+	 * user interrupt resumes into them exactly as it would into the steering queue.
+	 */
+	readonly #rearmedSteerMessages = new WeakSet<AgentMessage>();
+
 	/** Remove run-bound steers from every queue mirror and terminalize them as removed. */
 	#discardRunBoundSteers(messages: readonly AgentMessage[]): void {
 		if (messages.length === 0) return;
@@ -4019,6 +4038,7 @@ export class AgentSession {
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
 		this.#markSteeringAsFollowUpPolicy(rearmed);
+		for (const message of rearmed) this.#rearmedSteerMessages.add(message);
 		const deferredAlreadyPresent = this.#deferredSdkFollowUps.length > 0;
 		if (deferredAlreadyPresent) {
 			// Deferred follow-ups are an older cross-store FIFO head. Keep rearmed
@@ -4877,6 +4897,12 @@ export class AgentSession {
 	 * it had none), restored if the reminder is never delivered.
 	 */
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
+	/**
+	 * Active nested-tool scopes keyed by the model-facing eval call id. Each scope
+	 * is closed when that call's result is produced, so a nested call that resumes
+	 * after settlement cannot claim a reminder or invalidate a finished call.
+	 */
+	#nestedToolScopes = new Map<string, NestedToolScope>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -10943,6 +10969,20 @@ export class AgentSession {
 	 * undo their provisional claims so the rules stay eligible.
 	 */
 	#releasePerToolTtsrInjections(toolCallId?: string): void {
+		if (toolCallId === undefined) {
+			for (const scope of this.#nestedToolScopes.values()) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
+			this.#nestedToolScopes.clear();
+		} else {
+			const scope = this.#nestedToolScopes.get(toolCallId);
+			if (scope) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
+			this.#nestedToolScopes.delete(toolCallId);
+		}
 		const ids =
 			toolCallId === undefined
 				? new Set([
@@ -10962,11 +11002,49 @@ export class AgentSession {
 	}
 
 	/**
+	 * Restore rules claimed by a nested call that was refused at the dispatch
+	 * fence. The call never ran, so its reminder has no result to fold into and
+	 * must stay eligible. Calls that dispatched are owned by the parent result and
+	 * cancellation paths, which settle their claims at fold or release points.
+	 */
+	#releaseUndeliveredNestedClaims(toolCallId: string, rules: Rule[]): void {
+		if (rules.length === 0) return;
+		const names = new Set(rules.map(rule => rule.name));
+		const claims = this.#perToolTtsrClaims.get(toolCallId);
+		for (const name of names) {
+			// Only undo a claim this call still owns. A parent cancellation may have
+			// restored and deleted it already, and releasing again would erase the
+			// previous injected record.
+			if (!claims?.has(name)) continue;
+			this.#ttsrManager?.releaseInjected(name, claims.get(name));
+			claims.delete(name);
+		}
+		const bucket = this.#perToolTtsrInjections.get(toolCallId);
+		if (bucket) {
+			const keeping = bucket.filter(rule => !names.has(rule.name));
+			if (keeping.length > 0) this.#perToolTtsrInjections.set(toolCallId, keeping);
+			else this.#perToolTtsrInjections.delete(toolCallId);
+		}
+		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
+	}
+
+
+	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
 	 * The claim stays provisional until #settlePerToolTtsrDelivery sees the
 	 * decorated result actually published.
 	 */
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, signal?: AbortSignal): AfterToolCallResult | undefined {
+		// The eval call is settling, so any nested call that resumes later must not run.
+		const nestedScope = this.#nestedToolScopes.get(ctx.toolCall.id);
+		// Rules that interrupted a nested call were folded into this result without
+		// running; mark them so the reminder reports the block, not a passthrough.
+		const blockedRuleNames = new Set(nestedScope?.invalidatedBy ?? []);
+		if (nestedScope) {
+			nestedScope.closed = true;
+			nestedScope.abortController.abort();
+			this.#nestedToolScopes.delete(ctx.toolCall.id);
+		}
 		// An aborted call's result is replaced by the loop's aborted result, so a
 		// folded reminder would never reach the model. A pending TTSR retry carries
 		// the bucket into its injection; any other cancellation releases it.
@@ -10977,7 +11055,14 @@ export class AgentSession {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
-		const reminder = rules.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r))).join("\n\n");
+		const reminder = rules
+			.map(r =>
+				prompt.render(
+					blockedRuleNames.has(r.name) ? ttsrToolBlockedReminderTemplate : ttsrToolReminderTemplate,
+					ttsrPromptFields(r),
+				),
+			)
+			.join("\n\n");
 		const block: TextContent = { type: "text", text: reminder };
 		this.#perToolTtsrFolded.set(ctx.toolCall.id, { rules, block });
 
@@ -11093,45 +11178,11 @@ export class AgentSession {
 		if (!tool) return undefined;
 		const toolCall = { ...ctx.toolCall, arguments: ctx.args };
 		const matchContext = this.#getTtsrToolMatchContext({ ...ctx.assistantMessage, content: [toolCall] }, 0);
-		const entries = tool.matcherEntries?.(ctx.args);
-		const matched: Rule[] = [];
-		if (entries && entries.length > 0) {
-			for (const entry of entries) {
-				const rules = await manager.checkAstSnapshot(
-					entry.digest,
-					{
-						...matchContext,
-						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
-						streamKey: `${matchContext.streamKey}:${entry.path}`,
-					},
-					signal,
-				);
-				// The run was cancelled or superseded while matching: keep the call
-				// from dispatching and leave every rule unclaimed.
-				if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-				matched.push(...rules);
-			}
-		} else {
-			const digest = tool.matcherDigest?.(ctx.args);
-			if (digest === undefined) return undefined;
-			matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
-			if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-		}
-
-		// A rule already headed for delivery as a prose reminder (pending, being
-		// admitted to the follow-up queue, or queued) must not be claimed a second
-		// time by this call.
-		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
-		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
-		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
-			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
-			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
-		}
-		const matches = matched.filter(rule => {
-			if (pending.has(rule.name)) return false;
-			pending.add(rule.name);
-			return true;
-		});
+		const matched = await this.#matchTtsrAstSnapshots(tool, ctx.args, matchContext, signal, generation);
+		// The run was cancelled or superseded while matching: keep the call from
+		// dispatching and leave every rule unclaimed.
+		if (!matched) return { block: true, reason: "Aborted" };
+		const matches = this.#withoutPendingTtsrRules(matched);
 		if (
 			matches.length > 0 &&
 			this.#handleTtsrMatches(matches, matchContext, ctx.assistantMessage.timestamp, activePromptHandle)
@@ -11145,6 +11196,178 @@ export class AgentSession {
 	}
 
 	/**
+	 * Match a tool's finalized source digests against AST rules. Returns undefined
+	 * when the run was cancelled or superseded while matching.
+	 */
+	async #matchTtsrAstSnapshots(
+		tool: AgentTool,
+		args: unknown,
+		matchContext: TtsrMatchContext,
+		signal: AbortSignal | undefined,
+		generation: number,
+	): Promise<Rule[] | undefined> {
+		const manager = this.#ttsrManager;
+		if (!manager?.hasAstRules()) return [];
+		const cancelled = () => signal?.aborted === true || this.#promptGeneration !== generation;
+		const matched: Rule[] = [];
+		const entries = tool.matcherEntries?.(args);
+		if (entries && entries.length > 0) {
+			for (const entry of entries) {
+				const rules = await manager.checkAstSnapshot(
+					entry.digest,
+					{
+						...matchContext,
+						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
+						streamKey: `${matchContext.streamKey}:${entry.path}`,
+					},
+					signal,
+				);
+				if (cancelled()) return undefined;
+				matched.push(...rules);
+			}
+			return matched;
+		}
+		const digest = tool.matcherDigest?.(args);
+		if (digest === undefined) return matched;
+		matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
+		return cancelled() ? undefined : matched;
+	}
+
+	/**
+	 * Deduplicate matches and drop rules already headed for delivery as a prose
+	 * reminder (pending, being admitted to the follow-up queue, or queued): they
+	 * must not be claimed a second time by a tool call.
+	 */
+	#withoutPendingTtsrRules(matched: Rule[]): Rule[] {
+		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
+		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
+		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
+			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
+			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
+		}
+		return matched.filter(rule => {
+			if (pending.has(rule.name)) return false;
+			pending.add(rule.name);
+			return true;
+		});
+	}
+
+	/**
+	 * Refuse a nested call whose eval call already settled or was invalidated by an
+	 * interrupting match. Checked on entry and again after every await so a call
+	 * paused in lazy materialization or AST matching cannot resume into a finished
+	 * or invalidated eval. Eval code can catch these errors, which is why every
+	 * later call is refused rather than only the one that matched.
+	 */
+	#assertNestedToolScopeActive(scope: NestedToolScope): void {
+		if (scope.closed || this.#nestedToolScopes.get(scope.parentToolCallId) !== scope) {
+			throw new ToolError(
+				"This eval call already settled; nested tool calls cannot run after its result was produced.",
+			);
+		}
+		if (scope.invalidatedBy) {
+			throw new ToolError(
+				`This eval call was invalidated by an interrupting TTSR match (${scope.invalidatedBy.join(", ")}). No further nested tool calls will run in it; apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+	}
+
+	/**
+	 * Nested calls (eval `tool.<name>()`) dispatch outside the agent loop, so the
+	 * argument-stream and pre-dispatch matching above never see them. Apply the
+	 * same tool-scoped rules to the nested call's final arguments before it runs:
+	 * every match is folded into the parent call's result as a per-tool reminder,
+	 * and an interrupting match keeps the nested call from executing (the nested
+	 * analogue of aborting the stream before a direct call dispatches).
+	 */
+	async #ttsrBeforeNestedToolCall(
+		tool: AgentTool,
+		scope: NestedToolScope,
+		callName: string,
+		args: unknown,
+		signal: AbortSignal | undefined,
+	): Promise<Rule[]> {
+		this.#assertNestedToolScopeActive(scope);
+		if (signal?.aborted) throw new ToolAbortError();
+		const manager = this.#ttsrManager;
+		if (!manager?.hasRules()) return [];
+		const generation = this.#promptGeneration;
+		const matchContext: TtsrMatchContext = {
+			source: "tool",
+			// Match the name the cell invoked (including a custom wire name such as
+			// `apply_patch`), exactly like the direct-call pre-dispatch path.
+			toolName: callName,
+			// Complete arguments, not a stream continuation: scan the whole snapshot for
+			// regex conditions, and keep AST snapshot dedupe isolated per nested call.
+			streamKey: `nested:${scope.parentToolCallId}:${crypto.randomUUID()}`,
+			filePaths: this.#extractTtsrFilePathsFromArgs(args),
+		};
+		const matched = manager.checkSnapshot(JSON.stringify(args) ?? "", matchContext);
+		if (manager.hasAstRules()) {
+			const matcherTool = await this.#materializeTtsrMatcherTool(tool);
+			const astMatched = matcherTool
+				? await this.#matchTtsrAstSnapshots(matcherTool, args, matchContext, signal, generation)
+				: [];
+			if (!astMatched || signal?.aborted || this.#promptGeneration !== generation) throw new ToolAbortError();
+			matched.push(...astMatched);
+		}
+		// A sibling nested call may have interrupted while this one was matching:
+		// recheck before claiming or dispatching anything.
+		this.#assertNestedToolScopeActive(scope);
+		const matches = this.#withoutPendingTtsrRules(matched);
+		if (matches.length === 0) return [];
+		const added = this.#addPerToolTtsrInjections(scope.parentToolCallId, matches);
+		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
+		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
+			// Only rules this call newly claimed describe the blocked call. A rule
+			// already claimed by an earlier sibling ran there and keeps its wording.
+			scope.invalidatedBy = added.map(rule => rule.name);
+			// Cancel nested calls still parked before dispatch (for example in an
+			// approval await) so an approval granted after this match cannot run them.
+			scope.abortController.abort();
+			throw new ToolError(
+				`${this.#formatTtsrAbortReason(matches)}. The nested ${callName} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+		return added;
+	}
+
+	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope, callName: string): T {
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return async (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: AgentToolContext | undefined,
+				) => {
+					if (!scope.closed) this.#nestedToolScopes.set(scope.parentToolCallId, scope);
+					const callSignal = signal
+						? AbortSignal.any([signal, scope.abortController.signal])
+						: scope.abortController.signal;
+					const claimed = await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
+					try {
+						// Dispatch fence, immediately before the call with no await between:
+						// the eval may have settled or been invalidated during preflight, and a
+						// settled or invalidated scope has aborted callSignal for anything
+						// parked further in.
+						this.#assertNestedToolScopeActive(scope);
+						if (callSignal.aborted) throw new ToolAbortError();
+					} catch (error) {
+						// This call never dispatched, so its claims have no result to fold into.
+						// Once dispatched, the parent result and cancellation paths own settlement.
+						this.#releaseUndeliveredNestedClaims(scope.parentToolCallId, claimed);
+						throw error;
+					}
+					return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
+				};
+			},
+		}) as T;
+	}
+
+	/**
 	 * The active tool a call dispatches to (canonical or wire name, e.g. OpenAI's
 	 * `apply_patch` for `edit`), resolved through lazy facades so its matcher
 	 * hooks are readable before the first execution. A tool that fails to load
@@ -11152,14 +11375,18 @@ export class AgentSession {
 	 */
 	async #resolveTtsrMatcherTool(callName: string): Promise<AgentTool | undefined> {
 		const tool = activeToolForCallName(this.agent.state.tools, callName);
-		if (!tool) return undefined;
+		return tool ? await this.#materializeTtsrMatcherTool(tool) : undefined;
+	}
+
+	/** Resolve a lazy facade so its matcher hooks are readable before the first execution. */
+	async #materializeTtsrMatcherTool(tool: AgentTool): Promise<AgentTool | undefined> {
 		const materialize = (tool as { materialize?: unknown }).materialize;
 		if (typeof materialize !== "function") return tool;
 		try {
 			return (await materialize.call(tool)) as AgentTool;
 		} catch (error) {
 			logger.debug("TTSR could not resolve tool for AST matching", {
-				toolName: callName,
+				toolName: tool.name,
 				error: error instanceof Error ? error.message : String(error),
 			});
 			return undefined;
@@ -12995,7 +13222,11 @@ export class AgentSession {
 			this.#pendingSelectionFences > 0 ||
 			this.#cancelAndSubmitInProgress ||
 			this.#sessionAdmissionClosing ||
-			this.#sessionAdmissionClosed
+			this.#sessionAdmissionClosed ||
+			this.#deferredSdkFollowUps.length > 0 ||
+			this.#pendingBackgroundExchanges.length > 0 ||
+			this.#admittedBackgroundExchanges.length > 0 ||
+			this.#sessionWorkLease.isHeld()
 		);
 	}
 
@@ -13403,10 +13634,17 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** Get a registered tool with the same guards used for model-facing execution. */
-	getToolForExecution(name: string): AgentTool | undefined {
+	/**
+	 * Get a registered tool with the same guards used for model-facing execution.
+	 * With `nestedToolScope` (a nested call such as eval `tool.<name>()`), the tool
+	 * also applies tool-scoped TTSR rules before it runs.
+	 */
+	getToolForExecution(name: string, options?: { nestedToolScope?: NestedToolScope }): AgentTool | undefined {
 		const tool = this.getToolByName(name);
-		return tool ? this.#prepareToolForExecution(tool) : undefined;
+		if (!tool) return undefined;
+		const prepared = this.#prepareToolForExecution(tool);
+		const scope = options?.nestedToolScope;
+		return scope ? this.#wrapNestedToolForTtsr(prepared, scope, name) : prepared;
 	}
 
 	/**
@@ -14585,6 +14823,7 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
+					if (signal?.aborted) throw new ToolAbortError("Permission request cancelled");
 					const bridge = this.#clientBridge;
 					const inheritedEpoch = this.#sdkPermissionProvider
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
@@ -14713,6 +14952,8 @@ export class AgentSession {
 					ctx: never,
 				) => {
 					return await this.sessionManager.runWithCwdReadLease(async () => {
+						// Lease admission can wait for a writer; fence before the target starts.
+						if (signal?.aborted) throw new ToolAbortError();
 						const admittedGeneration = this.sessionManager.getCwdGeneration();
 						const result = await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 						// The lease keeps writers out for the whole execution, so this can
@@ -14761,6 +15002,10 @@ export class AgentSession {
 							args,
 						});
 					}
+					// These guards can await; do not start the tool if the call was cancelled.
+					// Permission-required tools let the permission wrapper report its own
+					// cancellation reason just inside this guard.
+					if (signal?.aborted && !PERMISSION_REQUIRED_TOOLS.has(target.name)) throw new ToolAbortError();
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},
@@ -14815,9 +15060,12 @@ export class AgentSession {
 		return wrapped;
 	}
 
-	#setGuardedAgentTools(tools: AgentTool[]): void {
+	#setGuardedAgentTools(tools: AgentTool[], onPublished?: () => void): void {
 		this.#activeToolSelectionRevision++;
 		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
+		// Anchor ownership before observers run: a throwing observer must not leave
+		// the published tool set unattributed to this operation.
+		onPublished?.();
 		this.#onToolNamesChanged?.(tools.map(tool => tool.name));
 	}
 
@@ -14834,6 +15082,7 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
+			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
 		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
@@ -14845,6 +15094,7 @@ export class AgentSession {
 		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
+			(options?.fence?.isCurrent() ?? true) &&
 			(options?.expectedActiveToolSelectionRevision === undefined ||
 				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
 					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
@@ -14939,7 +15189,7 @@ export class AgentSession {
 				}
 				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools);
+				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 				this.#invalidateDiscoveryCaches();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
@@ -15035,6 +15285,7 @@ export class AgentSession {
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
 				this.#pendingAppliedToolSignature = undefined;
+				options?.fence?.onApplied();
 				break;
 			}
 		} else if (promptRelevantToolsChanged) {
@@ -15053,7 +15304,7 @@ export class AgentSession {
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-		this.#setGuardedAgentTools(tools);
+		this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 		this.#invalidateDiscoveryCaches();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
@@ -15214,10 +15465,14 @@ export class AgentSession {
 		}
 	}
 
-	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
+	async #restoreMCPSelectionsForSessionContext(
+		sessionContext: SessionContext,
+		fence?: SessionViewRestoreFence,
+	): Promise<void> {
+		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
-			await this.#attachAskToolIfWorkflowActive();
+			await this.#attachAskToolIfWorkflowActive(fence);
 			return;
 		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
@@ -15239,11 +15494,13 @@ export class AgentSession {
 				? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
 				: (constructorDiscoveredBuiltinToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
-		await this.#applyActiveToolsByName(
+		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false },
+			{ persistMCPSelection: false, fence },
 		);
-		await this.#attachAskToolIfWorkflowActive();
+		if (fence && (applied === undefined || !fence.isCurrent()))
+			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		await this.#attachAskToolIfWorkflowActive(fence);
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -16366,8 +16623,8 @@ export class AgentSession {
 		}
 	}
 
-	async #attachAskToolIfWorkflowActive(): Promise<void> {
-		if (this.#isDisposed || this.#sessionAdmissionClosing) return;
+	async #attachAskToolIfWorkflowActive(fence?: SessionViewRestoreFence): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || (fence && !fence.isCurrent())) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -16402,6 +16659,7 @@ export class AgentSession {
 				});
 				retryHydration = true;
 			}
+			if (fence && !fence.isCurrent()) return;
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
@@ -16424,7 +16682,23 @@ export class AgentSession {
 		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			this.#attachAskTool();
+			if (fence) {
+				// Exact view restoration must join prompt rebuilding and fence its publication.
+				if (
+					!this.#explicitEmptyToolSelection &&
+					this.#toolRegistry.has("ask") &&
+					!this.getActiveToolNames().includes("ask")
+				) {
+					const applied = await this.#applyActiveToolsByName([...this.getActiveToolNames(), "ask"], {
+						persistMCPSelection: false,
+						fence,
+					});
+					if (applied === undefined || !fence.isCurrent())
+						throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+				}
+			} else {
+				this.#attachAskTool();
+			}
 		} else if (this.#durableWorkflowSkillState?.sessionId === sessionId) {
 			this.#durableWorkflowSkillState = undefined;
 		}
@@ -18914,6 +19188,11 @@ export class AgentSession {
 				this.#deferredFollowUpForceOneAtATime.add(message);
 			}
 			this.#deferredSdkFollowUps.push(message);
+			// Notify follow-up waiters that a message has been admitted to the deferred
+			// queue. This lets job poll and other callers to waitForFollowUpQueued interrupt
+			// immediately without waiting for the deferred message to enter the agent's live
+			// queue (which happens when streaming ends or the queue drains).
+			this.agent.notifyFollowUpWaiters();
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		}
@@ -20026,9 +20305,14 @@ export class AgentSession {
 
 	/** Whether the agent has queued steering messages that a `user_interrupt`
 	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
-	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts.
+	 *  Steers an interrupted run left unconsumed are re-routed onto the follow-up
+	 *  queue and still count: with two queued steers, the continuation that
+	 *  delivers the first leaves the second waiting there. */
 	get hasQueuedSteering(): boolean {
-		return this.agent.hasQueuedSteering();
+		if (this.agent.hasQueuedSteering()) return true;
+		if (this.agent.snapshotFollowUp().some(message => this.#rearmedSteerMessages.has(message))) return true;
+		return this.#deferredSdkFollowUps.some(message => this.#rearmedSteerMessages.has(message));
 	}
 
 	/** Get pending messages (read-only). Returns the public text-only view;
@@ -24082,7 +24366,7 @@ export class AgentSession {
 	async #setSharedSessionDefaultModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void },
+		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
 	): Promise<void> {
 		const operation = "set session model";
 		const assertMode = this.#controlPublicationModeFence(operation);
@@ -24150,12 +24434,13 @@ export class AgentSession {
 		const entries: SharedControlEntry[] = [{ type: "model_change", model: selector, role: "default" }];
 		if (effectiveLevel !== this.#thinkingLevel)
 			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
+		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 		entries.push({
 			type: "configured_model_chain",
 			chain: {
 				role: "default",
 				entries: [formatModelSelectorValue(selector, requestedLevel)],
-				origin: "model_selection",
+				origin,
 				explicitHead: true,
 				cleared: false,
 			},
@@ -24177,13 +24462,14 @@ export class AgentSession {
 		}
 		try {
 			assertCurrent();
-			this.markUserModelSelection();
+			const isUserSelection = options.cause !== "startup-override";
+			if (isUserSelection) this.markUserModelSelection();
 			this.#btwPrefixLedger.clear();
-			this.#setModelAuthoritatively(model, "user-selection");
+			this.#setModelAuthoritatively(model, isUserSelection ? "user-selection" : "startup-override");
 			this.#unavailableModelProfile = undefined;
-			this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+			if (isUserSelection) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 			this.#seedSessionCanonicalVariant(model);
-			this.#recordUserCanonicalVariantSelection();
+			if (isUserSelection) this.#recordUserCanonicalVariantSelection();
 			this.#applyThinkingLevel(requestedLevel, false, false, undefined, true);
 			this.#publishConcreteDefaultProfileState(materialized);
 			this.#defaultFallbackController = undefined;
@@ -24360,7 +24646,7 @@ export class AgentSession {
 		if (
 			this.#usesSharedSessionPublication() &&
 			options?.persistAsSessionDefault === true &&
-			options.cause === "user-selection"
+			(options.cause === "user-selection" || options.cause === "startup-override")
 		) {
 			return this.#setSharedSessionDefaultModel(model, thinkingLevel, options);
 		}
@@ -35435,6 +35721,220 @@ export class AgentSession {
 	// =========================================================================
 	// Tree Navigation
 	// =========================================================================
+
+	/**
+	 * Restore an exact runtime cursor, including the empty root. Unlike user tree
+	 * navigation this never runs hooks, summarizes, aborts work, or appends entries.
+	 * The caller must persist the cursor separately; flush does not persist it.
+	 */
+	async restoreTreeLeaf(targetId: string | null): Promise<void> {
+		const gone = () => Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (this.#isDisposed) throw gone();
+		this.#assertExternalSessionIngress();
+		const busy = () =>
+			this.isRevisionControlBusy ||
+			this.isCompacting ||
+			this.hasPendingBashMessages ||
+			this.hasPendingPythonMessages ||
+			this.queuedMessageCount > 0 ||
+			this.agent.hasQueuedMessages();
+		if (busy()) throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
+		if (targetId !== null && (typeof targetId !== "string" || targetId.length === 0))
+			throw Object.assign(new Error("Invalid session leaf."), { code: "invalid_input" });
+		const manager = this.sessionManager;
+		if (targetId !== null && !manager.getEntryForFidelity(targetId)) throw gone();
+		const previousLeaf = manager.getLeafId();
+		if (targetId === previousLeaf) return;
+		const agent = this.agent;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identity = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
+		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
+		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
+		const previousHasExplicitActiveToolSelectionForContext =
+			this.#committedHasExplicitActiveToolSelectionForContext;
+		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
+			? [...this.#committedExplicitMCPToolSelectionForContext]
+			: undefined;
+		const previousExplicitMCPToolSelectionPersistsForContext =
+			this.#committedExplicitMCPToolSelectionPersistsForContext;
+		const previousTools = [...agent.state.tools];
+		const previousBaseSystemPrompt = this.#baseSystemPrompt;
+		const previousSystemPrompt = agent.state.systemPrompt;
+		const previousLastAppliedToolSignature = this.#lastAppliedToolSignature;
+		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
+		const previousMessages = agent.state.messages.slice();
+		let ownedMessages = previousMessages;
+		let ownedContextRevision = agent.contextRevision;
+		let ownedHistoryRevision = agent.historyRevision;
+		let ownedLeaf = previousLeaf;
+		let revisions = manager.revisionSnapshot();
+		let moved = false;
+		// Identity only: the view may have moved on, but this session still owns the
+		// private selection-authority state this operation staged.
+		const sessionStillOurs = () =>
+			!this.#isDisposed &&
+			this.sessionManager === manager &&
+			this.agent === agent &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identity;
+		// View/history ownership: the leaf, transcript and transition identity this
+		// operation moved. Losing it means a foreign actor superseded the restoration.
+		const historyIsOurs = () => {
+			const now = manager.revisionSnapshot();
+			const messages = agent.state.messages;
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.agent === agent &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionFile() === file &&
+				manager.getSessionIdentityGeneration() === identity &&
+				this.#sessionTransitionKind === "navigate-tree" &&
+				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
+				this.#mcpCatalogGeneration === mcpCatalogGeneration &&
+				this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration &&
+				manager.getLeafId() === ownedLeaf &&
+				now.entry === revisions.entry &&
+				now.leaf === revisions.leaf &&
+				now.headerExport === revisions.headerExport &&
+				now.label === revisions.label &&
+				now.replayMetadata === revisions.replayMetadata &&
+				// Message-history only: prompt, tool and model publications must not
+				// suppress a history rollback of an independently drifted view.
+				agent.historyRevision === ownedHistoryRevision &&
+				messages.length === ownedMessages.length &&
+				messages.every((message, index) => message === ownedMessages[index]) &&
+				!busy()
+			);
+		};
+		const current = () => {
+			// Prompt and tool publications advance contextRevision even when they
+			// republish the same array, so ownership cannot rest on identity alone.
+			return historyIsOurs() && agent.contextRevision === ownedContextRevision;
+		};
+		const fence: SessionViewRestoreFence = {
+			isCurrent: current,
+			onApplied: () => {
+				ownedContextRevision = agent.contextRevision;
+			},
+		};
+		this.#beginSessionTransition("navigate-tree");
+		try {
+			if (!current()) throw gone();
+			if (targetId === null) manager.resetLeaf();
+			else manager.branch(targetId);
+			ownedLeaf = targetId;
+			revisions = { ...revisions, leaf: revisions.leaf + 1 };
+			moved = true;
+			this.#commitSessionTransition();
+			if (!current()) throw gone();
+			const context = this.buildDisplaySessionContext();
+			await this.#restoreMCPSelectionsForSessionContext(context, fence);
+			if (!current()) throw gone();
+			agent.replaceMessages(context.messages, {
+				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
+			});
+			ownedMessages = agent.state.messages.slice();
+			ownedHistoryRevision = agent.historyRevision;
+			ownedContextRevision = agent.contextRevision;
+			this.#resetInjectedContextSignatures();
+			this.#syncTodoPhasesFromBranch();
+			this.#closeCodexProviderSessionsForHistoryRewrite();
+			this.#resetActiveSdkRunOwnership();
+			if (!current()) throw gone();
+		} catch (error) {
+			// Undo independently-owned components. History (leaf and transcript) is
+			// reverted while the view is still ours; prompts, tools and selection
+			// authority only while this operation still owns them, so an independent
+			// publication is never overwritten.
+			if (moved && sessionStillOurs()) {
+				// Re-read ownership at each step: rollback callbacks are fallible and may
+				// publish prompt or history state of their own.
+				const selectionOurs = () =>
+					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
+				const authorityOurs = () =>
+					selectionOurs() &&
+					!this.#hasExplicitActiveToolSelectionForContext &&
+					this.#explicitMCPToolSelectionForContext === undefined &&
+					this.#explicitMCPToolSelectionPersistsForContext === true;
+				try {
+					if (historyIsOurs()) {
+						if (previousLeaf === null) manager.resetLeaf();
+						else manager.branch(previousLeaf);
+						// Re-anchor the cursor we just restored so later ownership reads
+						// reflect our own revert, not foreign drift.
+						ownedLeaf = previousLeaf;
+						revisions = { ...revisions, leaf: revisions.leaf + 1 };
+					}
+					if (authorityOurs()) {
+						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+						this.#explicitMCPToolSelectionPersistsForContext =
+							previousExplicitMCPToolSelectionPersistsForContext;
+						this.#commitExplicitMCPToolSelectionAuthority();
+					}
+					// Prompt before tools: the tool observer may publish prompt state of
+					// its own, and that later publication must win over this revert.
+					if (historyIsOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#baseSystemPrompt = previousBaseSystemPrompt;
+						agent.setSystemPrompt(previousSystemPrompt);
+						ownedContextRevision = agent.contextRevision;
+						// Invalidate rebuilds authorized for the abandoned target tools;
+						// otherwise one may publish their guidance over the reverted prompt.
+						this.#reserveBaseSystemPromptGeneration();
+					}
+					if (historyIsOurs() && selectionOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+						this.#activeToolSelectionRevision++;
+						agent.setTools(previousTools);
+						ownedContextRevision = agent.contextRevision;
+						// Signatures describe the prompt and tools this rollback just
+						// restored. Publish them before any observer can read or replace
+						// the cached signature with its own selection.
+						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+						this.#invalidateDiscoveryCaches();
+					} else if (selectionOurs() && agent.contextRevision === ownedContextRevision) {
+						// The view moved on, so its live tools stand. Only undo the
+						// discovered-selection staging this operation performed.
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+					}
+					if (historyIsOurs()) {
+						agent.replaceMessages(previousMessages, {
+							historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
+						});
+						// Re-anchor the history this rollback just published.
+						ownedMessages = agent.state.messages.slice();
+						ownedHistoryRevision = agent.historyRevision;
+						this.#resetInjectedContextSignatures();
+						this.#syncTodoPhasesFromBranch();
+						this.#closeCodexProviderSessionsForHistoryRewrite();
+					}
+				} catch {
+					throw Object.assign(new Error("Session view rollback failed."), {
+						code: "revision_failed",
+						rollbackFailed: true,
+					});
+				}
+				if (!historyIsOurs()) throw gone();
+			} else if (moved) {
+				throw gone();
+			}
+			throw error;
+		} finally {
+			this.#endSessionTransition();
+		}
+	}
 
 	/**
 	 * Navigate to a different node in the session tree.

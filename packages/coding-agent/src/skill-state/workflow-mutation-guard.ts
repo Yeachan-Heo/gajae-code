@@ -3989,13 +3989,47 @@ function isAllowlistedPath(cwd: string, rawPath: string, sessionId?: string | nu
 	}
 	return head === "specs" || head === "plans";
 }
-function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
-	const segments = relativeGjcSegments(cwd, rawPath);
-	return segments?.[0] === ".gjc";
+/**
+ * Project skills (`.gjc/skills/<name>/...`) are user-authored definitions that skill
+ * discovery reads and no `gjc` CLI writes, so agent file tools may edit them. The
+ * `.gjc/skills` directory itself and every other `.gjc/**` path stay runtime-owned.
+ * Segments are already lexically normalized, so `.gjc/skills/../state/x` is `.gjc/state/x`.
+ * The real target must also stay inside the real skills root and outside every other
+ * real `.gjc/**` location, so a symlink (including a symlinked `.gjc/skills`) or a
+ * hardlink cannot redirect the write into workflow state.
+ */
+async function isAgentWritableGjcSkillPath(cwd: string, rawPath: string, segments: string[]): Promise<boolean> {
+	if (segments[0] !== ".gjc" || segments[1] !== "skills" || segments.length < 3) return false;
+	const { absolutePath, unknown } = resolveRawPath(cwd, rawPath);
+	if (unknown || !absolutePath) return false;
+	const gjcRoot = path.join(path.resolve(cwd), ".gjc");
+	const [realGjcRoot, realSkillsRoot, realTarget] = await Promise.all([
+		canonicalizeForContainment(gjcRoot),
+		canonicalizeForContainment(path.join(gjcRoot, "skills")),
+		canonicalizeForContainment(absolutePath),
+	]);
+	if (realTarget === realSkillsRoot || !isPathWithin(realSkillsRoot, realTarget)) return false;
+	const realGjcSkillsDir = path.join(realGjcRoot, "skills");
+	if (
+		isPathWithin(realGjcRoot, realTarget) &&
+		(realTarget === realGjcSkillsDir || !isPathWithin(realGjcSkillsDir, realTarget))
+	) {
+		return false;
+	}
+	return hasUnsharedFileTarget(cwd, rawPath);
 }
 
-function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): boolean {
-	return targets.paths.some(rawPath => isBlockedGjcPath(cwd, rawPath));
+async function isBlockedGjcPath(cwd: string, rawPath: string): Promise<boolean> {
+	const segments = relativeGjcSegments(cwd, rawPath);
+	if (segments?.[0] !== ".gjc") return false;
+	return !(await isAgentWritableGjcSkillPath(cwd, rawPath, segments));
+}
+
+async function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): Promise<boolean> {
+	for (const rawPath of targets.paths) {
+		if (await isBlockedGjcPath(cwd, rawPath)) return true;
+	}
+	return false;
 }
 
 function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets, sessionId?: string | null): boolean {
@@ -4215,9 +4249,9 @@ export async function assertWorkflowMutationRawPathsAllowed(input: {
 	guardContext?: WorkflowGuardContext;
 }): Promise<void> {
 	const targets: ExtractedTargets = { paths: input.rawPaths, unknown: input.rawPaths.length === 0 };
-	// Always-on `.gjc/**` runtime-owned block, ahead of forceOverride.
+	// Always-on `.gjc/**` runtime-owned block (except `.gjc/skills/<name>/**`), ahead of forceOverride.
 	// A deferred ast_edit apply must not reach `.gjc/**` either.
-	if (hasBlockedGjcTarget(input.cwd, targets)) {
+	if (await hasBlockedGjcTarget(input.cwd, targets)) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
 		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
 		throw new ToolError(`${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`);
@@ -4240,7 +4274,11 @@ export async function getWorkflowMutationDecision(
 ): Promise<WorkflowMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
 	const targets = extractTargets(input.tool, input.args);
-	if (input.tool.name !== "bash" && input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
+	if (
+		input.tool.name !== "bash" &&
+		input.enforceWorkflowState !== false &&
+		(await hasBlockedGjcTarget(input.cwd, targets))
+	) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
 		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
 		return {

@@ -361,6 +361,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:emitSubagentSteerObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitSubagentSteerRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:navigateTree": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:restoreTreeLeaf":
+		"internal exact-cursor restoration primitive behind the reviewed SDK captureSessionView/restoreSessionView surface; not an independent public SDK operation",
 	"agent_session:hasCopyCandidateAssistantMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getLastVisibleHandoffText": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasExtensionHandlers": "internal accessor/plumbing, not a user-facing control seam",

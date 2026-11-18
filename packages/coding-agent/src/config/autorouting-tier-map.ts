@@ -58,6 +58,7 @@ export const CURATED_TIER_LABELS = {
 	],
 	"openai-codex/gpt-6-sol": [{ tier: "strong", effort: "high", rank: 1 }],
 	"openai-codex/gpt-6.1-sol": [{ tier: "strong", effort: "high", rank: 2 }],
+	"openai-codex/gpt-6.2-sol": [{ tier: "strong", effort: "high", rank: 3 }],
 	"openai-codex/gpt-6.1-terra": [
 		{ tier: "fast", effort: "medium", rank: 1 },
 		{ tier: "balanced", effort: "high", rank: 1 },
@@ -6686,6 +6687,52 @@ export const TIER_MAP_SKIP_LIST = {
 	"zenmux/openai/gpt-6-astra": { rationale: "models.dev refresh addition; not yet curated" },
 	"zenmux/openai/gpt-6-sol": { rationale: "models.dev refresh addition; not yet curated" },
 	"zenmux/xiaomi/mimo-v2.6-pro": { rationale: "models.dev refresh addition; not yet curated" },
+	// GPT-6.2 Astra and Sol catalog additions
+	"kilo/openai/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-astra-fast": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-astra-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-sol-fast": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-sol-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openai-codex/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openai/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openai/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"opencode-zen/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"opencode-zen/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-astra-pro": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-astra-pro:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-astra:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-sol-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-sol-pro:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-sol:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"venice/openai-gpt-62-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"venice/openai-gpt-62-astra-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"venice/openai-gpt-62-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"venice/openai-gpt-62-sol-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"vercel-ai-gateway/openai/gpt-6.2-astra": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"vercel-ai-gateway/openai/gpt-6.2-astra-fast": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"vercel-ai-gateway/openai/gpt-6.2-sol": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"vercel-ai-gateway/openai/gpt-6.2-sol-fast": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
 } as const satisfies TierMapSkipList;
 
 export const CURATED_TIER_MAP: AutoroutingCuratedTierMap = {
