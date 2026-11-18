@@ -224,5 +224,119 @@ describe("unified diff scrubber", () => {
 			// Hunk header should be preserved
 			expect(scrubbed).toContain("@@ -0,0 +1,3 @@");
 		});
+
+		describe("probepark findings - false positive prevention", () => {
+			it("does not redact legitimate files like passport.js", () => {
+				const diff = [
+					"diff --git a/src/passport.js b/src/passport.js",
+					"index 1111111..2222222 100644",
+					"--- a/src/passport.js",
+					"+++ b/src/passport.js",
+					"@@ -1,2 +1,2 @@",
+					" const strategy = new LocalStrategy();",
+					" module.exports = strategy;",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// passport.js should NOT be redacted (it's a legitimate library)
+				expect(scrubbed).toContain("passport.js");
+				expect(scrubbed).not.toContain("file-redacted");
+			});
+
+			it("does not redact legitimate files like keyboard.ts", () => {
+				const diff = [
+					"diff --git a/src/keyboard.ts b/src/keyboard.ts",
+					"index 1111111..2222222 100644",
+					"--- a/src/keyboard.ts",
+					"+++ b/src/keyboard.ts",
+					"@@ -1,2 +1,2 @@",
+					" interface KeyboardEvent {}",
+					" export default KeyboardEvent;",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// keyboard.ts should NOT be redacted
+				expect(scrubbed).toContain("keyboard.ts");
+				expect(scrubbed).not.toContain("file-redacted");
+			});
+
+			it("does not redact legitimate files like author.md", () => {
+				const diff = [
+					"diff --git a/docs/author.md b/docs/author.md",
+					"index 1111111..2222222 100644",
+					"--- a/docs/author.md",
+					"+++ b/docs/author.md",
+					"@@ -1,2 +1,2 @@",
+					" # Author",
+					" Some author information",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// author.md should NOT be redacted
+				expect(scrubbed).toContain("author.md");
+				expect(scrubbed).not.toContain("file-redacted");
+			});
+
+			it("does not redact legitimate files like authorization-service.ts", () => {
+				const diff = [
+					"diff --git a/src/authorization-service.ts b/src/authorization-service.ts",
+					"index 1111111..2222222 100644",
+					"--- a/src/authorization-service.ts",
+					"+++ b/src/authorization-service.ts",
+					"@@ -1,2 +1,2 @@",
+					" export class AuthorizationService {}",
+					" export default AuthorizationService;",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// authorization-service.ts should NOT be redacted (it's a business logic service)
+				expect(scrubbed).toContain("authorization-service.ts");
+				expect(scrubbed).not.toContain("file-redacted");
+			});
+
+			it("DOES redact actual credential files like secret-api-key.json", () => {
+				const diff = [
+					"diff --git a/config/secret-api-key.json b/config/secret-api-key.json",
+					"index 1111111..2222222 100644",
+					"--- a/config/secret-api-key.json",
+					"+++ b/config/secret-api-key.json",
+					"@@ -1,1 +1,1 @@",
+					' {"api": "sensitive"}',
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// secret-api-key.json SHOULD be redacted
+				expect(scrubbed).toContain("file-redacted");
+				expect(scrubbed).not.toContain("secret-api-key");
+			});
+
+			it("DOES redact actual credential files like .env.local with password", () => {
+				const diff = [
+					"diff --git a/config/.env.password b/config/.env.password",
+					"index 1111111..2222222 100644",
+					"--- a/config/.env.password",
+					"+++ b/config/.env.password",
+					"@@ -1,1 +1,1 @@",
+					" DB_PASSWORD=secret123",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// .env.password SHOULD be redacted
+				expect(scrubbed).toContain("file-redacted");
+				expect(scrubbed).not.toContain(".env.password");
+			});
+		});
 	});
 });

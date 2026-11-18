@@ -140,12 +140,34 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 /**
  * Redact paths in diff headers that may contain credential-shaped filenames.
  * Paths like 'src/secret-api-key.json' should be replaced with generic names.
+ *
+ * We only redact path COMPONENTS (not entire paths) that clearly indicate credentials:
+ * - Exact matches or matches with separators: secret, token, password, api-key, etc.
+ * - Must have clear boundaries (word separators) to avoid false positives like
+ *   passport.js, keyboard.ts, authorization-service.ts, etc.
  */
 function redactPathInDiffHeader(pathSection: string): string {
-	// Pattern to find credential-like keywords in paths
-	const credentialPattern = /(?:secret|token|password|pass|api_?key|auth|credential|private|key)/i;
+	// Split path into components and check each one
+	const components = pathSection.split("/");
+	let hasCredentialComponent = false;
 
-	if (credentialPattern.test(pathSection)) {
+	for (const component of components) {
+		// Match only if the credential keyword is a clear part of the component name
+		// This includes patterns like:
+		// - secret-key, secret_key, secret.key
+		// - api-key.json, apikey.env
+		// - password.conf, .env.password
+		// But NOT: passport.js, keyboard.ts, authorization-service.ts
+		const credentialPattern =
+			/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
+
+		if (credentialPattern.test(component)) {
+			hasCredentialComponent = true;
+			break;
+		}
+	}
+
+	if (hasCredentialComponent) {
 		// Path contains credential-like patterns; replace with placeholder
 		return "file-redacted";
 	}
