@@ -870,6 +870,7 @@ describe("github view cache persistence", () => {
 			"- item\n\n      |https://alice:demo|value@example.test/x|",
 			"- item\n\n    |https://alice:demo|value@example.test/x|",
 			"```\n- item\n  ```\n\n    |https://alice:demo|value@example.test/x|",
+			"- item\n\n```\nliteral\n```\n\n    | A | B |\n    |---|---|\n    |https://alice:demo|value@example.test/x|",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",

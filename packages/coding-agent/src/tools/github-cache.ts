@@ -516,9 +516,15 @@ function tableRowFlags(lines: string[]): boolean[] {
 	const listIndentAt = new Array<number | null>(rows.length).fill(null);
 	let listIndent: number | null = null;
 	for (let i = 0; i < rows.length; i++) {
-		// Markers inside a fence are literal text, not list structure.
-		if (fenced[i] === true) continue;
 		const row = rows[i] ?? "";
+		// Markers inside a fence are literal text, not list structure. A fence
+		// opener less indented than the list content starts outside the item, so
+		// it ends the list continuation.
+		if (fenced[i] === true) {
+			const fenceMarker = /^( *)(`{3,}|~{3,})/.exec(row);
+			if (fenceMarker && listIndent !== null && (fenceMarker[1] ?? "").length < listIndent) listIndent = null;
+			continue;
+		}
 		const marker = /^(\s*)(?:[-+*]|\d+[.)])\s+/.exec(row);
 		if (marker) {
 			listIndent = (marker[0] ?? "").length;
