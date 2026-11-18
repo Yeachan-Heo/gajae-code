@@ -132,6 +132,16 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		secrets: [],
 		survives: [],
 	},
+	// Documented limitation: an all-lower-case single-pad payload followed by prose is
+	// indistinguishable from a `<word>= value` assignment without a word list or an entropy
+	// model, so the key is preserved and the token stays. Base removed it only by also deleting
+	// the key and the `Basic` cue. Follow-up: classify the token, do not add another line regex.
+	{
+		name: "documented limitation: all-lower-case single-pad token reads as an assignment",
+		text: "Basic\nabcdefghijklmnopqrs= keep",
+		secrets: [],
+		survives: [],
+	},
 	{
 		name: "multi-character wrapped URI after an auth cue",
 		text: "Token\n**https://app:synthetic@db.example.com/db**",

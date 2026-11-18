@@ -1062,10 +1062,10 @@ const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127
 const BASE64_CONTINUATION_LINE = /^[ \t]*[A-Za-z0-9+/]{8,}={0,2}[ \t]*$/;
 /**
  * A padded token at the start of a line: base64 characters, then one or two `=` and the field
- * separator. The padding must complete a group of four, and the payload must not be a plain
- * lower-case word: `diagnostic=` and `diagnostics=` are field assignments, while a printed base64
- * payload carries upper-case letters, digits or `+/`. Without this, every `<word>= value` line
- * after a bare `Basic` loses its key.
+ * separator. The padding must complete a group of four. An all-lower-case payload can be an
+ * English word (`diagnostic=`, `diagnostics=`), so it counts as a token only when two pads or a
+ * field after it already show that the `=` is padding; otherwise a plain `<word>= value` line is
+ * an assignment and keeps its key.
  */
 const PADDED_TOKEN_AT_LINE_START = /^[ \t]*([A-Za-z0-9+/]{8,})(={1,2})(?=[ \t]|$)/;
 const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
@@ -1077,7 +1077,9 @@ function startsWithPaddedToken(line: string): boolean {
 	const payload = match[1] as string;
 	const padding = match[2] as string;
 	if ((payload.length + padding.length) % 4 !== 0) return false;
-	return /[A-Z0-9+/]/.test(payload);
+	if (/[A-Z0-9+/]/.test(payload)) return true;
+	if (padding === "==") return true;
+	return DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line.slice(match[0].length));
 }
 
 /**
