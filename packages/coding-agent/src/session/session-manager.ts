@@ -12472,6 +12472,8 @@ export class SessionManager {
 		return work;
 	}
 
+	#moveRelocationRewrite = false;
+
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
 		// assertLegacyMutationAllowed now allows moves within exclusive transitions (#7856)
 		this.assertLegacyMutationAllowed("move session");
@@ -12917,12 +12919,13 @@ export class SessionManager {
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
-			if (this.persist && this.#sessionFile) {
-				// Update the cwd in the header. The append is sufficient; rewriting the transcript
-				// would be a separate transcript-mutating operation outside the scope of the move (#7856).
+			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
+				await this.#rewriteFileForMove();
+			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
+				await this.#rewriteFileForMove();
 			} else {
-				// Session not persisted; update header in memory only
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 			}
 		} catch (error) {
@@ -17314,6 +17317,16 @@ export class SessionManager {
 		}
 	}
 
+	/** The move's own relocation rewrite; admitted only while this manager owns the cwd transition. */
+	async #rewriteFileForMove(): Promise<void> {
+		this.#moveRelocationRewrite = true;
+		try {
+			await this.#rewriteFile();
+		} finally {
+			this.#moveRelocationRewrite = false;
+		}
+	}
+
 	async #rewriteFile(): Promise<void> {
 		this.assertLegacyMutationAllowed("rewrite transcript");
 		await this.#queuePersistTask(async () => {
@@ -20547,7 +20560,13 @@ export class SessionManager {
 		// Appending header patches and persisting them is necessary for the move; full rewrites
 		// of the transcript are not part of the move and should stay under shared admission (#7856).
 		const cwdTransitionAllowedOps = new Set(["move session", "append header patch", "persist patches"]);
-		if (this.#ownsCwdTransition() && cwdTransitionAllowedOps.has(operation)) return;
+		if (
+			this.#ownsCwdTransition() &&
+			(cwdTransitionAllowedOps.has(operation) ||
+				(this.#moveRelocationRewrite &&
+					(operation === "rewrite transcript" || operation === "full transcript publication")))
+		)
+			return;
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 
