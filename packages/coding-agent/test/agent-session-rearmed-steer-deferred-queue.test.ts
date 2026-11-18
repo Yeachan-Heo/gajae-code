@@ -14,6 +14,19 @@ import { createSdkRunCapability } from "../src/session/sdk-run-capability-intern
 /**
  * Test for PR #7865 fix: hasQueuedSteering must check deferred SDK follow-ups
  * for re-armed steers when mixed SDK/TUI queue path is active.
+ *
+ * When an SDK run is interrupted (user_interrupt abort), steers are re-armed and
+ * moved to the deferred SDK follow-up queue if one already exists. Without checking
+ * #deferredSdkFollowUps in the hasQueuedSteering predicate, the predicate would
+ * return false even though a re-armed steer is queued. This breaks the steer-on-interrupt
+ * UX where the first Esc key should resume into the queued steer (not abort).
+ *
+ * The fix adds a third check to hasQueuedSteering (agent-session.ts:20089):
+ *   return this.#deferredSdkFollowUps.some(message => this.#rearmedSteerMessages.has(message));
+ *
+ * Without this check, the hasQueuedSteering predicate would return false and the
+ * test assertion would fail because the re-armed steer in #deferredSdkFollowUps would
+ * not be detected.
  */
 describe("AgentSession re-armed steer detection in deferred queue", () => {
 	let tempDir: TempDir;
