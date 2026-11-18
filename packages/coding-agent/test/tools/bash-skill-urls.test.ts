@@ -1224,6 +1224,9 @@ describe("expandInternalUrls session scope", () => {
 				const real = await realpath(sourcePath);
 				expect(real).toContain("\\");
 				expect(expanded).toBe(`cat '${real.replaceAll("\\", "/")}'`);
+				// The emitted spelling has to name the same file, not merely look right.
+				const emitted = expanded.slice("cat '".length, -1);
+				expect(await Bun.file(emitted).text()).toBe("windows-rule");
 			} finally {
 				await rm(repo, { recursive: true, force: true });
 			}
@@ -1700,6 +1703,14 @@ describe("bash session agent directory", () => {
 					env: { PAYLOAD: multiline("rule://own") },
 				});
 				expect(textOf(ownResult)).toContain(await realpath(ownRule));
+				// A structured value keeps the delimiters it was written with, so the
+				// expanded value is still the JSON the caller built.
+				const ownReal = await realpath(ownRule);
+				const structuredResult = await tool.execute("call-env-json", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: '{"rule":"rule://own"}' },
+				});
+				expect(textOf(structuredResult)).toBe(`{"rule":"${ownReal}"}`);
 				// The same position still refuses a rule that is not this session's.
 				await expect(
 					tool.execute("call-env-multiline-foreign", {

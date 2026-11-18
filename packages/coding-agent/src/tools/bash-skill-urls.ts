@@ -688,7 +688,14 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			shellContext && (enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index)),
 		);
 		const replacement = shellContext && !options.noEscape ? shellEscape(resolvedPath) : resolvedPath;
-		expanded = `${expanded.slice(0, index)}${replacement}${expanded.slice(index + token.length)}`;
+		// Command text replaces the whole token because the replacement brings its own
+		// quoting. A data value keeps the delimiters the token was written with: they
+		// are part of the value (`{"rule":"rule://x"}` is JSON, not shell text), and
+		// the path guard already refused a path that could close them.
+		const delimiterWidth = token === rawUrl ? 0 : 1;
+		const start = shellContext ? index : index + delimiterWidth;
+		const end = shellContext ? index + token.length : index + token.length - delimiterWidth;
+		expanded = `${expanded.slice(0, start)}${replacement}${expanded.slice(end)}`;
 	}
 
 	return expanded;
