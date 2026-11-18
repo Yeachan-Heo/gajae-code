@@ -419,7 +419,14 @@ async function unlinkedDirectorySpelling(base: string, target: string): Promise<
 	if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
 		return undefined;
 	}
-	let current = resolvedBase;
+	let current: string;
+	try {
+		// The base may itself be a link (the trusted home often is), so it is
+		// resolved once; every recovered name then has to hang off that directory.
+		current = await fs.realpath(resolvedBase);
+	} catch {
+		return undefined;
+	}
 	for (const part of relative.split(path.sep)) {
 		const requested = path.join(current, part);
 		let entry: fsTypes.Stats;
@@ -437,12 +444,16 @@ async function unlinkedDirectorySpelling(base: string, target: string): Promise<
 		} catch {
 			return undefined;
 		}
-		// The destination has to be the entry `lstat` authorized: a link swapped in
-		// between the two calls resolves to another directory, and `dev`/`ino`
-		// tells the two apart. A path-based check cannot be atomic, but identity is
-		// what decides here, not a second look at the name.
+		// The recovered name has to be a direct child of the directory already
+		// verified for it and may differ from the requested name only by case, so a
+		// link swapped in between the calls cannot move the boundary elsewhere.
+		if (path.dirname(resolved) !== current) return undefined;
+		const name = path.basename(resolved);
+		if (name.toLowerCase() !== part.toLowerCase()) return undefined;
+		// Identity supplements the location check: a rename keeps the inode but not
+		// the parent, and a replacement keeps neither.
 		if (!settled.isDirectory() || settled.dev !== entry.dev || settled.ino !== entry.ino) return undefined;
-		current = resolved;
+		current = path.join(current, name);
 	}
 	return current;
 }
