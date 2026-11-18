@@ -145,25 +145,89 @@ export function findPrivateKeySpans(text: OriginalText): PrivateKeySpan[] {
 	return findPrivateKeySpansIn(text);
 }
 
+/** Whether `character` can appear in a printed PEM body value. */
+function isPemBodyCharacter(character: string | undefined): boolean {
+	if (character === undefined) return false;
+	const code = character.charCodeAt(0);
+	return (
+		(code >= 48 && code <= 57) ||
+		(code >= 65 && code <= 90) ||
+		(code >= 97 && code <= 122) ||
+		character === "+" ||
+		character === "/" ||
+		character === "_" ||
+		character === "-"
+	);
+}
+
+/** Length of a physical or serialized line break at `at`, or 0. */
+function lineBreakLengthAt(text: string, at: number): number {
+	if (text[at] === "\n") return 1;
+	if (text[at] === "\r") return text[at + 1] === "\n" ? 2 : 1;
+	const serialized = serializedLineBreakEnd(text, at);
+	return serialized < 0 ? 0 : serialized - at;
+}
+
 /**
- * The start of the earliest private-key opener that no footer closes, or -1. A caller that bounds
- * a preview can keep an opener while cutting its footer, so the preview must mask from here on.
+ * End of the body an unpaired opener still owns. The body starts on the next printed line and
+ * consists of base64-shaped lines only; text on the banner's own line (prose, a nested sibling)
+ * is not part of the block, so a replacement bounded here never deletes it.
  */
-export function findUnpairedPrivateKeyBanner(text: string): number {
-	const spans = findPrivateKeySpansIn(text);
+function unpairedPrivateKeyBodyEnd(text: string, headerEnd: number): number {
+	const firstBreak = lineBreakLengthAt(text, headerEnd);
+	if (firstBreak === 0) return headerEnd;
+	let cursor = headerEnd + firstBreak;
+	let end = headerEnd;
+	while (cursor < text.length) {
+		let bodyStart = cursor;
+		while (text[bodyStart] === " " || text[bodyStart] === "\t") bodyStart++;
+		let bodyEnd = bodyStart;
+		while (isPemBodyCharacter(text[bodyEnd])) bodyEnd++;
+		if (bodyEnd === bodyStart) break;
+		if (text[bodyEnd] === "=") {
+			let padded = bodyEnd;
+			while (text[padded] === "=" && padded - bodyEnd < 2) padded++;
+			// `=` inside the value is not padding; this is an assignment, not a body line.
+			if (isPemBodyCharacter(text[padded])) break;
+			bodyEnd = padded;
+		}
+		let trailing = bodyEnd;
+		while (text[trailing] === " " || text[trailing] === "\t") trailing++;
+		if (trailing < text.length && lineBreakLengthAt(text, trailing) === 0) {
+			// Punctuation is where a serialized value ends; a word means the line is not a body.
+			if (isPemBodyCharacter(text[trailing])) break;
+			end = bodyEnd;
+			break;
+		}
+		end = bodyEnd;
+		const nextBreak = lineBreakLengthAt(text, trailing);
+		if (nextBreak === 0) break;
+		cursor = trailing + nextBreak;
+	}
+	return end;
+}
+
+/** Locate every private-key opener that no footer closes, bounded to the body it owns. */
+export function findUnpairedPrivateKeySpans(text: string): PrivateKeySpan[] {
+	const paired = findPrivateKeySpansIn(text);
+	const spans: PrivateKeySpan[] = [];
 	let at = 0;
 	while (at < text.length) {
 		const begin = text.indexOf(PEM_BEGIN, at);
-		if (begin < 0) return -1;
+		if (begin < 0) break;
 		const headerEnd = privateKeyMarkerEnd(text, begin, PEM_BEGIN);
 		if (headerEnd < 0) {
 			at = begin + PEM_BEGIN.length;
 			continue;
 		}
-		if (!spans.some(span => begin >= span.start && begin < span.end)) return begin;
+		if (paired.some(span => begin >= span.start && begin < span.end)) {
+			at = headerEnd;
+			continue;
+		}
+		spans.push({ start: begin, end: unpairedPrivateKeyBodyEnd(text, headerEnd) });
 		at = headerEnd;
 	}
-	return -1;
+	return spans;
 }
 
 /** Historical v1 pairing: first opener with the first footer after it, stopping when unmatched. */
@@ -363,9 +427,9 @@ export type CrashMaskStructure = "structured" | "blind";
  * the YAML rule replaces, so a caller can mask them alongside its own structural ranges instead
  * of letting a later pass re-read structure this one already classified.
  *
- * A structure-blind scan only accepts a header in the first column: that is the one shape whose
- * role does not depend on the containers and quoted values around it. It therefore can never
- * mask more than the structure-aware scan, which is what makes the containment property testable.
+ * A structure-blind scan accepts a header at any indentation and ignores the containers and quoted
+ * values around it. It therefore still finds an indented body whose structure-aware scan was
+ * wrongly suppressed, which is what lets the containment property catch that defect.
  */
 function findYamlBlockScalarSpansWithRules(
 	text: string,
@@ -375,8 +439,9 @@ function findYamlBlockScalarSpansWithRules(
 	const spans: PrivateKeySpan[] = [];
 	// A header line inside a credential container is data the container owns, not YAML structure:
 	// the container's close bounds the scalar, so the body scan cannot walk past it into unrelated
-	// text that merely looks indented.
-	const containers = structure === "blind" ? [] : findCredentialContainerSpansIn(text, rules);
+	// text that merely looks indented. The blind scan still accepts an indented header there, but
+	// it must stop at the same container close or it would delete text no structure-aware mask owns.
+	const containers = findCredentialContainerSpansIn(text, rules);
 	let quotedContainers: PrivateKeySpan[] | undefined;
 	let lineStart = 0;
 
@@ -387,12 +452,7 @@ function findYamlBlockScalarSpansWithRules(
 			lineStart = nextLineStart;
 			continue;
 		}
-		if (structure === "blind") {
-			if (header.indentation !== 0) {
-				lineStart = nextLineStart;
-				continue;
-			}
-		} else {
+		if (structure !== "blind") {
 			// A "header" inside a quoted container value is data, not a block scalar.
 			quotedContainers ??= findQuotedContainerDataSpansIn(text);
 			if (
@@ -404,8 +464,7 @@ function findYamlBlockScalarSpansWithRules(
 			}
 		}
 
-		const bodyLimit =
-			structure === "blind" ? text.length : (containingContainerEnd(containers, lineStart) ?? text.length);
+		const bodyLimit = containingContainerEnd(containers, lineStart) ?? text.length;
 		let bodyLineStart = nextLineStart;
 		while (bodyLineStart < bodyLimit) {
 			const bodyLine = lineBounds(text, bodyLineStart);
@@ -465,10 +524,35 @@ function opensQuotedValue(text: string, index: number, start: number): boolean {
 	return character === "[" || character === "{" || character === "," || character === ":" || character === "=";
 }
 
-/** Whether `position` sits on a comment line: only leading whitespace precedes the `#`. */
+/**
+ * Whether `position` sits in a YAML comment. A comment starts at `#` in the first column or after
+ * whitespace, and only outside a quoted scalar. An inline comment ends the structural line just
+ * as a leading one does, so a container assignment written after it is prose, not structure.
+ */
 function positionOnCommentLine(text: string, position: number): boolean {
 	const lineStart = text.lastIndexOf("\n", position - 1) + 1;
-	return /^[ \t]*#/.test(text.slice(lineStart, position));
+	let quote: string | undefined;
+	for (let index = lineStart; index < position; index++) {
+		const character = text[index] ?? "";
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (quote !== undefined) {
+			if (character === quote) quote = undefined;
+			continue;
+		}
+		if (
+			(character === '"' || character === "'" || character === "`") &&
+			(index === lineStart || opensQuotedValue(text, index, lineStart))
+		) {
+			quote = character;
+			continue;
+		}
+		if (character !== "#") continue;
+		if (index === lineStart || text[index - 1] === " " || text[index - 1] === "\t") return true;
+	}
+	return false;
 }
 
 /**
@@ -956,19 +1040,26 @@ const RESIDUAL_TRAILING_WHOLE_MATCH_RULES: readonly { readonly pattern: RegExp; 
  * so no rule can consume a line terminator or reinterpret text produced by another rule.
  */
 const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*$/i;
-/** A URI may follow the cue directly or after one wrapper character, as in `_https://…_`. */
-const URI_AT_LINE_START = /^[ \t]*[^A-Za-z0-9+.-]?[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+/** A URI may follow the cue after any run of wrapper characters, as in `**https://…**`. */
+const URI_AT_LINE_START = /^[ \t]*[^A-Za-z0-9+.-]*[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
 /** token68/base64: the trailing `=` is padding, not an assignment separator. */
 const BASE64_CONTINUATION_LINE = /^[ \t]*[A-Za-z0-9+/]{8,}={0,2}[ \t]*$/;
+/** A padded token at the start of a line; whatever follows the padding is a separate field. */
+const PADDED_TOKEN_AT_LINE_START = /^[ \t]*[A-Za-z0-9+/]{8,}={1,2}(?=[ \t]|$)/;
 const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
 
 /**
  * Whether a continuation line names a diagnostic field. Base64 is the exception: its padding is
- * not `key=value`, so `Basic\nZml4dHVyZTpwYXNzd29yZA==` stays a credential continuation.
+ * not `key=value`, so `Basic\nZml4dHVyZTpwYXNzd29yZA==` stays a credential continuation. A
+ * padded token followed by whitespace is the same exception with a diagnostic after it.
  */
 function startsDiagnosticAssignment(line: string): boolean {
-	return !BASE64_CONTINUATION_LINE.test(line) && DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line);
+	return (
+		!BASE64_CONTINUATION_LINE.test(line) &&
+		!PADDED_TOKEN_AT_LINE_START.test(line) &&
+		DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line)
+	);
 }
 
 /** Whether a line already carries a URL whose userinfo rule masks its own credential. */
@@ -978,6 +1069,20 @@ function carriesUrlCredential(line: string): boolean {
 
 /** An auth cue followed by an escaped line break (`\\n`), as a JSON-serialized value prints it. */
 const ESCAPED_AUTH_CUE = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*(?:\\+r)?\\+n[ \t]*/gi;
+
+/**
+ * End of a serialized line break (`\\n` or `\\r\\n`) at `at`, or -1. An even backslash run is a
+ * literal backslash, not an escape, so it does not separate fields.
+ */
+function serializedLineBreakEnd(text: string, at: number): number {
+	if (text[at] !== "\\") return -1;
+	let run = at;
+	while (text[run] === "\\") run++;
+	if ((run - at) % 2 === 0) return -1;
+	if (text[run] === "n") return run + 1;
+	if (text[run] === "r" && text[run + 1] === "\\" && text[run + 2] === "n") return run + 3;
+	return -1;
+}
 
 /**
  * Mask the credential a serialized value carries after an escaped line break. The escaped form
@@ -994,7 +1099,14 @@ function collectEscapedContinuations(
 	for (let match = ESCAPED_AUTH_CUE.exec(line); match !== null; ) {
 		const start = match.index + match[0].length;
 		let end = start;
-		while (end < line.length && !CONTINUATION_DELIMITER.test(line[end])) end++;
+		// A serialized value prints each of its lines on one physical line. The next escaped break
+		// ends this continuation, so the field after it keeps its own text and its own rules.
+		while (
+			end < line.length &&
+			!CONTINUATION_DELIMITER.test(line[end] as string) &&
+			serializedLineBreakEnd(line, end) < 0
+		)
+			end++;
 		const token = line.slice(start, end);
 		const hasUriValue = structure === "blind" ? carriesUrlCredential(token) : URI_AT_LINE_START.test(token);
 		if (end - start >= 8 && !startsDiagnosticAssignment(token) && !hasUriValue) {
@@ -1157,9 +1269,11 @@ export function maskStructured(text: string): MaskedCrashText {
 }
 
 /**
- * Structure-blind baseline over the same collectors: no credential-container bound, no
- * quoted-value gate and no indentation-dependent header. Its masks are the ones any correct
- * structure-aware pass must still cover, so a gate that suppresses one of them is a bug.
+ * Structure-blind baseline over the same collectors: no credential-container suppression, no
+ * quoted-value gate and no indentation-dependent header. A block-scalar body still stops at the
+ * container close that holds it, because a blind mask must not own text no structure-aware mask
+ * covers. Its masks are the ones any correct structure-aware pass must still cover, so a gate
+ * that suppresses one of them is a bug.
  */
 export function maskStructureBlind(text: string): MaskedCrashText {
 	return maskCrashText(text, "blind");
@@ -1169,6 +1283,26 @@ function maskCrashText(text: string, structure: CrashMaskStructure): MaskedCrash
 	const original = asOriginalText(text);
 	const masks = mergeRedactionRanges(collectCrashRedactionRanges(original, findPrivateKeySpans(original), structure));
 	return { text: applyRedactions(original, masks), masks };
+}
+
+/**
+ * Preview masking for one captured field. Unlike the general record pass, a field preview must
+ * remove a private-key opener whose footer fell outside the captured text, or the body would
+ * print unmasked. The unpaired opener and the body it owns are detected on this original text
+ * and applied in the same single pass; nothing rescans masked output.
+ */
+export function maskFieldPreview(text: string, structure: CrashMaskStructure = "structured"): MaskedCrashText {
+	const original = asOriginalText(text);
+	const masks = mergeRedactionRanges([
+		...collectCrashRedactionRanges(original, findPrivateKeySpans(original), structure),
+		...findUnpairedPrivateKeySpans(original).map(span => ({ ...span, label: PRIVATE_KEY_REDACTION_MARKER })),
+	]);
+	return { text: applyRedactions(original, masks), masks };
+}
+
+/** Structure-aware field-preview masking; see `maskFieldPreview`. */
+export function redactCrashSecretsForPreview(text: string): string {
+	return maskFieldPreview(text).text;
 }
 
 /**

@@ -25,7 +25,12 @@ import {
 } from "./crash-fingerprint";
 import type { CrashProvenance } from "./crash-journal";
 import { appendCrashEvent, appendFatalCrashEvent, detectCrashProvenance } from "./crash-journal";
-import { findUnpairedPrivateKeyBanner, PRIVATE_KEY_REDACTION_MARKER, redactCrashSecrets } from "./crash-redaction";
+import {
+	type MaskedCrashText,
+	maskStructured,
+	redactCrashSecrets,
+	redactCrashSecretsForPreview,
+} from "./crash-redaction";
 import { getCrashEventsPath, getCrashLogPath, getHandledErrorEventsPath, getHandledErrorLogPath } from "./dirs";
 import { isDesignedError } from "./error-classification";
 import * as logger from "./logger";
@@ -344,14 +349,12 @@ function boundedSerialized(text: string): string {
 }
 
 /**
- * Mask one complete field text. An opener whose footer is missing from the whole text has no
- * pairable block, so the rest of the field is masked: a preview that keeps such an opener would
- * also keep its body.
+ * Mask one complete field text in the single classification pass. An opener with no footer is
+ * detected on this original text and replaced only up to the body it owns, so a preview never
+ * rescans its own masked output and never deletes a sibling after the block.
  */
 function maskCompleteFieldText(value: string): string {
-	const masked = redactCrashSecrets(value);
-	const banner = findUnpairedPrivateKeyBanner(masked);
-	return banner < 0 ? masked : `${masked.slice(0, banner)}${PRIVATE_KEY_REDACTION_MARKER}`;
+	return redactCrashSecretsForPreview(value);
 }
 
 /**
@@ -582,7 +585,9 @@ export function recordHandledError(
 		)
 			return undefined;
 		const fatal = describeFatal(error);
-		const fingerprint = computeHandledErrorFingerprint(persistedCrashInput(fatal)).fingerprint;
+		// Persisted fields are already masked; the identity consumes them without detecting again.
+		const persisted = persistedCrashInput(fatal);
+		const fingerprint = computeHandledErrorFingerprint(persisted, { alreadyMasked: true }).fingerprint;
 		if (handledErrorFingerprints.has(fingerprint)) {
 			// Still hot: dedupe, but refresh recency so an actively failing class
 			// is not the one evicted under pressure.
@@ -598,7 +603,7 @@ export function recordHandledError(
 		const written = writeCrashRecord(label, fatal, {
 			path: options.path ?? getHandledErrorLogPath(),
 			now: options.now,
-			fingerprint: computeHandledErrorFingerprint(persistedCrashInput(fatal)),
+			fingerprint: computeHandledErrorFingerprint(persisted, { alreadyMasked: true }),
 		});
 		if (!written) {
 			handledErrorFingerprints.delete(fingerprint);
@@ -664,15 +669,13 @@ function getHandledErrorEventsTarget(target: string, configuredPath: string | un
 function crashLogStack(name: string, message: string, stack: string): string {
 	const allControls = /[\u0000-\u001f\u007f-\u009f]/g;
 	const frameControls = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
-	const redacted = redactCrashSecrets(stack);
-	const preserved = preserveFrameBoundary(
-		stack,
-		redacted,
-		headerBoundary(name, message, stack),
-		allControls,
-		frameControls,
-	);
-	return preserved ?? redacted.replace(allControls, " ");
+	const masked = maskStructured(stack);
+	const boundary = headerBoundary(name, message, stack);
+	const preserved =
+		boundary === undefined || boundary <= 0 || boundary > stack.length
+			? undefined
+			: flattenAtFrameBoundary(masked, boundary, allControls, frameControls);
+	return preserved ?? masked.text.replace(allControls, " ");
 }
 
 function headerBoundary(name: string, message: string, stack: string): number | undefined {
@@ -688,18 +691,26 @@ function headerBoundary(name: string, message: string, stack: string): number | 
 	return first === name ? newline : undefined;
 }
 
-function preserveFrameBoundary(
-	stack: string,
-	redacted: string,
-	boundary: number | undefined,
+/**
+ * Flatten the header's control characters while keeping the frame newlines in the tail. The
+ * classification already ran over the whole original stack; only the boundary is resolved here.
+ * A replacement that crosses the boundary has no clean split, so the caller flattens everything.
+ */
+function flattenAtFrameBoundary(
+	masked: MaskedCrashText,
+	boundary: number,
 	allControls: RegExp,
 	frameControls: RegExp,
 ): string | undefined {
-	if (boundary === undefined || boundary <= 0 || boundary > stack.length) return undefined;
-	const head = redactCrashSecrets(stack.slice(0, boundary));
-	const tail = redactCrashSecrets(stack.slice(boundary));
-	if (head + tail !== redacted) return undefined;
-	return `${head.replace(allControls, " ")}${redacted.slice(head.length).replace(frameControls, " ")}`;
+	let outputBoundary = boundary;
+	for (const mask of masked.masks) {
+		if (mask.start < boundary && mask.end > boundary) return undefined;
+		// A replacement shortens the text by its input span minus the label it prints.
+		if (mask.end <= boundary) outputBoundary -= mask.end - mask.start - mask.label.length;
+	}
+	const head = masked.text.slice(0, outputBoundary).replace(allControls, " ");
+	const tail = masked.text.slice(outputBoundary).replace(frameControls, " ");
+	return `${head}${tail}`;
 }
 
 /** The name, message, and stack strings that the crash log actually stores. */
@@ -724,8 +735,9 @@ function writeCrashRecord(
 		const persisted = persistedCrashInput(fatal);
 		const stack = persisted.stack ? `${persisted.stack}\n` : "";
 		const payload = fatal.payload ? `${fatal.payload}\n` : "";
-		// The marker must match the diagnostic a reader rebuilds from this text.
-		const fingerprint = options.fingerprint ?? computeCrashFingerprint(persisted);
+		// The marker must match the diagnostic a reader rebuilds from this text. The persisted
+		// fields are already masked, so the fingerprint consumes them without re-running detection.
+		const fingerprint = options.fingerprint ?? computeCrashFingerprint(persisted, { alreadyMasked: true });
 		const recordId = randomBytes(8).toString("hex");
 		const markerLine = `${formatCrashRecordMarker(fingerprint.fingerprint, fingerprint.version, recordId)}\n`;
 		// The marker is the record's identity, so it is budgeted first and appended
