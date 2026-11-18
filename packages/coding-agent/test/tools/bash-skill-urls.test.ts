@@ -2095,113 +2095,80 @@ describe("bash session agent directory", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"refuses a quoted env value whose rule path would break that quoting",
+		"expands an env value only when the resolved rule path needs no escaping",
 		async () => {
-			const parent = await mkdtemp(path.join(tmpdir(), "bash-env-quoted-"));
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-env-data-"));
 			try {
 				const project = path.join(parent, "project");
 				const agentDir = path.join(parent, "agent");
 				await mkdir(project);
 				await mkdir(agentDir);
-				// A tab is a legal filename character and passes the rule path guard, but
-				// it cannot sit raw inside the quoted value the caller wrote.
+				// A space needs no escaping in any format; a tab and a control character
+				// do, and the env channel cannot know how the caller would spell them.
+				const plainRule = path.join(project, "plain name.md");
 				const tabRule = path.join(project, "tabbed\tname.md");
+				const controlRule = path.join(project, "ctrl\u0001.md");
+				await writeFile(plainRule, "plain-rule");
 				await writeFile(tabRule, "tabbed-rule");
+				await writeFile(controlRule, "control-rule");
 				const ruleSource = (filePath: string) => ({
 					provider: "test",
 					providerName: "test",
 					path: filePath,
 					level: "user" as const,
 				});
-				setActiveRules([{ name: "tabbed", path: tabRule, content: "tabbed", _source: ruleSource(tabRule) }]);
-				const tool = createAgentDirBashTool(project, agentDir, path.join(parent, "settings-agent"));
-				await expect(
-					tool.execute("call-env-quoted-tab", {
-						command: 'printf "%s" "$PAYLOAD"',
-						env: { PAYLOAD: '{"rule":"rule://tabbed"}' },
-					}),
-				).rejects.toThrow(/would change the value's quoting/);
-				// A URL inside a longer quoted run lands in the enclosing quote too, so
-				// the same path cannot slip in beside a prefix.
-				await expect(
-					tool.execute("call-env-prefixed-tab", {
-						command: 'printf "%s" "$PAYLOAD"',
-						env: { PAYLOAD: '"prefix rule://tabbed"' },
-					}),
-				).rejects.toThrow(/would change the value's quoting/);
-				// An escaped quote later in the value must not hide the run that closes
-				// right after the URL: this value is balanced and would be corrupted.
-				await expect(
-					tool.execute("call-env-json-escaped", {
-						command: 'printf "%s" "$PAYLOAD"',
-						env: { PAYLOAD: '{"message":"prefix rule://tabbed suffix","note":"a \\"quote"}' },
-					}),
-				).rejects.toThrow(/would change the value's quoting/);
-				// An opener that follows a word character is still a double quote, so a
-				// shadowed quoted run cannot hide the replacement.
-				await expect(
-					tool.execute("call-env-word-adjacent", {
-						command: 'printf "%s" "$PAYLOAD"',
-						env: { PAYLOAD: 'x"prefix rule://tabbed"' },
-					}),
-				).rejects.toThrow(/would change the value's quoting/);
-				// A plural possessive is an apostrophe in a word, not a quoted run.
-				const possessive = await tool.execute("call-env-possessive-tab", {
-					command: 'printf "%s" "$PAYLOAD"',
-					env: { PAYLOAD: "owners' rule://tabbed and reviewers' notes" },
-				});
-				expect(textOf(possessive)).toContain(await realpath(tabRule));
-				// A decomposed accent and an astral letter are word characters too, so
-				// their apostrophes stay prose; both rows would invent a quoted run if the
-				// neighbours were read as UTF-16 units.
-				for (const [label, value] of [
-					["decomposed", "cafe\u0301's rule://tabbed and owners' notes"],
-					["astral", "\u{1d736}' rule://tabbed and \u{1d737}' notes"],
-				] as const) {
-					const proseValue = await tool.execute(`call-env-${label}-tab`, {
-						command: 'printf "%s" "$PAYLOAD"',
-						env: { PAYLOAD: value },
-					});
-					expect(textOf(proseValue)).toContain(await realpath(tabRule));
-				}
-				// An elided apostrophe (`'twas`) must not open a run that hides the real
-				// double-quoted field: the control character in the path is refused.
-				const controlRule = path.join(project, "ctrl\u0001.md");
-				await writeFile(controlRule, "control-rule");
 				setActiveRules([
+					{ name: "plain", path: plainRule, content: "plain", _source: ruleSource(plainRule) },
 					{ name: "tabbed", path: tabRule, content: "tabbed", _source: ruleSource(tabRule) },
 					{ name: "ctrl", path: controlRule, content: "control", _source: ruleSource(controlRule) },
 				]);
-				await expect(
-					tool.execute("call-env-elision-shadow", {
-						command: 'printf "%s" "$PAYLOAD"',
-						env: { PAYLOAD: '# \'tis a comment\r\nfile: "prefix rule://ctrl suffix"' },
-					}),
-				).rejects.toThrow(/would change the value's quoting/);
-				// An elision and a possessive around a bare URL are prose, not a run.
-				const elision = await tool.execute("call-env-elision-tab", {
-					command: 'printf "%s" "$PAYLOAD"',
-					env: { PAYLOAD: "'Twas rule://tabbed and the owners' choice" },
-				});
-				expect(textOf(elision)).toContain(await realpath(tabRule));
+				const tool = createAgentDirBashTool(project, agentDir, path.join(parent, "settings-agent"));
+				const run = (id: string, payload: string) =>
+					tool.execute(id, { command: 'printf "%s" "$PAYLOAD"', env: { PAYLOAD: payload } });
+				const plainReal = await realpath(plainRule);
+
+				// Embedded in a value, the URL may only be replaced by a path that needs
+				// no escaping, whatever format the caller wrote.
+				for (const [id, payload] of [
+					["json", '{"rule":"rule://tabbed"}'],
+					["quoted", '"prefix rule://tabbed"'],
+					["word-adjacent", 'x"prefix rule://tabbed"'],
+					["escaped-quote-after", '{"message":"prefix rule://tabbed suffix","note":"a \\"quote"}'],
+					["yaml-single-quoted", "key: 'prefix rule://tabbed suffix'"],
+					["yaml-control", '# \'tis a comment\r\nfile: "prefix rule://ctrl suffix"'],
+					["multiline", "before\nrule://tabbed\nafter"],
+				] as const) {
+					await expect(run(`call-env-${id}`, payload)).rejects.toThrow(/cannot carry/);
+				}
+
+				// A plain path is spliced into every one of those shapes.
+				for (const [id, payload] of [
+					["json", '{"rule":"rule://plain"}'],
+					["multiline", "before\nrule://plain\nafter"],
+					["prose", "it's rule://plain but we're ready"],
+					["possessive", "owners' rule://plain and reviewers' notes"],
+					["decomposed", "cafe\u0301's rule://plain and owners' notes"],
+					["astral", "\u{1d736}' rule://plain and \u{1d737}' notes"],
+					["elision", "'Twas rule://plain and the owners' choice"],
+					["yaml-single-quoted", "key: 'prefix rule://plain suffix'"],
+				] as const) {
+					const result = await run(`call-env-${id}-plain`, payload);
+					expect(textOf(result)).toContain(plainReal);
+				}
+
+				// The caller's own delimiters survive, so structured values stay parsed.
+				const structured = await run("call-env-structured", '{"rule":"rule://plain"}');
+				expect(textOf(structured)).toBe(`{"rule":"${plainReal}"}`);
+
+				// A value that is only the URL carries whatever the path holds.
+				const bareTab = await run("call-env-bare-tab", "rule://tabbed");
+				expect(textOf(bareTab)).toContain(await realpath(tabRule));
+
 				// A candidate the consumer reads as an escape is not a URL at all.
-				const escaped = await tool.execute("call-env-escaped-tab", {
-					command: 'printf "%s" "$PAYLOAD"',
-					env: { PAYLOAD: '{"message":"prefix \\rule://tabbed"}' },
-				});
+				const escaped = await run("call-env-escaped", '{"message":"prefix \\rule://tabbed"}');
 				expect(textOf(escaped)).toContain("\\rule://tabbed");
-				// A lone apostrophe in prose is not a quoted run, so the same path is
-				// accepted there instead of being refused as quoted data.
-				const prose = await tool.execute("call-env-prose-tab", {
-					command: 'printf "%s" "$PAYLOAD"',
-					env: { PAYLOAD: "it's rule://tabbed but we're ready" },
-				});
-				expect(textOf(prose)).toContain(await realpath(tabRule));
-				const bare = await tool.execute("call-env-bare-tab", {
-					command: 'printf "%s" "$PAYLOAD"',
-					env: { PAYLOAD: "rule://tabbed" },
-				});
-				expect(textOf(bare)).toContain(await realpath(tabRule));
+				const escapedOpener = await run("call-env-escaped-opener", '{"message":"prefix \\"rule://tabbed"}');
+				expect(textOf(escapedOpener)).toContain('\\"rule://tabbed');
 			} finally {
 				resetActiveRulesForTests();
 				await rm(parent, { recursive: true, force: true });

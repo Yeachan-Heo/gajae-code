@@ -788,45 +788,27 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
 /**
- * True when `index` sits inside a double-quoted run that closes after it. Data
- * values quote structurally with double quotes (JSON, YAML); an apostrophe is
- * prose in contractions, possessives, and elisions (`it's`, `owners'`,
- * `'twas`), so it never delimits here and cannot shadow a real quote. A quote
- * behind a backslash is escaped, not a delimiter.
+ * True when a backslash immediately before `index` escapes it (odd run). The
+ * consumer reads that escape, so the text after it is not a URL there.
  */
-function enclosingClosedQuote(value: string, index: number): string | undefined {
-	let inside = false;
-	for (let i = 0; i < index; i++) {
-		const character = value[i];
-		if (character === "\\") {
-			i++;
-			continue;
-		}
-		if (character === '"') inside = !inside;
-	}
-	if (!inside) return undefined;
-	for (let i = index; i < value.length; i++) {
-		const character = value[i];
-		if (character === "\\") {
-			i++;
-			continue;
-		}
-		if (character === '"') return '"';
-	}
-	return undefined;
-}
-
-/** True when a backslash immediately before `index` escapes it (odd run). */
 function escapedAt(value: string, index: number): boolean {
 	let count = 0;
 	for (let i = index - 1; i >= 0 && value[i] === "\\"; i--) count++;
 	return count % 2 === 1;
 }
 
-function assertFitsQuotedValue(resolvedPath: string, quoted: boolean): void {
-	if (!quoted || !QUOTED_VALUE_UNSAFE.test(resolvedPath)) return;
+/**
+ * A data value's format is the caller's, not this tool's: JSON, YAML, shell
+ * fragments, and prose all arrive as one opaque string, so the surrounding text
+ * cannot say how a path would have to be escaped. The rule is therefore the same
+ * for every insertion: a path carrying a quote, a backslash, or a control
+ * character is refused instead of spliced, because only the caller knows how its
+ * format would spell it.
+ */
+function assertPathFitsDataValue(resolvedPath: string): void {
+	if (!QUOTED_VALUE_UNSAFE.test(resolvedPath)) return;
 	throw new ToolError(
-		"Cannot expand this URL inside a quoted value: the resolved path contains a character that would change the value's quoting.",
+		"Cannot expand this URL in an env value: the resolved path contains a quote, a backslash, or a control character that the value cannot carry.",
 	);
 }
 
@@ -888,12 +870,10 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			// A data value carries no shell spelling, so a Windows path uses `/`,
 			// which names the same file and needs no escaping inside quotes.
 			replacement = windowsDataValueSpelling(resolvedPath);
-			// The replacement lands in the quote the token carries or, for a URL
-			// inside a longer quoted run, the quote still open at that position.
-			assertFitsQuotedValue(
-				replacement,
-				delimiter !== undefined || enclosingClosedQuote(command, index) !== undefined,
-			);
+			// A value that is only the URL carries whatever the path holds; once the
+			// URL sits inside text the caller wrote, only a path that needs no
+			// escaping by any format is safe to splice.
+			if (index !== 0 || token.length !== command.length) assertPathFitsDataValue(replacement);
 		}
 		// Command text replaces the whole token because the replacement brings its own
 		// quoting. A data value keeps the delimiters the token was written with: they
