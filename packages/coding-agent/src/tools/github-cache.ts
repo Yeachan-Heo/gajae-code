@@ -419,7 +419,7 @@ function maskCredentialJsonContainers(
 function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
 	const sanitized: string[] = [];
 	const masked = text.replace(
-		/(?<![A-Za-z0-9_])((?:authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
+		/(?<![A-Za-z0-9_-])((?:proxy-)?(?:authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
 		(
 			_match: string,
 			label: string,
@@ -735,13 +735,16 @@ function scrubCacheText(text: string, diff = false): string {
 	// Digest/Negotiate headers carry parameters after the scheme; mask the rest
 	// of the header line so a `response=` parameter cannot survive.
 	const withoutParameterizedAuth = withoutPem.replace(
-		/(?<![A-Za-z0-9_])((?:authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
+		/(?<![A-Za-z0-9_-])((?:proxy-)?(?:authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
 		"$1 «redacted»",
 	);
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutParameterizedAuth);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
-	const withoutCookies = withoutBearer.replace(/(?<![A-Za-z0-9_])(cookie[ \t]*:[ \t]*)[^\r\n]+/gi, "$1«redacted»");
+	const withoutCookies = withoutBearer.replace(
+		/(?<![A-Za-z0-9_-])((?:set-)?cookie[ \t]*:[ \t]*)[^\r\n]+/gi,
+		"$1«redacted»",
+	);
 	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);
 	let scrubbed = redactCrashSecrets(withoutAtSigns);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
