@@ -665,6 +665,22 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 }
 
 /**
+ * A data value keeps the delimiters the caller wrote around the URL, so the
+ * replacement must not be able to close them or be escape-processed inside
+ * them: a quote, a backslash, or a control character would change the shape of
+ * the value (a JSON string, for example) instead of only its path. Rule paths
+ * already refuse shell syntax; `skill://`, `local://`, and `plan://` paths are
+ * not guarded that way, so the delimiter check is the only backstop.
+ */
+function assertFitsDelimiter(resolvedPath: string, delimiter: string | undefined): void {
+	const structural = delimiter === '"' ? /["\\\u0000-\u001f]/ : delimiter === "'" ? /['\u0000-\u001f]/ : undefined;
+	if (!structural?.test(resolvedPath)) return;
+	throw new ToolError(
+		"Cannot expand this URL inside a quoted value: the resolved path contains a character that would change the value's quoting.",
+	);
+}
+
+/**
  * Expand filesystem-safe internal URLs in `command`. `agent://`,
  * `artifact://`, and `memory://` remain internal-reader-only and are rejected
  * before resolution.
@@ -712,11 +728,13 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			shellContext && (enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index)),
 		);
 		const replacement = shellContext && !options.noEscape ? shellEscape(resolvedPath) : resolvedPath;
+		const delimiter = token === rawUrl ? undefined : token[0];
+		if (!shellContext) assertFitsDelimiter(resolvedPath, delimiter);
 		// Command text replaces the whole token because the replacement brings its own
 		// quoting. A data value keeps the delimiters the token was written with: they
 		// are part of the value (`{"rule":"rule://x"}` is JSON, not shell text), and
-		// the path guard already refused a path that could close them.
-		const delimiterWidth = token === rawUrl ? 0 : 1;
+		// the delimiter check above refused a path that could close them.
+		const delimiterWidth = delimiter === undefined ? 0 : 1;
 		const start = shellContext ? index : index + delimiterWidth;
 		const end = shellContext ? index + token.length : index + token.length - delimiterWidth;
 		expanded = `${expanded.slice(0, start)}${replacement}${expanded.slice(end)}`;

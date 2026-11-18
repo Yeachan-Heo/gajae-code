@@ -1755,6 +1755,46 @@ describe("bash session agent directory", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"refuses a quoted env value whose rule path would break that quoting",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-env-quoted-"));
+			try {
+				const project = path.join(parent, "project");
+				const agentDir = path.join(parent, "agent");
+				await mkdir(project);
+				await mkdir(agentDir);
+				// A tab is a legal filename character and passes the rule path guard, but
+				// it cannot sit raw inside the quoted value the caller wrote.
+				const tabRule = path.join(project, "tabbed\tname.md");
+				await writeFile(tabRule, "tabbed-rule");
+				const ruleSource = (filePath: string) => ({
+					provider: "test",
+					providerName: "test",
+					path: filePath,
+					level: "user" as const,
+				});
+				setActiveRules([{ name: "tabbed", path: tabRule, content: "tabbed", _source: ruleSource(tabRule) }]);
+				const tool = createAgentDirBashTool(project, agentDir, path.join(parent, "settings-agent"));
+				await expect(
+					tool.execute("call-env-quoted-tab", {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: '{"rule":"rule://tabbed"}' },
+					}),
+				).rejects.toThrow(/would change the value's quoting/);
+				// The same path is accepted where the caller wrote no delimiters.
+				const bare = await tool.execute("call-env-bare-tab", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: "rule://tabbed" },
+				});
+				expect(textOf(bare)).toContain(await realpath(tabRule));
+			} finally {
+				resetActiveRulesForTests();
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it.skipIf(process.platform === "win32" || !canWriteUnderHome)(
 		"expands an ancestor project rule through bash command execution in a non-Git session",
 		async () => {
