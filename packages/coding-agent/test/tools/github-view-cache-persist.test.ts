@@ -1479,6 +1479,8 @@ describe("github view cache persistence", () => {
 			'"path": "prefix{ends\\\\",\n-Cookie: theme=\'light\'; sid=round46-opaque-session',
 			' {\n"path": "}{ends\\\\",\n-Cookie: theme=\'light\'; sid=cache-review46-opaque-id\n }',
 			' {\n"path": "}",\n-Cookie: theme=light}; sid=review47-opaque-session\n}',
+			'preamble "\n-Auth: diagnostic [\n-Cookie: theme=light; sid=round48-opaque-canary]',
+			"preamble \"\n-Auth: 'diagnostic' trace=[\n-Cookie: theme=light; sid=round48-opaque-canary]",
 		];
 		for (const [index, body] of bodies.entries()) {
 			putCached({
@@ -1500,6 +1502,7 @@ describe("github view cache persistence", () => {
 				"round46-opaque-session",
 				"cache-review46-opaque-id",
 				"review47-opaque-session",
+				"round48-opaque-canary",
 			]) {
 				expect(cacheFileBytes()).not.toContain(marker);
 				expect(cached?.payload.body).not.toContain(marker);

@@ -725,9 +725,17 @@ function startsCredentialHeader(line: string): boolean {
 	);
 }
 
+/** True when the line containing `index` begins a Cookie header. */
+function isCookieHeaderLine(text: string, index: number): boolean {
+	const start = text.lastIndexOf("\n", index) + 1;
+	const end = text.indexOf("\n", index);
+	const line = text.slice(start, end === -1 ? text.length : end);
+	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*cookie)\b/i.test(line);
+}
+
 /** Quote-aware bracket scan up to `end`. */
-function scanStructure(text: string, end: number): { stack: string[]; quoted: boolean } {
-	const stack: string[] = [];
+function scanStructure(text: string, end: number): { stack: { ch: string; index: number }[]; quoted: boolean } {
+	const stack: { ch: string; index: number }[] = [];
 	let quoted = false;
 	for (let i = 0; i < end; i++) {
 		const ch = text[i];
@@ -744,13 +752,13 @@ function scanStructure(text: string, end: number): { stack: string[]; quoted: bo
 			quoted = true;
 			continue;
 		}
-		if (ch === "{" || ch === "[") stack.push(ch);
+		if (ch === "{" || ch === "[") stack.push({ ch, index: i });
 		else if (ch === "}" || ch === "]") stack.pop();
 	}
 	return { stack, quoted };
 }
 
-/** True when a match carries the closer matching the innermost open container. */
+/** True when a match carries a Cookie-owned structural closer. */
 function closesMatchingContainer(text: string, end: number, match: string): boolean {
 	const scan = scanStructure(text, end);
 	if (scan.quoted) return false;
@@ -766,17 +774,18 @@ function closesMatchingContainer(text: string, end: number, match: string): bool
 			quoted = true;
 			continue;
 		}
-		if (ch === "{" || ch === "[") stack.push(ch);
-		else if (ch === "}" || ch === "]") {
-			const top = stack.at(-1);
-			if ((ch === "]" && top === "[") || (ch === "}" && top === "{")) {
-				const rest = match.slice(i + 1).trim();
-				if (rest === "" || rest === ",") {
-					stack.pop();
-					return true;
-				}
-			}
+		if (ch === "{" || ch === "[") {
+			stack.push({ ch, index: end + i });
+			continue;
 		}
+		if (ch !== "}" && ch !== "]") continue;
+		const top = stack.at(-1);
+		if (!top || !((ch === "]" && top.ch === "[") || (ch === "}" && top.ch === "{"))) continue;
+		const rest = match.slice(i + 1).trim();
+		if (rest !== "" && rest !== ",") continue;
+		if (!isCookieHeaderLine(text, top.index)) return false;
+		stack.pop();
+		return true;
 	}
 	return false;
 }
