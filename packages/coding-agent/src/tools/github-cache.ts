@@ -416,6 +416,14 @@ function maskCredentialJsonContainers(
  * header survives. `cookies` stays with the shared redactor: cookie pairs are
  * not a single value token.
  */
+/** Redact parameterized inline auth values such as `Token token="..."`. */
+function maskParameterizedAuthValues(text: string): string {
+	return text.replace(
+		/((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*[:=][ \t]*)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)([A-Za-z0-9_.-]+[ \t]*=[ \t]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
+		"$1$2$3$4«redacted»",
+	);
+}
+
 function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
 	const sanitized: string[] = [];
 	const masked = text.replace(
@@ -431,7 +439,6 @@ function maskBoundedAuthorizationHeaders(text: string): { text: string; restore:
 			offset: number,
 			text: string,
 		) => {
-			if (insideContainerQuote(text, offset)) return _match;
 			const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
 			const sentinel = `${BOUNDED_AUTHORIZATION_MASK}${sanitized.length}\u0000`;
 			sanitized.push(`${label}${scheme}${spacing}${quote}«redacted»${quote}`);
@@ -751,6 +758,12 @@ function lineStartsCredentialHeader(text: string, index: number): boolean {
 	return startsCredentialHeader(text.slice(start, end === -1 ? text.length : end));
 }
 
+/** True when only indentation/marker precedes a single quote on its line. */
+function isSingleQuoteItemStart(text: string, index: number): boolean {
+	const start = text.lastIndexOf("\n", index) + 1;
+	return /^[ \t]*[-+]?[ \t]*$/.test(text.slice(start, index));
+}
+
 /** Quote-aware bracket scan up to `end`. */
 function scanStructure(text: string, end: number): { stack: { ch: string; index: number }[]; quoted: boolean } {
 	const stack: { ch: string; index: number }[] = [];
@@ -766,7 +779,12 @@ function scanStructure(text: string, end: number): { stack: { ch: string; index:
 			if (ch === quote && !isEscapedAt(text, i)) quote = null;
 			continue;
 		}
-		if (ch === '"' || (ch === "'" && !isWordApostrophe(text, i) && lineStartsCredentialHeader(text, i))) {
+		if (
+			ch === '"' ||
+			(ch === "'" &&
+				!isWordApostrophe(text, i) &&
+				(lineStartsCredentialHeader(text, i) || isSingleQuoteItemStart(text, i)))
+		) {
 			quote = ch;
 			continue;
 		}
@@ -874,26 +892,16 @@ function scrubCacheText(text: string, diff = false): string {
 		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
 		"$1 «redacted»",
 	);
-	const withoutLineAuth = withoutParameterizedAuth
+	const withoutLineAuth = maskParameterizedAuthValues(withoutParameterizedAuth)
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
-			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
-				insideContainerQuote(text, offset) ? match : `${lineStart}${marker}${label} «redacted»`,
+			"$1$2$3 «redacted»",
 		)
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s|;"'`&,]+)/gi,
-			(
-				match: string,
-				lineStart: string,
-				marker: string,
-				label: string,
-				scheme: string,
-				space: string,
-				offset: number,
-				text: string,
-			) => (insideContainerQuote(text, offset) ? match : `${lineStart}${marker}${label}${scheme}${space}«redacted»`),
+			"$1$2$3$4$5«redacted»",
 		);
-	const authHeaders = maskBoundedAuthorizationHeaders(withoutLineAuth);
+	const authHeaders = maskBoundedAuthorizationHeaders(maskParameterizedAuthValues(withoutLineAuth));
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
 	const withoutCookies = withoutBearer
