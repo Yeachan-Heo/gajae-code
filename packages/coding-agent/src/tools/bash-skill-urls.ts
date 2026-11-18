@@ -385,6 +385,42 @@ function isStrictlyInside(root: string, candidate: string): boolean {
 const PROJECT_RULE_DIR_NAMES = [".agent", ".agents"] as const;
 
 /**
+ * On-disk spelling of `target` when every component below `base` is a real
+ * directory, or `undefined` when one is missing or is a link (junction).
+ * `realpath` cannot answer this question: it reports a link target, and
+ * promoting that target to a trust root would let a linked rule directory grant
+ * everything it points at. It also reports the on-disk case, which a synthesized
+ * `.agent` spelling misses on a case-insensitive volume. An exact name wins over
+ * a case-folded one, so a directory holding both keeps the synthesized spelling.
+ */
+async function unlinkedDirectorySpelling(base: string, target: string): Promise<string | undefined> {
+	const resolvedBase = path.resolve(base);
+	const relative = path.relative(resolvedBase, path.resolve(target));
+	if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		return undefined;
+	}
+	let current = resolvedBase;
+	for (const part of relative.split(path.sep)) {
+		let names: string[];
+		try {
+			names = await fs.readdir(current);
+		} catch {
+			return undefined;
+		}
+		const match = names.includes(part) ? part : names.find(name => name.toLowerCase() === part.toLowerCase());
+		if (match === undefined) return undefined;
+		current = path.join(current, match);
+		try {
+			const entry = await fs.lstat(current);
+			if (entry.isSymbolicLink() || !entry.isDirectory()) return undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	return current;
+}
+
+/**
  * Real path of a rule file in an ancestor `.agent/rules` or `.agents/rules` directory
  * under the trusted home. Non-Git discovery loads those directories and skips home.
  * Ancestors are matched by physical identity so a trusted home reached through a
@@ -417,16 +453,13 @@ async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string
 		for (const dirName of PROJECT_RULE_DIR_NAMES) {
 			const lexicalRuleDir = path.join(ancestor.lexical, dirName, "rules");
 			const canonicalRuleDir = path.join(ancestor.canonical, dirName, "rules");
-			if (!pathStaysInside(lexicalRuleDir, lexical) && !pathStaysInside(canonicalRuleDir, lexical)) continue;
-			// The names above are synthesized, so on a case-insensitive volume an
-			// on-disk `.AGENT` would not match the synthesized `.agent`. Take the
-			// resolved spelling only when it names the same path with different
-			// casing: realpath also follows a link at the rules directory itself,
-			// and a linked rules directory must not widen the boundary to its target.
-			const resolvedRuleDir = await canonicalPathOrAncestor(canonicalRuleDir, SESSION_URL_ESCAPE);
-			const ruleDirSpelling =
-				resolvedRuleDir.toLowerCase() === canonicalRuleDir.toLowerCase() ? resolvedRuleDir : canonicalRuleDir;
-			if (pathStaysInside(ruleDirSpelling, realTarget)) return realTarget;
+			// The names above are synthesized, and a linked rules directory must not
+			// widen the boundary to its target, so the boundary is the on-disk
+			// spelling of a directory reached without following a link.
+			const ruleDir = await unlinkedDirectorySpelling(ancestor.canonical, canonicalRuleDir);
+			if (ruleDir === undefined) continue;
+			if (!pathStaysInside(lexicalRuleDir, lexical) && !pathStaysInside(ruleDir, lexical)) continue;
+			if (pathStaysInside(ruleDir, realTarget)) return realTarget;
 		}
 	}
 	return undefined;
@@ -453,19 +486,23 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 		if (realRule !== realTarget) continue;
 		for (const dirName of PROJECT_RULE_DIR_NAMES) {
 			const ruleRoot = path.join(home, dirName, "rules");
-			let realRoot: string;
-			try {
-				realRoot = await fs.realpath(ruleRoot);
-			} catch {
-				continue;
+			// An unlinked rules directory is its own on-disk spelling, so a `.AGENT`
+			// written by the user still matches. A linked one keeps the documented
+			// behavior: the link target is the rules directory, and the request has to
+			// be spelled under the link itself.
+			const unlinkedRoot = await unlinkedDirectorySpelling(home, ruleRoot);
+			let boundary = unlinkedRoot;
+			if (boundary === undefined) {
+				try {
+					boundary = await fs.realpath(ruleRoot);
+				} catch {
+					continue;
+				}
+				if (!pathStaysInside(ruleRoot, lexical) || !pathStaysInside(ruleRoot, ruleLexical)) continue;
 			}
-			// The physical rules directory is the trust anchor. Accepting either
-			// spelling keeps an on-disk `.AGENT` or a differently cased home from
-			// rejecting a rule that really does live in the trusted rules directory.
-			const sourceIsInRuleDir = pathStaysInside(ruleRoot, lexical) || pathStaysInside(realRoot, lexical);
-			const ruleIsInRuleDir = pathStaysInside(ruleRoot, ruleLexical) || pathStaysInside(realRoot, ruleLexical);
-			if (!sourceIsInRuleDir || !ruleIsInRuleDir) continue;
-			if (pathStaysInside(realRoot, realTarget)) return realTarget;
+			if (pathStaysInside(boundary, lexical) && pathStaysInside(boundary, ruleLexical)) {
+				if (pathStaysInside(boundary, realTarget)) return realTarget;
+			}
 		}
 	}
 	return undefined;

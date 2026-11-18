@@ -776,6 +776,68 @@ describe("expandInternalUrls session scope", () => {
 		}
 	});
 
+	it("expands an ancestor rule whose rule directory is spelled with different case", async () => {
+		const trusted = await mkdtemp(path.join(tmpdir(), "bash-ancestor-case-"));
+		const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(trusted);
+		try {
+			const project = path.join(trusted, "work", "project");
+			const cwd = path.join(project, "subdir");
+			// A case-insensitive volume reports the spelling the user created.
+			const rule = path.join(project, ".AGENT", "RULES", "check.md");
+			await mkdir(path.dirname(rule), { recursive: true });
+			await mkdir(cwd);
+			await writeFile(rule, "mixed-case-ancestor");
+			const router = createInternalRouter({ "rule://check": { sourcePath: rule } });
+			await expectExpandsToSource(
+				"cat rule://check",
+				{
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(trusted, "agent"),
+				},
+				rule,
+			);
+		} finally {
+			spy.mockRestore();
+			await rm(trusted, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!symlinkSupported)(
+		"refuses an ancestor rule directory that is a link to a case-variant sibling",
+		async () => {
+			const trusted = await mkdtemp(path.join(tmpdir(), "bash-ancestor-link-"));
+			const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(trusted);
+			try {
+				const project = path.join(trusted, "work", "project");
+				const cwd = path.join(project, "subdir");
+				const sibling = path.join(project, ".AGENT", "rules");
+				await mkdir(sibling, { recursive: true });
+				await mkdir(cwd);
+				await writeFile(path.join(sibling, "check.md"), "linked-ancestor");
+				// The project's rule directory is reached through a link into a
+				// case-variant sibling, which is a different directory on a
+				// case-sensitive filesystem. The request is spelled through the link,
+				// as discovery would spell it.
+				await symlink(path.join(project, ".AGENT"), path.join(project, ".agent"));
+				const rule = path.join(project, ".agent", "rules", "check.md");
+				const router = createInternalRouter({ "rule://check": { sourcePath: rule } });
+				await expect(
+					expandInternalUrls("cat rule://check", {
+						skills: [],
+						internalRouter: router,
+						sessionCwd: cwd,
+						sessionAgentDir: path.join(trusted, "agent"),
+					}),
+				).rejects.toThrow(/outside this session/);
+			} finally {
+				spy.mockRestore();
+				await rm(trusted, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it.skipIf(!canWriteUnderHome)(
 		"refuses an ancestor rule that is inside the runtime home but outside the trusted home",
 		async () => {
