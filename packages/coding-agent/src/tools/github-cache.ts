@@ -388,8 +388,12 @@ function maskCredentialJsonContainers(text: string): { text: string; restore: (s
 		if (first !== "{" && first !== "[") continue;
 		let end = findBalancedValueEnd(text, valueStart);
 		if (end === -1) {
-			const lineEnd = text.indexOf("\n", valueStart);
-			end = lineEnd === -1 ? text.length : lineEnd;
+			// The container never closes. A JSON value cannot contain a blank
+			// line, so the paragraph boundary is the last safe stopping point;
+			// without one the rest of the text belongs to the malformed value.
+			const tail = text.slice(valueStart);
+			const paragraph = /\n[ \t]*\n/.exec(tail);
+			end = paragraph ? valueStart + paragraph.index : text.length;
 		}
 		out += text.slice(last, valueStart) + '"«redacted»"';
 		last = end;

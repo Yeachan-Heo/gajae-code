@@ -818,6 +818,7 @@ describe("github view cache persistence", () => {
 			],
 			['{"token":{"note":"demo"}}', '{"token":"«redacted»"}'],
 			['{"token":{"note":"opaque-demo-value"', '{"token":"«redacted»"'],
+			['{"token": {\n"note":"opaque-demo-value"', '{"token": "«redacted»"'],
 		];
 		cases.forEach(([body, expected], index) => {
 			const number = 90 + index;
