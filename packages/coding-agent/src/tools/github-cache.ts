@@ -730,7 +730,7 @@ function isContainerOpenerLine(text: string, index: number): boolean {
 	const start = text.lastIndexOf("\n", index) + 1;
 	const end = text.indexOf("\n", index);
 	const line = text.slice(start, end === -1 ? text.length : end);
-	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*(?:cookie|authorization|auth))[ \t]*["']?[ \t]*[:=][ \t]*[[{][ \t]*$/i.test(
+	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*(?:cookie|authorization|auth))[ \t]*["']?[ \t]*[:=][ \t]*[[{]/i.test(
 		line,
 	);
 }
@@ -862,13 +862,17 @@ function scrubCacheText(text: string, diff = false): string {
 		)
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
-			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
-				containerDepthAt(text, offset) > 0 &&
-				(insideContainerQuote(text, offset) ||
-					closesMatchingContainer(text, offset, match) ||
-					(match.includes('"') && !hasLocalDoubleQuotePair(match)))
-					? match
-					: `${lineStart}${marker}${label}«redacted»`,
+			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) => {
+				if (containerDepthAt(text, offset) === 0) return `${lineStart}${marker}${label}«redacted»`;
+				if (insideContainerQuote(text, offset)) return match;
+				if (closesMatchingContainer(text, offset, match)) {
+					if (!match.includes("'")) return match;
+					const closer = match.trimEnd().slice(-1);
+					return `${lineStart}${marker}${label}«redacted»${closer}`;
+				}
+				if (match.includes('"') && !hasLocalDoubleQuotePair(match)) return match;
+				return `${lineStart}${marker}${label}«redacted»`;
+			},
 		)
 		.replace(
 			/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,

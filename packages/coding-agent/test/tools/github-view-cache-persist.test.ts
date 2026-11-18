@@ -1483,6 +1483,9 @@ describe("github view cache persistence", () => {
 			"preamble \"\n-Auth: 'diagnostic' trace=[\n-Cookie: theme=light; sid=round48-opaque-canary]",
 			"-Auth: [\n+mixed-auth-array-opaque-canary\n-Cookie: sid=display]",
 			'-Auth: [\n-  "fixture-auth-array-canary",\n-Cookie: sid=fixture-cookie]',
+			'-Auth: [\n-  "fixture-auth-item",\n-Cookie: sid=first\'fixture-opaque-session]',
+			'Cookie: ["first",\n  "cookie-array-private-canary",\n-Cookie: sid=display]',
+			'-Cookie: [first,\n-  "fixture-second-opaque",\n-Cookie: sid=display]',
 		];
 		for (const [index, body] of bodies.entries()) {
 			putCached({
@@ -1507,6 +1510,10 @@ describe("github view cache persistence", () => {
 				"round48-opaque-canary",
 				"mixed-auth-array-opaque-canary",
 				"fixture-auth-array-canary",
+				"fixture-auth-item",
+				"fixture-opaque-session",
+				"cookie-array-private-canary",
+				"fixture-second-opaque",
 			]) {
 				expect(cacheFileBytes()).not.toContain(marker);
 				expect(cached?.payload.body).not.toContain(marker);
