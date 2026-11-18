@@ -374,7 +374,10 @@ function findBalancedValueEnd(text: string, start: number): number {
  * Matches inside an already-consumed value are skipped, and an unterminated
  * value is redacted through the end of its line rather than left behind.
  */
-function maskCredentialJsonContainers(text: string): { text: string; restore: (scrubbed: string) => string } {
+function maskCredentialJsonContainers(
+	text: string,
+	diff: boolean,
+): { text: string; restore: (scrubbed: string) => string } {
 	if (!text.includes("{") && !text.includes("[")) return { text, restore: scrubbed => scrubbed };
 	let out = "";
 	let last = 0;
@@ -393,7 +396,9 @@ function maskCredentialJsonContainers(text: string): { text: string; restore: (s
 			// not, because an empty diff context line is a single space and the
 			// value can continue after it. Prose falls back to its paragraph.
 			const tail = text.slice(valueStart);
-			const section = tail.indexOf("\ndiff --git ");
+			// Only a real unified diff has sections; a lookalike line in prose is
+			// text, not a boundary the scrubber may trust.
+			const section = diff ? tail.indexOf("\ndiff --git ") : -1;
 			// A blank line is legal whitespace inside a JSON array, so prose
 			// has no safe intermediate stop: fail closed to the end of the text.
 			end = section === -1 ? text.length : valueStart + section;
@@ -611,16 +616,16 @@ function stripUrlUserinfo(text: string): string {
  * text, so the cache cannot inherit that assumption.
  */
 const CACHE_VENDOR_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-	[/(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
-	[/(?<![A-Za-z0-9])gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
-	[/(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
-	[/(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}/g, "«redacted-api-key»"],
-	[/(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{8,}/g, "«redacted-slack-token»"],
-	[/(?<![A-Za-z0-9])npm_[A-Za-z0-9]{20,}/g, "«redacted-npm-token»"],
-	[/(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
-	[/(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
-	[/(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
-	[/(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}/g, "«redacted-google-api-key»"],
+	[/(?<![A-Za-z])github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
+	[/(?<![A-Za-z])gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
+	[/(?<![A-Za-z])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
+	[/(?<![A-Za-z])sk-[A-Za-z0-9_-]{8,}/g, "«redacted-api-key»"],
+	[/(?<![A-Za-z])xox[baprs]-[A-Za-z0-9-]{8,}/g, "«redacted-slack-token»"],
+	[/(?<![A-Za-z])npm_[A-Za-z0-9]{20,}/g, "«redacted-npm-token»"],
+	[/(?<![A-Za-z])glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
+	[/(?<![A-Za-z])hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
+	[/(?<![A-Za-z])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
+	[/(?<![A-Za-z])AIza[0-9A-Za-z_-]{35}/g, "«redacted-google-api-key»"],
 ];
 
 function scrubCacheVendorTokens(text: string): string {
@@ -641,6 +646,8 @@ function scrubHostPaths(text: string): string {
 	const homePattern =
 		home.length > 1 ? new RegExp(`(?<![A-Za-z0-9._#])${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
 	const escapedHome = home.length > 1 ? home.replaceAll("/", "\\/") : "";
+	// JSON text escapes quotes and backslashes as well as slashes.
+	const jsonHome = home.length > 1 ? JSON.stringify(home).slice(1, -1) : "";
 	const scrubLocal = (chunk: string): string => {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
@@ -649,9 +656,9 @@ function scrubHostPaths(text: string): string {
 		// JSON text can escape path separators; mask the same local paths in
 		// that spelling without changing the surrounding text.
 		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
-		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|]+/gi, "$1~");
 		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
-		return scrubbed.replace(/(?<![A-Za-z0-9._#])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
+		return scrubbed.replace(/(?<![A-Za-z0-9._#])[A-Za-z]:[\\/]Users[\\/][^\\/\r\n"`<>()[\]{},;|]+/gi, "~");
 	};
 	// A `file:` URL's path is local, so scrub it without turning the marker into
 	// an authority: `file:///home/u/x` -> `file:///~/x`,
@@ -679,12 +686,13 @@ function scrubHostPaths(text: string): string {
 		if (!localAuthority) return url;
 		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
+		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
 		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|]+/g, "$1~");
 		scrubbed = scrubbed.replace(/\/root(?=\/|[?#]|$)/g, "~");
 		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
-		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|]+/gi, "$1~");
 		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
-		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
+		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\r\n"`<>()[\]{},;|]+/gi, "$1~");
 	};
 	// A URL's path is content, not a local path, so only scrub outside URL spans.
 	// `|` ends a span so a compact Markdown table row does not shield the next
@@ -702,14 +710,14 @@ function scrubHostPaths(text: string): string {
 }
 
 /** Text-level scrub for everything the view cache persists or serves back. */
-function scrubCacheText(text: string): string {
+function scrubCacheText(text: string, diff = false): string {
 	// Userinfo comes off the raw text first: container masking can collapse a
 	// blank line that ended a Markdown table, and a later table classification
 	// would then hide a URL behind its cell separator.
 	const withoutUserinfo = stripUrlUserinfo(text);
 	// Structured containers next: a partial flat match would hide the credential
 	// label from the quote-aware container pass.
-	const containers = maskCredentialJsonContainers(withoutUserinfo);
+	const containers = maskCredentialJsonContainers(withoutUserinfo, diff);
 	// The shared URL rule does not know about Markdown cell separators and can
 	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
 	// (userinfo was already removed) so only our authority pass sees them.
@@ -802,7 +810,7 @@ function scrubStoredView(
 	// the damaged text would be indexed as the persisted one. Sibling fields are
 	// scrubbed generically; the rebuilt `unified` and `files` come from the
 	// exact text that is stored so slice offsets stay valid.
-	const scrubbedUnified = scrubPrDiffText(unified, scrubCacheText);
+	const scrubbedUnified = scrubPrDiffText(unified, value => scrubCacheText(value, true));
 	const reparsed = parsePrUnifiedDiff(scrubbedUnified);
 	const extras = isRecordValue(payload)
 		? scrubPersistedValue(

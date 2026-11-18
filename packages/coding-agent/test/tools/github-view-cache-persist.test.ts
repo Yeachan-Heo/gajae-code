@@ -771,6 +771,32 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.unified).not.toContain("demo-canary");
 	});
 
+	it("redacts a token after an invalid UTF-8 escape in a quoted path", () => {
+		const diff = [
+			`diff --git "a/${"\\377"}${GITHUB_TOKEN}" "b/${"\\377"}${GITHUB_TOKEN}"`,
+			"new file mode 100644",
+			"--- /dev/null",
+			`+++ "b/${"\\377"}${GITHUB_TOKEN}"`,
+			"@@ -0,0 +1 @@",
+			"+x",
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 96,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain(GITHUB_TOKEN);
+		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 96, false, TEST_AUTH_KEY);
+		expect(cached?.payload.unified).not.toContain(GITHUB_TOKEN);
+	});
+
 	it("keeps unquoted operand spaces and replacement metacharacters", () => {
 		const secret = "opaque-cache-value-1234567890";
 		const diff = [
@@ -825,6 +851,7 @@ describe("github view cache persistence", () => {
 			['{"token": {\n"note":"opaque-demo-value"', '{"token": "«redacted»"'],
 			['{"token": [\n\n"opaque-demo-value"\n', '{"token": "«redacted»"'],
 			['"token": [\n  "opaque-cache-canary-123"', '"token": "«redacted»"'],
+			['"token": [\n  "opaque-demo-value"\ndiff --git a/x b/x\n"opaque-more"', '"token": "«redacted»"'],
 		];
 		cases.forEach(([body, expected], index) => {
 			const number = 90 + index;
@@ -927,6 +954,8 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("alpha|beta");
 		expect(cacheFileBytes()).not.toContain("cache|canary");
 		expect(cacheFileBytes()).not.toContain("cache-fixture");
+		expect(cacheFileBytes()).not.toContain("'cache-fixture");
+		expect(cacheFileBytes()).not.toContain("Jane Doe");
 		expect(cacheFileBytes()).not.toContain(os.homedir());
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");
@@ -980,7 +1009,7 @@ describe("github view cache persistence", () => {
 
 	it("masks an escaped custom home path", () => {
 		const escapedHome = os.homedir().replaceAll("/", "\\/");
-		const body = `{"path":"${escapedHome}/private.key"}\n{"path":"C:\\\\Users\\\\cache-fixture\\\\config"}`;
+		const body = `{"path":"${escapedHome}/private.key"}\n{"path":"C:\\\\Users\\\\cache-fixture\\\\config"}\n{"path":"C:\\\\Users\\\\'cache-fixture\\\\config"}\n{"path":"C:\\\\Users\\\\Jane Doe\\\\config"}`;
 		const url = `https://github.com/${TEST_REPO}/issues/95`;
 		putCached({
 			authKey: TEST_AUTH_KEY,
