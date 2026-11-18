@@ -190,12 +190,16 @@ async function canonicalLocalPath(localRoot: string, lexicalPath: string): Promi
 
 const SKILL_ESCAPE = "Path traversal is not allowed in skill:// URLs";
 
-/** Real path of `target`, or the real ancestor plus the missing suffix. */
+/**
+ * Real path of `target`, or the real ancestor plus the missing suffix.
+ * Any filesystem failure is reported as `escapeMessage` so a foreign pathname
+ * never reaches the caller through an operating-system error.
+ */
 async function canonicalPathOrAncestor(target: string, escapeMessage: string): Promise<string> {
 	try {
 		return await fs.realpath(target);
 	} catch (error) {
-		if (!isEnoent(error)) throw error;
+		if (!isEnoent(error)) throw new ToolError(escapeMessage);
 	}
 
 	const missing: string[] = [];
@@ -205,14 +209,13 @@ async function canonicalPathOrAncestor(target: string, escapeMessage: string): P
 		try {
 			stat = await fs.lstat(cursor);
 		} catch (error) {
-			if (!isEnoent(error)) throw error;
+			if (!isEnoent(error)) throw new ToolError(escapeMessage);
 		}
 		if (stat) {
 			try {
 				return path.join(await fs.realpath(cursor), ...missing);
-			} catch (error) {
-				if (isEnoent(error)) throw new ToolError(escapeMessage);
-				throw error;
+			} catch {
+				throw new ToolError(escapeMessage);
 			}
 		}
 		const parent = path.dirname(cursor);
@@ -241,6 +244,82 @@ function extractScheme(url: string): SupportedInternalScheme | undefined {
 	const scheme = match[1].toLowerCase();
 	if (!SUPPORTED_INTERNAL_SCHEMES.includes(scheme as SupportedInternalScheme)) return undefined;
 	return scheme as SupportedInternalScheme;
+}
+
+/**
+ * Shell quote state at `index`: the quote syntax still open, or undefined.
+ * A URL matched inside an open quote is spliced into an argument the caller
+ * already quoted, so replacing it with a separately quoted path would end that
+ * quote early and expose any shell syntax in the replacement path.
+ * `$'...'` is tracked separately because there a backslash escapes `'`.
+ */
+function enclosingQuote(command: string, index: number): "'" | '"' | "ansi-c" | undefined {
+	let quote: "'" | '"' | "ansi-c" | undefined;
+	for (let i = 0; i < index; i++) {
+		const character = command[i];
+		if (quote === "ansi-c") {
+			if (character === "\\") i++;
+			else if (character === "'") quote = undefined;
+			continue;
+		}
+		if (quote === "'") {
+			if (character === "'") quote = undefined;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") i++;
+			else if (character === '"') quote = undefined;
+			continue;
+		}
+		if (character === "\\") i++;
+		else if (character === "$" && command[i + 1] === "'") {
+			quote = "ansi-c";
+			i++;
+		} else if (character === "'" || character === '"') quote = character;
+	}
+	return quote;
+}
+
+/**
+ * True when the character immediately before a URL token changes how the
+ * replacement's leading quote is read: an adjacent `$` turns it into ANSI-C or
+ * locale quoting, and an odd backslash run escapes it. Both would run the
+ * replacement path outside the single-quoted segment added by shellEscape.
+ */
+function unsafeExpansionPrefix(command: string, index: number): boolean {
+	if (index === 0) return false;
+	const preceding = command[index - 1];
+	if (preceding === "$") {
+		let escapedBy = 0;
+		for (let i = index - 2; i >= 0 && command[i] === "\\"; i--) escapedBy++;
+		if (escapedBy % 2 === 0) return true;
+	}
+	let backslashes = 0;
+	for (let i = index - 1; i >= 0 && command[i] === "\\"; i--) backslashes++;
+	return backslashes % 2 === 1;
+}
+
+/**
+ * Shell contexts that expand text again after this substitution: command
+ * substitution, backticks, heredoc bodies, parameter/arithmetic expansion,
+ * arithmetic commands, and bracket subscripts. In those contexts the single
+ * quotes added by `shellEscape` are not quoting, so a canonical path carrying
+ * shell syntax could run. Multi-line commands are refused for the same reason:
+ * comment and heredoc membership starts at line structure a flat scan cannot
+ * model.
+ */
+function hasNestedExpansionContext(command: string): boolean {
+	return (
+		command.includes("\n") ||
+		command.includes("\r") ||
+		command.includes("`") ||
+		command.includes("((") ||
+		command.includes("[") ||
+		command.includes("]") ||
+		/(?:^|[\s;&|])let(?:\s|$)/.test(command) ||
+		/\$[([{]|\$['"]/.test(command) ||
+		/(?:^|[^<])<<(?![<])/.test(command)
+	);
 }
 
 function unquoteToken(token: string): string {
@@ -273,36 +352,40 @@ const PROJECT_RULE_DIR_NAMES = [".agent", ".agents"] as const;
 /**
  * Real path of a rule file in an ancestor `.agent/rules` or `.agents/rules` directory
  * under the trusted home. Non-Git discovery loads those directories and skips home.
+ * Ancestors are matched by physical identity so a trusted home reached through a
+ * symlink still matches the project tree spelled with either path.
  */
 async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string): Promise<string | undefined> {
-	const cwd = path.resolve(sessionCwd);
-	const home = path.resolve(getTrustedHomeDir());
-	if (!isStrictlyInside(home, cwd)) return undefined;
+	const lexicalCwd = path.resolve(sessionCwd);
+	const lexicalHome = path.resolve(getTrustedHomeDir());
+	const canonicalHome = await canonicalPathOrAncestor(lexicalHome, SESSION_URL_ESCAPE);
+	const canonicalCwd = await canonicalPathOrAncestor(lexicalCwd, SESSION_URL_ESCAPE);
+	if (!isStrictlyInside(canonicalHome, canonicalCwd)) return undefined;
+
 	const lexical = path.resolve(sourcePath);
 	const realTarget = await canonicalPathOrAncestor(lexical, SESSION_URL_ESCAPE);
-	let ancestor = path.dirname(cwd);
-	while (isStrictlyInside(home, ancestor)) {
-		let realAncestor: string;
-		try {
-			realAncestor = await fs.realpath(ancestor);
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-			realAncestor = ancestor;
+
+	// Walk the session's lexical ancestors, keeping the lexical spelling used by
+	// discovery alongside the physical identity used for containment.
+	const ancestors: { lexical: string; canonical: string }[] = [];
+	let lexicalAncestor = path.dirname(lexicalCwd);
+	for (;;) {
+		const canonicalAncestor = await canonicalPathOrAncestor(lexicalAncestor, SESSION_URL_ESCAPE);
+		if (!isStrictlyInside(canonicalHome, canonicalAncestor)) break;
+		ancestors.push({ lexical: lexicalAncestor, canonical: canonicalAncestor });
+		const parent = path.dirname(lexicalAncestor);
+		if (parent === lexicalAncestor) break;
+		lexicalAncestor = parent;
+	}
+
+	for (const ancestor of ancestors) {
+		for (const dirName of PROJECT_RULE_DIR_NAMES) {
+			const lexicalRuleDir = path.join(ancestor.lexical, dirName, "rules");
+			const canonicalRuleDir = path.join(ancestor.canonical, dirName, "rules");
+			const sourceIsInRuleDir =
+				pathStaysInside(lexicalRuleDir, lexical) || pathStaysInside(canonicalRuleDir, lexical);
+			if (sourceIsInRuleDir && pathStaysInside(canonicalRuleDir, realTarget)) return realTarget;
 		}
-		if (pathStaysInside(realAncestor, realTarget)) {
-			for (const dirName of PROJECT_RULE_DIR_NAMES) {
-				const ruleDir = path.join(dirName, "rules");
-				if (
-					pathStaysInside(path.join(ancestor, ruleDir), lexical) &&
-					pathStaysInside(path.join(realAncestor, ruleDir), realTarget)
-				) {
-					return realTarget;
-				}
-			}
-		}
-		const parent = path.dirname(ancestor);
-		if (parent === ancestor) break;
-		ancestor = parent;
 	}
 	return undefined;
 }
@@ -321,8 +404,8 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 		let realRule: string;
 		try {
 			realRule = await fs.realpath(ruleLexical);
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
+		} catch {
+			// A stale or inaccessible unrelated rule must not block a healthy one.
 			continue;
 		}
 		if (realRule !== realTarget) continue;
@@ -332,8 +415,8 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 			let realRoot = ruleRoot;
 			try {
 				realRoot = await fs.realpath(ruleRoot);
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
+			} catch {
+				continue;
 			}
 			if (pathStaysInside(realRoot, realTarget)) return realTarget;
 		}
@@ -341,12 +424,16 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 	return undefined;
 }
 
+/**
+ * Drop the whole `Available:` tail, not just its first line: rule names derive
+ * from filenames, and a name containing a newline would otherwise leave its
+ * remaining fragments in the diagnostic.
+ */
 function withoutForeignRuleNames(message: string): string {
-	return message
-		.split(/\r?\n/)
-		.filter(line => !line.startsWith("Available:"))
-		.join("\n")
-		.trim();
+	const lines = message.split(/\r?\n/);
+	const availableIndex = lines.findIndex(line => line.startsWith("Available:"));
+	const kept = availableIndex === -1 ? lines : lines.slice(0, availableIndex);
+	return kept.join("\n").trim();
 }
 
 /** Real path of `lexicalPath` when it stays inside `root`; otherwise undefined. */
@@ -357,7 +444,7 @@ async function containedExpansionPath(root: string, lexicalPath: string): Promis
 	try {
 		realRoot = await fs.realpath(resolvedRoot);
 	} catch (error) {
-		if (!isEnoent(error)) throw error;
+		if (!isEnoent(error)) throw new ToolError(SESSION_URL_ESCAPE);
 	}
 	const realTarget = await canonicalPathOrAncestor(resolvedLexical, SESSION_URL_ESCAPE);
 	if (!pathStaysInside(realRoot, realTarget)) return undefined;
@@ -373,15 +460,31 @@ async function sessionScopedRulePath(
 	const repoRoot = await findRepoRoot(sessionCwd);
 	for (const root of [repoRoot ?? path.resolve(sessionCwd), path.resolve(agentDir)]) {
 		const contained = await containedExpansionPath(root, sourcePath);
-		if (contained) return contained;
+		if (contained) return refuseShellBearingRulePath(contained);
 	}
 	const userRule = await discoveredUserRulePath(sourcePath);
-	if (userRule) return userRule;
+	if (userRule) return refuseShellBearingRulePath(userRule);
 	if (!repoRoot) {
 		const ancestorRule = await discoveredAncestorRulePath(sessionCwd, sourcePath);
-		if (ancestorRule) return ancestorRule;
+		if (ancestorRule) return refuseShellBearingRulePath(ancestorRule);
 	}
 	throw new ToolError(`rule:// ${SESSION_URL_ESCAPE}.`);
+}
+
+/**
+ * A canonical path carrying shell syntax can change the command that re-reads
+ * the substituted text (arithmetic, heredocs, `eval`, `source`). Refuse it
+ * fail-closed instead of trying to enumerate every such context.
+ */
+const RULE_PATH_SHELL_SYNTAX = /[$`;&|<>()'"\\\n\r]/;
+
+function refuseShellBearingRulePath(resolvedPath: string): string {
+	if (RULE_PATH_SHELL_SYNTAX.test(resolvedPath)) {
+		throw new ToolError(
+			"rule:// URL resolved to a path containing shell syntax and cannot be expanded in a bash command.",
+		);
+	}
+	return resolvedPath;
 }
 
 async function resolveInternalUrlToPath(
@@ -392,6 +495,7 @@ async function resolveInternalUrlToPath(
 	ensureLocalParentDirs?: boolean,
 	sessionCwd?: string,
 	sessionAgentDir?: string,
+	enclosedInQuote = false,
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
@@ -466,6 +570,11 @@ async function resolveInternalUrlToPath(
 	}
 
 	if (scheme === "rule" && sessionCwd !== undefined) {
+		if (enclosedInQuote) {
+			throw new ToolError(
+				"rule:// URLs must be a standalone shell argument in bash commands; a rule:// URL inside a quoted argument cannot be expanded safely.",
+			);
+		}
 		return sessionScopedRulePath(resource.sourcePath, sessionCwd, sessionAgentDir);
 	}
 
@@ -504,6 +613,9 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 	if (matches.length === 0) return command;
 
 	let expanded = command;
+	const nestedRuleContext =
+		hasNestedExpansionContext(command) &&
+		matches.some(match => extractScheme(normalizeLocalScheme(unquoteToken(match[0]))) === "rule");
 	for (let i = matches.length - 1; i >= 0; i--) {
 		const match = matches[i];
 		const token = match[0];
@@ -512,6 +624,11 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 
 		const rawUrl = unquoteToken(token);
 		const url = normalizeLocalScheme(rawUrl);
+		if (nestedRuleContext && extractScheme(url) === "rule") {
+			throw new ToolError(
+				"rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets.",
+			);
+		}
 		const resolvedPath = await resolveInternalUrlToPath(
 			url,
 			options.skills,
@@ -520,6 +637,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.ensureLocalParentDirs,
 			options.sessionCwd,
 			options.sessionAgentDir,
+			enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index),
 		);
 		const replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);
 		expanded = `${expanded.slice(0, index)}${replacement}${expanded.slice(index + token.length)}`;

@@ -1035,6 +1035,196 @@ describe("expandInternalUrls session scope", () => {
 		}
 	});
 
+	it("refuses a rule in another session's root while keeping the caller's own root", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-two-sessions-"));
+		try {
+			const callerCwd = path.join(parent, "caller-project");
+			const callerAgent = path.join(parent, "caller-agent");
+			const otherCwd = path.join(parent, "other-project");
+			const otherAgent = path.join(parent, "other-agent");
+			await mkdir(callerCwd);
+			await mkdir(callerAgent);
+			await mkdir(otherCwd);
+			await mkdir(otherAgent);
+			const ownRule = path.join(callerAgent, "own.md");
+			const foreignAgentRule = path.join(otherAgent, "secret.md");
+			const otherSessionOnly = path.join(otherCwd, "only-there.md");
+			const foreignMemory = path.join(memoryRootFor(otherAgent, otherCwd), "memory_summary.md");
+			await writeFile(ownRule, "own-rule");
+			await writeFile(foreignAgentRule, "other-agent-rule");
+			await writeFile(otherSessionOnly, "other-session-only");
+			await mkdir(path.dirname(foreignMemory), { recursive: true });
+			await writeFile(foreignMemory, "other-memory");
+			const router = createInternalRouter({
+				"rule://own": { sourcePath: ownRule },
+				"rule://secret": { sourcePath: foreignAgentRule },
+				"rule://only-there": { sourcePath: otherSessionOnly },
+				"memory://root/memory_summary.md": { sourcePath: foreignMemory },
+			});
+			const options = {
+				skills: [] as Skill[],
+				internalRouter: router,
+				sessionCwd: callerCwd,
+				sessionAgentDir: callerAgent,
+			};
+			await expectExpandsToSource("cat rule://own", options, ownRule);
+			for (const url of ["rule://secret", "rule://only-there"]) {
+				let message = "";
+				try {
+					await expandInternalUrls(`cat ${url}`, options);
+				} catch (error) {
+					message = error instanceof Error ? error.message : String(error);
+				}
+				expect(message).toContain("outside this session");
+				expect(message).not.toContain(path.basename(otherCwd));
+				expect(message).not.toContain(path.basename(otherAgent));
+				expect(message).not.toContain(path.basename(otherSessionOnly));
+			}
+			await expect(expandInternalUrls("cat memory://root/memory_summary.md", options)).rejects.toThrow(
+				/memory:\/\/ URLs cannot be expanded/,
+			);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported)(
+		"refuses a rule URL quoted inside a larger argument instead of splicing a canonical path",
+		async () => {
+			const repo = await mkdtemp(path.join(tmpdir(), "bash-rule-quote-"));
+			try {
+				await execFileAsync("git", ["init", "-q", repo]);
+				const dangerous = path.join(repo, "$(touch pwned).md");
+				await writeFile(dangerous, "dangerous-rule");
+				const alias = path.join(repo, "alias.md");
+				await symlink(dangerous, alias);
+				const benign = path.join(repo, "deploy.md");
+				await writeFile(benign, "benign-rule");
+				const router = createInternalRouter({
+					"rule://alias": { sourcePath: alias },
+					"rule://deploy": { sourcePath: benign },
+				});
+				const options = {
+					skills: [] as Skill[],
+					internalRouter: router,
+					sessionCwd: repo,
+					sessionAgentDir: path.join(repo, "agent"),
+				};
+				// An unquoted embedded URL keeps working: the replacement starts its own
+				// shell word segment.
+				const expanded = await expandInternalUrls("grep --file=rule://deploy /dev/null", options);
+				expect(expanded).toContain(shellEscape(await realpath(benign)));
+				// Inside an argument the caller already quoted, the same replacement would
+				// end that quote early, so it is refused before expansion. A leading `$`
+				// would also reinterpret the replacement's quoting.
+				for (const command of [
+					"grep '--file=rule://alias' /dev/null",
+					'grep "--file=rule://alias" /dev/null',
+					"grep $'x\\' rule://alias' /dev/null",
+					"cat $'rule://alias'",
+					'cat $"rule://alias"',
+					"cat $rule://alias",
+					"cat \\'rule://alias'",
+					'printf "%s\\n" "$(cat "prefix rule://alias")"',
+					"cat <<EOF\nrule://alias\nEOF",
+					'echo ok # "\ncat "prefix rule://alias"',
+					"printf '%s\\n' $[ rule://alias ]",
+					"(( rule://alias ))",
+					"let rule://alias",
+					"echo $" + "{x:-rule://alias}",
+					"printf '%s\\n' $" + "{a[rule://alias]}",
+					"a[0+'rule://alias'+0]=x",
+					"a['rule://alias']=x",
+				]) {
+					await expect(expandInternalUrls(command, options)).rejects.toThrow(/standalone shell argument/);
+				}
+				const realBenign = await realpath(benign);
+				for (const command of ["cat 'rule://deploy'", 'cat "rule://deploy"']) {
+					expect(await expandInternalUrls(command, options)).toContain(shellEscape(realBenign));
+				}
+			} finally {
+				await rm(repo, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported)(
+		"refuses a rule whose canonical path carries shell expansion syntax",
+		async () => {
+			const repo = await mkdtemp(path.join(tmpdir(), "bash-rule-path-syntax-"));
+			try {
+				await execFileAsync("git", ["init", "-q", repo]);
+				const dangerous = path.join(repo, "$(touch pwned).md");
+				await writeFile(dangerous, "dangerous-rule");
+				const semicolon = path.join(repo, "x; touch pwned;#.md");
+				await writeFile(semicolon, "semicolon-rule");
+				const alias = path.join(repo, "alias.md");
+				await symlink(dangerous, alias);
+				const benign = path.join(repo, "deploy.md");
+				await writeFile(benign, "benign-rule");
+				const router = createInternalRouter({
+					"rule://alias": { sourcePath: alias },
+					"rule://semicolon": { sourcePath: semicolon },
+					"rule://deploy": { sourcePath: benign },
+				});
+				const options = {
+					skills: [] as Skill[],
+					internalRouter: router,
+					sessionCwd: repo,
+					sessionAgentDir: path.join(repo, "agent"),
+				};
+				for (const command of [
+					"cat rule://alias",
+					'l""et rule://alias',
+					"\\let rule://alias",
+					"eval rule://semicolon",
+				]) {
+					await expect(expandInternalUrls(command, options)).rejects.toThrow(/shell syntax/);
+				}
+				expect(await expandInternalUrls("cat rule://deploy", options)).toContain(
+					shellEscape(await realpath(benign)),
+				);
+				await expect(Bun.file(path.join(repo, "pwned")).exists()).resolves.toBe(false);
+			} finally {
+				await rm(repo, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported)(
+		"does not leak a foreign session path when its rule link cannot be resolved",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-foreign-loop-"));
+			try {
+				const callerCwd = path.join(parent, "caller-project");
+				const callerAgent = path.join(parent, "caller-agent");
+				const otherAgent = path.join(parent, "other-agent");
+				await mkdir(callerCwd);
+				await mkdir(callerAgent);
+				await mkdir(otherAgent);
+				const loop = path.join(otherAgent, "loop.md");
+				await symlink(loop, loop);
+				const router = createInternalRouter({ "rule://loop": { sourcePath: loop } });
+				let message = "";
+				try {
+					await expandInternalUrls("cat rule://loop", {
+						skills: [],
+						internalRouter: router,
+						sessionCwd: callerCwd,
+						sessionAgentDir: callerAgent,
+					});
+				} catch (error) {
+					message = error instanceof Error ? error.message : String(error);
+				}
+				expect(message).toContain("outside this session");
+				expect(message).not.toContain(path.basename(otherAgent));
+				expect(message).not.toContain(loop);
+			} finally {
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("refuses a rule file that only shares a directory prefix", async () => {
 		const parent = await mkdtemp(path.join(tmpdir(), "bash-prefix-"));
 		try {
@@ -1118,6 +1308,38 @@ describe("expandInternalUrls session scope", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32" || !symlinkSupported)(
+		"expands an ancestor rule when the trusted home is reached through a symlink",
+		async () => {
+			const physical = await mkdtemp(path.join(tmpdir(), "bash-home-real-"));
+			const holder = await mkdtemp(path.join(tmpdir(), "bash-home-link-"));
+			const linkedHome = path.join(holder, "home");
+			await symlink(physical, linkedHome);
+			const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(linkedHome);
+			try {
+				const project = path.join(physical, "project");
+				const rule = path.join(project, ".agent", "rules", "check.md");
+				await mkdir(path.dirname(rule), { recursive: true });
+				await writeFile(rule, "symlinked-home-rule");
+				const physicalCwd = path.join(project, "subdir");
+				await mkdir(physicalCwd);
+				const router = createInternalRouter({ "rule://check": { sourcePath: rule } });
+				const options = {
+					skills: [] as Skill[],
+					internalRouter: router,
+					sessionAgentDir: path.join(physical, "agent"),
+				};
+				await expectExpandsToSource("cat rule://check", { ...options, sessionCwd: physicalCwd }, rule);
+				const lexicalCwd = path.join(linkedHome, "project", "subdir");
+				await expectExpandsToSource("cat rule://check", { ...options, sessionCwd: lexicalCwd }, rule);
+			} finally {
+				spy.mockRestore();
+				await rm(holder, { recursive: true, force: true });
+				await rm(physical, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("refuses bash expansion of a rule URL when the session directory is omitted", async () => {
 		const cwd = await mkdtemp(path.join(tmpdir(), "bash-omit-"));
 		try {
@@ -1138,7 +1360,7 @@ describe("expandInternalUrls session scope", () => {
 			const router = {
 				canHandle: () => true,
 				resolve: async () => {
-					throw new Error("Unknown rule: missing\nAvailable: private-deploy");
+					throw new Error("Unknown rule: missing\nAvailable: private-deploy\nprivate-deploy\ncontinued-fragment");
 				},
 			};
 			let message = "";
@@ -1154,6 +1376,7 @@ describe("expandInternalUrls session scope", () => {
 			expect(message).toContain("Unknown rule: missing");
 			expect(message).not.toContain("Available:");
 			expect(message).not.toContain("private-deploy");
+			expect(message).not.toContain("continued-fragment");
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -1193,12 +1416,19 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 	return result.content.find(part => part.type === "text")?.text ?? "";
 }
 
-function createAgentDirBashTool(cwd: string, requestedAgentDir: string, settingsAgentDir: string): BashTool {
+function createAgentDirBashTool(
+	cwd: string,
+	requestedAgentDir: string,
+	settingsAgentDir: string,
+	readOnlyPrefixes?: readonly string[],
+): BashTool {
 	const session = {
 		cwd,
 		getSessionFile: () => null,
 		getSessionId: () => "bash-agent-dir-scope",
 		getSessionAgentDir: () => requestedAgentDir,
+		bashRestrictionProfile: readOnlyPrefixes ? ("read-only" as const) : undefined,
+		bashAllowedPrefixes: readOnlyPrefixes ? [...readOnlyPrefixes] : undefined,
 		skills: [],
 		settings: {
 			has(key: string) {
@@ -1445,4 +1675,36 @@ describe("bash session agent directory", () => {
 			await rm(trusted, { recursive: true, force: true });
 		}
 	});
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported)(
+		"refuses a quoted rule URL in read-only bash before the canonical path can reach the shell",
+		async () => {
+			const repo = await mkdtemp(path.join(tmpdir(), "bash-rule-readonly-"));
+			try {
+				await execFileAsync("git", ["init", "-q", repo]);
+				const dangerous = path.join(repo, "$(touch pwned).md");
+				await writeFile(dangerous, "dangerous-rule");
+				const alias = path.join(repo, "alias.md");
+				await symlink(dangerous, alias);
+				setActiveRules([
+					{
+						name: "alias",
+						path: alias,
+						content: "dangerous-rule",
+						_source: { provider: "test", providerName: "test", path: alias, level: "project" },
+					},
+				]);
+				const tool = createAgentDirBashTool(repo, path.join(repo, "agent"), path.join(repo, "settings-agent"), [
+					"grep",
+				]);
+				await expect(
+					tool.execute("call-readonly-splice", { command: "grep --file=rule://alias /dev/null" }),
+				).rejects.toThrow(/standalone shell argument/);
+				await expect(Bun.file(path.join(repo, "pwned")).exists()).resolves.toBe(false);
+			} finally {
+				resetActiveRulesForTests();
+				await rm(repo, { recursive: true, force: true });
+			}
+		},
+	);
 });
