@@ -2708,8 +2708,11 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 				// next word starts a command again.
 				"cat >out& sh -c rule://deploy",
 				"cat >out & sh -c rule://deploy",
-				// `-o` consumes an operand inside its own simple command only.
-				'sh -o echo -c "cat "rule://deploy',
+				// `-o` consumes an operand inside its own simple command only. `errexit`
+				// is an option name a real shell accepts, so this refuses a valid
+				// invocation rather than a nonsense one. Control: the parent scanner
+				// also refuses it, so it is not regression evidence.
+				'sh -o errexit -c "cat "rule://deploy',
 				// A real invocation sharing the command line stays refused.
 				"printf x &>out; sh -c 'cat rule://deploy'",
 				"sh -c 'cat rule://deploy' &>out",
@@ -2734,6 +2737,8 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 			const outPath = path.join(fixture.authorized, "out");
 			// `&>` and `&>>` between `printf` and a shell name leave `sh` as
 			// ordinary argument data; each case writes a fresh destination.
+			// Regression detectors: the parent scanner read the `&` as a command
+			// separator, put `sh` in command position, and refused both commands.
 			for (const command of ["printf '%s' &>out sh -c rule://deploy", "printf '%s' &>>out sh -c rule://deploy"]) {
 				await rm(outPath, { force: true });
 				const emitted = await expandInternalUrls(command, options);
@@ -2744,11 +2749,24 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 				// order: both data words and the authorized path.
 				expect(await Bun.file(outPath).text()).toBe(`sh-c${fixture.canonical}`);
 			}
-			// Every file-target operator form redirects to its target word and still
-			// passes the authorized path through as the operand.
-			for (const operator of ["&>", "&>>", ">|"]) {
+			// `&>` and `&>>` after the operand redirect the printed path to their
+			// target word and keep the authorized path as the operand.
+			for (const operator of ["&>", "&>>"]) {
 				await rm(outPath, { force: true });
 				const emitted = await expandInternalUrls(`printf '%s' rule://deploy ${operator}out`, options);
+				expect(emitted).toContain(`'${fixture.canonical}'`);
+				const result = await runShell(emitted, fixture.authorized);
+				expect(result.code).toBe(0);
+				expect(await Bun.file(outPath).text()).toBe(fixture.canonical);
+			}
+			// `>|` with the operator between the command word and the later
+			// argument. The parent scanner ended the redirection at `|`, so `out`
+			// became a command word there; this placement, not a trailing operator,
+			// is what the operator/target boundary has to classify correctly.
+			// Control: the parent scanner expands this one too.
+			{
+				await rm(outPath, { force: true });
+				const emitted = await expandInternalUrls("printf '%s' >|out rule://deploy", options);
 				expect(emitted).toContain(`'${fixture.canonical}'`);
 				const result = await runShell(emitted, fixture.authorized);
 				expect(result.code).toBe(0);
@@ -2780,13 +2798,46 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 			const backgroundRun = await runShell(background, fixture.authorized);
 			expect(backgroundRun.code).toBe(0);
 			expect(await Bun.file(outPath).text()).toBe(fixture.canonical);
-			// `-o` is bounded to its own command: `echo` starts a new one and
-			// prints the expanded operand.
+			// `-o` is bounded to its own command: the separator ends `sh -o`, and
+			// `echo` starts a new command that prints the expanded operand. Regression
+			// detector: the parent scanner consumed `echo` as the `-o` operand across
+			// the separator and refused this command.
 			const separate = await expandInternalUrls("sh -o; echo -c rule://deploy", options);
 			expect(separate).toContain(`'${fixture.canonical}'`);
 			const echoRun = await runShell(separate, fixture.authorized);
 			expect(echoRun.code).toBe(0);
+			// `sh -o` with no option name prints its option table first, so this
+			// asserts the operand `echo` prints rather than the whole stdout.
 			expect(echoRun.stdout).toContain(`-c ${fixture.canonical}`);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("reads the authorized rule through the emitted pathname with a boundary operator in play", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-redirect-read-"));
+		try {
+			const fixture = await writeFixture(parent, "proj[e]po");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+				sessionCwd: fixture.authorized,
+			};
+			const outPath = path.join(fixture.authorized, "out");
+			// A reader, not a printer: `cat` has to open the emitted pathname, so a
+			// pathname that is merely printable fails here, and the destination holds
+			// the rule file's own expected text instead of the absence of a sentinel.
+			// Fresh destination per case. Controls: the parent scanner expands these
+			// too, so they are not regression evidence.
+			for (const command of ["cat >|out rule://deploy", "cat &>out rule://deploy"]) {
+				await rm(outPath, { force: true });
+				const emitted = await expandInternalUrls(command, options);
+				expect(emitted).toContain(`'${fixture.canonical}'`);
+				const result = await runShell(emitted, fixture.authorized);
+				expect(result.code).toBe(0);
+				expect(result.stderr).toBe("");
+				expect(await Bun.file(outPath).text()).toBe("echo AUTHORIZED-RULE\n");
+			}
 		} finally {
 			await rm(parent, { recursive: true, force: true });
 		}
@@ -2847,7 +2898,7 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 			expect(dataEmitted).toContain(`'${fixture.canonical}'`);
 			const dataRun = await runShell(dataEmitted, fixture.authorized);
 			expect(dataRun.code).toBe(0);
-			expect(dataRun.stdout).toContain(fixture.canonical);
+			expect(dataRun.stdout).toBe(`sh-c${fixture.canonical}`);
 			// `--` before any `-c` makes `-c` an operand, not an option: the URL is
 			// data and expands, and sh reads no script from it. Control: the parent
 			// scanner allows this too, so it is not pre-fix failure evidence.
