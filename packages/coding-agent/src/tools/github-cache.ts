@@ -559,11 +559,7 @@ function tableRowFlags(lines: string[]): boolean[] {
 	let covered = -1;
 	for (let i = 1; i < lines.length; i++) {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
-		if (
-			(indentOf(rows[i] ?? "") >= 4 && inList[i] !== true) ||
-			(indentOf(rows[i - 1] ?? "") >= 4 && inList[i - 1] !== true)
-		)
-			continue;
+		if (isIndentedCode(i) || isIndentedCode(i - 1)) continue;
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
 		flags[i - 1] = true;
 		flags[i] = true;
