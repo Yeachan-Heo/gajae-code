@@ -874,6 +874,7 @@ export async function writeTopicRegistryAtomic(
 			new Error("topic registry destination disappeared after generation validation"),
 		);
 	if (!destinationExists) {
+		await ensureDir(fsImpl, parent);
 		try {
 			await fsImpl.writeFile(file, serialized, { mode: 0o600, flag: "wx" });
 		} catch (error) {
@@ -4862,6 +4863,13 @@ export class TelegramNotificationDaemon {
 		if (!this.stopRequested) this.effects.openAdmission();
 	}
 
+	/** @internal Test-only method to refresh ownership heartbeat for all active topics. */
+	async refreshOwnershipHeartbeat(sessionId: string): Promise<void> {
+		// Calls renewActiveTopicLeases which iterates all sessions and re-arms expired leases.
+		// sessionId is for test instrumentation only; the method renews all sessions.
+		await this.renewActiveTopicLeases();
+	}
+
 	#lifecycleActor(): SessionLifecycleActor {
 		return { id: String(this.opts.chatId), namespace: `telegram:${tokenFingerprint(this.opts.botToken)}` };
 	}
@@ -7144,7 +7152,11 @@ export class TelegramNotificationDaemon {
 				? undefined
 				: { session, token: 0, logicalSessionId };
 	}
-	async #renewTopicLease(sessionId: string, session?: AttachmentSession): Promise<boolean> {
+	async #renewTopicLease(
+		sessionId: string,
+		session?: AttachmentSession,
+		admits: () => boolean = () => true,
+	): Promise<boolean> {
 		if (!this.#topicRegistryMutationAllowed() || !this.#topicAdmissionAllows(session)) return false;
 		const record = this.topics.get(sessionId);
 		if (!record) return true;
@@ -7158,6 +7170,7 @@ export class TelegramNotificationDaemon {
 		};
 		return this.#persistTopicMutation(
 			() =>
+				admits() &&
 				this.topics.acquireLease(
 					sessionId,
 					this.installationHostId,
@@ -7434,6 +7447,15 @@ export class TelegramNotificationDaemon {
 		let claim: { previousSessionId: string; hadDurableTopic: boolean } | undefined;
 		try {
 			claim = await this.#withRecoveryBindingClaim(async () => {
+				const topicIsExclusive = (): boolean => {
+					const record = this.topics.get(candidateSessionId);
+					return (
+						!record ||
+						Object.entries(this.topics.serialize().topics).every(
+							([id, other]) => id === candidateSessionId || other.topicId !== record.topicId,
+						)
+					);
+				};
 				const existing = this.topics.get(candidateSessionId);
 				const hadDurableTopic = existing !== undefined;
 				const previousBinding = existing
@@ -7446,6 +7468,8 @@ export class TelegramNotificationDaemon {
 				let retiredTopicState: TopicRegistryState | undefined;
 				const outcome = await this.#persistTopicMutation(
 					() => {
+						if (!topicIsExclusive()) return "rejected";
+
 						if (
 							identitylessAdmission === "resume" &&
 							this.topics.get(candidateSessionId)?.authorityState === "disconnect_grace"
@@ -7487,7 +7511,7 @@ export class TelegramNotificationDaemon {
 						};
 					return undefined;
 				}
-				if (!(await this.#renewTopicLease(candidateSessionId, session))) {
+				if (!(await this.#renewTopicLease(candidateSessionId, session, topicIsExclusive))) {
 					if (session.recoveryLease?.token === pendingToken)
 						session.recoveryLease = {
 							state: "rejected",
