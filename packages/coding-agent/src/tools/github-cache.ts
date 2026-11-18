@@ -438,27 +438,8 @@ function maskParameterizedAuthValues(text: string): string {
 				}
 			}
 		} else if (first === "\\" && (text[valueStart + 1] === '"' || text[valueStart + 1] === "'")) {
-			const quote = text[valueStart + 1];
 			const lineEnd = text.indexOf("\n", valueStart);
-			const limit = lineEnd === -1 ? text.length : lineEnd;
-			const field = /\s+(?:cookie|authorization|auth)\s*:/i.exec(text.slice(valueStart, limit));
-			const segmentEnd = field ? valueStart + field.index : limit;
-			const close = `\\${quote}`;
-			let closeAt = -1;
-			for (
-				let at = text.indexOf(close, valueStart + 2);
-				at !== -1 && at < segmentEnd;
-				at = text.indexOf(close, at + 1)
-			) {
-				const after = text[at + 2] ?? "";
-				if (after === "|") {
-					closeAt = at;
-					break;
-				}
-				if (after === "" || /[\s,;"'\\]/.test(after)) closeAt = at;
-			}
-			end = closeAt >= 0 ? closeAt + 2 : segmentEnd;
-			if (closeAt >= 0 && text[end] === "|") end = limit;
+			end = lineEnd === -1 ? text.length : lineEnd;
 		} else {
 			while (end < text.length && !/[\s,;]/.test(text[end])) end++;
 		}
