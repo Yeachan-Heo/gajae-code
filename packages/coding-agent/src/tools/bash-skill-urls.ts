@@ -376,6 +376,18 @@ function pathStaysInside(root: string, candidate: string): boolean {
 	return process.platform !== "win32" || windowsPathIsInside(resolvedRoot, resolvedCandidate);
 }
 
+/**
+ * True when `candidate` is spelled inside `root`, ignoring case on Windows. This
+ * answers provenance — was the request written under the configured directory —
+ * and never identity: discovery stores the configured prefix, while the same
+ * directory's real path can carry other casing or a symlinked home. Containment
+ * decisions use {@link pathStaysInside} on the verified on-disk root instead.
+ */
+function pathSpelledInside(root: string, candidate: string): boolean {
+	const relative = path.relative(path.resolve(root), path.resolve(candidate));
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 function isStrictlyInside(root: string, candidate: string): boolean {
 	const resolvedRoot = path.resolve(root);
 	const resolvedCandidate = path.resolve(candidate);
@@ -460,7 +472,7 @@ async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string
 			// spelling of a directory reached without following a link.
 			const ruleDir = await unlinkedDirectorySpelling(ancestor.canonical, canonicalRuleDir);
 			if (ruleDir === undefined) continue;
-			if (!pathStaysInside(lexicalRuleDir, lexical) && !pathStaysInside(ruleDir, lexical)) continue;
+			if (!pathSpelledInside(lexicalRuleDir, lexical) && !pathSpelledInside(ruleDir, lexical)) continue;
 			if (pathStaysInside(ruleDir, realTarget)) return realTarget;
 		}
 	}
@@ -493,13 +505,16 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 			// promoting a case-variant sibling that discovery never loaded.
 			const unlinkedRoot = await unlinkedDirectorySpelling(home, ruleRoot);
 			if (unlinkedRoot !== undefined) {
-				if (!pathStaysInside(unlinkedRoot, lexical) || !pathStaysInside(unlinkedRoot, ruleLexical)) continue;
+				// Provenance is the request's spelling under the configured root; the
+				// directory's on-disk spelling may differ in case, or the trusted home
+				// may be reached through a link, so this gate folds case.
+				if (!pathSpelledInside(ruleRoot, lexical) || !pathSpelledInside(ruleRoot, ruleLexical)) continue;
 				if (pathStaysInside(unlinkedRoot, realTarget)) return realTarget;
 				continue;
 			}
 			// A linked rules directory keeps the documented behavior: the link is the
 			// trust anchor for the request's spelling, its target for containment.
-			if (!pathStaysInside(ruleRoot, lexical) || !pathStaysInside(ruleRoot, ruleLexical)) continue;
+			if (!pathSpelledInside(ruleRoot, lexical) || !pathSpelledInside(ruleRoot, ruleLexical)) continue;
 			let linkedRoot: string;
 			try {
 				linkedRoot = await fs.realpath(ruleRoot);

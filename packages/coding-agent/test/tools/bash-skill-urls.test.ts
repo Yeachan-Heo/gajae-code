@@ -721,6 +721,43 @@ describe("expandInternalUrls session scope", () => {
 	);
 
 	it.skipIf(!symlinkSupported)(
+		"expands an unlinked user rule when the trusted home is reached through a link",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-user-home-link-"));
+			const realHome = path.join(parent, "real-home");
+			const linkHome = path.join(parent, "home-link");
+			await mkdir(realHome);
+			await symlink(realHome, linkHome);
+			const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(linkHome);
+			try {
+				const rule = path.join(realHome, ".agents", "rules", "check.md");
+				await mkdir(path.dirname(rule), { recursive: true });
+				await writeFile(rule, "linked-home-rule");
+				// Discovery stores the configured home spelling, which reaches the same
+				// directory through the link the trusted home is.
+				const linkSpelledRule = path.join(linkHome, ".agents", "rules", "check.md");
+				setActiveRules([activeUserRule("check", linkSpelledRule)]);
+				const cwd = path.join(realHome, "work", "project");
+				await mkdir(cwd, { recursive: true });
+				await expectExpandsToSource(
+					"cat rule://check",
+					{
+						skills: [],
+						internalRouter: createInternalRouter({ "rule://check": { sourcePath: linkSpelledRule } }),
+						sessionCwd: cwd,
+						sessionAgentDir: path.join(realHome, "agent"),
+					},
+					rule,
+				);
+			} finally {
+				spy.mockRestore();
+				resetActiveRulesForTests();
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(!symlinkSupported)(
 		"expands a user rule spelled through a linked rules directory and refuses the same file at its target",
 		async () => {
 			const home = await mkdtemp(path.join(tmpdir(), "bash-user-link-root-"));
