@@ -545,9 +545,30 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(payload).toContain('"name": "Authorization"');
 	});
 
-	it("keeps the intent field out when a sibling spells its name with an escape", () => {
-		// The field that resolves to `_i` is the intent field, whichever spelling the payload used,
-		// and the real intent field must not be displaced by the escaped spelling.
+	it("prints an argument name with the spelling it arrived with", () => {
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-authored-spelling",
+						name: "request",
+						arguments: { "fi\\u006ce": "ORDINARY_VALUE" },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain('name="fi\\u006ce"');
+		expect(dumped).not.toContain('name="file"');
+		expect(dumped).toContain("ORDINARY_VALUE");
+	});
+
+	it("keeps a field whose name only resolves to the intent field and drops the literal one", () => {
+		// The intent field is the literal `_i` key the agent loop destructures. A field whose name
+		// merely resolves to it is an ordinary argument, so its value stays and its own spelling is
+		// printed, exactly as origin/dev renders it.
 		const dumped = dump([
 			assistant(
 				[
@@ -555,15 +576,16 @@ describe("formatSessionDumpText credential scrub", () => {
 						type: "toolCall",
 						id: "call-escaped-intent-field",
 						name: "request",
-						arguments: { "\\u005fi": "escaped-intent-value", _i: "intent-value", note: "kept-note" },
+						arguments: { "\\u005fi": "ESCAPED_INTENT_DATA", _i: "PLAIN_INTENT_DATA", note: "kept-note" },
 					},
 				],
 				1,
 			),
 		] as AgentMessage[]);
 
-		expect(dumped).not.toContain("intent-value");
-		expect(dumped).not.toContain("escaped-intent-value");
+		expect(dumped).not.toContain("PLAIN_INTENT_DATA");
+		expect(dumped).toContain("ESCAPED_INTENT_DATA");
+		expect(dumped).toContain('name="\\u005fi"');
 		expect(dumped).toContain("kept-note");
 	});
 

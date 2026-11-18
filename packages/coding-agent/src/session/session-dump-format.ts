@@ -60,9 +60,11 @@ function stripTypeBoxFields(obj: unknown): unknown {
 function takeRedactedTextRun(parts: string[]): string | undefined {
 	if (parts.length === 0) return undefined;
 	// Blocks are rendered with a newline between them, which would split a banner that straddles
-	// two blocks, so they are paired while still adjacent and only then joined for display.
+	// two blocks, so they are paired while still adjacent and only then joined for display. A
+	// single block needs no pairing, and pairing it would replace the block before the scrubber
+	// could also mask the credential container around its footer.
 	// Message text is literal, not encoded JSON, so its `\u` escapes are evidence and stay.
-	const paired = redactCrossFieldPrivateKeys(parts, { decodeEscapes: false }) as string[];
+	const paired = parts.length > 1 ? (redactCrossFieldPrivateKeys(parts, { decodeEscapes: false }) as string[]) : parts;
 	const redacted = redactCrashSecrets(paired.join("\n"));
 	parts.length = 0;
 	return redacted;
@@ -184,7 +186,6 @@ function decodeEscapedIdentity(input: string): string {
 }
 
 /** An integer-like key is enumerated before every other field, so it must keep its spelling. */
-const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
 
 /**
  * Decode `\u` escapes in every string leaf and every field name, so banner detection,
@@ -195,31 +196,20 @@ const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
  * Field names are part of that decoded representation: a name spelled with an escape is only
  * credential-shaped once resolved, and it is this prepass — not a later pass over the
  * serialized text — that has to recognize it.
- * The spelling each entry is stored under keeps the pairing stream in its original order and
- * keeps every entry: a name another entry also claims or already authored, or one that would
- * move an integer-like key, stays as it arrived. No entry is renamed into a spelling another
- * entry holds, and no spelling is invented.
+ * The spelling each entry keeps is the one it arrived with, so the pairing stream stays in its
+ * original order and no entry is dropped, renamed or moved. Credential recognition resolves the
+ * spelling instead, so an encoded name classifies like the name it stands for.
  */
 function decodeValueStrings(value: unknown): unknown {
 	if (typeof value === "string") return decodeEscapedText(value);
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
-	const source = Object.entries(value);
-	const authored = new Set(Object.keys(value));
-	const claims = new Map<string, number>();
-	for (const [key] of source) {
-		const name = decodeEscapedText(key);
-		claims.set(name, (claims.get(name) ?? 0) + 1);
-	}
+	const source = value as Record<string, unknown>;
 	const decoded = Object.create(null) as Record<string, unknown>;
-	for (const [key, nested] of source) {
-		const name = decodeEscapedText(key);
-		// A decoded spelling is printed only when this entry is its only claimant, it keeps the
-		// enumeration order, and no sibling already authored that exact spelling. A sibling keeps
-		// its own key when it cannot be renamed, so decoding into an authored spelling would
-		// overwrite one of the two entries — a chained escape can decode to exactly that text.
-		const printed = name === key || (claims.get(name) === 1 && !authored.has(name) && !ARRAY_INDEX_NAME.test(name));
-		decoded[printed ? name : key] = decodeValueStrings(nested);
+	for (const [key, nested] of Object.entries(source)) {
+		// The entry keeps the spelling it arrived with, so decoding never renames or reorders a
+		// field. Recognition reads the resolved spelling through `fieldIdentity` instead.
+		decoded[key] = decodeValueStrings(nested);
 	}
 	return decoded;
 }
@@ -406,9 +396,7 @@ function formatArgsAsXml(
 	// not dumped as an ordinary argument either. A schema root is not an argument, so a
 	// definition named `_i` stays part of the schema.
 	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
-	const entries = Object.entries(paired ?? args).filter(
-		([key]) => mode === "schema" || fieldIdentity(key) !== INTENT_FIELD,
-	);
+	const entries = Object.entries(paired ?? args).filter(([key]) => mode === "schema" || key !== INTENT_FIELD);
 	const parts: string[] = [];
 	for (const [key, value] of entries) {
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
