@@ -484,7 +484,7 @@ function tableRowFlags(lines: string[]): boolean[] {
 	const rows = lines.map(line => line.replace(/\r$/, ""));
 	let opener: { marker: string; length: number } | null = null;
 	for (let i = 0; i < lines.length; i++) {
-		const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(rows[i] ?? "");
+		const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(rows[i] ?? "");
 		if (opener === null) {
 			if (match) {
 				const marker = match[1] ?? "";

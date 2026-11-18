@@ -863,6 +863,7 @@ describe("github view cache persistence", () => {
 			"|https://docs.example|person@example.test|",
 			"```text\r\nhttps://alice:demo|value@example.test/x\r\n---|---\r\n```\r\n",
 			"```text\r\n|https://alice:demo|value@example.test/x|\r\n```\r\n",
+			"```text\n    ```\r\n|https://alice:demo|value@example.test/x|\r\n```\n",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
