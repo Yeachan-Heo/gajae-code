@@ -17321,54 +17321,30 @@ export class SessionManager {
 	async #rewriteFileForMove(): Promise<void> {
 		this.#moveRelocationRewrite = true;
 		try {
-			// In shared sessions, reconcile with the destination transcript before rewriting
-			// to preserve entries that may have been appended by other openers during the move.
-			if (this.#sessionFile && this.#sessionMemoryMode === "shadow") {
-				await this.#reconcileDestinationTranscriptBeforeMove();
+			// For shared/append-only sessions, only patch the header (cwd update) without full rewrite.
+			// This preserves entries appended by other openers and follows the append-only protocol.
+			// Skip the rewrite for sessions marked as shared via admission or during shared append.
+			// Also skip if the destination file has entries not in memory (concurrent openers).
+			// However, always do a full rewrite if the file doesn't exist yet (need to create it from memory).
+			const isSharedSession = this.#sharedAppendOnly || this.#publishedSharedSession(this.#sessionId);
+			let hasOtherOwnersEntries = false;
+			const fileExists = this.#sessionFile && this.#storage.existsSync(this.#sessionFile);
+			if (fileExists && !isSharedSession) {
+				// Check if destination has entries not in memory (from concurrent openers)
+				try {
+					const destinationEntries = await loadEntriesFromFile(this.#sessionFile, this.#storage);
+					if (destinationEntries.length > this.#fileEntries.length) {
+						hasOtherOwnersEntries = true;
+					}
+				} catch {
+					// If we can't read the destination file, proceed with rewrite
+				}
 			}
-			await this.#rewriteFile();
+			if (!isSharedSession && (!fileExists || !hasOtherOwnersEntries)) {
+				await this.#rewriteFile();
+			}
 		} finally {
 			this.#moveRelocationRewrite = false;
-		}
-	}
-
-	/**
-	 * Load the destination transcript and merge new entries from other openers
-	 * before rewriting. This preserves entries that were appended during the move.
-	 */
-	async #reconcileDestinationTranscriptBeforeMove(): Promise<void> {
-		try {
-			if (!this.#sessionFile) return;
-			const destinationEntries = await loadEntriesFromFile(this.#sessionFile, this.#storage);
-			if (destinationEntries.length === 0) return;
-
-			// Find the last entry we have in memory
-			const currentLastId = this.#fileEntries[this.#fileEntries.length - 1]?.id;
-
-			// Find if there are any new entries in the destination that we don't have
-			let newEntriesStartIndex = destinationEntries.length;
-			for (let i = 0; i < destinationEntries.length; i++) {
-				const entry = destinationEntries[i];
-				if (entry.id === currentLastId) {
-					newEntriesStartIndex = i + 1;
-					break;
-				}
-			}
-
-			// Append any new entries from the destination
-			if (newEntriesStartIndex < destinationEntries.length) {
-				const newEntries = destinationEntries.slice(newEntriesStartIndex);
-				this.#fileEntries.push(...newEntries);
-				// Update the index for new entries
-				for (const entry of newEntries) {
-					if (entry.type !== "session") {
-						this.#byId.set(entry.id, entry);
-					}
-				}
-			}
-		} catch (error) {
-			// If we can't reconcile, proceed with the rewrite anyway
-			// Better to lose entries than to fail the move entirely
 		}
 	}
 
