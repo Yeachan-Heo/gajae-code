@@ -11069,47 +11069,67 @@ export class AgentSession {
 		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
 			return;
 		}
-		const reconciledRuleNames = new Map<string, number>();
+		// Latest published checkpoint per rule. A legacy entry without one only proves the rule
+		// was delivered, so it maps to undefined unless a checkpointed entry exists.
+		const checkpoints = new Map<string, number | undefined>();
 		for (const message of this.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== "ttsr-injection") {
 				continue;
 			}
-			// Extract the message count at which this reminder was originally injected.
-			// This preserves the after-gap checkpoint for repeat-gap calculations.
-			const messageCount = (message.details as any)?.messageCount;
+			const rawCount = (message.details as { messageCount?: unknown } | undefined)?.messageCount;
+			const checkpoint = typeof rawCount === "number" && Number.isFinite(rawCount) ? rawCount : undefined;
 			for (const ruleName of this.#extractTtsrRuleNames(message.details)) {
-				reconciledRuleNames.set(ruleName, messageCount ?? this.#ttsrManager.getMessageCount());
+				const previous = checkpoints.get(ruleName);
+				if (checkpoint === undefined) {
+					if (!checkpoints.has(ruleName)) checkpoints.set(ruleName, undefined);
+				} else {
+					checkpoints.set(ruleName, previous === undefined ? checkpoint : Math.max(previous, checkpoint));
+				}
 			}
 		}
-		if (reconciledRuleNames.size > 0) {
-			// Only reconcile rules without restored records to preserve checkpoint timestamps (#7838).
-			// Rules that were restored from session state have exact per-rule ttsr_injection records
-			// with computed after-gap checkpoints; re-marking them resets the checkpoint, suppressing
-			// legitimate future injections. Only mark rules found in the message history that don't
-			// yet have a record, allowing the fallback for genuinely missing markers.
-			const existingRecords = new Set<string>();
-			for (const record of this.#ttsrManager.getInjectedRecords()) {
-				existingRecords.add(record.name);
-			}
-			const namesToReconcile = Array.from(reconciledRuleNames.keys()).filter(name => !existingRecords.has(name));
-			if (namesToReconcile.length > 0) {
-				// Use the original message count for each rule to preserve the after-gap checkpoint.
-				for (const name of namesToReconcile) {
-					const messageCount = reconciledRuleNames.get(name) ?? this.#ttsrManager.getMessageCount();
-					this.#ttsrManager.markInjectedByNamesAt([name], messageCount);
+		if (checkpoints.size === 0) return;
+		// The counter is restored from ttsr_injection markers only. If a newer reminder's marker is
+		// missing, that counter lags its published checkpoint; advance it so the after-gap interval is
+		// measured from the checkpoint rather than from an older marker's count.
+		let latestCheckpoint: number | undefined;
+		for (const checkpoint of checkpoints.values()) {
+			if (checkpoint !== undefined && (latestCheckpoint === undefined || checkpoint > latestCheckpoint))
+				latestCheckpoint = checkpoint;
+		}
+		if (latestCheckpoint !== undefined && latestCheckpoint > this.#ttsrManager.getMessageCount()) {
+			this.#ttsrManager.restoreMessageCount(latestCheckpoint);
+		}
+		// Restored records carry exact checkpoints from ttsr_injection markers. Keep a record unless a
+		// newer published reminder proves a later injection whose marker is missing (#7838); re-marking
+		// at the restored current count would restart the after-gap interval.
+		const recorded = new Map<string, number>();
+		for (const record of this.#ttsrManager.getInjectedRecords()) {
+			recorded.set(record.name, record.lastInjectedAt);
+		}
+		for (const [name, checkpoint] of checkpoints) {
+			const lastInjectedAt = recorded.get(name);
+			if (checkpoint === undefined) {
+				// Legacy entry without a checkpoint: only fill a missing record, at the current count.
+				if (lastInjectedAt === undefined) {
+					this.#ttsrManager.markInjectedByNamesAt([name], this.#ttsrManager.getMessageCount());
 				}
+				continue;
+			}
+			if (lastInjectedAt === undefined || lastInjectedAt < checkpoint) {
+				this.#ttsrManager.markInjectedByNamesAt([name], checkpoint);
 			}
 		}
 	}
 
-	#markTtsrInjected(ruleNames: string[], persistMarker = true): void {
+	#markTtsrInjected(ruleNames: string[], persistMarker = true, atMessageCount?: number): void {
 		const uniqueRuleNames = Array.from(
 			new Set(ruleNames.map(ruleName => ruleName.trim()).filter(ruleName => ruleName.length > 0)),
 		);
 		if (uniqueRuleNames.length === 0) {
 			return;
 		}
-		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
+		if (atMessageCount === undefined) this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
+		else this.#ttsrManager?.markInjectedByNamesAt(uniqueRuleNames, atMessageCount);
 		if (!persistMarker) return;
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
 		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
@@ -11293,48 +11313,58 @@ export class AgentSession {
 					}
 				};
 				let injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
-				let details = injection ? { rules: injection.rules.map(rule => rule.name) } : undefined;
-				// In discard mode, pre-extract settled and custom reminders to gather the final rule set
-				// before publication. This ensures the persisted entry contains all rules for reopen reconciliation.
-				let preExtractedSettledRules: Rule[] = [];
-				let preExtractedContent: string[] = [];
-				if (this.#ttsrManager?.getSettings().contextMode === "discard" && injection && details) {
+				const ruleNames = injection ? injection.rules.map(rule => rule.name) : [];
+				// Discard mode drops the suffix holding settled per-tool and earlier retry reminders.
+				// Gather them into the final payload before publication so the durable entry and the
+				// live message carry the same content and rule set (#7838).
+				if (this.#ttsrManager?.getSettings().contextMode === "discard") {
 					const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
 					if (targetAssistantIndex !== -1) {
+						const discardedContent: string[] = [];
+						const settledRules: Rule[] = [];
 						if (this.#ttsrSettledGeneration === generation) {
 							for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
 								for (const rule of rules) {
-									if (!details.rules.includes(rule.name)) {
-										preExtractedSettledRules.push(rule);
-										details.rules.push(rule.name);
+									if (!ruleNames.includes(rule.name)) {
+										settledRules.push(rule);
+										ruleNames.push(rule.name);
 									}
 								}
-								preExtractedContent.push(reminderText);
+								discardedContent.push(reminderText);
 							}
 						}
 						for (let i = targetAssistantIndex; i < this.agent.state.messages.length; i++) {
 							const msg = this.agent.state.messages[i];
 							if (msg.role === "custom" && msg.customType === "ttsr-injection") {
 								for (const ruleName of this.#extractTtsrRuleNames(msg.details)) {
-									if (!details.rules.includes(ruleName)) {
-										details.rules.push(ruleName);
-									}
+									if (!ruleNames.includes(ruleName)) ruleNames.push(ruleName);
 								}
 								if (msg.content && typeof msg.content === "string") {
-									preExtractedContent.push(msg.content);
+									discardedContent.push(msg.content);
 								}
 							}
 						}
-						// Augment injection with extracted content
-						if (preExtractedContent.length > 0) {
-							injection = {
-								...injection,
-								content: injection.content + "\n\n" + preExtractedContent.join("\n\n"),
-							};
+						if (discardedContent.length > 0) {
+							if (injection) {
+								injection = {
+									...injection,
+									content: `${injection.content}\n\n${discardedContent.join("\n\n")}`,
+								};
+							} else if (settledRules.length > 0) {
+								injection = { content: discardedContent.join("\n\n"), rules: settledRules };
+							}
 						}
 					}
 				}
+				// One payload for the durable entry and the live message. messageCount is the checkpoint the
+				// rules are marked at, so reopen reconciliation restores it instead of the current count.
+				const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
+				const details = injection ? { rules: ruleNames, messageCount: ttsrMessageCount } : undefined;
 				let publicationFailure: { error: unknown; outcome: SharedAppendFailureOutcome | undefined } | undefined;
+				// Live-history identity before the await: an abort advances the prompt generation without a
+				// successor, so delivery after an abort is fenced on this history being untouched instead.
+				const liveLengthBefore = this.agent.state.messages.length;
+				const liveTailBefore = this.agent.state.messages.at(-1);
 				if (injection && details) {
 					// Persist before any live mutation. A shared session refuses the legacy append,
 					// so publish through the admitted path like other in-turn custom messages
@@ -11345,46 +11375,22 @@ export class AgentSession {
 						publicationFailure = { error, outcome: getSharedAppendFailureOutcome(error) };
 					}
 				}
-				// The publication awaited: an abort, dispose, or newer prompt/interrupt may have
-				// landed meanwhile. A newer interrupt owns the resume; leave everything to it.
-				if (this.#ttsrRetryToken !== retryToken) return;
-				if (
-					signal.aborted ||
-					this.#isDisposed ||
-					!this.#ttsrAbortPending ||
-					this.#promptGeneration !== generation
-				) {
+				// The publication awaited: an abort, dispose, or newer prompt/interrupt may have landed
+				// meanwhile. Classify the outcome first so an uncertain append still fails closed (#7838).
+				const ownsRetry = () => this.#ttsrRetryToken === retryToken;
+				const endRetry = () => {
+					if (!ownsRetry()) return;
 					this.#ttsrAbortPending = false;
-					// If the shared append succeeded but abort invalidated the retry, still reconcile the
-					// committed reminder to prevent the rule from suppressing another interrupt while the
-					// reminder already exists in the transcript (#7838).
-					if (publicationFailure === undefined && injection && details) {
-						// The append committed; add the reminder to live session history to maintain
-						// consistency between shared store and agent message state. Mark rules as consumed
-						// even though abort prevents full retry setup. A stale/rejected publication lets us
-						// retry in memory; a committed append requires marking to suppress repeat-gap intervals,
-						// but we do not persist a marker since the session may be reopened without the
-						// in-memory appended message.
-						const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-						this.agent.appendMessage({
-							role: "custom",
-							customType: "ttsr-injection",
-							content: injection.content,
-							display: false,
-							details: { ...details, messageCount: ttsrMessageCount },
-							attribution: "agent",
-							timestamp: Date.now(),
-						});
-						this.#markTtsrInjected(details.rules, false);
-					}
-					// A newer prompt owns the pending and per-tool state; the abort that preceded
-					// it already released this retry's claims. Same generation: release only the
-					// buckets this retry captured, still identical, and drop only its carried rules.
 					releaseCarriedTtsr();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
-					return;
-				}
+				};
+				const retryInvalidated = () =>
+					!ownsRetry() ||
+					signal.aborted ||
+					this.#isDisposed ||
+					!this.#ttsrAbortPending ||
+					this.#promptGeneration !== generation;
 				if (publicationFailure) {
 					const { error, outcome } = publicationFailure;
 					// Stale and unknown outcomes require different handling:
@@ -11392,16 +11398,15 @@ export class AgentSession {
 					//   make later shared writes uncommittable, so retry must stop and reopen (#7838).
 					// - Unknown: may have committed; require session close to prevent duplicate (#7838).
 					// - Rejected: definite non-commit; safe to retry in memory.
+					// Both fail-closed paths apply even after an abort or a newer interrupt, because the
+					// persistence state they report belongs to this session, not to the retry.
 					if (outcome?.kind === "stale") {
 						logger.warn("TTSR retry requires session reopen after stale shared append", {
 							rules: details?.rules,
 							reason: outcome.reason,
 							error: error instanceof Error ? error.message : String(error),
 						});
-						this.#ttsrAbortPending = false;
-						releaseCarriedTtsr();
-						this.#resolveTtsrResume();
-						this.#endSessionRecapRequestIf(recapRequest);
+						endRetry();
 						// Stale conditions are persistent; shared writes will remain uncommittable.
 						// Require reopening to clear the persistent state.
 						void this.dispose().catch(() => {
@@ -11425,10 +11430,7 @@ export class AgentSession {
 							attemptedId,
 							error: error instanceof Error ? error.message : String(error),
 						});
-						this.#ttsrAbortPending = false;
-						releaseCarriedTtsr();
-						this.#resolveTtsrResume();
-						this.#endSessionRecapRequestIf(recapRequest);
+						endRetry();
 						// An unknown append may already be in the transcript, but it does not
 						// prove the model received the reminder. Do not persist consumption or
 						// let a later prompt bypass it through another match path or repeat gap.
@@ -11443,9 +11445,14 @@ export class AgentSession {
 							"warning",
 							attemptedId
 								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped and the session was closed because the reminder may already be in the session transcript.`
-							: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
+								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
 							"ttsr",
 						);
+						return;
+					}
+					// Rejected: nothing was committed, so an invalidated retry only releases its claims.
+					if (retryInvalidated()) {
+						endRetry();
 						return;
 					}
 					logger.warn("TTSR injection message could not be persisted", {
@@ -11458,6 +11465,52 @@ export class AgentSession {
 						"TTSR reminder could not be saved to the session transcript; retrying with it in memory only.",
 						"ttsr",
 					);
+				} else if (retryInvalidated()) {
+					// The retry will not run. Without a committed reminder it only releases its claims.
+					if (!injection || !details) {
+						endRetry();
+						return;
+					}
+					// A committed reminder is delivered only into the live history this retry saw. A successor
+					// that appended to it or took over the resume must not receive a stale retry's message.
+					const messages = this.agent.state.messages;
+					const deliverable =
+						ownsRetry() &&
+						!this.#isDisposed &&
+						messages.length === liveLengthBefore &&
+						messages.at(-1) === liveTailBefore;
+					endRetry();
+					if (deliverable) {
+						// Deliver so the next prompt sees the committed reminder, marked at its published checkpoint.
+						this.agent.appendMessage({
+							role: "custom",
+							customType: "ttsr-injection",
+							content: injection.content,
+							display: false,
+							details,
+							attribution: "agent",
+							timestamp: Date.now(),
+						});
+						this.#markTtsrInjected(details.rules, false, ttsrMessageCount);
+						return;
+					}
+					if (this.#isDisposed) return;
+					// The reminder is in the transcript but cannot reach live context. Close the session so a
+					// later prompt neither runs without it nor publishes it again; reopen reconciles the entry.
+					logger.warn("TTSR reminder committed after its retry was cancelled; closing session", {
+						rules: details.rules,
+					});
+					void this.dispose().catch(() => {
+						logger.warn("Cancelled TTSR reminder teardown failed", {
+							code: "ttsr_cancelled_publication_teardown_failed",
+						});
+					});
+					this.emitNotice(
+						"warning",
+						"TTSR reminder was saved after its retry was cancelled and live history had changed; the session was closed and must be reopened to continue.",
+						"ttsr",
+					);
+					return;
 				}
 				// Committed to the retry: the carried rules leave their pending and per-tool buckets.
 				this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
@@ -11465,63 +11518,9 @@ export class AgentSession {
 				this.#perToolTtsrFolded.clear();
 				this.#perToolTtsrClaims.clear();
 				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
-				// Extract TTSR reminders from discarded messages before truncating them.
-				// In a shared-concurrency batch, one tool can emit a folded reminder before another tool
-				// triggers an AST interrupt. Settlement removes it from pending/folded, but settled reminders
-				// must be preserved when discarding context. Extract both custom messages and settled per-tool
-				// reminders to avoid losing the reminder while its rule remains consumed (#7838).
+				// The discarded suffix's settled and earlier retry reminders were already folded into the
+				// published payload above; only truncate here so the live message matches the durable entry.
 				if (this.#ttsrManager?.getSettings().contextMode === "discard" && targetAssistantIndex !== -1) {
-					const discardedContent: string[] = [];
-					const settledRules: Rule[] = [];
-					
-					// Extract settled per-tool reminders that were delivered but are now being discarded.
-					// Only use reminders that belong to the current generation to prevent cross-turn leaks (#7838).
-					if (this.#ttsrSettledGeneration === generation) {
-						for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
-							for (const rule of rules) {
-								if (!carriedNames.has(rule.name)) {
-									carriedNames.add(rule.name);
-									settledRules.push(rule);
-								}
-							}
-							discardedContent.push(reminderText);
-						}
-					}
-					
-					// Extract custom ttsr-injection messages from the assistant message history
-					for (let i = targetAssistantIndex; i < this.agent.state.messages.length; i++) {
-						const msg = this.agent.state.messages[i];
-						if (msg.role === "custom" && msg.customType === "ttsr-injection") {
-							for (const ruleName of this.#extractTtsrRuleNames(msg.details)) {
-								if (!carriedNames.has(ruleName)) {
-									carriedNames.add(ruleName);
-								}
-							}
-							// Preserve the custom message content that will be discarded
-							if (msg.content && typeof msg.content === "string") {
-								discardedContent.push(msg.content);
-							}
-						}
-					}
-					
-					// Create or augment injection with discarded reminders
-					if (discardedContent.length > 0) {
-						if (injection) {
-							// Augment existing injection with settled reminders
-							injection = {
-								...injection,
-								content: injection.content + "\n\n" + discardedContent.join("\n\n"),
-							};
-						} else if (settledRules.length > 0) {
-							// Create new injection from settled reminders only
-							injection = {
-								content: discardedContent.join("\n\n"),
-								rules: settledRules,
-							};
-							details = { rules: settledRules.map(rule => rule.name) };
-						}
-					}
-					
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
 						historyRewrite: { reason: "retry", preserveSeededPrefix: true },
 					});
@@ -11530,13 +11529,12 @@ export class AgentSession {
 					this.#settledToolTtsrReminders.clear();
 				}
 				if (injection && details) {
-					const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
 					this.agent.appendMessage({
 						role: "custom",
 						customType: "ttsr-injection",
 						content: injection.content,
 						display: false,
-						details: { ...details, messageCount: ttsrMessageCount },
+						details,
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
@@ -11544,7 +11542,7 @@ export class AgentSession {
 					// memory only. Consume it in this live manager to avoid a repeatMode
 					// once interrupt loop, but do not persist a marker that would suppress
 					// the still-eligible rule when this session is reopened.
-					this.#markTtsrInjected(details.rules, publicationFailure === undefined);
+					this.#markTtsrInjected(details.rules, publicationFailure === undefined, ttsrMessageCount);
 				}
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
