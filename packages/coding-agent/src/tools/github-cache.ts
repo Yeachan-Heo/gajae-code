@@ -973,8 +973,7 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 		// header of their own.
 		const previous = text[index - 1];
 		const atMarkedLineStart = (previous === "+" || previous === "-") && (index < 2 || text[index - 2] === "\n");
-		const leftBoundary =
-			index === 0 || (!/[A-Za-z0-9_-]/.test(previous as string) && previous !== "-" ? true : atMarkedLineStart);
+		const leftBoundary = index === 0 || atMarkedLineStart || !/[A-Za-z0-9_-]/.test(previous as string);
 		if (ch !== undefined && /[A-Za-z]/.test(ch) && leftBoundary && openCredentialContainers === 0) {
 			const header = matchCredentialHeaderAt(text, index, false);
 			if (header !== null && opensContainer(text, header)) {
