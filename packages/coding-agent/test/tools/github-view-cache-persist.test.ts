@@ -774,6 +774,7 @@ describe("github view cache persistence", () => {
 	it("redacts a token after an invalid UTF-8 escape in a quoted path", () => {
 		const diff = [
 			`diff --git "a/${"\\377"}${GITHUB_TOKEN}" "b/${"\\377"}${GITHUB_TOKEN}"`,
+			`diff --git "a/${"\\377\\t"}${GITHUB_TOKEN}" "b/${"\\377\\t"}${GITHUB_TOKEN}"`,
 			"new file mode 100644",
 			"--- /dev/null",
 			`+++ "b/${"\\377"}${GITHUB_TOKEN}"`,

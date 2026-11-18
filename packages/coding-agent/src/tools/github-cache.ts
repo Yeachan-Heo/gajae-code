@@ -616,16 +616,16 @@ function stripUrlUserinfo(text: string): string {
  * text, so the cache cannot inherit that assumption.
  */
 const CACHE_VENDOR_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-	[/(?<![A-Za-z])github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
-	[/(?<![A-Za-z])gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
-	[/(?<![A-Za-z])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
-	[/(?<![A-Za-z])sk-[A-Za-z0-9_-]{8,}/g, "«redacted-api-key»"],
-	[/(?<![A-Za-z])xox[baprs]-[A-Za-z0-9-]{8,}/g, "«redacted-slack-token»"],
-	[/(?<![A-Za-z])npm_[A-Za-z0-9]{20,}/g, "«redacted-npm-token»"],
-	[/(?<![A-Za-z])glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
-	[/(?<![A-Za-z])hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
-	[/(?<![A-Za-z])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
-	[/(?<![A-Za-z])AIza[0-9A-Za-z_-]{35}/g, "«redacted-google-api-key»"],
+	[/github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
+	[/gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
+	[/(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
+	[/sk-[A-Za-z0-9_-]{8,}/g, "«redacted-api-key»"],
+	[/xox[baprs]-[A-Za-z0-9-]{8,}/g, "«redacted-slack-token»"],
+	[/npm_[A-Za-z0-9]{20,}/g, "«redacted-npm-token»"],
+	[/glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
+	[/hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
+	[/(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
+	[/AIza[0-9A-Za-z_-]{35}/g, "«redacted-google-api-key»"],
 ];
 
 function scrubCacheVendorTokens(text: string): string {
