@@ -883,6 +883,7 @@ describe("github view cache persistence", () => {
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
 			"left | right\n--- | ---\n# https://docs.example|user@localhost:/home/cache-fixture/config",
 			`left | right\n--- | ---\n# https://docs.example|@${os.homedir()}/cache-canary`,
+			"//fixture-user@/home/cache-fixture/config\nhttps://fixture-user@/root/config",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
@@ -925,6 +926,7 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("cache|canary");
 		expect(cacheFileBytes()).not.toContain("cache-fixture");
 		expect(cacheFileBytes()).not.toContain(os.homedir());
+		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cached?.payload.body).not.toContain("opaque");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});

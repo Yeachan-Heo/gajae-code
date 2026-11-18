@@ -666,11 +666,11 @@ function scrubHostPaths(text: string): string {
 	const scrubHomeSegmentInUrl = (url: string): string => {
 		// A valid URL path is content. Only a malformed local authority (empty
 		// port on localhost) is treated as carrying a local path.
-		const localAuthority =
-			/^[a-z][a-z0-9+.-]*:\/\/localhost:(?=\/)/i.test(url) || /^[a-z][a-z0-9+.-]*:\/\/\//i.test(url);
+		const localAuthority = /^(?:[a-z][a-z0-9+.-]*:)?\/\/(?:localhost:(?=\/)|\/)/i.test(url);
 		if (!localAuthority) return url;
 		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
 		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|]+/g, "$1~");
+		scrubbed = scrubbed.replace(/\/root(?=\/|$)/g, "~");
 		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
 	};
 	// A URL's path is content, not a local path, so only scrub outside URL spans.
