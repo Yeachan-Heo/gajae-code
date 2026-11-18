@@ -4964,6 +4964,49 @@ describe("ModelRegistry", () => {
 				shadowServer.stop(true);
 			}
 		});
+		test("keeps a credentialed Rapid-MLX discovery probe on the direct transport", async () => {
+			// The transport exemption follows provider identity, not the absence of a
+			// credential: a Rapid-MLX entry that carries a secret header still probes
+			// over the direct socket, so no proxy can read the header or inject a
+			// catalog. A fetch hook throws if the probe regresses to the shared path.
+			const probes: { pathname: string; apiKey: string | null }[] = [];
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					if (pathname !== "/v1/models") return new Response(null, { status: 404 });
+					probes.push({ pathname, apiKey: request.headers.get("x-api-key") });
+					return Response.json({ data: [{ id: "rapid-mlx-credentialed-model", context_window: 131_072 }] });
+				},
+			});
+			const baseUrl = `http://127.0.0.1:${server.port}/v1`;
+			try {
+				writeRawModelsJson({
+					"rapid-mlx": {
+						baseUrl,
+						api: "openai-completions",
+						auth: "none",
+						headers: { "X-API-Key": "rapid-mlx-header-key" },
+						discovery: { type: "rapid-mlx" },
+					},
+				});
+				const fetched: string[] = [];
+				using _hook = hookFetch(input => {
+					fetched.push(String(input));
+					throw new Error(`Rapid-MLX discovery must not use fetch: ${String(input)}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("rapid-mlx", "online");
+
+				expect(probes).toEqual([{ pathname: "/v1/models", apiKey: "rapid-mlx-header-key" }]);
+				expect(fetched).toEqual([]);
+				expect(registry.find("rapid-mlx", "rapid-mlx-credentialed-model")?.baseUrl).toBe(baseUrl);
+			} finally {
+				server.stop(true);
+			}
+		});
 		test("keeps an authenticated non-Rapid-MLX implicit probe on the configured proxy", async () => {
 			// Credential presence is not a transport exemption: the direct-socket rule
 			// is Rapid-MLX identity. An authenticated oMLX probe must keep using the
