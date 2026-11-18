@@ -1626,6 +1626,59 @@ describe("bash session agent directory", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"expands a rule URL inside a multiline env value while refusing a foreign session rule there",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-env-multiline-"));
+			try {
+				const project = path.join(parent, "project");
+				const agentDir = path.join(parent, "agent");
+				const foreign = path.join(parent, "foreign");
+				await mkdir(project);
+				await mkdir(agentDir);
+				await mkdir(foreign);
+				const ownRule = path.join(project, "own.md");
+				const foreignRule = path.join(foreign, "foreign.md");
+				await writeFile(ownRule, "own-rule");
+				await writeFile(foreignRule, "foreign-rule");
+				const ruleSource = (filePath: string) => ({
+					provider: "test",
+					providerName: "test",
+					path: filePath,
+					level: "user" as const,
+				});
+				setActiveRules([
+					{ name: "own", path: ownRule, content: "own-rule", _source: ruleSource(ownRule) },
+					{ name: "foreign", path: foreignRule, content: "foreign-rule", _source: ruleSource(foreignRule) },
+				]);
+				const tool = createAgentDirBashTool(project, agentDir, path.join(parent, "settings-agent"));
+				// Env values are data: the prompt tells the model to hand multiline and
+				// untrusted content to the tool through them, so a rule URL there is
+				// expanded like any other value instead of being read as shell text.
+				const multiline = (url: string) => `line one\n${url}\nline three`;
+				const ownResult = await tool.execute("call-env-multiline-own", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: multiline("rule://own") },
+				});
+				expect(textOf(ownResult)).toContain(await realpath(ownRule));
+				// The same position still refuses a rule that is not this session's.
+				await expect(
+					tool.execute("call-env-multiline-foreign", {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: multiline("rule://foreign") },
+					}),
+				).rejects.toThrow(/outside this session/);
+				// Command text keeps the shell-context guard that env values do not need.
+				await expect(
+					tool.execute("call-command-heredoc", { command: "cat <<EOF\nrule://own\nEOF" }),
+				).rejects.toThrow(/standalone shell argument/);
+			} finally {
+				resetActiveRulesForTests();
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it.skipIf(process.platform === "win32" || !canWriteUnderHome)(
 		"expands an ancestor project rule through bash command execution in a non-Git session",
 		async () => {

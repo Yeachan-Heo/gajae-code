@@ -627,12 +627,16 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 }
 
 /**
- * Expand filesystem-safe internal URLs in a bash command string. `agent://`,
+ * Expand filesystem-safe internal URLs in `command`. `agent://`,
  * `artifact://`, and `memory://` remain internal-reader-only and are rejected
  * before resolution.
  * `rule://` expands to a session, repository, or agent-directory path, a non-Git
  * ancestor rule under the trusted home, or a discovered user rule under
  * `.agent/rules`, `.agents/rules`, or the agent directory.
+ * Passing `context: "data"` expands a value the shell never parses (an env
+ * value) instead of command text: the same authorization applies, but the
+ * quoting and nested-expansion guards, which only describe shell reading, do
+ * not.
  */
 export async function expandInternalUrls(command: string, options: InternalUrlExpansionOptions): Promise<string> {
 	if (!command.includes("://") && !command.includes("local:/")) return command;
@@ -640,8 +644,10 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 	const matches = Array.from(command.matchAll(INTERNAL_URL_PATTERN_INCLUDING_NORMALIZED_LOCAL));
 	if (matches.length === 0) return command;
 
+	const shellContext = options.context !== "data";
 	let expanded = command;
 	const nestedRuleContext =
+		shellContext &&
 		hasNestedExpansionContext(command) &&
 		matches.some(match => extractScheme(normalizeLocalScheme(unquoteToken(match[0]))) === "rule");
 	for (let i = matches.length - 1; i >= 0; i--) {
@@ -665,9 +671,9 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.ensureLocalParentDirs,
 			options.sessionCwd,
 			options.sessionAgentDir,
-			enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index),
+			shellContext && (enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index)),
 		);
-		const replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);
+		const replacement = shellContext && !options.noEscape ? shellEscape(resolvedPath) : resolvedPath;
 		expanded = `${expanded.slice(0, index)}${replacement}${expanded.slice(index + token.length)}`;
 	}
 

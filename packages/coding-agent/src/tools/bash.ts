@@ -1501,7 +1501,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								: await expandInternalUrls(value, {
 										...internalUrlOptions,
 										ensureLocalParentDirs: true,
-										noEscape: true,
+										// An env value is data the executor passes verbatim; the
+										// shell never parses it, so command-text quoting and
+										// nested-expansion guards do not apply, while the
+										// session and path authorization still do.
+										context: "data",
 									}),
 						]),
 					),
