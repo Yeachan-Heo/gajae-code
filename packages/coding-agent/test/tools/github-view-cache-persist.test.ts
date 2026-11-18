@@ -881,6 +881,49 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});
 
+	it("redacts an unterminated container through the next diff section", () => {
+		const diff = [
+			"diff --git a/one b/one",
+			"index 1111111..2222222 100644",
+			"--- a/one",
+			"+++ b/one",
+			"@@ -1,5 +1,5 @@",
+			" {",
+			'-  "items": [',
+			'+  "token": [',
+			'     "dummy",',
+			'     "item2",',
+			'     "item3",',
+			"diff --git a/next b/next",
+			"index 3333333..4444444 100644",
+			"--- a/next",
+			"+++ b/next",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 94,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain("dummy");
+		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 94, false, TEST_AUTH_KEY);
+		expect(cached?.payload.unified).not.toContain("dummy");
+		expect(cached?.payload.unified).toContain("diff --git a/next b/next");
+		expect(cached?.payload.files).toHaveLength(2);
+		const [first, second] = cached?.payload.files ?? [];
+		expect(cached?.payload.unified.slice(first?.startOffset, first?.endOffset)).toContain("«redacted»");
+		expect(cached?.payload.unified.slice(second?.startOffset, second?.endOffset)).toContain("+new");
+	});
+
 	it("keeps a sanitized diff path byte-stable across write and read", () => {
 		const secret = "demo-token-1234";
 		const diff = [

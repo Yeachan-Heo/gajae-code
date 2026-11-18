@@ -388,12 +388,18 @@ function maskCredentialJsonContainers(text: string): { text: string; restore: (s
 		if (first !== "{" && first !== "[") continue;
 		let end = findBalancedValueEnd(text, valueStart);
 		if (end === -1) {
-			// The container never closes. A JSON value cannot contain a blank
-			// line, so the paragraph boundary is the last safe stopping point;
-			// without one the rest of the text belongs to the malformed value.
+			// The container never closes. A unified diff section boundary is a
+			// safe stop and keeps the following file's patch; a blank line is
+			// not, because an empty diff context line is a single space and the
+			// value can continue after it. Prose falls back to its paragraph.
 			const tail = text.slice(valueStart);
-			const paragraph = /\n[ \t]*\n/.exec(tail);
-			end = paragraph ? valueStart + paragraph.index : text.length;
+			const section = tail.indexOf("\ndiff --git ");
+			if (section !== -1) {
+				end = valueStart + section;
+			} else {
+				const paragraph = /\n[ \t]*\n/.exec(tail);
+				end = paragraph ? valueStart + paragraph.index : text.length;
+			}
 		}
 		out += text.slice(last, valueStart) + '"«redacted»"';
 		last = end;
