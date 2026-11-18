@@ -102,6 +102,11 @@ jobs:
             );
 
             // Find reviewers with CHANGES_REQUESTED or COMMENTED (latest review only)
+            // Publishing automation accounts that should not be re-requested.
+            // These accounts may publish or manage releases and should not be
+            // re-requested when they provide review feedback.
+            const EXCLUDED_AUTOMATION_ACCOUNTS = new Set(['snowykr']);
+
             function latestReviewByUser(reviews, prAuthor) {
               const reviewerMap = new Map();
 
@@ -120,6 +125,11 @@ jobs:
 
                 // Skip bots (check if user type is Bot)
                 if (review.user.type === 'Bot') {
+                  continue;
+                }
+
+                // Skip excluded automation accounts
+                if (EXCLUDED_AUTOMATION_ACCOUNTS.has(reviewer)) {
                   continue;
                 }
 

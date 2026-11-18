@@ -313,6 +313,47 @@ describe("workflow permission policy", () => {
 		expect([...selected.keys()]).toEqual(["eligible-reviewer"]);
 	});
 
+	test("excludes automation accounts from re-request", async () => {
+		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
+		const jobs = documentRecord(source.jobs);
+		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
+		const getReviewers = steps.map(documentRecord).find(step => step.id === "get-reviewers");
+		const reviewerScript = documentRecord(documentRecord(getReviewers).with).script as string;
+		const helper = reviewerScript.match(/function latestReviewByUser\(reviews, prAuthor\) \{[\s\S]*?^\}/m);
+		const accountsDecl = reviewerScript.match(/const EXCLUDED_AUTOMATION_ACCOUNTS = new Set\(\[([^\]]+)\]\)/);
+		expect(helper).not.toBeNull();
+		expect(accountsDecl).not.toBeNull();
+		expect(accountsDecl?.[1]).toContain("'snowykr'");
+
+		type Review = {
+			user: { login: string; type: string } | null;
+			state: string;
+			submitted_at: string;
+		};
+		const createLatestReviewByUser = new Function(
+			`${reviewerScript.match(/const EXCLUDED_AUTOMATION_ACCOUNTS[^;]+;/m)?.[0]}
+${helper?.[0]}
+return latestReviewByUser;`,
+		) as () => (reviews: Review[], prAuthor: string | undefined) => Map<string, Review>;
+		const latestReviewByUser = createLatestReviewByUser();
+
+		const selected = latestReviewByUser([
+			{
+				user: { login: "snowykr", type: "User" },
+				state: "COMMENTED",
+				submitted_at: "2026-10-13T00:00:00Z",
+			},
+			{
+				user: { login: "eligible-reviewer", type: "User" },
+				state: "CHANGES_REQUESTED",
+				submitted_at: "2026-10-13T00:00:30Z",
+			},
+		], undefined);
+
+		// snowykr should be excluded, only eligible-reviewer should remain
+		expect([...selected.keys()]).toEqual(["eligible-reviewer"]);
+	});
+
 	test("uses chronological API order when review timestamps tie", async () => {
 		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
 		const jobs = documentRecord(source.jobs);
