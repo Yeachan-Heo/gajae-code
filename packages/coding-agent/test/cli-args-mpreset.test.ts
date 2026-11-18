@@ -188,6 +188,9 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			session.configuredModelChains.push({ role, entries });
 		},
+		async setConfiguredModelChainForControl(role: string, entries: readonly string[]) {
+			session.configuredModelChains.push({ role, entries });
+		},
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			session.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},

@@ -38,6 +38,10 @@ function controllerFor(phases: TodoPhase[]) {
 		session: {
 			getTodoPhases: () => [],
 			setTodoPhases: vi.fn(),
+			// The controller's admission boundary. A legacy session delegates this to
+			// `sessionManager.assertLegacyMutationAllowed`; the shared-session behavior is
+			// covered by the real-session regression in shared-title-eligibility.test.ts.
+			assertAdditiveMutationAllowed: vi.fn((_operation: string) => {}),
 			appendCustomEntryInBackground: vi.fn(),
 			appendMessageInBackground: vi.fn(),
 		},
@@ -86,14 +90,14 @@ describe("/todo mutation admission", () => {
 		if (command.startsWith("import")) {
 			vi.spyOn(fs, "readFile").mockResolvedValue("# Replacement\n- [ ] Imported task\n");
 		}
-		ctx.sessionManager.assertLegacyMutationAllowed.mockImplementation(operation => {
+		ctx.session.assertAdditiveMutationAllowed.mockImplementation((operation: string) => {
 			throw new SharedSessionMutationUnsupportedError(operation);
 		});
 
 		await controller.handleTodoCommand(command);
 
-		expect(ctx.sessionManager.assertLegacyMutationAllowed).toHaveBeenCalledTimes(1);
-		expect(ctx.sessionManager.assertLegacyMutationAllowed.mock.calls[0]?.[0]).toStartWith("/todo ");
+		expect(ctx.session.assertAdditiveMutationAllowed).toHaveBeenCalledTimes(1);
+		expect(ctx.session.assertAdditiveMutationAllowed.mock.calls[0]?.[0]).toStartWith("/todo ");
 		expect(ctx.session.setTodoPhases).not.toHaveBeenCalled();
 		expect(ctx.setTodos).not.toHaveBeenCalled();
 		expect(ctx.agent.appendMessage).not.toHaveBeenCalled();
@@ -112,14 +116,14 @@ describe("/todo mutation admission", () => {
 
 	it("keeps read-only display available when mutation admission would refuse", async () => {
 		const { controller, ctx, showStatus, showError } = controllerFor(structuredClone(initial));
-		ctx.sessionManager.assertLegacyMutationAllowed.mockImplementation(operation => {
+		ctx.session.assertAdditiveMutationAllowed.mockImplementation((operation: string) => {
 			throw new SharedSessionMutationUnsupportedError(operation);
 		});
 
 		await controller.handleTodoCommand("");
 
 		expect(showStatus).toHaveBeenCalledWith(phasesToMarkdown(initial).trimEnd());
-		expect(ctx.sessionManager.assertLegacyMutationAllowed).not.toHaveBeenCalled();
+		expect(ctx.session.assertAdditiveMutationAllowed).not.toHaveBeenCalled();
 		expect(ctx.session.setTodoPhases).not.toHaveBeenCalled();
 		expect(ctx.agent.appendMessage).not.toHaveBeenCalled();
 		expect(showError).not.toHaveBeenCalled();
@@ -131,7 +135,7 @@ describe("/todo mutation admission", () => {
 
 		await controller.handleTodoCommand("start Write");
 
-		expect(ctx.sessionManager.assertLegacyMutationAllowed).toHaveBeenCalledWith("/todo start Write report");
+		expect(ctx.session.assertAdditiveMutationAllowed).toHaveBeenCalledWith("/todo start Write report");
 		expect(ctx.session.setTodoPhases).toHaveBeenCalledWith(expected);
 		expect(ctx.setTodos).toHaveBeenCalledWith(expected);
 		expect(ctx.session.appendCustomEntryInBackground).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, {

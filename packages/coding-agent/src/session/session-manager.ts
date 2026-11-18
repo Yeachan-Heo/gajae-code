@@ -1970,6 +1970,43 @@ function isManagedReplaceIdentityMismatch(error: unknown): boolean {
 }
 
 /** Title publication has patch evidence, not a conversation-graph entry ID. */
+/** Outcome of a shared live-session star patch. `changed: false` means the committed transcript already carried it. */
+export type SharedStarOutcome =
+	| { readonly kind: "committed"; readonly changed: boolean }
+	| {
+			readonly kind: "stale";
+			readonly reason:
+				| "transcript_moved"
+				| "persistence_latched"
+				| "rewrite_required"
+				| "unsupported_transcript"
+				| "star_patch_upgrade_required";
+	  }
+	| { readonly kind: "rejected"; readonly error: unknown }
+	| {
+			readonly kind: "unknown";
+			readonly sessionId: string;
+			readonly starred: boolean;
+			readonly predecessor?: ManagedFileIdentity;
+			readonly receipt?: ManagedAppendReceipt;
+			readonly error: unknown;
+	  };
+
+/** A shared session star that was not proven committed; never retried through the legacy writer. */
+export class SessionStarPublicationError extends Error {
+	readonly code: Exclude<SharedStarOutcome["kind"], "committed">;
+	constructor(readonly outcome: Exclude<SharedStarOutcome, { kind: "committed" }>) {
+		super(
+			outcome.kind === "stale" && outcome.reason === "star_patch_upgrade_required"
+				? "This shared session's format cannot record a star without rewriting it; reopen it alone to upgrade."
+				: `Shared session star publication ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
+			{ cause: outcome },
+		);
+		this.name = "SessionStarPublicationError";
+		this.code = outcome.kind;
+	}
+}
+
 export type SharedTitleOutcome =
 	| { readonly kind: "committed"; readonly title: string }
 	| { readonly kind: "skipped"; readonly reason: "stale" | "named" }
@@ -2015,6 +2052,47 @@ export type SharedAppendOutcome =
 				| "unsupported_transcript";
 	  }
 	| { readonly kind: "rejected"; readonly error: unknown };
+
+/**
+ * What reconciliation proved about the attempted IDs of an `unknown` shared append batch.
+ *
+ * `committed` means every attempted entry is durably in the transcript. `absent` means
+ * neither the transcript nor the resident graph holds any of them, so a retry cannot
+ * duplicate them. `partial` means some of the batch is durable and the rest is provably
+ * absent: the batch did not apply as a unit. `unresolved` means at least one entry may
+ * already be durable and the transcript could not decide; such entries must not be
+ * resubmitted blindly.
+ */
+export type SharedAppendReconciliation =
+	| { readonly kind: "committed"; readonly ids: readonly string[] }
+	| { readonly kind: "absent"; readonly ids: readonly string[] }
+	| { readonly kind: "partial"; readonly committed: readonly string[]; readonly absent: readonly string[] }
+	| { readonly kind: "unresolved"; readonly ids: readonly string[]; readonly error: unknown };
+
+/**
+ * The exact receipt of a shared publication whose durability could not be proven.
+ *
+ * Every shared publication kind - canonical and custom entries, compaction, controls,
+ * title and star patches - retains its receipt here when its outcome is `unknown`. The
+ * manager latches persistence on it, so no later publication can build on a transcript
+ * state this opener does not know, and the session that owns the manager closes ingress.
+ */
+export type SharedPublicationUncertainty =
+	| { readonly publication: "entries"; readonly outcome: Extract<SharedEntriesAppendOutcome, { kind: "unknown" }> }
+	| { readonly publication: "title"; readonly outcome: Extract<SharedTitleOutcome, { kind: "unknown" }> }
+	| { readonly publication: "star"; readonly outcome: Extract<SharedStarOutcome, { kind: "unknown" }> };
+
+/** The persistence latch for a shared publication with an unknown outcome; carries the full receipt. */
+export class SharedPublicationUnknownError extends Error {
+	readonly code = "shared_publication_unknown";
+	constructor(
+		message: string,
+		readonly uncertainty: SharedPublicationUncertainty,
+	) {
+		super(message, { cause: uncertainty.outcome });
+		this.name = "SharedPublicationUnknownError";
+	}
+}
 
 /**
  * What a writable open did about pending migration.
@@ -8018,6 +8096,8 @@ export class SessionManager {
 	 * refusal.
 	 */
 	readonly #sharedAppendBarSessionIds = new Set<string>();
+	/** Set once by {@link admitRootSharedPublication}; part of {@link usesSharedPublication}. */
+	#rootSharedPublication = false;
 	/**
 	 * Permanent bar on resident-graph and whole-transcript rewrites. Latched once this
 	 * manager re-anchors to a committed transcript whose entries it did not import:
@@ -13125,6 +13205,29 @@ export class SessionManager {
 	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
 	}
+
+	#sharedPublicationUnknownError(): SharedPublicationUnknownError | undefined {
+		return this.#persistError instanceof SharedPublicationUnknownError ? this.#persistError : undefined;
+	}
+
+	/** The retained receipt of the shared publication that latched persistence with an unknown outcome. */
+	getUnknownSharedPublication(): SharedPublicationUncertainty | undefined {
+		return this.#persistError instanceof SharedPublicationUnknownError ? this.#persistError.uncertainty : undefined;
+	}
+
+	/**
+	 * The single latch for every shared publication kind whose outcome is `unknown`.
+	 *
+	 * Replaces any raw failure an inner write already latched, so persistence - and a
+	 * strict close - carries the full receipt rather than a partial cause. Later shared
+	 * publications report `stale: persistence_latched` and legacy writers rethrow it.
+	 */
+	#latchUnknownSharedPublication(message: string, uncertainty: SharedPublicationUncertainty): void {
+		const retained = new SharedPublicationUnknownError(message, uncertainty);
+		if (this.#persistError) this.#persistError = retained;
+		else this.#recordPersistError(retained);
+	}
+
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
 		if (!this.#persistError) this.#persistError = normalized;
@@ -19054,7 +19157,21 @@ export class SessionManager {
 		return header?.starredPatchVersion === 1 && header.starred === true;
 	}
 
+	/**
+	 * Star or unstar the live session through the protocol its publication eligibility
+	 * selects. Callers never choose: a session that publishes through shared admission
+	 * appends a header patch under its managed transaction lease, and any outcome other
+	 * than a proven commit throws {@link SessionStarPublicationError} without falling back
+	 * to the legacy writer.
+	 */
 	async setSessionStarred(starred: boolean): Promise<boolean> {
+		if (!this.usesSharedPublication()) return this.#setSessionStarredLegacy(starred);
+		const outcome = await this.#setSessionStarredSharingSession(starred);
+		if (outcome.kind === "committed") return outcome.changed;
+		throw new SessionStarPublicationError(outcome);
+	}
+
+	async #setSessionStarredLegacy(starred: boolean): Promise<boolean> {
 		this.assertLegacyMutationAllowed("set session starred");
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -19070,6 +19187,177 @@ export class SessionManager {
 			else header.starred = previous;
 			this.#headerExportRevision++;
 			throw error;
+		}
+	}
+
+	/**
+	 * Append-only star patch for a session other openers may also be writing. Mirrors the
+	 * shared title publication: never a whole-transcript header upgrade, never a replay of
+	 * resident state over a peer's appends, and an unproven write is retained as `unknown`
+	 * and latches persistence instead of being retried.
+	 */
+	async #setSessionStarredSharingSession(starred: boolean): Promise<SharedStarOutcome> {
+		this.#assertRecoveryHydrationWritable();
+		if (this.destination.kind !== "managed")
+			return { kind: "rejected", error: new Error("shared_star_requires_managed_destination") };
+		const sessionId = this.#sessionId;
+		const identityGeneration = this.#committedIdentityGeneration;
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return { kind: "rejected", error: new Error("shared_star_requires_session_file") };
+		const current = () => this.#sessionId === sessionId && this.#committedIdentityGeneration === identityGeneration;
+		const patch = { starred } as const;
+		const releasePublication = this.#enterSharedPublication(sessionId, { append: false, rewrite: false });
+		try {
+			const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+			let attempted = false;
+			let predecessorIdentity: ManagedFileIdentity | undefined;
+			let priorCommittedDigest: string | undefined;
+			let receipt: ManagedAppendReceipt | undefined;
+			const retainUnknown = (error: unknown): SharedStarOutcome => {
+				const outcome: Extract<SharedStarOutcome, { kind: "unknown" }> = {
+					kind: "unknown",
+					sessionId,
+					starred,
+					predecessor: predecessorIdentity,
+					receipt,
+					error,
+				};
+				this.#latchUnknownSharedPublication("Shared session star publication outcome is unknown", {
+					publication: "star",
+					outcome,
+				});
+				return outcome;
+			};
+			let result: SharedStarOutcome;
+			try {
+				result = await withManagedSessionTransaction<SharedStarOutcome>({ locksDirectory, sessionId }, scope => {
+					scope.assertOwned();
+					if (!current()) return { kind: "stale", reason: "transcript_moved" };
+					if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+					this.#refreshManagedTranscriptRelocation();
+					if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
+						return { kind: "stale", reason: "transcript_moved" };
+					if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
+					const store = this.#managedTranscriptStore(sessionFile);
+					const relative = path.basename(sessionFile);
+					store.assertBound();
+					const snapshot = store.readExpected(relative);
+					if (!this.#flushed && snapshot) return { kind: "stale", reason: "transcript_moved" };
+					const record: HeaderPatchRecord = { type: "header_patch", patch };
+					const patchBytes = Buffer.from(`${JSON.stringify(record)}\n`);
+					try {
+						if (snapshot) {
+							let content: string;
+							let entries: FileEntry[];
+							let rawHeader: unknown;
+							try {
+								content = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.bytes);
+								entries = parseSessionEntries(content);
+								const newline = content.indexOf("\n");
+								rawHeader = JSON.parse(newline === -1 ? content : content.slice(0, newline));
+							} catch {
+								return { kind: "stale", reason: "unsupported_transcript" };
+							}
+							const header = entries[0];
+							if (header?.type !== "session" || header.id !== sessionId || !isRecord(rawHeader))
+								return { kind: "stale", reason: "transcript_moved" };
+							if (snapshot.bytes.at(-1) !== 10) return { kind: "stale", reason: "unsupported_transcript" };
+							// Upgrading the header to carry star patches rewrites the whole transcript,
+							// which would move a live peer's transcript identity. Same append-only rule
+							// as the picker's shared star.
+							if (rawHeader.starredPatchVersion !== 1 || Number(rawHeader.version) < 4)
+								return { kind: "stale", reason: "star_patch_upgrade_required" };
+							predecessorIdentity = snapshot.identity;
+							priorCommittedDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
+							if ((header.starred === true) === starred) return { kind: "committed", changed: false };
+							if (!current()) return { kind: "stale", reason: "transcript_moved" };
+							attempted = true;
+							scope.assertOwned();
+							receipt = store.appendExpectedIdentitySync(relative, patchBytes, snapshot.identity);
+						} else {
+							if (
+								this.#flushed ||
+								!this.persist ||
+								this.#readOnlyResume ||
+								this.#ensuredOnDisk ||
+								this.#managedPersistExpectedIdentity
+							)
+								return { kind: "stale", reason: "transcript_moved" };
+							const resident = this.#fileEntries[0];
+							if (resident?.type !== "session" || resident.id !== sessionId)
+								return { kind: "stale", reason: "transcript_moved" };
+							if (this.isSessionStarred() === starred) return { kind: "committed", changed: false };
+							// A never-published transcript has no peer yet: publish it once, no-clobber,
+							// with the star already folded into a patch-capable header.
+							const entries = materializeResidentEntriesForPersistenceSync(
+								this.#fileEntries,
+								this.#residentBlobStores(),
+							).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+							const first = entries[0];
+							if (first?.type !== "session") return { kind: "stale", reason: "transcript_moved" };
+							entries[0] = { ...first, starredPatchVersion: 1, starred };
+							const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+							attempted = true;
+							scope.assertOwned();
+							store.publishNoReplaceSync(relative, bytes);
+							const published = store.readExpected(relative);
+							if (!published?.bytes.equals(bytes)) throw new Error("durability_unproven");
+							receipt = { identity: published.identity, descriptor: store.descriptorExpected(relative)! };
+						}
+						const verified = store.readExpected(relative);
+						if (
+							!verified ||
+							!receipt ||
+							verified.identity.sha256 !== receipt.identity.sha256 ||
+							(snapshot &&
+								(!verified.bytes.subarray(0, snapshot.bytes.length).equals(snapshot.bytes) ||
+									!verified.bytes.subarray(snapshot.bytes.length).equals(patchBytes)))
+						)
+							throw new Error("durability_unproven");
+						return { kind: "committed", changed: true };
+					} catch (error) {
+						if (error instanceof ManagedAppendIdentityMismatchError)
+							return { kind: "stale", reason: "transcript_moved" };
+						if (!attempted) throw error;
+						return retainUnknown(error);
+					}
+				});
+			} catch (error) {
+				if (!attempted) return { kind: "rejected", error };
+				return retainUnknown(error);
+			}
+			if (result.kind !== "committed") return result;
+			// Latch before bookkeeping: the patch is durable from here on. A transcript that
+			// already held a state this manager never committed keeps rewrite authority barred.
+			if (result.changed && predecessorIdentity && predecessorIdentity.sha256 !== priorCommittedDigest)
+				this.#latchSharedRewriteBar(sessionId);
+			// The committed transcript now carries the requested star even when a peer had
+			// already set it; the resident header follows it.
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (header && (header.starredPatchVersion !== 1 || (header.starred === true) !== starred)) {
+				header.starredPatchVersion = 1;
+				applyHeaderPatch(header, patch);
+				this.#headerExportRevision++;
+			}
+			if (result.changed) {
+				if (receipt) {
+					this.#managedPersistExpectedIdentity = receipt.identity;
+					this.#openCommittedDigest = receipt.identity.sha256;
+				}
+				if (!this.#flushed) {
+					this.#flushed = true;
+					this.#ensuredOnDisk = true;
+					if (this.#effectiveSessionMemoryMode() !== "off") {
+						this.#buildDisposableSidecars(this.#fileEntries);
+						if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
+					}
+				}
+			}
+			return result;
+		} finally {
+			releasePublication();
 		}
 	}
 
@@ -19122,6 +19410,12 @@ export class SessionManager {
 	}
 
 	async #setLivePickerStar(session: SessionInfo, starred: boolean): Promise<void> {
+		if (this.usesSharedPublication()) {
+			this.#assertPickerSessionIsCurrent(session);
+			const outcome = await this.#setSessionStarredSharingSession(starred);
+			if (outcome.kind !== "committed") throw new SessionStarPublicationError(outcome);
+			return;
+		}
 		this.assertLegacyMutationAllowed("set live picker star");
 		this.#assertRecoveryHydrationWritable();
 		this.#assertPickerSessionIsCurrent(session);
@@ -19480,9 +19774,8 @@ export class SessionManager {
 			let predecessorIdentity: ManagedFileIdentity | undefined;
 			let priorCommittedDigest: string | undefined;
 			let receipt: ManagedAppendReceipt | undefined;
-			let retainedFailure: Error | undefined;
 			const retainUnknown = (error: unknown): SharedTitleOutcome => {
-				const outcome: SharedTitleOutcome = {
+				const outcome: Extract<SharedTitleOutcome, { kind: "unknown" }> = {
 					kind: "unknown",
 					sessionId,
 					patch,
@@ -19490,11 +19783,10 @@ export class SessionManager {
 					receipt,
 					error,
 				};
-				if (retainedFailure) retainedFailure.cause = outcome;
-				else {
-					retainedFailure = new Error("Shared session title publication outcome is unknown", { cause: outcome });
-					this.#recordPersistError(retainedFailure);
-				}
+				this.#latchUnknownSharedPublication("Shared session title publication outcome is unknown", {
+					publication: "title",
+					outcome,
+				});
 				return outcome;
 			};
 			try {
@@ -19596,17 +19888,9 @@ export class SessionManager {
 				return retainUnknown(error);
 			}
 			if (result.kind === "committed") {
-				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-				if (header) {
-					applyHeaderPatch(header, patch);
-					this.#headerExportRevision++;
-				}
-				this.#sessionName = sanitized;
-				this.#titleSource = source;
-				if (receipt) {
-					this.#managedPersistExpectedIdentity = receipt.identity;
-					this.#openCommittedDigest = receipt.identity.sha256;
-				}
+				// Latch before any bookkeeping: the adoption is durable from here on, and a
+				// later throwing step must not leave the safety bar unset.
+				//
 				// The snapshot branch imported only the header. Rewrite authority stays barred
 				// only when the transcript already held a state this manager never committed:
 				// renaming a transcript this manager wrote itself keeps full authority.
@@ -19619,6 +19903,17 @@ export class SessionManager {
 				// `#managedPersistExpectedIdentity` on a non-committed title outcome.
 				if (predecessorIdentity && predecessorIdentity.sha256 !== priorCommittedDigest)
 					this.#latchSharedRewriteBar(sessionId);
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header) {
+					applyHeaderPatch(header, patch);
+					this.#headerExportRevision++;
+				}
+				this.#sessionName = sanitized;
+				this.#titleSource = source;
+				if (receipt) {
+					this.#managedPersistExpectedIdentity = receipt.identity;
+					this.#openCommittedDigest = receipt.identity.sha256;
+				}
 				if (!this.#flushed) {
 					this.#flushed = true;
 					this.#ensuredOnDisk = true;
@@ -20532,6 +20827,34 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Opt this manager into shared publication as the trusted root interactive opener
+	 * (#7711). One-way: an opener that may have published through the shared transaction
+	 * never returns to the legacy writers.
+	 */
+	admitRootSharedPublication(): void {
+		this.#rootSharedPublication = true;
+	}
+
+	/** Whether this manager's current transcript exists on disk. */
+	isTranscriptPublished(): boolean {
+		return this.#flushed || this.#ensuredOnDisk || this.#managedPersistExpectedIdentity !== undefined;
+	}
+
+	#rootSharedPublicationOwnsTranscript(): boolean {
+		return this.#rootSharedPublication && this.isManagedDestination() && this.isTranscriptPublished();
+	}
+
+	/**
+	 * The single publication-eligibility rule (#7824): a managed destination whose opener is
+	 * the admitted root, or whose logical session already requires shared admission.
+	 * Admission-aware writers on this class and every AgentSession publication seam select
+	 * shared or legacy publication from this predicate alone.
+	 */
+	usesSharedPublication(): boolean {
+		return this.isManagedDestination() && (this.#rootSharedPublication || this.requiresSharedMutationAdmission());
+	}
+
 	/** Whether this logical session must keep using shared mutation admission. */
 	requiresSharedMutationAdmission(): boolean {
 		const sessionId = this.#sessionId;
@@ -20547,13 +20870,37 @@ export class SessionManager {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 
-	/** Additive legacy appends are safe once a control publication's transaction has settled. */
+	/**
+	 * Admission for an additive legacy append.
+	 *
+	 * The append bar is refusal policy, not the safety guarantee, so a one-shot control
+	 * publication that scopes its own admission does not bar later appends. Once a
+	 * canonical shared publication arms the permanent bar, every additive legacy append
+	 * of this logical session refuses here, before any graph mutation, with
+	 * {@link SharedSessionMutationUnsupportedError}. The check is reached from the live
+	 * write funnels only — {@link #appendEntry} for entry appends and
+	 * {@link appendMessage} for messages — plus {@link appendSessionRecap}, which plans
+	 * before it writes. Callers that must stay durable publish through the
+	 * `*SharingSession` methods instead.
+	 */
 	assertLegacyAppendAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, false);
 	}
 
 	#assertLogicalSessionMutationAllowed(sessionId: string, operation: string, includeRewrite: boolean): void {
+		// A fenced or uncertain transcript takes no further write: refuse with the latched
+		// typed error before the caller changes live state the transcript cannot record.
+		if (sessionId === this.#sessionId) {
+			const latched = this.getAppendIdentityMismatch() ?? this.#sharedPublicationUnknownError();
+			if (latched) throw latched;
+		}
 		if ((this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0)
+			throw new SharedSessionMutationUnsupportedError(operation);
+		// An admitted root publishes only through the shared lease once its transcript
+		// exists on disk: a legacy write there skips the lease a live peer may hold, and
+		// fails later on a stale identity. Unpublished bootstrap staging stays legacy and
+		// becomes part of the first shared publication.
+		if (sessionId === this.#sessionId && this.#rootSharedPublicationOwnsTranscript())
 			throw new SharedSessionMutationUnsupportedError(operation);
 		if (this.#sharedAppendBarSessionIds.has(sessionId)) throw new SharedSessionMutationUnsupportedError(operation);
 		if (includeRewrite && this.#sharedRewriteBarSessionIds.has(sessionId))
@@ -20893,13 +21240,14 @@ export class SessionManager {
 		let attempted = 0;
 		const unknown = (error: unknown): SharedEntriesAppendOutcome => {
 			const outcome = { kind: "unknown" as const, ids: [...ids], error };
-			if (controlOperation) {
-				const retained = new Error("Shared control publication outcome is unknown", { cause: outcome });
-				// A synchronous append may already have latched the raw failure. Retain
-				// it in the outcome and preserve the full operation receipt on close.
-				if (this.#persistError) this.#persistError = retained;
-				else this.#recordPersistError(retained);
-			}
+			// A synchronous append may already have latched the raw failure. Retain it in the
+			// outcome and preserve the full receipt on the latch and on close.
+			this.#latchUnknownSharedPublication(
+				controlOperation
+					? "Shared control publication outcome is unknown"
+					: "Shared entry publication outcome is unknown",
+				{ publication: "entries", outcome },
+			);
 			return outcome;
 		};
 		const allocateIds = () => {
@@ -21159,6 +21507,57 @@ export class SessionManager {
 		if (!file || !this.#storage.existsSync(file))
 			return { kind: "unknown", id, error: new Error("durability_unproven") };
 		return { kind: "committed", id };
+	}
+
+	/**
+	 * Decide the attempted IDs of an `unknown` shared append before anyone retries or
+	 * reports it. A multi-entry publication (a control batch, a tool-selection pair) is
+	 * reconciled as the batch it was: per ID, and as a whole.
+	 *
+	 * `unknown` is not "not persisted": an entry can be committed before the failure that
+	 * produced the outcome (post-write snapshot verification, transaction release, a
+	 * superseded publication), and it can still be resident here unpublished. A blind retry
+	 * can therefore duplicate it, and a failure report can be wrong.
+	 *
+	 * An ID is only absent once both the committed transcript and this manager's resident
+	 * graph are known not to hold it. Any read or publish failure after that point is
+	 * `unresolved`, which callers must hold rather than resubmit.
+	 */
+	async reconcileUnknownSharedAppends(
+		attempted: readonly string[],
+		error: unknown,
+	): Promise<SharedAppendReconciliation> {
+		const ids = [...attempted];
+		const durableIn = (candidate: CommittedTranscriptRead): ReadonlySet<string> | undefined =>
+			candidate.kind === "snapshot" && candidate.snapshot.sessionId === this.#sessionId
+				? new Set(candidate.snapshot.entryIds.filter(id => ids.includes(id)))
+				: undefined;
+		let read: CommittedTranscriptRead;
+		try {
+			read = await this.captureCommittedSnapshot();
+		} catch (cause) {
+			return { kind: "unresolved", ids, error: cause };
+		}
+		let durable = durableIn(read);
+		if (durable?.size === ids.length) return { kind: "committed", ids };
+		if (ids.some(id => !durable?.has(id) && this.#byId.has(id))) {
+			// Part of the batch was staged in this process but its publication was not proven.
+			// Publish the pending bytes and re-verify; never append an entry a second time.
+			try {
+				await this.flush();
+				read = await this.captureCommittedSnapshot();
+			} catch (cause) {
+				return { kind: "unresolved", ids, error: cause };
+			}
+			durable = durableIn(read);
+			if (durable?.size === ids.length) return { kind: "committed", ids };
+			// A resident entry the re-read still does not show is neither durable nor absent.
+			if (ids.some(id => !durable?.has(id) && this.#byId.has(id))) return { kind: "unresolved", ids, error };
+		}
+		if (read.kind !== "absent" && durable === undefined) return { kind: "unresolved", ids, error };
+		const committed = ids.filter(id => durable?.has(id));
+		if (committed.length === 0) return { kind: "absent", ids };
+		return { kind: "partial", committed, absent: ids.filter(id => !durable?.has(id)) };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */

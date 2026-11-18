@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isPackageTestPath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, omittedPackageTestPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { buildReverseDependencyIndex, dependentTestsFor, describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isPackageTestPath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, omittedPackageTestPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, TARGETED_DEPENDENT_TEST_LIMIT, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 import fc from "fast-check";
-import { enumerateTestFiles } from "./run-bun-test-files";
+import { enumerateTestFiles, selectShard } from "./run-bun-test-files";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -2516,5 +2516,162 @@ describe("generated JSON schema sync selection", () => {
 			expect(tasks.filter(task => task.key === "check-schemas")).toHaveLength(1);
 			expect(describeTasks(tasks).find(entry => entry.key === "check-schemas")).toBeDefined();
 		}
+	});
+});
+
+describe("PR planning follows the module graph to tests that load a changed file", () => {
+	const repoRoot = path.join(import.meta.dir, "..");
+	const fixturePackage: WorkspacePackage = {
+		name: "@gajae-code/fixture",
+		dir: "packages/fixture",
+		manifest: { name: "@gajae-code/fixture", scripts: { check: "true", test: "true" } },
+	};
+	const consumerPackage: WorkspacePackage = {
+		name: "@gajae-code/consumer",
+		dir: "packages/consumer",
+		manifest: { name: "@gajae-code/consumer", scripts: { check: "true", test: "true" } },
+	};
+	const fixtureFiles: Record<string, string> = {
+		"packages/fixture/src/session.ts": "export class Session { setLevel() {} }\n",
+		"packages/fixture/src/registry.ts": 'import { Session } from "./session";\nexport const run = (s: Session) => s.setLevel();\n',
+		"packages/fixture/src/acp.ts": 'export { run } from "./registry";\n',
+		"packages/fixture/src/types-only.ts": "export interface Shape { level: string }\n",
+		"packages/fixture/src/unrelated.ts": "export const unrelated = 1;\n",
+		"packages/fixture/scripts/generate-inventory.ts": '#!/usr/bin/env bun\nconst source = "packages/fixture/src/session.ts";\nexport const read = () => Bun.file(source).text();\n',
+		// A hand-rolled fake that reaches the changed module only through another module.
+		"packages/fixture/test/fake.test.ts": 'import { run } from "../src/acp";\nrun({ setLevel() {} } as never);\n',
+		// The package self-reference resolves to src/.
+		"packages/fixture/test/self.test.ts": 'import { Session } from "@gajae-code/fixture/session";\nnew Session();\n',
+		// A generated-inventory check whose generator reads the changed source as text.
+		"packages/fixture/test/inventory.test.ts": 'import { read } from "../scripts/generate-inventory";\nvoid read;\n',
+		// Type-only imports are erased and typechecked by the package check, not this selector.
+		"packages/fixture/test/types.test.ts": 'import type { Shape } from "../src/types-only";\nimport type { Session } from "../src/session";\nconst s: Shape | Session | undefined = undefined;\nvoid s;\n',
+		"packages/fixture/test/unrelated.test.ts": 'import { unrelated } from "../src/unrelated";\nvoid unrelated;\n',
+		// Cross-package consumers keep their owner-test and package-check policy.
+		"packages/consumer/test/consumer.test.ts": 'import { Session } from "@gajae-code/fixture/session";\nnew Session();\n',
+	};
+	const fixtureIndex = buildReverseDependencyIndex(
+		[fixturePackage, consumerPackage],
+		Object.keys(fixtureFiles).sort(),
+		file => fixtureFiles[file]!,
+	);
+
+	test("selects direct, transitive, self-referenced and read-as-data dependents only", () => {
+		expect(fixtureIndex.unresolved).toEqual([]);
+		expect(dependentTestsFor(["packages/fixture/src/session.ts"], fixtureIndex).sort()).toEqual([
+			"packages/fixture/test/fake.test.ts",
+			"packages/fixture/test/inventory.test.ts",
+			"packages/fixture/test/self.test.ts",
+		]);
+		expect(dependentTestsFor(["packages/fixture/src/types-only.ts"], fixtureIndex)).toEqual([]);
+	});
+
+	test("a small dependent set becomes focused test tasks, not the package suite", () => {
+		const keys = planTargetedTasks(["packages/fixture/src/session.ts"], [fixturePackage, consumerPackage], [], false, fixtureIndex).map(
+			task => task.key,
+		);
+		for (const testFile of ["fake", "inventory", "self"]) expect(keys).toContain(`test:packages/fixture/test/${testFile}.test.ts`);
+		expect(keys).not.toContain("test:packages/fixture/test/unrelated.test.ts");
+		expect(keys).not.toContain("test:packages/fixture/test/types.test.ts");
+		expect(keys).not.toContain("test:packages/consumer/test/consumer.test.ts");
+		expect(keys).not.toContain("test:@gajae-code/fixture");
+	});
+
+	test("a dependent set above the limit is carried by the package's own test tasks", () => {
+		const files: Record<string, string> = { "packages/fixture/src/hub.ts": "export const hub = 1;\n" };
+		for (let index = 0; index <= TARGETED_DEPENDENT_TEST_LIMIT; index++)
+			files[`packages/fixture/test/hub-${index}.test.ts`] = 'import { hub } from "../src/hub";\nvoid hub;\n';
+		const index = buildReverseDependencyIndex([fixturePackage], Object.keys(files), file => files[file]!);
+		const keys = planTargetedTasks(["packages/fixture/src/hub.ts"], [fixturePackage], [], false, index).map(task => task.key);
+		expect(keys).toContain("test:@gajae-code/fixture");
+		expect(keys.filter(key => key.startsWith("test:packages/fixture/test/hub-"))).toEqual([]);
+	});
+
+	test("#7829's diff plans every test it broke on dev", async () => {
+		// The changed paths of PR #7829 (squash 267d918d). Its PR plan ran neither of these
+		// four, and all four failed on dev after merge (fixed by #7831).
+		const changedPaths = [
+			"packages/agent/changelog.d/7815-publication-abort-diagnostic.md",
+			"packages/agent/src/agent.ts",
+			"packages/agent/test/agent.test.ts",
+			"packages/coding-agent/changelog.d/7815-shared-title-eligibility.md",
+			"packages/coding-agent/changelog.d/7823-shared-model-profile-publication.md",
+			"packages/coding-agent/changelog.d/7824-shared-session-controls.md",
+			"packages/coding-agent/src/config/model-profile-activation.ts",
+			"packages/coding-agent/src/modes/components/settings-selector.ts",
+			"packages/coding-agent/src/modes/controllers/command-controller.ts",
+			"packages/coding-agent/src/modes/controllers/extension-ui-controller.ts",
+			"packages/coding-agent/src/modes/controllers/goal-mode-controller.ts",
+			"packages/coding-agent/src/modes/controllers/input-controller.ts",
+			"packages/coding-agent/src/modes/controllers/plan-mode-controller.ts",
+			"packages/coding-agent/src/modes/controllers/selector-controller.ts",
+			"packages/coding-agent/src/modes/controllers/todo-command-controller.ts",
+			"packages/coding-agent/src/modes/runtime-init.ts",
+			"packages/coding-agent/src/session-import/provider-service.ts",
+			"packages/coding-agent/src/session/agent-session.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/src/slash-commands/builtin-registry.ts",
+			"packages/coding-agent/src/slash-commands/helpers/todo.ts",
+			"packages/coding-agent/src/task/executor.ts",
+			"packages/coding-agent/test/acp-builtins.test.ts",
+			"packages/coding-agent/test/agent-session-fast-mode.test.ts",
+			"packages/coding-agent/test/input-controller-auto-title.test.ts",
+			"packages/coding-agent/test/modes/components/settings-selector-thinking-commit.test.ts",
+			"packages/coding-agent/test/modes/controllers/todo-command-controller.test.ts",
+			"packages/coding-agent/test/shared-agent-control-admission.test.ts",
+			"packages/coding-agent/test/shared-legacy-mutation-guard.test.ts",
+			"packages/coding-agent/test/shared-model-profile-activation.test.ts",
+			"packages/coding-agent/test/shared-mutation-eligibility.test.ts",
+			"packages/coding-agent/test/shared-root-control-regressions.test.ts",
+			"packages/coding-agent/test/shared-session-fast-mode.test.ts",
+			"packages/coding-agent/test/shared-temporary-model-control.test.ts",
+			"packages/coding-agent/test/shared-title-eligibility.test.ts",
+			"packages/coding-agent/test/slash-command-builtin-registry.test.ts",
+			"packages/coding-agent/test/title-regeneration-race.test.ts",
+		];
+		const brokenOnDev = [
+			"packages/coding-agent/test/model-selector-controller-batch.test.ts",
+			"packages/coding-agent/test/slash-commands/model.test.ts",
+			"packages/coding-agent/test/cancel-and-submit.test.ts",
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts",
+		];
+		// Drive the planner CLI exactly as the PR plan job does, so the assertion covers
+		// the production wiring rather than a hand-built index.
+		const proc = Bun.spawn(["bun", path.join(repoRoot, "scripts/ci-dev-affected.ts"), "--dry-run"], {
+			cwd: repoRoot,
+			env: {
+				...process.env,
+				CI_DEV_AFFECTED_PLAN: undefined,
+				CI_FORCE_FULL: undefined,
+				GITHUB_EVENT_NAME: "pull_request",
+				CI_DEV_PLAN_MODE: "pr",
+				CI_DEV_CHANGED_PATHS: changedPaths.join("\n"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		const commands = stdout
+			.split("\n")
+			.filter(line => line.startsWith(" - ") && line.includes(": "))
+			.map(line => line.slice(line.indexOf(": ") + 2).replace(/ \(cwd: [^)]*\)$/, "").split(" "));
+		const shardFiles = await enumerateTestFiles("packages/coding-agent", repoRoot);
+		const covered = (testFile: string) =>
+			commands.some(command => {
+				if (command[0] === "bun" && command[1] === "test" && command.at(-1) === testFile) return true;
+				const shard = command.find(argument => argument.startsWith("--shard="))?.match(/^--shard=(\d+)\/(\d+)$/);
+				return (
+					command.includes("--root=packages/coding-agent") &&
+					shard !== undefined &&
+					shard !== null &&
+					selectShard(shardFiles, { index: Number(shard[1]), total: Number(shard[2]) }).includes(testFile)
+				);
+			});
+		expect(brokenOnDev.filter(testFile => !covered(testFile))).toEqual([]);
 	});
 });

@@ -569,7 +569,14 @@ describe("#7824 default fallback resolution in a shared root TUI session", () =>
 
 	it("publishes the thinking change of a fallback switch before switching the model", async () => {
 		const f = await fixture({ streamFn });
-		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
+		await f.session.setConfiguredModelChainForControl(
+			"default",
+			[missingSelector, `${fallbackSelector}:high`],
+			"modelRoles",
+			undefined,
+			false,
+			() => true,
+		);
 		await canonicalMessage(f);
 		const before = await Bun.file(f.file).text();
 		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
@@ -589,7 +596,14 @@ describe("#7824 default fallback resolution in a shared root TUI session", () =>
 
 	it("leaves model and fallback state untouched when the thinking publication is refused", async () => {
 		const f = await fixture({ streamFn });
-		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
+		await f.session.setConfiguredModelChainForControl(
+			"default",
+			[missingSelector, `${fallbackSelector}:high`],
+			"modelRoles",
+			undefined,
+			false,
+			() => true,
+		);
 		await canonicalMessage(f);
 		const fallbackState = f.session.getDefaultFallbackRuntimeState();
 		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({

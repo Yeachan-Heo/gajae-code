@@ -68,7 +68,6 @@ const LEGACY_WRITERS: Record<string, Invoke> = {
 	prepareBranchedSession: (m, { first }) => m.prepareBranchedSession(first),
 	fork: m => m.fork(),
 	setSessionName: m => m.setSessionName("legacy title", "user"),
-	setSessionStarred: m => m.setSessionStarred(true),
 	dropSession: (m, { file }) => m.dropSession(file),
 };
 
@@ -95,6 +94,7 @@ const NOT_LEGACY_WRITERS: Record<string, string> = {
 	setSessionNameSharingSession: "admitted shared title publication",
 	moveTo: "session-level cwd mutation (#7856); allowed during exclusive cwd transition in shared sessions",
 	setSessionStarredForPicker: "live picker star; current session guarded by set live picker star",
+	setSessionStarred: "admission-aware: publishes an append-only header patch when usesSharedPublication()",
 	appendPreparedModelChange: "writes an unpublished prepared successor",
 	appendPreparedThinkingLevelChange: "writes an unpublished prepared successor",
 	appendPreparedServiceTierChange: "writes an unpublished prepared successor",
