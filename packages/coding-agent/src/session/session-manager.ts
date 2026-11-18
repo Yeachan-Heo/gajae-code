@@ -5725,6 +5725,21 @@ function stripUndefinedPlainObjectFields(value: unknown, path = "entry"): unknow
 }
 
 function normalizeSessionEntryForStorage(entry: SessionEntry): SessionEntry {
+	if (
+		entry.type === "message" &&
+		entry.message.role === "assistant" &&
+		entry.message.content.some(block => block.type === "toolCall")
+	) {
+		// Dispatch can annotate live tool calls after message_end. The resident
+		// transcript must retain the same payload that was hashed and written.
+		entry = {
+			...entry,
+			message: {
+				...entry.message,
+				content: entry.message.content.map(block => (block.type === "toolCall" ? { ...block } : block)),
+			},
+		};
+	}
 	return stripUndefinedPlainObjectFields(entry) as SessionEntry;
 }
 
