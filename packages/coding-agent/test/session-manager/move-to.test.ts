@@ -7,6 +7,7 @@ import {
 	loadEntriesFromFile,
 	type SessionHeader,
 	SessionManager,
+	type SessionMessageEntry,
 	syncSessionMoveDirectory,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@gajae-code/coding-agent/tools/path-utils";
@@ -70,6 +71,22 @@ function hasAssistantEntry(entries: unknown[]): boolean {
 			(e as any).type === "message" &&
 			"message" in e &&
 			(e as any).message?.role === "assistant",
+	);
+}
+
+function isMessageEntry(entry: unknown): entry is SessionMessageEntry {
+	return (
+		typeof entry === "object" &&
+		entry !== null &&
+		"type" in entry &&
+		(entry as { type?: string }).type === "message" &&
+		"message" in entry
+	);
+}
+
+function getUserMessages(entries: unknown[]): SessionMessageEntry[] {
+	return entries.filter(
+		(entry): entry is SessionMessageEntry => isMessageEntry(entry) && entry.message.role === "user",
 	);
 }
 
@@ -476,19 +493,72 @@ describe("SessionManager.moveTo", () => {
 			// 2. User message "from A"
 			// 3. Assistant message from A
 			// 4. User message "from B during move" (this should be preserved, not lost)
-			const userMessages = entries.filter(
-				(e): e is any =>
-					typeof e === "object" &&
-					e !== null &&
-					(e as any).type === "message" &&
-					(e as any).message?.role === "user",
-			);
+			const userMessages = getUserMessages(entries);
 
-			const fromBMessage = userMessages.find((e: any) => e.message?.content === "from B during move");
+			const fromBMessage = userMessages.find(
+				e =>
+					e.message.role === "user" &&
+					typeof e.message.content === "string" &&
+					e.message.content === "from B during move",
+			);
 			expect(fromBMessage).not.toBeUndefined();
 			// Also verify the header was updated
 			const header = getHeader(entries);
 			expect(header?.cwd).toBe(path.resolve(cwdB));
+		} finally {
+			await sessionB.close();
+		}
+	});
+
+	it("preserves peer-appended header patches when moving", async () => {
+		// Create session A and initialize with content
+		const sessionA = SessionManager.create(cwdA);
+		sessionA.appendMessage({ role: "user", content: "from A", timestamp: 1 });
+		sessionA.appendMessage(makeAssistantMessage());
+		await sessionA.flush();
+
+		const sourceFile = sessionA.getSessionFile()!;
+		expect(fs.existsSync(sourceFile)).toBe(true);
+
+		// Open the same session as B in shadow mode (shared append-only)
+		const sessionB = await SessionManager.open(sourceFile, cwdA, undefined, "copy-retain", "shadow");
+
+		try {
+			// Manually simulate a concurrent header patch by writing directly to the source file
+			// This simulates what would happen if another opener added a title header patch
+			const currentContent = await Bun.file(sourceFile).text();
+			const headerPatchLine = JSON.stringify({
+				type: "header_patch",
+				patch: { title: "Updated title from peer" },
+			});
+			await Bun.write(sourceFile, `${currentContent}\n${headerPatchLine}\n`);
+
+			// Move session A to cwdB
+			await sessionA.moveTo(cwdB);
+
+			// Verify the destination file exists
+			const destinationFile = sessionA.getSessionFile()!;
+			expect(fs.existsSync(destinationFile)).toBe(true);
+			expect(fs.existsSync(sourceFile)).toBe(false);
+
+			// Load and verify entries from the destination
+			const entries = await loadEntriesFromFile(destinationFile);
+
+			// Should have:
+			// 1. Session header (possibly with title update from patch)
+			// 2. User message "from A"
+			// 3. Assistant message from A
+			// 4. Header patch with title update (this should be preserved)
+			const header = getHeader(entries);
+			expect(header).not.toBeUndefined();
+			// Header should have the updated cwd
+			expect(header?.cwd).toBe(path.resolve(cwdB));
+			// Header should have the title from the peer's patch
+			expect(header?.title).toBe("Updated title from peer");
+
+			// Verify the user messages are present
+			const userMessages = getUserMessages(entries);
+			expect(userMessages.length).toBeGreaterThanOrEqual(1);
 		} finally {
 			await sessionB.close();
 		}
