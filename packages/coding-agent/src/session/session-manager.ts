@@ -17326,10 +17326,10 @@ export class SessionManager {
 			// Skip the rewrite for sessions marked as shared via admission or during shared append.
 			// Also skip if the destination file has entries not in memory (concurrent openers).
 			// However, always do a full rewrite if the file doesn't exist yet (need to create it from memory).
-			const isSharedSession = this.#sharedAppendOnly || this.#publishedSharedSession(this.#sessionId);
+			const isSharedSession = this.#sharedAppendOnly || this.#publishedSharedSession(this.#sessionId ?? "");
 			let hasOtherOwnersEntries = false;
 			const fileExists = this.#sessionFile && this.#storage.existsSync(this.#sessionFile);
-			if (fileExists && !isSharedSession) {
+			if (fileExists && !isSharedSession && this.#sessionFile) {
 				// Check if destination has entries not in memory (from concurrent openers)
 				try {
 					const destinationEntries = await loadEntriesFromFile(this.#sessionFile, this.#storage);
