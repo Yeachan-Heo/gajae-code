@@ -429,21 +429,20 @@ async function unlinkedDirectorySpelling(base: string, target: string): Promise<
 			return undefined;
 		}
 		if (!entry.isDirectory() || entry.isSymbolicLink()) return undefined;
+		let resolved: string;
+		let settled: fsTypes.Stats;
 		try {
-			current = await fs.realpath(requested);
+			resolved = await fs.realpath(requested);
+			settled = await fs.stat(resolved);
 		} catch {
 			return undefined;
 		}
-		// A writer could replace the entry between the two calls. Re-reading the
-		// resolved path refuses a link that appeared there; a path-based check
-		// cannot be atomic, and whoever can race this directory can already write
-		// the rules inside it.
-		try {
-			const settled = await fs.lstat(current);
-			if (settled.isSymbolicLink() || !settled.isDirectory()) return undefined;
-		} catch {
-			return undefined;
-		}
+		// The destination has to be the entry `lstat` authorized: a link swapped in
+		// between the two calls resolves to another directory, and `dev`/`ino`
+		// tells the two apart. A path-based check cannot be atomic, but identity is
+		// what decides here, not a second look at the name.
+		if (!settled.isDirectory() || settled.dev !== entry.dev || settled.ino !== entry.ino) return undefined;
+		current = resolved;
 	}
 	return current;
 }
@@ -768,22 +767,45 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
 /**
+ * True when the quote at `index` can delimit a value rather than being an
+ * apostrophe inside a word (`it's`, `don't`), which prose carries freely.
+ */
+function isQuoteBoundary(value: string, index: number): boolean {
+	const word = /[\p{L}\p{N}_]/u;
+	const before = value[index - 1];
+	const after = value[index + 1];
+	return !(before !== undefined && after !== undefined && word.test(before) && word.test(after));
+}
+
+/**
  * The quote character enclosing `index` when that run also closes after the
- * match, or `undefined`. A data value may carry a lone apostrophe in prose
- * (`it's ...`), which is not a quoted run, and a balanced-looking value can hide
- * the closer behind an escaped quote; both are decided with the same escape
- * rules as {@link enclosingQuote} instead of by counting characters.
+ * match, or `undefined`. A data value is not shell text: an apostrophe inside a
+ * word is prose, and a value with balanced-looking quotes can hide the closer
+ * behind an escaped quote. Both are decided with the same escape rules used to
+ * find the opener instead of by counting characters.
  */
 function enclosingClosedQuote(value: string, index: number): string | undefined {
-	const opened = enclosingQuote(value, index);
-	if (opened === undefined) return undefined;
-	for (let i = index; i < value.length; i++) {
+	let opened: string | undefined;
+	for (let i = 0; i < index; i++) {
 		const character = value[i];
-		if (character === "\\" && opened !== "'") {
+		if (opened === undefined) {
+			if ((character === "'" || character === '"') && isQuoteBoundary(value, i)) opened = character;
+			continue;
+		}
+		if (character === "\\" && opened === '"') {
 			i++;
 			continue;
 		}
-		if (opened === "ansi-c" ? character === "'" : character === opened) return opened;
+		if (character === opened && isQuoteBoundary(value, i)) opened = undefined;
+	}
+	if (opened === undefined) return undefined;
+	for (let i = index; i < value.length; i++) {
+		const character = value[i];
+		if (character === "\\" && opened === '"') {
+			i++;
+			continue;
+		}
+		if (character === opened && isQuoteBoundary(value, i)) return opened;
 	}
 	return undefined;
 }

@@ -848,8 +848,13 @@ describe("expandInternalUrls session scope", () => {
 			try {
 				await mkdir(path.join(home, ".agents", "RULES"), { recursive: true });
 				await writeFile(path.join(home, ".agents", "RULES", "shared.md"), "case-link-rule");
-				// On a case-sensitive namespace `.rules` and `RULES` are two entries; the
-				// configured one is the link, so only its own spelling is the anchor.
+				// On a case-folded volume `.rules` and `RULES` name one entry and the
+				// question does not exist.
+				const foldsCase = await lstat(path.join(home, ".agents", "rules")).then(
+					() => true,
+					() => false,
+				);
+				if (foldsCase) return;
 				await symlink(path.join(home, ".agents", "RULES"), path.join(home, ".agents", "rules"));
 				const targetSpelled = path.join(home, ".agents", "RULES", "shared.md");
 				const linkSpelled = path.join(home, ".agents", "rules", "shared.md");
@@ -2119,7 +2124,7 @@ describe("bash session agent directory", () => {
 				// accepted there instead of being refused as quoted data.
 				const prose = await tool.execute("call-env-prose-tab", {
 					command: 'printf "%s" "$PAYLOAD"',
-					env: { PAYLOAD: "it's rule://tabbed" },
+					env: { PAYLOAD: "it's rule://tabbed but we're ready" },
 				});
 				expect(textOf(prose)).toContain(await realpath(tabRule));
 				const bare = await tool.execute("call-env-bare-tab", {
