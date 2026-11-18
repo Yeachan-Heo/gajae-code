@@ -201,6 +201,7 @@ export const KNOWN_PROVIDERS = [
 	"zenmux",
 	"lm-studio",
 	"omlx",
+	"rapid-mlx",
 ] as const;
 
 export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];

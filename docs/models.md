@@ -461,7 +461,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
-- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `vllm`, `sglang`, `openai-models-list`, or `models-dev`; `models-dev` may select a different catalog entry with `modelsDevProvider`
+- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `rapid-mlx`, `vllm`, `sglang`, `openai-models-list`, or `models-dev`; `models-dev` may select a different catalog entry with `modelsDevProvider`
 - `discovery.outputModalities` (`openai-models-list` only): admit only `/models` rows whose advertised `output_modalities` all appear in this list, for example `[text]` to keep image, audio, video and embedding rows out of a chat catalog; rows without `output_modalities` are skipped. Unset admits every row.
 - `discovery.inputModalities` (`openai-models-list` only): admit only `/models` rows whose advertised `input_modalities` all appear in this list, for example `[text]` to keep audio-input transcription rows out of a chat catalog; rows without `input_modalities` are skipped. Unset admits every row. Pair it with `outputModalities` when text output alone still includes non-chat rows.
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models use top-level automatic caching and emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints default to explicit block markers because compatible proxies commonly inject, rewrite, or reject top-level cache controls; they omit `ttl` unless `compat.supportsLongCacheRetention: true` opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
@@ -789,6 +789,29 @@ If `omlx` is not explicitly configured, registry adds an implicit discoverable p
 - auth mode: keyless (`auth: none` behavior)
 
 Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `max_model_len` support.
+
+### Implicit Rapid-MLX discovery
+
+[Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) is an open-source local LLM inference server for Apple Silicon, built on MLX.
+
+If `rapid-mlx` is not explicitly configured, registry adds an implicit discoverable provider:
+
+- provider: `rapid-mlx`
+- api: `openai-completions`
+- base URL: `RAPID_MLX_BASE_URL` from the launching shell or trusted user configuration, or `http://localhost:8000/v1`; project `.env` overrides are ignored
+- auth mode: keyless (`auth: none` behavior); `RAPID_MLX_API_KEY` attaches when configured
+
+Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `context_window` support. The implicit endpoint override accepts only HTTP(S) loopback URLs.
+
+vLLM and SGLang answer the same OpenAI `/v1/models` shape on the same loopback ports, so the implicit probe only publishes entries that carry a Rapid-MLX-native field (`context_window`, `reasoning_parser`, `tool_call_parser`, `recommended_sampling`, `is_hybrid`, or `is_moe`). A vLLM-only server keeps its own `vllm` catalog instead of being republished as Rapid-MLX; naming `rapid-mlx` with `discovery.type: rapid-mlx` in `models.json` is an explicit selection and skips that check. Symmetrically, the implicit vLLM and SGLang loopback probes skip individual entries that carry one of those Rapid-MLX-native fields, and a catalog cached by implicit loopback vLLM/SGLang discovery before that guard is refused on an `offline` refresh. The implicit Rapid-MLX probe's admission policy is part of the discovery cache provenance, so an `offline` refresh republishes that probe's cached catalog only while the row was admitted under the same policy; an operator-selected `rapid-mlx` entry uses the general offline cache behavior. Identity evidence exists only in the server response, so the implicit probe does not republish a row admitted under another policy.
+
+Built-in OpenAI-compatible inference (`openai-completions` and `openai-responses`) selects its transport by provider identity: the `rapid-mlx` provider uses the direct-transport fetch, and every other provider keeps the ambient proxy-aware `fetch`. The endpoint check then decides whether a direct socket is actually used: only an HTTP(S) loopback endpoint is dialed directly, while a non-loopback endpoint falls back to the ambient proxy-aware `fetch`. A caller-supplied `fetch` for inference wins over that selection and owns its own transport and redirect policy. Bun applies `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` to loopback requests — including a proxy a project `.env` declared — and caches that choice per process, so on the direct path a proxy never receives `RAPID_MLX_API_KEY` or the request body.
+
+Registry discovery is a separate rule. A Rapid-MLX `/models` probe of a loopback endpoint — keyless or credentialed — is issued over a direct socket that does not follow redirects for the `rapid-mlx` provider and for any custom provider whose `discovery.type` is `rapid-mlx`. The registry owns that probe, so an inference `fetch` override does not control it. A custom provider id that selects `discovery.type: rapid-mlx` for a loopback endpoint therefore bypasses the proxy for `/models` while its inference still uses the ambient `fetch`; set `NO_PROXY` for that inference traffic when it must connect directly. A discovery request to a non-loopback endpoint uses the ambient `fetch`.
+
+For inference, transport selection follows the provider, never the destination host. Another provider whose endpoint is also loopback — vLLM, SGLang, Ollama, LM Studio, or a custom OpenAI-compatible entry, including a custom id that selects `discovery.type: rapid-mlx` — keeps the ambient proxy-aware `fetch` for inference, so that provider's proxy variables remain the documented transport control and `NO_PROXY` is how a direct connection is requested.
+
+Install with `brew install rapid-mlx`, then run `rapid-mlx serve qwen3.5-4b-4bit --port 8000`. If another local runtime uses port 8000, choose a free port with `--port` and set `RAPID_MLX_BASE_URL` accordingly. Without `--port`, Rapid-MLX selects the first free port in 8000–8009.
 
 ### Implicit vLLM discovery
 
