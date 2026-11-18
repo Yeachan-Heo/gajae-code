@@ -14817,6 +14817,7 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
+					if (signal?.aborted) throw new ToolAbortError("Permission request cancelled");
 					const bridge = this.#clientBridge;
 					const inheritedEpoch = this.#sdkPermissionProvider
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
@@ -14993,6 +14994,10 @@ export class AgentSession {
 							args,
 						});
 					}
+					// These guards can await; do not start the tool if the call was cancelled.
+					// Permission-required tools let the permission wrapper report its own
+					// cancellation reason just inside this guard.
+					if (signal?.aborted && !PERMISSION_REQUIRED_TOOLS.has(target.name)) throw new ToolAbortError();
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},

@@ -2227,7 +2227,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 					[
 						evalCall(
 							"eval-1",
-							"tool.bash({ command: 'echo X' }).catch(() => {}); await new Promise(resolve => setTimeout(resolve, 50)); return 'CELL-DONE';",
+							"tool.bash({ command: 'echo X' }).catch(() => {}); await new Promise(resolve => setTimeout(resolve, 200)); return 'CELL-DONE';",
 						),
 					],
 				],
@@ -2270,7 +2270,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			};
 			const asked: string[] = [];
 			const code = `tool.bash({ command: 'echo X' }).catch(() => {});
-			 await new Promise(resolve => setTimeout(resolve, 50));
+			 await new Promise(resolve => setTimeout(resolve, 200));
 			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('READ-BLOCKED'); }
 			 try { await tool.read({ path: 'public.txt' }); } catch (error) { console.log('AFTER:' + String(error?.message ?? error)); }
 			 await new Promise(resolve => setTimeout(resolve, 400));`;
@@ -2418,6 +2418,40 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(text).toContain("TTSR-BLOCK-B");
 			expect(text).toContain("allowed to run because the rule is configured not to interrupt");
 			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
+		});
+
+		it("does not start a lazily loaded tool after a sibling interrupts", async () => {
+			const lazyGate = Promise.withResolvers<void>();
+			const lazyCalls: unknown[] = [];
+			const fakeRead: AgentTool = {
+				name: "read",
+				label: "Read",
+				description: "read",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					lazyCalls.push(args);
+					return { content: [{ type: "text" as const, text: "LAZY-BODY" }] };
+				},
+			};
+			const lazyRead = new LazyAgentTool(BUILTIN_TOOL_DESCRIPTORS.read!, undefined, async () => {
+				await lazyGate.promise;
+				return fakeRead;
+			});
+			const code = `tool.read({ path: 'public.txt' }).catch(() => {});
+			 await new Promise(resolve => setTimeout(resolve, 50));
+			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('BLOCKED'); }`;
+			const { session } = createSession(
+				[evalToolFor(() => session), lazyRead as unknown as AgentTool],
+				[[evalCall("eval-1", code)]],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "start lazy reads");
+
+			expect(toolResultText(session, "eval-1")).toContain("BLOCKED");
+			lazyGate.resolve();
+			await Bun.sleep(10);
+			expect(lazyCalls).toEqual([]);
 		});
 
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
