@@ -11006,8 +11006,12 @@ export class AgentSession {
 		const names = new Set(rules.map(rule => rule.name));
 		const claims = this.#perToolTtsrClaims.get(toolCallId);
 		for (const name of names) {
-			this.#ttsrManager?.releaseInjected(name, claims?.get(name));
-			claims?.delete(name);
+			// Only undo a claim this call still owns. A parent cancellation may have
+			// restored and deleted it already, and releasing again would erase the
+			// previous injected record.
+			if (!claims?.has(name)) continue;
+			this.#ttsrManager?.releaseInjected(name, claims.get(name));
+			claims.delete(name);
 		}
 		const bucket = this.#perToolTtsrInjections.get(toolCallId);
 		if (bucket) {
@@ -11309,7 +11313,9 @@ export class AgentSession {
 		const added = this.#addPerToolTtsrInjections(scope.parentToolCallId, matches);
 		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
 		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
-			scope.invalidatedBy = matches.map(rule => rule.name);
+			// Only rules this call newly claimed describe the blocked call. A rule
+			// already claimed by an earlier sibling ran there and keeps its wording.
+			scope.invalidatedBy = added.map(rule => rule.name);
 			// Cancel nested calls still parked before dispatch (for example in an
 			// approval await) so an approval granted after this match cannot run them.
 			scope.abortController.abort();

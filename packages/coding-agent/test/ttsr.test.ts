@@ -2383,6 +2383,43 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(text).toContain("FILE-BODY");
 		});
 
+		it("keeps a rule claimed by an earlier sibling out of the blocked reminder", async () => {
+			const reads: unknown[] = [];
+			const passthrough = makeRule({
+				name: "passthrough-a",
+				content: "TTSR-PASS-A: read ran.",
+				condition: ["secrets"],
+				scope: ["tool:read"],
+				interruptMode: "never",
+				repeatMode: "after-gap",
+				repeatGap: 0,
+			});
+			const blocking = makeRule({
+				name: "blocking-b",
+				content: "TTSR-BLOCK-B: read was blocked.",
+				condition: ["block"],
+				scope: ["tool:read"],
+				interruptMode: "always",
+			});
+			const code = `await tool.read({ path: 'secrets.txt' });
+			 try { await tool.read({ path: 'secrets-block.txt' }); } catch (error) { console.log(String(error?.message ?? error)); }`;
+			const { session } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", code)]],
+				[passthrough, blocking],
+			);
+			await run(session, "batch reads");
+
+			// The first read ran with the passthrough rule; the second was blocked by
+			// the other rule. The earlier claim must keep its passthrough wording.
+			expect(reads).toEqual([{ path: "secrets.txt", _i: "js prelude" }]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("TTSR-PASS-A");
+			expect(text).toContain("TTSR-BLOCK-B");
+			expect(text).toContain("allowed to run because the rule is configured not to interrupt");
+			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
+		});
+
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
 			const { session, triggered } = createSession(
 				[evalToolFor(() => session), new WriteTool(createToolSession())],
