@@ -3533,7 +3533,7 @@ function createControlSurface(
 		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
 		queueCancellation.queueCandidate = queuedAtDispatch;
 		if (queuedAtDispatch && queueCancellation.accepted) queueCancellation.disposition = "queued";
-		if (kind === "prompt")
+		if (kind === "prompt" || kind === "skill")
 			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
 		let queuedRunStartRefused = false;
@@ -4019,23 +4019,35 @@ function createControlSurface(
 								code: "idempotency_conflict",
 							});
 						return tombstone.turnDisposition === "stopped"
-							? {
-									ok: true,
-									selection: scope,
-									turn: "stopped",
-									...(scope === "owned"
-										? {
-												ownedWork: tombstone.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
-												automaticDelivery: "none",
-												resumeOnOwnedCompletion: false,
-											}
-										: {
-												ownedWork: "left_running",
-												automaticDelivery: "enabled",
-												resumeOnOwnedCompletion: true,
-											}),
-									replay: stored(tombstone),
-								}
+							? (() => {
+									const isPrefCancelled = tombstone.ownedWorkDisposition === "not_requested";
+									const isPreflightPath =
+										isPrefCancelled || (scope === "turn" && tombstone.ownedWorkDisposition === "uncertain");
+									return {
+										ok: true,
+										selection: scope,
+										turn: "stopped",
+										...(scope === "owned"
+											? {
+													ownedWork: isPrefCancelled
+														? "stopped"
+														: tombstone.ownedWorkDisposition === "stopped"
+															? "stopped"
+															: "uncertain",
+													automaticDelivery: "none",
+													resumeOnOwnedCompletion: false,
+												}
+											: {
+													ownedWork: "left_running",
+													automaticDelivery: "enabled",
+													resumeOnOwnedCompletion: true,
+												}),
+										...(isPreflightPath
+											? { reason: isPrefCancelled ? "preflight_cancelled" : "worker_unsettled" }
+											: {}),
+										replay: stored(tombstone),
+									};
+								})()
 							: tombstone.turnDisposition === "no_effect"
 								? {
 										ok: true,
@@ -4288,10 +4300,23 @@ function createControlSurface(
 			const cancelRequesterPreflights = () => {
 				let actualCancellations = 0;
 				for (const cancel of [...admittedRequesterPreflights]) {
-					if (cancel()) actualCancellations++;
+					if (cancel()) {
+						actualCancellations++;
+					}
 				}
 				if (actualCancellations > 0) {
-					preflightsCancelledByAbort = true;
+					// Issue #7853: Check if ANY cancellation record for this requester has
+					// started execution. If so, we can't be certain the specific invocation
+					// being aborted had its preflight cancelled—only mark stopped if the
+					// requester's cancellations are all pre-execution and we have no other
+					// active submissions with started execution on this connection.
+					const requesterCancellations = [...acceptedQueueCancellations.values()].filter(
+						r => r.connectionId === abortingConnectionId,
+					);
+					const hasStartedExecution = requesterCancellations.some(r => r.ExecutionStarted === true);
+					if (!hasStartedExecution) {
+						preflightsCancelledByAbort = true;
+					}
 					// Remove the admitted callbacks from the live set so a preflight
 					// added by a LATER submission is untouched by this abort (and the
 					// bucket cleanup below reflects what actually remains).
