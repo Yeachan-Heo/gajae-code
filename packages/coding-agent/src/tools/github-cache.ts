@@ -718,12 +718,24 @@ function isEscapedAt(text: string, index: number): boolean {
 	return slashes % 2 === 1;
 }
 
+/** True when a line begins a credential header that can safely reset prose quote state. */
+function startsCredentialHeader(line: string): boolean {
+	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*cookie|(?:(?:[A-Za-z0-9]+-)*authorization|auth))[ \t]*["']?[ \t]*[:=]/i.test(
+		line,
+	);
+}
+
 /** Quote-aware bracket scan up to `end`. */
 function scanStructure(text: string, end: number): { stack: string[]; quoted: boolean } {
 	const stack: string[] = [];
 	let quoted = false;
 	for (let i = 0; i < end; i++) {
 		const ch = text[i];
+		if ((i === 0 || text[i - 1] === "\n") && stack.length === 0) {
+			const lineEnd = text.indexOf("\n", i);
+			const line = text.slice(i, lineEnd === -1 ? text.length : lineEnd);
+			if (startsCredentialHeader(line)) quoted = false;
+		}
 		if (quoted) {
 			if (ch === '"' && !isEscapedAt(text, i)) quoted = false;
 			continue;
@@ -758,8 +770,11 @@ function closesMatchingContainer(text: string, end: number, match: string): bool
 		else if (ch === "}" || ch === "]") {
 			const top = stack.at(-1);
 			if ((ch === "]" && top === "[") || (ch === "}" && top === "{")) {
-				stack.pop();
-				return true;
+				const rest = match.slice(i + 1).trim();
+				if (rest === "" || rest === ",") {
+					stack.pop();
+					return true;
+				}
 			}
 		}
 	}
