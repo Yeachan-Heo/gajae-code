@@ -3839,6 +3839,14 @@ function createControlSurface(
 			// or is aborted, so that a terminal abort can still cancel an accepted preflight.
 			// Delete only happens after submission completes or abort successfully cancels it.
 			const connectionId = sdkControlRequesterContext.getStore() ?? "";
+			if (!submission) {
+				// Cleanup synchronously when dispatch throws before submission is assigned:
+				// imageUploads.redeem() throws before submission is created, leaving the
+				// preflight callback in the set indefinitely.
+				requesterPreflights.delete(cancelPreflight);
+				if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+					pendingPreflights.delete(connectionId);
+			}
 			void submission?.then(
 				() => {
 					requesterPreflights.delete(cancelPreflight);
@@ -3934,6 +3942,8 @@ function createControlSurface(
 					const persisted = stored(existing);
 					if (existing.turnDisposition === "stopped") {
 						const isPrefCancelled = existing.ownedWorkDisposition === "not_requested";
+						const isPreflightPath =
+							isPrefCancelled || (scope === "turn" && existing.ownedWorkDisposition === "uncertain");
 						return {
 							ok: true,
 							selection: scope,
@@ -3949,6 +3959,11 @@ function createControlSurface(
 										resumeOnOwnedCompletion: false,
 									}
 								: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
+							...(isPreflightPath
+								? {
+										reason: isPrefCancelled ? "preflight_cancelled" : "worker_unsettled",
+									}
+								: {}),
 							replay: persisted,
 						};
 					}
