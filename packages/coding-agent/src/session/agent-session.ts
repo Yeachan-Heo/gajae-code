@@ -4889,6 +4889,14 @@ export class AgentSession {
 	 * it had none), restored if the reminder is never delivered.
 	 */
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
+	/**
+	 * Eval calls (keyed by their parent tool call id) that an interrupting nested
+	 * TTSR match invalidated, with the matched rule names. Eval code can catch the
+	 * interruption error, so the claim alone must not let a retried nested call
+	 * execute before the folded reminder reaches the model. Cleared when the eval
+	 * call's result is produced.
+	 */
+	#invalidatedNestedEvals = new Map<string, string[]>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -10955,6 +10963,8 @@ export class AgentSession {
 	 * undo their provisional claims so the rules stay eligible.
 	 */
 	#releasePerToolTtsrInjections(toolCallId?: string): void {
+		if (toolCallId === undefined) this.#invalidatedNestedEvals.clear();
+		else this.#invalidatedNestedEvals.delete(toolCallId);
 		const ids =
 			toolCallId === undefined
 				? new Set([
@@ -10979,6 +10989,8 @@ export class AgentSession {
 	 * decorated result actually published.
 	 */
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, signal?: AbortSignal): AfterToolCallResult | undefined {
+		// The eval call is settling, so its nested-call invalidation no longer gates anything.
+		this.#invalidatedNestedEvals.delete(ctx.toolCall.id);
 		// An aborted call's result is replaced by the loop's aborted result, so a
 		// folded reminder would never reach the model. A pending TTSR retry carries
 		// the bucket into its injection; any other cancellation releases it.
@@ -11193,8 +11205,19 @@ export class AgentSession {
 		args: unknown,
 		signal: AbortSignal | undefined,
 	): Promise<void> {
+		if (signal?.aborted) return;
+		// A previous nested call in this eval already interrupted on a TTSR rule.
+		// Its error is catchable cell code, so refusing every later call is what
+		// keeps a caught interruption from being retried before the folded
+		// reminder is delivered with the eval result.
+		const invalidatedBy = this.#invalidatedNestedEvals.get(parentToolCallId);
+		if (invalidatedBy) {
+			throw new ToolError(
+				`This eval call was invalidated by an interrupting TTSR match (${invalidatedBy.join(", ")}). No further nested tool calls will run in it; apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
 		const manager = this.#ttsrManager;
-		if (!manager?.hasRules() || signal?.aborted) return;
+		if (!manager?.hasRules()) return;
 		const generation = this.#promptGeneration;
 		const matchContext: TtsrMatchContext = {
 			source: "tool",
@@ -11217,8 +11240,9 @@ export class AgentSession {
 		const added = this.#addPerToolTtsrInjections(parentToolCallId, matches);
 		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
 		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
+			this.#invalidatedNestedEvals.set(parentToolCallId, matches.map(rule => rule.name));
 			throw new ToolError(
-				`${this.#formatTtsrAbortReason(matches)}. The nested ${tool.name} call was not executed; apply the rule reminder in this tool result, then retry.`,
+				`${this.#formatTtsrAbortReason(matches)}. The nested ${tool.name} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
 			);
 		}
 	}

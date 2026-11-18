@@ -2074,6 +2074,80 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(modelMessages).toHaveLength(2);
 		});
 
+		it("refuses every later nested call when cell code catches an interrupting match", async () => {
+			const reads: unknown[] = [];
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`await tool.read({ path: 'public-1.txt' });
+								 const errors = [];
+								 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { errors.push(String(error?.message ?? error)); }
+								 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { errors.push(String(error?.message ?? error)); }
+								 try { await tool.read({ path: 'public-2.txt' }); } catch (error) { errors.push(String(error?.message ?? error)); }
+								 console.log(errors.join('\\n'));`,
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+
+			// The first read ran; the interrupting read never reached the tool, and
+			// catching its error must not let either a retry or a later call run
+			// before the folded reminder is delivered.
+			expect(reads).toEqual([{ path: "public-1.txt", _i: "js prelude" }]);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("invalidated by an interrupting TTSR match");
+			expect(injectedNames(session)).toEqual(["secret-reads"]);
+		});
+
+		it("keeps batched read results in call order when one item fails and a rule folds", async () => {
+			const reads: unknown[] = [];
+			const scriptedRead: AgentTool = {
+				name: "read",
+				label: "Read",
+				description: "read",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					const filePath = (args as { path: string }).path;
+					reads.push(args);
+					if (filePath === "boom.txt") throw new Error("BOOM");
+					return { content: [{ type: "text" as const, text: `BODY:${filePath}` }] };
+				},
+			};
+			const { session } = createSession(
+				[evalToolFor(() => session), scriptedRead],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`const results = await Promise.allSettled([
+							   tool.read({ path: 'secrets.txt' }),
+							   tool.read({ path: 'boom.txt' }),
+							   tool.read({ path: 'public.txt' }),
+							 ]);
+							 console.log(results.map(result => result.status).join(','));
+							 console.log(results.map(result => result.status === 'fulfilled' ? result.value : String(result.reason.message ?? result.reason)).join('|'));`,
+						),
+					],
+				],
+				[secretReadRule()],
+			);
+			await run(session, "batch reads");
+
+			expect(reads.map(arg => (arg as { path: string }).path)).toEqual(["secrets.txt", "boom.txt", "public.txt"]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("fulfilled,rejected,fulfilled");
+			expect(text).toContain("BODY:secrets.txt|BOOM|BODY:public.txt");
+			expect(text).toContain(READ_RULE_CONTENT);
+		});
+
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
 			const { session, triggered } = createSession(
 				[evalToolFor(() => session), new WriteTool(createToolSession())],

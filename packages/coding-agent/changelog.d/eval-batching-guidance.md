@@ -4,4 +4,4 @@
 
 ### Fixed
 
-- Conditional TTSR rules scoped to `tool:<name>` now apply to nested eval `tool.<name>()` calls. A match folds the rule reminder into the eval result, and an interrupting match keeps the nested call from running (#6237).
+- Conditional TTSR rules scoped to `tool:<name>` now apply to nested eval `tool.<name>()` calls. A match folds the rule reminder into the eval result, and an interrupting match keeps the nested call from running and invalidates the rest of that eval call, so code that catches the error cannot retry before the reminder is delivered (#6237).
