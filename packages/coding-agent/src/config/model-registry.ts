@@ -1339,7 +1339,7 @@ interface DiscoveryProviderConfig {
 	cacheRetention?: CacheRetention;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
-	/** Set only by the registry's own implicit local probes, never by models.json. */
+	/** Set only by the registry's own implicit Rapid-MLX probe, never by models.json. */
 	implicitProbe?: boolean;
 }
 
@@ -4152,7 +4152,6 @@ export class ModelRegistry {
 				baseUrl: Bun.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434",
 				discovery: { type: "ollama" },
 				optional: true,
-				implicitProbe: true,
 			});
 			// Implicit Ollama auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("ollama");
@@ -4165,7 +4164,6 @@ export class ModelRegistry {
 				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
 				discovery: { type: "llama.cpp" },
 				optional: true,
-				implicitProbe: true,
 			});
 			// Implicit llama.cpp auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("llama.cpp");
@@ -4178,7 +4176,6 @@ export class ModelRegistry {
 				baseUrl: Bun.env.LM_STUDIO_BASE_URL || "http://127.0.0.1:1234/v1",
 				discovery: { type: "lm-studio" },
 				optional: true,
-				implicitProbe: true,
 			});
 			// Implicit LM Studio auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("lm-studio");
@@ -4191,7 +4188,6 @@ export class ModelRegistry {
 				baseUrl: resolveLoopbackOpenAIBaseUrl(Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1"),
 				discovery: { type: "omlx" },
 				optional: true,
-				implicitProbe: true,
 			});
 			// Implicit oMLX auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("omlx");
@@ -6238,21 +6234,23 @@ export class ModelRegistry {
 				providerConfig.discovery.type === "sglang") &&
 			loopbackDiscovery;
 		const signal = AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS);
-		// A probe of a local endpoint must not go through `fetch`: Bun applies
-		// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to loopback requests — including a proxy
-		// a project `.env` declared — caches that decision per process, and offers
-		// no per-request bypass, so only a direct socket proves the probe cannot
-		// reach a proxy.
+		// Discovery bypasses `fetch` only for a loopback Rapid-MLX probe: Bun
+		// applies HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to loopback requests — including
+		// a proxy a project `.env` declared — caches that decision per process, and
+		// offers no per-request bypass, so only a direct socket proves that exact
+		// request cannot reach a proxy. A proxy that can answer `/models` can inject
+		// a catalog just as easily as it can read a bearer.
 		//
-		// Rapid-MLX is always direct, keyed or keyless: a proxy that can answer
-		// `/models` can inject a catalog just as easily as it can read a bearer, and
-		// the provider endpoint is always loopback. The canonical provider id covers
-		// a configured `providers.rapid-mlx` entry that auto-selects
-		// `openai-models-list` because it has no discovery stanza; the discovery type
-		// covers an alias named in models.json. Every other provider takes the
-		// ordinary `fetch` path, so a configured proxy is honoured for discovery
-		// exactly as it is for inference; carrying a credential is not a transport
-		// exemption.
+		// The rule is narrower than "local probe". The direct socket requires BOTH
+		// an HTTP(S) loopback endpoint AND a Rapid-MLX identity: the canonical
+		// provider id (a configured `providers.rapid-mlx` entry that auto-selects
+		// `openai-models-list` because it has no discovery stanza) or
+		// `discovery.type: rapid-mlx` (an alias named in models.json). A configured
+		// Rapid-MLX endpoint can be non-loopback, and it then takes the ordinary
+		// `fetch` path. Every other provider — including the implicit Ollama,
+		// llama.cpp, LM Studio, and oMLX probes — is never direct, so a configured
+		// proxy is honoured for its discovery exactly as it is for inference;
+		// carrying a credential is not a transport exemption.
 		const directLoopbackProbe =
 			loopbackDiscovery &&
 			(providerConfig.provider === "rapid-mlx" || providerConfig.discovery.type === "rapid-mlx");
