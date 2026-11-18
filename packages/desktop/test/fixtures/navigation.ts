@@ -110,12 +110,13 @@ export function installNavigationFixture(holdBootstrap = false): void {
 	};
 	const emit = (frame: DesktopFrame) => {
 		if (frame.type === "snapshot") snapshot = frame.snapshot;
-		if (frame.type === "session") snapshot = {
-			...snapshot,
-			sessions: snapshot.sessions.some(item => item.id === frame.session.id)
-				? snapshot.sessions.map(item => item.id === frame.session.id ? frame.session : item)
-				: [...snapshot.sessions, frame.session],
-		};
+		if (frame.type === "session")
+			snapshot = {
+				...snapshot,
+				sessions: snapshot.sessions.some(item => item.id === frame.session.id)
+					? snapshot.sessions.map(item => (item.id === frame.session.id ? frame.session : item))
+					: [...snapshot.sessions, frame.session],
+			};
 		for (const [id, callback] of listeners) callbacks.get(callback)?.({ event: "engine-frame", id, payload: frame });
 	};
 	const respond = (id: string, result: unknown) => emit({ type: "response", id, ok: true, result });
@@ -158,17 +159,27 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		requests: () => requests,
 		snapshot: () => snapshot,
 		seedTranscripts(messageCount, sessionCount) {
-			const sessions = sessionCount === undefined ? snapshot.sessions : Array.from({ length: sessionCount }, (_, i) =>
-				session(`scroll-${i}`, `Scroll conversation ${i}`, "idle"));
-			emit({ type: "snapshot", snapshot: { ...snapshot, sessions: sessions.map(item => ({
-				...item,
-				messages: Array.from({ length: messageCount }, (_, i) => ({
-					id: `${item.id}-message-${i}`,
-					entryId: `${item.id}-message-${i}`,
-					role: "user" as const,
-					text: `Transcript ${item.id}, message ${i}\nA stable line for reading offsets.\n한글과 English remain in the same transcript.\nThe final line has a predictable height.`,
-				})),
-			})) } });
+			const sessions =
+				sessionCount === undefined
+					? snapshot.sessions
+					: Array.from({ length: sessionCount }, (_, i) =>
+							session(`scroll-${i}`, `Scroll conversation ${i}`, "idle"),
+						);
+			emit({
+				type: "snapshot",
+				snapshot: {
+					...snapshot,
+					sessions: sessions.map(item => ({
+						...item,
+						messages: Array.from({ length: messageCount }, (_, i) => ({
+							id: `${item.id}-message-${i}`,
+							entryId: `${item.id}-message-${i}`,
+							role: "user" as const,
+							text: `Transcript ${item.id}, message ${i}\nA stable line for reading offsets.\n한글과 English remain in the same transcript.\nThe final line has a predictable height.`,
+						})),
+					})),
+				},
+			});
 		},
 		holdAnimationFrames(hold) {
 			holdFrames = hold;
@@ -179,8 +190,7 @@ export function installNavigationFixture(holdBootstrap = false): void {
 			const frames = [...heldFrames.values()];
 			heldFrames.clear();
 			// Running cancelled callbacks deliberately models callbacks already handed to the browser.
-			for (const frame of frames)
-				if (includeCancelled || !frame.cancelled) frame.callback(performance.now());
+			for (const frame of frames) if (includeCancelled || !frame.cancelled) frame.callback(performance.now());
 		},
 		holdProjectReorder(hold) {
 			holdReorder = hold;
@@ -234,6 +244,9 @@ export function installNavigationFixture(holdBootstrap = false): void {
 			switch (request.method) {
 				case "bootstrap":
 					result = snapshot;
+					break;
+				case "project.refresh":
+					result = { kind: "refreshed", snapshot };
 					break;
 				case "models.list":
 					result = snapshot.models;

@@ -40,23 +40,41 @@ async function fixture() {
 	const agentDir = path.join(dataDir, "agent");
 	await fs.mkdir(cwd);
 	process.env.GJC_CODING_AGENT_DIR = agentDir;
-	await Bun.write(path.join(agentDir, "config.yml"), JSON.stringify({
-		recipe: { enabled: false }, compaction: { enabled: false }, retry: { enabled: false },
-		tools: { discoveryMode: "off" },
-	}));
+	await Bun.write(
+		path.join(agentDir, "config.yml"),
+		JSON.stringify({
+			recipe: { enabled: false },
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			tools: { discoveryMode: "off" },
+		}),
+	);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Missing fixture model");
 	const results: sdk.CreateAgentSessionResult[] = [];
 	const options = {
-		cwd, agentDir, model, extensions: [], skills: [], rules: [], contextFiles: [],
-		promptTemplates: [], slashCommands: [], disableExtensionDiscovery: true,
-		enableMcpAutoload: false, enableLsp: false, skipPythonPreflight: true,
-		deferOptionalModelRefresh: true, deferMemoryBackendStartup: true,
-		asyncJobs: "none" as const, toolNames: [],
+		cwd,
+		agentDir,
+		model,
+		extensions: [],
+		skills: [],
+		rules: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		disableExtensionDiscovery: true,
+		enableMcpAutoload: false,
+		enableLsp: false,
+		skipPythonPreflight: true,
+		deferOptionalModelRefresh: true,
+		deferMemoryBackendStartup: true,
+		asyncJobs: "none" as const,
+		toolNames: [],
 	};
 	const frames: DesktopFrame[] = [];
 	const host = new DesktopHost({
-		dataDir, emit: frame => frames.push(frame),
+		dataDir,
+		emit: frame => frames.push(frame),
 		createSession: async input => {
 			const result = await sdk.createAgentSession({ ...input, ...options });
 			results.push(result);
@@ -80,11 +98,24 @@ async function fixture() {
 		else await host.close();
 		await fs.rm(root, { recursive: true, force: true });
 	});
-	return { root, cwd, dataDir, agentDir, host, options, results, call, expectRetained: () => { retained = true; } };
+	return {
+		root,
+		cwd,
+		dataDir,
+		agentDir,
+		host,
+		options,
+		results,
+		call,
+		expectRetained: () => {
+			retained = true;
+		},
+	};
 }
 
 async function terminalConversation(f: {
-	cwd: string; agentDir: string;
+	cwd: string;
+	agentDir: string;
 	call<T>(method: DesktopRequest["method"], params: Record<string, unknown>): Promise<T>;
 }) {
 	// A pre-native terminal transcript has no enrollment marker. Two exact branches
@@ -93,20 +124,31 @@ async function terminalConversation(f: {
 	const sessionId = crypto.randomUUID();
 	const file = path.join(destination.directory, `${sessionId}.jsonl`);
 	const leaf = "terminal-second";
-	await Bun.write(file, [
-		{ type: "session", version: 5, id: sessionId, cwd: f.cwd, timestamp: new Date().toISOString() },
-		...["terminal-first", leaf].map(id => ({
-			type: "message", id, parentId: null, timestamp: new Date().toISOString(),
-			message: { role: "user", content: [{ type: "text", text: "from the terminal" }], timestamp: Date.now() },
-		})),
-	].map(item => JSON.stringify(item)).join("\n") + "\n");
+	await Bun.write(
+		file,
+		`${[
+			{ type: "session", version: 5, id: sessionId, cwd: f.cwd, timestamp: new Date().toISOString() },
+			...["terminal-first", leaf].map(id => ({
+				type: "message",
+				id,
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message: { role: "user", content: [{ type: "text", text: "from the terminal" }], timestamp: Date.now() },
+			})),
+		]
+			.map(item => JSON.stringify(item))
+			.join("\n")}\n`,
+	);
 	const resolved = sdk.resolveEmbeddedResumeCheckpoint(file);
 	if (resolved.kind !== "resolved") throw new Error(resolved.reason);
 	const project = await f.call<DesktopProject>("project.open", { path: f.cwd });
 	return { file, leaf, sessionId, project, checkpoint: resolved.checkpoint };
 }
 
-interface Connected { kind: "connected"; session: DesktopSession }
+interface Connected {
+	kind: "connected";
+	session: DesktopSession;
+}
 
 test("discovered terminal conversation connects with native ownership and the native interaction bridge", async () => {
 	const f = await fixture();
@@ -133,7 +175,11 @@ test("discovered terminal conversation connects with native ownership and the na
 	await Promise.resolve();
 	const question = f.host.snapshot().sessions.find(item => item.id === t.sessionId)?.question;
 	if (!question) throw new Error("Native interaction did not reach the desktop");
-	await f.call<unknown>("question.answer", { sessionId: t.sessionId, questionId: question.id, value: "native answer" });
+	await f.call<unknown>("question.answer", {
+		sessionId: t.sessionId,
+		questionId: question.id,
+		value: "native answer",
+	});
 	expect(await answer).toBe("native answer");
 	expect(await f.call<unknown>("session.disconnect", { sessionId: t.sessionId })).toEqual({ kind: "disconnected" });
 	expect(f.host.snapshot().sessions.find(item => item.id === t.sessionId)?.ownership).toBeUndefined();
@@ -145,17 +191,21 @@ test("connect refuses an unattested legacy tail without admitting a writer", asy
 	expect(t.checkpoint.kind).toBe("legacy_tail");
 	const before = await Bun.file(t.file).text();
 	const count = f.results.length;
-	expect(await f.call<unknown>("session.connect", {
-		sessionId: t.sessionId,
-		selection: { snapshotDigest: t.checkpoint.snapshotDigest, targetLeafId: t.leaf },
-	})).toEqual({ kind: "refused", reason: "legacy_attestation_required", checkpoint: t.checkpoint });
+	expect(
+		await f.call<unknown>("session.connect", {
+			sessionId: t.sessionId,
+			selection: { snapshotDigest: t.checkpoint.snapshotDigest, targetLeafId: t.leaf },
+		}),
+	).toEqual({ kind: "refused", reason: "legacy_attestation_required", checkpoint: t.checkpoint });
 	expect(await Bun.file(t.file).text()).toBe(before);
 	expect(f.results.length).toBe(count);
-	expect(await f.call<unknown>("session.connect", {
-		sessionId: t.sessionId,
-		selection: { snapshotDigest: t.checkpoint.snapshotDigest, targetLeafId: t.leaf },
-		legacyAttestation: { snapshotDigest: "another-row", acknowledged: true },
-	})).toEqual({ kind: "refused", reason: "legacy_attestation_required", checkpoint: t.checkpoint });
+	expect(
+		await f.call<unknown>("session.connect", {
+			sessionId: t.sessionId,
+			selection: { snapshotDigest: t.checkpoint.snapshotDigest, targetLeafId: t.leaf },
+			legacyAttestation: { snapshotDigest: "another-row", acknowledged: true },
+		}),
+	).toEqual({ kind: "refused", reason: "legacy_attestation_required", checkpoint: t.checkpoint });
 });
 
 test("connect refuses when the transcript moves between strict capture and native creation", async () => {
@@ -164,7 +214,9 @@ test("connect refuses when the transcript moves between strict capture and nativ
 	const create = sdk.createEmbeddedAgentSession;
 	function moved(input: sdk.NativeEmbeddedAgentSessionOptions): Promise<sdk.NativeEmbeddedOpenResult>;
 	function moved(input: sdk.EmbeddedAgentSessionOptions): Promise<sdk.EmbeddedAgentSessionResult>;
-	async function moved(input: sdk.NativeEmbeddedAgentSessionOptions | sdk.EmbeddedAgentSessionOptions): Promise<sdk.NativeEmbeddedOpenResult | sdk.EmbeddedAgentSessionResult> {
+	async function moved(
+		input: sdk.NativeEmbeddedAgentSessionOptions | sdk.EmbeddedAgentSessionOptions,
+	): Promise<sdk.NativeEmbeddedOpenResult | sdk.EmbeddedAgentSessionResult> {
 		if ("native" in input) {
 			await fs.appendFile(t.file, "\n");
 			return create(input);
@@ -173,7 +225,9 @@ test("connect refuses when the transcript moves between strict capture and nativ
 	}
 	const factory = vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation(moved);
 	const opened = await openNativeSession({
-		options: f.options, storage: { managed: true }, file: t.file,
+		options: f.options,
+		storage: { managed: true },
+		file: t.file,
 		selection: { snapshotDigest: t.checkpoint.snapshotDigest, targetLeafId: t.leaf },
 		legacyAttestation: { snapshotDigest: t.checkpoint.snapshotDigest, acknowledged: true },
 	});
@@ -217,14 +271,19 @@ test("disconnect reports a targetless owned blocker without minting empty consen
 	const preparation = vi.spyOn(sdk, "prepareEmbeddedDisconnect").mockImplementation(async (handle, op) => {
 		const prepared = await prepare(handle, op);
 		if (!prepared.inventory) throw new Error("Missing real inventory");
-		return { ...prepared, inventory: {
-			...prepared.inventory,
-			blockers: [{ kind: "hidden_context", id: t.sessionId, reason: "hidden_next_turn_context" }],
-		} };
+		return {
+			...prepared,
+			inventory: {
+				...prepared.inventory,
+				blockers: [{ kind: "hidden_context", id: t.sessionId, reason: "hidden_next_turn_context" }],
+			},
+		};
 	});
 	const consent = vi.spyOn(sdk, "consentEmbeddedDisconnect");
 	expect(await f.call<unknown>("session.disconnect", { sessionId: t.sessionId })).toEqual({
-		kind: "blocked", state: "checkpoint_incomplete", blockers: ["owned_work:hidden_context"],
+		kind: "blocked",
+		state: "checkpoint_incomplete",
+		blockers: ["owned_work:hidden_context"],
 	});
 	expect(consent).not.toHaveBeenCalled();
 	expect(f.results.at(-1)!.session.sessionManager.getStrictCloseState().kind).toBe("none_started");
@@ -244,24 +303,29 @@ test("disconnect retains an owner whose final closure cannot be proven", async (
 	vi.spyOn(manager, "getResumeClosureEvidence").mockResolvedValue(undefined);
 	f.expectRetained();
 	expect(await f.call<unknown>("session.disconnect", { sessionId: t.sessionId })).toEqual({
-		kind: "blocked", state: "detach_unknown", blockers: ["terminal_retention"],
+		kind: "blocked",
+		state: "detach_unknown",
+		blockers: ["terminal_retention"],
 	});
 	const retained = f.host.snapshot().sessions.find(item => item.id === t.sessionId);
 	expect(retained?.ownership).toBe("native");
 	expect(retained?.connectionState).toBe("detach_unknown");
 	expect(await f.call<unknown>("session.disconnect", { sessionId: t.sessionId })).toMatchObject({ kind: "blocked" });
 	expect(await f.call<unknown>("session.connect", { sessionId: t.sessionId })).toEqual({
-		kind: "refused", reason: f.host.snapshot().sessions.find(item => item.id === t.sessionId)?.connectionState,
+		kind: "refused",
+		reason: f.host.snapshot().sessions.find(item => item.id === t.sessionId)?.connectionState,
 	});
 });
 
 test("legacy connect surfaces exact candidates and requires a selection even after attestation", async () => {
 	const f = await fixture();
 	const t = await terminalConversation(f);
-	expect(await f.call<unknown>("session.connect", {
-		sessionId: t.sessionId,
-		legacyAttestation: { snapshotDigest: t.checkpoint.snapshotDigest, acknowledged: true },
-	})).toEqual({ kind: "selector_required", checkpoint: t.checkpoint, candidates: t.checkpoint.candidates });
+	expect(
+		await f.call<unknown>("session.connect", {
+			sessionId: t.sessionId,
+			legacyAttestation: { snapshotDigest: t.checkpoint.snapshotDigest, acknowledged: true },
+		}),
+	).toEqual({ kind: "selector_required", checkpoint: t.checkpoint, candidates: t.checkpoint.candidates });
 	expect(f.host.snapshot().sessions.find(item => item.id === t.sessionId)?.ownership).toBeUndefined();
 });
 
@@ -274,9 +338,13 @@ test("after a native successor commit, reattachment resolves the successor witho
 		selection: { snapshotDigest: t.checkpoint.snapshotDigest, targetLeafId: t.leaf },
 		legacyAttestation: { snapshotDigest: t.checkpoint.snapshotDigest, acknowledged: true },
 	});
-	const creations = await Promise.all(create.mock.results.map(item => item.value)) as Array<sdk.NativeEmbeddedOpenResult | sdk.EmbeddedAgentSessionResult>;
-	const opened = creations.find((result): result is Extract<sdk.NativeEmbeddedOpenResult, { kind: "opened" }> =>
-		"kind" in result && result.kind === "opened");
+	const creations = (await Promise.all(create.mock.results.map(item => item.value))) as Array<
+		sdk.NativeEmbeddedOpenResult | sdk.EmbeddedAgentSessionResult
+	>;
+	const opened = creations.find(
+		(result): result is Extract<sdk.NativeEmbeddedOpenResult, { kind: "opened" }> =>
+			"kind" in result && result.kind === "opened",
+	);
 	if (!opened) throw new Error("Missing admitted native runtime");
 	expect((await opened.runtime.session.branch(t.leaf)).kind).toBe("applied");
 	const successorId = opened.result.session.sessionManager.getSessionId();
@@ -287,15 +355,31 @@ test("after a native successor commit, reattachment resolves the successor witho
 	expect(row?.id).toBe(t.sessionId);
 	const catalog = await Bun.file(path.join(f.dataDir, "catalog.json")).json();
 	expect(catalog.sessions.find((item: { id: string }) => item.id === t.sessionId)).toMatchObject({
-		id: t.sessionId, sessionId: successorId, managed: true,
+		id: t.sessionId,
+		sessionId: successorId,
+		managed: true,
 	});
-	// Use the real SDK's exact saved-transcript resolution. Stop only before runtime
-	// launch: this test must neither impersonate a CLI nor require a resident daemon.
-	const resume = vi.spyOn(sdk.lifecycle.AgentDirSessionLifecycleService.prototype, "resume")
-		.mockRejectedValue(new Error("fixture stopped after exact successor resolution"));
-	await expect(f.call<unknown>("session.select", { sessionId: t.sessionId })).rejects.toThrow(
-		"fixture stopped after exact successor resolution",
-	);
-	expect(resume).toHaveBeenCalledTimes(1);
-	expect(resume.mock.calls[0]![0].target).toMatchObject({ sessionId: successorId, sessionPath: successorFile });
+	// Selection only observes persisted successor history and must not launch an owner.
+	const resume = vi
+		.spyOn(sdk.lifecycle.AgentDirSessionLifecycleService.prototype, "resume")
+		.mockRejectedValue(new Error("selection must not resume an owner"));
+	const selected = await f.call<DesktopSession>("session.select", { sessionId: t.sessionId });
+	expect(selected).toMatchObject({ id: t.sessionId, readOnly: true, observation: { source: "disk" } });
+	expect(resume).not.toHaveBeenCalled();
+	// Re-admission resolves the exact successor at the native factory boundary,
+	// not the predecessor or the lifecycle service that would mint another owner.
+	create.mockClear();
+	const reconnected = await f.call<Connected>("session.connect", { sessionId: t.sessionId });
+	expect(reconnected.kind).toBe("connected");
+	const nativeInputs = (
+		create.mock.calls.map(([input]) => input) as Array<
+			sdk.NativeEmbeddedAgentSessionOptions | sdk.EmbeddedAgentSessionOptions
+		>
+	).filter((input): input is sdk.NativeEmbeddedAgentSessionOptions => "native" in input);
+	expect(nativeInputs).toHaveLength(1);
+	const input = nativeInputs[0]!;
+	expect(input.storage).toMatchObject({ file: successorFile });
+	if ("create" in input.native) throw new Error("Expected exact native successor admission");
+	expect(input.native.identity).toMatchObject({ sessionId: successorId, canonicalPath: successorFile });
+	expect(resume).not.toHaveBeenCalled();
 });

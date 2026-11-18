@@ -20,6 +20,7 @@ import {
 	createSessionImageInput,
 	deleteEmbeddedSession,
 	type EmbeddedAgentSessionResult,
+	type EmbeddedTranscriptObservation,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	executeAcpBuiltinSlashCommand,
@@ -28,25 +29,22 @@ import {
 	getSettingsCatalog,
 	type InputEventResult,
 	listEmbeddedProjectSessions,
+	type NativeInvocationResult,
+	observeEmbeddedTranscript,
 	type QueuedInputSubmission,
 	resolveEmbeddedResumeCheckpoint,
 	resolveManagedSessionScope,
 	restoreSessionView,
-	type SdkComposerCompletionResult,
 	type SdkComposerObservation,
 	type SdkPreferenceOutcome,
-	type SdkSelectModelResult,
 	SdkRevisionError,
-	type SdkSessionInfo,
+	type SdkSelectModelResult,
 	type SdkSessionView,
 	type SettingCatalogItem,
 	Settings,
 	type SlashCommandRuntime,
 	validateEmbeddedConfigPatch,
-	type NativeInvocationResult,
 } from "@gajae-code/coding-agent/sdk";
-import { bridgeNativeInteraction, type NativeInteractionQuestion } from "./native-interaction-bridge";
-import { type NativeOpenInput, type NativeOpenOutcome, type NativeSession, type NativeUnresolvedOpen, openNativeSession } from "./native-session";
 import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
@@ -58,7 +56,7 @@ import type {
 } from "./activity-protocol";
 import { prepareDesktopAttachmentInput } from "./attachment-input";
 import { createDesktopBtwController, type DesktopBtwController } from "./btw-controls";
-import { DesktopComposerCompletion, projectDesktopCompletion, readDesktopCompletionInput } from "./composer-completion";
+import { DesktopComposerCompletion, readDesktopCompletionInput } from "./composer-completion";
 import { DeliveryJournal } from "./delivery-journal";
 import { prepareDesktopEnvironment } from "./environment-policy";
 import {
@@ -66,7 +64,6 @@ import {
 	DesktopGatePresentationError,
 	type DesktopGatePresenter,
 } from "./gate-presentation";
-import { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
 	copyableMessageText,
@@ -84,6 +81,14 @@ import {
 	validateSessionThinking,
 } from "./model-controls";
 import { createNativeAdmission } from "./native-admission";
+import { bridgeNativeInteraction, type NativeInteractionQuestion } from "./native-interaction-bridge";
+import {
+	type NativeOpenInput,
+	type NativeOpenOutcome,
+	type NativeSession,
+	type NativeUnresolvedOpen,
+	openNativeSession,
+} from "./native-session";
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
 import {
 	createDesktopPreferencesController,
@@ -108,6 +113,7 @@ import type {
 	DesktopHistory,
 	DesktopMessage,
 	DesktopProject,
+	DesktopProjectRefreshResult,
 	DesktopQuestion,
 	DesktopQueuedInput,
 	DesktopRequest,
@@ -116,7 +122,7 @@ import type {
 	DesktopSnapshot,
 } from "./protocol";
 import { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./protocol";
-import { projectDesktopSessionInfo, readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
+import { readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 
@@ -150,6 +156,18 @@ const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"mcp.get",
 	"mcp.operate",
 	"session.info",
+]);
+const DISCOVERY_REFRESH_INTERVAL_MS = 30_000;
+const DISCOVERED_READ_ONLY_REASON =
+	"This discovered conversation is read-only. Use session.connect to admit native ownership before editing it.";
+/** Fail closed: a newly added protocol writer cannot control an unowned transcript. */
+const DISCOVERED_READ_METHODS = new Set<DesktopRequest["method"]>([
+	"session.select",
+	"history.get",
+	"models.list",
+	"session.info",
+	"composer.complete",
+	"message.copyText",
 ]);
 const HISTORY_PAGE_LIMIT = 500;
 const COMMAND_OUTPUT_LIMIT = 200_000;
@@ -355,10 +373,29 @@ interface SavedSession {
 	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
 	managed?: true;
 }
+/** Catalog-local discovery exclusions, not transcript ownership or deletion authority. */
+interface SelectedForkTranscript {
+	projectId: string;
+	sessionId: string;
+	file: string;
+}
+/** Explicit App deletion only; never inferred from inventory absence or fork provenance. */
+interface DeletedTranscript {
+	projectId: string;
+	sessionId: string;
+	file: string;
+}
+interface DiscoveredSession {
+	metadata: SavedSession;
+	sessionId: string;
+	file: string;
+}
 interface Catalog {
 	version: 1;
 	projects: DesktopProject[];
 	sessions: SavedSession[];
+	selectedForkTranscripts?: SelectedForkTranscript[];
+	deletedTranscripts?: DeletedTranscript[];
 }
 interface TrackedQueuedInput {
 	dto: DesktopQueuedInput;
@@ -397,7 +434,7 @@ async function admitted<T>(
 	return result.value;
 }
 /** Admit only slash-command mutations; keep getters and other methods on the real session. */
-function admittedSlashSession(live: LiveSession): AgentSession {
+function admittedSlashSession(live: LiveSession, assertCallerControl: () => void): AgentSession {
 	if (!live.native) return live.sdk;
 	return new Proxy<AgentSession>(live.sdk, {
 		get(target, prop) {
@@ -405,24 +442,50 @@ function admittedSlashSession(live: LiveSession): AgentSession {
 			if (typeof value !== "function") return value;
 			switch (prop) {
 				case "clearContext":
-					return (...args: Parameters<AgentSession["clearContext"]>) =>
-						admitted(live, sdk => sdk.clearContext(...args), runtime => runtime.session.clearContext(...args));
+					return (...args: Parameters<AgentSession["clearContext"]>) => {
+						assertCallerControl();
+						return admitted(
+							live,
+							sdk => sdk.clearContext(...args),
+							runtime => runtime.session.clearContext(...args),
+						);
+					};
 				case "compact":
-					return (...args: Parameters<AgentSession["compact"]>) =>
-						admitted(live, sdk => sdk.compact(...args), runtime => runtime.session.compact(...args));
+					return (...args: Parameters<AgentSession["compact"]>) => {
+						assertCallerControl();
+						return admitted(
+							live,
+							sdk => sdk.compact(...args),
+							runtime => runtime.session.compact(...args),
+						);
+					};
 				case "setSessionName":
-					return (...args: Parameters<AgentSession["setSessionName"]>) =>
-						admitted(live, sdk => sdk.setSessionName(...args), runtime => runtime.session.setSessionName(...args));
+					return (...args: Parameters<AgentSession["setSessionName"]>) => {
+						assertCallerControl();
+						return admitted(
+							live,
+							sdk => sdk.setSessionName(...args),
+							runtime => runtime.session.setSessionName(...args),
+						);
+					};
 				case "setThinkingLevelForControl":
-					return (...args: Parameters<AgentSession["setThinkingLevelForControl"]>) =>
-						admitted(
+					return (...args: Parameters<AgentSession["setThinkingLevelForControl"]>) => {
+						assertCallerControl();
+						return admitted(
 							live,
 							sdk => sdk.setThinkingLevelForControl(...args),
 							runtime => runtime.session.setThinkingLevelForControl(...args),
 						);
+					};
 				case "exportToHtml":
-					return (...args: Parameters<AgentSession["exportToHtml"]>) =>
-						admitted(live, sdk => sdk.exportToHtml(...args), runtime => runtime.session.exportToHtml(...args));
+					return (...args: Parameters<AgentSession["exportToHtml"]>) => {
+						assertCallerControl();
+						return admitted(
+							live,
+							sdk => sdk.exportToHtml(...args),
+							runtime => runtime.session.exportToHtml(...args),
+						);
+					};
 				default:
 					return value.bind(target);
 			}
@@ -544,10 +607,17 @@ export class DesktopHost {
 	#live = new Map<string, LiveSession>();
 	/** Publication tokens survive live-map removal without retaining disposed SDK owners. */
 	#viewOwners = new WeakMap<SavedSession, symbol>();
-	#managed = new Map<string, ManagedSession>();
-	#managedControlEpoch = 0;
-	#managedOpening = new Map<string, Promise<ManagedSession>>();
-	#managedProjectEpochs = new Map<string, number>();
+	/** Ephemeral disk observations, never ownership or persisted reading state. */
+	#observed = new Map<string, EmbeddedTranscriptObservation>();
+	#discoveryEpochs = new Map<string, number>();
+	#discoveryRefreshes = new Map<
+		string,
+		{
+			epoch: number;
+			startedAt: number;
+			pending?: Promise<DesktopProjectRefreshResult>;
+		}
+	>();
 	/** Unpublished SDK ownership, retained until publication or proven disposal. */
 	#candidates = new Set<SessionCandidate>();
 	/** Opens without a published runtime still own their native manager and dependencies. */
@@ -585,6 +655,16 @@ export class DesktopHost {
 	#saving: Promise<void> = Promise.resolve();
 	#saveFailures: unknown[] = [];
 	#closed = false;
+	#nextControlGeneration = 0;
+	#controlOwners = new WeakMap<
+		LiveSession,
+		{
+			generation: number;
+			manager: SessionManager;
+			identityGeneration: number;
+			epoch: number;
+		}
+	>();
 	readonly #connectionGeneration = crypto.randomUUID();
 	#closing?: Promise<void>;
 	#tasks = new Set<Promise<unknown>>();
@@ -733,7 +813,51 @@ export class DesktopHost {
 				new Set(sessions.map(s => s.id)).size !== sessions.length
 			)
 				throw new Error("Duplicate desktop IDs");
-			this.#catalog = { version: 1, projects, sessions };
+			let selectedForkTranscripts: SelectedForkTranscript[] | undefined;
+			if (catalog.selectedForkTranscripts !== undefined) {
+				if (!Array.isArray(catalog.selectedForkTranscripts)) throw new Error("Invalid selected fork transcripts");
+				selectedForkTranscripts = catalog.selectedForkTranscripts.map(value => {
+					const item = record(value);
+					if (!item || Object.keys(item).length !== 3) throw new Error("Invalid selected fork transcript");
+					const projectId = identifier(item, "projectId");
+					const sessionId = identifier(item, "sessionId");
+					const file = requiredString(item, "file");
+					if (
+						!projects.some(project => project.id === projectId) ||
+						!path.isAbsolute(file) ||
+						path.resolve(file) !== file ||
+						file.includes("\0")
+					)
+						throw new Error("Invalid selected fork transcript");
+					return { projectId, sessionId, file };
+				});
+			}
+			let deletedTranscripts: DeletedTranscript[] | undefined;
+			if (catalog.deletedTranscripts !== undefined) {
+				if (!Array.isArray(catalog.deletedTranscripts)) throw new Error("Invalid deleted transcripts");
+				deletedTranscripts = catalog.deletedTranscripts.map(value => {
+					const item = record(value);
+					if (!item || Object.keys(item).length !== 3) throw new Error("Invalid deleted transcript");
+					const projectId = identifier(item, "projectId");
+					const sessionId = identifier(item, "sessionId");
+					const file = requiredString(item, "file");
+					if (
+						!projects.some(project => project.id === projectId) ||
+						!path.isAbsolute(file) ||
+						path.resolve(file) !== file ||
+						file.includes("\0")
+					)
+						throw new Error("Invalid deleted transcript");
+					return { projectId, sessionId, file };
+				});
+			}
+			this.#catalog = {
+				version: 1,
+				projects,
+				sessions,
+				...(selectedForkTranscripts ? { selectedForkTranscripts } : {}),
+				...(deletedTranscripts ? { deletedTranscripts } : {}),
+			};
 		}
 		this.#control = await createEmbeddedAgentSession({
 			cwd: this.dataDir,
@@ -958,10 +1082,75 @@ export class DesktopHost {
 		});
 		return save;
 	}
-	#dto(metadata: SavedSession, messageBudget = 2_000_000): DesktopSession {
+	/** Renderer intent is host-monotonic; the SDK lifecycle remains an independent admission fence. */
+	#controlGeneration(live: LiveSession): number {
+		if (!live.metadata.managed) return live.sdk.sessionLifecycle.generation;
+		const generation = live.sdk.sessionLifecycle.generation;
+		const manager = live.sdk.sessionManager;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		let owner = this.#controlOwners.get(live);
+		if (
+			!owner ||
+			owner.generation !== generation ||
+			owner.manager !== manager ||
+			owner.identityGeneration !== identityGeneration
+		) {
+			if (this.#nextControlGeneration >= Number.MAX_SAFE_INTEGER)
+				throw new Error("Desktop control generation exhausted");
+			owner = { generation, manager, identityGeneration, epoch: ++this.#nextControlGeneration };
+			this.#controlOwners.set(live, owner);
+		}
+		return owner.epoch;
+	}
+	#callerControl(metadata: SavedSession, params: Record<string, unknown>): () => void {
+		if (!metadata.managed) return () => {};
 		const live = this.#live.get(metadata.id);
-		const managed = this.#managed.get(metadata.id);
-		if (managed && !live) return managed.dto(messageBudget);
+		if (!live?.native) throw new Error(DISCOVERED_READ_ONLY_REASON);
+		const sdk = live.sdk;
+		const generation = sdk.sessionLifecycle.generation;
+		const manager = sdk.sessionManager;
+		const sessionId = sdk.sessionId;
+		const managerSessionId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const epoch = this.#controlGeneration(live);
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+		const cwd = project?.path;
+		const assertCurrent = () => {
+			if (
+				!Number.isSafeInteger(params.sessionGeneration) ||
+				params.sessionGeneration !== epoch ||
+				this.#closed ||
+				!this.#catalog.sessions.includes(metadata) ||
+				!project ||
+				project.closed ||
+				!this.#catalog.projects.includes(project) ||
+				project.path !== cwd ||
+				this.#live.get(metadata.id) !== live ||
+				this.#retiredLive.has(live) ||
+				live.native?.state !== "connected" ||
+				live.sdk !== sdk ||
+				sdk.sessionLifecycle.disposed ||
+				sdk.sessionLifecycle.transitioning ||
+				sdk.sessionLifecycle.generation !== generation ||
+				sdk.sessionManager !== manager ||
+				sdk.sessionId !== sessionId ||
+				manager.getSessionId() !== managerSessionId ||
+				manager.getSessionIdentityGeneration() !== identityGeneration ||
+				manager.getCwd() !== cwd ||
+				this.#controlGeneration(live) !== epoch
+			)
+				throw new Error("SDK owner changed. Select the conversation again.");
+		};
+		assertCurrent();
+		return assertCurrent;
+	}
+	#dto(metadata: SavedSession, messageBudget = 2_000_000, captured?: EmbeddedTranscriptObservation): DesktopSession {
+		const live = this.#live.get(metadata.id);
+		const observed = !live ? (captured ?? this.#observed.get(metadata.id)) : undefined;
+		const readOnly = metadata.managed && !live?.native;
+		const readOnlyProjection = readOnly
+			? { readOnly: true as const, readOnlyReason: DISCOVERED_READ_ONLY_REASON }
+			: {};
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
 		const awaitingGate = gates?.available && gates.pending.length > 0;
@@ -971,12 +1160,12 @@ export class DesktopHost {
 					text => this.#redact(text),
 					messageBudget,
 					{
-						sessionGeneration: live.sdk.sessionLifecycle.generation,
+						sessionGeneration: this.#controlGeneration(live),
 						streamingMessage: live.streamingMessage,
 						revision: entryId => this.#revisions(live).revision(live.sdk, entryId),
 					},
 				)
-			: [];
+			: projectMessages(observed?.messages ?? [], text => this.#redact(text), messageBudget);
 		const notices = (live?.notices ?? []).map(message => ({
 			...message,
 			text: this.#redact(message.text),
@@ -1003,6 +1192,22 @@ export class DesktopHost {
 			projectId: metadata.projectId,
 			title: metadata.title,
 			starred: metadata.starred,
+			...(metadata.managed
+				? { origin: "external" as const, mode: readOnly ? ("readonly" as const) : ("native" as const) }
+				: {}),
+			...readOnlyProjection,
+			...(observed
+				? {
+						observation: {
+							source: "disk" as const,
+							snapshotDigest: observed.checkpoint.snapshotDigest,
+							checkpointKind: observed.checkpoint.kind,
+							selectionRequired: observed.selectionRequired,
+							unresolvedCount: observed.unresolvedCount,
+							sequence: observed.messageObservations.map(item => ({ ...item })),
+						},
+					}
+				: {}),
 			status:
 				question || awaitingGate
 					? "waiting"
@@ -1016,7 +1221,7 @@ export class DesktopHost {
 			...(live?.sdk.model ? { model: `${live.sdk.model.provider}/${live.sdk.model.id}` } : {}),
 			thinking: projectDesktopThinking(live?.sdk),
 			operatorRunning: live?.operator?.isBusy() ?? false,
-			controlGeneration: live?.sdk.sessionLifecycle.generation ?? null,
+			controlGeneration: live ? this.#controlGeneration(live) : null,
 			...(live?.native ? { ownership: "native" as const, connectionState: live.native.state } : {}),
 			...(live ? { promptEditing: true as const } : {}),
 			imageInput: live
@@ -1026,6 +1231,10 @@ export class DesktopHost {
 					}
 				: null,
 			messages: fitted.messages,
+			...(observed &&
+			(observed.unresolvedCount > 0 || fitted.truncated || countVisibleMessages(observed.messages) > HISTORY_LIMIT)
+				? { historyTruncated: true }
+				: {}),
 			...(live &&
 			(fitted.truncated ||
 				countVisibleMessages(live.sdk.messages) +
@@ -1136,7 +1345,11 @@ export class DesktopHost {
 			if (connected.native.state !== "connected") return { kind: "refused", reason: connected.native.state };
 			return { kind: "connected", session: this.#dto(metadata) };
 		}
-		const connect: { file?: string; selection?: NativeOpenInput["selection"]; legacyAttestation?: NativeOpenInput["legacyAttestation"] } = {};
+		const connect: {
+			file?: string;
+			selection?: NativeOpenInput["selection"];
+			legacyAttestation?: NativeOpenInput["legacyAttestation"];
+		} = {};
 		if (params.selection !== undefined) {
 			const selection = record(params.selection);
 			if (!selection || (selection.targetLeafId !== null && typeof selection.targetLeafId !== "string"))
@@ -1148,15 +1361,17 @@ export class DesktopHost {
 		}
 		if (params.legacyAttestation !== undefined) {
 			const attestation = record(params.legacyAttestation);
-			if (!attestation || attestation.acknowledged !== true) throw new Error("Invalid legacy attestation");
+			if (attestation?.acknowledged !== true) throw new Error("Invalid legacy attestation");
 			connect.legacyAttestation = {
-				snapshotDigest: requiredString(attestation, "snapshotDigest", 128), acknowledged: true,
+				snapshotDigest: requiredString(attestation, "snapshotDigest", 128),
+				acknowledged: true,
 			};
 		}
 		if (metadata.managed) {
 			const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
 			const inventory = await listEmbeddedProjectSessions({
-				cwd: project.path, agentDir: this.agentDir,
+				cwd: project.path,
+				agentDir: this.agentDir,
 				directory: path.join(this.dataDir, "sessions", project.id),
 			});
 			const matches = inventory.managed.filter(item => item.id === (metadata.sessionId ?? metadata.id));
@@ -1165,9 +1380,7 @@ export class DesktopHost {
 		}
 		try {
 			await this.#open(metadata, undefined, connect);
-			const attachment = this.#managed.get(metadata.id);
-			await attachment?.close();
-			this.#managed.delete(metadata.id);
+			this.#observed.delete(metadata.id);
 			this.#publishSnapshot();
 			return { kind: "connected", session: this.#dto(metadata) };
 		} catch (error) {
@@ -1184,8 +1397,7 @@ export class DesktopHost {
 		if (!live?.native) return { kind: "blocked", blockers: ["native_owner_missing"] };
 		// Persist the current transcript identity before TERM releases resident state.
 		// Active work is left to the SDK's owned stop/join admission, never aborted raw.
-		if (live.native.state === "connected" && !live.busy && !live.sdk.isStreaming)
-			await this.#persistLive(live);
+		if (live.native.state === "connected" && !live.busy && !live.sdk.isStreaming) await this.#persistLive(live);
 		const outcome = await live.native.disconnect();
 		if (outcome.kind !== "disconnected") {
 			this.#publish(live);
@@ -1302,11 +1514,16 @@ export class DesktopHost {
 		return null;
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
-	async #constructCandidate(metadata: SavedSession, manager?: SessionManager, connect?: NativeConnectInput): Promise<SessionCandidate> {
+	async #constructCandidate(
+		metadata: SavedSession,
+		manager?: SessionManager,
+		connect?: NativeConnectInput,
+	): Promise<SessionCandidate> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
 		if (!project || !(await fs.stat(project.path)).isDirectory()) throw new Error("Project directory unavailable");
 		const directory = await this.#sessionDirectory(project.path, metadata);
-		if (metadata.scope !== "managed" && !metadata.managed) await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		if (metadata.scope !== "managed" && !metadata.managed)
+			await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 		let existingFile: string | undefined = connect?.file;
 		if (metadata.file && !existingFile) {
 			// A recorded transcript that is gone must fail rather than let the SDK
@@ -1414,11 +1631,18 @@ export class DesktopHost {
 				connectionGeneration: this.#connectionGeneration,
 				redact: text => this.#redact(text),
 			}),
-			preferences: createDesktopPreferencesController(candidate.sdk, createNativeAdmission(candidate.native?.runtime)),
-			mcp: createDesktopMcpController(candidate.factory, {
-				connectionGeneration: this.#connectionGeneration,
-				redact: text => this.#redact(text),
-			}, candidate.native?.runtime),
+			preferences: createDesktopPreferencesController(
+				candidate.sdk,
+				createNativeAdmission(candidate.native?.runtime),
+			),
+			mcp: createDesktopMcpController(
+				candidate.factory,
+				{
+					connectionGeneration: this.#connectionGeneration,
+					redact: text => this.#redact(text),
+				},
+				candidate.native?.runtime,
+			),
 			activityRevision: 0,
 			activityPublishedRevision: 0,
 			busy: false,
@@ -1692,6 +1916,35 @@ export class DesktopHost {
 				file: sourceFile,
 				cwd: project.path,
 				selection: { snapshotDigest: resolved.checkpoint.snapshotDigest, targetLeafId: source.getLeafId() },
+				...(entryId !== undefined
+					? {
+							reserveSelectedForkTranscript: async (identity: {
+								readonly role: "staging" | "successor";
+								readonly sessionId: string;
+								readonly file: string;
+							}) => {
+								assertSource();
+								if (
+									(identity.role !== "staging" && identity.role !== "successor") ||
+									!ID.test(identity.sessionId) ||
+									!path.isAbsolute(identity.file) ||
+									path.resolve(identity.file) !== identity.file ||
+									identity.file.includes("\0")
+								)
+									throw new Error("Invalid selected fork transcript reservation");
+								// Install before the save await: a stale inventory must also recheck
+								// this exact producer identity at its catalog insertion boundary.
+								this.#catalog.selectedForkTranscripts ??= [];
+								this.#catalog.selectedForkTranscripts.push({
+									projectId: project.id,
+									sessionId: identity.sessionId,
+									file: identity.file,
+								});
+								await this.#save();
+								assertSource();
+							},
+						}
+					: {}),
 				...(live.metadata.scope === "managed"
 					? { agentDir: this.agentDir, managed: true as const }
 					: { directory }),
@@ -1801,25 +2054,35 @@ export class DesktopHost {
 	}
 	#attachOperatorController(live: LiveSession): void {
 		live.operatorCurrentId = undefined;
-		live.operator = createDesktopOperatorController(live.sdk, {
-			connectionGeneration: this.#connectionGeneration,
-			redact: text => this.#redact(text),
-			createStreamRedactor: () => createDesktopStreamRedactor([...this.#secrets], text => this.#redact(text)),
-			emit: event => {
-				if (this.#closed || this.#live.get(live.metadata.id) !== live) return;
-				live.operatorCurrentId = event.operation.operationId;
-				this.#emit({ type: "operator", sessionId: live.metadata.id, event });
-				this.#schedule(live);
+		live.operator = createDesktopOperatorController(
+			live.sdk,
+			{
+				connectionGeneration: this.#connectionGeneration,
+				redact: text => this.#redact(text),
+				createStreamRedactor: () => createDesktopStreamRedactor([...this.#secrets], text => this.#redact(text)),
+				emit: event => {
+					if (this.#closed || this.#live.get(live.metadata.id) !== live) return;
+					live.operatorCurrentId = event.operation.operationId;
+					this.#emit({ type: "operator", sessionId: live.metadata.id, event });
+					this.#schedule(live);
+				},
 			},
-		}, createNativeAdmission(live.native?.runtime));
+			createNativeAdmission(live.native?.runtime),
+		);
 	}
 	#attachBtwController(live: LiveSession): void {
-		const generation = live.sdk.sessionLifecycle.generation;
+		const generation = this.#controlGeneration(live);
 		const controller = createDesktopBtwController(live.sdk, {
 			redact: text => this.#redact(text),
 			createStreamRedactor: () => createDesktopStreamRedactor([...this.#secrets], text => this.#redact(text)),
 			emit: event => {
-				if (this.#closed || this.#live.get(live.metadata.id) !== live || live.btw !== controller) return;
+				if (
+					this.#closed ||
+					this.#live.get(live.metadata.id) !== live ||
+					live.btw !== controller ||
+					this.#controlGeneration(live) !== generation
+				)
+					return;
 				this.#emit({ type: "btw", sessionId: live.metadata.id, sessionGeneration: generation, event }, true);
 			},
 		});
@@ -1865,10 +2128,14 @@ export class DesktopHost {
 			redact: text => this.#redact(text),
 		});
 		live.preferences = createDesktopPreferencesController(live.sdk, createNativeAdmission(live.native?.runtime));
-		live.mcp = createDesktopMcpController(live.factory, {
-			connectionGeneration: this.#connectionGeneration,
-			redact: text => this.#redact(text),
-		}, live.native?.runtime);
+		live.mcp = createDesktopMcpController(
+			live.factory,
+			{
+				connectionGeneration: this.#connectionGeneration,
+				redact: text => this.#redact(text),
+			},
+			live.native?.runtime,
+		);
 		this.#cancelQuestions(live);
 		live.titleAbort?.abort();
 		live.titleAbort = undefined;
@@ -2195,10 +2462,12 @@ export class DesktopHost {
 		text: string,
 		images: ImageContent[],
 		allowGateMutation = false,
+		assertCallerControl: () => void = () => {},
 	): Promise<{ handled: boolean; text: string; images: ImageContent[] }> {
 		const runner = live.sdk.extensionRunner;
 		if (!runner?.hasHandlers("input")) return { handled: false, text, images };
 		await this.#delivery(id, { disposition: "accepted" });
+		assertCallerControl();
 		const generation = live.sdk.sessionLifecycle.generation;
 		let result: InputEventResult;
 		try {
@@ -2285,11 +2554,14 @@ export class DesktopHost {
 		alreadyBegun = false,
 		allowGateMutation = false,
 		editEntryId?: string,
+		assertCallerControl: () => void = () => {},
 	): Promise<void> {
 		let completeTask = this.#localTaskCompletion(live);
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
-		const input = await this.#extensionInput(live, id, text, images, allowGateMutation);
+		assertCallerControl();
+		const input = await this.#extensionInput(live, id, text, images, allowGateMutation, assertCallerControl);
+		assertCallerControl();
 		if (input.handled) return;
 		accepted = this.#deliveries.list().some(receipt => receipt.id === id && receipt.disposition === "accepted");
 		text = input.text;
@@ -2325,7 +2597,12 @@ export class DesktopHost {
 		};
 		try {
 			if (editEntryId !== undefined) {
-				const input = { entryId: editEntryId, action: "edit" as const, body: text, ...(images.length ? { images } : {}) };
+				const input = {
+					entryId: editEntryId,
+					action: "edit" as const,
+					body: text,
+					...(images.length ? { images } : {}),
+				};
 				await admitted(
 					live,
 					() => live.factory.revise(input, options),
@@ -2337,7 +2614,12 @@ export class DesktopHost {
 					sdk => createSessionImageInput(sdk).prompt(text, images, options),
 					runtime => runtime.images.prompt(text, images, options),
 				);
-			} else await admitted(live, sdk => sdk.prompt(text, options), runtime => runtime.prompt.prompt(text, options));
+			} else
+				await admitted(
+					live,
+					sdk => sdk.prompt(text, options),
+					runtime => runtime.prompt.prompt(text, options),
+				);
 			await live.sdk.waitForIdle();
 		} catch (error) {
 			await this.#delivery(
@@ -2466,6 +2748,7 @@ export class DesktopHost {
 			await this.initialize();
 			if (this.#closed && request.method !== "shutdown") throw new Error("Host is closed");
 			if (request.method === "prompt") {
+				this.#callerControl(this.#metadata(request.params), request.params);
 				prepareDesktopAttachmentInput(request);
 				const metadata = this.#metadata(request.params);
 				promptAdmissionAttempted = true;
@@ -2519,8 +2802,25 @@ export class DesktopHost {
 	}
 	async #dispatch(request: DesktopRequest): Promise<unknown> {
 		const { method, params } = request;
+		// Admission is enforced before every fast path, including managed owner routing.
+		if (typeof params.sessionId === "string" && method !== "session.connect" && method !== "session.disconnect") {
+			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
+			if (metadata?.managed && !this.#live.get(metadata.id)?.native && !DISCOVERED_READ_METHODS.has(method))
+				throw new Error(DISCOVERED_READ_ONLY_REASON);
+		}
+		const assertCallerControl = ["prompt", "abort", "model.set", "thinking.set"].includes(method)
+			? this.#callerControl(this.#metadata(params), params)
+			: () => {};
 		const attachmentInput = method === "prompt" ? prepareDesktopAttachmentInput(request) : undefined;
 		if (method === "bootstrap") {
+			// Bootstrap is also the connection/reconnection boundary. Discovery is
+			// additive and never grants ownership; failed scans cannot erase rows.
+			await Promise.allSettled(
+				this.#catalog.projects
+					.filter(project => !project.closed)
+					.map(project => this.#refreshProjectSessions(project)),
+			);
+			if (this.#closed) throw new Error("Host is closed");
 			const snapshot = this.snapshot();
 			this.#emit({ type: "snapshot", snapshot });
 			return snapshot;
@@ -2539,7 +2839,8 @@ export class DesktopHost {
 		if (method === "message.copyText") return this.#copyText(request);
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
-			if (metadata?.managed && !this.#live.has(metadata.id)) return this.#dispatchManaged(request, this.#metadata(params));
+			if (metadata?.managed && !this.#live.has(metadata.id))
+				return this.#dispatchDiscovered(request, this.#metadata(params));
 		}
 		if (method === "auth.providers") {
 			const statuses = await this.#authorizationProviders();
@@ -2579,6 +2880,12 @@ export class DesktopHost {
 			const resolved = await fs.realpath(requiredString(params, "path"));
 			if (!(await fs.stat(resolved)).isDirectory()) throw new Error("Project must be a directory");
 			return this.#withProject(resolved, () => this.#openProject(resolved));
+		}
+		if (method === "project.refresh") {
+			const project = this.#catalog.projects.find(item => item.id === identifier(params, "projectId"));
+			if (!project) throw new Error("Project not found");
+			if (project.closed) throw new Error("Workspace is closed. Open the folder again before refreshing it.");
+			return this.#refreshProjectSessions(project);
 		}
 		if (method === "project.close") {
 			const projectId = identifier(params, "projectId");
@@ -2762,7 +3069,7 @@ export class DesktopHost {
 				offset,
 				limit,
 				text => this.#redact(text),
-				{ sessionGeneration: live.sdk.sessionLifecycle.generation, streamingMessage: live.streamingMessage },
+				{ sessionGeneration: this.#controlGeneration(live), streamingMessage: live.streamingMessage },
 			);
 			return {
 				sessionId: live.metadata.id,
@@ -2828,13 +3135,19 @@ export class DesktopHost {
 		)
 			return await this.#forgetMissingSession(metadata);
 		const live = await this.#open(metadata);
+		assertCallerControl();
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
 			live.gateMutation = true;
 			live.titleAbort?.abort();
 			try {
 				this.#cancelQuestions(live);
-				await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort(), "queue.abort");
+				await admitted(
+					live,
+					sdk => sdk.abort(),
+					runtime => runtime.queue.abort(),
+					"queue.abort",
+				);
 				return await this.#deleteSession(live, metadata);
 			} finally {
 				live.gateMutation = false;
@@ -2856,9 +3169,16 @@ export class DesktopHost {
 			}
 			this.#cancelQuestions(live);
 			for (const tracked of live.queued.values()) {
+				assertCallerControl();
 				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			}
-			await admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort(), "queue.abort");
+			assertCallerControl();
+			await admitted(
+				live,
+				sdk => sdk.abort(),
+				runtime => runtime.queue.abort(),
+				"queue.abort",
+			);
 			this.#publish(live);
 			return null;
 		}
@@ -2867,7 +3187,7 @@ export class DesktopHost {
 			const controller = live.btw;
 			if (!controller) throw new Error("No side-chat controller is connected to this conversation.");
 			const { sessionId: _sessionId, sessionGeneration, ...input } = params;
-			if (!Number.isSafeInteger(sessionGeneration) || sessionGeneration !== live.sdk.sessionLifecycle.generation)
+			if (!Number.isSafeInteger(sessionGeneration) || sessionGeneration !== this.#controlGeneration(live))
 				throw new Error("The session changed. Open the side chat again.");
 			if ((method === "btw.open" || method === "btw.submit") && live.gateMutation)
 				throw new Error("Open the side chat again after the session change finishes.");
@@ -3031,6 +3351,7 @@ export class DesktopHost {
 		if (method === "prompt") {
 			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
 			await this.#awaitStartup(live);
+			assertCallerControl();
 			if (!attachmentInput) throw new Error("Prompt attachment envelope was not validated");
 			let { text, images } = attachmentInput;
 			const { editEntryId } = attachmentInput;
@@ -3046,7 +3367,7 @@ export class DesktopHost {
 					throw new Error("Slash commands cannot be submitted with attachments.");
 				if (live.busy || live.sdk.isStreaming)
 					throw new Error("Run the command after the current operation finishes.");
-				const result = await this.#command(metadata, text, request.id, true);
+				const result = await this.#command(metadata, text, request.id, true, assertCallerControl);
 				if (result.refused) await this.#delivery(request.id, { disposition: "refused", error: result.output });
 				else if (result.consumed && result.prompt === undefined && commandName !== "btw")
 					await this.#delivery(request.id, { disposition: "completed" });
@@ -3054,11 +3375,13 @@ export class DesktopHost {
 				return result;
 			}
 			if (text.trimStart().startsWith("/")) await this.#observation(live).catalog({});
+			assertCallerControl();
 			if (editEntryId !== undefined && (live.busy || live.sdk.isStreaming))
 				throw new Error("Edit the prompt after the current operation finishes.");
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
-				const input = await this.#extensionInput(live, request.id, text, images);
+				const input = await this.#extensionInput(live, request.id, text, images, false, assertCallerControl);
+				assertCallerControl();
 				if (input.handled) return null;
 				text = input.text;
 				images = input.images;
@@ -3238,7 +3561,17 @@ export class DesktopHost {
 			return this.#exclusive(
 				live,
 				async () => {
-					await this.#promptDelivery(live, request.id, text, images, true, false, editEntryId);
+					assertCallerControl();
+					await this.#promptDelivery(
+						live,
+						request.id,
+						text,
+						images,
+						true,
+						false,
+						editEntryId,
+						assertCallerControl,
+					);
 					return null;
 				},
 				false,
@@ -3263,10 +3596,15 @@ export class DesktopHost {
 		return this.#exclusive(
 			live,
 			async () => {
+				assertCallerControl();
 				switch (method) {
 					case "session.rename": {
 						const title = requiredString(params, "title", 200).trim();
-						await admitted(live, sdk => sdk.setSessionName(title, "user"), runtime => runtime.session.setSessionName(title, "user"));
+						await admitted(
+							live,
+							sdk => sdk.setSessionName(title, "user"),
+							runtime => runtime.session.setSessionName(title, "user"),
+						);
 						metadata.title = title;
 						this.#publishSnapshot();
 						return null;
@@ -3283,10 +3621,21 @@ export class DesktopHost {
 					case "session.revision":
 						return this.#showRevision(live, params);
 					case "session.compact":
-						await admitted(live, sdk => sdk.compact(), runtime => runtime.session.compact());
+						await admitted(
+							live,
+							sdk => sdk.compact(),
+							runtime => runtime.session.compact(),
+						);
 						return null;
 					case "session.retry":
-						if (!(await admitted(live, sdk => sdk.retry(), runtime => runtime.session.retry()))) throw new Error("Session cannot be retried");
+						if (
+							!(await admitted(
+								live,
+								sdk => sdk.retry(),
+								runtime => runtime.session.retry(),
+							))
+						)
+							throw new Error("Session cannot be retried");
 						return null;
 					case "session.export": {
 						const directory = path.join(this.dataDir, "exports");
@@ -3315,20 +3664,35 @@ export class DesktopHost {
 						try {
 							requireAppliedPreference(
 								(await createNativeAdmission(live.native?.runtime)(
-									rt => rt.preferences.handle("model.select", { provider: model.provider, modelId: model.id, scope: "global" }),
+									rt =>
+										rt.preferences.handle("model.select", {
+											provider: model.provider,
+											modelId: model.id,
+											scope: "global",
+										}),
 									() => controls.selectModel({ provider: model.provider, modelId: model.id, scope: "global" }),
 								)) as SdkSelectModelResult,
 							);
 						} finally {
 							controls.dispose();
 						}
-						if (level !== undefined) await admitted(live, sdk => sdk.setThinkingLevelForControl(level, true), runtime => runtime.session.setThinkingLevelForControl(level, true));
+						assertCallerControl();
+						if (level !== undefined)
+							await admitted(
+								live,
+								sdk => sdk.setThinkingLevelForControl(level, true),
+								runtime => runtime.session.setThinkingLevelForControl(level, true),
+							);
 						return null;
 					}
 					case "thinking.set": {
 						this.#assertModelCatalogReady(live.sdk.modelRegistry);
 						const level = validateSessionThinking(live.sdk, params.level);
-						await admitted(live, sdk => sdk.setThinkingLevelForControl(level, false), runtime => runtime.session.setThinkingLevelForControl(level, false));
+						await admitted(
+							live,
+							sdk => sdk.setThinkingLevelForControl(level, false),
+							runtime => runtime.session.setThinkingLevelForControl(level, false),
+						);
 						return null;
 					}
 					case "tools.set": {
@@ -3338,7 +3702,11 @@ export class DesktopHost {
 							names.some(name => typeof name !== "string" || !live.sdk.getAllToolNames().includes(name))
 						)
 							throw new Error("Invalid tool names");
-						await admitted(live, sdk => sdk.setActiveToolsByName(names as string[], { explicit: true }), runtime => runtime.session.setActiveToolsByName(names as string[], { explicit: true }));
+						await admitted(
+							live,
+							sdk => sdk.setActiveToolsByName(names as string[], { explicit: true }),
+							runtime => runtime.session.setActiveToolsByName(names as string[], { explicit: true }),
+						);
 						return null;
 					}
 					case "goal.operate": {
@@ -3352,7 +3720,15 @@ export class DesktopHost {
 							op !== "drop"
 						)
 							throw new Error("Invalid goal operation");
-						return admitted(live, sdk => sdk.operateGoal(op, op === "create" ? requiredString(params, "objective") : undefined), runtime => runtime.workflow.operateGoal(op, op === "create" ? requiredString(params, "objective") : undefined));
+						return admitted(
+							live,
+							sdk => sdk.operateGoal(op, op === "create" ? requiredString(params, "objective") : undefined),
+							runtime =>
+								runtime.workflow.operateGoal(
+									op,
+									op === "create" ? requiredString(params, "objective") : undefined,
+								),
+						);
 					}
 					default:
 						throw new Error("Unknown method");
@@ -3371,6 +3747,7 @@ export class DesktopHost {
 		if (live.completion?.isCurrent()) return live.completion;
 		const sdk = live.sdk;
 		const generation = sdk.sessionLifecycle.generation;
+		const controlGeneration = this.#controlGeneration(live);
 		const sessionId = sdk.sessionId;
 		const manager = sdk.sessionManager;
 		const cwd = manager.getCwd();
@@ -3383,6 +3760,7 @@ export class DesktopHost {
 				this.#live.get(live.metadata.id) === live &&
 				!this.#retiredLive.has(live) &&
 				live.completion === completion &&
+				this.#controlGeneration(live) === controlGeneration &&
 				!live.gateMutation &&
 				!!project &&
 				!project.closed &&
@@ -3420,20 +3798,9 @@ export class DesktopHost {
 			!project.closed &&
 			project.path === cwd;
 		let rawText: string;
-		if (metadata.managed && !this.#live.has(metadata.id)) {
-			const session = this.#managed.get(metadata.id);
-			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
-			const current = () =>
-				catalogCurrent() &&
-				!!session &&
-				this.#managed.get(metadata.id) === session &&
-				session.isAttached &&
-				session.controlGeneration === generation &&
-				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
-			if (!session || !current()) throw new Error("SDK owner changed. Select the conversation again.");
-			rawText = await session.copyText(entryId, generation);
-			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-		} else {
+		if (metadata.managed && !this.#live.has(metadata.id))
+			throw new Error("Connect this conversation before requesting exact message copies.");
+		{
 			// Copy never opens an owner or takes the mutation lock, even during a run.
 			const live = this.#live.get(metadata.id);
 			if (!live) throw new Error("Session changed. Select the conversation again.");
@@ -3442,6 +3809,7 @@ export class DesktopHost {
 			const file = manager.getSessionFile();
 			const managerId = manager.getSessionId();
 			const identityGeneration = manager.getSessionIdentityGeneration();
+			const sdkGeneration = sdk.sessionLifecycle.generation;
 			const sessionId = sdk.sessionId;
 			const current = () =>
 				catalogCurrent() &&
@@ -3451,7 +3819,8 @@ export class DesktopHost {
 				live.sdk === sdk &&
 				!sdk.sessionLifecycle.disposed &&
 				!sdk.sessionLifecycle.transitioning &&
-				sdk.sessionLifecycle.generation === generation &&
+				sdk.sessionLifecycle.generation === sdkGeneration &&
+				this.#controlGeneration(live) === generation &&
 				sdk.sessionId === sessionId &&
 				sdk.sessionManager === manager &&
 				manager.getSessionId() === managerId &&
@@ -3480,31 +3849,13 @@ export class DesktopHost {
 	async #complete(params: Record<string, unknown>): Promise<DesktopCompletionResult> {
 		const input = readDesktopCompletionInput(params);
 		const metadata = this.#metadata(params);
-		if (metadata.managed && !this.#live.has(metadata.id)) {
-			// A read of suggestions never opens/reconnects an owner on behalf of an old draft.
-			const session = this.#managed.get(metadata.id);
-			const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
-			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
-			const cwd = project?.path;
-			const current = () =>
-				!this.#closed &&
-				!!project &&
-				!project.closed &&
-				project.path === cwd &&
-				this.#managed.get(metadata.id) === session &&
-				session?.isAttached === true &&
-				session.controlGeneration === input.sessionGeneration &&
-				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
-			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-			const result = await session!.query("composer.complete", { text: input.text, cursor: input.cursor });
-			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-			return this.#filterCompletions(projectDesktopCompletion(result as SdkComposerCompletionResult));
-		}
+		if (metadata.managed && !this.#live.has(metadata.id))
+			throw new Error("Connect this conversation before requesting composer suggestions.");
 		const live = this.#live.get(metadata.id);
-		if (!live || live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
+		if (!live || this.#controlGeneration(live) !== input.sessionGeneration)
 			throw new Error("Session changed. Select the conversation again.");
 		await this.#awaitStartup(live);
-		if (live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
+		if (this.#live.get(metadata.id) !== live || this.#controlGeneration(live) !== input.sessionGeneration)
 			throw new Error("Session changed. Select the conversation again.");
 		return this.#filterCompletions(await this.#composer(live).complete(input.text, input.cursor));
 	}
@@ -3515,122 +3866,59 @@ export class DesktopHost {
 		};
 	}
 
-	async #openManaged(metadata: SavedSession): Promise<ManagedSession> {
-		const existing = this.#managed.get(metadata.id);
-		if (existing?.isAttached) return existing;
-		const pending = this.#managedOpening.get(metadata.id);
-		if (pending) return pending;
-		if (existing) this.#managed.delete(metadata.id);
+	async #observeDiscovered(metadata: SavedSession): Promise<EmbeddedTranscriptObservation> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
-		const projectEpoch = this.#managedProjectEpochs.get(project.id) ?? 0;
-		const cwd = project.path;
-		const session = new ManagedSession({
-			agentDir: this.agentDir,
+		const epoch = this.#discoveryEpochs.get(project.id) ?? 0;
+		const inventory = await listEmbeddedProjectSessions({
 			cwd: project.path,
-			id: metadata.id,
-			sessionId: metadata.sessionId ?? metadata.id,
-			projectId: metadata.projectId,
-			title: metadata.title,
-			starred: metadata.starred,
-			nextControlGeneration: () => {
-				if (this.#managedControlEpoch >= Number.MAX_SAFE_INTEGER)
-					throw new Error("Desktop control generation exhausted");
-				return ++this.#managedControlEpoch;
-			},
-			redact: text => this.#redact(text),
-			delivery: (id, changes) => this.#delivery(id, changes),
-			onTaskCompleted: (turnId, desktopEpoch) => {
-				if (
-					!this.#closed &&
-					this.#managed.get(metadata.id) === session &&
-					this.#catalog.sessions.includes(metadata) &&
-					this.#catalog.projects.includes(project) &&
-					project.id === metadata.projectId &&
-					!project.closed &&
-					project.path === cwd &&
-					(this.#managedProjectEpochs.get(project.id) ?? 0) === projectEpoch &&
-					session.controlGeneration === desktopEpoch &&
-					typeof turnId === "string" &&
-					turnId.trim()
-				)
-					this.#taskCompleted(metadata.id, ["managed", desktopEpoch, turnId]);
-			},
-			onChange: () => {
-				if (this.#managed.get(metadata.id) === session && !this.#closed && !project.closed)
-					this.#emit({ type: "session", session: session.dto() });
-			},
+			agentDir: this.agentDir,
+			directory: path.join(this.dataDir, "sessions", project.id),
 		});
-		const opening = (async () => {
-			try {
-				await existing?.close();
-				await session.open();
-				if (this.#closed || project.closed || (this.#managedProjectEpochs.get(project.id) ?? 0) !== projectEpoch)
-					throw new Error("Workspace closed while connecting to SDK owner");
-				this.#managed.set(metadata.id, session);
-				return session;
-			} catch (error) {
-				await session.close();
-				throw error;
-			}
-		})();
-		this.#managedOpening.set(metadata.id, opening);
-		try {
-			return await opening;
-		} finally {
-			if (this.#managedOpening.get(metadata.id) === opening) this.#managedOpening.delete(metadata.id);
-		}
+		if (
+			this.#closed ||
+			project.closed ||
+			!this.#catalog.sessions.includes(metadata) ||
+			(this.#discoveryEpochs.get(project.id) ?? 0) !== epoch
+		)
+			throw new Error("Workspace or conversation changed while observing history");
+		const matches = inventory.managed.filter(item => item.id === (metadata.sessionId ?? metadata.id));
+		if (matches.length !== 1) throw new Error("Transcript identity is ambiguous or unavailable");
+		const observed = observeEmbeddedTranscript({
+			file: matches[0]!.path,
+			cwd: project.path,
+			sessionId: metadata.sessionId ?? metadata.id,
+		});
+		if (observed.kind !== "observed") throw new Error(`Transcript observation refused: ${observed.reason}`);
+		return observed;
 	}
 
-	async #dispatchManaged(request: DesktopRequest, metadata: SavedSession): Promise<unknown> {
+	async #dispatchDiscovered(request: DesktopRequest, metadata: SavedSession): Promise<unknown> {
 		const { method, params } = request;
-		const supported = [
-			"session.select",
-			"history.get",
-			"prompt",
-			"abort",
-			"models.list",
-			"model.set",
-			"thinking.set",
-			"session.info",
-		];
-		if (!supported.includes(method))
-			throw new Error(`The SDK owner does not support desktop ${method}. Use its original control surface.`);
-		const query =
-			method === "session.select" ||
-			method === "history.get" ||
-			method === "models.list" ||
-			method === "session.info";
-		// A write must not resume/reconnect an owner on behalf of an old rendered
-		// intent. Only reads may establish or synchronize the current attachment.
-		const session = query ? await this.#openManaged(metadata) : this.#managed.get(metadata.id);
-		if (
-			!session ||
-			(!query &&
-				(!Number.isSafeInteger(params.sessionGeneration) || params.sessionGeneration !== session.controlGeneration))
-		)
-			throw new Error("SDK owner changed before control dispatch. Select the conversation again.");
+		if (!["session.select", "history.get", "models.list"].includes(method))
+			throw new Error(`Connect this conversation before requesting ${method}; only persisted history is available.`);
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
+		const cwd = project.path;
+		const epoch = this.#discoveryEpochs.get(project.id) ?? 0;
+		const assertCurrent = () => {
+			if (
+				this.#closed ||
+				project.closed ||
+				!this.#catalog.projects.includes(project) ||
+				project.path !== cwd ||
+				!this.#catalog.sessions.includes(metadata) ||
+				(this.#discoveryEpochs.get(project.id) ?? 0) !== epoch
+			)
+				throw new Error("Workspace or conversation changed while observing history");
+		};
+		const observed = await this.#observeDiscovered(metadata);
+		assertCurrent();
+		if (this.#live.has(metadata.id)) return this.#dispatch(request);
+		this.#observed.set(metadata.id, observed);
 		switch (method) {
-			case "session.info": {
-				if (Object.keys(params).some(key => key !== "sessionId"))
-					throw new Error("Invalid session read parameters");
-				const generation = session.controlGeneration;
-				const info = await session.query("session.info");
-				if (
-					this.#closed ||
-					this.#managed.get(metadata.id) !== session ||
-					!session.isAttached ||
-					session.controlGeneration !== generation
-				)
-					throw new Error("SDK owner changed. Select the conversation again.");
-				return projectDesktopSessionInfo(info as SdkSessionInfo, {
-					catalogSessionId: metadata.id,
-					redact: text => this.#redact(text),
-				});
-			}
 			case "session.select":
-				await session.refresh();
 				this.#publishSnapshot();
-				return session.dto();
+				assertCurrent();
+				return this.#dto(metadata, 2_000_000, observed);
 			case "history.get": {
 				const offset = params.offset ?? 0;
 				const limit = params.limit ?? HISTORY_PAGE_LIMIT;
@@ -3644,26 +3932,23 @@ export class DesktopHost {
 					limit > HISTORY_PAGE_LIMIT
 				)
 					throw new Error("Invalid history page");
-				await session.refresh();
-				return session.history(offset, limit);
+				if (observed.selectionRequired)
+					throw new Error("History requires an exact branch selection through session.connect.");
+				const { total, page, truncated } = projectHistoryPage(observed.messages, offset, limit, text =>
+					this.#redact(text),
+				);
+				assertCurrent();
+				return {
+					sessionId: metadata.id,
+					total,
+					offset,
+					messages: page,
+					truncated: truncated || observed.unresolvedCount > 0,
+					observation: this.#dto(metadata, 2_000_000, observed).observation,
+				} satisfies DesktopHistory;
 			}
-			case "prompt": {
-				if (params.editEntryId !== undefined)
-					throw new Error("Prompt editing is unavailable for this SDK connection.");
-				const input = prepareDesktopAttachmentInput(request);
-				if (input.images.length) throw new Error("Image submission is unavailable for this SDK connection");
-				await session.prompt(request.id, input.text, params.deliverAs);
-				return null;
-			}
-			case "abort":
-				return session.control("turn.abort");
 			case "models.list":
-				await session.refresh();
-				return session.models();
-			case "model.set":
-				return session.setModel(requiredString(params, "modelId", 500), params.thinkingLevel);
-			case "thinking.set":
-				return session.setThinking(params.level);
+				return [];
 		}
 	}
 
@@ -3676,21 +3961,8 @@ export class DesktopHost {
 		// The close already owns the workspace's queue entry, so teardown must finish on a budget:
 		// an uncooperative abort would otherwise keep every later reopen of this folder waiting.
 		const deadline = AbortSignal.timeout(CLOSE_TEARDOWN_TIMEOUT_MS);
-		this.#managedProjectEpochs.set(projectId, (this.#managedProjectEpochs.get(projectId) ?? 0) + 1);
-		const managedOpening = [...this.#managedOpening.entries()].filter(
-			([id]) => this.#catalog.sessions.find(session => session.id === id)?.projectId === projectId,
-		);
-		for (const [id] of managedOpening) this.#managedOpening.delete(id);
-		await Promise.allSettled(managedOpening.map(([, opening]) => bounded(opening, deadline)));
-		for (const [id, session] of [...this.#managed]) {
-			if (this.#catalog.sessions.find(item => item.id === id)?.projectId !== projectId) continue;
-			this.#managed.delete(id);
-			try {
-				await bounded(session.close(), deadline);
-			} catch (error) {
-				console.error(`Desktop workspace could not detach SDK session ${id}: ${String(error)}`);
-			}
-		}
+		for (const session of this.#catalog.sessions)
+			if (session.projectId === projectId) this.#observed.delete(session.id);
 		// A session that is still opening when the workspace closes must not stay live either:
 		// settling each in-flight open lets its publish path see the closed project and refuse.
 		const opening = [...this.#opening.entries()]
@@ -3721,7 +3993,11 @@ export class DesktopHost {
 			this.#live.delete(id);
 			this.#retiredLive.add(live);
 			try {
-				await admitted(live, sdk => sdk.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS }), runtime => runtime.queue.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS }));
+				await admitted(
+					live,
+					sdk => sdk.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS }),
+					runtime => runtime.queue.abort({ cause: "session_switch", timeoutMs: CLOSE_ABORT_TIMEOUT_MS }),
+				);
 			} catch (error) {
 				console.error(`Desktop workspace close could not abort session ${id}: ${String(error)}`);
 			}
@@ -3749,17 +4025,26 @@ export class DesktopHost {
 		return next;
 	}
 
+	#isDiscoveryExcluded(projectId: string, sessionId: string, file: string): boolean {
+		const matches = (item: SelectedForkTranscript | DeletedTranscript) =>
+			item.projectId === projectId && item.sessionId === sessionId && item.file === file;
+		return (
+			(this.#catalog.selectedForkTranscripts?.some(matches) ?? false) ||
+			(this.#catalog.deletedTranscripts?.some(matches) ?? false)
+		);
+	}
+
 	/** Read-only SDK inventory: no recovery, transcript copies, or eager live sessions. */
 	async #discoverProjectSessions(
 		project: DesktopProject,
-	): Promise<{ discovered: SavedSession[]; creationTimes: Map<string, number> }> {
+	): Promise<{ discovered: DiscoveredSession[]; creationTimes: Map<string, number> }> {
 		const { managed, local: desktop } = await listEmbeddedProjectSessions({
 			cwd: project.path,
 			agentDir: this.agentDir,
 			directory: path.join(this.dataDir, "sessions", project.id),
 		});
 		const sessions = [...managed, ...desktop];
-		const discovered: SavedSession[] = [];
+		const discovered: DiscoveredSession[] = [];
 		const creationTimes = new Map<string, number>();
 		const ids = new Set(this.#catalog.sessions.map(session => session.id));
 		for (const session of sessions.sort((left, right) => left.created.getTime() - right.created.getTime())) {
@@ -3779,17 +4064,88 @@ export class DesktopHost {
 			);
 			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
 			if (existing || desktop.includes(session) || ids.has(session.id)) continue;
+			const file = await fs.realpath(session.path).catch(() => undefined);
+			if (!file || this.#isDiscoveryExcluded(project.id, session.id, file)) continue;
 			ids.add(session.id);
 			discovered.push({
-				id: session.id,
-				projectId: project.id,
-				title: (session.title || session.firstMessage.trim() || "Untitled session").slice(0, 200),
-				starred: session.starred,
-				managed: true,
-				createdAt,
+				sessionId: session.id,
+				file,
+				metadata: {
+					id: session.id,
+					projectId: project.id,
+					title: (session.title || session.firstMessage.trim() || "Untitled session").slice(0, 200),
+					starred: session.starred,
+					managed: true,
+					createdAt,
+				},
 			});
 		}
 		return { discovered, creationTimes };
+	}
+
+	/** Explicit refresh scans outside the workspace lock; close can fence a slow scan immediately. */
+	#refreshProjectSessions(project: DesktopProject): Promise<DesktopProjectRefreshResult> {
+		const epoch = this.#discoveryEpochs.get(project.id) ?? 0;
+		const previous = this.#discoveryRefreshes.get(project.id);
+		if (previous?.epoch === epoch) {
+			if (previous.pending) return previous.pending;
+			const retryAfter = DISCOVERY_REFRESH_INTERVAL_MS - (performance.now() - previous.startedAt);
+			if (retryAfter > 0) return Promise.resolve({ kind: "throttled", retryAfter, snapshot: this.snapshot() });
+		}
+		const refresh: { epoch: number; startedAt: number; pending?: Promise<DesktopProjectRefreshResult> } = {
+			epoch,
+			startedAt: performance.now(),
+		};
+		const cwd = project.path;
+		const current = () =>
+			!this.#closed &&
+			!project.closed &&
+			project.path === cwd &&
+			this.#catalog.projects.includes(project) &&
+			(this.#discoveryEpochs.get(project.id) ?? 0) === epoch;
+		const pending = (async (): Promise<DesktopProjectRefreshResult> => {
+			try {
+				const { discovered } = await this.#discoverProjectSessions(project);
+				return await this.#withProject(cwd, async () => {
+					if (!current()) throw new Error("Workspace changed while refreshing discovery");
+					// Recheck against the current catalog, not the scan's starting snapshot.
+					// Appending keeps every existing user-ordered slot and live row intact.
+					const added: SavedSession[] = [];
+					for (const { metadata: session, sessionId, file } of discovered) {
+						if (
+							this.#isDiscoveryExcluded(project.id, sessionId, file) ||
+							this.#catalog.sessions.some(
+								item =>
+									item.id === session.id || (item.projectId === project.id && item.sessionId === session.id),
+							)
+						)
+							continue;
+						this.#catalog.sessions.push(session);
+						added.push(session);
+					}
+					// A scan with no new rows has no publication to serialize behind other writers.
+					if (added.length === 0) return { kind: "refreshed", snapshot: this.snapshot() };
+					try {
+						await this.#save();
+					} catch (error) {
+						const additions = new Set(added);
+						this.#catalog.sessions = this.#catalog.sessions.filter(item => !additions.has(item));
+						throw error;
+					}
+					if (!current()) throw new Error("Workspace changed while refreshing discovery");
+					this.#publishSnapshot();
+					return { kind: "refreshed", snapshot: this.snapshot() };
+				});
+			} catch (error) {
+				if (this.#discoveryRefreshes.get(project.id) === refresh) this.#discoveryRefreshes.delete(project.id);
+				throw error;
+			} finally {
+				delete refresh.pending;
+			}
+		})();
+		refresh.pending = pending;
+		this.#discoveryRefreshes.set(project.id, refresh);
+		return pending;
 	}
 
 	/** Restores or refreshes a workspace under the same fence used by close. */
@@ -3801,6 +4157,7 @@ export class DesktopHost {
 			path: resolved,
 		};
 		const { discovered, creationTimes } = await this.#discoverProjectSessions(project);
+		if (this.#closed) throw new Error("Host is closed");
 		const previousCreationTimes = new Map(this.#catalog.sessions.map(session => [session, session.createdAt]));
 		for (const session of this.#catalog.sessions) {
 			const createdAt = creationTimes.get(session.id);
@@ -3810,7 +4167,14 @@ export class DesktopHost {
 		delete project.closed;
 		if (!existing) this.#catalog.projects.push(project);
 		// Place newly discovered history chronologically without disturbing any existing user order.
-		for (const session of discovered) {
+		for (const { metadata: session, sessionId, file } of discovered) {
+			if (
+				this.#isDiscoveryExcluded(project.id, sessionId, file) ||
+				this.#catalog.sessions.some(
+					item => item.id === session.id || (item.projectId === project.id && item.sessionId === sessionId),
+				)
+			)
+				continue;
 			const index = this.#catalog.sessions.findIndex(
 				item =>
 					item.projectId === project.id &&
@@ -3828,7 +4192,7 @@ export class DesktopHost {
 				if (createdAt === undefined) delete session.createdAt;
 				else session.createdAt = createdAt;
 			}
-			const added = new Set(discovered);
+			const added = new Set(discovered.map(item => item.metadata));
 			this.#catalog.sessions = this.#catalog.sessions.filter(session => !added.has(session));
 			if (!existing) this.#catalog.projects = this.#catalog.projects.filter(item => item !== project);
 			if (closed !== undefined) project.closed = closed;
@@ -3844,6 +4208,8 @@ export class DesktopHost {
 	 */
 	async #closeProject(project: DesktopProject): Promise<null> {
 		const previous = project.closed;
+		this.#discoveryEpochs.set(project.id, (this.#discoveryEpochs.get(project.id) ?? 0) + 1);
+		this.#discoveryRefreshes.delete(project.id);
 		project.closed = true;
 		try {
 			await this.#save();
@@ -3875,23 +4241,65 @@ export class DesktopHost {
 		return null;
 	}
 
+	/** Prove the retired owner's exact saved identity without admitting another SDK owner. */
+	async #deletedTranscript(
+		metadata: SavedSession,
+		sessionId: string,
+		sdkFile: string | undefined,
+	): Promise<DeletedTranscript | undefined> {
+		// Absence is not proof of retirement or artifact-deletion authority. The caller
+		// must already have completed normal live disposal, even on this path.
+		if (await this.#transcriptMissing(metadata)) return;
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+		if (!project || !metadata.file || !sdkFile || metadata.sessionId !== sessionId)
+			throw new Error("Cannot prove deleted transcript identity");
+		const file = await fs.realpath(this.#sessionPath(metadata.file, metadata.scope));
+		const root = await fs.realpath(this.#storageRoot(metadata.scope));
+		if (!file.startsWith(`${root}${path.sep}`) || (await fs.realpath(sdkFile)) !== file)
+			throw new Error("Deleted transcript file does not match its retired SDK owner");
+		const observed = observeEmbeddedTranscript({ file, cwd: project.path, sessionId });
+		if (
+			observed.kind !== "observed" ||
+			observed.identity.sessionId !== sessionId ||
+			observed.identity.canonicalPath !== file
+		)
+			throw new Error("Cannot prove deleted transcript identity from its saved bytes");
+		return { projectId: metadata.projectId, sessionId, file };
+	}
+
 	async #deleteSession(live: LiveSession, metadata: SavedSession): Promise<null> {
 		this.#cancelQuestions(live);
 		live.queued.clear();
+		const sessionId = live.sdk.sessionId;
+		const sdkFile = live.sdk.sessionFile;
 		await this.#disposeLive(live);
 		this.#live.delete(metadata.id);
+		if (live.sdk.sessionId !== sessionId || live.sdk.sessionFile !== sdkFile)
+			throw new Error("Deleted transcript identity changed during SDK retirement");
+		const deletion = await this.#deletedTranscript(metadata, sessionId, sdkFile);
 		const index = this.#catalog.sessions.indexOf(metadata);
+		const hadDeletions = this.#catalog.deletedTranscripts !== undefined;
+		if (deletion) {
+			this.#catalog.deletedTranscripts ??= [];
+			this.#catalog.deletedTranscripts.push(deletion);
+		}
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
 		try {
+			// The exact exclusion and removal share one atomic catalog replacement.
+			// Discovery also rechecks current exclusions at each insertion boundary.
 			await this.#save();
 		} catch (error) {
 			this.#catalog.sessions.splice(index, 0, metadata);
+			if (deletion) {
+				this.#catalog.deletedTranscripts = this.#catalog.deletedTranscripts!.filter(item => item !== deletion);
+				if (!hadDeletions && this.#catalog.deletedTranscripts.length === 0) delete this.#catalog.deletedTranscripts;
+			}
 			throw error;
 		}
-		// A transcript another surface already removed is forgotten after live-owner
-		// disposal; its absence is not deletion authority for the SDK.
-		if (metadata.file && !(await this.#transcriptMissing(metadata)))
-			await this.#deleteTranscript(metadata.file, metadata.scope);
+		// A cleanup failure must not turn this explicit deletion into new discovery.
+		// Missing bytes still authorize neither SDK deletion nor artifact cleanup.
+		if (deletion)
+			await deleteEmbeddedSession(deletion.file, metadata.scope === "managed" ? { managed: true } : undefined);
 		this.#publishSnapshot();
 		return null;
 	}
@@ -3925,7 +4333,11 @@ export class DesktopHost {
 		};
 		void (async () => {
 			try {
-				const result = await admitted(live, sdk => sdk.generateAutoSessionTitle(text, { signal: controller.signal }), runtime => runtime.session.generateAutoSessionTitle(text, { signal: controller.signal }));
+				const result = await admitted(
+					live,
+					sdk => sdk.generateAutoSessionTitle(text, { signal: controller.signal }),
+					runtime => runtime.session.generateAutoSessionTitle(text, { signal: controller.signal }),
+				);
 				if (result.kind === "failed") {
 					console.error("Desktop automatic session title generation failed");
 					return;
@@ -3965,9 +4377,13 @@ export class DesktopHost {
 		text: string,
 		requestId: string,
 		alreadyBegun = false,
+		assertCallerControl: () => void = () => {},
 	): Promise<DesktopCommandResult> {
+		assertCallerControl();
 		const live = await this.#open(metadata);
+		assertCallerControl();
 		await this.#awaitStartup(live);
+		assertCallerControl();
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 		if (/^\s*\/btw(?:\s|$)/i.test(text)) {
 			const question = text
@@ -3994,13 +4410,21 @@ export class DesktopHost {
 			// would report success and an unknown name would spend a provider turn.
 			return { consumed: false, refused: true, output: DESKTOP_UNAVAILABLE };
 		// Commands mutate the same session as prompts, so they take the same lock.
-		return this.#exclusive(live, () => this.#runCommand(live, text, requestId, alreadyBegun), true);
+		return this.#exclusive(
+			live,
+			() => {
+				assertCallerControl();
+				return this.#runCommand(live, text, requestId, alreadyBegun, assertCallerControl);
+			},
+			true,
+		);
 	}
 	async #runCommand(
 		live: LiveSession,
 		text: string,
 		requestId: string,
 		alreadyBegun = false,
+		assertCallerControl: () => void = () => {},
 	): Promise<DesktopCommandResult> {
 		const chunks: string[] = [];
 		let written = 0;
@@ -4014,19 +4438,34 @@ export class DesktopHost {
 			if (bounded.length < redacted.length) dropped = true;
 		};
 		const runtime: SlashCommandRuntime = {
-			session: admittedSlashSession(live),
+			session: admittedSlashSession(live, assertCallerControl),
 			sessionManager: live.sdk.sessionManager,
 			settings: live.settings,
 			cwd: live.sdk.sessionManager.getCwd(),
 			output: value => append(String(value)),
 			refreshCommands: async () => {
-				await admitted(live, () => live.factory.refreshCommands(), runtime => runtime.session.refreshCommands());
+				assertCallerControl();
+				await admitted(
+					live,
+					() => live.factory.refreshCommands(),
+					runtime => runtime.session.refreshCommands(),
+				);
 				live.completion = undefined;
 				this.#publishSnapshot();
 			},
 			reloadPlugins: async () => {
-				await admitted(live, sdk => sdk.reloadSkills(), runtime => runtime.session.reloadSkills());
-				await admitted(live, () => live.factory.refreshCommands(), runtime => runtime.session.refreshCommands());
+				assertCallerControl();
+				await admitted(
+					live,
+					sdk => sdk.reloadSkills(),
+					runtime => runtime.session.reloadSkills(),
+				);
+				assertCallerControl();
+				await admitted(
+					live,
+					() => live.factory.refreshCommands(),
+					runtime => runtime.session.refreshCommands(),
+				);
 				live.completion = undefined;
 				this.#publishSnapshot();
 			},
@@ -4062,7 +4501,17 @@ export class DesktopHost {
 				// A builtin that returns a prompt starts a real turn, so its failure is the
 				// conversation's failure even though command.run itself is administrative.
 				try {
-					await this.#promptDelivery(live, requestId, forwarded, [], alreadyBegun, true);
+					assertCallerControl();
+					await this.#promptDelivery(
+						live,
+						requestId,
+						forwarded,
+						[],
+						alreadyBegun,
+						true,
+						undefined,
+						assertCallerControl,
+					);
 				} catch (error) {
 					if (
 						!live.errorOwner &&
@@ -4126,14 +4575,18 @@ export class DesktopHost {
 		// Attach a handler immediately while unrelated session cleanup drains.
 		void authorizationClose?.catch(() => {});
 		await attempt(() => this.#cancelQuestions());
-		await Promise.allSettled([...this.#opening.values(), ...this.#managedOpening.values()]);
-		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
-		this.#managed.clear();
+		await Promise.allSettled([...this.#opening.values()]);
+		this.#observed.clear();
 		await attempt(() => this.#cancelQuestions());
 		await Promise.all(
 			[...this.#live.values()].map(live =>
 				attempt(() =>
-					admitted(live, sdk => sdk.abort(), runtime => runtime.queue.abort(), "queue.abort"),
+					admitted(
+						live,
+						sdk => sdk.abort(),
+						runtime => runtime.queue.abort(),
+						"queue.abort",
+					),
 				),
 			),
 		);

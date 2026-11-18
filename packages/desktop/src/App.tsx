@@ -717,6 +717,35 @@ export default function App() {
 	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal && recoveryReady;
+	const discoveryView = useRef({ connected, projects: snapshot?.projects ?? [] });
+	discoveryView.current = { connected, projects: snapshot?.projects ?? [] };
+	useEffect(() => {
+		let alive = true;
+		const refresh = () => {
+			if (!alive || !discoveryView.current.connected) return;
+			for (const project of discoveryView.current.projects) {
+				// Only ordered host frames update the catalog; a response may already be stale.
+				void request("project.refresh", { projectId: project.id }).catch(error => {
+					if (alive && discoveryView.current.connected)
+						console.warn("Background project discovery refresh failed", error);
+				});
+			}
+		};
+		const foreground = () => {
+			if (document.visibilityState === "visible") refresh();
+		};
+		window.addEventListener("focus", refresh);
+		window.addEventListener("online", refresh);
+		window.addEventListener("pageshow", refresh);
+		document.addEventListener("visibilitychange", foreground);
+		return () => {
+			alive = false;
+			window.removeEventListener("focus", refresh);
+			window.removeEventListener("online", refresh);
+			window.removeEventListener("pageshow", refresh);
+			document.removeEventListener("visibilitychange", foreground);
+		};
+	}, []);
 	const copyMounted = useRef(false);
 	useLayoutEffect(() => {
 		copyMounted.current = true;
@@ -885,6 +914,7 @@ export default function App() {
 				return;
 			}
 			if (event.type === "fatal") {
+				discoveryView.current.connected = false;
 				if (!bootstrapped) settleFailedBootstrap();
 				else
 					enqueueRecovery(async () => {
@@ -912,6 +942,7 @@ export default function App() {
 				setKey("");
 			}
 			if (event.type === "snapshot") {
+				discoveryView.current.projects = event.snapshot.projects;
 				setSnapshot(event.snapshot);
 				enqueueRecovery(async () => {
 					for (const receipt of event.snapshot.deliveries) await reconcileIndividually(receipt);
@@ -957,6 +988,7 @@ export default function App() {
 				}
 				const initial = await request<DesktopSnapshot>("bootstrap");
 				if (alive && !failed) {
+					discoveryView.current.projects = initial.projects;
 					setSnapshot(initial);
 					const bootstrapDeliveries = [...initial.deliveries];
 					for (const event of buffered) {
@@ -989,6 +1021,7 @@ export default function App() {
 				}
 			} catch (error) {
 				if (alive) {
+					discoveryView.current.connected = false;
 					if (!failed && !bootstrapped) settleFailedBootstrap();
 					failed = true;
 					setFatal(true);
@@ -1163,8 +1196,12 @@ export default function App() {
 					.find(item => item.dataset.transcriptMessage === position.anchor?.id)
 					?.querySelector<HTMLElement>(".message");
 				if (anchor && anchor.getBoundingClientRect().height > 0)
-					top = node.scrollTop + anchor.getBoundingClientRect().top
-						- node.getBoundingClientRect().top - node.clientTop - position.anchor.offset;
+					top =
+						node.scrollTop +
+						anchor.getBoundingClientRect().top -
+						node.getBoundingClientRect().top -
+						node.clientTop -
+						position.anchor.offset;
 			}
 			if (Math.abs(node.scrollTop - top) > 0.5) node.scrollTop = top;
 			appliedTop = node.scrollTop;
@@ -1192,13 +1229,17 @@ export default function App() {
 				// A shrink can clamp scrollTop before ResizeObserver runs. Growth cannot
 				// clamp it upward, so retain a reader's upward movement even when streamed
 				// content arrives before the browser delivers that scroll event.
-				const upwardDuringGrowth = node.scrollTop < appliedTop && node.scrollHeight > contentHeight
-					&& node.clientHeight === viewportHeight && node.clientWidth === viewportWidth;
-				if (!upwardDuringGrowth && (
-					node.scrollHeight !== contentHeight ||
-					node.clientHeight !== viewportHeight ||
-					node.clientWidth !== viewportWidth
-				)) {
+				const upwardDuringGrowth =
+					node.scrollTop < appliedTop &&
+					node.scrollHeight > contentHeight &&
+					node.clientHeight === viewportHeight &&
+					node.clientWidth === viewportWidth;
+				if (
+					!upwardDuringGrowth &&
+					(node.scrollHeight !== contentHeight ||
+						node.clientHeight !== viewportHeight ||
+						node.clientWidth !== viewportWidth)
+				) {
 					schedule();
 					return;
 				}

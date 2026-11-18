@@ -3,6 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getBundledModel } from "@gajae-code/ai";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import * as sdk from "@gajae-code/coding-agent/sdk";
@@ -10,7 +11,7 @@ import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/c
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
-import { ManagedSession } from "../src/managed-session";
+import { openNativeSession } from "../src/native-session";
 import {
 	type DesktopFrame,
 	type DesktopProject,
@@ -46,7 +47,7 @@ async function waitForEntry(entered: Promise<void>, operation: Promise<unknown>)
 		await Promise.race([
 			entered,
 			operation.then(() => {
-				throw new Error("SDK operation settled before entering the deferred attachment");
+				throw new Error("SDK operation settled before entering the deferred observation");
 			}),
 			expired.promise,
 		]);
@@ -73,7 +74,23 @@ async function fixture() {
 			dataDir,
 			emit: frame => frames.push(frame),
 			createSession: async options => {
-				const result = await createAgentSession({ ...options, extensions: [] });
+				const result = await createAgentSession({
+					...options,
+					model: getBundledModel("anthropic", "claude-sonnet-4-5"),
+					extensions: [],
+					skills: [],
+					rules: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					disableExtensionDiscovery: true,
+					enableMcpAutoload: false,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					deferOptionalModelRefresh: true,
+					deferMemoryBackendStartup: true,
+					toolNames: [],
+				});
 				created.push(result);
 				return result;
 			},
@@ -109,7 +126,13 @@ async function fixture() {
 		if (!file) throw new Error("Missing persisted session");
 		const id = manager.getSessionId();
 		const bytes = await Bun.file(file).text();
-		if (!keepOpen) await manager.close();
+		if (!keepOpen) {
+			const membership = manager.getOwnerMembership();
+			if (!membership) throw new Error("Missing fixture cooperative owner membership");
+			const closed = await manager.flushAndCloseStrict();
+			if (closed.kind !== "closed") throw new Error(`Fixture strict close failed: ${JSON.stringify(closed)}`);
+			expect(manager.retireCooperativeOwnerAfterClose(membership)).toBe(true);
+		}
 		return { id, file, bytes };
 	};
 	return {
@@ -231,22 +254,19 @@ test("serializes discovery refresh with close and reopen of the same project", a
 });
 
 for (const afterReopen of [false, true]) {
-	test(`does not publish an SDK attachment that finishes ${afterReopen ? "after project reopen" : "during project close"}`, async () => {
+	test(`does not publish a disk observation that finishes ${afterReopen ? "after project reopen" : "during project close"}`, async () => {
 		const h = await fixture();
 		const terminal = await h.persist("Delayed terminal attachment");
 		const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const opening = vi.spyOn(ManagedSession.prototype, "open").mockImplementation(async () => {
+		const list = sdk.listEmbeddedProjectSessions;
+		const listing = vi.spyOn(sdk, "listEmbeddedProjectSessions").mockImplementationOnce(async options => {
+			const inventory = await list(options);
 			entered.resolve();
 			await release.promise;
+			return inventory;
 		});
-		const detached = vi.spyOn(ManagedSession.prototype, "close").mockResolvedValue(undefined);
-		// Exercise a real late completion beyond the close budget without waiting
-		// fifteen seconds. The project must fence it even after closed is cleared.
-		const budget = afterReopen
-			? vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(AbortSignal.abort())
-			: undefined;
 		const selecting = h.call("session.select", { sessionId: terminal.id });
 		const pending: Promise<unknown>[] = [selecting];
 		try {
@@ -258,125 +278,162 @@ for (const afterReopen of [false, true]) {
 				if (Date.now() >= deadline) throw new Error("Project did not publish its closed fence");
 				await Bun.sleep(5);
 			}
-			const reopening = h.call("project.open", { path: h.projectDir });
-			pending.push(reopening);
+			await closing;
 			if (afterReopen) {
-				await closing;
-				await reopening;
+				await h.call("project.open", { path: h.projectDir });
 				expect(h.snapshot().projects.map(item => item.id)).toEqual([project.id]);
 			}
 			release.resolve();
-			await expect(selecting).rejects.toThrow("closed while connecting");
-			await closing;
-			await reopening;
-			expect(detached).toHaveBeenCalledTimes(1);
+			await expect(selecting).rejects.toThrow("changed while observing history");
+			if (!afterReopen) await h.call("project.open", { path: h.projectDir });
+			expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+			expect(h.snapshot().sessions.find(item => item.id === terminal.id)?.observation).toBeUndefined();
 			expect(h.created).toHaveLength(0);
 			expect(h.snapshot().sessions.find(item => item.id === terminal.id)?.controlGeneration).toBeNull();
 		} finally {
 			// Even a failed entry/fence assertion must unblock host.close in afterEach.
 			release.resolve();
 			await Promise.allSettled(pending);
-			budget?.mockRestore();
-			opening.mockRestore();
-			detached.mockRestore();
+			listing.mockRestore();
 		}
 	});
 }
 
-test("surfaces an SDK selection failure before the deferred attachment barrier", async () => {
+test("surfaces an SDK disk selection failure before the deferred observation barrier", async () => {
 	const h = await fixture();
 	const terminal = await h.persist("Unavailable attachment");
 	await h.call("project.open", { path: h.projectDir });
 	const entered = Promise.withResolvers<void>();
-	const opening = vi.spyOn(ManagedSession.prototype, "open").mockRejectedValue(new Error("Early selection failure"));
+	const opening = vi.spyOn(sdk, "observeEmbeddedTranscript").mockImplementation(() => {
+		throw new Error("Early selection failure");
+	});
 	const selecting = h.call("session.select", { sessionId: terminal.id });
 	try {
 		await expect(waitForEntry(entered.promise, selecting)).rejects.toThrow("Early selection failure");
+		expect(h.created).toHaveLength(0);
+		expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+		expect(h.snapshot().sessions[0]?.controlGeneration).toBeNull();
 	} finally {
 		await Promise.allSettled([selecting]);
 		opening.mockRestore();
 	}
 });
 
-test("requires the rendered managed generation for writes and never reconnects to satisfy a stale control", async () => {
+test("requires the rendered native generation for writes and never reconnects to satisfy a stale control", async () => {
+	const availableModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!availableModel) throw new Error("Missing fixture model");
+	process.env.GJC_NO_TITLE = "1";
 	const h = await fixture();
 	const terminal = await h.persist("Generation-owned controls");
 	await h.call("project.open", { path: h.projectDir });
-	const saved = h.snapshot().sessions.find(item => item.id === terminal.id);
-	if (!saved) throw new Error("Missing discovered fixture session");
-	let generation = 7;
-	let attached = true;
-	const opening = vi.spyOn(ManagedSession.prototype, "open").mockResolvedValue(undefined);
-	vi.spyOn(ManagedSession.prototype, "refresh").mockResolvedValue(undefined);
-	const attachmentDescriptor = Object.getOwnPropertyDescriptor(ManagedSession.prototype, "isAttached");
-	const generationDescriptor = Object.getOwnPropertyDescriptor(ManagedSession.prototype, "controlGeneration");
-	if (!attachmentDescriptor || !generationDescriptor) throw new Error("Missing attachment fixture properties");
-	Object.defineProperties(ManagedSession.prototype, {
-		isAttached: { configurable: true, get: () => attached },
-		controlGeneration: { configurable: true, get: () => (attached ? generation : null) },
-	});
-	cleanups.push(async () => {
-		Object.defineProperties(ManagedSession.prototype, {
-			isAttached: attachmentDescriptor,
-			controlGeneration: generationDescriptor,
-		});
-	});
-	vi.spyOn(ManagedSession.prototype, "dto").mockImplementation(() => ({ ...saved, controlGeneration: generation }));
-	const model = vi.spyOn(ManagedSession.prototype, "setModel").mockResolvedValue(undefined);
-	const thinking = vi.spyOn(ManagedSession.prototype, "setThinking").mockResolvedValue(undefined);
-	const prompt = vi.spyOn(ManagedSession.prototype, "prompt").mockResolvedValue(undefined);
-	const control = vi.spyOn(ManagedSession.prototype, "control").mockResolvedValue(undefined);
 	const writes: Array<{ method: DesktopRequest["method"]; input: Record<string, unknown> }> = [
-		{ method: "model.set", input: { modelId: "fixture/model" } },
-		{ method: "thinking.set", input: { level: "high" } },
+		{ method: "model.set", input: { modelId: "anthropic/claude-sonnet-4-5" } },
+		{ method: "thinking.set", input: { level: "off" } },
 		{ method: "prompt", input: { text: "Only the rendered owner may receive this" } },
 		{ method: "abort", input: {} },
 	];
-	// Writes are not permission to create a connection, even with a plausible generation.
-	await expect(
-		h.call("model.set", { sessionId: terminal.id, sessionGeneration: generation, modelId: "fixture/model" }),
-	).rejects.toThrow("SDK owner changed");
-	expect(opening).not.toHaveBeenCalled();
-	await h.call("session.select", { sessionId: terminal.id });
-	for (const sessionGeneration of [undefined, null, "7", 6, 7.5]) {
-		for (const { method, input } of writes) {
-			const malformedPrompt =
-				method === "prompt" &&
-				sessionGeneration !== undefined &&
-				sessionGeneration !== null &&
-				(typeof sessionGeneration !== "number" || !Number.isSafeInteger(sessionGeneration));
+	const admission = vi.spyOn(sdk, "createEmbeddedAgentSession");
+	for (const selected of [false, true]) {
+		if (selected) await h.call("session.select", { sessionId: terminal.id });
+		for (const sessionGeneration of [undefined, null, "7", -1, 7.5, 7])
+			for (const { method, input } of writes)
+				await expect(h.call(method, { sessionId: terminal.id, sessionGeneration, ...input })).rejects.toThrow(
+					"read-only",
+				);
+	}
+	expect(admission).not.toHaveBeenCalled();
+	expect(h.created).toHaveLength(0);
+	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+	const connect = async () => {
+		const resolved = sdk.resolveEmbeddedResumeCheckpoint(terminal.file);
+		if (resolved.kind !== "resolved") throw new Error(resolved.reason);
+		// SDK-persisted fixtures have an enrolled, explicitly retired owner, not a legacy row.
+		const result = await h.call<{ kind: "connected"; session: DesktopSession } | { kind: "refused"; reason: string }>(
+			"session.connect",
+			{
+				sessionId: terminal.id,
+				selection: {
+					snapshotDigest: resolved.checkpoint.snapshotDigest,
+					targetLeafId: resolved.checkpoint.leafEntryId,
+				},
+			},
+		);
+		if (result.kind !== "connected") throw new Error(`Native fixture connect failed: ${JSON.stringify(result)}`);
+		return result.session;
+	};
+	const connected = await connect();
+	const generation = connected.controlGeneration;
+	if (generation === null) throw new Error("Missing native control generation");
+	const owner = h.created.at(-1)?.session;
+	if (!owner) throw new Error("Missing native SDK owner");
+	// Isolated mode removes inherited keys. Seed the real temporary credential
+	// store rather than fabricating model availability or skipping auth preflight.
+	await owner.modelRegistry.authStorage.set(availableModel.provider, {
+		type: "api_key", key: "fixture-anthropic-key",
+	});
+	if (!owner.modelRegistry.find(availableModel.provider, availableModel.id, owner.credentialSessionId))
+		throw new Error("Generation fixture model is absent from the actual registered catalog");
+	if (!await owner.modelRegistry.getApiKey(availableModel, owner.credentialSessionId))
+		throw new Error("Generation fixture has no isolated credential for its model");
+	const sdkGeneration = owner.sessionLifecycle.generation;
+	const connectedBytes = await Bun.file(terminal.file).text();
+	const promotion = vi.spyOn(owner.sessionManager, "promoteDefaultModelSelection");
+	const model = vi.spyOn(owner, "setDefaultModelSelection");
+	const thinking = vi.spyOn(owner, "setThinkingLevelForControl").mockResolvedValue(undefined);
+	const prompt = vi.spyOn(owner, "prompt").mockResolvedValue(undefined);
+	const abort = vi.spyOn(owner, "abort").mockResolvedValue(undefined);
+	for (const sessionGeneration of [
+		undefined,
+		null,
+		"7",
+		-1,
+		generation - 1,
+		generation + 1,
+		7.5,
+		Number.MAX_SAFE_INTEGER + 1,
+	])
+		for (const { method, input } of writes)
 			await expect(h.call(method, { sessionId: terminal.id, sessionGeneration, ...input })).rejects.toThrow(
-				malformedPrompt ? "Invalid prompt session generation" : "SDK owner changed",
+				"SDK owner changed",
 			);
+	for (const spy of [model, thinking, prompt, abort]) expect(spy).not.toHaveBeenCalled();
+	expect(await Bun.file(terminal.file).text()).toBe(connectedBytes);
+	for (const { method, input } of writes) {
+		try {
+			await h.call(method, { sessionId: terminal.id, sessionGeneration: generation, ...input });
+		} catch (error) {
+			const result = model.mock.results.at(-1);
+			const outcome = result?.type === "return" ? await Promise.allSettled([result.value]) : undefined;
+			const promotions = promotion.mock.results.map(result => {
+				if (result.type !== "return") return { type: result.type, error: String(result.value) };
+				const value = result.value;
+				return { kind: value.kind, error: "error" in value ? value.error?.stack : undefined };
+			});
+			throw new Error(`${method}: ${String(error)}; model producer outcome: ${JSON.stringify(outcome)}; transcript promotions: ${JSON.stringify(promotions)}`);
 		}
 	}
-	generation = 8;
-	for (const { method, input } of writes)
-		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: 7, ...input })).rejects.toThrow(
-			"SDK owner changed",
-		);
-	expect(model).not.toHaveBeenCalled();
-	expect(thinking).not.toHaveBeenCalled();
-	expect(prompt).not.toHaveBeenCalled();
-	expect(control).not.toHaveBeenCalled();
-	for (const { method, input } of writes)
-		await h.call(method, { sessionId: terminal.id, sessionGeneration: generation, ...input });
 	expect(model).toHaveBeenCalledTimes(1);
 	expect(thinking).toHaveBeenCalledTimes(1);
 	expect(prompt).toHaveBeenCalledTimes(1);
-	expect(control).toHaveBeenCalledTimes(1);
-	attached = false;
+	expect(abort).toHaveBeenCalledTimes(1);
+	for (const spy of [promotion, model, thinking, prompt, abort]) spy.mockRestore();
+	expect(await h.call<{ kind: string }>("session.disconnect", { sessionId: terminal.id })).toEqual({
+		kind: "disconnected",
+	});
+	const admissions = admission.mock.calls.length;
+	for (const { method, input } of writes)
+		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: generation, ...input })).rejects.toThrow(
+			"read-only",
+		);
+	expect(admission).toHaveBeenCalledTimes(admissions);
+	const reconnected = await connect();
+	expect(h.created.at(-1)?.session.sessionLifecycle.generation).toBe(sdkGeneration);
+	expect(reconnected.controlGeneration).not.toBeNull();
+	expect(reconnected.controlGeneration).not.toBe(generation);
 	for (const { method, input } of writes)
 		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: generation, ...input })).rejects.toThrow(
 			"SDK owner changed",
 		);
-	expect(model).toHaveBeenCalledTimes(1);
-	expect(thinking).toHaveBeenCalledTimes(1);
-	expect(prompt).toHaveBeenCalledTimes(1);
-	expect(control).toHaveBeenCalledTimes(1);
-	expect(opening).toHaveBeenCalledTimes(1);
-	expect(h.created).toHaveLength(0);
-	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
 });
 
 test("sorts an older late discovery before newer desktop sessions across refresh and restart", async () => {
@@ -416,19 +473,56 @@ test("late discovery preserves explicit desktop session order across refresh and
 	expect(await Bun.file(older.file).text()).toBe(older.bytes);
 });
 
-test("uses SDK ownership admission rather than a local transcript writer when selecting a discovered session", async () => {
+test("selection observes another surface's owner without admission; explicit connect preserves refusal", async () => {
 	const h = await fixture();
-	const terminal = await h.persist("Still owned by terminal", h.projectDir, true);
+	const terminal = await h.persist("Still owned by terminal");
+	const resolved = sdk.resolveEmbeddedResumeCheckpoint(terminal.file);
+	if (resolved.kind !== "resolved") throw new Error(resolved.reason);
+	const selection = {
+		snapshotDigest: resolved.checkpoint.snapshotDigest,
+		targetLeafId: resolved.checkpoint.leafEntryId,
+	};
+	const owner = await openNativeSession({
+		options: {
+			cwd: h.projectDir,
+			agentDir: h.agentDir,
+			extensions: [],
+			disableExtensionDiscovery: true,
+			enableMcpAutoload: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			deferOptionalModelRefresh: true,
+			deferMemoryBackendStartup: true,
+			toolNames: [],
+		},
+		storage: { managed: true },
+		file: terminal.file,
+		selection,
+	});
+	if (owner.kind !== "opened") throw new Error(`External owner failed: ${JSON.stringify(owner)}`);
+	cleanups.push(async () => {
+		expect(await owner.session.disconnect()).toEqual({ kind: "disconnected" });
+	});
+	const bytes = await Bun.file(terminal.file).text();
 	await h.call("project.open", { path: h.projectDir });
-	const admission = vi
-		.spyOn(ManagedSession.prototype, "open")
-		.mockRejectedValue(new Error("Fixture SDK owner unavailable"));
-	await expect(h.call("session.select", { sessionId: terminal.id })).rejects.toThrow("SDK owner unavailable");
-	expect(admission).toHaveBeenCalledTimes(1);
-	await expect(h.call("session.delete", { sessionId: terminal.id })).rejects.toThrow(
-		"does not support desktop session.delete",
-	);
+	const admission = vi.spyOn(sdk, "createEmbeddedAgentSession");
+	const resume = vi.spyOn(sdk.lifecycle.AgentDirSessionLifecycleService.prototype, "resume");
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(selected.readOnly).toBe(true);
+	expect(selected.controlGeneration).toBeNull();
+	expect(admission).not.toHaveBeenCalled();
+	expect(resume).not.toHaveBeenCalled();
+	await expect(h.call("session.delete", { sessionId: terminal.id })).rejects.toThrow("read-only");
+	const current = sdk.resolveEmbeddedResumeCheckpoint(terminal.file);
+	if (current.kind !== "resolved") throw new Error(current.reason);
+	expect(
+		await h.call<{ kind: string; reason: string }>("session.connect", {
+			sessionId: terminal.id,
+			selection: { snapshotDigest: current.checkpoint.snapshotDigest, targetLeafId: current.checkpoint.leafEntryId },
+			legacyAttestation: { snapshotDigest: current.checkpoint.snapshotDigest, acknowledged: true },
+		}),
+	).toEqual({ kind: "refused", reason: "authority_lost_unresolved" });
 	expect(h.created).toHaveLength(0);
-	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+	expect(await Bun.file(terminal.file).text()).toBe(bytes);
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
 });

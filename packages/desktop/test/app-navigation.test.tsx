@@ -26,17 +26,61 @@ beforeAll(async () => {
 }, 30000);
 afterAll(async () => { await browser?.close(); if (server) { server.kill(); await server.exited; } });
 
-async function fixture(holdBootstrap = false): Promise<{ context: BrowserContext; page: Page }> {
+async function fixture(holdBootstrap = false, unmountable = false): Promise<{ context: BrowserContext; page: Page }> {
 	const context = await browser.createBrowserContext();
+	const loadErrors: string[] = [];
 	try {
 		const page = await context.newPage();
+		page.on("pageerror", error => loadErrors.push(String(error)));
+		if (unmountable) {
+			page.setDefaultTimeout(5_000);
+			page.setDefaultNavigationTimeout(5_000);
+		}
 		await page.setViewport({ width: 1400, height: 900 });
 		await page.evaluateOnNewDocument(installNavigationFixture, holdBootstrap);
+		let interceptionError: unknown;
+		if (unmountable) {
+			await page.setRequestInterception(true);
+			page.on("request", intercepted => {
+				const url = new URL(intercepted.url());
+				if (url.pathname !== "/src/App.tsx" || url.searchParams.has("navigation-original")) {
+					void intercepted.continue();
+					return;
+				}
+				void (async () => {
+					const source = await (await fetch(intercepted.url())).text();
+					const react = source.match(/from\s*["']([^"']*\/react\.js(?:\?[^"']*)?)["']/)?.[1];
+					if (!react) throw new Error("Missing transformed React import for unmount fixture");
+					await intercepted.respond({ status: 200, contentType: "application/javascript", body: `
+						import App from "/src/App.tsx?navigation-original";
+						import React from ${JSON.stringify(react)};
+						const { createElement, useEffect, useState } = React;
+						export default function NavigationMount() {
+							const [mounted, setMounted] = useState(true);
+							useEffect(() => {
+								const unmount = () => setMounted(false);
+								window.addEventListener("navigation-unmount", unmount);
+								return () => window.removeEventListener("navigation-unmount", unmount);
+							}, []);
+							return mounted ? createElement(App) : null;
+						}
+					` });
+				})().catch(error => {
+					interceptionError = error;
+					void intercepted.abort();
+				});
+			});
+		}
 		await page.goto(origin);
+		if (interceptionError) throw interceptionError;
 		await page.waitForFunction(() => window.navigationFixture.requests().some(request => request.method === "bootstrap"));
 		if (!holdBootstrap) await page.waitForSelector(".session-row");
 		return { context, page };
-	} catch (error) { await context.close(); throw error; }
+	} catch (error) {
+		await context.close();
+		if (loadErrors.length) throw new Error(`${String(error)}; browser module errors: ${loadErrors.join("; ")}`);
+		throw error;
+	}
 }
 
 async function holdRequest(page: Page, method: DesktopMethod): Promise<void> {
@@ -170,6 +214,198 @@ async function seedTranscripts(page: Page, count = 240): Promise<void> {
 }
 
 suite("mounted desktop navigation", () => {
+	test("refreshes only current projects on focus, online and foreground events, not ordinary snapshots", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.waitForSelector('.sidebar-open-project:not([disabled])');
+			const refreshes = () => page.evaluate(() => window.navigationFixture.requests()
+				.filter(request => request.method === "project.refresh").map(request => request.params.projectId));
+			const baseline = await page.evaluate(() => window.navigationFixture.requests().length);
+			expect(await refreshes()).toEqual([]);
+			await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+			await heldRequest(page, "project.refresh", 2);
+			expect(await refreshes()).toEqual(["p", "q"]);
+			await page.evaluate(() => {
+				const snapshot = window.navigationFixture.snapshot();
+				window.navigationFixture.emit({ type: "snapshot", snapshot: {
+					...snapshot,
+					projects: [snapshot.projects[0]!, { id: "r", name: "Current workspace", path: "/work/current" }],
+					sessions: snapshot.sessions.filter(session => session.projectId === "p"),
+				} });
+			});
+			await page.waitForSelector('[data-project-id="r"]');
+			expect(await refreshes()).toEqual(["p", "q"]);
+			for (const event of ["focus", "online", "pageshow"]) {
+				const count = (await refreshes()).length;
+				await page.evaluate(event => window.dispatchEvent(new Event(event)), event);
+				await heldRequest(page, "project.refresh", count + 2);
+				expect((await refreshes()).slice(-2)).toEqual(["p", "r"]);
+			}
+			await page.evaluate(() => {
+				Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+				document.dispatchEvent(new Event("visibilitychange"));
+			});
+			expect(await refreshes()).toHaveLength(8);
+			await page.evaluate(() => {
+				Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+				document.dispatchEvent(new Event("visibilitychange"));
+			});
+			await heldRequest(page, "project.refresh", 10);
+			expect((await refreshes()).slice(-2)).toEqual(["p", "r"]);
+			await page.evaluate(() => {
+				window.navigationFixture.emit({ type: "snapshot", snapshot: { ...window.navigationFixture.snapshot(), projects: [], sessions: [] } });
+				// The host frame closes projects before React has rendered the new catalog.
+				window.dispatchEvent(new Event("online"));
+			});
+			await page.waitForSelector('.project-group', { hidden: true });
+			expect(await refreshes()).toHaveLength(10);
+			expect(await page.evaluate(baseline => window.navigationFixture.requests().slice(baseline)
+				.map(request => request.method), baseline)).toEqual(Array(10).fill("project.refresh"));
+		} finally { await context.close(); }
+	}, 30000);
+
+	for (const kind of ["refreshed", "throttled"] as const) {
+		test(`additive discovery preserves selection, draft, card and reading anchor despite a stale ${kind} response`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await seedTranscripts(page);
+				await openTranscript(page, "old");
+				await page.waitForSelector('.composer textarea:not([disabled])');
+				await page.type('.composer textarea', "Keep this unsent discovery draft");
+				await page.click('.session-work-toggle');
+				await page.waitForSelector('.session-work-card');
+				const saved = await scrollTranscript(page, 1423);
+				const stale = await page.evaluate(() => window.navigationFixture.snapshot());
+				await holdRequest(page, "project.refresh");
+				await page.evaluate(() => window.dispatchEvent(new Event("online")));
+				await heldRequest(page, "project.refresh", 2);
+				await page.evaluate(() => {
+					const snapshot = window.navigationFixture.snapshot();
+					const template = snapshot.sessions.find(session => session.id === "old")!;
+					window.navigationFixture.emit({ type: "snapshot", snapshot: {
+						...snapshot,
+						sessions: [...snapshot.sessions, { ...template, id: "discovered", title: "Discovered conversation", controlGeneration: null, messages: [] }],
+					} });
+				});
+				await page.waitForSelector('.session-select[title="Discovered conversation · Idle"]');
+				await page.evaluate(({ kind, stale }) => {
+					const refreshes = window.navigationFixture.requests().filter(request => request.method === "project.refresh");
+					for (const request of refreshes) window.navigationFixture.emit({ type: "response", id: request.id, ok: true,
+						result: { kind, ...(kind === "throttled" ? { retryAfter: 30000 } : {}), snapshot: stale } });
+				}, { kind, stale });
+				await expectTranscriptAnchor(page, saved);
+				expect(await page.$('.session-select[title="Discovered conversation · Idle"]')).not.toBeNull();
+				expect(await page.$('.session-select[title="Oldest conversation · Idle"][aria-current="page"]')).not.toBeNull();
+				expect(await page.$eval('.composer textarea', (node: HTMLTextAreaElement) => node.value)).toBe("Keep this unsent discovery draft");
+				expect(await page.$('.session-work-toggle[aria-pressed="true"]')).not.toBeNull();
+				expect(await page.$('.session-work-card')).not.toBeNull();
+				expect(await page.evaluate(() => window.navigationFixture.requests()
+					.filter(request => ["project.open", "session.connect", "session.admit", "prompt"].includes(request.method)))).toEqual([]);
+			} finally { await context.close(); }
+		}, 30000);
+	}
+
+	test("background discovery rejection leaves the host connected and never replays a draft", async () => {
+		const { context, page } = await fixture();
+		const errors: string[] = [];
+		const warnings: string[] = [];
+		page.on("pageerror", error => errors.push(String(error)));
+		page.on("console", message => {
+			if (message.type() === "warn") warnings.push(message.text());
+		});
+		try {
+			await page.click('.session-select[title="Oldest conversation · Idle"]');
+			await page.waitForSelector('.composer textarea:not([disabled])');
+			await page.type('.composer textarea', "Do not replay this draft");
+			await holdRequest(page, "project.refresh");
+			await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+			await heldRequest(page, "project.refresh", 2);
+			await page.evaluate(() => {
+				for (const request of window.navigationFixture.requests().filter(request => request.method === "project.refresh"))
+					window.navigationFixture.emit({ type: "response", id: request.id, ok: false, error: "Background discovery unavailable" });
+			});
+			await page.type('.composer textarea', " remains editable");
+			expect(await page.$eval('.composer textarea', (node: HTMLTextAreaElement) => node.value)).toBe("Do not replay this draft remains editable");
+			expect(await page.$('.sidebar-open-project:not([disabled])')).not.toBeNull();
+			expect(await page.$('.main-pane .error-banner')).toBeNull();
+			expect(await page.evaluate(() => window.navigationFixture.requests()
+				.filter(request => ["project.open", "session.connect", "session.admit", "prompt"].includes(request.method)))).toEqual([]);
+			expect(errors).toEqual([]);
+			expect(warnings.filter(message => message.includes("Background project discovery refresh failed"))).toHaveLength(2);
+			await page.evaluate(() => window.dispatchEvent(new Event("online")));
+			await heldRequest(page, "project.refresh", 4);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("does not refresh while bootstrap is disconnected or immediately after a fatal frame", async () => {
+		const { context, page } = await fixture(true);
+		try {
+			const trigger = () => page.evaluate(() => {
+				for (const event of ["focus", "online", "pageshow"]) window.dispatchEvent(new Event(event));
+				document.dispatchEvent(new Event("visibilitychange"));
+			});
+			await trigger();
+			expect(await page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "project.refresh"))).toEqual([]);
+			await page.evaluate(() => window.navigationFixture.connect());
+			await page.waitForSelector('.sidebar-open-project:not([disabled])');
+			await page.evaluate(() => {
+				window.navigationFixture.emit({ type: "fatal", error: "Host stopped" });
+				// Fence the event synchronously, before React commits the fatal state.
+				window.dispatchEvent(new Event("online"));
+			});
+			await page.waitForSelector('.main-pane .error-banner');
+			await trigger();
+			expect(await page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "project.refresh"))).toEqual([]);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("keeps discovery listeners stable across snapshots and removes them when App unmounts", async () => {
+		const { context, page } = await fixture(false, true);
+		const errors: string[] = [];
+		page.on("pageerror", error => errors.push(String(error)));
+		try {
+			await page.waitForSelector('.sidebar-open-project:not([disabled])');
+			const client = await page.createCDPSession();
+			const listenerCounts = async () => {
+				const counts: Record<string, number> = {};
+				for (const target of ["window", "document"]) {
+					const { result } = await client.send("Runtime.evaluate", { expression: target });
+					const { listeners } = await client.send("DOMDebugger.getEventListeners", { objectId: result.objectId! });
+					for (const event of target === "window" ? ["focus", "online", "pageshow"] : ["visibilitychange"])
+						counts[`${target}:${event}`] = listeners.filter(listener => listener.type === event).length;
+				}
+				return counts;
+			};
+			const mounted = await listenerCounts();
+			expect(mounted["window:online"]).toBe(1);
+			await threeProjects(page);
+			expect(await listenerCounts()).toEqual(mounted);
+			await holdRequest(page, "project.refresh");
+			await page.evaluate(() => window.dispatchEvent(new Event("online")));
+			await heldRequest(page, "project.refresh", 3);
+			await page.evaluate(() => window.dispatchEvent(new Event("navigation-unmount")));
+			await page.waitForSelector('.app-shell', { hidden: true });
+			await page.evaluate(() => {
+				const frame = Promise.withResolvers<void>();
+				requestAnimationFrame(() => requestAnimationFrame(() => frame.resolve()));
+				return frame.promise;
+			});
+			const unmounted = await listenerCounts();
+			for (const [event, count] of Object.entries(mounted)) expect(unmounted[event]).toBeLessThan(count);
+			expect(unmounted["window:online"]).toBe(0);
+			const before = await page.evaluate(() => window.navigationFixture.requests().length);
+			await page.evaluate(() => {
+				for (const request of window.navigationFixture.requests().filter(request => request.method === "project.refresh"))
+					window.navigationFixture.emit({ type: "response", id: request.id, ok: false, error: "Late discovery failure" });
+				for (const event of ["focus", "online", "pageshow"]) window.dispatchEvent(new Event(event));
+				document.dispatchEvent(new Event("visibilitychange"));
+			});
+			expect(await page.evaluate(() => window.navigationFixture.requests().length)).toBe(before);
+			expect(errors).toEqual([]);
+			await client.detach();
+		} finally { await context.close(); }
+	}, 30000);
+
 	test("restores a reading anchor across navigation, active streaming and background frames", async () => {
 		const { context, page } = await fixture();
 		try {

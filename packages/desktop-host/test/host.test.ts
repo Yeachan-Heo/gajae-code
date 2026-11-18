@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +12,7 @@ import {
 	captureSessionView,
 	createAgentSession,
 	type ExtensionContext,
+	NativeRuntimeRefusal,
 	Settings,
 } from "@gajae-code/coding-agent/sdk";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
@@ -23,6 +25,8 @@ import {
 	validateQuestionAnswer,
 } from "../src/host";
 import { fitMessages, projectHistoryPage, projectMessages } from "../src/message-projection";
+import type { NativeDisconnectOutcome, NativeSession } from "../src/native-session";
+import * as nativeSessions from "../src/native-session";
 import type {
 	DesktopForkResult,
 	DesktopFrame,
@@ -667,18 +671,107 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		expect(h.sessions).toHaveLength(1);
 	});
 
-	test("answer copy fences SDK retirement while waiting for initialized ownership", async () => {
+	test("raw native disposal refuses without tearing down the answer-copy owner", async () => {
 		const h = await launch();
-		const reading = h.call("message.copyText", {
-			sessionId: h.source.id,
-			sessionGeneration: h.sdk.sessionLifecycle.generation,
-			entryId: h.assistantId,
-		});
-		// handle() yields to initialization before dispatch. Retire the actual SDK owner
-		// in that microtask gap, without substituting the host's initializer.
-		h.sdk.dispose();
-		await expect(reading).rejects.toThrow("Session changed");
+		const cleanup = vi.fn(async () => {});
+		h.sdk.registerToolSessionCleanup(cleanup);
+		spies.push(vi.spyOn(h.dependencies[0]!.registry, "dispose"), vi.spyOn(h.dependencies[0]!.settings, "close"));
+		const lifecycle = { ...h.sdk.sessionLifecycle };
+		const closeState = { ...h.sdk.sessionManager.getStrictCloseState() };
+		const identity = h.sdk.sessionId;
+		const files = await h.transcriptFiles();
+		const catalog = await Bun.file(path.join(h.dataDir, "catalog.json")).text();
+		expect(() => h.sdk.dispose()).toThrow("Native disposal requires registry termination authorization");
+		expect(cleanup).not.toHaveBeenCalled();
+		expect(h.dependencies[0]!.registry.dispose).not.toHaveBeenCalled();
+		expect(h.dependencies[0]!.settings.close).not.toHaveBeenCalled();
+		expect(h.sdk.sessionLifecycle).toEqual(lifecycle);
+		expect(h.sdk.sessionManager.getStrictCloseState()).toEqual(closeState);
+		expect(h.sdk.sessionId).toBe(identity);
 		expect(h.sessions).toHaveLength(1);
+		expect(h.uiBindings).toEqual([identity]);
+		expect(await h.transcriptFiles()).toEqual(files);
+		expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+		expect(await Bun.file(path.join(h.dataDir, "catalog.json")).text()).toBe(catalog);
+		expect(
+			await h.call<{ text: string }>("message.copyText", {
+				sessionId: h.source.id,
+				sessionGeneration: lifecycle.generation,
+				entryId: h.assistantId,
+			}),
+		).toEqual({ text: "first response" });
+	});
+
+	test("answer copy fences SDK retirement while waiting for initialized ownership", async () => {
+		const owners: NativeSession[] = [];
+		const openNativeSession = nativeSessions.openNativeSession;
+		spies.push(
+			vi.spyOn(nativeSessions, "openNativeSession").mockImplementation(async input => {
+				const opened = await openNativeSession(input);
+				if (opened.kind === "opened") owners.push(opened.session);
+				return opened;
+			}),
+		);
+		const h = await launch();
+		expect(owners).toHaveLength(1);
+		const owner = owners[0]!;
+		expect(owner.sdk).toBe(h.sdk);
+		const initialized = Promise.withResolvers<void>();
+		const release = heldRelease();
+		const generation = h.sdk.sessionLifecycle.generation;
+		const initialize = h.host.initialize.bind(h.host);
+		let holdCopyInitialization = true;
+		const disconnect = vi.spyOn(owner, "disconnect");
+		spies.push(
+			disconnect,
+			vi.spyOn(h.host, "initialize").mockImplementation(async () => {
+				const hold = holdCopyInitialization;
+				holdCopyInitialization = false;
+				await initialize();
+				if (hold) {
+					initialized.resolve();
+					await release.promise;
+				}
+			}),
+		);
+		let settled = false;
+		const reading = h
+			.call("message.copyText", {
+				sessionId: h.source.id,
+				sessionGeneration: generation,
+				entryId: h.assistantId,
+			})
+			.finally(() => {
+				settled = true;
+			});
+		void reading.catch(() => {});
+		try {
+			await bounded(initialized.promise, "copy initialization entry");
+			// Only the copy waits on the real initializer's completion. The public host
+			// disconnect retires this owner and removes its live controllers atomically.
+			expect(await h.call<NativeDisconnectOutcome>("session.disconnect", { sessionId: h.source.id })).toEqual({
+				kind: "disconnected",
+			});
+			expect(disconnect).toHaveBeenCalled();
+			for (const result of disconnect.mock.results) {
+				expect(result.type).toBe("return");
+				if (result.type === "return") expect(await result.value).toEqual({ kind: "disconnected" });
+			}
+			expect(owner.sdk).toBe(h.sdk);
+			expect(h.sdk.sessionLifecycle.generation).toBe(generation);
+			expect(owner.state).toBe("disconnected");
+			expect(h.sdk.sessionLifecycle.disposed).toBe(true);
+			expect(h.sdk.sessionManager.getStrictCloseState().kind).toBe("closed");
+			expect(settled).toBe(false);
+			release.resolve();
+			await expect(reading).rejects.toThrow("Session changed");
+			expect(h.sessions).toHaveLength(1);
+			expect(owners).toHaveLength(1);
+			expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+		} finally {
+			release.resolve();
+			await bounded(Promise.allSettled([reading]), "retired copy completion");
+		}
 	});
 
 	test("prompt copy returns the exact persisted user text, not the bounded preview", async () => {
@@ -858,7 +951,9 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			expected.map(message => [message.role, message.text]),
 		);
 		expect(copied.messages.some(message => message.entryId === h.entryIds[index])).toBe(false);
-		const header: { parentSession: string } = JSON.parse((await Bun.file(child.sessionFile!).text()).split("\n")[0]!);
+		const childFile = child.sessionFile;
+		if (!childFile) throw new Error("Missing committed child transcript");
+		const header: { parentSession: string } = JSON.parse((await Bun.file(childFile).text()).split("\n")[0]!);
 		expect(header.parentSession).not.toBe(h.sourceFile);
 		expect(await Bun.file(header.parentSession).exists()).toBe(true);
 		expect(await h.transcriptFiles()).toHaveLength(3);
@@ -868,6 +963,18 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		expect((await h.call<DesktopSession>("session.select", { sessionId: h.source.id })).messages).toEqual(
 			history.messages,
 		);
+		const catalog: { selectedForkTranscripts: Array<{ projectId: string; sessionId: string; file: string }> } =
+			await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+		const stagingHeader: { id: string } = JSON.parse((await Bun.file(header.parentSession).text()).split("\n")[0]!);
+		expect(catalog.selectedForkTranscripts).toEqual([
+			{ projectId: h.source.projectId, sessionId: stagingHeader.id, file: header.parentSession },
+			{ projectId: h.source.projectId, sessionId: child.sessionId, file: childFile },
+		]);
+		await h.close();
+		expect((await h.restart()).sessions.map(session => session.id).sort()).toEqual(
+			[h.source.id, fork.session.id].sort(),
+		);
+		expect(await h.transcriptFiles()).toHaveLength(3);
 	});
 
 	test("successful fork does not run a fallible source finalizer after committing the child", async () => {
@@ -910,6 +1017,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			h.source.messages.map(message => message.text),
 		);
 		expect(await h.transcriptFiles()).toHaveLength(2);
+		expect((await Bun.file(path.join(h.dataDir, "catalog.json")).json()).selectedForkTranscripts).toBeUndefined();
 		expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
 	});
 
@@ -975,44 +1083,50 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		}
 	});
 
-	test("rejects publication if the source SDK identity changes while a candidate hook awaits", async () => {
+	test("raw native identity change refuses while a held fork candidate is cancelled", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = heldRelease();
 		const h = await launch({
 			beforeBranch: async () => {
 				entered.resolve();
 				await release.promise;
-				return {};
+				return { cancel: true };
 			},
 		});
-		const pending = h.call("session.fork", { sessionId: h.source.id, entryId: h.entryIds[1] });
-		const outcome = pending.then(
-			value => ({ value, error: undefined }),
-			error => ({ value: undefined, error }),
-		);
-		let identityChange: Promise<boolean> | undefined;
+		const files = await h.transcriptFiles();
+		const catalogPath = path.join(h.dataDir, "catalog.json");
+		const previousIdentity = h.sdk.sessionId;
+		const managerIdentity = h.sdk.sessionManager.getSessionId();
+		const identityGeneration = h.sdk.sessionManager.getSessionIdentityGeneration();
+		const lifecycle = { ...h.sdk.sessionLifecycle };
+		const pending = h.call<DesktopForkResult>("session.fork", { sessionId: h.source.id, entryId: h.entryIds[1] });
+		void pending.catch(() => {});
 		try {
 			await bounded(entered.promise, "branch hook entry");
-			const previousIdentity = h.sdk.sessionId;
-			identityChange = h.track(h.sdk.newSession());
-			expect(await bounded(identityChange, "source identity change")).toBe(true);
-			expect(h.sdk.sessionId).not.toBe(previousIdentity);
+			const catalog = await Bun.file(catalogPath).text();
+			await expect(bounded(h.track(h.sdk.newSession()), "raw source identity refusal")).rejects.toBeInstanceOf(
+				NativeRuntimeRefusal,
+			);
+			expect(h.sdk.sessionId).toBe(previousIdentity);
+			expect(h.sdk.sessionManager.getSessionId()).toBe(managerIdentity);
+			expect(h.sdk.sessionManager.getSessionIdentityGeneration()).toBe(identityGeneration);
+			expect(h.sdk.sessionLifecycle).toEqual(lifecycle);
+			expect(await Bun.file(catalogPath).text()).toBe(catalog);
 			release.resolve();
-			expect(String((await outcome).error)).toContain("Source session changed while forking");
+			expect(await pending).toEqual({ cancelled: true });
 			expect(h.sessions[1]!.session.sessionLifecycle.disposed).toBe(true);
 			expect(await Bun.file(h.sessions[1]!.session.sessionFile!).exists()).toBe(false);
-			expect(h.uiBindings).toEqual([previousIdentity, h.sdk.sessionId]);
+			expect(h.uiBindings).toEqual([previousIdentity]);
 			expect(h.uiBindings).not.toContain(h.sessions[1]!.session.sessionId);
 			expect((await h.call<DesktopSnapshot>("bootstrap")).sessions.map(session => session.id)).toEqual([
 				h.source.id,
 			]);
+			expect(await h.transcriptFiles()).toEqual(files);
+			expect(await Bun.file(catalogPath).text()).toBe(catalog);
 			expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
 		} finally {
 			release.resolve();
-			await bounded(
-				Promise.allSettled([pending, ...(identityChange ? [identityChange] : [])]),
-				"identity race completion",
-			);
+			await bounded(Promise.allSettled([pending]), "identity refusal completion");
 		}
 	});
 
@@ -1224,8 +1338,13 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		const catalogPath = path.join(h.dataDir, "catalog.json");
 		const rename = fs.rename;
 		let catalogWrites = 0;
+		let childWriteEntered = false;
 		const save = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
-			if (String(to) === catalogPath && ++catalogWrites === 2) throw new Error("catalog rollback failed");
+			if (String(to) === catalogPath) {
+				const catalog: { sessions: Array<{ id: string }> } = await Bun.file(String(from)).json();
+				if (catalog.sessions.some(session => session.id !== h.source.id)) childWriteEntered = true;
+				if (childWriteEntered && ++catalogWrites === 2) throw new Error("catalog rollback failed");
+			}
 			return rename(from, to);
 		});
 		spies.push(save);
@@ -1295,10 +1414,17 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		const catalogPath = path.join(h.dataDir, "catalog.json");
 		const before = await Bun.file(catalogPath).text();
 		const rename = fs.rename;
+		const remove = vi.spyOn(sdk, "deleteEmbeddedSession");
+		spies.push(remove);
 		let catalogWrites = 0;
+		let rejectedCatalog: {
+			sessions: Array<{ id: string }>;
+			deletedTranscripts: Array<{ projectId: string; sessionId: string; file: string }>;
+		} | undefined;
 		const save = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
 			if (String(to) === catalogPath) {
 				catalogWrites++;
+				rejectedCatalog = await Bun.file(String(from)).json();
 				throw new Error("deletion catalog save failed");
 			}
 			return rename(from, to);
@@ -1309,6 +1435,11 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 				"deletion catalog save failed",
 			);
 			expect(catalogWrites).toBe(1);
+			expect(rejectedCatalog?.sessions).toEqual([]);
+			expect(rejectedCatalog?.deletedTranscripts).toEqual([
+				{ projectId: h.source.projectId, sessionId: h.sdk.sessionId, file: h.sourceFile },
+			]);
+			expect(remove).not.toHaveBeenCalled();
 			expect(h.sdk.sessionLifecycle.disposed).toBe(true);
 			await bounded(h.sdk.awaitDisposeCompletion(), "deleted session actual disposal");
 			expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
@@ -1319,6 +1450,8 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		} finally {
 			save.mockRestore();
 		}
+		await h.call("project.open", { path: h.projectDir });
+		expect((await Bun.file(catalogPath).json()).deletedTranscripts).toBeUndefined();
 		await expect(h.close()).rejects.toThrow("Desktop shutdown failed");
 		expect((await h.restart()).sessions.map(session => session.id)).toEqual([h.source.id]);
 		const recovered = await h.call<DesktopSession>("session.select", { sessionId: h.source.id });
@@ -1343,20 +1476,155 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 
 	test("artifact deletion failure does not resurrect a durably removed catalog entry", async () => {
 		const h = await launch();
-		// Inject failure at the public SDK's verified deletion boundary.
-		const remove = vi.spyOn(sdk, "deleteEmbeddedSession").mockRejectedValue(new Error("artifact cleanup failed"));
+		// Inject failure at the public SDK's verified deletion boundary, after checking
+		// that retirement and the atomic removal/exclusion commit already happened.
+		const remove = vi.spyOn(sdk, "deleteEmbeddedSession").mockImplementation(async () => {
+			expect(h.sdk.sessionLifecycle.disposed).toBe(true);
+			const catalog = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+			expect(catalog.sessions).toEqual([]);
+			expect(catalog.deletedTranscripts).toEqual([
+				{ projectId: h.source.projectId, sessionId: h.sdk.sessionId, file: h.sourceFile },
+			]);
+			throw new Error("artifact cleanup failed");
+		});
 		spies.push(remove);
 		try {
 			await expect(h.call("session.delete", { sessionId: h.source.id })).rejects.toThrow("artifact cleanup failed");
 			expect(remove).toHaveBeenCalledTimes(1);
+			expect(remove).toHaveBeenCalledWith(h.sourceFile, { managed: true });
 			expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
-			expect((await Bun.file(path.join(h.dataDir, "catalog.json")).json()).sessions).toEqual([]);
+			const catalog = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+			expect(catalog.sessions).toEqual([]);
+			expect(catalog.deletedTranscripts).toEqual([
+				{ projectId: h.source.projectId, sessionId: h.sdk.sessionId, file: h.sourceFile },
+			]);
+			expect(catalog.selectedForkTranscripts).toBeUndefined();
 			expect((await h.call<DesktopSnapshot>("bootstrap")).sessions).toEqual([]);
 		} finally {
 			remove.mockRestore();
 		}
 		await h.close();
 		expect((await h.restart()).sessions).toEqual([]);
+		expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+		expect(h.sessions).toHaveLength(1);
+	});
+
+	test.each(["same file", "same SDK ID", "lineage child", "different project"] as const)(
+		"explicit deletion does not exclude an unrelated %s identity after restart",
+		async variant => {
+			const h = await launch();
+			const remove = vi.spyOn(sdk, "deleteEmbeddedSession").mockRejectedValue(new Error("retain deleted bytes"));
+			spies.push(remove);
+			try {
+				await expect(h.call("session.delete", { sessionId: h.source.id })).rejects.toThrow("retain deleted bytes");
+			} finally {
+				remove.mockRestore();
+			}
+			await h.close();
+			const catalogFile = path.join(h.dataDir, "catalog.json");
+			const catalog: {
+				projects: DesktopProject[];
+				deletedTranscripts: Array<{ projectId: string; sessionId: string; file: string }>;
+			} = await Bun.file(catalogFile).json();
+			const deletion = catalog.deletedTranscripts[0]!;
+			const lines = h.sourceBytes.trimEnd().split("\n");
+			const header: { id: string; parentSession?: string } = JSON.parse(lines[0]!);
+			let discoveredId = deletion.sessionId;
+			if (variant === "same SDK ID") {
+				await fs.rename(h.sourceFile, path.join(path.dirname(h.sourceFile), `other_${discoveredId}.jsonl`));
+			} else if (variant === "different project") {
+				const otherProject = { id: crypto.randomUUID(), name: "Other", path: h.dataDir, closed: true };
+				catalog.projects.push(otherProject);
+				deletion.projectId = otherProject.id;
+				await Bun.write(catalogFile, JSON.stringify(catalog));
+			} else {
+				discoveredId = crypto.randomUUID();
+				header.id = discoveredId;
+				if (variant === "lineage child") header.parentSession = h.sourceFile;
+				lines[0] = JSON.stringify(header);
+				await Bun.write(
+					variant === "same file" ? h.sourceFile : path.join(path.dirname(h.sourceFile), `child_${discoveredId}.jsonl`),
+					`${lines.join("\n")}\n`,
+				);
+			}
+			const snapshot = await h.restart();
+			expect(snapshot.sessions.map(session => session.id)).toEqual([discoveredId]);
+			expect(snapshot.sessions[0]?.controlGeneration).toBeNull();
+			expect(snapshot.sessions[0]?.readOnly).toBe(true);
+			expect(h.sessions).toHaveLength(1);
+		},
+	);
+
+	test.each(["bootstrap", "project.open"] as const)(
+		"an in-flight %s inventory cannot resurrect a subsequently deleted transcript",
+		async method => {
+			const h = await launch();
+			const entered = Promise.withResolvers<void>();
+			const release = heldRelease();
+			const list = sdk.listEmbeddedProjectSessions;
+			let held = false;
+			const scan = vi.spyOn(sdk, "listEmbeddedProjectSessions").mockImplementation(async input => {
+				const inventory = await list(input);
+				if (!held && input.cwd === h.projectDir) {
+					held = true;
+					entered.resolve();
+					await release.promise;
+				}
+				return inventory;
+			});
+			const remove = vi.spyOn(sdk, "deleteEmbeddedSession").mockRejectedValue(new Error("retain deleted bytes"));
+			spies.push(scan, remove);
+			const pending = h.call(method, method === "project.open" ? { path: h.projectDir } : {});
+			void pending.catch(() => {});
+			try {
+				await bounded(entered.promise, "inventory captured before explicit deletion");
+				await expect(h.call("session.delete", { sessionId: h.source.id })).rejects.toThrow("retain deleted bytes");
+				release.resolve();
+				await pending;
+				expect(h.host.snapshot().sessions).toEqual([]);
+				expect((await Bun.file(path.join(h.dataDir, "catalog.json")).json()).sessions).toEqual([]);
+				expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+			} finally {
+				release.resolve();
+				await bounded(Promise.allSettled([pending]), "stale deletion scan completion");
+				scan.mockRestore();
+				remove.mockRestore();
+			}
+			await h.close();
+			expect((await h.restart()).sessions).toEqual([]);
+		},
+	);
+
+	test("an unprovable deleted transcript identity retains the catalog row and its bytes", async () => {
+		const h = await launch();
+		const observe = vi.spyOn(sdk, "observeEmbeddedTranscript").mockReturnValue({
+			kind: "refused",
+			reason: "context_mismatch",
+		});
+		const remove = vi.spyOn(sdk, "deleteEmbeddedSession");
+		spies.push(observe, remove);
+		try {
+			await expect(h.call("session.delete", { sessionId: h.source.id })).rejects.toThrow(
+				"Cannot prove deleted transcript identity from its saved bytes",
+			);
+			expect(h.sdk.sessionLifecycle.disposed).toBe(true);
+			expect(observe).toHaveBeenCalledWith({
+				file: h.sourceFile,
+				cwd: h.projectDir,
+				sessionId: h.sdk.sessionId,
+			});
+			expect(remove).not.toHaveBeenCalled();
+			const catalog = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+			expect(catalog.sessions.map((session: { id: string }) => session.id)).toEqual([h.source.id]);
+			expect(catalog.deletedTranscripts).toBeUndefined();
+			expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+			expect(h.sessions).toHaveLength(1);
+		} finally {
+			observe.mockRestore();
+			remove.mockRestore();
+		}
+		await h.close();
+		expect((await h.restart()).sessions.map(session => session.id)).toEqual([h.source.id]);
 	});
 
 	test.each([
@@ -1405,10 +1673,13 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		spies.push(
 			vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
 				if (String(to) === catalogPath && !held) {
-					held = true;
 					const catalog: { sessions: Array<{ id: string }> } = await Bun.file(String(from)).json();
-					saving.resolve(catalog.sessions.find(session => session.id !== h.source.id)!.id);
-					await release.promise;
+					const child = catalog.sessions.find(session => session.id !== h.source.id);
+					if (child) {
+						held = true;
+						saving.resolve(child.id);
+						await release.promise;
+					}
 				}
 				return rename(from, to);
 			}),
@@ -1437,6 +1708,152 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			);
 		}
 	});
+
+	test.each(["staging", "successor"] as const)(
+		"a failed %s reservation save refuses producer publication",
+		async role => {
+			const h = await launch();
+			const catalogPath = path.join(h.dataDir, "catalog.json");
+			const rename = fs.rename;
+			let rejectedIdentity: { sessionId: string; file: string } | undefined;
+			const save = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+				if (String(to) === catalogPath && !rejectedIdentity) {
+					const catalog: { selectedForkTranscripts?: Array<{ sessionId: string; file: string }> } =
+						await Bun.file(String(from)).json();
+					if (catalog.selectedForkTranscripts?.length === (role === "staging" ? 1 : 2)) {
+						rejectedIdentity = catalog.selectedForkTranscripts.at(-1)!;
+						expect(await Bun.file(rejectedIdentity.file).exists()).toBe(false);
+						throw new Error("reservation save failed");
+					}
+				}
+				return rename(from, to);
+			});
+			spies.push(save);
+			try {
+				await expect(h.call("session.fork", { sessionId: h.source.id, entryId: h.entryIds[1] })).rejects.toThrow(
+					"reservation save failed",
+				);
+				expect(rejectedIdentity).toBeDefined();
+				expect(await Bun.file(rejectedIdentity!.file).exists()).toBe(false);
+				expect(h.sessions).toHaveLength(role === "staging" ? 1 : 2);
+				expect(await h.transcriptFiles()).toHaveLength(1);
+			} finally {
+				save.mockRestore();
+			}
+			await expect(h.close()).rejects.toThrow("Desktop shutdown failed");
+			expect((await h.restart()).sessions.map(session => session.id)).toEqual([h.source.id]);
+		},
+	);
+
+	test.each(["staging", "successor"] as const)(
+		"retained %s transcripts from a failed real selected-entry fork stay unimported after restart",
+		async failure => {
+			let stagingId = "";
+			let stagingFile = "";
+			let successorFile = "";
+			let branchEntered = false;
+			const h = await launch({
+				beforeBranch: async () => {
+					branchEntered = true;
+					return failure === "staging" ? { cancel: true } : {};
+				},
+				configureCandidate: result => {
+					stagingId = result.session.sessionId;
+					stagingFile = result.session.sessionFile!;
+					result.session.subscribeSessionIdentityChanges(() => {
+						successorFile = result.session.sessionFile!;
+					});
+					if (failure === "successor") {
+						let attempts = 0;
+						result.session.registerToolSessionTransitionCleanup(() => {
+							if (attempts++ === 0) throw new Error("branch cleanup failed");
+						});
+					}
+				},
+			});
+			const remove = vi.spyOn(sdk, "deleteEmbeddedSession").mockRejectedValue(new Error("retain private transcript"));
+			spies.push(remove);
+			try {
+				await expect(h.call("session.fork", { sessionId: h.source.id, entryId: h.entryIds[1] })).rejects.toThrow();
+				expect(branchEntered).toBe(true);
+				expect(stagingId).not.toBe("");
+				const catalog: {
+					sessions: Array<{ id: string }>;
+					selectedForkTranscripts: Array<{ projectId: string; sessionId: string; file: string }>;
+				} = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+				expect(catalog.sessions.map(session => session.id)).toEqual([h.source.id]);
+				expect(catalog.selectedForkTranscripts[0]).toEqual({
+					projectId: h.source.projectId,
+					sessionId: stagingId,
+					file: stagingFile,
+				});
+				expect(catalog.selectedForkTranscripts).toHaveLength(failure === "staging" ? 1 : 2);
+				if (failure === "successor") {
+					expect(successorFile).not.toBe("");
+					expect(h.sessions[1]!.session.sessionId).not.toBe(stagingId);
+					expect(catalog.selectedForkTranscripts[1]).toEqual({
+						projectId: h.source.projectId,
+						sessionId: h.sessions[1]!.session.sessionId,
+						file: successorFile,
+					});
+				}
+				for (const identity of catalog.selectedForkTranscripts)
+					expect(await Bun.file(identity.file).exists()).toBe(true);
+				expect((await h.call<DesktopSnapshot>("bootstrap")).sessions.map(session => session.id)).toEqual([h.source.id]);
+			} finally {
+				remove.mockRestore();
+			}
+			await h.close();
+			expect((await h.restart()).sessions.map(session => session.id)).toEqual([h.source.id]);
+			expect(await h.transcriptFiles()).toHaveLength(failure === "staging" ? 2 : 3);
+			expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+		},
+	);
+
+	test.each(["same file", "same SDK ID", "lineage child", "different project"] as const)(
+		"selected-entry provenance does not suppress an unrelated %s identity",
+		async variant => {
+			const h = await launch();
+			const fork = await h.call<DesktopForkResult>("session.fork", {
+				sessionId: h.source.id,
+				entryId: h.entryIds[1],
+			});
+			if (fork.cancelled) throw new Error("Unexpected cancellation");
+			await h.close();
+			const catalogFile = path.join(h.dataDir, "catalog.json");
+			const catalog: {
+				projects: DesktopProject[];
+				selectedForkTranscripts: Array<{ projectId: string; sessionId: string; file: string }>;
+			} = await Bun.file(catalogFile).json();
+			const staging = catalog.selectedForkTranscripts[0]!;
+			const lines = (await Bun.file(staging.file).text()).trimEnd().split("\n");
+			const header: { id: string; parentSession?: string } = JSON.parse(lines[0]!);
+			let discoveredId = staging.sessionId;
+			if (variant === "same SDK ID") {
+				await fs.rename(staging.file, path.join(path.dirname(staging.file), `other_${staging.sessionId}.jsonl`));
+			} else if (variant === "different project") {
+				const otherProject = { id: crypto.randomUUID(), name: "Other", path: h.dataDir, closed: true };
+				catalog.projects.push(otherProject);
+				staging.projectId = otherProject.id;
+				await Bun.write(catalogFile, JSON.stringify(catalog));
+			} else {
+				discoveredId = crypto.randomUUID();
+				header.id = discoveredId;
+				if (variant === "lineage child") header.parentSession = staging.file;
+				lines[0] = JSON.stringify(header);
+				await Bun.write(
+					variant === "same file" ? staging.file : path.join(path.dirname(staging.file), `child_${discoveredId}.jsonl`),
+					`${lines.join("\n")}\n`,
+				);
+			}
+			const snapshot = await h.restart();
+			expect(snapshot.sessions.map(session => session.id).sort()).toEqual(
+				[h.source.id, fork.session.id, discoveredId].sort(),
+			);
+			expect(snapshot.sessions.find(session => session.id === discoveredId)?.controlGeneration).toBeNull();
+			expect(h.sessions).toHaveLength(2);
+		},
+	);
 
 	test("a real post-commit SDK branch failure disposes and removes both private identities", async () => {
 		let candidateId = "";

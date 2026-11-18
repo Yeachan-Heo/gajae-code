@@ -4,7 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { Effort } from "@gajae-code/ai/core";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import * as sdk from "@gajae-code/coding-agent/sdk";
 import {
 	listManagedSessionCandidates,
@@ -15,6 +17,7 @@ import {
 	router as sdkRouter,
 } from "@gajae-code/coding-agent/sdk";
 import { createSdkWebSocketTransport } from "@gajae-code/coding-agent/sdk/host/websocket-transport";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DeliveryJournal } from "../src/delivery-journal";
 import { DesktopHost } from "../src/host";
@@ -120,9 +123,11 @@ async function fixture(
 	const queries: unknown[] = [];
 	const receipts = new Map<string, Record<string, unknown>>();
 	const connections = new Set<string>();
+	const handlers = new Set<Promise<void>>();
+	const handlerFailures: unknown[] = [];
 	const disposeFrames = transport.onFrame((connectionId, frame) => {
 		connections.add(connectionId);
-		void (async () => {
+		const handler = (async () => {
 			if (frame.type === "event_replay") {
 				await transport.sendFrame(connectionId, {
 					type: "event_replay_result",
@@ -233,14 +238,21 @@ async function fixture(
 				}
 				await transport.sendFrame(connectionId, { type: "control_response", id: frame.id, ok: true, result });
 			}
-		})().catch(error => {
-			void transport.sendFrame(connectionId, {
-				type: "query_response",
-				id: frame.id,
-				ok: false,
-				error: { code: "fixture_error", message: String(error) },
-			});
+		})().catch(async error => {
+			handlerFailures.push(error);
+			try {
+				await transport.sendFrame(connectionId, {
+					type: frame.type === "control_request" ? "control_response" : "query_response",
+					id: frame.id,
+					ok: false,
+					error: { code: "fixture_error", message: String(error) },
+				});
+			} catch (sendError) {
+				handlerFailures.push(new AggregateError([error, sendError], "Fixture error response failed"));
+			}
 		});
+		handlers.add(handler);
+		void handler.then(() => handlers.delete(handler));
 	});
 	const authority = await createDesktopManagedEndpointAuthority({ agentDir, cwd, sessionId: id, generation });
 	const { binding } = authority;
@@ -321,10 +333,12 @@ async function fixture(
 	const adapter = createAdapter();
 	cleanups.push(async () => {
 		for (const value of adapters) await value.close();
-		await modelQueries?.close();
 		disposeFrames?.();
+		while (handlers.size) await Promise.all([...handlers]);
+		await modelQueries?.close();
 		await transport.stop();
 		await fs.rm(directory, { recursive: true, force: true });
+		if (handlerFailures.length) throw new AggregateError(handlerFailures, "Managed endpoint fixture handlers failed");
 	});
 	if (options.open !== false) await adapter.open();
 	return {
@@ -555,42 +569,110 @@ test("managed answer copy checks router object equality even while the captured 
 });
 
 for (const retirement of ["close", "reopen"] as const) {
-	test(`managed answer copy host fences project ${retirement} and retired managed map after reading`, async () => {
-		const h = await fixture({ pagedTranscript: true });
-		h.entries.push({ id: "answer", role: "assistant", body: "answer from owner", stopReason: "stop" });
+	test(`native answer copy host fences project ${retirement} across the startup read boundary`, async () => {
 		const environment = { ...process.env };
 		const previousAgentDir = getAgentDir();
 		process.env.GJC_DESKTOP_ISOLATED = "1";
-		const createEmbedded = sdk.createEmbeddedAgentSession;
-		vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation((async (
-			options: sdk.EmbeddedAgentSessionOptions,
-		) => {
-			const owner = await createEmbedded(options);
-			const refresh = owner.refreshModels.bind(owner);
-			vi.spyOn(owner, "refreshModels").mockImplementation(() => refresh("offline"));
-			return owner;
-		}) as typeof sdk.createEmbeddedAgentSession);
-		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "list").mockImplementation(input =>
-			h.lifecycle.list(input),
-		);
-		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "resume").mockImplementation(input =>
-			h.lifecycle.resume(input),
-		);
-		await Bun.write(
-			path.join(h.directory, "catalog.json"),
-			JSON.stringify({
-				version: 1,
-				projects: [{ id: h.projectId, name: "Fixture project", path: h.cwd }],
-				sessions: [{ id: h.id, projectId: h.projectId, title: "Managed owner", starred: false, managed: true }],
-			}),
-		);
-		const frames: DesktopFrame[] = [];
-		const host = new DesktopHost({ dataDir: h.directory, emit: frame => frames.push(frame) });
+		process.env.GJC_NO_TITLE = "1";
+		const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-native-copy-")));
+		const cwd = path.join(directory, "project");
+		const agentDir = path.join(directory, "agent");
+		await fs.mkdir(cwd);
+		await fs.mkdir(agentDir);
+		process.env.GJC_CODING_AGENT_DIR = agentDir;
+		setAgentDir(agentDir);
+		vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined);
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Persisted question" }],
+			timestamp: Date.now(),
+		});
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Missing fixture model");
+		manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "answer from native owner" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			timestamp: Date.now(),
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+		await manager.ensureOnDisk();
+		await manager.flush();
+		const sessionId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Missing persisted answer");
+		const membership = manager.getOwnerMembership();
+		if (!membership) throw new Error("Missing fixture cooperative owner membership");
+		const closed = await manager.flushAndCloseStrict();
+		if (closed.kind !== "closed") throw new Error(`Fixture strict close failed: ${JSON.stringify(closed)}`);
+		expect(manager.retireCooperativeOwnerAfterClose(membership)).toBe(true);
 		const release = Promise.withResolvers<void>();
+		const startup = Promise.withResolvers<void>();
+		let holdStartup = true;
+		const createEmbedded = sdk.createEmbeddedAgentSession;
+		function createFixtureEmbedded(
+			options: sdk.NativeEmbeddedAgentSessionOptions,
+		): Promise<sdk.NativeEmbeddedOpenResult>;
+		function createFixtureEmbedded(options: sdk.EmbeddedAgentSessionOptions): Promise<sdk.EmbeddedAgentSessionResult>;
+		async function createFixtureEmbedded(
+			options: sdk.EmbeddedAgentSessionOptions | sdk.NativeEmbeddedAgentSessionOptions,
+		): Promise<sdk.EmbeddedAgentSessionResult | sdk.NativeEmbeddedOpenResult> {
+			if (!("native" in options)) return createEmbedded(options);
+			const opened = await createEmbedded(options);
+			if (opened.kind === "opened" && holdStartup) {
+				const initialize = opened.result.initializeUI.bind(opened.result);
+				vi.spyOn(opened.result, "initializeUI").mockImplementation(async input => {
+					await initialize(input);
+					startup.resolve();
+					await release.promise;
+				});
+			}
+			return opened;
+		}
+		const factory = vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation(createFixtureEmbedded);
+		const frames: DesktopFrame[] = [];
+		const nativeManagers: SessionManager[] = [];
+		const host = new DesktopHost({
+			dataDir: directory,
+			emit: frame => frames.push(frame),
+			createSession: async options => {
+				const result = await sdk.createAgentSession({
+					...options,
+					model,
+					extensions: [],
+					skills: [],
+					rules: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					disableExtensionDiscovery: true,
+					enableMcpAutoload: false,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					deferOptionalModelRefresh: true,
+					deferMemoryBackendStartup: true,
+					toolNames: [],
+				});
+				nativeManagers.push(result.session.sessionManager);
+				return result;
+			},
+		});
 		cleanups.push(async () => {
 			release.resolve();
 			try {
 				await host.close();
+				await fs.rm(directory, { recursive: true, force: true });
 			} finally {
 				for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];
 				Object.assign(process.env, environment);
@@ -605,52 +687,92 @@ for (const retirement of ["close", "reopen"] as const) {
 			if (!response.ok) throw new Error(response.error);
 			return response.result as T;
 		};
-		const selected = await call<DesktopSession>("session.select", { sessionId: h.id });
-		const descriptor = selected.messages.find(message => message.role === "assistant")?.copy;
-		if (!descriptor) throw new Error("Missing host managed copy descriptor");
-		const read = Promise.withResolvers<void>();
-		const originalCopy = ManagedSession.prototype.copyText;
-		const copy = vi.spyOn(ManagedSession.prototype, "copyText").mockImplementationOnce(async function (
-			this: ManagedSession,
-			entryId,
-			generation,
-		) {
-			const text = await originalCopy.call(this, entryId, generation);
-			read.resolve();
-			await release.promise;
-			return text;
+		const project = await call<{ id: string }>("project.open", { path: cwd });
+		const observed = await call<DesktopSession>("session.select", { sessionId });
+		expect(observed.messages.find(message => message.role === "assistant")?.text).toBe("answer from native owner");
+		expect(observed.messages.find(message => message.role === "assistant")?.copy).toBeUndefined();
+		const admissions = factory.mock.calls.length;
+		const unadmittedBytes = await Bun.file(file).text();
+		await expect(call("message.copyText", { sessionId, sessionGeneration: 7, entryId: "answer" })).rejects.toThrow(
+			"Connect this conversation",
+		);
+		expect(factory).toHaveBeenCalledTimes(admissions);
+		expect(await Bun.file(file).text()).toBe(unadmittedBytes);
+		const connect = async () => {
+			const resolved = sdk.resolveEmbeddedResumeCheckpoint(file);
+			if (resolved.kind !== "resolved") throw new Error(resolved.reason);
+			// This fixture's exact enrolled cooperative owner was strictly closed and retired.
+			const result = await call<
+				{ kind: "connected"; session: DesktopSession } | { kind: "refused"; reason: string }
+			>("session.connect", {
+				sessionId,
+				selection: {
+					snapshotDigest: resolved.checkpoint.snapshotDigest,
+					targetLeafId: resolved.checkpoint.leafEntryId,
+				},
+			});
+			if (result.kind !== "connected")
+				throw new Error(`Native copy fixture connect failed: ${JSON.stringify(result)}`);
+			return result.session;
+		};
+		const connected = await connect();
+		const descriptor = connected.messages.find(message => message.role === "assistant")?.copy;
+		if (!descriptor) throw new Error("Missing native copy descriptor");
+		await startup.promise;
+		const nativeManager = nativeManagers.at(-1);
+		if (!nativeManager) throw new Error("Missing native manager");
+		const entered = Promise.withResolvers<void>();
+		const identityGeneration = nativeManager.getSessionIdentityGeneration.bind(nativeManager);
+		vi.spyOn(nativeManager, "getSessionIdentityGeneration").mockImplementationOnce(() => {
+			entered.resolve();
+			return identityGeneration();
 		});
-		const reading = call("message.copyText", { sessionId: h.id, ...descriptor });
+		const reading = call("message.copyText", { sessionId, ...descriptor });
 		const outcome = reading.then(
 			value => ({ value, error: undefined }),
 			(error: unknown) => ({ value: undefined, error }),
 		);
 		try {
 			await Promise.race([
-				read.promise,
+				entered.promise,
 				reading.then(() => {
-					throw new Error("Copy completed before the retirement barrier");
+					throw new Error("Copy settled before entering its startup read boundary");
 				}),
 			]);
-			await call("project.close", { projectId: h.projectId });
+			await call("project.close", { projectId: project.id });
+			const retiredBytes = await Bun.file(file).text();
 			if (retirement === "reopen") {
-				await call("project.open", { path: h.cwd });
-				const reopened = await call<DesktopSession>("session.select", { sessionId: h.id });
-				expect(reopened.messages.find(message => message.role === "assistant")?.copy?.sessionGeneration).not.toBe(
-					descriptor.sessionGeneration,
+				await call("project.open", { path: cwd });
+				const reopened = await call<DesktopSession>("session.select", { sessionId });
+				expect(reopened.controlGeneration).toBeNull();
+				expect(reopened.messages.find(message => message.role === "assistant")?.copy).toBeUndefined();
+				await expect(call("message.copyText", { sessionId, ...descriptor })).rejects.toThrow(
+					"Connect this conversation",
 				);
 			}
 			release.resolve();
 			const result = await outcome;
 			expect(result.value).toBeUndefined();
 			expect(result.error).toBeInstanceOf(Error);
-			expect((result.error as Error).message).toContain("SDK owner changed");
+			expect((result.error as Error).message).toContain("Session changed");
+			expect(await Bun.file(file).text()).toBe(retiredBytes);
+			if (retirement === "reopen") {
+				holdStartup = false;
+				const fresh = (await connect()).messages.find(message => message.role === "assistant")?.copy;
+				if (!fresh) throw new Error("Missing fresh native copy descriptor after explicit reconnect");
+				expect(fresh.sessionGeneration).not.toBe(descriptor.sessionGeneration);
+				await expect(call("message.copyText", { sessionId, ...descriptor })).rejects.toThrow("Session changed");
+				expect(await call<{ text: string }>("message.copyText", { sessionId, ...fresh })).toEqual({
+					text: "answer from native owner",
+				});
+			}
+			expect(JSON.stringify(frames.filter(frame => frame.type === "response" && !frame.ok))).not.toContain(
+				"answer from native owner",
+			);
 		} finally {
 			release.resolve();
-			copy.mockRestore();
+			await outcome;
 		}
-		expect(h.controls).toEqual([]);
-		expect(await Bun.file(h.file).text()).toBe(h.transcript);
 	});
 }
 

@@ -9,6 +9,7 @@ export const PROTOCOL_VERSION = 1;
 export const DESKTOP_METHODS = [
 	"bootstrap",
 	"project.open",
+	"project.refresh",
 	"project.close",
 	"project.reorder",
 	"session.reorder",
@@ -218,7 +219,32 @@ export interface DesktopSession {
 	controlGeneration: number | null;
 	/** Present only while this host holds SDK-admitted native ownership. */
 	ownership?: "native";
-	connectionState?: "connected" | "disconnecting" | "disconnected" | "release_failed" | "detach_unknown" | "uncertain_cursor" | "checkpoint_incomplete";
+	/** Discovered history remains read-only until explicit native ownership admission. */
+	origin?: "external";
+	mode?: "readonly" | "native";
+	readOnly?: true;
+	readOnlyReason?: string;
+	/** Exact persisted snapshot, not a claim about a running owner's state. */
+	observation?: {
+		source: "disk";
+		snapshotDigest: string;
+		checkpointKind: "recorded" | "tail_unambiguous" | "empty" | "legacy_tail" | "ambiguous" | "invalid";
+		selectionRequired: boolean;
+		unresolvedCount: number;
+		/** Total context order; content entries reference messages by their canonical entryId. */
+		sequence: Array<
+			| { kind: "content"; entryId: string | null }
+			| { kind: "unresolved"; entryId: string | null; reason: "resident_payload_unavailable" }
+		>;
+	};
+	connectionState?:
+		| "connected"
+		| "disconnecting"
+		| "disconnected"
+		| "release_failed"
+		| "detach_unknown"
+		| "uncertain_cursor"
+		| "checkpoint_incomplete";
 	/** The host can rewind this conversation's tree to edit a prompt or show another revision. */
 	promptEditing?: true;
 	/** Present on host projections, including unavailable unopened/no-model sessions. */
@@ -264,6 +290,11 @@ export interface DesktopCapability {
 	available: boolean;
 	reason?: string;
 }
+/** Explicit refresh outcome; retryAfter is the remaining per-project throttle in milliseconds. */
+export type DesktopProjectRefreshResult =
+	| { kind: "refreshed"; snapshot: DesktopSnapshot }
+	| { kind: "throttled"; retryAfter: number; snapshot: DesktopSnapshot };
+
 export interface DesktopSnapshot {
 	protocolVersion: number;
 	projects: DesktopProject[];
@@ -324,6 +355,7 @@ export interface DesktopHistory {
 	offset: number;
 	messages: DesktopMessage[];
 	truncated: boolean;
+	observation?: DesktopSession["observation"];
 }
 export interface DesktopAuthProvider {
 	id: string;
