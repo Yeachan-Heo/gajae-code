@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { deflateRawSync, gzipSync, constants as zlibConstants } from "node:zlib";
 import { Zip, ZipDeflate, ZipPassThrough, zipSync } from "fflate";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import { openArchive } from "../src/tools/archive-reader";
 
 const exec = promisify(execFile);
@@ -93,14 +94,6 @@ function appendPaxHeader(chunks: Uint8Array[], records: Array<[string, string]>,
 
 function appendTarFile(chunks: Uint8Array[], name: string, body: Uint8Array): void {
 	chunks.push(ustarHeader(name, body.byteLength), pad512(body));
-}
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
 }
 
 function randomInteger(random: () => number, min: number, max: number): number {
@@ -894,7 +887,7 @@ describe("openArchive inflate caps", () => {
 	test(
 		"holds fixed-seed generated ZIP and ZIP64 directory properties (seed 0x6847d17b)",
 		noted("holds fixed-seed generated ZIP and ZIP64 directory properties (seed 0x6847d17b)", async () => {
-			const random = seededRandom(0x6847d17b);
+			const random = lcgUnit(0x6847d17b);
 			for (let caseIndex = 0; caseIndex < 8; caseIndex++) {
 				const name = `member-${caseIndex}-${randomAscii(random, 6)}.bin`;
 				const payload = randomBytes(random, randomInteger(random, 1, 64));
@@ -1600,7 +1593,7 @@ describe("openArchive inflate caps", () => {
 	test(
 		"fixed-seed generated PAX metadata preserves paths, sizes, and member bytes",
 		noted("fixed-seed generated PAX metadata preserves paths, sizes, and member bytes", async () => {
-			const random = seededRandom(0x6847_2026);
+			const random = lcgUnit(0x6847_2026);
 			const boundaryCommentLengths = [86, 87, 88, 986, 987, 988];
 			const chunks: Uint8Array[] = [];
 			const expected: Array<{ path: string; bytes: Uint8Array }> = [];
@@ -1694,7 +1687,7 @@ describe("openArchive inflate caps", () => {
 	test(
 		"fixed-seed generated malformed PAX boundaries terminate with rejection",
 		noted("fixed-seed generated malformed PAX boundaries terminate with rejection", async () => {
-			const random = seededRandom(0x6847_2027);
+			const random = lcgUnit(0x6847_2027);
 			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-malformed-properties-"));
 			try {
 				for (let index = 0; index < 32; index++) {
@@ -1719,7 +1712,7 @@ describe("openArchive inflate caps", () => {
 	test(
 		"fixed-seed generated PAX overrides cannot bypass effective size or path limits",
 		noted("fixed-seed generated PAX overrides cannot bypass effective size or path limits", async () => {
-			const random = seededRandom(0x6847_2028);
+			const random = lcgUnit(0x6847_2028);
 			const dir = await mkdtemp(path.join(tmpdir(), "archive-pax-limit-properties-"));
 			try {
 				for (let index = 0; index < 16; index++) {
@@ -1779,7 +1772,7 @@ describe("openArchive inflate caps", () => {
 	test(
 		"fixed-seed generated ZIP and ZIP64 members preserve names and bytes",
 		noted("fixed-seed generated ZIP and ZIP64 members preserve names and bytes", async () => {
-			const random = seededRandom(0x6847_2111);
+			const random = lcgUnit(0x6847_2111);
 			for (let index = 0; index < 64; index++) {
 				const count = index % 5 === 0 ? 2 : 1;
 				const members = Array.from({ length: count }, (_, ordinal) => generatedZipMember(random, index, ordinal));
@@ -1792,7 +1785,7 @@ describe("openArchive inflate caps", () => {
 	test(
 		"fixed-seed generated ZIP truncation and inconsistent records reject",
 		noted("fixed-seed generated ZIP truncation and inconsistent records reject", async () => {
-			const random = seededRandom(0x6847_2112);
+			const random = lcgUnit(0x6847_2112);
 			for (let index = 0; index < 64; index++) {
 				const member = generatedZipMember(random, index, 0);
 				const built = buildGeneratedZip([member], index % 2 === 0, random);

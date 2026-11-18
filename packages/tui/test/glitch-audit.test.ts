@@ -3,7 +3,7 @@ import { type Component, TUI } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui/components/text";
 import { renderMetrics } from "@gajae-code/tui/metrics";
 import { ImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 /**
  * Glitch repro audit for the user-reported renderer glitch classes:
@@ -87,12 +87,6 @@ class RawLinesComponent implements Component {
 	render(): string[] {
 		return [...this.#lines];
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
 }
 
 describe("TUI glitch audit (reported glitch classes)", () => {

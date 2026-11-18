@@ -709,6 +709,76 @@ describe("Agent", () => {
 		).toBe(false);
 	});
 
+	it("logs the underlying cause when canonical publication aborts the run", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const failure = new Error("Shared session mutation requires transaction admission: append entry");
+			const mock = createMockModel({ responses: [{ content: ["must not continue"] }] });
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event =>
+				event.type === "message_end" && event.message.role === "assistant" ? Promise.reject(failure) : undefined,
+			);
+			await agent.prompt("run");
+			const call = warn.mock.calls.find(([message]) => message === "Agent run aborted with an underlying failure");
+			expect(call).toBeDefined();
+			expect(call?.[1]).toMatchObject({ code: "aborted", cause: expect.stringContaining(failure.message) });
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not log a run failure for a deliberate cancellation", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const mock = createMockModel({ responses: [{ content: ["cancelled"] }] });
+			const entered = Promise.withResolvers<void>();
+			const completion = Promise.withResolvers<void>();
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					entered.resolve();
+					return completion.promise;
+				}
+			});
+			const run = agent.prompt("run");
+			await entered.promise;
+			agent.abort();
+			completion.resolve();
+			await run;
+			const messages = warn.mock.calls.map(([message]) => message);
+			expect(messages).not.toContain("Agent run failed");
+			expect(messages).not.toContain("Agent run aborted with an underlying failure");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not report a forced abort as a run failure", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const mock = createMockModel({ responses: [{ content: ["forced"] }] });
+			const entered = Promise.withResolvers<void>();
+			const completion = Promise.withResolvers<void>();
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					entered.resolve();
+					return completion.promise;
+				}
+			});
+			const run = agent.prompt("run");
+			await entered.promise;
+			agent.forceAbort("Force aborted");
+			completion.resolve();
+			await run;
+			const messages = warn.mock.calls.map(([message]) => message);
+			expect(messages).not.toContain("Agent run failed");
+			expect(messages).not.toContain("Agent run aborted with an underlying failure");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it("does not dispatch non-abortable tools after cancellation during canonical admission", async () => {
 		const mock = createMockModel({
 			responses: [{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] }],

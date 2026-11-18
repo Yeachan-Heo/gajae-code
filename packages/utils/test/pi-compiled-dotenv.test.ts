@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "./helpers/trust-temp-dirs";
 
 /**
  * `PI_COMPILED` is a build-script marker for a standalone binary. A repository
@@ -15,18 +14,8 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "pi-compiled-env-probe.ts");
 const KEY = "PI_COMPILED";
 
-const tempDirs: string[] = [];
-
-function tempDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pi-compiled-dotenv-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const trustDirs = createTrustTempDirs("gjc-pi-compiled-dotenv-");
+const { tempDir, projectDir } = trustDirs;
 
 async function resolveIn(cwd: string, options: { autoload: boolean; inherited?: string }): Promise<string | null> {
 	const env: Record<string, string> = {};
@@ -51,11 +40,11 @@ describe.each([
 	["no dotenv autoload", false],
 ] as const)("PI_COMPILED project dotenv boundary (%s)", (_label, autoload) => {
 	it("drops a value declared by the project .env", async () => {
-		expect(await resolveIn(tempDir(`${KEY}=true\n`), { autoload })).toBeNull();
+		expect(await resolveIn(projectDir(`${KEY}=true\n`), { autoload })).toBeNull();
 	});
 
 	it("drops a dynamic project declaration", async () => {
-		expect(await resolveIn(tempDir(`COMPILED=true\n${KEY}=$COMPILED\n`), { autoload })).toBeNull();
+		expect(await resolveIn(projectDir(`COMPILED=true\n${KEY}=$COMPILED\n`), { autoload })).toBeNull();
 	});
 
 	it("keeps a value inherited from the launching shell", async () => {
@@ -63,10 +52,10 @@ describe.each([
 	});
 
 	it("does not let the project .env replace an inherited value", async () => {
-		expect(await resolveIn(tempDir(`${KEY}=true\n`), { autoload, inherited: "1" })).toBe("1");
+		expect(await resolveIn(projectDir(`${KEY}=true\n`), { autoload, inherited: "1" })).toBe("1");
 	});
 
 	it("drops an inherited value equal to the project declaration", async () => {
-		expect(await resolveIn(tempDir(`${KEY}=true\n`), { autoload, inherited: "true" })).toBeNull();
+		expect(await resolveIn(projectDir(`${KEY}=true\n`), { autoload, inherited: "true" })).toBeNull();
 	});
 });

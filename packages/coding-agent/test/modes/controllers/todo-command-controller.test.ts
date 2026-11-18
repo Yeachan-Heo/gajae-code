@@ -38,6 +38,8 @@ function controllerFor(phases: TodoPhase[]) {
 		session: {
 			getTodoPhases: () => [],
 			setTodoPhases: vi.fn(),
+			appendCustomEntryInBackground: vi.fn(),
+			appendMessageInBackground: vi.fn(),
 		},
 		setTodos: vi.fn(),
 		agent: { appendMessage: vi.fn() },
@@ -95,8 +97,8 @@ describe("/todo mutation admission", () => {
 		expect(ctx.session.setTodoPhases).not.toHaveBeenCalled();
 		expect(ctx.setTodos).not.toHaveBeenCalled();
 		expect(ctx.agent.appendMessage).not.toHaveBeenCalled();
-		expect(ctx.sessionManager.appendCustomEntry).not.toHaveBeenCalled();
-		expect(ctx.sessionManager.appendMessage).not.toHaveBeenCalled();
+		expect(ctx.session.appendCustomEntryInBackground).not.toHaveBeenCalled();
+		expect(ctx.session.appendMessageInBackground).not.toHaveBeenCalled();
 		expect(entries).toEqual(before);
 		expect(phases).toEqual(initial);
 		expect(ctx.ui.suspend).not.toHaveBeenCalled();
@@ -132,11 +134,11 @@ describe("/todo mutation admission", () => {
 		expect(ctx.sessionManager.assertLegacyMutationAllowed).toHaveBeenCalledWith("/todo start Write report");
 		expect(ctx.session.setTodoPhases).toHaveBeenCalledWith(expected);
 		expect(ctx.setTodos).toHaveBeenCalledWith(expected);
-		expect(ctx.sessionManager.appendCustomEntry).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, {
+		expect(ctx.session.appendCustomEntryInBackground).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, {
 			phases: expected,
 		});
 		expect(ctx.agent.appendMessage).toHaveBeenCalledTimes(1);
-		expect(ctx.sessionManager.appendMessage).toHaveBeenCalledWith(ctx.agent.appendMessage.mock.calls[0]?.[0]);
+		expect(ctx.session.appendMessageInBackground).toHaveBeenCalledWith(ctx.agent.appendMessage.mock.calls[0]?.[0]);
 		expect(showStatus).toHaveBeenCalledWith("Started: Write report");
 		expect(showError).not.toHaveBeenCalled();
 	});

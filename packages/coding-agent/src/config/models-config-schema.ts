@@ -225,11 +225,38 @@ export const ProviderAuthSchema = z.enum(["apiKey", "none", "oauth"]);
 export type ProviderAuthMode = z.infer<typeof ProviderAuthSchema>;
 export type ProviderDiscovery = z.infer<typeof ProviderDiscoverySchema>;
 
+/**
+ * The one spelling of the `credential: store` declaration. The schema, the
+ * loader's provider validation, and provider setup all derive from this
+ * constant so the literal cannot drift between writer and reader.
+ */
+export const PROVIDER_CREDENTIAL_STORE = "store" as const;
+export type ProviderStoreCredential = typeof PROVIDER_CREDENTIAL_STORE;
+
 const ProviderConfigSchema = z
 	.object({
 		baseUrl: z.string().min(1).optional(),
 		apiKey: z.string().min(1).optional(),
 		apiKeyEnv: z.string().min(1).optional(),
+		/**
+		 * Declares that the provider's API key lives in the local credential
+		 * store (`agent.db`) rather than in `apiKey`/`apiKeyEnv`. Provider setup
+		 * writes both the key and this declaration for pasted credentials;
+		 * `auth login` stores credentials but never edits `models.yml`, so after a
+		 * login add this declaration by hand. The runtime resolves it through the
+		 * same stored-credential layer used by every other provider; the field
+		 * exists so the loader can tell a deliberate store-backed provider from
+		 * one that simply forgot a credential source.
+		 *
+		 * Ambiguous when combined with any other credential source (`apiKey`,
+		 * `apiKeyEnv`, `openaiCompat.apiKey`, `openaiCompat.apiKeyEnv`), and
+		 * incompatible with `auth: none`, `auth: oauth`, and
+		 * `api: bedrock-converse-stream` at provider or model level. It does not
+		 * pin a credential row and is not verified at load time; a provider whose
+		 * stored credential is missing resolves no stored credential until one is
+		 * stored (the registry logs a warning at load).
+		 */
+		credential: z.literal(PROVIDER_CREDENTIAL_STORE).optional(),
 		api: z
 			.enum([
 				"openai-completions",

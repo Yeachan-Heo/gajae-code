@@ -8,6 +8,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { waitForToolCallBoundary } from "../src/sdk/prompt-tool-boundary";
 
 /**
@@ -31,13 +32,8 @@ const TEST_GRACE_MS = 300;
 /** The model call after the tool never answers, so the run is still live to fence. */
 const UNANSWERED_MODEL_CALL_MS = 30_000;
 
-async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(5);
-	}
-}
+const waitUntil = (predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 5, label });
 
 /** A tool that writes in two halves and parks between them, like a real patch apply. */
 function mutatingTool(input: {

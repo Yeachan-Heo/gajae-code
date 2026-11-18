@@ -14,11 +14,12 @@ import {
 	subagentBodyCacheTestHooks,
 	subagentToolRenderer,
 } from "../../src/tools/subagent-render";
+import { loadTestTheme } from "../helpers/test-theme";
 
 let theme: Theme;
 
 beforeAll(async () => {
-	theme = (await getThemeByName("red-claw"))!;
+	theme = (await loadTestTheme())!;
 	expect(theme).toBeDefined();
 	setThemeInstance(theme);
 });

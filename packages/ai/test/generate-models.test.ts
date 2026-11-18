@@ -62,6 +62,29 @@ describe("injectCodexGpt6Models", () => {
 
 		expect(models).toEqual([
 			expect.objectContaining({
+				id: "gpt-6.2-astra",
+				name: "GPT-6.2 Astra",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+				priority: 1,
+			}),
+			expect.objectContaining({
+				id: "gpt-6.2-sol",
+				name: "GPT-6.2 Sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
 				id: "gpt-6-astra",
 				name: "GPT-6 Astra",
 				api: "openai-codex-responses",
@@ -71,7 +94,6 @@ describe("injectCodexGpt6Models", () => {
 				contextWindow: UNK_CONTEXT_WINDOW,
 				maxTokens: UNK_MAX_TOKENS,
 				preferWebsockets: true,
-				priority: 1,
 			}),
 			expect.objectContaining({
 				id: "gpt-6-sol",
@@ -118,6 +140,10 @@ describe("injectCodexGpt6Models", () => {
 				preferWebsockets: true,
 			}),
 		]);
+		expect(models.filter(model => model.id === "gpt-6.2-astra")).toHaveLength(1);
+		expect(models.filter(model => model.id === "gpt-6.2-sol")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6.2-sol")).not.toHaveProperty("priority");
+		expect(models.find(model => model.id === "gpt-6-astra")).not.toHaveProperty("priority");
 		expect(models.filter(model => model.id === "gpt-6-sol")).toHaveLength(1);
 		expect(models.find(model => model.id === "gpt-6-sol")).not.toHaveProperty("priority");
 		expect(models.filter(model => model.id === "gpt-6.1-sol")).toHaveLength(1);
@@ -170,9 +196,14 @@ describe("applyUltrafastTierModelPolicies", () => {
 			model("github-copilot", "gpt-6-astra"),
 			model("opencode-zen", "gpt-6.1-sol"),
 			model("openai-codex", "gpt-6-sol"),
+			model("openai", "gpt-6.2-astra"),
+			model("openai-codex", "gpt-6.2-sol"),
+			model("opencode-zen", "gpt-6.2-astra"),
+			model("openrouter", "openai/gpt-6.2-sol"),
 		];
 		models[2]!.compat = { ...models[2]!.compat, supportsServiceTier: true };
 		models[3]!.compat = { ...models[3]!.compat, supportsServiceTier: true };
+		models[7]!.compat = { ...models[7]!.compat, supportsServiceTier: true };
 
 		applyUltrafastTierModelPolicies(models);
 
@@ -181,6 +212,10 @@ describe("applyUltrafastTierModelPolicies", () => {
 		expect(models[2]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
 		expect(models[3]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
 		expect(models[4]?.compat).toEqual({ supportsReasoningEffort: true });
+		expect(models[5]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[6]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[7]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[8]?.compat).toEqual({ supportsReasoningEffort: true });
 	});
 
 	it("does not infer ultrafast support for GPT-5.6 models", () => {

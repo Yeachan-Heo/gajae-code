@@ -15,6 +15,7 @@ import {
 	runInteractiveBashPty,
 } from "@gajae-code/coding-agent/tools/bash-interactive";
 import { getKeybindings, setKeybindings } from "@gajae-code/tui";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { KeybindingsManager } from "../src/config/keybindings";
 
 interface CapturedComponent {
@@ -80,14 +81,8 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 describe("interactive PTY fold ownership", () => {
 	it("removes ambient coordinator markers while preserving explicit env overrides", async () => {

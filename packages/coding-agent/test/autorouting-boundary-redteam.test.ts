@@ -24,7 +24,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { SmartRoutingPanelComponent } from "../src/modes/components/smart-routing-panel";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import * as sdkModule from "../src/sdk";
 import type { RoutingSettingsPreview } from "../src/sdk/routing-settings";
 import { ArtifactManager } from "../src/session/artifacts";
@@ -43,6 +43,7 @@ import {
 import type { AutoroutingPreflightFailure, SingleResult, TaskRoutingEvidence } from "../src/task/types";
 import { assertRoutingEvidenceInvariant } from "../src/task/types";
 import { splitInternalUrlSel } from "../src/tools/path-utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const rootCommand = "bun test packages/coding-agent/test/autorouting-boundary-redteam.test.ts";
 
@@ -1308,7 +1309,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 	});
 
 	it("fresh B1 seam: panel refuses catalog drift and requires review of a fresh preview", async () => {
-		const loadedTheme = await getThemeByName("red-claw");
+		const loadedTheme = await loadTestTheme();
 		if (loadedTheme) setThemeInstance(loadedTheme);
 		const catalogA = [
 			model("anthropic", "claude-haiku-4-5"),

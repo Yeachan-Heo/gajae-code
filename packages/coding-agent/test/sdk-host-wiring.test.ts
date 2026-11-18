@@ -21,6 +21,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
@@ -151,6 +152,7 @@ function captureInternalSend(
 }
 
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { closeSocket } from "./helpers/close-socket";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
@@ -179,13 +181,8 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 });
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = performance.now() + 15_000;
-	while (!predicate()) {
-		if (performance.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(20);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 15_000, { intervalMs: 20, label, clock: () => performance.now() });
 function pauseNextReconciliationCommit(
 	sessionFile: string,
 	sessionId: string,
@@ -327,15 +324,6 @@ async function awaitSocketOpen(socket: WebSocket): Promise<void> {
 	socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	await promise;
 }
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
-}
-
 async function removeTempDir(dir: string): Promise<void> {
 	for (let attempt = 0; ; attempt++) {
 		try {
@@ -8375,6 +8363,18 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 		}),
 	);
 	await waitFor(() => deliveries.length === 1, "terminal prompt accepted");
+	// Wait for the durable acceptance response so the abort below observes the
+	// accepted-but-not-started state this test names. Aborting during admission
+	// instead races the preflight-cancellation cleanup, which fail-closes to
+	// `turn: "uncertain"` (reason `worker_unsettled`) and would let a
+	// non-settled finalization satisfy this test.
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-prompt"),
+		"terminal prompt acceptance response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-prompt")).toMatchObject({
+		ok: true,
+	});
 	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	// The fixture harness fires agent_start without binding an exact run handle,
 	// so the prompt is normally accepted-but-not-started: terminal abort must
@@ -8407,7 +8407,11 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	if (abortResponse?.result?.turn === "no_active_turn") {
 		expect(abortResponse.result.terminal).toBe("terminal_no_effect");
 	} else {
-		expect(abortResponse?.result).toMatchObject({ ownedWork: "left_running", resumeOnOwnedCompletion: true });
+		expect(abortResponse?.result).toMatchObject({
+			turn: "stopped",
+			ownedWork: "left_running",
+			resumeOnOwnedCompletion: true,
+		});
 	}
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });

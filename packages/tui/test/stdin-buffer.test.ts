@@ -919,4 +919,108 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b]11;rgb:0000/0000/0000\x1b\\"]);
 		});
 	});
+	describe("Paste recovery and grouping", () => {
+		function collect(options: ConstructorParameters<typeof StdinBuffer>[0] = {}) {
+			const instance = new StdinBuffer(options);
+			const data: string[] = [];
+			const pastes: string[] = [];
+			instance.on("data", sequence => data.push(sequence));
+			instance.on("paste", content => pastes.push(content));
+			return { instance, data, pastes };
+		}
+
+		it("recovers from a lost end marker once the watchdog fires", async () => {
+			const { instance, data, pastes } = collect({ pasteTimeout: 20 });
+			instance.process("\x1b[200~abc");
+			expect(instance.pasting).toBe(true);
+			await Bun.sleep(60);
+
+			expect(pastes).toEqual(["abc"]);
+			expect(instance.pasting).toBe(false);
+			instance.process("x");
+			expect(data).toEqual(["x"]);
+		});
+
+		it("keeps the watchdog alive while paste chunks keep arriving", async () => {
+			const { instance, pastes } = collect({ pasteTimeout: 40 });
+			instance.process("\x1b[200~a");
+			await Bun.sleep(25);
+			instance.process("b");
+			await Bun.sleep(25);
+			instance.process("c\x1b[201~");
+
+			expect(pastes).toEqual(["abc"]);
+		});
+
+		it("delivers an oversized paste as soon as the byte cap is exceeded", () => {
+			const { instance, data, pastes } = collect({ pasteByteLimit: 8 });
+			instance.process("\x1b[200~12345");
+			expect(pastes).toEqual([]);
+			instance.process("6789");
+
+			expect(pastes).toEqual(["123456789"]);
+			expect(instance.pasting).toBe(false);
+			instance.process("z");
+			expect(data).toEqual(["z"]);
+		});
+
+		it("counts the byte cap in UTF-8 bytes", () => {
+			const { instance, pastes } = collect({ pasteByteLimit: 5 });
+			instance.process("\x1b[200~\ud654\ub9b0");
+			expect(pastes).toEqual(["\ud654\ub9b0"]);
+		});
+
+		it("delivers an unbracketed multi-line burst as one paste", () => {
+			const { instance, data, pastes } = collect();
+			instance.process("one\ntwo\nthree");
+
+			expect(pastes).toEqual(["one\ntwo\nthree"]);
+			expect(data).toEqual([]);
+		});
+
+		it("groups an unbracketed burst split across reads", () => {
+			const { instance, data, pastes } = collect();
+			instance.process("one\ntwo\n");
+			expect(pastes).toEqual([]);
+			instance.process("three");
+
+			expect(pastes).toEqual(["one\ntwo\nthree"]);
+			expect(data).toEqual([]);
+		});
+
+		it("replays a single Enter as a key after the classification window", async () => {
+			const { instance, data, pastes } = collect();
+			instance.process("hi\r");
+			expect(data).toEqual([]);
+			await Bun.sleep(40);
+
+			expect(data).toEqual(["h", "i", "\r"]);
+			expect(pastes).toEqual([]);
+		});
+
+		it("returns a held break candidate from flush()", () => {
+			const { instance, data } = collect();
+			instance.process("a\r");
+
+			expect(instance.flush()).toEqual(["a", "\r"]);
+			expect(data).toEqual([]);
+			expect(instance.getBuffer()).toBe("");
+		});
+
+		it("replays the held candidate as keys before an escape sequence", () => {
+			const { instance, data } = collect();
+			instance.process("a\r");
+			instance.process("\x1b[A");
+
+			expect(data).toEqual(["a", "\r", "\x1b[A"]);
+		});
+
+		it("routes input after a paste end marker through the data path", () => {
+			const { instance, data, pastes } = collect();
+			instance.process("\x1b[200~pasted\x1b[201~\x1b[13;5ux");
+
+			expect(pastes).toEqual(["pasted"]);
+			expect(data).toEqual(["\x1b[13;5u", "x"]);
+		});
+	});
 });

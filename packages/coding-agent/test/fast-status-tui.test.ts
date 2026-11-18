@@ -1,9 +1,10 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import type { Model } from "@gajae-code/ai";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
 import { Text } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 function model(provider: string, id: string): Model {
 	return { provider, id } as unknown as Model;
@@ -57,8 +58,7 @@ function createTuiRuntime() {
 
 describe("/fast status TUI rendering", () => {
 	beforeAll(async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for /fast status TUI test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 	});
 	test("AC-5: renders a multiline transcript panel, clears the editor, and never uses showStatus", async () => {

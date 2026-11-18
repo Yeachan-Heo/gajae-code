@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "./helpers/trust-temp-dirs";
 
 /**
  * `GJC_LOG_DIR` selects where the rotating file transport writes and where every
@@ -25,23 +25,7 @@ interface Resolved {
 	markerDir: string | null;
 }
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-log-dir-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
-
-function projectDir(dotenv: string): string {
-	const dir = tempDir();
-	fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { tempDir, projectDir } = createTrustTempDirs("gjc-log-dir-trust-");
 
 async function resolveIn(
 	cwd: string,

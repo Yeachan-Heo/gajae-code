@@ -4,18 +4,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Broker, type BrokerResponse, lifecycleTargetForTest } from "../src/sdk/broker/broker";
+import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
-
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
 
 const roots: string[] = [];
 afterEach(async () => {

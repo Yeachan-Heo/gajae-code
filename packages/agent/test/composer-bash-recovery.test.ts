@@ -16,16 +16,10 @@ import {
 } from "@gajae-code/ai/providers/composer-discipline";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 const bashSchema = z.object({ command: z.string() });
 const readSchema = z.object({ path: z.string() });
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
 
 function hasText(messages: readonly (AgentMessage | Message)[], text: string): boolean {
 	return messages.some(message => {

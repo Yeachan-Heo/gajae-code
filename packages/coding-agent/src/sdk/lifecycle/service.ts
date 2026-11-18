@@ -462,6 +462,7 @@ const RETRYABLE_BROKER_ERRORS = new Set([
 	"startup_admission_timeout",
 ]);
 
+/** Lifecycle idempotency digests: sorted keys, omits undefined-valued keys, and stringifies non-record values (undefined becomes the string "undefined"). */
 function canonicalJson(value: unknown): string {
 	if (value === null) return "null";
 	if (typeof value === "string" || typeof value === "boolean" || typeof value === "number")

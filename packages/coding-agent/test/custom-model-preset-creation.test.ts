@@ -15,10 +15,11 @@ import {
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
 import { YAML } from "bun";
+import { loadTestTheme } from "./helpers/test-theme";
 
 let tempDir: string;
 let authStorage: AuthStorage;
@@ -42,7 +43,7 @@ const placeholderProfile: ModelProfileDefinition = {
 beforeEach(async () => {
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-custom-preset-"));
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
-	setThemeInstance((await getThemeByName("red-claw"))!);
+	setThemeInstance((await loadTestTheme())!);
 });
 
 afterEach(async () => {

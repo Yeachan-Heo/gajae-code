@@ -29,7 +29,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { isRecord, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
 import type { MCPServer } from "../capability/mcp";
 import { normalizeClaudeMcpJson, normalizeCodexMcpToml, validateMCPCompatServer } from "../discovery/mcp-compat";
@@ -285,10 +285,6 @@ function toMCPServerConfig(server: MCPServer): MCPServerConfig {
 	if (server.sharing !== undefined) config.sharing = server.sharing;
 	if (server.noInheritEnv !== undefined) config.noInheritEnv = server.noInheritEnv;
 	return config as unknown as MCPServerConfig;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface DestinationMcpState {

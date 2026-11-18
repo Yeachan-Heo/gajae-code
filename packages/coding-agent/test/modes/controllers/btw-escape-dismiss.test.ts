@@ -6,6 +6,7 @@ import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { Container, type TUI } from "@gajae-code/tui";
 import { setKittyProtocolActive } from "@gajae-code/tui/keys";
+import { drainMicrotasks } from "../../helpers/microtasks";
 
 beforeAll(async () => {
 	await initTheme();
@@ -75,12 +76,6 @@ function makeHarness(runEphemeralTurn: () => Promise<unknown>): Harness {
 
 const pending = () => new Promise<never>(() => {});
 
-async function drain(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
-}
-
 describe("btw panel Esc dismissal (issue #455)", () => {
 	it("dismisses a running btw panel on Esc", async () => {
 		const { editor, btw, btwContainer, scope, releaseBtwConversationScope } = makeHarness(() => pending());
@@ -104,7 +99,7 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			assistantMessage: {},
 		}));
 		await btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(btw.hasActiveRequest()).toBe(true);
 		// A settled turn keeps the scope for follow-ups; only closing the panel releases it.
 		expect(releaseBtwConversationScope).not.toHaveBeenCalled();
@@ -122,7 +117,7 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			throw new Error("boom");
 		});
 		await btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(btw.hasActiveRequest()).toBe(true);
 
 		editor.handleInput(ESC);
@@ -137,7 +132,7 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			assistantMessage: {},
 		}));
 		await completed.btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(completed.btw.hasOpenPanel()).toBe(true);
 		completed.editor.handleInput(ESC);
 		expect(completed.btw.hasOpenPanel()).toBe(false);
@@ -147,7 +142,7 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			throw new Error("boom");
 		});
 		await errored.btw.start("Why?");
-		await drain();
+		await drainMicrotasks();
 		expect(errored.btw.hasOpenPanel()).toBe(true);
 		errored.editor.handleInput(ESC);
 		expect(errored.btw.hasOpenPanel()).toBe(false);
@@ -251,7 +246,7 @@ describe("queued /btw handoff on Esc queue restore", () => {
 		const input = new InputController(ctx);
 
 		await btw.start("Side question?");
-		await drain();
+		await drainMicrotasks();
 		await btw.handoff();
 		editor.setText("main draft");
 

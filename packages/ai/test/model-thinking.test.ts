@@ -17,6 +17,7 @@ import {
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Context, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import { streamSimple } from "../src/stream";
 
 const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
@@ -32,14 +33,6 @@ const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
 	xai: "https://api.x.ai/v1",
 	zai: "https://api.z.ai/v1",
 };
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -525,7 +518,7 @@ describe("model thinking metadata", () => {
 		});
 		const catalogCases = directCatalogCases;
 		const versions = Array.from(new Set(catalogCases.map(({ major, minor }) => `${major}.${minor}`))).sort();
-		const random = seededRandom(0x5eed_5505);
+		const random = lcgUnit(0x5eed_5505);
 		const randomInt = (max: number): number => Math.floor(random() * max);
 
 		expect(versions).toContain("4.5");

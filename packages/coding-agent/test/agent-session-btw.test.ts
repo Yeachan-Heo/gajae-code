@@ -29,6 +29,7 @@ import {
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, type TUI } from "@gajae-code/tui";
+import { drainMicrotasks } from "./helpers/microtasks";
 
 registerMockApi();
 const CONTROLLED_BTW_API = "controlled-btw-test";
@@ -134,11 +135,6 @@ function completeControlledStream(call: ControlledStreamCall, text: string): voi
 	emitControlledText(call, text);
 	finishControlledStream(call);
 }
-async function drainSyntheticStart(): Promise<void> {
-	// Include the queued async-generator yield, abort race, and cleanup reactions.
-	for (let i = 0; i < 50; i++) await Promise.resolve();
-}
-
 const sessions: AgentSession[] = [];
 
 it("idle close refuses a btw credential preflight", async () => {
@@ -548,7 +544,7 @@ describe("AgentSession /btw isolation", () => {
 			turn: { question: "deadline", scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 		const sideCall = await controlled.sideStarted;
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 
 		try {
 			vi.advanceTimersByTime(BTW_STREAM_IDLE_TIMEOUT_MS - 1);
@@ -750,7 +746,7 @@ describe("AgentSession /btw isolation", () => {
 		void retirement.then(() => {
 			settled = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(settled).toBe(false);
 		expect(harness.model.calls).toHaveLength(0);
 		release.resolve();
@@ -785,7 +781,7 @@ describe("AgentSession /btw isolation", () => {
 		await entered.promise;
 		vi.useFakeTimers();
 		controller.abort(new Error("cancel uncertain binding"));
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		vi.advanceTimersByTime(5_000);
 		expect(await rejected).toMatchObject({ code: "unknown_effect" });
 		expect(() => harness.session.prepareCloseIfIdle()).toThrow("Session is not idle");
@@ -793,7 +789,7 @@ describe("AgentSession /btw isolation", () => {
 		const join = harness.session.joinBtwTurnsForControl().then(() => {
 			joined = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(joined).toBe(false);
 		expect(harness.model.calls).toHaveLength(0);
 		release.resolve();
@@ -933,7 +929,7 @@ describe("AgentSession /btw isolation", () => {
 		void disposal?.then(() => {
 			disposed = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(disposal).toBeDefined();
 		expect(disposed).toBe(false);
 		expect(harness.model.calls).toHaveLength(0);
@@ -964,7 +960,7 @@ describe("AgentSession /btw isolation", () => {
 		void transition.then(() => {
 			retired = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(retired).toBe(false);
 		key.resolve("late-key");
 		await expect(turn).rejects.toThrow("retired");
@@ -997,7 +993,7 @@ describe("AgentSession /btw isolation", () => {
 		);
 		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		const transition = harness.session.clearContext();
 		try {
 			expect(call.options?.signal?.aborted).toBe(true);
@@ -1058,7 +1054,7 @@ describe("AgentSession /btw isolation", () => {
 				const call = await controlled.sideStarted;
 				let transition: Promise<unknown> | undefined;
 				try {
-					await drainSyntheticStart();
+					await drainMicrotasks(50);
 					vi.useFakeTimers();
 					transition =
 						transitionKind === "clear" ? harness.session.clearContext() : harness.session.navigateTree(targetId);
@@ -1081,7 +1077,7 @@ describe("AgentSession /btw isolation", () => {
 					);
 					void transitionRejected.catch(() => {});
 					expect(call.options?.signal?.aborted).toBe(true);
-					await drainSyntheticStart();
+					await drainMicrotasks(50);
 					expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 					expect(transitionSettled).toBe(false);
 					expect(harness.sessionManager.getLeafId()).toBe(leafId);
@@ -1118,7 +1114,7 @@ describe("AgentSession /btw isolation", () => {
 					// Exercise the restored public event bridge without opening another provider.
 					const event = { type: "message_start" as const, message: userMessage("predecessor bridge probe") };
 					harness.session.agent.emitExternalEvent(event);
-					await drainSyntheticStart();
+					await drainMicrotasks(50);
 					expect(listener).toHaveBeenCalledWith(event);
 					if (cleanupOutcome === "deadline") {
 						let idle = false;
@@ -1126,7 +1122,7 @@ describe("AgentSession /btw isolation", () => {
 							idle = true;
 						});
 						void idleWait.catch(() => {});
-						await drainSyntheticStart();
+						await drainMicrotasks(50);
 						expect(idle).toBe(false);
 						release.resolve();
 						completeControlledStream(call, "late precommit bytes");
@@ -1189,7 +1185,7 @@ describe("AgentSession /btw isolation", () => {
 		let handoffFailure: Promise<unknown> | undefined;
 		let generatedCall: ControlledStreamCall | undefined;
 		try {
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			handoff = harness.session.handoff();
 			handoffFailure = handoff.then(
 				() => {
@@ -1210,7 +1206,7 @@ describe("AgentSession /btw isolation", () => {
 			generatedCall = await controlled.mainStarted;
 			const handoffText = "## Goal\nKeep the generated document available for copy/retry.";
 			completeControlledStream(generatedCall, handoffText);
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 			expect(settled).toBe(false);
 			expect(harness.sessionManager.getLeafId()).toBe(leafId);
@@ -1268,7 +1264,7 @@ describe("AgentSession /btw isolation", () => {
 		});
 		const call = await controlled.sideStarted;
 		completeControlledStream(call, "complete but not closed");
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 		let completed = false;
 		let idle = false;
@@ -1281,7 +1277,7 @@ describe("AgentSession /btw isolation", () => {
 		const idleWait = harness.session.waitForIdle().then(() => {
 			idle = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(completed).toBe(false);
 		expect(idle).toBe(false);
 		release.resolve();
@@ -1328,7 +1324,7 @@ describe("AgentSession /btw isolation", () => {
 			},
 		);
 		void incomplete.catch(() => {});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(10);
 		await incomplete;
@@ -1336,7 +1332,7 @@ describe("AgentSession /btw isolation", () => {
 		const completion = harness.session.awaitDisposeCompletion().then(() => {
 			disposed = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(disposed).toBe(false);
 		expect(call.options?.signal?.aborted).toBe(true);
 		release.resolve();
@@ -1373,7 +1369,7 @@ describe("AgentSession /btw isolation", () => {
 		const call = await controlled.sideStarted;
 		let completion: Promise<void> | undefined;
 		try {
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			harness.session.setDisposeTimeoutForTests(10);
 			vi.useFakeTimers();
 			completion = harness.session.awaitDisposeCompletion();
@@ -1398,11 +1394,11 @@ describe("AgentSession /btw isolation", () => {
 				},
 			);
 			void incomplete.catch(() => {});
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 			vi.advanceTimersByTime(10);
 			await incomplete;
-			await drainSyntheticStart();
+			await drainMicrotasks(50);
 			expect(settled).toBe(false);
 			expect(harness.session.awaitDisposeCompletion()).toBe(completion);
 			expect(call.options?.signal?.aborted).toBe(true);
@@ -1443,10 +1439,10 @@ describe("AgentSession /btw isolation", () => {
 		);
 		void rejected.catch(() => {});
 		const call = await controlled.sideStarted;
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		vi.useFakeTimers();
 		controller.abort(new Error("cancel side"));
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(onIteratorReturn).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(5_000);
 		await rejected;
@@ -1454,7 +1450,7 @@ describe("AgentSession /btw isolation", () => {
 		const idleWait = harness.session.waitForIdle().then(() => {
 			idle = true;
 		});
-		await drainSyntheticStart();
+		await drainMicrotasks(50);
 		expect(idle).toBe(false);
 		completeControlledStream(call, "late private bytes");
 		await idleWait;

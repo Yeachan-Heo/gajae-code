@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
@@ -133,14 +134,8 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 	return { router, attachment, requests, requestOptions, sent, maintenance, setCurrent: value => (current = value) };
 }
 
-const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
-	const deadline = Date.now() + 2_000;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error(`Timed out waiting for ${label}`);
-};
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 2_000, { intervalMs: 5, label });
 
 test("an attachment without sendMaintenance is rejected at setup, leaving no lease (#4730 review)", async () => {
 	// A custom attachment that predates the maintenance capability must fail with

@@ -1438,6 +1438,10 @@
 				"circuitMaxCooldownMs": {
 					"type": "number",
 					"default": 1800000
+				},
+				"concurrencyWaitMs": {
+					"type": "number",
+					"default": 300000
 				}
 			},
 			"additionalProperties": false
@@ -2722,7 +2726,8 @@
 						"parallel",
 						"kagi",
 						"synthetic",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"default": "auto"
 				},
@@ -2747,7 +2752,8 @@
 							"parallel",
 							"kagi",
 							"synthetic",
-							"searxng"
+							"searxng",
+							"keenable"
 						]
 					},
 					"description": "Ordered fallback web search providers after the active model native provider",
@@ -3214,7 +3220,8 @@
 						"kagi",
 						"synthetic",
 						"parallel",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"

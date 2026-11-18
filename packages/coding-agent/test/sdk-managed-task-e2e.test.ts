@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Broker, type SpawnPromptLayer, type SpawnRegistrationRequest } from "../src/sdk/broker/broker";
 import { managedIdentity, managedTaskDomainPath } from "../src/sdk/broker/managed-task-dag";
-import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import type { SpawnLifecycleOwnerResolution, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
+import { createAttest } from "./helpers/managed-attestation";
 
 type SpawnRegistrationInput = SpawnRegistrationRequest;
 
@@ -102,28 +102,7 @@ const verifier = {
 	}),
 };
 
-async function attest(broker: Broker, cwd: string): Promise<void> {
-	const incarnation = processIncarnation(process.pid);
-	if (!incarnation) throw new Error("Test owner has no process incarnation");
-	for (const endpointGeneration of [0, 1]) {
-		await broker.index.append({
-			type: "host_registered",
-			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
-			endpointGeneration,
-			pid: process.pid,
-			hostIncarnation: incarnation,
-			masterRole: {
-				version: 2,
-				ownerSessionId: ownerId,
-				launchPid: process.pid,
-				launchProcessIncarnation: incarnation,
-				role: "master",
-				attestationEpoch: epoch,
-			},
-		});
-	}
-}
+const attest = createAttest(ownerId, epoch);
 
 type Counts = { launches: number; closes: number };
 

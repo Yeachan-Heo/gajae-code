@@ -461,7 +461,7 @@ export function createPromptActionAutocompleteProvider(
 		},
 		{
 			id: "paste-image",
-			label: "Paste image from clipboard",
+			label: "Paste image or text from clipboard",
 			description: options.keybindings.getDisplayString("app.clipboard.pasteImage"),
 			keywords: ["paste", "image", "clipboard", "screenshot", "attach", "vision"],
 			execute: options.pasteImage,

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isRecord } from "@gajae-code/utils";
 
 export type CrystalClassification = "confirmed" | "inferred" | "disputed";
 export type CrystalItemKind = "goal" | "constraint" | "decision" | "acceptance_criterion" | "non_goal";
@@ -294,10 +295,6 @@ type CrystalSemanticProfile = {
 	exclusive: boolean;
 	stateValue: string;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
 
 function text(value: unknown, name: string, max = MAX_TEXT): string {
 	if (typeof value !== "string" || value.trim() === "") throw new Error(`${name} must be non-empty text`);

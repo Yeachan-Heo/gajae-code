@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parse } from "yaml";
+import { planTargetedTasks } from "./ci-dev-affected";
 
 // The dev-ci workflow wires the Telegram daemon generation guard into the sharded
 // aggregate. These assertions pin the exact-revision + fail-closed topology so a
@@ -13,6 +14,7 @@ interface WorkflowStep {
 	shell?: string;
 	uses?: string;
 	run?: string;
+	"continue-on-error"?: string | boolean;
 	env?: Record<string, string>;
 	with?: Record<string, string | number>;
 }
@@ -22,6 +24,7 @@ interface WorkflowJob {
 	"runs-on"?: string | string[];
 	needs?: string[];
 	if?: string;
+	"continue-on-error"?: string | boolean;
 	permissions?: Record<string, "read" | "write" | "none">;
 	env?: Record<string, string>;
 	concurrency?: { group: string; "cancel-in-progress"?: string | boolean; queue?: string };
@@ -439,6 +442,71 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const workflowConcurrency = source.match(/group:\s*>-\s*\n\s*\$\{\{[\s\S]*?cancel-in-progress:/)?.[0] ?? "";
 		expect(workflowConcurrency).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
 		expect(workflowConcurrency).not.toContain("'dev-ci-virtual-integration'");
+	});
+
+	// The affected planner selects its own `ci-selftest`/`affected-selftest` task for
+	// CI-harness changes, so a planner regression that stops emitting that task also
+	// stops the tests that would catch it. This fixed job is the independent rail:
+	// it has no planner dependency, so neither relevance nor task emission can hide
+	// these tests, and the required affected aggregate fails closed on its result.
+	test("runs the CI meta-script unit tests independently of the affected plan", async () => {
+		const d = await workflow();
+		const meta = requiredJob(d, "ci-meta-tests");
+		// No `needs` on purpose: the tests must not be gated by the plan they validate.
+		expect(meta.needs ?? []).toEqual([]);
+		expect(meta["runs-on"]).toBe("ubuntu-22.04");
+		// Non-code events validate nothing in any other job, so this rail shares the
+		// planner's metadata-edit / head-only-dispatch skip predicate exactly.
+		expect(meta.if).toBe(requiredJob(d, "affected-plan").if);
+		expect(checkoutRef(meta.steps)).toBe("${{ github.event.pull_request.head.sha || github.sha }}");
+		// A fixed workflow step is only meaningful if it runs installed tests; the
+		// tarball order also keeps the invocation unambiguous on every platform.
+		const installIndex = meta.steps.findIndex(step => step.run?.trim() === "bun install --frozen-lockfile");
+		const testIndex = meta.steps.findIndex(step => step.name === "Run CI meta-script unit tests");
+		expect(installIndex).toBeGreaterThan(-1);
+		expect(testIndex).toBeGreaterThan(installIndex);
+		// `ci-dev-affected.test.ts` drives the live planner, which shells out to
+		// `cargo metadata`; the repo-pinned toolchain must be provisioned before the
+		// tests, or a cold rustup download can blow the test's 30s budget.
+		const rustIndex = meta.steps.findIndex(step => step.uses?.startsWith("dtolnay/rust-toolchain@"));
+		expect(rustIndex).toBeGreaterThan(-1);
+		expect(meta.steps[rustIndex]!.with).toMatchObject({ toolchain: "nightly-2026-08-12" });
+		expect(testIndex).toBeGreaterThan(rustIndex);
+		const invocation = namedStep(meta, "Run CI meta-script unit tests").run ?? "";
+		expect(invocation.trim().split(/\s+/)).toEqual([
+			"bun",
+			"test",
+			"./scripts/ci-dev-affected.test.ts",
+			"./scripts/run-bun-test-files.test.ts",
+			"./scripts/dev-ci-guard-topology.test.ts",
+			"./scripts/ci-risk-canary-manifest.test.ts",
+			"./scripts/ci-virtual-integration.test.ts",
+			"./scripts/ci-gjc-state-gates.test.ts",
+		]);
+		// The planner's own `ci-selftest` command is the definition this fixed rail
+		// mirrors, so compare against it: a seventh meta test added to the planner
+		// must not leave the independent rail running yesterday's six.
+		const plannerSelftest = planTargetedTasks(["scripts/dev-ci-guard-topology.test.ts"], [], []).find(task => task.key === "ci-selftest");
+		expect(plannerSelftest?.command.slice(2)).toEqual(
+			invocation
+				.trim()
+				.split(/\s+/)
+				.slice(2)
+				.map(file => file.replace(/^\.\//, "")),
+		);
+		const affected = requiredJob(d, "affected");
+		expect(affected.needs).toContain("ci-meta-tests");
+		// Match the executable comparison, not just the interpolation: echoing the same
+		// expression satisfies a substring check while dropping the gate.
+		const failClosedRun = namedStep(affected, "Fail closed on producer and live dependency results").run ?? "";
+		expect(failClosedRun.split("\n").map(line => line.trim())).toContain("test '${{ needs.ci-meta-tests.result }}' = success");
+		expect(failClosedRun).not.toContain("|| true");
+		// A skipped or continue-on-error step reports success without running the fixed
+		// invocation, so the rail only holds while neither escape hatch is present.
+		const testStep = namedStep(meta, "Run CI meta-script unit tests");
+		expect(testStep.if).toBeUndefined();
+		expect(testStep["continue-on-error"]).toBeUndefined();
+		expect(meta["continue-on-error"]).toBeUndefined();
 	});
 
 });

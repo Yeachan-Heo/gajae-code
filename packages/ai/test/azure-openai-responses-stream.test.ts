@@ -6,6 +6,7 @@ import { type AzureOpenAIResponsesOptions, streamAzureOpenAIResponses } from "..
 import { getEnvApiKey } from "../src/stream";
 import type { Context, Model, Tool } from "../src/types";
 import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
+import { createAbortedSignal } from "./helpers";
 
 const originalFetch = global.fetch;
 
@@ -28,12 +29,6 @@ const firstClassAzureModel: Model<"azure-openai-responses"> = {
 	name: "GPT-4.1",
 	provider: "azure-openai",
 };
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
 
 function createSseResponse(events: unknown[]): Response {
 	const sse = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;

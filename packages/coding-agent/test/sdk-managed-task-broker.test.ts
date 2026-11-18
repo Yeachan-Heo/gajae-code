@@ -24,12 +24,12 @@ import {
 	restoreManagedAttemptRefs,
 	transactManagedTaskDomain,
 } from "../src/sdk/broker/managed-task-dag";
-import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import {
 	SpawnAuthorityStore,
 	type SpawnLifecycleOwnerResolution,
 	type SpawnSubstrateProof,
 } from "../src/sdk/broker/spawn-authority";
+import { createAttest } from "./helpers/managed-attestation";
 
 type SpawnRegistrationInput = SpawnRegistrationRequest;
 
@@ -171,28 +171,7 @@ const promptLayer = {
 	reconcile: async () => ({ status: "terminal_ok" as const, commandId: "cmd-1", turnId: "turn-1" }),
 };
 
-async function attest(broker: Broker, cwd: string): Promise<void> {
-	const incarnation = processIncarnation(process.pid);
-	if (!incarnation) throw new Error("Test owner has no process incarnation");
-	for (const endpointGeneration of [0, 1]) {
-		await broker.index.append({
-			type: "host_registered",
-			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
-			endpointGeneration,
-			pid: process.pid,
-			hostIncarnation: incarnation,
-			masterRole: {
-				version: 2,
-				ownerSessionId: ownerId,
-				launchPid: process.pid,
-				launchProcessIncarnation: incarnation,
-				role: "master",
-				attestationEpoch: epoch,
-			},
-		});
-	}
-}
+const attest = createAttest(ownerId, epoch);
 
 function node(id: string, workspace: string, resource: string) {
 	return {

@@ -478,7 +478,7 @@ export class TodoCommandController {
 		this.ctx.setTodos(nextPhases);
 
 		// 2. Persist for reload survival via custom session entry.
-		this.ctx.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: nextPhases });
+		this.ctx.session.appendCustomEntryInBackground(USER_TODO_EDIT_CUSTOM_TYPE, { phases: nextPhases });
 
 		// 3. Inject system reminder so the agent learns about the change next turn.
 		const reminderText = buildSystemReminder(action, nextPhases);
@@ -489,7 +489,7 @@ export class TodoCommandController {
 			timestamp: Date.now(),
 		};
 		this.ctx.agent.appendMessage(message);
-		this.ctx.sessionManager.appendMessage(message);
+		this.ctx.session.appendMessageInBackground(message);
 		return true;
 	}
 }

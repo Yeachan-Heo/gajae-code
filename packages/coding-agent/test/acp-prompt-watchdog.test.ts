@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
 import { logger, TempDir } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpPromptPayload } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
@@ -112,14 +113,8 @@ async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	]);
 }
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 45_000;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error(`Timed out waiting for ${label}`);
-}
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 45_000, { intervalMs: 5, label });
 
 function workingUpdates(updates: SessionNotification[]): number {
 	return updates.filter(

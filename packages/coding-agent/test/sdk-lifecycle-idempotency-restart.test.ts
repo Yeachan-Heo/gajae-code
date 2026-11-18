@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { ModelProfileRegistryError, UnknownModelProfileError } from "../src/config/model-profile-contract";
 import { Broker } from "../src/sdk/broker/broker";
+import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { deriveIdempotencyIdentity, deriveLegacyIdentity } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger, type LifecycleLedgerEntry } from "../src/sdk/broker/lifecycle-ledger";
@@ -11,18 +12,6 @@ import { LifecycleLedger, type LifecycleLedgerEntry } from "../src/sdk/broker/li
 function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
-
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 describe("SDK lifecycle ledger", () => {
 	it("migrates a terminal v3 identity before replaying it after a broker restart", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-v3-replay-"));

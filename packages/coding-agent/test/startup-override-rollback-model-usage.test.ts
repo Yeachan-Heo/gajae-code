@@ -12,13 +12,14 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { applyStartupModelProfiles } from "../src/main";
 import { executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
 import type { AcpBuiltinCommandRuntime } from "../src/slash-commands/types";
+import { loadTestTheme } from "./helpers/test-theme";
 
 // `gjc --model openai-codex/gpt-5.5` installs a run-scoped startup override that
 // never enters the agent.db model MRU (issue #6768). A model change inside that
@@ -57,8 +58,7 @@ afterEach(async () => {
 });
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Failed to load test theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

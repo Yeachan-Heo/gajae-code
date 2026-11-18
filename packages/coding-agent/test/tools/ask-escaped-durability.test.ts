@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage, AgentToolContext } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AgentContext, AgentLoopConfig, AgentToolContext } from "@gajae-code/agent-core/types";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { readDeepInterviewStateCompact } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
@@ -10,13 +9,8 @@ import { readWorkflowStateJson } from "@gajae-code/coding-agent/gjc-runtime/stat
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { TempDir } from "@gajae-code/utils";
+import { identityConverter } from "../../../agent/test/helpers";
 import { terminalOnlyStream } from "../helpers/terminal-only-stream";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
 
 function createSession(cwd: string, sessionId: string): ToolSession {
 	return {

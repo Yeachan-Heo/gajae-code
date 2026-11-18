@@ -16,6 +16,7 @@ import {
 } from "../src/commands/sdk";
 import { acquireFileLock } from "../src/config/file-lock";
 import { Settings } from "../src/config/settings";
+import { canonicalJson } from "../src/coordinator-mcp/canonical-json";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
@@ -244,16 +245,6 @@ async function settleRetainedTranscriptForTest(
 		}
 	}
 	return current;
-}
-
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
 }
 function deleteRequestHash(request: Record<string, unknown>): string {
 	const cwd = canonicalDeleteLocatorPath(String(request.cwd));

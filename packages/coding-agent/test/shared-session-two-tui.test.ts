@@ -350,8 +350,28 @@ async function readSingleTranscript(sessions: string) {
 /** Waits until the TUI has drawn its footer, which is not part of the spawned argv. */
 const ready = (tui: Tui) => waitFor(() => /v\d+\.\d+\.\d+/.test(tui.screen()), 60_000, "TUI footer");
 
+/**
+ * Whether a message entry carrying `needle` is on disk. Raw text is not enough: the prompt's
+ * workflow-intent record also quotes it and is published before the message itself.
+ */
+async function hasMessage(sessions: string, needle: string): Promise<boolean> {
+	const raw = await transcriptText(sessions);
+	if (!raw) return false;
+	const entries = raw
+		.split("\n")
+		.slice(1)
+		.flatMap(line => {
+			try {
+				return [JSON.parse(line) as TranscriptEntry];
+			} catch {
+				return [];
+			}
+		});
+	return promptEntries(entries, needle).length > 0;
+}
+
 const committed = (sessions: string, needle: string) =>
-	waitFor(async () => (await transcriptText(sessions))?.includes(needle) ?? false, 60_000, `entry ${needle}`);
+	waitFor(() => hasMessage(sessions, needle), 60_000, `entry ${needle}`);
 
 /** Entries whose serialized form contains the prompt as a complete JSON string value. */
 function promptEntries(entries: TranscriptEntry[], prompt: string) {
@@ -739,10 +759,7 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		second.pty.write("race-from-B\r");
 
 		await waitFor(
-			async () => {
-				const text = await transcriptText(sessions);
-				return text?.includes("race-from-A") === true && text.includes("race-from-B");
-			},
+			async () => (await hasMessage(sessions, "race-from-A")) && (await hasMessage(sessions, "race-from-B")),
 			90_000,
 			"both simultaneous prompts",
 		);
