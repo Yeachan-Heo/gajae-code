@@ -15,12 +15,20 @@ import {
  * assertion below. `secrets` are the literals that must be absent from both outputs; `survives`
  * are the literals that must still be present in both. An entry with no secrets is a plain
  * document: the structure-aware path must return it untouched.
+ *
+ * Declarations are occurrence-aware: a bare string means the original text contains the literal
+ * exactly once, and a `{ literal, count }` entry states a multiplicity explicitly. The count is
+ * asserted against the input first, so a declaration cannot drift from the fixture text, and then
+ * against each output. A fixture that contains the same literal twice therefore cannot report a
+ * deletion as a pass just because one copy remains.
  */
+type DeclaredLiteral = string | { readonly literal: string; readonly count: number };
+
 interface CorpusEntry {
 	readonly name: string;
 	readonly text: string;
-	readonly secrets: readonly string[];
-	readonly survives: readonly string[];
+	readonly secrets: readonly DeclaredLiteral[];
+	readonly survives: readonly DeclaredLiteral[];
 	/** The case belongs to the captured-field preview path, which also bounds an unpaired body. */
 	readonly preview?: boolean;
 }
@@ -37,6 +45,11 @@ const B64_CONTINUATION = "Zml4dHVyZTpwYXNzd29yZA==";
 const ESCAPED_CONTINUATION = '{message:"fixture", code:{detail:"bearer\\nopaquecredential123\\ndiagnostic=keep"}}';
 const UNPAIRED_WITH_SIBLING =
 	'{message:"fixture", code:{detail:"-----BEGIN RSA PRIVATE KEY-----\\nBODY", note:"keep-me"}}';
+const UNPAIRED_WITH_FOLLOWING_KEY =
+	'{message:"fixture", code:{detail:"-----BEGIN RSA PRIVATE KEY-----\\nBODY\\nNote: keep", note:"keep-me"}}';
+const UNPAIRED_BODY = "Qk9EWUJPRFlCT0RZQk9EWQ==";
+const UNPAIRED_PADDED_ONE_SPACE = `{message:"fixture", code:{detail:"-----BEGIN RSA PRIVATE KEY----- \\n${UNPAIRED_BODY}\\nNote: keep", note:"keep-me"}}`;
+const UNPAIRED_PADDED_TWO_SPACES = `{message:"fixture", code:{detail:"-----BEGIN RSA PRIVATE KEY-----  \\n${UNPAIRED_BODY}\\nNote: keep", note:"keep-me"}}`;
 const UNPAIRED_IN_PROSE = '{code:"PEM example: -----BEGIN RSA PRIVATE KEY-----; diagnostic=keep"}';
 
 // Built from parts so the repository never stores a Slack-token-shaped literal; the fixture
@@ -111,6 +124,14 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		secrets: [B64_CONTINUATION, "opaque-one"],
 		survives: ["diagnostic=keep", "password="],
 	},
+	// A bare cue followed by an assignment is a field, not a padded token: neither
+	// `diagnostic=` nor the shorter word is base64, so the whole text must stay byte-identical.
+	{
+		name: "assignment continuation after a bare auth cue",
+		text: "Basic\ndiagnostic= keep\nBasic\ndiagnostics= keep",
+		secrets: [],
+		survives: [],
+	},
 	{
 		name: "multi-character wrapped URI after an auth cue",
 		text: "Token\n**https://app:synthetic@db.example.com/db**",
@@ -128,6 +149,27 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		text: UNPAIRED_WITH_SIBLING,
 		secrets: ["-----BEGIN RSA PRIVATE KEY-----", "BODY"],
 		survives: ['{detail:"', '", note:"keep-me"}'],
+		preview: true,
+	},
+	{
+		name: "unpaired private-key body keeps a following diagnostic key",
+		text: UNPAIRED_WITH_FOLLOWING_KEY,
+		secrets: ["-----BEGIN RSA PRIVATE KEY-----", "BODY"],
+		survives: ["Note: keep", 'note:"keep-me"'],
+		preview: true,
+	},
+	{
+		name: "unpaired private-key body after one trailing space",
+		text: UNPAIRED_PADDED_ONE_SPACE,
+		secrets: ["-----BEGIN RSA PRIVATE KEY-----", UNPAIRED_BODY],
+		survives: ["Note: keep", 'note:"keep-me"'],
+		preview: true,
+	},
+	{
+		name: "unpaired private-key body after two trailing spaces",
+		text: UNPAIRED_PADDED_TWO_SPACES,
+		secrets: ["-----BEGIN RSA PRIVATE KEY-----", UNPAIRED_BODY],
+		survives: ["Note: keep", 'note:"keep-me"'],
 		preview: true,
 	},
 	{
@@ -297,7 +339,7 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 			"note=keep",
 		].join("\n"),
 		secrets: ["opaque-literal-secret-123", "opaque-folded-secret-456"],
-		survives: ["password: |", "note=keep"],
+		survives: ["password: |", { literal: "note=keep", count: 2 }],
 	},
 	{
 		name: "yaml block scalar inside a credential container",
@@ -383,22 +425,62 @@ function expectMaskingMonotonicity(entry: CorpusEntry, structured: MaskedCrashTe
 }
 
 /**
+ * Non-overlapping occurrences of `literal` in `text`. A surviving literal is compared by count,
+ * not by presence, so deleting one of two identical lines is observable.
+ */
+function countOccurrences(text: string, literal: string): number {
+	let count = 0;
+	for (let at = text.indexOf(literal); at >= 0; at = text.indexOf(literal, at + literal.length)) count++;
+	return count;
+}
+
+function declaredLiterals(declarations: readonly DeclaredLiteral[]): { literal: string; count: number }[] {
+	return declarations.map(declared =>
+		typeof declared === "string"
+			? { literal: declared, count: 1 }
+			: { literal: declared.literal, count: declared.count },
+	);
+}
+
+/**
  * Ground truth for both paths. A shared guard can hide a secret from both paths at once, so the
- * containment check alone is not enough: the declared secret literals must be absent and the
- * declared must-survive literals present in each output.
+ * containment check alone is not enough: the declared secret literals must be gone from and the
+ * declared must-survive literals present the declared number of times in each output. Every
+ * declaration is first asserted against the original text, so a multiplicity is grounded in the
+ * fixture rather than in the assertion author's memory.
  */
 function expectGroundTruth(entry: CorpusEntry, structured: MaskedCrashText, blind: MaskedCrashText): void {
-	for (const secret of entry.secrets) {
-		if (structured.text.includes(secret))
-			throw new Error(`structured kept secret ${JSON.stringify(secret)} in ${JSON.stringify(entry.text)}`);
-		if (blind.text.includes(secret))
-			throw new Error(`blind kept secret ${JSON.stringify(secret)} in ${JSON.stringify(entry.text)}`);
+	const paths = [
+		["structured", structured],
+		["blind", blind],
+	] as const;
+	for (const { literal, count } of declaredLiterals(entry.secrets)) {
+		const declaredInInput = countOccurrences(entry.text, literal);
+		if (declaredInInput !== count)
+			throw new Error(
+				`fixture declares ${count} occurrence(s) of secret ${JSON.stringify(literal)} but the text has ${declaredInInput}`,
+			);
+		for (const [path, masked] of paths) {
+			const kept = countOccurrences(masked.text, literal);
+			if (kept > 0)
+				throw new Error(
+					`${path} kept secret ${JSON.stringify(literal)} ${kept} time(s) in ${JSON.stringify(entry.text)}`,
+				);
+		}
 	}
-	for (const literal of entry.survives) {
-		if (!structured.text.includes(literal))
-			throw new Error(`structured dropped ${JSON.stringify(literal)} from ${JSON.stringify(entry.text)}`);
-		if (!blind.text.includes(literal))
-			throw new Error(`blind dropped ${JSON.stringify(literal)} from ${JSON.stringify(entry.text)}`);
+	for (const { literal, count } of declaredLiterals(entry.survives)) {
+		const declaredInInput = countOccurrences(entry.text, literal);
+		if (declaredInInput !== count)
+			throw new Error(
+				`fixture declares ${count} occurrence(s) of survivor ${JSON.stringify(literal)} but the text has ${declaredInInput}`,
+			);
+		for (const [path, masked] of paths) {
+			const kept = countOccurrences(masked.text, literal);
+			if (kept !== count)
+				throw new Error(
+					`dropped ${JSON.stringify(literal)} from ${path}: ${kept} of ${count} occurrence(s) remain in ${JSON.stringify(entry.text)}`,
+				);
+		}
 	}
 }
 
