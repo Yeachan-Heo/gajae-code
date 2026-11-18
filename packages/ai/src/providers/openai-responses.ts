@@ -56,7 +56,7 @@ import {
 	iterateWithIdleTimeout,
 	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
-import { createLoopbackDirectFetch } from "../utils/loopback-transport";
+import { resolveProviderFetch } from "../utils/loopback-transport";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { isLoopbackHostname } from "../utils/parse-bind";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -608,7 +608,7 @@ function createClient(
 	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
 	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, providerSessionId, "openai");
 	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
-	const baseFetch = fetchOverride ?? createLoopbackDirectFetch(fetch);
+	const baseFetch = resolveProviderFetch(model.provider, fetchOverride);
 	const queryFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			return baseFetch(appendQueryToRequest(input, endpointQuery), init);

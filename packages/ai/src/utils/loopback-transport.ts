@@ -2,7 +2,7 @@ import * as dns from "node:dns/promises";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
-import type { FetchImpl } from "../types";
+import type { FetchImpl, Provider } from "../types";
 
 /**
  * Transport that reaches a loopback endpoint directly instead of through the
@@ -268,9 +268,8 @@ async function toLoopbackDirectInit(
  * Fetch implementation that sends loopback destinations over the direct
  * transport and delegates every other destination to `baseFetch`.
  *
- * One factory for every local-provider call site keeps the bypass scoped to
- * loopback: a non-loopback endpoint keeps the ambient proxy-aware behaviour,
- * and a caller cannot accidentally route a loopback credential through `fetch`.
+ * This factory decides by destination, so callers must already have selected it
+ * for the right provider; see {@link resolveProviderFetch}.
  */
 export function createLoopbackDirectFetch(baseFetch: FetchImpl): FetchImpl {
 	const directFetch = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -281,4 +280,32 @@ export function createLoopbackDirectFetch(baseFetch: FetchImpl): FetchImpl {
 	}) as FetchImpl;
 	if (baseFetch.preconnect) directFetch.preconnect = baseFetch.preconnect;
 	return directFetch;
+}
+
+/**
+ * Providers whose loopback endpoint contract requires the direct transport.
+ *
+ * Transport selection is provider identity, never the destination host. Bun
+ * applies `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to loopback requests, so a
+ * host-based rule would silently override the proxy configuration that other
+ * local runtimes document as their transport knob (vLLM, SGLang, Ollama, or any
+ * custom OpenAI-compatible endpoint). Those providers keep the ambient
+ * proxy-aware `fetch` and select `NO_PROXY` when they need a direct connection;
+ * only Rapid-MLX promises a proxy-isolated loopback socket.
+ */
+const LOOPBACK_DIRECT_PROVIDERS: ReadonlySet<string> = new Set(["rapid-mlx"]);
+
+export function usesLoopbackDirectTransport(provider: Provider): boolean {
+	return LOOPBACK_DIRECT_PROVIDERS.has(provider);
+}
+
+/**
+ * Resolve the transport an OpenAI-compatible client dials with. A caller-supplied
+ * `fetch` always wins because it owns its transport and redirect policy;
+ * otherwise Rapid-MLX dials loopback directly and every other provider keeps the
+ * ambient proxy-aware `fetch`.
+ */
+export function resolveProviderFetch(provider: Provider, fetchOverride: FetchImpl | undefined): FetchImpl {
+	if (fetchOverride) return fetchOverride;
+	return usesLoopbackDirectTransport(provider) ? createLoopbackDirectFetch(fetch) : fetch;
 }
