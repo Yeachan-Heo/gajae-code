@@ -1228,7 +1228,21 @@ describe("expandInternalUrls session scope", () => {
 				// The emitted spelling has to name the same file, not merely look right.
 				const emitted = expanded.slice("cat '".length, -1);
 				expect(await Bun.file(emitted).text()).toBe("windows-rule");
+				// And the real tool has to reach it through the shell it actually starts.
+				setActiveRules([
+					{
+						name: "deploy",
+						path: sourcePath,
+						content: "windows-rule",
+						_source: { provider: "test", providerName: "test", path: sourcePath, level: "user" },
+					},
+				]);
+				const tool = createAgentDirBashTool(repo, path.join(repo, "agent"), path.join(repo, "settings-agent"));
+				const result = await tool.execute("call-win-path", { command: "cat rule://deploy" });
+				expect(textOf(result)).toContain("windows-rule");
 			} finally {
+				resetActiveRulesForTests();
+				await disposeAllShellSessions();
 				await rm(repo, { recursive: true, force: true });
 			}
 		},
@@ -1243,10 +1257,15 @@ describe("expandInternalUrls session scope", () => {
 				const variantCwd = path.join(parent, "repo");
 				const agentDir = path.join(parent, "agent");
 				await mkdir(callerCwd);
-				await mkdir(variantCwd);
 				await mkdir(agentDir);
-				// A case-insensitive directory folds the two names onto one; the
-				// containment question only exists where they stay distinct.
+				try {
+					await mkdir(variantCwd);
+				} catch (error) {
+					// A case-insensitive directory folds the two names onto one; the
+					// containment question only exists where they stay distinct.
+					if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+					throw error;
+				}
 				if ((await realpath(callerCwd)) === (await realpath(variantCwd))) return;
 				const sourcePath = path.join(variantCwd, "secret.md");
 				await writeFile(sourcePath, "foreign-rule");
