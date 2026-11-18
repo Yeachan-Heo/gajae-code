@@ -470,7 +470,7 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
  * set is used, so a compact table cannot be merged into one URL.
  */
 const SCHEME_USERINFO = /(?<![A-Za-z0-9.])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
-const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:\\\||[^\r\n /?#"`<>|])*@/gi;
+const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9.])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:\\\||[^\r\n /?#"`<>|])*@/gi;
 const RELATIVE_USERINFO = /(?<![A-Za-z0-9.:])\/\/[^\r\n /?#"`<>]*@/g;
 const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\/\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
 const ESCAPED_USERINFO = /(?<![A-Za-z0-9.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
@@ -635,12 +635,12 @@ function scrubCacheVendorTokens(text: string): string {
 function scrubHostPaths(text: string): string {
 	const home = os.homedir();
 	const homePattern =
-		home.length > 1 ? new RegExp(`(?<![A-Za-z0-9._#-])${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
+		home.length > 1 ? new RegExp(`(?<![A-Za-z0-9._#])${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
 	const scrubLocal = (chunk: string): string => {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
-		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#-])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
-		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#-])\/root(?![A-Za-z0-9._-])/g, "~");
-		return scrubbed.replace(/(?<![A-Za-z0-9._#-])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/root(?![A-Za-z0-9._-])/g, "~");
+		return scrubbed.replace(/(?<![A-Za-z0-9._#])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
 	};
 	// A `file:` URL's path is local, so scrub it without turning the marker into
 	// an authority: `file:///home/u/x` -> `file:///~/x`,
