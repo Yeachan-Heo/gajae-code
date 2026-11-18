@@ -590,7 +590,7 @@ export async function verifyStandalone(appArgument: string) {
 		activeScenario = "background-job";
 		const releaseFile = path.join(project, "release-job");
 		const jobMarker = path.join(project, "job-marker.txt");
-		await turn(sessionId, {
+		const jobStartHistory = await turn(sessionId, {
 			prompt: "standalone background start",
 			answer: "standalone background started",
 			tools: [
@@ -606,6 +606,9 @@ export async function verifyStandalone(appArgument: string) {
 				},
 			],
 		});
+		const startResult = jobStartHistory.findLast(message => message.role === "tool" && message.toolName === "bash");
+		const toolJobId = startResult?.text.match(/^Background job (bg_\d+) started:/)?.[1];
+		assert(toolJobId, "Bash did not publish an executable background job ID");
 		const runningJob = await waitFor(async () => {
 			const update = await host.request<DesktopActivityUpdate>("activity.get", { sessionId });
 			assert(update.activity.available, `Activity unavailable: ${JSON.stringify(update.activity)}`);
@@ -618,7 +621,7 @@ export async function verifyStandalone(appArgument: string) {
 			tools: [
 				{
 					name: "job",
-					arguments: { poll: [runningJob.id], tail: [runningJob.id] },
+					arguments: { poll: [toolJobId], tail: [toolJobId] },
 					result: "standalone-job-complete",
 				},
 			],
@@ -664,7 +667,7 @@ export async function verifyStandalone(appArgument: string) {
 				"real job poll returns output",
 				"job reaches completed and writes marker",
 			],
-			{ runningJob, finishedJob, detail },
+			{ toolJobId, runningJob, finishedJob, detail },
 		);
 
 		activeScenario = "revise-fork";
