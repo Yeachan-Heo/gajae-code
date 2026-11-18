@@ -12634,7 +12634,7 @@ test("turn.result reports a prompt admitted during preflight, then its cancellat
 	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 	const connect = async () => {
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
