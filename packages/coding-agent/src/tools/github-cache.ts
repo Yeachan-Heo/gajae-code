@@ -394,12 +394,9 @@ function maskCredentialJsonContainers(text: string): { text: string; restore: (s
 			// value can continue after it. Prose falls back to its paragraph.
 			const tail = text.slice(valueStart);
 			const section = tail.indexOf("\ndiff --git ");
-			if (section !== -1) {
-				end = valueStart + section;
-			} else {
-				const paragraph = /\n[ \t]*\n/.exec(tail);
-				end = paragraph ? valueStart + paragraph.index : text.length;
-			}
+			// A blank line is legal whitespace inside a JSON array, so prose
+			// has no safe intermediate stop: fail closed to the end of the text.
+			end = section === -1 ? text.length : valueStart + section;
 		}
 		out += text.slice(last, valueStart) + '"«redacted»"';
 		last = end;
@@ -483,11 +480,27 @@ const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$
 function tableRowFlags(lines: string[]): boolean[] {
 	const flags = new Array<boolean>(lines.length).fill(false);
 	const fenced = new Array<boolean>(lines.length).fill(false);
-	let inFence = false;
+	let opener: { marker: string; length: number } | null = null;
 	for (let i = 0; i < lines.length; i++) {
-		const isFence = /^(?:```|~~~)/.test((lines[i] ?? "").trim());
-		fenced[i] = inFence || isFence;
-		if (isFence) inFence = !inFence;
+		const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(lines[i] ?? "");
+		if (opener === null) {
+			if (match) {
+				const marker = match[1] ?? "";
+				opener = { marker: marker.charAt(0), length: marker.length };
+				fenced[i] = true;
+			}
+			continue;
+		}
+		fenced[i] = true;
+		const marker = match?.[1] ?? "";
+		if (
+			match &&
+			marker.charAt(0) === opener.marker &&
+			marker.length >= opener.length &&
+			(match[2] ?? "").trim() === ""
+		) {
+			opener = null;
+		}
 	}
 	for (let i = 0; i < lines.length; i++) {
 		if (fenced[i] === true) continue;

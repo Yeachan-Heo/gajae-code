@@ -3038,7 +3038,7 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 			const candidate = match.index ?? 0;
 			if (candidate <= 0) continue;
 			const right = body.slice(candidate + " and ".length);
-			if (right.startsWith("b/") || right.startsWith("/dev/null")) separator = candidate;
+			if (right.startsWith("b/") || right === "/dev/null") separator = candidate;
 		}
 	}
 	if (separator === -1) separator = body.lastIndexOf(" and ");

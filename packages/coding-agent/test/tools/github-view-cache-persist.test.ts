@@ -748,6 +748,7 @@ describe("github view cache persistence", () => {
 			`Binary files a/plain and b/token='left and ${secret}' differ`,
 			`Binary files a/plain and "b/name\\ntoken=${secret} and b/suffix" differ`,
 			`Binary files a/token='left and b/right' and /dev/null differ`,
+			`Binary files a/token='left and /dev/null-demo-canary' and b/token='left and /dev/null-demo-canary' differ`,
 			"",
 		].join("\n");
 		putCached({
@@ -767,6 +768,7 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.unified).toContain("differ");
 		expect(cached?.payload.unified).toContain("/dev/null");
 		expect(cached?.payload.unified).toContain("diff --git a/unchanged b/unchanged");
+		expect(cached?.payload.unified).not.toContain("demo-canary");
 	});
 
 	it("keeps unquoted operand spaces and replacement metacharacters", () => {
@@ -821,6 +823,7 @@ describe("github view cache persistence", () => {
 			['{"token":{"note":"demo"}}', '{"token":"«redacted»"}'],
 			['{"token":{"note":"opaque-demo-value"', '{"token":"«redacted»"'],
 			['{"token": {\n"note":"opaque-demo-value"', '{"token": "«redacted»"'],
+			['{"token": [\n\n"opaque-demo-value"\n', '{"token": "«redacted»"'],
 		];
 		cases.forEach(([body, expected], index) => {
 			const number = 90 + index;
@@ -851,6 +854,13 @@ describe("github view cache persistence", () => {
 			"---|---",
 			"https://docs.example|'person@example.test'",
 			"|https://alice:pa\\|ss@example.test/z|keep|",
+			"~~~",
+			"```",
+			"~~~",
+			"",
+			"| URL | contact |",
+			"|---|---|",
+			"|https://docs.example|person@example.test|",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
@@ -877,6 +887,7 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).toContain("first|second\n---|---\nhttps://docs.example|'person@example.test'");
 		expect(cached?.payload.body).toContain("```text\nhttps://example.test/x\n---|---\n```");
 		expect(cached?.payload.body).toContain("|https://example.test/z|keep|");
+		expect(cached?.payload.body).toContain("|https://docs.example|person@example.test|");
 		expect(cached?.payload.body).not.toContain("opaque");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});
