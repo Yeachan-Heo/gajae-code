@@ -799,30 +799,45 @@ function isSingleQuoteItemStart(text: string, index: number): boolean {
  *                   marker (`+`/`-`) and blanks, any other name needs a
  *                   non-name byte before it
  *   NAME         := ( word `-` )* ( `cookie` | `cookies` | `authorization` | `auth` )
- *   value-trivia := blanks; a line-leading header whose value is on the next
- *                   line may cross one newline, an optional diff marker, blanks
+ *   value-trivia := blanks; a line-leading header whose value is on a later
+ *                   line may cross blank lines (each with an optional diff
+ *                   marker) and blanks
  *   value        := container | scalar
  *   container    := `[` inner `]` | `{` inner `}`
  *   inner        := ( string | bare-run | container | separator )*
  *   separator    := whitespace | `,` | bracket | a line-leading diff marker
- *   string       := `"` | `'` | '`' delimited, where `\X` inside consumes X
- *   bare-run     := any run without whitespace or one of `,[]{}`"'\`
+ *   string       := LAYER-L string, where a layer-L delimiter is a run of
+ *                   `2^(L-1)-1` backslashes plus a quote, and `\X` inside
+ *                   consumes X
+ *   bare-run     := any run without whitespace or one of `,[]{}`"'\
  *
  * What the state machine below enforces:
+ *  - The scanner reads exactly one text: a prose region, or one projection of
+ *    one diff hunk. Unified-diff text is never scanned as a single stream; it
+ *    is first lexed into hunks and projected onto context, old, and new lines,
+ *    so a `+`/`-` marker or a projection change cannot alter container depth.
  *  - A container begins only where the header grammar places its value. The
  *    left boundary is a line start (after an optional diff marker) or any
  *    non-name byte, so prose such as `the cookie: x` is not one.
- *  - One pass over the whole text. Inside a string `\X` consumes X, so a quote
- *    escaped by an odd backslash run never closes the string; outside a
- *    string the same rule keeps `\]` or `\{` from changing depth. A quote,
- *    comma, or bracket inside a string never changes container depth.
+ *  - One pass over the region. Inside a layer-1 string an even backslash run
+ *    leaves the quote bare, so `\"` cannot close it; outside a string the same
+ *    rule keeps `\]` or `\{` from changing depth. A quote, comma, or bracket
+ *    inside a string never changes container depth.
+ *  - Serialization layers are explicit. A quote introduced by an odd backslash
+ *    run is the delimiter of an inner escaped representation (`\"` is layer 2,
+ *    `\\\"` is layer 3). It is adopted only when a closer for that layer
+ *    exists, because a lone escaped quote is ordinary prose content. Once a
+ *    layer is open its closer must match the layer, so a `]` or a shallower
+ *    quote inside it is content rather than structure.
  *  - `"`, `'`, and backtick strings are tracked; a `'` between word characters
  *    is an apostrophe, not a delimiter.
- *  - Outside any container a line-leading credential header drops a dangling
- *    prose quote, so one stray `"` in a body cannot shield later headers.
+ *  - A line-leading credential header drops a dangling prose quote opened on
+ *    an earlier line even when an unrelated brace is still open, so one stray
+ *    `"` in a body cannot shield later headers. Inside a credential container
+ *    the quote is an item string and is left alone.
  *  - An unterminated container fails closed: its remaining content is redacted
- *    through the end of its region instead of being left behind. A unified
- *    diff region ends at the next `diff --git` header, so one file's truncated
+ *    through the end of its region instead of being left behind. A region is a
+ *    prose gap or one diff projection, so one file's or one side's truncated
  *    container cannot consume another file's patch.
  *
  * The whole header and container are masked with a nonce sentinel while the
@@ -830,9 +845,10 @@ function isSingleQuoteItemStart(text: string, index: number): boolean {
  * quotes, backticks, brackets, commas, whitespace, and line-leading diff
  * markers, backticks, and `:` separators are copied, only item content is
  * replaced. A terminated container therefore keeps its line count and diff
- * hunk shape, each terminated item keeps a paired opening and closing quote,
- * and a multiline item keeps each physical line's diff prefix. An unterminated
- * string keeps its remaining lines (redacted) with no invented closer.
+ * hunk shape, each terminated item keeps a paired opening and closing quote
+ * (including its escaped-quote framing), and a multiline item keeps each
+ * physical line's diff prefix. An unterminated string keeps its remaining
+ * lines (redacted) with no invented closer.
  */
 const CREDENTIAL_CONTAINER_NAME = /^(?:[A-Za-z0-9]+-)*(?:cookies?|authorization|auth)$/i;
 const CONTAINER_REDACTION = "«redacted»";
@@ -860,21 +876,97 @@ function isContainerSkeleton(ch: string): boolean {
 	return ch === " " || ch === "\t" || ch === "\r" || ch === "\n" || ",[]{}:".includes(ch);
 }
 
-/** True when the byte at `index` follows an odd backslash run. */
-function isEscapedAt(text: string, index: number): boolean {
+/** Number of backslashes immediately before `index`. */
+function backslashRunBefore(text: string, index: number): number {
 	let slashes = 0;
 	while (text[index - 1 - slashes] === "\\") slashes++;
-	return slashes % 2 === 1;
+	return slashes;
 }
 
-/** True when `ch` opens a string inside container content. */
-function isContainerStringOpener(text: string, index: number): boolean {
+/** True when the byte at `index` follows an odd backslash run. */
+function isEscapedAt(text: string, index: number): boolean {
+	return backslashRunBefore(text, index) % 2 === 1;
+}
+
+/**
+ * Backslash run of a delimiter at serialization `layer`. The persisted text
+ * itself is layer 1 and its quote is bare; layer 2 is the inner representation
+ * of one JSON-string nesting and its quote is `\"`; layer 3 is the next
+ * nesting and its quote is `\\\"`.
+ */
+function delimiterRunForLayer(layer: number): number {
+	return 2 ** (layer - 1) - 1;
+}
+
+/** Serialization layer whose quote delimiter is a run of `run` backslashes, or null. */
+function layerForDelimiterRun(run: number): number | null {
+	if (run === 0) return 1;
+	if (run !== 1 && run !== 3 && run !== 7) return null;
+	return Math.log2(run + 1) + 1;
+}
+
+/**
+ * True when a quote preceded by `run` backslashes closes a layer-`layer` string.
+ * Layer 1 keeps the ordinary escape rule (an even run leaves the quote bare);
+ * an inner layer's delimiter is a run congruent to its own delimiter run, so
+ * `\"` closes a layer 2 string while `\\\"` stays nested content in it.
+ */
+function closesStringAt(run: number, layer: number): boolean {
+	return run % 2 ** layer === delimiterRunForLayer(layer);
+}
+
+/**
+ * String opener at `index`, including the layer its delimiter belongs to. A
+ * single quote or backtick is always layer 1. A quote introduced by an odd
+ * backslash run is a hypothesis: it is an inner serialization layer only when
+ * a closer for that layer exists, because a lone `\"` in prose is escaped
+ * content, not a delimiter.
+ */
+function containerStringAt(
+	text: string,
+	index: number,
+	limit: number,
+): { layer: number; start: number; quoteIndex: number } | null {
 	const ch = text[index];
-	return (
-		(ch === '"' || ch === "`" || ch === "'") &&
-		(ch !== "'" || !isWordApostrophe(text, index)) &&
-		!isEscapedAt(text, index)
-	);
+	if (ch === "\\") {
+		let run = 1;
+		while (text[index + run] === "\\") run++;
+		const quoteIndex = index + run;
+		if (text[quoteIndex] !== '"') return null;
+		const layer = layerForDelimiterRun(run);
+		if (layer === null || layer === 1) return null;
+		if (findStringEnd(text, quoteIndex, '"', layer, limit) === -1) return null;
+		return { layer, start: index, quoteIndex };
+	}
+	if (ch === "'") {
+		if (isWordApostrophe(text, index) || isEscapedAt(text, index)) return null;
+		return { layer: 1, start: index, quoteIndex: index };
+	}
+	if (ch === "`") {
+		if (isEscapedAt(text, index)) return null;
+		return { layer: 1, start: index, quoteIndex: index };
+	}
+	if (ch !== '"') return null;
+	// Layer 1 only: an inner-layer opener is recognized at the start of its
+	// backslash run, never halfway through one.
+	if (layerForDelimiterRun(backslashRunBefore(text, index)) !== 1) return null;
+	return { layer: 1, start: index, quoteIndex: index };
+}
+
+/** Offset of the next string start in [from, limit), skipping whole backslash runs. */
+function nextContainerStringStart(text: string, from: number, limit: number): number {
+	let index = from;
+	while (index < limit) {
+		if (containerStringAt(text, index, limit) !== null) return index;
+		if (text[index] === "\\") {
+			let run = 1;
+			while (text[index + run] === "\\") run++;
+			index += run % 2 === 1 ? run + 1 : run;
+			continue;
+		}
+		index++;
+	}
+	return -1;
 }
 
 /** True when `index` is a diff marker at the start of a physical line. */
@@ -882,31 +974,34 @@ function isLineLeadingDiffMarker(text: string, index: number): boolean {
 	return text[index - 1] === "\n" && (text[index] === "+" || text[index] === "-");
 }
 
-/** Index of the quote that closes the string opened at `start`, or -1. */
-function findStringEnd(text: string, start: number, quote: string): number {
-	for (let index = start + 1; index < text.length; index++) {
-		const ch = text[index];
-		if (ch === "\\") {
-			index++;
-			continue;
-		}
-		if (ch === quote) return index;
+/** Index of the quote that closes the layer-`layer` string opened at `start`, or -1. */
+function findStringEnd(text: string, start: number, quote: string, layer: number, limit: number): number {
+	for (let index = start + 1; index < limit; index++) {
+		if (text[index] !== quote) continue;
+		if (closesStringAt(backslashRunBefore(text, index), layer)) return index;
 	}
 	return -1;
 }
 
-/** Skip blanks; a line-leading header whose value starts on the next line is still its value. */
+/**
+ * Skip blanks between a credential header and its value. A line-leading
+ * header may place its value on a later line: blank lines in between (with or
+ * without a diff marker) belong to the header's trivia, so a marked blank line
+ * does not orphan the container. A line that holds anything else ends the
+ * trivia, because that line is somebody else's value.
+ */
 function skipHeaderValueTrivia(text: string, start: number, allowNextLine: boolean): number {
 	let index = start;
 	while (isHorizontalBlank(text[index])) index++;
 	if (!allowNextLine) return index;
-	if (text[index] !== "\n" && text[index] !== "\r") return index;
-	if (text[index] === "\r") index++;
-	if (text[index] !== "\n") return index;
-	index++;
-	if (text[index] === "+" || text[index] === "-") index++;
-	while (isHorizontalBlank(text[index])) index++;
-	return index;
+	for (;;) {
+		if (text[index] === "\r") index++;
+		if (text[index] !== "\n") return index;
+		index++;
+		if (text[index] === "+" || text[index] === "-") index++;
+		while (isHorizontalBlank(text[index])) index++;
+		if (text[index] !== "\n" && text[index] !== "\r") return index;
+	}
 }
 
 /**
@@ -953,55 +1048,58 @@ function opensContainer(text: string, match: CredentialHeaderMatch): boolean {
 	return text[match.valueStart] === "[" || text[match.valueStart] === "{";
 }
 
-/** Diff side a physical line belongs to: new, old, both, or not a hunk line. */
-type DiffSide = "+" | "-" | " ";
-
-/** Classify the side of the hunk line starting at `lineStart`. */
-function diffLineSide(text: string, lineStart: number): DiffSide {
-	const ch = text[lineStart];
-	if (ch !== "+" && ch !== "-" && ch !== " ") return " ";
-	// `+++`/`---` are file headers, not hunk lines.
-	if (text[lineStart + 1] === ch && text[lineStart + 2] === ch && text[lineStart + 3] === " ") return " ";
-	return ch;
-}
-
-/** True when a closer on `closerSide` can end a container opened on `openerSide`. */
-function sideCanClose(openerSide: DiffSide, closerSide: DiffSide): boolean {
-	if (openerSide === " ") return true;
-	return closerSide === openerSide || closerSide === " ";
-}
-
-/** All credential header container spans, in text order. */
-function findCredentialContainerSpans(text: string, diff = false): CredentialContainerSpan[] {
+/**
+ * All credential header container spans, in text order.
+ *
+ * The scanner reads one text: a prose region, or one projection of one diff
+ * hunk. It never sees `+`/`-` markers as content structure, because the diff
+ * layer has already projected each side into its own text. Strings carry the
+ * serialization layer they belong to, so `\"` inside a container body is a
+ * delimiter of the inner representation instead of escaped literal content.
+ */
+function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 	const spans: CredentialContainerSpan[] = [];
-	const stack: { closer: string; credential: CredentialHeaderMatch | null; side: DiffSide }[] = [];
+	const stack: { closer: string; credential: CredentialHeaderMatch | null }[] = [];
 	let openCredentialContainers = 0;
-	let quote: string | null = null;
+	let string: { quote: string; layer: number } | null = null;
 	let pending: CredentialHeaderMatch | null = null;
-	let side: DiffSide = " ";
 	for (let index = 0; index < text.length; index++) {
-		const ch = text[index];
-		if (index === 0 || text[index - 1] === "\n") side = diff ? diffLineSide(text, index) : " ";
-		if ((index === 0 || text[index - 1] === "\n") && stack.length === 0) {
+		const ch = text[index] as string;
+		const atLineStart = index === 0 || text[index - 1] === "\n";
+		if (atLineStart && openCredentialContainers === 0) {
 			const header = matchLineCredentialHeader(text, index);
-			// A prose quote cannot cross a credential header line.
-			if (header !== null) quote = null;
-			if (header !== null && opensContainer(text, header)) {
-				// Jump over the header prefix: it is label syntax, not prose, so it
-				// cannot open a string or a bracket of its own.
-				pending = header;
-				index = header.valueStart - 1;
-				continue;
+			if (header !== null) {
+				// A line-leading header is structure, so a prose quote still open from
+				// an earlier line is dangling and cannot shield it. Inside a credential
+				// container the open quote is an item string and is left alone.
+				string = null;
+				if (opensContainer(text, header)) {
+					// Jump over the header prefix: it is label syntax, not prose, so it
+					// cannot open a string or a bracket of its own.
+					pending = header;
+					index = header.valueStart - 1;
+					continue;
+				}
 			}
 		}
-		if (quote) {
-			if (ch === "\\") index++;
-			else if (ch === quote) quote = null;
+		if (string !== null) {
+			if (ch === string.quote && closesStringAt(backslashRunBefore(text, index), string.layer)) string = null;
 			continue;
 		}
-		// An escaped byte outside a string is not structure (`\]`, `\{`).
+		// A backslash run outside a string is structure only as a serialization
+		// delimiter (`\"`) or as one content escape (`\]`, `\{`).
 		if (ch === "\\") {
-			index++;
+			let run = 1;
+			while (text[index + run] === "\\") run++;
+			if (text[index + run] === '"') {
+				const opener = containerStringAt(text, index, text.length);
+				if (opener !== null) {
+					string = { quote: '"', layer: opener.layer };
+					index = opener.quoteIndex;
+					continue;
+				}
+			}
+			index += run % 2 === 1 ? run : run - 1;
 			continue;
 		}
 		// A credential header may also sit mid-line (`trace Authorization: [`).
@@ -1010,8 +1108,8 @@ function findCredentialContainerSpans(text: string, diff = false): CredentialCon
 		const previous = text[index - 1];
 		const atMarkedLineStart = (previous === "+" || previous === "-") && (index < 2 || text[index - 2] === "\n");
 		const leftBoundary = index === 0 || atMarkedLineStart || !/[A-Za-z0-9_-]/.test(previous as string);
-		if (ch !== undefined && /[A-Za-z]/.test(ch) && leftBoundary && openCredentialContainers === 0) {
-			// A line start (plain or marked) may place the value on the next line;
+		if (/[A-Za-z]/.test(ch) && leftBoundary && openCredentialContainers === 0) {
+			// A line start (plain or marked) may place the value on a later line;
 			// a mid-line header must keep its value on the same line.
 			const allowNextLine = index === 0 || previous === "\n" || atMarkedLineStart;
 			const header = matchCredentialHeaderAt(text, index, allowNextLine);
@@ -1022,7 +1120,7 @@ function findCredentialContainerSpans(text: string, diff = false): CredentialCon
 			}
 		}
 		if (ch === '"') {
-			const close = findStringEnd(text, index, ch);
+			const close = findStringEnd(text, index, ch, 1, text.length);
 			// A quoted member name (`"auth":`) is a header at any depth, but never
 			// inside a credential container that is already being emptied.
 			if (close !== -1 && openCredentialContainers === 0) {
@@ -1033,11 +1131,11 @@ function findCredentialContainerSpans(text: string, diff = false): CredentialCon
 					continue;
 				}
 			}
-			quote = ch;
+			string = { quote: ch, layer: 1 };
 			continue;
 		}
 		if (ch === "`") {
-			quote = ch;
+			string = { quote: ch, layer: 1 };
 			continue;
 		}
 		if (
@@ -1045,13 +1143,13 @@ function findCredentialContainerSpans(text: string, diff = false): CredentialCon
 			!isWordApostrophe(text, index) &&
 			(stack.length > 0 || lineStartsCredentialHeader(text, index) || isSingleQuoteItemStart(text, index))
 		) {
-			quote = ch;
+			string = { quote: ch, layer: 1 };
 			continue;
 		}
 		if (ch === "[" || ch === "{") {
 			const credential = pending !== null && pending.valueStart === index ? pending : null;
 			if (credential !== null) openCredentialContainers++;
-			stack.push({ closer: ch === "[" ? "]" : "}", credential, side });
+			stack.push({ closer: ch === "[" ? "]" : "}", credential });
 			pending = null;
 			continue;
 		}
@@ -1060,9 +1158,6 @@ function findCredentialContainerSpans(text: string, diff = false): CredentialCon
 		// A stray or mismatched closer cannot end a container; leaving the
 		// opener on the stack makes the span fail closed instead.
 		if (!top || top.closer !== ch) continue;
-		// In a unified diff the two sides are different texts: an old-side `-]`
-		// must not close a new-side `+[`, or the added items after it survive.
-		if (diff && top.credential !== null && !sideCanClose(top.side, side)) continue;
 		stack.pop();
 		if (top.credential !== null) {
 			openCredentialContainers--;
@@ -1125,21 +1220,32 @@ function redactContainerBody(text: string, span: CredentialContainerSpan): strin
 	let out = text.slice(span.valueStart, span.valueStart + 1);
 	let index = span.valueStart + 1;
 	while (index < contentEnd) {
-		if (isContainerStringOpener(text, index)) {
-			const opener = text[index] as string;
-			const close = findStringEnd(text, index, opener);
+		const opener = containerStringAt(text, index, contentEnd);
+		if (opener !== null) {
+			const close = findStringEnd(
+				text,
+				opener.quoteIndex,
+				text[opener.quoteIndex] as string,
+				opener.layer,
+				contentEnd,
+			);
 			const stringEnd = close === -1 || close >= contentEnd ? contentEnd : close;
+			const delimiter = text.slice(opener.start, opener.quoteIndex + 1);
+			const closeRun = delimiterRunForLayer(opener.layer);
 			// A single-line item collapses to one marker; a multiline one keeps its
 			// physical lines so a diff hunk's count and prefixes stay valid.
 			const multiline =
-				text.slice(index + 1, stringEnd).includes("\n") || text.slice(index + 1, stringEnd).includes("\r");
-			out += opener + (multiline ? redactSkeletonRegion(text, index + 1, stringEnd) : CONTAINER_REDACTION);
-			if (stringEnd < contentEnd) out += opener;
+				text.slice(opener.quoteIndex + 1, stringEnd).includes("\n") ||
+				text.slice(opener.quoteIndex + 1, stringEnd).includes("\r");
+			out +=
+				delimiter +
+				(multiline ? redactSkeletonRegion(text, opener.quoteIndex + 1, stringEnd) : CONTAINER_REDACTION);
+			if (close !== -1 && close < contentEnd) out += text.slice(close - closeRun, close + 1);
 			index = stringEnd < contentEnd ? stringEnd + 1 : contentEnd;
 			continue;
 		}
-		let regionEnd = index;
-		while (regionEnd < contentEnd && !isContainerStringOpener(text, regionEnd)) regionEnd++;
+		const next = nextContainerStringStart(text, index, contentEnd);
+		const regionEnd = next === -1 ? contentEnd : next;
 		out += redactSkeletonRegion(text, index, regionEnd);
 		index = regionEnd;
 	}
@@ -1152,8 +1258,8 @@ function redactContainerBody(text: string, span: CredentialContainerSpan): strin
  * restore function. The header itself is masked too, so no later line-level or
  * shared rule can collapse it, delete its opener, or reformat a diff hunk.
  */
-function redactCredentialContainersInSection(text: string, masked: string[], diff: boolean): string {
-	const spans = findCredentialContainerSpans(text, diff);
+function redactCredentialContainersInSection(text: string, masked: string[]): string {
+	const spans = findCredentialContainerSpans(text);
 	if (spans.length === 0) return text;
 	let out = "";
 	let last = 0;
@@ -1183,48 +1289,121 @@ function redactCredentialContainersInSection(text: string, masked: string[], dif
 	return out + text.slice(last);
 }
 
+/** One physical line of unified-diff hunk content. `end` excludes the newline. */
+interface UnifiedDiffLine {
+	start: number;
+	contentStart: number;
+	end: number;
+	prefix: " " | "+" | "-";
+}
+
+interface UnifiedDiffHunk {
+	lines: UnifiedDiffLine[];
+}
+
 /**
- * Redact containers region by region. A unified diff is a sequence of
- * independent file sections, so an unterminated container inside one file's
- * patch fails closed against that section instead of consuming the next
- * file's `diff --git` header and hunk.
+ * Split unified-diff text into hunks of content lines. A hunk starts at `@@ `
+ * and ends at the next file/hunk header or any line that is not hunk content,
+ * so a truncated patch can never borrow structure from a later hunk.
+ */
+function lexUnifiedDiff(text: string): UnifiedDiffHunk[] {
+	const hunks: UnifiedDiffHunk[] = [];
+	let current: UnifiedDiffHunk | null = null;
+	let start = 0;
+	while (start <= text.length) {
+		const newline = text.indexOf("\n", start);
+		const end = newline === -1 ? text.length : newline;
+		const atLineStart = start === 0 || text[start - 1] === "\n";
+		if (atLineStart && text.startsWith("@@ ", start)) {
+			current = { lines: [] };
+			hunks.push(current);
+		} else if (atLineStart && text.startsWith("diff --git ", start)) {
+			current = null;
+		} else {
+			const prefix = text[start];
+			if (current !== null && (prefix === " " || prefix === "+" || prefix === "-")) {
+				current.lines.push({ start, contentStart: start + 1, end, prefix });
+			} else {
+				// A blank separator or `\ No newline at end of file` marker closes the
+				// hunk body; the remaining text is scanned as prose.
+				current = null;
+			}
+		}
+		if (newline === -1) break;
+		start = newline + 1;
+	}
+	return hunks.filter(hunk => hunk.lines.length > 0);
+}
+
+/**
+ * Redact a unified diff through its structured projections. Context lines
+ * belong to both sides, old-side lines exist only in the old file, new-side
+ * lines only in the new one. A container is decided inside one projection, so
+ * an old-side `-]` can no longer close a new-side container and a context
+ * opener that closes on one side leaves the other side open (and therefore
+ * fails closed through the end of its hunk). The redacted projection line is
+ * written back into its own physical line, keeping prefixes and framing.
+ */
+function redactDiffProjections(text: string, masked: string[]): string {
+	const hunks = lexUnifiedDiff(text);
+	if (hunks.length === 0) return redactCredentialContainersInSection(text, masked);
+	const projections: ((line: UnifiedDiffLine) => boolean)[] = [
+		line => line.prefix === " ",
+		line => line.prefix !== "+",
+		line => line.prefix !== "-",
+	];
+	let out = "";
+	let cursor = 0;
+	for (const hunk of hunks) {
+		out += redactCredentialContainersInSection(text.slice(cursor, hunk.lines[0]!.start), masked);
+		const redacted: (string | null)[] = new Array(hunk.lines.length).fill(null);
+		for (const include of projections) {
+			const rawIndex: number[] = [];
+			let projection = "";
+			for (let index = 0; index < hunk.lines.length; index++) {
+				const line = hunk.lines[index]!;
+				if (!include(line)) continue;
+				rawIndex.push(index);
+				projection += `${text.slice(line.contentStart, line.end)}\n`;
+			}
+			if (projection.length === 0) continue;
+			const section = redactCredentialContainersInSection(projection, masked);
+			if (section === projection) continue;
+			const sectionLines = section.split("\n");
+			for (let position = 0; position < rawIndex.length; position++) {
+				const index = rawIndex[position]!;
+				if (redacted[index] !== null) continue;
+				const content = sectionLines[position];
+				if (content === undefined) continue;
+				const original = text.slice(hunk.lines[index]!.contentStart, hunk.lines[index]!.end);
+				if (content !== original) redacted[index] = content;
+			}
+		}
+		for (let index = 0; index < hunk.lines.length; index++) {
+			const line = hunk.lines[index]!;
+			out +=
+				text.slice(line.start, line.contentStart) + (redacted[index] ?? text.slice(line.contentStart, line.end));
+			if (index < hunk.lines.length - 1) out += "\n";
+		}
+		cursor = hunk.lines.at(-1)!.end;
+	}
+	return out + redactCredentialContainersInSection(text.slice(cursor), masked);
+}
+
+/**
+ * Redact credential containers. Prose is scanned as one region; unified-diff
+ * text is projected per hunk and per side before scanning, so a `+`/`-` prefix
+ * or a side boundary changes what the content means. Slots are allocated
+ * across every region and projection: a per-region table would alias two
+ * sentinels onto one restore entry.
  */
 function redactCredentialContainers(
 	text: string,
 	diff = false,
 ): { text: string; restore: (scrubbed: string) => string } {
-	const regions: [number, number][] = [];
-	let regionStart = 0;
-	if (diff) {
-		// File and hunk headers are structural boundaries: an unterminated
-		// container fails closed inside its hunk instead of erasing later hunks
-		// or files, which would corrupt the stored patch and its slices.
-		const cuts: number[] = [];
-		for (const marker of ["\ndiff --git ", "\n@@ "]) {
-			let from = 0;
-			for (;;) {
-				const boundary = text.indexOf(marker, from);
-				if (boundary === -1) break;
-				cuts.push(boundary + 1);
-				from = boundary + 1;
-			}
-		}
-		cuts.sort((left, right) => left - right);
-		for (const cut of cuts) {
-			if (cut <= regionStart) continue;
-			regions.push([regionStart, cut]);
-			regionStart = cut;
-		}
-	}
-	regions.push([regionStart, text.length]);
-	// Slots are allocated across all regions: a per-region table would make
-	// region A's slot 0 and region B's slot 0 alias one sentinel pattern.
 	const masked: string[] = [];
-	let out = "";
-	for (const [start, end] of regions) {
-		out += redactCredentialContainersInSection(text.slice(start, end), masked, diff);
-	}
-	return { text: out, restore: scrubbed => restoreMasked(scrubbed, CONTAINER_MASK, masked) };
+	const scrubbed = diff ? redactDiffProjections(text, masked) : redactCredentialContainersInSection(text, masked);
+	return { text: scrubbed, restore: scrubbed => restoreMasked(scrubbed, CONTAINER_MASK, masked) };
 }
 
 /** Text-level scrub for everything the view cache persists or serves back. */

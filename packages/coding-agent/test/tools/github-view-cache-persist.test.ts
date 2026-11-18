@@ -2010,5 +2010,91 @@ describe("github view cache persistence", () => {
 			expect(unified.split("\n")).toContain('+  "«redacted»"');
 			expect(unified.split("\n")).toContain("+]");
 		});
+
+		it("redacts items delimited by the escaped-quote serialization layer", () => {
+			// The persisted text can itself hold an escaped representation, so `\"`
+			// is an item delimiter of the inner layer, not escaped literal content.
+			// Reading it as literal content lets the `]` inside the item close the
+			// container early and leaves the next item behind.
+			const body = 'Auth: [\n  \\"first]fragment\\",\n  "escaped-layer-opaque"\n]';
+			storeBody(1330, body);
+			const stored = readBody(1330) ?? "";
+			expect(stored).not.toContain("first]fragment");
+			expect(stored).not.toContain("escaped-layer-opaque");
+			expect(cacheFileBytes()).not.toContain("escaped-layer-opaque");
+			expect(stored).toContain('\\"«redacted»\\"');
+			expect(stored).not.toContain("\u0000");
+			storeBody(1331, stored);
+			expect(readBody(1331)).toBe(stored);
+		});
+
+		it("redacts through a doubly escaped serialization layer", () => {
+			const body = 'Auth: [\n  \\\\"deep]fragment\\\\",\n  "deep-layer-opaque"\n]';
+			storeBody(1332, body);
+			const stored = readBody(1332) ?? "";
+			expect(stored).not.toContain("deep]fragment");
+			expect(stored).not.toContain("deep-layer-opaque");
+			expect(cacheFileBytes()).not.toContain("deep-layer-opaque");
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("crosses a marked blank line between a header and its opener", () => {
+			// A `+` line with nothing after it is a blank line in the rendered
+			// diff; it belongs to the header's trivia, so the container is still
+			// recognized and fails closed when it never closes.
+			const body = "+Auth:\n+\n+[\n+marked-blank-opaque";
+			storeBody(1333, body);
+			const stored = readBody(1333) ?? "";
+			expect(stored).not.toContain("marked-blank-opaque");
+			expect(cacheFileBytes()).not.toContain("marked-blank-opaque");
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("does not let a dangling prose quote shield a later header", () => {
+			// The open brace and the dangling `"` are unrelated to the header; a
+			// quote that opened on an earlier line is not structure the header must
+			// stay inside.
+			const body = '{\nnoise "\nAuth: [\nprose-quote-opaque';
+			storeBody(1334, body);
+			const stored = readBody(1334) ?? "";
+			expect(stored).not.toContain("prose-quote-opaque");
+			expect(cacheFileBytes()).not.toContain("prose-quote-opaque");
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("closes a context container only inside the projection that holds its closer", () => {
+			// A context line exists on both sides. An old-side `-]` closes only the
+			// old projection; the new projection keeps the container open and its
+			// added item must fail closed.
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1,2 +1,3 @@",
+				" Cookie: [",
+				' "first",',
+				"-]",
+				'+  "context-closed-opaque"',
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1335,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1335, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("context-closed-opaque");
+			expect(cacheFileBytes()).not.toContain("context-closed-opaque");
+			expect(unified).toContain("@@ -1,2 +1,3 @@");
+			expect(unified.split("\n")).toContain("-]");
+			expect(unified).not.toContain("\u0000");
+		});
 	});
 });
