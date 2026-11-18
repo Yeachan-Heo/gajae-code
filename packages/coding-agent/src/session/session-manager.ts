@@ -17344,7 +17344,7 @@ export class SessionManager {
 
 			// Find the last entry we have in memory
 			const currentLastId = this.#fileEntries[this.#fileEntries.length - 1]?.id;
-			
+
 			// Find if there are any new entries in the destination that we don't have
 			let newEntriesStartIndex = destinationEntries.length;
 			for (let i = 0; i < destinationEntries.length; i++) {
