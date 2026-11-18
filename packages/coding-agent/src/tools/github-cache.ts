@@ -442,10 +442,12 @@ function maskParameterizedAuthValues(text: string): string {
 			while (text[valueStart + slashes] === "\\") slashes++;
 			const quote = slashes > 0 && slashes % 2 === 1 ? text[valueStart + slashes] : "";
 			if (quote === '"' || quote === "'") {
+				// Fail closed through the line end. Credential header containers are
+				// emptied before this pass runs, so an item quote can no longer be
+				// orphaned here; a value whose quoting is ambiguous stays redacted
+				// rather than half-visible.
 				const lineEnd = text.indexOf("\n", valueStart);
-				const limit = lineEnd === -1 ? text.length : lineEnd;
-				const cookieContainer = /\s+cookie\s*:\s*[[{]/i.exec(text.slice(valueStart, limit));
-				end = cookieContainer ? valueStart + cookieContainer.index : limit;
+				end = lineEnd === -1 ? text.length : lineEnd;
 			} else {
 				while (end < text.length && !/[\s,;]/.test(text[end])) end++;
 			}
@@ -753,27 +755,9 @@ function scrubHostPaths(text: string): string {
 	return out + scrubLocal(text.slice(last));
 }
 
-/** Text-level scrub for everything the view cache persists or serves back. */
-/** True when the character at `index` is preceded by an odd backslash run. */
-function isEscapedAt(text: string, index: number): boolean {
-	let slashes = 0;
-	for (let i = index - 1; i >= 0 && text[i] === "\\"; i--) slashes++;
-	return slashes % 2 === 1;
-}
-
 /** True when a line begins a credential header that can safely reset prose quote state. */
 function startsCredentialHeader(line: string): boolean {
 	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*cookie|(?:(?:[A-Za-z0-9]+-)*authorization|auth))[ \t]*["']?[ \t]*[:=]/i.test(
-		line,
-	);
-}
-
-/** True when the line containing `index` is a bare credential container opener. */
-function isContainerOpenerLine(text: string, index: number): boolean {
-	const start = text.lastIndexOf("\n", index) + 1;
-	const end = text.indexOf("\n", index);
-	const line = text.slice(start, end === -1 ? text.length : end);
-	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*(?:cookie|authorization|auth))[ \t]*["']?[ \t]*[:=][ \t]*[[{]/i.test(
 		line,
 	);
 }
@@ -796,114 +780,259 @@ function isSingleQuoteItemStart(text: string, index: number): boolean {
 	return /^[ \t]*[-+]?[ \t]*$/.test(text.slice(start, index));
 }
 
-/** Quote-aware bracket scan up to `end`. */
-function scanStructure(text: string, end: number): { stack: { ch: string; index: number }[]; quoted: boolean } {
-	const stack: { ch: string; index: number }[] = [];
+/**
+ * Credential header containers: the grammar this scanner reads.
+ *
+ * Cached text is Markdown/JSON-like prose, sometimes unified-diff text. A
+ * credential header container is:
+ *
+ *   header       := line-name | quoted-member-name
+ *   line-name    := line-start, optional diff marker (`+`/`-`), blanks,
+ *                   NAME, optional quote, blanks, (`:` | `=`), value-trivia
+ *   quoted-name  := `"` NAME `"` blanks (`:` | `=`) value-trivia   (JSON member, anywhere)
+ *   NAME         := ( word `-` )* ( `cookie` | `cookies` | `authorization` | `auth` )
+ *   value-trivia := blanks; when nothing follows on the line, one newline,
+ *                   an optional diff marker, and blanks
+ *   value        := container | scalar
+ *   container    := `[` inner `]` | `{` inner `}`
+ *   inner        := ( string | bare-run | container | separator )*
+ *   separator    := whitespace | `,` | bracket | a line-leading diff marker
+ *   string       := `"` ( `\` any | any-except-`"`-and-`\` )* `"`, same for `'`
+ *   bare-run     := any run without whitespace or one of `,[]{}`"'
+ *
+ * What the state machine below enforces:
+ *  - A container begins only where the header grammar places its value. The
+ *    name boundary is the line start (after an optional diff marker) or a
+ *    quoted JSON member name, so prose such as `the cookie: x` is not one.
+ *  - One pass over the whole text. Inside a string `\X` consumes X, so a quote
+ *    escaped by an odd backslash run never closes the string, and a quote,
+ *    comma, or bracket inside a string never changes container depth.
+ *  - A `'` between word characters is an apostrophe, not a string delimiter.
+ *  - Outside any container a line-leading credential header drops a dangling
+ *    prose quote, so one stray `"` in a body cannot shield later headers.
+ *  - An unterminated container fails closed: its remaining content is redacted
+ *    through end of text instead of being left behind.
+ *
+ * Replacement preserves the skeleton: quotes, brackets, commas, whitespace,
+ * and line-leading diff markers are copied, only item content is replaced. A
+ * multiline container therefore keeps its line count, and each item keeps a
+ * paired opening and closing quote.
+ */
+const CREDENTIAL_CONTAINER_NAME = /^(?:[A-Za-z0-9]+-)*(?:cookies?|authorization|auth)$/i;
+const CONTAINER_REDACTION = "«redacted»";
+
+interface CredentialContainerSpan {
+	valueStart: number;
+	valueEnd: number;
+	terminated: boolean;
+}
+
+/** True when `ch` is part of a container's structural skeleton. */
+function isContainerSkeleton(ch: string): boolean {
+	return ch === " " || ch === "\t" || ch === "\r" || ch === "\n" || ",[]{}:".includes(ch);
+}
+
+/** Index of the quote that closes the string opened at `start`, or -1. */
+function findStringEnd(text: string, start: number, quote: string): number {
+	for (let index = start + 1; index < text.length; index++) {
+		const ch = text[index];
+		if (ch === "\\") {
+			index++;
+			continue;
+		}
+		if (ch === quote) return index;
+	}
+	return -1;
+}
+
+/** Skip blanks; a header whose value starts on the next line is still its value. */
+function skipHeaderValueTrivia(text: string, start: number): number {
+	let index = start;
+	while (text[index] === " " || text[index] === "\t") index++;
+	if (text[index] !== "\n" && text[index] !== "\r") return index;
+	if (text[index] === "\r") index++;
+	if (text[index] !== "\n") return index;
+	index++;
+	if (text[index] === "+" || text[index] === "-") index++;
+	while (text[index] === " " || text[index] === "\t") index++;
+	return index;
+}
+
+/** Match a line-leading credential header and return where its value begins. */
+function matchLineCredentialHeader(text: string, lineStart: number): number | null {
+	let index = lineStart;
+	if (text[index] === "+" || text[index] === "-") index++;
+	while (text[index] === " " || text[index] === "\t") index++;
+	const nameStart = index;
+	while (index < text.length && /[A-Za-z0-9-]/.test(text[index] as string)) index++;
+	if (index === nameStart) return null;
+	if (!CREDENTIAL_CONTAINER_NAME.test(text.slice(nameStart, index))) return null;
+	if (text[index] === '"' || text[index] === "'") index++;
+	while (text[index] === " " || text[index] === "\t") index++;
+	if (text[index] !== ":" && text[index] !== "=") return null;
+	return skipHeaderValueTrivia(text, index + 1);
+}
+
+/** True when a quoted member name is followed by `:`/`=` and a container value. */
+function matchQuotedMemberHeader(text: string, quoteStart: number, quoteEnd: number): number | null {
+	if (!CREDENTIAL_CONTAINER_NAME.test(text.slice(quoteStart + 1, quoteEnd))) return null;
+	let index = quoteEnd + 1;
+	while (text[index] === " " || text[index] === "\t") index++;
+	if (text[index] !== ":" && text[index] !== "=") return null;
+	index = skipHeaderValueTrivia(text, index + 1);
+	return text[index] === "[" || text[index] === "{" ? index : null;
+}
+
+/** All credential header container spans, in text order. */
+function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
+	const spans: CredentialContainerSpan[] = [];
+	const stack: { closer: string; credentialStart: number | null }[] = [];
 	let quote: string | null = null;
-	for (let i = 0; i < end; i++) {
-		const ch = text[i];
-		if ((i === 0 || text[i - 1] === "\n") && stack.length === 0) {
-			const lineEnd = text.indexOf("\n", i);
-			const line = text.slice(i, lineEnd === -1 ? text.length : lineEnd);
-			if (startsCredentialHeader(line)) quote = null;
+	let pendingContainerStart: number | null = null;
+	for (let index = 0; index < text.length; index++) {
+		const ch = text[index];
+		if ((index === 0 || text[index - 1] === "\n") && stack.length === 0) {
+			const valueStart = matchLineCredentialHeader(text, index);
+			// A prose quote cannot cross a credential header line.
+			if (valueStart !== null) quote = null;
+			if (valueStart !== null && (text[valueStart] === "[" || text[valueStart] === "{")) {
+				// Jump over the header prefix: it is label syntax, not prose, so it
+				// cannot open a string or a bracket of its own.
+				pendingContainerStart = valueStart;
+				index = valueStart - 1;
+				continue;
+			}
 		}
 		if (quote) {
-			if (ch === quote && !isEscapedAt(text, i)) quote = null;
+			if (ch === "\\") index++;
+			else if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === '"') {
+			const close = findStringEnd(text, index, ch);
+			// A quoted member name (`"auth":`) is a header at any depth, but never
+			// inside a credential container that is already being emptied.
+			if (close !== -1 && stack.every(entry => entry.credentialStart === null)) {
+				const valueStart = matchQuotedMemberHeader(text, index, close);
+				if (valueStart !== null) {
+					pendingContainerStart = valueStart;
+					index = valueStart - 1;
+					continue;
+				}
+			}
+			quote = ch;
 			continue;
 		}
 		if (
-			ch === '"' ||
-			(ch === "'" &&
-				!isWordApostrophe(text, i) &&
-				(lineStartsCredentialHeader(text, i) || isSingleQuoteItemStart(text, i)))
+			ch === "'" &&
+			!isWordApostrophe(text, index) &&
+			(stack.length > 0 || lineStartsCredentialHeader(text, index) || isSingleQuoteItemStart(text, index))
 		) {
 			quote = ch;
 			continue;
 		}
-		if (ch === "{" || ch === "[") stack.push({ ch, index: i });
-		else if (ch === "}" || ch === "]") stack.pop();
-	}
-	return { stack, quoted: quote !== null };
-}
-
-/** True when a match carries a Cookie-owned structural closer. */
-function closesMatchingContainer(text: string, end: number, match: string): boolean {
-	const scan = scanStructure(text, end);
-	if (scan.quoted) return false;
-	const stack = [...scan.stack];
-	let quote: string | null = null;
-	for (let i = 0; i < match.length; i++) {
-		const ch = match[i];
-		if (quote) {
-			if (ch === quote && !isEscapedAt(match, i)) quote = null;
+		if (ch === "[" || ch === "{") {
+			stack.push({
+				closer: ch === "[" ? "]" : "}",
+				credentialStart: pendingContainerStart === index ? index : null,
+			});
+			pendingContainerStart = null;
 			continue;
 		}
-		if (ch === '"' || (ch === "'" && !isWordApostrophe(match, i))) {
-			quote = ch;
-			continue;
-		}
-		if (ch === "{" || ch === "[") {
-			stack.push({ ch, index: end + i });
-			continue;
-		}
-		if (ch !== "}" && ch !== "]") continue;
+		if (ch !== "]" && ch !== "}") continue;
 		const top = stack.at(-1);
-		if (!top || !((ch === "]" && top.ch === "[") || (ch === "}" && top.ch === "{"))) continue;
-		const rest = match.slice(i + 1).trim();
-		if (rest !== "" && rest !== ",") continue;
-		if (!isContainerOpenerLine(text, top.index)) return false;
+		// A stray or mismatched closer cannot end a container; leaving the
+		// opener on the stack makes the span fail closed instead.
+		if (!top || top.closer !== ch) continue;
 		stack.pop();
-		return true;
+		if (top.credentialStart !== null) {
+			spans.push({ valueStart: top.credentialStart, valueEnd: index + 1, terminated: true });
+		}
 	}
-	return false;
-}
-
-/** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
-function containerDepthAt(text: string, end: number): number {
-	return scanStructure(text, end).stack.length;
-}
-
-/** True when the match starts inside a double-quoted string. */
-function insideContainerQuote(text: string, end: number): boolean {
-	return scanStructure(text, end).quoted;
-}
-
-/** True when the match itself contains a paired double-quoted value. */
-function hasLocalDoubleQuotePair(match: string): boolean {
-	const first = match.indexOf('"');
-	if (first < 0) return false;
-	for (let i = first + 1; i < match.length; i++) {
-		if (match[i] === '"' && !isEscapedAt(match, i)) return true;
+	// A credential container that never closes is still credential material.
+	for (const entry of stack) {
+		if (entry.credentialStart !== null) {
+			spans.push({ valueStart: entry.credentialStart, valueEnd: text.length, terminated: false });
+		}
 	}
-	return false;
+	return spans.sort((left, right) => left.valueStart - right.valueStart);
 }
 
-/** Redact a whole Auth/Authorization container through its balanced end. */
-function maskAuthContainers(text: string): string {
+/** Replace container content while copying its structural skeleton. */
+function redactContainerSpan(text: string, span: CredentialContainerSpan): string {
+	const contentEnd = span.terminated ? span.valueEnd - 1 : span.valueEnd;
+	let out = text.slice(span.valueStart, span.valueStart + 1);
+	let index = span.valueStart + 1;
+	while (index < contentEnd) {
+		const ch = text[index] as string;
+		if (ch === '"' || (ch === "'" && !isWordApostrophe(text, index))) {
+			const close = findStringEnd(text, index, ch);
+			if (close === -1 || close >= contentEnd) {
+				out += `${ch}${CONTAINER_REDACTION}`;
+				index = contentEnd;
+				continue;
+			}
+			out += `${ch}${CONTAINER_REDACTION}${ch}`;
+			index = close + 1;
+			continue;
+		}
+		if (index > span.valueStart + 1 && text[index - 1] === "\n" && (ch === "+" || ch === "-")) {
+			out += ch;
+			index++;
+			continue;
+		}
+		if (isContainerSkeleton(ch)) {
+			out += ch;
+			index++;
+			continue;
+		}
+		let runEnd = index + 1;
+		while (
+			runEnd < contentEnd &&
+			!isContainerSkeleton(text[runEnd] as string) &&
+			text[runEnd] !== '"' &&
+			!(text[runEnd] === "'" && !isWordApostrophe(text, runEnd))
+		) {
+			runEnd++;
+		}
+		out += CONTAINER_REDACTION;
+		index = runEnd;
+	}
+	if (span.terminated) out += text[span.valueEnd - 1];
+	return out;
+}
+
+/**
+ * Locate credential header containers by structure and redact their content in
+ * place. Runs before every line-level header rule, so no line heuristic can
+ * orphan a container quote or leave one of its items behind.
+ */
+function redactCredentialContainers(text: string): string {
+	const spans = findCredentialContainerSpans(text);
+	if (spans.length === 0) return text;
 	let out = "";
 	let last = 0;
-	for (const match of text.matchAll(
-		/((?:"(?:[A-Za-z0-9]+-)*(?:authorization|auth)"|(?:[A-Za-z0-9]+-)*(?:authorization|auth))[ \t]*[:=][ \t]*)([[{])/gi,
-	)) {
-		const index = match.index ?? 0;
-		if (index < last) continue;
-		const valueStart = index + match[0].length - 1;
-		const end = findBalancedValueEnd(text, valueStart);
-		const stop = end === -1 ? text.length : end;
-		out += text.slice(last, index) + `${match[1]}«redacted»`;
-		last = stop;
+	for (const span of spans) {
+		if (span.valueStart < last) continue;
+		out += text.slice(last, span.valueStart) + redactContainerSpan(text, span);
+		last = span.valueEnd;
 	}
 	return out + text.slice(last);
 }
 
+/** Text-level scrub for everything the view cache persists or serves back. */
 function scrubCacheText(text: string, diff = false): string {
 	// Userinfo comes off the raw text first: container masking can collapse a
 	// blank line that ended a Markdown table, and a later table classification
 	// would then hide a URL behind its cell separator.
 	const withoutUserinfo = stripUrlUserinfo(text);
-	// Structured containers next: a partial flat match would hide the credential
-	// label from the quote-aware container pass.
-	const containers = maskCredentialJsonContainers(withoutUserinfo, diff);
+	// Credential header containers are located and emptied structurally before
+	// any line-level rule runs, so a quote inside one can never be orphaned by a
+	// later line mask and no item of the container can survive behind it.
+	const withoutContainers = redactCredentialContainers(withoutUserinfo);
+	// Structured credential assignments next: a partial flat match would hide the
+	// credential label from the quote-aware container pass.
+	const containers = maskCredentialJsonContainers(withoutContainers, diff);
 	// The shared URL rule does not know about Markdown cell separators and can
 	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
 	// (userinfo was already removed) so only our authority pass sees them.
@@ -919,8 +1048,7 @@ function scrubCacheText(text: string, diff = false): string {
 	);
 	// Digest/Negotiate headers carry parameters after the scheme; mask the rest
 	// of the header line so a `response=` parameter cannot survive.
-	const withoutAuthContainers = maskAuthContainers(withoutPem);
-	const withoutParameterizedAuth = withoutAuthContainers.replace(
+	const withoutParameterizedAuth = withoutPem.replace(
 		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
 		"$1 «redacted»",
 	);
@@ -938,32 +1066,16 @@ function scrubCacheText(text: string, diff = false): string {
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
 	const withoutCookies = withoutBearer
 		.replace(
-			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*\r?\n[-+][^\S\r\n]*[[{][^\r\n]*(?:\r?\n[-+]?[^\r\n]*)*?\r?\n[-+]?[^\S\r\n]*[\]}][^\r\n]*/gi,
-			"$1$2Cookie: «redacted»",
-		)
-		.replace(
 			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*(?![^\S\r\n]*\r?\n[^\S\r\n]*[[{])(?=[^\S\r\n]*\r?\n)(?:\r?\n[-+]?[^\S\r\n]+[^\r\n]*)+/gi,
 			"$1$2Cookie: «redacted»",
 		)
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
-			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) => {
-				if (containerDepthAt(text, offset) === 0) return `${lineStart}${marker}${label}«redacted»`;
-				if (insideContainerQuote(text, offset)) return match;
-				if (closesMatchingContainer(text, offset, match)) {
-					if (!match.includes("'")) return match;
-					const closerIndex = Math.max(match.lastIndexOf("]"), match.lastIndexOf("}"));
-					const closer = closerIndex >= 0 ? match.slice(closerIndex) : "";
-					return `${lineStart}${marker}${label}«redacted»${closer}`;
-				}
-				if (match.includes('"') && !hasLocalDoubleQuotePair(match)) return match;
-				return `${lineStart}${marker}${label}«redacted»`;
-			},
+			"$1$2$3«redacted»",
 		)
 		.replace(
 			/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
-			(match: string, label: string, offset: number, text: string) =>
-				containerDepthAt(text, offset) > 0 ? match : `${label}«redacted»`,
+			"$1«redacted»",
 		);
 	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);
 	let scrubbed = redactCrashSecrets(withoutAtSigns);

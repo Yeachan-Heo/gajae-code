@@ -1555,4 +1555,96 @@ describe("github view cache persistence", () => {
 			}
 		}
 	});
+
+	describe("credential header containers", () => {
+		// The item whose value holds an escaped auth token must keep its outer
+		// closing quote: only a structurally balanced container lets the shared
+		// redactor collapse the header and leave the following line alone.
+		const ESCAPED_AUTH_COOKIE =
+			'Cookie: [\n  "sid=a; Authorization: Token token=\\"container-auth-secret-1\\"",\n  "container-opaque-2"\n]\nafter=keep';
+		const REDACTED_COOKIE = "Cookie: «redacted»\nafter=keep";
+
+		function storeBody(number: number, body: string): void {
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "issue",
+				number,
+				includeComments: false,
+				payload: { body },
+				rendered: body,
+				fetchedAt: 1,
+			});
+		}
+
+		function readBody(number: number): string | undefined {
+			return getCached<{ body?: string }>(TEST_REPO, "issue", number, false, TEST_AUTH_KEY)?.payload.body;
+		}
+
+		it("keeps the quoted Cookie array structure while removing an escaped auth value", () => {
+			storeBody(1301, ESCAPED_AUTH_COOKIE);
+			const body = readBody(1301);
+			expect(body).toBe(REDACTED_COOKIE);
+			expect(body).not.toContain("container-auth-secret-1");
+			expect(cacheFileBytes()).not.toContain("container-auth-secret-1");
+		});
+
+		it("redacts a Bearer value escaping inside a quoted Cookie item", () => {
+			const body =
+				'Cookie: [\n  "sid=a; Authorization: Bearer \\"container-bearer-secret-3\\"",\n  "container-opaque-4"\n]\nafter=keep';
+			storeBody(1302, body);
+			const stored = readBody(1302);
+			expect(stored).toBe(REDACTED_COOKIE);
+			expect(stored).not.toContain("container-bearer-secret-3");
+			expect(cacheFileBytes()).not.toContain("container-bearer-secret-3");
+		});
+
+		it("redacts the opaque item following an escaped auth item on persist", () => {
+			storeBody(1303, ESCAPED_AUTH_COOKIE);
+			expect(readBody(1303)).not.toContain("container-opaque-2");
+			expect(cacheFileBytes()).not.toContain("container-opaque-2");
+		});
+
+		it("redacts the opaque item following an escaped auth item on cache read", () => {
+			storeBody(1304, "placeholder");
+			const db = openDb();
+			expect(db).not.toBeNull();
+			// Simulate a row written by an older binary: bypass the write scrub.
+			db?.prepare(
+				"UPDATE github_view_cache SET payload = ?, rendered = ? WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
+			).run(
+				JSON.stringify({ body: ESCAPED_AUTH_COOKIE }),
+				ESCAPED_AUTH_COOKIE,
+				TEST_AUTH_KEY,
+				TEST_REPO,
+				"issue",
+				1304,
+				0,
+			);
+
+			const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 1304, false, TEST_AUTH_KEY);
+			const packed = `${cached?.rendered}\n${JSON.stringify(cached?.payload)}`;
+			expect(packed).not.toContain("container-auth-secret-1");
+			expect(packed).not.toContain("container-opaque-2");
+			expect(cached?.rendered).toBe(REDACTED_COOKIE);
+		});
+
+		it("still redacts a plain single-line Cookie header", () => {
+			const body = "Cookie: sid=plain-cookie-secret; theme=dark";
+			storeBody(1305, body);
+			expect(readBody(1305)).toBe("Cookie: «redacted»");
+			expect(cacheFileBytes()).not.toContain("plain-cookie-secret");
+		});
+
+		it("does not throw or leak on an unterminated Cookie container", () => {
+			const body =
+				'Cookie: [\n  "sid=a; Authorization: Token token=\\"truncated-auth-secret-5\\"",\n  "truncated-opaque-6"';
+			expect(() => storeBody(1306, body)).not.toThrow();
+			const stored = readBody(1306);
+			expect(stored).not.toContain("truncated-auth-secret-5");
+			expect(stored).not.toContain("truncated-opaque-6");
+			expect(cacheFileBytes()).not.toContain("truncated-auth-secret-5");
+			expect(cacheFileBytes()).not.toContain("truncated-opaque-6");
+		});
+	});
 });
