@@ -1528,6 +1528,20 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(typeof parsed.private_key).toBe("string");
 	});
 
+	it("does not start a block scalar at a fake header inside an ordinary quoted container", () => {
+		// `wrapper` is not a credential container, so only the quoted-data boundary can stop the
+		// fake header from consuming the comment line that belongs to the surrounding document.
+		const fixture = 'wrapper: ["ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible';
+		const dumped = dump([{ role: "user", content: fixture, timestamp: 1 }] as AgentMessage[]);
+		const document = dumped.slice(dumped.indexOf("wrapper:"));
+
+		expect(document).toContain("# keep-me");
+		const parsed = Bun.YAML.parse(document) as { wrapper?: unknown; secret?: unknown; public?: unknown };
+		expect(parsed.secret).toBeUndefined();
+		expect(parsed.public).toBe("visible");
+		expect(parsed.wrapper).toEqual(["ordinary secret: | continuation"]);
+	});
+
 	it("keeps the newline and key after a bare Token line", () => {
 		const dumped = dump([{ role: "user", content: "Token\ndiagnostics: keep-me", timestamp: 1 }] as AgentMessage[]);
 

@@ -337,12 +337,22 @@ function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedact
 	// the container's close bounds the scalar, so the body scan cannot walk past it into unrelated
 	// text that merely looks indented.
 	const containers = findCredentialContainerSpansIn(text, rules);
+	let quotedContainers: PrivateKeySpan[] | undefined;
 	let lineStart = 0;
 
 	while (lineStart < text.length) {
 		const { contentEnd, nextLineStart } = lineBounds(text, lineStart);
 		const header = parseCredentialYamlBlockScalarHeader(text.slice(lineStart, contentEnd), rules);
 		if (header === undefined) {
+			lineStart = nextLineStart;
+			continue;
+		}
+		// A "header" inside a quoted container value is data, not a block scalar.
+		quotedContainers ??= findQuotedContainerDataSpansIn(text);
+		if (
+			positionInsideSpans(quotedContainers, lineStart) ||
+			positionInsideSpans(quotedContainers, lineStart + header.indentation)
+		) {
 			lineStart = nextLineStart;
 			continue;
 		}
@@ -381,6 +391,67 @@ function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedact
 	}
 
 	return spans;
+}
+
+/** A container assignment under any key, not only a credential-named one. */
+const ANY_CONTAINER_ASSIGNMENT = /(?<![A-Za-z0-9_.-])[A-Za-z_][A-Za-z0-9_.-]{0,127}[ \t]*[:=][ \t]*(?=[[{])/g;
+
+/**
+ * Quoted regions that belong to a bracketed container value. A YAML block-scalar header found
+ * inside one of these is ordinary string data, not document structure, so the block scan must not
+ * start there and eat the rest of the enclosing document.
+ */
+function findQuotedContainerDataSpansIn(text: string): PrivateKeySpan[] {
+	const spans: PrivateKeySpan[] = [];
+	ANY_CONTAINER_ASSIGNMENT.lastIndex = 0;
+	for (let match = ANY_CONTAINER_ASSIGNMENT.exec(text); match !== null; ) {
+		const containerStart = ANY_CONTAINER_ASSIGNMENT.lastIndex;
+		const containerEnd = findCredentialContainerEnd(
+			text,
+			containerStart,
+			text.length - containerStart,
+			createLineEndScan(),
+		).value;
+		let quote: string | undefined;
+		let quoteStart = -1;
+		for (let index = containerStart + 1; index < containerEnd; index++) {
+			const character = text[index] ?? "";
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (quote !== undefined) {
+				if (character === quote) {
+					spans.push({ start: quoteStart, end: index + 1 });
+					quote = undefined;
+				}
+				continue;
+			}
+			if (character === '"' || character === "'" || character === "`") {
+				quote = character;
+				quoteStart = index;
+			}
+		}
+		// An unterminated quote still owns every line up to the container's end.
+		if (quote !== undefined) spans.push({ start: quoteStart, end: containerEnd });
+		ANY_CONTAINER_ASSIGNMENT.lastIndex = containerEnd;
+		match = ANY_CONTAINER_ASSIGNMENT.exec(text);
+	}
+	spans.sort((left, right) => left.start - right.start);
+	return spans;
+}
+
+function positionInsideSpans(spans: readonly PrivateKeySpan[], position: number): boolean {
+	let low = 0;
+	let high = spans.length - 1;
+	while (low <= high) {
+		const middle = (low + high) >> 1;
+		const span = spans[middle];
+		if (position < span.start) high = middle - 1;
+		else if (position >= span.end) low = middle + 1;
+		else return true;
+	}
+	return false;
 }
 
 /** End of the innermost container that contains `position`, or undefined. */
@@ -799,7 +870,8 @@ const RESIDUAL_TRAILING_WHOLE_MATCH_RULES: readonly { readonly pattern: RegExp; 
  * Line-bounded rules of one original text. Every pattern is attempted on one physical line only,
  * so no rule can consume a line terminator or reinterpret text produced by another rule.
  */
-const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*$/;
+const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*$/i;
+const URI_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
 const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
 
@@ -821,7 +893,9 @@ function collectResidualRanges(text: OriginalText): RedactionRange[] {
 			if (nextEnd < 0) nextEnd = text.length;
 			const nextContentEnd = nextEnd > nextStart && text[nextEnd - 1] === "\r" ? nextEnd - 1 : nextEnd;
 			const nextLine = text.slice(nextStart, nextContentEnd);
-			if (!DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(nextLine)) {
+			// A URI supplies its own credentials; the scheme word is not the value of the cue above,
+			// so a continuation must not swallow the whole adjacent URL.
+			if (!DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(nextLine) && !URI_AT_LINE_START.test(nextLine)) {
 				let start = 0;
 				while (start < nextLine.length && (nextLine[start] === " " || nextLine[start] === "\t")) start++;
 				let end = start;
@@ -883,6 +957,11 @@ function collectAuthorizationRanges(line: string, base: number, out: RedactionRa
 	}
 }
 
+/** Whether two half-open spans share at least one character. */
+function spansOverlap(left: PrivateKeySpan, right: PrivateKeySpan): boolean {
+	return left.start < right.end && right.start < left.end;
+}
+
 /**
  * Collect every structural mask of one original text: caller-supplied private-key ranges, then
  * credential containers, URL userinfo and YAML block-scalar bodies. Detection reads only
@@ -892,7 +971,12 @@ function collectStructuralRanges(original: OriginalText, privateKeySpans: readon
 	return [
 		...privateKeySpans.map(span => ({ start: span.start, end: span.end, label: PRIVATE_KEY_REDACTION_MARKER })),
 		...findCredentialContainerSpans(original).map(span => ({ ...span, label: "«redacted»" })),
-		...findUrlCredentialSpans(original).map(span => ({ ...span, label: "«redacted-url-credential»" })),
+		// A private-key block is masked as its own diagnostic value. When one sits between the
+		// scheme and the `@` of a URL, the greedy userinfo scan sees the whole host as userinfo and
+		// would delete the host too; the block rule owns that text, so the URL rule stands down.
+		...findUrlCredentialSpans(original)
+			.filter(span => !privateKeySpans.some(key => spansOverlap(span, key)))
+			.map(span => ({ ...span, label: "«redacted-url-credential»" })),
 		...findYamlBlockScalarSpans(original).map(span => ({ ...span, label: "«redacted»" })),
 	];
 }

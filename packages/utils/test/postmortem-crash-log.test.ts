@@ -38,6 +38,27 @@ function spawnBun(script: string, options: { args?: string[]; env?: Record<strin
 	};
 }
 
+describe("crash redaction classification", () => {
+	it("keeps a URI on the line after a bare auth cue instead of swallowing it", () => {
+		const text = "Token\npostgresql+asyncpg://app:synthetic@db.example.com/db";
+
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).toBe("Token\npostgresql+asyncpg://«redacted-url-credential»@db.example.com/db");
+		expect(redacted).not.toContain("synthetic");
+		expect(redacted).toContain("db.example.com/db");
+	});
+
+	it("recognizes a lower-case auth cue before a continuation value", () => {
+		const value = "abcdefghijopaquevalue";
+
+		const redacted = redactCrashSecrets(`bearer\n${value}`);
+
+		expect(redacted).toBe("bearer\n«redacted-auth»");
+		expect(redacted).not.toContain(value);
+	});
+});
+
 describe("recordFatalCrash", () => {
 	it("writes a structured, diagnosable record for an Error", () => {
 		const target = tempCrashLog();
@@ -119,6 +140,26 @@ describe("recordFatalCrash", () => {
 		const contents = fs.readFileSync(target, "utf8");
 		expect(contents).not.toContain(token);
 		expect(contents).toContain("«redacted-auth»");
+	});
+
+	it("keeps the host and trailing note when a private-key block sits inside URL userinfo", () => {
+		const target = tempCrashLog();
+		const fixture =
+			"https://db.example.com(-----BEGIN RSA PRIVATE KEY-----\nBODY\n-----END RSA PRIVATE KEY-----)@note";
+
+		expect(recordFatalCrash("Uncaught Exception", { message: "fixture", code: fixture }, { path: target })).toBe(
+			target,
+		);
+		const contents = fs.readFileSync(target, "utf8");
+		const lines = contents.split("\n");
+
+		// The header, the captured payload and the identity marker stay adjacent on their own lines.
+		expect(lines[0]).toContain("[Uncaught Exception] Error: fixture");
+		expect(lines[1]).toBe('{"code":"https://db.example.com(«redacted-private-key»)@note"}');
+		expect(lines[2]).toStartWith("gjc-crash-record.v1 ");
+		expect(contents).not.toContain("BODY");
+		expect(contents).toContain("db.example.com");
+		expect(contents).toContain("@note");
 	});
 
 	it("keeps frame lines when the header ends in a labeled credential", () => {

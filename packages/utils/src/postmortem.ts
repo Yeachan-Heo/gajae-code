@@ -286,27 +286,27 @@ function capturedValue(field: FieldRead): unknown {
 }
 
 function boundedJsonString(value: string): string {
-	const redacted = redactCrashSecrets(value);
-	if (Buffer.byteLength(JSON.stringify(redacted), "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES)
-		return JSON.stringify(redacted);
+	const serialized = JSON.stringify(value);
+	if (Buffer.byteLength(serialized, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) return serialized;
 
 	let low = 0;
-	let high = redacted.length;
+	let high = value.length;
 	while (low < high) {
 		const midpoint = Math.ceil((low + high) / 2);
-		const candidate = JSON.stringify(`${redacted.slice(0, midpoint)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
+		const candidate = JSON.stringify(`${value.slice(0, midpoint)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
 		if (Buffer.byteLength(candidate, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) low = midpoint;
 		else high = midpoint - 1;
 	}
 	let end = low;
-	if (end > 0 && /[\uD800-\uDBFF]/.test(redacted[end - 1] ?? "")) end--;
-	return JSON.stringify(`${redacted.slice(0, end)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
+	if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1] ?? "")) end--;
+	return JSON.stringify(`${value.slice(0, end)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
 }
 
 /**
- * Serializes one already-captured diagnostic value. Credential shapes are
- * redacted before output, and oversized fields become a bounded string preview
- * so one request body cannot evict the remaining crash context.
+ * Serializes one already-captured diagnostic value without redacting it. Credential shapes are
+ * removed once by the persistence or stderr formatter, after capture: redacting here would make
+ * the formatter read its own markers as source text and delete unrelated context around them.
+ * Oversized fields become a bounded string preview for the same one-pass reason.
  */
 function serializeCapturedValue(value: unknown): string {
 	if (value === undefined) return JSON.stringify(UNDEFINED_FIELD);
@@ -315,9 +315,8 @@ function serializeCapturedValue(value: unknown): string {
 	try {
 		const serialized = JSON.stringify(value);
 		if (typeof serialized !== "string") return boundedJsonString(String(value));
-		const redacted = redactCrashSecrets(serialized);
-		if (Buffer.byteLength(redacted, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) return redacted;
-		return boundedJsonString(redacted);
+		if (Buffer.byteLength(serialized, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) return serialized;
+		return boundedJsonString(serialized);
 	} catch {
 		try {
 			return boundedJsonString(String(value));
@@ -328,8 +327,9 @@ function serializeCapturedValue(value: unknown): string {
 }
 
 /**
- * Captures only stable diagnostic context. Arbitrary request objects and bodies
- * are intentionally excluded: they are large, routinely contain credentials,
+ * Captures only stable diagnostic context as raw serialized text. Redaction runs once per output
+ * path, so a masked marker can never be re-read as if it were original text. Arbitrary request
+ * objects and bodies are intentionally excluded: they are large, routinely contain credentials,
  * and add less crash value than transport, process, and lifecycle metadata.
  */
 function capturePayload(reason: object): CapturedPayload | undefined {
@@ -360,7 +360,7 @@ function fieldText(field: FieldRead, fallback: string): string {
 	}
 }
 
-/** A throwable reduced to captured text; the rest of this module reads nothing else. */
+/** A throwable reduced to raw captured text; formatting redacts each output exactly once. */
 interface FatalDiagnostic {
 	name: string;
 	message: string;
