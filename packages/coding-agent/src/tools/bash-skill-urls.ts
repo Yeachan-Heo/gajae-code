@@ -702,16 +702,17 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 }
 
 /**
- * A data value keeps the delimiters the caller wrote around the URL, so the
- * replacement must not be able to close them or be escape-processed inside
- * them: a quote, a backslash, or a control character would change the shape of
- * the value (a JSON string, for example) instead of only its path. Rule paths
- * already refuse shell syntax; `skill://`, `local://`, and `plan://` paths are
- * not guarded that way, so the delimiter check is the only backstop.
+ * Characters that end a quoted value or are escape-processed inside one. A
+ * resolved path carrying one of them cannot be spliced into a value the caller
+ * quoted without changing the value's shape (a JSON string, for example)
+ * instead of only its path. Rule paths already refuse shell syntax;
+ * `skill://`, `local://`, and `plan://` paths are not guarded that way, so this
+ * check is the only backstop for them.
  */
-function assertFitsDelimiter(resolvedPath: string, delimiter: string | undefined): void {
-	const structural = delimiter === '"' ? /["\\\u0000-\u001f]/ : delimiter === "'" ? /['\u0000-\u001f]/ : undefined;
-	if (!structural?.test(resolvedPath)) return;
+const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
+
+function assertFitsQuotedValue(resolvedPath: string, quoted: boolean): void {
+	if (!quoted || !QUOTED_VALUE_UNSAFE.test(resolvedPath)) return;
 	throw new ToolError(
 		"Cannot expand this URL inside a quoted value: the resolved path contains a character that would change the value's quoting.",
 	);
@@ -766,7 +767,11 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		);
 		const replacement = shellContext && !options.noEscape ? shellEscape(resolvedPath) : resolvedPath;
 		const delimiter = token === rawUrl ? undefined : token[0];
-		if (!shellContext) assertFitsDelimiter(resolvedPath, delimiter);
+		// The replacement lands in the quote the token carries or, for a URL inside
+		// a longer quoted run, the quote still open at that position.
+		if (!shellContext) {
+			assertFitsQuotedValue(resolvedPath, delimiter !== undefined || enclosingQuote(command, index) !== undefined);
+		}
 		// Command text replaces the whole token because the replacement brings its own
 		// quoting. A data value keeps the delimiters the token was written with: they
 		// are part of the value (`{"rule":"rule://x"}` is JSON, not shell text), and

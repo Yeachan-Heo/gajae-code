@@ -1863,6 +1863,14 @@ describe("bash session agent directory", () => {
 						env: { PAYLOAD: '{"rule":"rule://tabbed"}' },
 					}),
 				).rejects.toThrow(/would change the value's quoting/);
+				// A URL inside a longer quoted run lands in the enclosing quote too, so
+				// the same path cannot slip in beside a prefix.
+				await expect(
+					tool.execute("call-env-prefixed-tab", {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: '"prefix rule://tabbed"' },
+					}),
+				).rejects.toThrow(/would change the value's quoting/);
 				// The same path is accepted where the caller wrote no delimiters.
 				const bare = await tool.execute("call-env-bare-tab", {
 					command: 'printf "%s" "$PAYLOAD"',
