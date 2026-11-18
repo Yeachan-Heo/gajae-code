@@ -978,6 +978,28 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.unified.slice(second?.startOffset, second?.endOffset)).toContain("+new");
 	});
 
+	it("masks an escaped custom home path", () => {
+		const escapedHome = os.homedir().replaceAll("/", "\\/");
+		const body = `{"path":"${escapedHome}/private.key"}\n{"path":"C:\\\\Users\\\\cache-fixture\\\\config"}`;
+		const url = `https://github.com/${TEST_REPO}/issues/95`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 95,
+			includeComments: true,
+			payload: issuePayload(95, body, url),
+			rendered: body,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain(escapedHome);
+		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 95, true, TEST_AUTH_KEY);
+		expect(cached?.payload.body).not.toContain(escapedHome);
+		expect(cacheFileBytes()).not.toContain("cache-fixture");
+	});
+
 	it("keeps a sanitized diff path byte-stable across write and read", () => {
 		const secret = "demo-token-1234";
 		const diff = [

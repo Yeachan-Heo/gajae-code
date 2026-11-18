@@ -640,13 +640,16 @@ function scrubHostPaths(text: string): string {
 	const home = os.homedir();
 	const homePattern =
 		home.length > 1 ? new RegExp(`(?<![A-Za-z0-9._#])${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
+	const escapedHome = home.length > 1 ? home.replaceAll("/", "\\/") : "";
 	const scrubLocal = (chunk: string): string => {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
+		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/root(?![A-Za-z0-9._-])/g, "~");
 		// JSON text can escape path separators; mask the same local paths in
 		// that spelling without changing the surrounding text.
 		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
 		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
 		return scrubbed.replace(/(?<![A-Za-z0-9._#])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
 	};
@@ -675,9 +678,11 @@ function scrubHostPaths(text: string): string {
 			/^(?:[a-z][a-z0-9+.-]*:)?\\\/\\\/(?:localhost:(?=\\\/)|\\\/)/i.test(url);
 		if (!localAuthority) return url;
 		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
+		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
 		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|]+/g, "$1~");
 		scrubbed = scrubbed.replace(/\/root(?=\/|[?#]|$)/g, "~");
 		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
 		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
 		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
 	};
