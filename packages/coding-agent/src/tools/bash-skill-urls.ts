@@ -777,15 +777,20 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
  */
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
+const WORD_CHARACTER = /[\p{L}\p{N}_]/u;
+
 /**
- * True when the quote at `index` can delimit a value rather than being an
- * apostrophe inside a word (`it's`, `don't`), which prose carries freely.
+ * True when the character at `index` delimits a quoted run in a data value. A
+ * double quote always does. An apostrophe inside a word (`it's`, `owners'`) is
+ * prose: it opens a run only at a word start and closes it only at a word end,
+ * which is how a contraction or a possessive is written.
  */
-function isQuoteBoundary(value: string, index: number): boolean {
-	const word = /[\p{L}\p{N}_]/u;
-	const before = value[index - 1];
-	const after = value[index + 1];
-	return !(before !== undefined && after !== undefined && word.test(before) && word.test(after));
+function isDataQuote(value: string, index: number, opening: boolean): boolean {
+	const character = value[index];
+	if (character === '"') return true;
+	if (character !== "'") return false;
+	const neighbour = opening ? value[index - 1] : value[index + 1];
+	return !(neighbour !== undefined && WORD_CHARACTER.test(neighbour));
 }
 
 /**
@@ -800,14 +805,14 @@ function enclosingClosedQuote(value: string, index: number): string | undefined 
 	for (let i = 0; i < index; i++) {
 		const character = value[i];
 		if (opened === undefined) {
-			if ((character === "'" || character === '"') && isQuoteBoundary(value, i)) opened = character;
+			if (isDataQuote(value, i, true)) opened = character;
 			continue;
 		}
 		if (character === "\\" && opened === '"') {
 			i++;
 			continue;
 		}
-		if (character === opened && isQuoteBoundary(value, i)) opened = undefined;
+		if (character === opened && isDataQuote(value, i, false)) opened = undefined;
 	}
 	if (opened === undefined) return undefined;
 	for (let i = index; i < value.length; i++) {
@@ -816,7 +821,7 @@ function enclosingClosedQuote(value: string, index: number): string | undefined 
 			i++;
 			continue;
 		}
-		if (character === opened && isQuoteBoundary(value, i)) return opened;
+		if (character === opened && isDataQuote(value, i, false)) return opened;
 	}
 	return undefined;
 }

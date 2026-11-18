@@ -2120,6 +2120,20 @@ describe("bash session agent directory", () => {
 						env: { PAYLOAD: '{"message":"prefix rule://tabbed suffix","note":"a \\"quote"}' },
 					}),
 				).rejects.toThrow(/would change the value's quoting/);
+				// An opener that follows a word character is still a double quote, so a
+				// shadowed quoted run cannot hide the replacement.
+				await expect(
+					tool.execute("call-env-word-adjacent", {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: 'x"prefix rule://tabbed"' },
+					}),
+				).rejects.toThrow(/would change the value's quoting/);
+				// A plural possessive is an apostrophe in a word, not a quoted run.
+				const possessive = await tool.execute("call-env-possessive-tab", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: "owners' rule://tabbed and reviewers' notes" },
+				});
+				expect(textOf(possessive)).toContain(await realpath(tabRule));
 				// A lone apostrophe in prose is not a quoted run, so the same path is
 				// accepted there instead of being refused as quoted data.
 				const prose = await tool.execute("call-env-prose-tab", {
