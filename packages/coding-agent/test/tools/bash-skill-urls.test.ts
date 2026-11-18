@@ -2160,9 +2160,11 @@ describe("bash session agent directory", () => {
 				const structured = await run("call-env-structured", '{"rule":"rule://plain"}');
 				expect(textOf(structured)).toBe(`{"rule":"${plainReal}"}`);
 
-				// A value that is only the URL carries whatever the path holds.
+				// A value that is only the URL carries whatever the path holds, but a value
+				// that wraps it in quotes is structured text and still cannot carry a tab.
 				const bareTab = await run("call-env-bare-tab", "rule://tabbed");
 				expect(textOf(bareTab)).toContain(await realpath(tabRule));
+				await expect(run("call-env-whole-quoted-tab", '"rule://tabbed"')).rejects.toThrow(/cannot carry/);
 
 				// A candidate the consumer reads as an escape is not a URL at all.
 				const escaped = await run("call-env-escaped", '{"message":"prefix \\rule://tabbed"}');

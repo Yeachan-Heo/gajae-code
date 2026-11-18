@@ -844,9 +844,11 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 
 		const rawUrl = unquoteToken(token);
 		const url = normalizeLocalScheme(rawUrl);
-		// A value escaped by a backslash is not a URL: the consumer reads the escape,
-		// so expanding the text after it would change the value instead of its path.
-		if (!shellContext && escapedAt(command, index)) continue;
+		const delimiter = token === rawUrl ? undefined : token[0];
+		const urlStart = index + (delimiter === undefined ? 0 : 1);
+		// A character the consumer reads as an escape starts no URL: the token's own
+		// opening quote or the scheme's first letter behind a backslash.
+		if (!shellContext && (escapedAt(command, index) || escapedAt(command, urlStart))) continue;
 		if (nestedRuleContext && extractScheme(url) === "rule") {
 			throw new ToolError(
 				"rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets.",
@@ -862,7 +864,6 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.sessionAgentDir,
 			shellContext && (enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index)),
 		);
-		const delimiter = token === rawUrl ? undefined : token[0];
 		let replacement: string;
 		if (shellContext) {
 			replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);
@@ -870,10 +871,13 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			// A data value carries no shell spelling, so a Windows path uses `/`,
 			// which names the same file and needs no escaping inside quotes.
 			replacement = windowsDataValueSpelling(resolvedPath);
-			// A value that is only the URL carries whatever the path holds; once the
-			// URL sits inside text the caller wrote, only a path that needs no
-			// escaping by any format is safe to splice.
-			if (index !== 0 || token.length !== command.length) assertPathFitsDataValue(replacement);
+			// A value that is only a bare URL carries whatever the path holds; a value
+			// that wraps the URL in its own quotes is structured text, and once the URL
+			// sits inside text the caller wrote, only a path that needs no escaping by
+			// any format is safe to splice.
+			if (delimiter !== undefined || index !== 0 || token.length !== command.length) {
+				assertPathFitsDataValue(replacement);
+			}
 		}
 		// Command text replaces the whole token because the replacement brings its own
 		// quoting. A data value keeps the delimiters the token was written with: they
