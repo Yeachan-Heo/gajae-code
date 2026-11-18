@@ -6249,15 +6249,13 @@ export class ModelRegistry {
 		// the provider endpoint is always loopback. The canonical provider id covers
 		// a configured `providers.rapid-mlx` entry that auto-selects
 		// `openai-models-list` because it has no discovery stanza; the discovery type
-		// covers an alias named in models.json. Other implicit providers keep the
-		// previous rule (direct only when a credential header is present) so this
-		// repair does not widen their transport.
-		const carriesCredentialHeader = Object.keys(requestHeaders).some(isSensitiveDiscoveryHeader);
+		// covers an alias named in models.json. Every other provider takes the
+		// ordinary `fetch` path, so a configured proxy is honoured for discovery
+		// exactly as it is for inference; carrying a credential is not a transport
+		// exemption.
 		const directLoopbackProbe =
 			loopbackDiscovery &&
-			(providerConfig.provider === "rapid-mlx" ||
-				providerConfig.discovery.type === "rapid-mlx" ||
-				(providerConfig.implicitProbe === true && carriesCredentialHeader));
+			(providerConfig.provider === "rapid-mlx" || providerConfig.discovery.type === "rapid-mlx");
 		const response = directLoopbackProbe
 			? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
 			: await fetch(modelsUrl, {
