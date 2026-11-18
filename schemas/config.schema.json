@@ -2421,7 +2421,7 @@
 				},
 				"js": {
 					"type": "boolean",
-					"description": "Allow the eval tool to dispatch to the in-process JavaScript runtime",
+					"description": "Allow the eval tool to run JavaScript cells in the QuickJS sandbox",
 					"default": true
 				}
 			},

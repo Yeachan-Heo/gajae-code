@@ -2937,7 +2937,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "editing",
 			label: "Eval: JavaScript backend",
-			description: "Allow the eval tool to dispatch to the in-process JavaScript runtime",
+			description: "Allow the eval tool to run JavaScript cells in the QuickJS sandbox",
 		},
 	},
 

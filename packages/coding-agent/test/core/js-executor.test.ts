@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
@@ -41,6 +42,7 @@ describe("executeJs", () => {
 	let session: ToolSession;
 	let sessionFile: string;
 	let sessionId: string;
+	let readSession: ToolSession;
 
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@js-executor-");
@@ -52,6 +54,11 @@ describe("executeJs", () => {
 			getSessionFile: () => sessionFile,
 			getSessionSpawns: () => null,
 			settings: Settings.isolated(),
+		};
+		const readTool = new ReadTool({ ...session });
+		readSession = {
+			...session,
+			getToolByName: name => (name === "read" ? (readTool as unknown as AgentTool) : undefined),
 		};
 
 		await Bun.write(
@@ -202,81 +209,12 @@ describe("executeJs", () => {
 		expect(calls.output.trim()).toBe("1");
 	});
 
-	it("does not auto-display side-effect import rewrites", async () => {
+	it("rejects side-effect imports without auto-displaying anything", async () => {
 		const result = await executeJs('import "node:path";', { sessionId, session, sessionFile });
 
-		expect(result.exitCode).toBe(0);
-		expect(result.output.trim()).toBe("");
+		expect(result.exitCode).toBe(1);
+		expect(result.output).toContain('import of "node:path" is not available in the QuickJS sandbox');
 		expect(result.displayOutputs).toEqual([]);
-	});
-
-	it("exposes the worker's real process object", async () => {
-		const result = await executeJs(
-			[
-				"return {",
-				"  version: process.version,",
-				"  versionsNode: typeof process.versions.node,",
-				"  platform: process.platform,",
-				"  arch: process.arch,",
-				"  hasEnv: 'env' in process,",
-				"  hasExit: 'exit' in process,",
-				"};",
-			].join("\n"),
-			{ sessionId, session, sessionFile },
-		);
-
-		expect(result.exitCode).toBe(0);
-		expect(getJsonData(result)).toEqual({
-			version: process.version,
-			versionsNode: "string",
-			platform: process.platform,
-			arch: process.arch,
-			hasEnv: true,
-			hasExit: true,
-		});
-	});
-
-	it("exposes common web globals and the raw Node fs module", async () => {
-		const result = await executeJs(
-			[
-				"const uuid = crypto.randomUUID();",
-				"const digest = await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode('ok'));",
-				"const base = __gjc_session__.cwd;",
-				"fs.mkdirSync(base + '/nested', { recursive: true });",
-				"fs.writeFileSync(base + '/nested/value.txt', 'hello');",
-				"await fs.promises.copyFile(base + '/nested/value.txt', base + '/nested/copy.txt');",
-				"const text = fs.readFileSync(base + '/nested/copy.txt', 'utf8');",
-				"const bytes = await fs.promises.readFile(base + '/nested/copy.txt');",
-				"const stat = fs.statSync(base + '/nested/copy.txt');",
-				"const entries = fs.readdirSync(base + '/nested');",
-				"const start = performance.now();",
-				"return {",
-				"  uuid: typeof uuid,",
-				"  digestBytes: digest.byteLength,",
-				"  text,",
-				"  byteLength: bytes.byteLength,",
-				"  isFile: stat.isFile(),",
-				"  entries: entries.sort(),",
-				"  hasConstants: typeof fs.constants.R_OK,",
-				"  buffer: Buffer.from('ok').toString('hex'),",
-				"  performance: typeof start,",
-				"};",
-			].join("\n"),
-			{ sessionId, session, sessionFile },
-		);
-
-		expect(result.exitCode).toBe(0);
-		expect(getJsonData(result)).toEqual({
-			uuid: "string",
-			digestBytes: 32,
-			text: "hello",
-			byteLength: 5,
-			isFile: true,
-			entries: ["copy.txt", "value.txt"],
-			hasConstants: "number",
-			buffer: "6f6b",
-			performance: "number",
-		});
 	});
 
 	it("reads files as text and supports offset/limit slicing", async () => {
@@ -288,7 +226,7 @@ describe("executeJs", () => {
 			].join("\n"),
 			{
 				sessionId,
-				session,
+				session: readSession,
 				sessionFile,
 			},
 		);
@@ -300,24 +238,6 @@ describe("executeJs", () => {
 			full: '{\n  "name": "demo",\n  "enabled": true\n}',
 			sliced: '  "name": "demo",',
 		});
-	});
-
-	it("rejects protocol paths and directory reads from native read()", async () => {
-		const protocolResult = await executeJs("await read('agent://demo');", {
-			sessionId,
-			session,
-			sessionFile,
-		});
-		expect(protocolResult.exitCode).toBe(1);
-		expect(protocolResult.output).toContain("Protocol paths are not supported");
-
-		const directoryResult = await executeJs("await read('.');", {
-			sessionId,
-			session,
-			sessionFile,
-		});
-		expect(directoryResult.exitCode).toBe(1);
-		expect(directoryResult.output).toContain("Directory paths are not supported");
 	});
 
 	it("routes output() through tool.read and keeps tool.* results normalized", async () => {
@@ -389,7 +309,7 @@ describe("executeJs", () => {
 	it("awaits promise-valued final expressions before displaying", async () => {
 		const result = await executeJs("read('config.json');", {
 			sessionId,
-			session,
+			session: readSession,
 			sessionFile,
 		});
 
@@ -400,7 +320,7 @@ describe("executeJs", () => {
 	it("awaits identifier promise final expressions before displaying", async () => {
 		const result = await executeJs("const pending = read('config.json'); pending;", {
 			sessionId,
-			session,
+			session: readSession,
 			sessionFile,
 		});
 
@@ -420,16 +340,6 @@ describe("executeJs", () => {
 		expect(result.displayOutputs).toEqual([{ type: "json", data: { answer: 42, nested: { ok: true } } }]);
 	});
 
-	it('rewrites static `import { x } from "pkg"` to dynamic import', async () => {
-		const result = await executeJs('import { join } from "node:path";\nreturn join("a", "b");', {
-			sessionId,
-			session,
-			sessionFile,
-		});
-		expect(result.exitCode).toBe(0);
-		expect(result.output.trim()).toBe(path.join("a", "b"));
-	});
-
 	it("strips TypeScript syntax before executing user code", async () => {
 		const result = await executeJs(
 			[
@@ -443,16 +353,20 @@ describe("executeJs", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.output.trim()).toBe("7");
 	});
-	it("falls back to text display when the final expression value is not structured-cloneable", async () => {
-		const result = await executeJs("({ fn: () => 1 });", { sessionId, session, sessionFile });
+	it("falls back to text display when the final expression value cannot be serialized", async () => {
+		const result = await executeJs("const cyclic = { name: 'loop' }; cyclic.self = cyclic; cyclic;", {
+			sessionId,
+			session,
+			sessionFile,
+		});
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toContain("[object Object]");
-		// No JSON display because structuredClone fails on the embedded function.
+		// No JSON display because the cyclic value cannot cross the JSON bridge.
 		expect(result.displayOutputs.filter(o => o.type === "json")).toHaveLength(0);
 	});
 
 	it("cancels execution when the timeout expires", async () => {
-		const result = await executeJs("await new Promise(() => {})", {
+		const result = await executeJs("await sleep(60_000)", {
 			sessionId,
 			session,
 			sessionFile,

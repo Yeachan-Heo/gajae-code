@@ -1,7 +1,8 @@
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
-import { JsRuntime, type RuntimeHooks } from "./shared/runtime";
-import type { RunErrorPayload, SessionSnapshot, ToolReply, Transport, WorkerInbound } from "./worker-protocol";
+import { QuickJsCellRuntime } from "./quickjs/runtime";
+import type { RuntimeHooks } from "./shared/runtime";
+import type { RunErrorPayload, ToolReply, Transport, WorkerInbound } from "./worker-protocol";
 
 interface PendingTool {
 	resolve(value: unknown): void;
@@ -45,7 +46,8 @@ function errorFromPayload(payload: RunErrorPayload): Error {
 
 export class WorkerCore {
 	#transport: Transport;
-	#runtime: JsRuntime | null = null;
+	#runtime: QuickJsCellRuntime | null = null;
+	#creating: Promise<QuickJsCellRuntime> | null = null;
 	#queue: Promise<void> = Promise.resolve();
 	#active: ActiveRun | null = null;
 	#unsubscribe: () => void;
@@ -59,10 +61,18 @@ export class WorkerCore {
 	#handle(msg: WorkerInbound): void {
 		switch (msg.type) {
 			case "init":
-				this.#ensureRuntime(msg.snapshot);
+				this.#ensureRuntime().catch((error: unknown) => {
+					// The first run retries creation and reports the failure to its caller.
+					this.#transport.send({
+						type: "log",
+						level: "warn",
+						msg: "JS eval runtime initialization failed",
+						meta: { error: error instanceof Error ? error.message : String(error) },
+					});
+				});
 				return;
 			case "run":
-				this.#enqueueRun(msg.runId, msg.code, msg.filename, msg.snapshot);
+				this.#enqueueRun(msg.runId, msg.code, msg.filename, msg.deadlineMs);
 				return;
 			case "tool-reply":
 				this.#deliverToolReply(msg.id, msg.reply);
@@ -73,17 +83,23 @@ export class WorkerCore {
 		}
 	}
 
-	#ensureRuntime(snapshot: SessionSnapshot): JsRuntime {
-		if (this.#runtime) {
-			this.#runtime.setCwd(snapshot.cwd);
-			return this.#runtime;
+	async #ensureRuntime(): Promise<QuickJsCellRuntime> {
+		let runtime = this.#runtime;
+		if (runtime && !runtime.alive) {
+			this.#runtime = null;
+			runtime = null;
 		}
-		this.#runtime = new JsRuntime({
-			initialCwd: snapshot.cwd,
-			sessionId: snapshot.sessionId,
-			getHooks: () => this.#hooksForCurrentRun(),
-		});
-		return this.#runtime;
+		if (!runtime) {
+			const creating = this.#creating ?? QuickJsCellRuntime.create({ getHooks: () => this.#hooksForCurrentRun() });
+			this.#creating = creating;
+			try {
+				runtime = await creating;
+			} finally {
+				if (this.#creating === creating) this.#creating = null;
+			}
+			this.#runtime = runtime;
+		}
+		return runtime;
 	}
 
 	#hooksForCurrentRun(): RuntimeHooks | null {
@@ -97,23 +113,21 @@ export class WorkerCore {
 		};
 	}
 
-	#enqueueRun(runId: string, code: string, filename: string, snapshot: SessionSnapshot): void {
+	#enqueueRun(runId: string, code: string, filename: string, deadlineMs: number | undefined): void {
 		const previous = this.#queue;
 		const next = (async () => {
 			await previous.catch(() => undefined);
-			await this.#runOne(runId, code, filename, snapshot);
+			await this.#runOne(runId, code, filename, deadlineMs);
 		})();
 		this.#queue = next.catch(() => undefined);
 	}
 
-	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
-		const runtime = this.#ensureRuntime(snapshot);
-		runtime.setCwd(snapshot.cwd);
+	async #runOne(runId: string, code: string, filename: string, deadlineMs: number | undefined): Promise<void> {
 		const active: ActiveRun = { runId, pendingTools: new Map() };
-		this.#active = active;
 		try {
-			const value = await runtime.run(code, filename);
-			runtime.displayValue(value);
+			const runtime = await this.#ensureRuntime();
+			this.#active = active;
+			await runtime.runCell(code, filename, deadlineMs);
 			this.#transport.send({ type: "result", runId, ok: true });
 		} catch (error) {
 			this.#transport.send({ type: "result", runId, ok: false, error: errorPayload(error) });
@@ -147,7 +161,18 @@ export class WorkerCore {
 			rejectPendingTools(active, new ToolError("JS worker closed"));
 		}
 		this.#active = null;
+		const runtime = this.#runtime;
 		this.#runtime = null;
+		try {
+			runtime?.dispose();
+		} catch (error) {
+			this.#transport.send({
+				type: "log",
+				level: "warn",
+				msg: "JS eval runtime disposal failed",
+				meta: { error: error instanceof Error ? error.message : String(error) },
+			});
+		}
 		this.#transport.send({ type: "closed" });
 		this.#unsubscribe();
 		this.#transport.close();

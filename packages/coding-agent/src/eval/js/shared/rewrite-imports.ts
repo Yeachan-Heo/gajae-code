@@ -295,7 +295,7 @@ function demoteTopLevelLexicals(code: string, options: { publishGlobals?: boolea
 	return result;
 }
 
-function returnFinalExpression(code: string): { source: string; returned: boolean } {
+function returnFinalExpression(code: string, tokenArg: string): { source: string; returned: boolean } {
 	const ast = parseProgram(code);
 	const body = ast?.program.body;
 	if (!body) return { source: code, returned: false };
@@ -309,7 +309,7 @@ function returnFinalExpression(code: string): { source: string; returned: boolea
 		const suffix = code.slice(expression.end);
 		const semicolonMatch = statement.match(/;\s*$/);
 		const trimmedStatement = semicolonMatch ? statement.slice(0, semicolonMatch.index) : statement;
-		return { source: `${prefix}__gjc_set_final_expr__((${trimmedStatement}));${suffix}`, returned: true };
+		return { source: `${prefix}__gjc_set_final_expr__((${trimmedStatement})${tokenArg});${suffix}`, returned: true };
 	}
 	if (last?.type === "ReturnStatement") {
 		// Top-level `return value;` is otherwise swallowed: it forces the cell into an async IIFE
@@ -320,7 +320,7 @@ function returnFinalExpression(code: string): { source: string; returned: boolea
 		const prefix = code.slice(0, ret.start);
 		const suffix = code.slice(ret.end);
 		const expr = code.slice(ret.argument.start, ret.argument.end);
-		return { source: `${prefix}__gjc_set_final_expr__((${expr}));${suffix}`, returned: true };
+		return { source: `${prefix}__gjc_set_final_expr__((${expr})${tokenArg});${suffix}`, returned: true };
 	}
 	return { source: code, returned: false };
 }
@@ -395,9 +395,21 @@ function stripTypeScript(code: string): string {
 const LOOKS_LIKE_TS =
 	/(?:\binterface\s+\w|\btype\s+\w+\s*=|\b(?:as|satisfies)\s+(?:[A-Z]|\bconst\b)|:\s*(?:string|number|boolean|any|unknown|void|never|object|[A-Z]\w*)\b|<\s*[A-Z]\w*\s*[,>])/;
 
-export function wrapCode(code: string): { source: string; asyncWrapped: boolean; finalExpressionReturned: boolean } {
+export interface WrapCodeOptions {
+	/**
+	 * Passed as a second argument to `__gjc_set_final_expr__` so a runtime can ignore final
+	 * values reported by continuations of earlier cells.
+	 */
+	finalExpressionToken?: number;
+}
+
+export function wrapCode(
+	code: string,
+	options: WrapCodeOptions = {},
+): { source: string; asyncWrapped: boolean; finalExpressionReturned: boolean } {
 	const stripped = stripTypeScript(code);
-	const finalExpression = returnFinalExpression(stripped);
+	const tokenArg = options.finalExpressionToken === undefined ? "" : `, ${options.finalExpressionToken}`;
+	const finalExpression = returnFinalExpression(stripped, tokenArg);
 	const importsRewritten = rewriteImports(finalExpression.source);
 	const needsAsyncWrapper = requiresAsyncWrapper(importsRewritten);
 	const rewritten = {

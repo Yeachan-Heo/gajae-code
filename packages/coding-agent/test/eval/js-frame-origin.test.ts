@@ -78,7 +78,9 @@ describe("js host-worker frame origin", () => {
 			session,
 			sessionFile: "/tmp/js-frame-origin.jsonl",
 		});
-		expect(hooked.exitCode).toBe(0);
+		// The QuickJS sandbox has no `require`, so guest code cannot reach the worker's parentPort.
+		expect(hooked.exitCode).toBe(1);
+		expect(hooked.output).toMatch(/ReferenceError: .*require.* is not defined/);
 		calls.length = 0;
 		const attacked = await executeJs('throw new Error("boom-real");', {
 			sessionId,

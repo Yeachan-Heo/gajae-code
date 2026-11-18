@@ -10,14 +10,7 @@ import { WorkerCore } from "./worker-core";
 // Bun's `--compile` bundler discovers, the `new URL` form is what makes dev
 // runs portable across cwds. The worker is registered as an additional
 // `--compile` entrypoint in `scripts/build-binary.ts`.
-import type {
-	JsDisplayOutput,
-	RunErrorPayload,
-	SessionSnapshot,
-	Transport,
-	WorkerInbound,
-	WorkerOutbound,
-} from "./worker-protocol";
+import type { JsDisplayOutput, RunErrorPayload, Transport, WorkerInbound, WorkerOutbound } from "./worker-protocol";
 
 export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
 export type { JsDisplayOutput } from "./worker-protocol";
@@ -101,14 +94,14 @@ function getSessionWaiters(sessionKey: string): Set<(error: Error) => void> {
 
 export async function executeInVmContext(options: {
 	sessionKey: string;
-	sessionId: string;
-	cwd: string;
 	session: ToolSession;
 	ownerId?: string;
 	reset?: boolean;
 	code: string;
 	filename: string;
 	timeoutMs?: number;
+	/** Wall-clock deadline (epoch ms) enforced inside the worker by the QuickJS runtime. */
+	deadlineMs?: number;
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
 	if (options.reset) {
@@ -119,12 +112,7 @@ export async function executeInVmContext(options: {
 	contextResetPromise.catch(() => undefined);
 	waiters.add(rejectContextReset);
 	const runPromise = (async (): Promise<{ value: unknown }> => {
-		const session = await acquireSession(
-			options.sessionKey,
-			{ cwd: options.cwd, sessionId: options.sessionId },
-			options.ownerId,
-			options.timeoutMs,
-		);
+		const session = await acquireSession(options.sessionKey, options.ownerId, options.timeoutMs);
 		return await runQueued(session, () => runOnce(session, options));
 	})();
 	try {
@@ -198,11 +186,10 @@ async function runQueued<T>(session: JsSession, work: () => Promise<T>): Promise
 async function runOnce(
 	session: JsSession,
 	options: {
-		sessionId: string;
-		cwd: string;
 		session: ToolSession;
 		code: string;
 		filename: string;
+		deadlineMs?: number;
 		runState: VmRunState;
 	},
 ): Promise<{ value: unknown }> {
@@ -243,7 +230,7 @@ async function runOnce(
 				runId,
 				code: options.code,
 				filename: options.filename,
-				snapshot: { cwd: options.cwd, sessionId: options.sessionId },
+				deadlineMs: options.deadlineMs,
 			})
 		) {
 			settleRunWithError(session, pending, new ToolError("JS worker send failed"));
@@ -256,12 +243,7 @@ async function runOnce(
 	}
 }
 
-async function acquireSession(
-	sessionKey: string,
-	snapshot: SessionSnapshot,
-	ownerId: string | undefined,
-	timeoutMs?: number,
-): Promise<JsSession> {
+async function acquireSession(sessionKey: string, ownerId: string | undefined, timeoutMs?: number): Promise<JsSession> {
 	const existing = sessions.get(sessionKey);
 	if (existing && existing.state !== "dead") return await existing.ready.promise;
 
@@ -315,7 +297,7 @@ async function acquireSession(
 				Promise.reject(new ToolError("JS context replaced during initialization"))
 			);
 		}
-		worker.send({ type: "init", snapshot });
+		worker.send({ type: "init" });
 		session.state = "alive";
 		session.ready.resolve(session);
 		ensureVmResourceCleanup();
