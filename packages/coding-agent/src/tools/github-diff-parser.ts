@@ -64,7 +64,7 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 	const { lines, hasTrailingNewline } = splitLines(unifiedDiff);
 	const result: string[] = [];
 	let i = 0;
-	const initialState: HunkState = { inCredentialValue: false, bracketDepth: 0, bracketStack: [] };
+	const initialState: HunkState = { inCredentialValue: false, bracketDepth: 0, bracketStack: [], inPemBlock: false };
 	let hunkState = initialState;
 
 	while (i < lines.length) {
@@ -73,11 +73,14 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 		// Reset credential state at file boundaries
 		if (line.startsWith("diff --git")) {
 			// Redact paths in diff --git headers if they contain credential-like filenames
-			const gitMatch = line.match(/^diff --git a\/(.*) b\/(.*?)$/);
+			// Handle both unquoted and C-quoted paths
+			const gitMatch = line.match(/^diff --git (.+) (.+)$/);
 			if (gitMatch) {
-				const oldPath = redactPathInDiffHeader(gitMatch[1]);
-				const newPath = redactPathInDiffHeader(gitMatch[2]);
-				result.push(`diff --git a/${oldPath} b/${newPath}`);
+				const oldPath = gitMatch[1];
+				const newPath = gitMatch[2];
+				const redactedOld = redactDiffHeaderPath(oldPath);
+				const redactedNew = redactDiffHeaderPath(newPath);
+				result.push(`diff --git ${redactedOld} ${redactedNew}`);
 			} else {
 				result.push(line);
 			}
@@ -88,31 +91,53 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 			i += 1;
 		} else if (line.startsWith("--- ")) {
 			// Redact old-side path for credential-shaped filenames
-			const minusMatch = line.match(/^--- a\/(.*?)$/);
+			const minusMatch = line.match(/^--- (.+)$/);
 			if (minusMatch) {
-				const redactedPath = redactPathInDiffHeader(minusMatch[1]);
-				result.push(`--- a/${redactedPath}`);
+				const redactedPath = redactDiffHeaderPath(minusMatch[1]);
+				result.push(`--- ${redactedPath}`);
 			} else {
 				result.push(redactDiffLine(line));
 			}
 			i += 1;
 		} else if (line.startsWith("+++ ")) {
 			// Redact new-side path for credential-shaped filenames
-			const plusMatch = line.match(/^\+\+\+ b\/(.*?)$/);
+			const plusMatch = line.match(/^\+\+\+ (.+)$/);
 			if (plusMatch) {
-				const redactedPath = redactPathInDiffHeader(plusMatch[1]);
-				result.push(`+++ b/${redactedPath}`);
+				const redactedPath = redactDiffHeaderPath(plusMatch[1]);
+				result.push(`+++ ${redactedPath}`);
 			} else {
 				result.push(redactDiffLine(line));
+			}
+			i += 1;
+		} else if (line.startsWith("rename from ") || line.startsWith("rename to ")) {
+			// Scrub credential-shaped paths in rename headers
+			const renameMatch = line.match(/^(rename (?:from|to) )(.+)$/);
+			if (renameMatch) {
+				const prefix = renameMatch[1];
+				const path = renameMatch[2];
+				const redactedPath = redactPathInDiffHeader(path);
+				result.push(`${prefix}${redactedPath}`);
+			} else {
+				result.push(line);
+			}
+			i += 1;
+		} else if (line.startsWith("copy from ") || line.startsWith("copy to ")) {
+			// Scrub credential-shaped paths in copy headers
+			const copyMatch = line.match(/^(copy (?:from|to) )(.+)$/);
+			if (copyMatch) {
+				const prefix = copyMatch[1];
+				const path = copyMatch[2];
+				const redactedPath = redactPathInDiffHeader(path);
+				result.push(`${prefix}${redactedPath}`);
+			} else {
+				result.push(line);
 			}
 			i += 1;
 		} else if (
 			line.startsWith("old mode") ||
 			line.startsWith("new mode") ||
 			line.startsWith("mode ") ||
-			line.startsWith("similarity ") ||
-			line.startsWith("rename ") ||
-			line.startsWith("copy ")
+			line.startsWith("similarity ")
 		) {
 			result.push(line);
 			i += 1;
@@ -135,6 +160,39 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 		joined += "\n";
 	}
 	return joined;
+}
+
+/**
+ * Parse and redact a diff header path, handling both unquoted and C-quoted formats.
+ * C-quoted paths look like: "a/file name" or "a/file\nname"
+ * Returns the original format with redacted path content.
+ */
+function redactDiffHeaderPath(headerPath: string): string {
+	// Check if path is C-quoted (starts and ends with quotes)
+	if (headerPath.startsWith('"') && headerPath.endsWith('"')) {
+		// C-quoted path: extract the prefix (a/ or b/), path, and suffix
+		const innerPath = headerPath.slice(1, -1); // Remove quotes
+		const innerMatch = innerPath.match(/^([ab])\/(.*)$/);
+		if (innerMatch) {
+			const prefix = innerMatch[1];
+			const path = innerMatch[2];
+			const redacted = redactPathInDiffHeader(path);
+			// Return in quoted format
+			return `"${prefix}/${redacted}"`;
+		}
+		return headerPath; // Return unchanged if parsing failed
+	}
+
+	// Unquoted path: extract prefix (a/ or b/) and redact the path part
+	const unquotedMatch = headerPath.match(/^([ab])\/(.*)$/);
+	if (unquotedMatch) {
+		const prefix = unquotedMatch[1];
+		const path = unquotedMatch[2];
+		const redacted = redactPathInDiffHeader(path);
+		return `${prefix}/${redacted}`;
+	}
+
+	return headerPath; // Return unchanged if neither format matched
 }
 
 /**
@@ -214,6 +272,7 @@ interface HunkState {
 	inCredentialValue: boolean;
 	bracketDepth: number;
 	bracketStack: string[]; // Track opening bracket types to validate matching
+	inPemBlock: boolean; // Track if we're inside a PEM block
 }
 
 interface HunkResult {
@@ -237,7 +296,7 @@ interface HunkResult {
 function redactHunk(
 	lines: string[],
 	hunkHeaderIndex: number,
-	inputState: HunkState = { inCredentialValue: false, bracketDepth: 0, bracketStack: [] },
+	inputState: HunkState = { inCredentialValue: false, bracketDepth: 0, bracketStack: [], inPemBlock: false },
 ): HunkResult {
 	const headerLine = lines[hunkHeaderIndex];
 	const match = headerLine.match(HUNK_HEADER_RE);
@@ -448,6 +507,9 @@ function countBracketsQuoteAwareWithStack(
 /**
  * Identify which original line indices should be fully redacted based on accumulated redaction.
  * This catches multi-line credentials that don't match our pattern heuristics.
+ *
+ * We only use this for detecting when the ENTIRE hunk is replaced by a single marker
+ * (e.g., pure PEM blocks). For mixed content, rely on state-based line-by-line tracking.
  */
 function findFullyRedactedLinesByAccumulation(
 	lineInfos: LineInfo[],
@@ -461,14 +523,14 @@ function findFullyRedactedLinesByAccumulation(
 		return fullyRedactedLines;
 	}
 
-	// Only use this for detecting PEM-like blocks: multi-line content that becomes a single marker
+	// Only mark all lines as fully redacted if the ENTIRE accumulated content becomes a single marker
 	if (
 		redactedAccumulated.match(/^«[a-z-]+»$/) ||
 		redactedAccumulated.match(/^«[a-z-]+»\n?$/) ||
 		redactedAccumulated.trim().match(/^«[a-z-]+»$/)
 	) {
 		// Entire content was replaced with a single redaction marker
-		// This is the PEM block case: multiple original lines become one marker
+		// This is the PEM-only case: multiple original lines become one marker
 		for (let i = 0; i < lineInfos.length; i += 1) {
 			fullyRedactedLines.add(i);
 		}
@@ -492,6 +554,7 @@ function applyStateBasedRedactionWithState(
 	let inCredentialValue = inputState.inCredentialValue;
 	let bracketDepth = inputState.bracketDepth;
 	let bracketStack = [...inputState.bracketStack];
+	let inPemBlock = inputState.inPemBlock;
 
 	// First, identify if the entire hunk is a multi-line credential that gets fully redacted
 	// (e.g., PEM blocks). Only use this for cases not covered by our pattern matching.
@@ -522,6 +585,22 @@ function applyStateBasedRedactionWithState(
 			continue;
 		}
 
+		// Check if this line is a PEM block marker
+		const isPemBlockStart = line.match(/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/);
+		const isPemBlockEnd = line.match(/^-----END [A-Z0-9 ]*PRIVATE KEY-----/);
+
+		// Handle PEM block state - check both start of block and ongoing PEM content
+		if (isPemBlockStart || inPemBlock) {
+			if (isPemBlockStart) {
+				inPemBlock = true;
+			}
+			if (isPemBlockEnd) {
+				inPemBlock = false;
+			}
+			result.push({ ...info, content: "«redacted»" });
+			continue;
+		}
+
 		// Check if this line starts a credential header with value on later line
 		const isCredentialHeader =
 			line.match(/:(\s*)$/) && // Ends with colon (possibly followed by space)
@@ -537,7 +616,8 @@ function applyStateBasedRedactionWithState(
 			/^\s*(Auth(?:orization)?|Cookie|Token|Secret|Password|Pass|Key)\s*:\s*[[{]/i,
 		);
 
-		const hasCredentialOpening = credentialFieldMatch || credentialWithBracket || isCredentialHeader;
+		const hasCredentialOpening =
+			credentialFieldMatch || credentialWithBracket || isCredentialHeader || isPemBlockStart;
 
 		if (hasCredentialOpening) {
 			// This line starts a credential header or field
@@ -579,5 +659,5 @@ function applyStateBasedRedactionWithState(
 		}
 	}
 
-	return { redactedLines: result, state: { inCredentialValue, bracketDepth, bracketStack } };
+	return { redactedLines: result, state: { inCredentialValue, bracketDepth, bracketStack, inPemBlock } };
 }

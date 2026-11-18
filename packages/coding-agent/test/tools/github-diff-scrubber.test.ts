@@ -337,6 +337,87 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed).toContain("file-redacted");
 				expect(scrubbed).not.toContain(".env.password");
 			});
+
+			it("[P2] scrubs C-quoted paths containing credentials", () => {
+				// C-quoted paths: Git uses these for paths with special characters
+				const diff = [
+					'diff --git "a/config/secret-token.env" "b/config/secret-token.env"',
+					"index 1111111..2222222 100644",
+					'--- "a/config/secret-token.env"',
+					'+++ "b/config/secret-token.env"',
+					"@@ -1,1 +1,1 @@",
+					" token=abc123",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Credential path should be redacted
+				expect(scrubbed).not.toContain("secret-token");
+			});
+
+			it("[P2] scrubs rename headers with credential-shaped paths", () => {
+				// Rename operations preserve old path in header
+				const diff = [
+					"diff --git a/src/api-secret-key.ts b/src/config.ts",
+					"similarity index 100%",
+					"rename from src/api-secret-key.ts",
+					"rename to src/config.ts",
+					"index 1111111..2222222 100644",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Credential-shaped path in rename headers should be redacted
+				expect(scrubbed).not.toContain("api-secret-key");
+			});
+
+			it("[P2] scrubs copy headers with credential-shaped paths", () => {
+				// Copy operations preserve source path in header
+				const diff = [
+					"diff --git a/src/api-password.ts b/src/api-password-backup.ts",
+					"similarity index 100%",
+					"copy from src/api-password.ts",
+					"copy to src/api-password-backup.ts",
+					"index 1111111..2222222 100644",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Credential-shaped paths in copy headers should be redacted
+				expect(scrubbed).not.toContain("api-password");
+			});
+
+			it("[P2] handles mixed-content PEM blocks with surrounding context", () => {
+				// PEM blocks can appear with surrounding content in the same hunk
+				const diff = [
+					...HEADER,
+					"@@ -0,0 +1,6 @@",
+					"+// Key setup",
+					"+-----BEGIN PRIVATE KEY-----",
+					"+MIIEvQIBADANBgkqhkiG9w0BAQE",
+					"+-----END PRIVATE KEY-----",
+					"+// Key initialized",
+					"+console.log('ready');",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// PEM content should be redacted
+				expect(scrubbed).not.toContain("BEGIN PRIVATE KEY");
+				expect(scrubbed).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQE");
+
+				// But surrounding context should be preserved
+				expect(scrubbed).toContain("// Key setup");
+				expect(scrubbed).toContain("// Key initialized");
+				expect(scrubbed).toContain("console.log");
+
+				// Line count should be preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
 		});
 	});
 });
