@@ -205,28 +205,26 @@ describe("#7856 setTemporaryModel in a shared root TUI session", () => {
 });
 
 describe("#7856 Move Session in a shared root TUI session", () => {
-	it("allows moveTo through runExclusiveCwdMoveTransition in a shared session", async () => {
+	it("refuses moveTo in a shared session with SharedSessionMutationUnsupportedError", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
 
-		const previousFile = f.manager.getSessionFile()!;
 		const targetDir = path.join(f.cwd, "..", "moved-session");
 		await fs.mkdir(targetDir, { recursive: true });
 
-		// moveTo through runExclusiveCwdMoveTransition should not throw SharedSessionMutationUnsupportedError
-		// This matches the path used by Move Session tool (via rescopeSessionCwd)
+		// Move Session in shared root TUI sessions stays refused (pre-#7858 behavior).
+		// This path is used by Move Session tool (via rescopeSessionCwd).
+		let threwExpected = false;
 		try {
 			await f.manager.runExclusiveCwdMoveTransition(() => f.manager.moveTo(targetDir));
 		} catch (error) {
-			throw new Error(`moveTo failed: ${error instanceof Error ? error.message : String(error)}`);
+			if (error instanceof Error && error.constructor.name === "SharedSessionMutationUnsupportedError") {
+				threwExpected = true;
+			} else {
+				throw error;
+			}
 		}
 
-		// Verify that the session file changed (indicating a successful move)
-		const newFile = f.manager.getSessionFile()!;
-		expect(newFile).not.toBe(previousFile);
-
-		// Verify that transcript entries are still accessible after move
-		const entries = f.manager.getEntries();
-		expect(entries.length).toBeGreaterThan(0);
+		expect(threwExpected).toBe(true);
 	});
 });

@@ -12472,9 +12472,6 @@ export class SessionManager {
 		return work;
 	}
 
-	#moveRelocationRewrite = false;
-	#hadSessionFileOnMoveRewrite = false;
-
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
 		// assertLegacyMutationAllowed now allows moves within exclusive transitions (#7856)
 		this.assertLegacyMutationAllowed("move session");
@@ -12921,13 +12918,11 @@ export class SessionManager {
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
-				this.#hadSessionFileOnMoveRewrite = hadSessionFile;
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
-				await this.#rewriteFileForMove();
+				await this.#rewriteFile();
 			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
-				this.#hadSessionFileOnMoveRewrite = hadSessionFile;
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
-				await this.#rewriteFileForMove();
+				await this.#rewriteFile();
 			} else {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 			}
@@ -17320,99 +17315,6 @@ export class SessionManager {
 		}
 	}
 
-	/** The move's own relocation rewrite; admitted only while this manager owns the cwd transition. */
-	async #rewriteFileForMove(): Promise<void> {
-		this.#moveRelocationRewrite = true;
-		try {
-			// When the session file was moved (hadSessionFileOnMoveRewrite=true), we do a header-only
-			// patch to preserve peer-appended entries and header patches.
-			// When the file didn't exist (hadSessionFileOnMoveRewrite=false), we do a full rewrite from memory.
-			if (this.#hadSessionFileOnMoveRewrite && this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
-				// File was moved: patch header line only, preserve everything else byte-for-byte
-				await this.#patchHeaderOnlyInFile();
-			} else {
-				// File didn't exist or no longer exists: full rewrite from memory
-				await this.#rewriteFile();
-			}
-		} finally {
-			this.#moveRelocationRewrite = false;
-			this.#hadSessionFileOnMoveRewrite = false;
-		}
-	}
-
-	/**
-	 * Patch only the header line in an existing file, preserving all other content byte-for-byte.
-	 * This is used when a session file is moved: we update the cwd in the header but keep all
-	 * peer-appended entries and header patches intact.
-	 */
-	async #patchHeaderOnlyInFile(): Promise<void> {
-		if (!this.#sessionFile) return;
-		const sessionFile = this.#sessionFile;
-		let fileContent: string;
-		try {
-			fileContent = await this.#storage.readText(sessionFile);
-		} catch (err) {
-			if (isEnoent(err)) {
-				// File was deleted; fall back to full rewrite
-				await this.#rewriteFile();
-				return;
-			}
-			throw err;
-		}
-
-		// Get the in-memory header with updated cwd
-		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header) {
-			// No header in memory; shouldn't happen, but fall back to full rewrite
-			await this.#rewriteFile();
-			return;
-		}
-
-		// Split content into lines preserving empty lines at the end
-		const lines = fileContent.endsWith("\n") ? fileContent.slice(0, -1).split("\n") : fileContent.split("\n");
-
-		if (lines.length === 0 || !lines[0]) {
-			// Empty file or no first line; fall back to full rewrite
-			await this.#rewriteFile();
-			return;
-		}
-
-		// Replace the header line (first line) with the updated header
-		const newHeaderLine = JSON.stringify(header);
-		lines[0] = newHeaderLine;
-
-		// Reconstruct the file content, preserving the final newline
-		const newContent = lines.join("\n") + (fileContent.endsWith("\n") ? "\n" : "");
-
-		// Write atomically to a temp file, then replace
-		await this.#queuePersistTask(async () => {
-			// Close any open persist writer before atomically replacing the file.
-			// The writer's fd points to the old inode; after replacement, the writer
-			// would point to stale identity and later appends would fail.
-			await this.#closePersistWriterInternal();
-
-			this.#withSessionPersistenceFenceSync(() => {
-				const dir = path.resolve(sessionFile, "..");
-				const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.tmp`);
-				try {
-					// Write the new content to the temp file synchronously
-					this.#storage.writeTextSync(tempPath, newContent);
-					const replacement = this.#replaceSessionFileSync(tempPath, sessionFile);
-					if (replacement.kind === "restored_previous") throw replacement.error;
-					// Update managedPersistExpectedIdentity to reflect the new file inode.
-					// After replacing the file, the transcript's inode has changed and we must
-					// capture the new identity for subsequent managed appends.
-					this.#adoptManagedPersistIdentity(sessionFile);
-				} catch (err) {
-					void this.#storage.unlink(tempPath).catch(() => {});
-					throw toError(err);
-				}
-			});
-		});
-		this.#flushed = true;
-		this.#ensuredOnDisk = true;
-	}
-
 	async #rewriteFile(): Promise<void> {
 		this.assertLegacyMutationAllowed("rewrite transcript");
 		await this.#queuePersistTask(async () => {
@@ -20642,17 +20544,6 @@ export class SessionManager {
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
-		// Allow only the operations that the move itself performs (header/cwd relocation).
-		// Appending header patches and persisting them is necessary for the move; full rewrites
-		// of the transcript are not part of the move and should stay under shared admission (#7856).
-		const cwdTransitionAllowedOps = new Set(["move session", "append header patch", "persist patches"]);
-		if (
-			this.#ownsCwdTransition() &&
-			(cwdTransitionAllowedOps.has(operation) ||
-				(this.#moveRelocationRewrite &&
-					(operation === "rewrite transcript" || operation === "full transcript publication")))
-		)
-			return;
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 
