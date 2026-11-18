@@ -711,6 +711,27 @@ function scrubHostPaths(text: string): string {
 }
 
 /** Text-level scrub for everything the view cache persists or serves back. */
+/** True when a match carries the closer matching the innermost open container. */
+function closesMatchingContainer(text: string, end: number, match: string): boolean {
+	const stack: string[] = [];
+	const push = (ch: string) => stack.push(ch);
+	const close = (ch: string) => {
+		const top = stack.at(-1);
+		if ((ch === "]" && top === "[") || (ch === "}" && top === "{")) return stack.pop() !== undefined;
+		return false;
+	};
+	for (let i = 0; i < end; i++) {
+		const ch = text[i];
+		if (ch === "{" || ch === "[") push(ch);
+		else if (ch === "}" || ch === "]") close(ch);
+	}
+	for (const ch of match) {
+		if (ch === "{" || ch === "[") push(ch);
+		else if ((ch === "}" || ch === "]") && close(ch)) return true;
+	}
+	return false;
+}
+
 /** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
 function containerDepthAt(text: string, end: number): number {
 	let depth = 0;
@@ -773,7 +794,8 @@ function scrubCacheText(text: string, diff = false): string {
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
 			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
-				containerDepthAt(text, offset) > 0 && /["'\]}]/.test(match)
+				containerDepthAt(text, offset) > 0 &&
+				((/["']/.test(match) && !/[=:][ \t]*["']/.test(match)) || closesMatchingContainer(text, offset, match))
 					? match
 					: `${lineStart}${marker}${label}«redacted»`,
 		)
