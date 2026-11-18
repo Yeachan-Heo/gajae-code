@@ -2070,7 +2070,13 @@ describe("bash session agent directory", () => {
 						env: { PAYLOAD: '"prefix rule://tabbed"' },
 					}),
 				).rejects.toThrow(/would change the value's quoting/);
-				// The same path is accepted where the caller wrote no delimiters.
+				// A lone apostrophe in prose is not a quoted run, so the same path is
+				// accepted there instead of being refused as quoted data.
+				const prose = await tool.execute("call-env-prose-tab", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: "it's rule://tabbed" },
+				});
+				expect(textOf(prose)).toContain(await realpath(tabRule));
 				const bare = await tool.execute("call-env-bare-tab", {
 					command: 'printf "%s" "$PAYLOAD"',
 					env: { PAYLOAD: "rule://tabbed" },

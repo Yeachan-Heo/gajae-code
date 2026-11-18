@@ -747,6 +747,20 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
  */
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
+/**
+ * The quote character enclosing `index` when that character is balanced in the
+ * value, or `undefined`. A lone apostrophe in prose (`it's skill://x`) is not a
+ * quoted run, and treating it as one would refuse an ordinary path.
+ */
+function enclosingBalancedQuote(value: string, index: number): string | undefined {
+	const opened = enclosingQuote(value, index);
+	if (opened === undefined) return undefined;
+	const character = opened === "ansi-c" ? "'" : opened;
+	let count = 0;
+	for (const candidate of value) if (candidate === character) count++;
+	return count % 2 === 0 ? character : undefined;
+}
+
 function assertFitsQuotedValue(resolvedPath: string, quoted: boolean): void {
 	if (!quoted || !QUOTED_VALUE_UNSAFE.test(resolvedPath)) return;
 	throw new ToolError(
@@ -806,7 +820,10 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		// The replacement lands in the quote the token carries or, for a URL inside
 		// a longer quoted run, the quote still open at that position.
 		if (!shellContext) {
-			assertFitsQuotedValue(resolvedPath, delimiter !== undefined || enclosingQuote(command, index) !== undefined);
+			assertFitsQuotedValue(
+				resolvedPath,
+				delimiter !== undefined || enclosingBalancedQuote(command, index) !== undefined,
+			);
 		}
 		// Command text replaces the whole token because the replacement brings its own
 		// quoting. A data value keeps the delimiters the token was written with: they
