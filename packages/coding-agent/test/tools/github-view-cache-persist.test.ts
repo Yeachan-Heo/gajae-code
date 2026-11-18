@@ -824,6 +824,7 @@ describe("github view cache persistence", () => {
 			['{"token":{"note":"opaque-demo-value"', '{"token":"«redacted»"'],
 			['{"token": {\n"note":"opaque-demo-value"', '{"token": "«redacted»"'],
 			['{"token": [\n\n"opaque-demo-value"\n', '{"token": "«redacted»"'],
+			['"token": [\n  "opaque-cache-canary-123"', '"token": "«redacted»"'],
 		];
 		cases.forEach(([body, expected], index) => {
 			const number = 90 + index;

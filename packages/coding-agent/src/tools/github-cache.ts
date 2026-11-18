@@ -375,7 +375,7 @@ function findBalancedValueEnd(text: string, start: number): number {
  * value is redacted through the end of its line rather than left behind.
  */
 function maskCredentialJsonContainers(text: string): { text: string; restore: (scrubbed: string) => string } {
-	if (!text.includes("{")) return { text, restore: scrubbed => scrubbed };
+	if (!text.includes("{") && !text.includes("[")) return { text, restore: scrubbed => scrubbed };
 	let out = "";
 	let last = 0;
 	for (const match of text.matchAll(
