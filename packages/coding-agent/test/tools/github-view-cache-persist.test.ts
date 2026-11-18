@@ -800,6 +800,86 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.unified).not.toContain("gjc-");
 	});
 
+	it("keeps structured credential containers out of the cache", () => {
+		const cases = [
+			['{"token":[1,2],"keep":1}', '{"token":"«redacted»","keep":1}'],
+			['{"token":{"value":"demo"},"keep":1}', '{"token":"«redacted»","keep":1}'],
+		];
+		cases.forEach(([body, expected], index) => {
+			const number = 90 + index;
+			const url = `https://github.com/${TEST_REPO}/issues/${number}`;
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "issue",
+				number,
+				includeComments: true,
+				payload: issuePayload(number, body as string, url),
+				rendered: body as string,
+				sourceUrl: url,
+				fetchedAt: 1,
+			});
+			const cached = getCached<{ body?: string }>(TEST_REPO, "issue", number, true, TEST_AUTH_KEY);
+			expect(cached?.payload.body).toBe(expected);
+		});
+	});
+
+	it("strips userinfo from escaped scheme-relative links and keeps table cells apart", () => {
+		const body = ["json \\/\\/user:opaque@host/x", "|//docs.example|'person@example.test'|"].join("\n");
+		const url = `https://github.com/${TEST_REPO}/issues/92`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 92,
+			includeComments: true,
+			payload: issuePayload(92, body, url),
+			rendered: body,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+
+		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 92, true, TEST_AUTH_KEY);
+		expect(cached?.payload.body).toContain("json \\/\\/host/x");
+		expect(cached?.payload.body).toContain("|//docs.example|'person@example.test'|");
+		expect(cached?.payload.body).not.toContain("opaque");
+	});
+
+	it("keeps a sanitized diff path byte-stable across write and read", () => {
+		const secret = "demo-token-1234";
+		const diff = [
+			`diff --git "a/plain" "b/Authorization: Bearer ${secret}"`,
+			"index 1111111..2222222 100644",
+			"--- a/plain",
+			`+++ "b/Authorization: Bearer ${secret}"`,
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 93,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		const first = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 93, false, TEST_AUTH_KEY);
+		const second = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 93, false, TEST_AUTH_KEY);
+		expect(first?.payload.unified).toBe(second?.payload.unified);
+		expect(first?.payload.unified).not.toContain(secret);
+		expect(first?.payload.files).toHaveLength(1);
+		expect(first?.payload.files[0]?.path).toBe("Authorization: Bearer «redacted»");
+		const [file] = first?.payload.files ?? [];
+		expect(first?.payload.unified.slice(file?.startOffset, file?.endOffset).startsWith('diff --git "a/plain"')).toBe(
+			true,
+		);
+	});
+
 	it("does not merge two compact table cells into one URL", () => {
 		const body = "|//example.test|dev@else.test|";
 		const url = `https://github.com/${TEST_REPO}/issues/78`;
@@ -1007,6 +1087,7 @@ describe("github view cache persistence", () => {
 				expect(parsed.files[0]?.path).toBe(`a/${segment}/«redacted»/${segment}`);
 				const [first, second] = parsed.files;
 				expect(rewritten.slice(first?.startOffset, first?.endOffset).startsWith(`diff --git "a/`)).toBe(true);
+				expect(rewritten.slice(first?.startOffset, first?.endOffset)).toContain("+content");
 				expect(rewritten.slice(second?.startOffset, second?.endOffset)).toBe(
 					[
 						"diff --git a/tail b/tail",

@@ -304,7 +304,7 @@ function escapeRegExp(value: string): string {
  * redactor: their grammars are not a single value token.
  */
 const BOUNDED_CREDENTIAL_ASSIGNMENT =
-	/(?<![A-Za-z0-9])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s"'`|;&,<>#]+)|(?=[\r\n]|$))/gi;
+	/(?<![A-Za-z0-9])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|\{((?:\\.|[^{}\\\r\n])*)\}|\[((?:\\.|[^[\]\\\r\n])*)\]|([^\s"'`|;&,<>#]+)|(?=[\r\n]|$))/gi;
 
 /**
  * Sentinels are nonce-prefixed so a literal NUL sequence in user text cannot
@@ -362,7 +362,8 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
 			doubleQuoted: string | undefined,
 			singleQuoted: string | undefined,
 		) => {
-			const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
+			const quote =
+				doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : separator.includes('"') ? '"' : "";
 			const sentinel = `${BOUNDED_CREDENTIAL_MASK}${sanitized.length}\u0000`;
 			sanitized.push(`${label}${separator}${quote}«redacted»${quote}`);
 			return sentinel;
@@ -385,7 +386,11 @@ function stripUrlUserinfo(text: string): string {
 		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>|]*@/gi,
 		"$1",
 	);
-	return withoutSchemeUserinfo.replace(/(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g, "//");
+	// JSON text can escape the slashes of a protocol-relative URL (`\/\/user@host`).
+	// Keep the spelling and drop only the userinfo.
+	return withoutSchemeUserinfo
+		.replace(/(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g, "//")
+		.replace(/(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>|]*@/g, "\\/\\/");
 }
 
 /**

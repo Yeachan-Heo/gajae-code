@@ -3086,28 +3086,31 @@ export function maskPrDiffPathTokens(
 		const tokens = prDiffPathTokens(line);
 		if (tokens.length === 0) continue;
 		let masked = line;
-		// Right to left keeps the earlier token offsets valid.
+		// Right to left keeps the earlier token offsets valid. Every well-formed
+		// path token is masked, even when the decoded value needs no change: a
+		// second (read) pass must not run prose rules over a token whose sanitized
+		// form already contains a marker, and an unchanged token must round-trip
+		// byte for byte.
 		for (let index = tokens.length - 1; index >= 0; index -= 1) {
 			const token = tokens[index] as PrDiffPathToken;
 			if (token.escaped) continue;
 			const sanitized = transform(token.value);
-			if (sanitized === token.value) continue;
+			const replacement =
+				sanitized === token.value ? line.slice(token.start, token.end) : quotePrDiffPath(sanitized);
 			const sentinel = `${PR_DIFF_PATH_MASK}${sanitizedTokens.length}\u0000`;
-			sanitizedTokens.push(quotePrDiffPath(sanitized));
+			sanitizedTokens.push(replacement);
 			masked = masked.slice(0, token.start) + sentinel + masked.slice(token.end);
 		}
 		if (masked !== line) lines[i] = masked;
 	}
 	if (sanitizedTokens.length === 0) return { text, restore: scrubbed => scrubbed };
+	// Linear restore: a large diff can hold thousands of path tokens, so one
+	// pass with a function replacer is used instead of a replaceAll per token.
+	const sentinelPattern = new RegExp(`${PR_DIFF_PATH_MASK.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\d+)\u0000`, "g");
 	return {
 		text: lines.join("\n"),
-		restore: scrubbed => {
-			let restored = scrubbed;
-			for (let index = 0; index < sanitizedTokens.length; index += 1) {
-				restored = restored.replaceAll(`${PR_DIFF_PATH_MASK}${index}\u0000`, () => sanitizedTokens[index] ?? "");
-			}
-			return restored;
-		},
+		restore: scrubbed =>
+			scrubbed.replace(sentinelPattern, (_match, index: string) => sanitizedTokens[Number(index)] ?? ""),
 	};
 }
 
