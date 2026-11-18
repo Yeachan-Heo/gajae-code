@@ -976,6 +976,35 @@ function carriesUrlCredential(line: string): boolean {
 	return findUrlCredentialSpansIn(line).length > 0;
 }
 
+/** An auth cue followed by an escaped line break (`\\n`), as a JSON-serialized value prints it. */
+const ESCAPED_AUTH_CUE = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*(?:\\+r)?\\+n[ \t]*/gi;
+
+/**
+ * Mask the credential a serialized value carries after an escaped line break. The escaped form
+ * prints on one physical line, so the continuation rules would never see the value; the guards
+ * are the same ones the physical continuation uses.
+ */
+function collectEscapedContinuations(
+	line: string,
+	base: number,
+	structure: CrashMaskStructure,
+	out: RedactionRange[],
+): void {
+	ESCAPED_AUTH_CUE.lastIndex = 0;
+	for (let match = ESCAPED_AUTH_CUE.exec(line); match !== null; ) {
+		const start = match.index + match[0].length;
+		let end = start;
+		while (end < line.length && !CONTINUATION_DELIMITER.test(line[end])) end++;
+		const token = line.slice(start, end);
+		const hasUriValue = structure === "blind" ? carriesUrlCredential(token) : URI_AT_LINE_START.test(token);
+		if (end - start >= 8 && !startsDiagnosticAssignment(token) && !hasUriValue) {
+			out.push({ start: base + start, end: base + end, label: "«redacted-auth»" });
+		}
+		ESCAPED_AUTH_CUE.lastIndex = Math.max(ESCAPED_AUTH_CUE.lastIndex, end);
+		match = ESCAPED_AUTH_CUE.exec(line);
+	}
+}
+
 function collectResidualRanges(text: OriginalText, structure: CrashMaskStructure = "structured"): RedactionRange[] {
 	const ranges: RedactionRange[] = [];
 	let lineStart = 0;
@@ -985,6 +1014,7 @@ function collectResidualRanges(text: OriginalText, structure: CrashMaskStructure
 		const contentEnd = lineEnd > lineStart && text[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
 		const line = text.slice(lineStart, contentEnd);
 		collectLineRanges(line, CURRENT_CREDENTIAL_REDACTION_RULES, lineStart, ranges);
+		collectEscapedContinuations(line, lineStart, structure, ranges);
 		// A scheme marker alone at the end of a line carries its value on the next physical line.
 		// The continuation is explicit and bounded: it is skipped when the next line is a field
 		// assignment, so `Token\ndiagnostics: keep-me` keeps its newline and its key.

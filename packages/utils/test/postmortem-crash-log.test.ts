@@ -117,6 +117,16 @@ describe("crash redaction classification", () => {
 		expect(redacted).toContain("# keep-me");
 	});
 
+	it("masks an auth continuation across an escaped line break", () => {
+		const value = "opaquecredential123";
+
+		expect(redactCrashSecrets(`{"code":"bearer\\n${value}"}`)).toBe('{"code":"bearer\\n«redacted-auth»"}');
+		expect(redactCrashSecrets(`{"code":"Basic\\nZml4dHVyZTpwYXNzd29yZA=="}`)).toBe(
+			'{"code":"Basic\\n«redacted-auth»"}',
+		);
+		expect(redactCrashSecrets(`{"note":"Token\\ndiagnostic=keep"}`)).toBe(`{"note":"Token\\ndiagnostic=keep"}`);
+	});
+
 	it("keeps a trailing diagnostic after a lower-case Authorization scheme", () => {
 		const redacted = redactCrashSecrets("Authorization: bearer opaquecredential123 diagnostic=keep");
 
@@ -400,6 +410,18 @@ describe("recordFatalCrash", () => {
 
 		expect(contents).not.toContain(sentinel);
 		expect(contents).toContain('{"code":"«redacted-private-key»"}');
+	});
+
+	it("masks an auth continuation inside a nested string of a captured object field", () => {
+		const target = tempCrashLog();
+		const value = "opaquecredential123";
+		const reason = { message: "fixture", code: { detail: `bearer\n${value}` } };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(value);
+		expect(contents).toContain('"detail":"bearer\\n«redacted-auth»"');
 	});
 
 	it("masks an auth continuation inside a captured string field", () => {

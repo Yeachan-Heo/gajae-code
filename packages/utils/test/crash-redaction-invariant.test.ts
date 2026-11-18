@@ -35,6 +35,11 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 	{ name: "auth continuation with token68 padding", text: "Basic\nZml4dHVyZTpwYXNzd29yZA==", secret: true },
 	{ name: "auth continuation with bare token", text: "bearer\nabcdefghijopaquevalue", secret: true },
 	{
+		name: "auth continuation across an escaped newline",
+		text: '{"code":"bearer\\nopaquecredential123"}',
+		secret: true,
+	},
+	{
 		name: "auth continuation with URI on the next line",
 		text: "Token\npostgresql+asyncpg://app:synthetic@db.example.com/db",
 		secret: true,
@@ -165,6 +170,7 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		secret: false,
 	},
 	{ name: "url without credentials", text: "GET https://db.example.com/v1/items?limit=3 returned 200", secret: false },
+	{ name: "json with an escaped newline", text: '{"note":"first\\nsecond","count":2}', secret: false },
 	{
 		name: "bracketed ordinary data",
 		text: 'wrapper: [alpha, beta, "gamma delta"]\n# note\npublic: visible',
