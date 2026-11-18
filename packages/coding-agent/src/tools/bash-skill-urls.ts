@@ -844,16 +844,19 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 
 		const rawUrl = unquoteToken(token);
 		const url = normalizeLocalScheme(rawUrl);
-		const delimiter = token === rawUrl ? undefined : token[0];
-		const urlStart = index + (delimiter === undefined ? 0 : 1);
+		const quotedToken = token !== rawUrl;
+		const urlStart = index + (quotedToken ? 1 : 0);
+		const urlEnd = urlStart + rawUrl.length;
 		// The same bytes mean different things in JSON (an escape) and in a YAML
-		// literal block (data), and an env value does not say which it is, so the
-		// ambiguity is reported instead of guessed at or silently left unresolved.
-		if (!shellContext && (escapedAt(command, index) || escapedAt(command, urlStart))) {
+		// literal block (data), and an env value does not say which it is, so an
+		// escaped scheme is reported instead of guessed at or silently left
+		// unresolved. An escaped quote is only data around the URL, not a delimiter.
+		if (!shellContext && escapedAt(command, urlStart)) {
 			throw new ToolError(
 				"Refusing to expand this URL in an env value: it follows a backslash, which the value's format may read as an escape. Remove the backslash or make the URL the whole value.",
 			);
 		}
+		const delimiter = quotedToken && !escapedAt(command, index) ? token[0] : undefined;
 		if (nestedRuleContext && extractScheme(url) === "rule") {
 			throw new ToolError(
 				"rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets.",
@@ -888,9 +891,8 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		// quoting. A data value keeps the delimiters the token was written with: they
 		// are part of the value (`{"rule":"rule://x"}` is JSON, not shell text), and
 		// the delimiter check above refused a path that could close them.
-		const delimiterWidth = delimiter === undefined ? 0 : 1;
-		const start = shellContext ? index : index + delimiterWidth;
-		const end = shellContext ? index + token.length : index + token.length - delimiterWidth;
+		const start = shellContext ? index : urlStart;
+		const end = shellContext ? index + token.length : urlEnd;
 		expanded = `${expanded.slice(0, start)}${replacement}${expanded.slice(end)}`;
 	}
 

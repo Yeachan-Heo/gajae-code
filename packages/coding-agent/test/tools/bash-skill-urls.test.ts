@@ -2166,12 +2166,13 @@ describe("bash session agent directory", () => {
 				expect(textOf(bareTab)).toContain(await realpath(tabRule));
 				await expect(run("call-env-whole-quoted-tab", '"rule://tabbed"')).rejects.toThrow(/cannot carry/);
 
-				// A backslash before the URL is ambiguous: JSON reads it as an escape, a
-				// YAML literal block as data. The tool reports that instead of guessing.
+				// An escaped quote is data around the URL, not a delimiter, so the escaped
+				// opener keeps its backslash and only the URL is replaced.
+				const escapedOpener = await run("call-env-escaped-opener", '{"m":"prefix \\"rule://plain"}');
+				expect(textOf(escapedOpener)).toContain(plainReal);
+				expect(textOf(escapedOpener)).toContain('\\"');
+				// A genuine ambiguity: a backslash before the scheme itself.
 				await expect(run("call-env-escaped", '{"message":"prefix \\rule://tabbed"}')).rejects.toThrow(
-					/may read as an escape/,
-				);
-				await expect(run("call-env-escaped-opener", '{"message":"prefix \\"rule://tabbed"}')).rejects.toThrow(
 					/may read as an escape/,
 				);
 				await expect(run("call-env-yaml-literal", "note: |\n  Rule marker: \\rule://tabbed")).rejects.toThrow(
