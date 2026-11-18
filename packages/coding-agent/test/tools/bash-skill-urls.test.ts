@@ -442,6 +442,14 @@ function memoryRootFor(agentDir: string, cwd: string): string {
 	return path.join(getMemoriesDir(agentDir), encoded);
 }
 
+/**
+ * The shell reads a drive-qualified path with `/` separators, so a rule path on
+ * Windows is handed over in that spelling rather than the native one.
+ */
+function shellSpelling(filePath: string): string {
+	return /^[A-Za-z]:[\\/]/.test(filePath) ? filePath.replaceAll("\\", "/") : filePath;
+}
+
 async function expectExpandsToSource(
 	command: string,
 	options: Parameters<typeof expandInternalUrls>[1],
@@ -458,7 +466,7 @@ async function expectExpandsToSource(
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
-	expect([lexical, real]).toContain(got);
+	expect([shellSpelling(lexical), shellSpelling(real)]).toContain(got);
 }
 
 describe("expandInternalUrls session scope", () => {
@@ -1218,6 +1226,37 @@ describe("expandInternalUrls session scope", () => {
 				expect(expanded).toBe(`cat '${real.replaceAll("\\", "/")}'`);
 			} finally {
 				await rm(repo, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"refuses a rule in a case-variant sibling directory when the volume is case-sensitive",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-case-"));
+			try {
+				const callerCwd = path.join(parent, "Repo");
+				const variantCwd = path.join(parent, "repo");
+				const agentDir = path.join(parent, "agent");
+				await mkdir(callerCwd);
+				await mkdir(variantCwd);
+				await mkdir(agentDir);
+				// A case-insensitive directory folds the two names onto one; the
+				// containment question only exists where they stay distinct.
+				if ((await realpath(callerCwd)) === (await realpath(variantCwd))) return;
+				const sourcePath = path.join(variantCwd, "secret.md");
+				await writeFile(sourcePath, "foreign-rule");
+				const router = createInternalRouter({ "rule://secret": { sourcePath } });
+				await expect(
+					expandInternalUrls("cat rule://secret", {
+						skills: [],
+						internalRouter: router,
+						sessionCwd: callerCwd,
+						sessionAgentDir: agentDir,
+					}),
+				).rejects.toThrow(/outside this session/);
+			} finally {
+				await rm(parent, { recursive: true, force: true });
 			}
 		},
 	);

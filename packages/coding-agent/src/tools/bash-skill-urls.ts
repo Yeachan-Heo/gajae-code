@@ -345,9 +345,23 @@ function shellEscape(p: string): string {
 
 const SESSION_URL_ESCAPE = "URL is outside this session and cannot be expanded in a bash command";
 
+/**
+ * True when `candidate` is `root` or below it. Windows resolves `path.relative`
+ * without regard to case, so a case-variant sibling directory such as
+ * `C:\work\proj` counts as inside `C:\work\Proj` even on a volume or directory
+ * that is case-sensitive. Every caller here compares two canonical paths or two
+ * paths derived from one spelling, so on Windows the shared prefix has to match
+ * exactly as well: a case-insensitive volume canonicalizes both sides to one
+ * spelling, and a case-sensitive one keeps their real spellings apart.
+ */
 function pathStaysInside(root: string, candidate: string): boolean {
-	const relative = path.relative(root, candidate);
-	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+	const resolvedRoot = path.resolve(root);
+	const resolvedCandidate = path.resolve(candidate);
+	const relative = path.relative(resolvedRoot, resolvedCandidate);
+	if (relative === "") return true;
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+	if (process.platform !== "win32") return true;
+	return resolvedCandidate.slice(0, resolvedRoot.length) === resolvedRoot;
 }
 
 function isStrictlyInside(root: string, candidate: string): boolean {
