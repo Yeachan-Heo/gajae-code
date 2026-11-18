@@ -1,3 +1,3 @@
 ### Fixed
 
-- Telegram notification bus now properly re-registers with a successor broker when the initial SDK broker registration failed. Sessions no longer keep stale generation heartbeats for hours; when a broker generation changes, the notification bus now properly transitions from the old to the new generation (#7879).
+- **Broker generation recovery** (#7879): Sessions with failed initial broker registrations now properly re-register with successor brokers when broker generation changes. The notification bus properly handles attachment transitions, and session-ready publication IDs are scoped by generation to prevent duplicate publications. The fix ensures the notification state machine transitions cleanly when a broker generation changes after initial registration failure.

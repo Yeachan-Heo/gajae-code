@@ -730,8 +730,9 @@ export class ChatDaemonRuntime {
 			// unpositioned session_ready frame deliberately carries no ring
 			// generation; reject only an explicit, conflicting Router-owned value.
 			if (correlated.generation !== undefined && correlated.generation !== attachment.generation) return;
-			// Use stable publication ID for session_ready so replays use the same nonce
-			const stablePublicationId = publicationId ?? `session-ready:${sessionId}`;
+			// Use stable publication ID for session_ready so replays use the same nonce.
+			// Include generation to avoid collisions when broker registration changes the generation.
+			const stablePublicationId = publicationId ?? `session-ready:${sessionId}:${attachment.generation}`;
 			await this.#resume(
 				sessionId,
 				attachment.generation,
