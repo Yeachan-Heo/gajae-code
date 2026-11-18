@@ -2996,8 +2996,10 @@ function singlePathToken(line: string, prefix: string): PrDiffPathToken[] {
 function binaryFileTokens(line: string): PrDiffPathToken[] {
 	const prefix = "Binary files ";
 	const rest = line.slice(prefix.length);
+	const suffix = rest.endsWith(" differ") ? " differ" : "";
+	const body = suffix ? rest.slice(0, -suffix.length) : rest;
 	const tokens: PrDiffPathToken[] = [];
-	const first = rest.startsWith('"') ? parseDiffQuotedToken(rest, 0) : undefined;
+	const first = body.startsWith('"') ? parseDiffQuotedToken(body, 0) : undefined;
 	if (first) {
 		tokens.push({
 			start: prefix.length,
@@ -3005,38 +3007,32 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 			value: first.value,
 			escaped: first.escaped,
 		});
-		const afterAnd = rest.indexOf(" and ", first.nextIndex);
+		const afterAnd = body.indexOf(" and ", first.nextIndex);
 		if (afterAnd === -1) return tokens;
 		const secondStart = afterAnd + " and ".length;
-		const quotedSecond = rest.charAt(secondStart) === '"' ? parseDiffQuotedToken(rest, secondStart) : undefined;
-		const end = quotedSecond
-			? quotedSecond.nextIndex
-			: rest.endsWith(" differ")
-				? rest.length - " differ".length
-				: rest.length;
+		const quotedSecond = body.charAt(secondStart) === '"' ? parseDiffQuotedToken(body, secondStart) : undefined;
 		tokens.push({
 			start: prefix.length + secondStart,
-			end: prefix.length + end,
-			value: quotedSecond ? quotedSecond.value : rest.slice(secondStart, end),
+			end: prefix.length + (quotedSecond ? quotedSecond.nextIndex : body.length),
+			value: quotedSecond ? quotedSecond.value : body.slice(secondStart),
 			escaped: quotedSecond?.escaped,
 		});
 		return tokens;
 	}
-	const andIndex = rest.indexOf(" and ");
-	if (andIndex <= 0) return tokens;
-	const secondStart = andIndex + " and ".length;
-	const quotedSecond2 = rest.charAt(secondStart) === '"' ? parseDiffQuotedToken(rest, secondStart) : undefined;
-	const end = quotedSecond2
-		? quotedSecond2.nextIndex
-		: rest.endsWith(" differ")
-			? rest.length - " differ".length
-			: rest.length;
-	tokens.push({ start: prefix.length, end: prefix.length + andIndex, value: rest.slice(0, andIndex) });
+	// An unquoted left path may itself contain ` and `. A quoted right operand
+	// starts at the last ` and "`; otherwise the right operand is the last ` and `
+	// segment.
+	const quotedSeparator = body.lastIndexOf(' and "');
+	const separator = quotedSeparator > 0 ? quotedSeparator : body.lastIndexOf(" and ");
+	if (separator <= 0) return tokens;
+	const secondStart = separator + " and ".length;
+	const quotedSecond = body.charAt(secondStart) === '"' ? parseDiffQuotedToken(body, secondStart) : undefined;
+	tokens.push({ start: prefix.length, end: prefix.length + separator, value: body.slice(0, separator) });
 	tokens.push({
 		start: prefix.length + secondStart,
-		end: prefix.length + end,
-		value: quotedSecond2 ? quotedSecond2.value : rest.slice(secondStart, end),
-		escaped: quotedSecond2?.escaped,
+		end: prefix.length + (quotedSecond ? quotedSecond.nextIndex : body.length),
+		value: quotedSecond ? quotedSecond.value : body.slice(secondStart),
+		escaped: quotedSecond?.escaped,
 	});
 	return tokens;
 }

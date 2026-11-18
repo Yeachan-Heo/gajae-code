@@ -323,7 +323,6 @@ function restoreMasked(scrubbed: string, prefix: string, values: readonly string
 	return restored;
 }
 
-const BOUNDED_CONTAINER_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-container-`;
 const AT_SIGN_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-at-\u0000`;
 
 /**
@@ -372,27 +371,31 @@ function findBalancedValueEnd(text: string, start: number): number {
  * A JSON-text credential whose value is an object or array has to be consumed
  * with quote and depth awareness; the flat assignment mask would stop at a
  * nested brace or a delimiter inside a string and leave the rest behind.
+ * Matches inside an already-consumed value are skipped, and an unterminated
+ * value is redacted through the end of its line rather than left behind.
  */
 function maskCredentialJsonContainers(text: string): { text: string; restore: (scrubbed: string) => string } {
 	if (!text.includes("{")) return { text, restore: scrubbed => scrubbed };
-	const sanitized: string[] = [];
 	let out = "";
 	let last = 0;
 	for (const match of text.matchAll(
 		/(?<![A-Za-z0-9])"((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)"\s*:\s*/gi,
 	)) {
-		const valueStart = (match.index ?? 0) + match[0].length;
+		const matchIndex = match.index ?? 0;
+		if (matchIndex < last) continue;
+		const valueStart = matchIndex + match[0].length;
 		const first = text.charAt(valueStart);
 		if (first !== "{" && first !== "[") continue;
-		const end = findBalancedValueEnd(text, valueStart);
-		if (end === -1) continue;
-		out += text.slice(last, valueStart) + `${BOUNDED_CONTAINER_MASK}${sanitized.length}\u0000`;
-		sanitized.push('"«redacted»"');
+		let end = findBalancedValueEnd(text, valueStart);
+		if (end === -1) {
+			const lineEnd = text.indexOf("\n", valueStart);
+			end = lineEnd === -1 ? text.length : lineEnd;
+		}
+		out += text.slice(last, valueStart) + '"«redacted»"';
 		last = end;
 	}
-	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
 	out += text.slice(last);
-	return { text: out, restore: scrubbed => restoreMasked(scrubbed, BOUNDED_CONTAINER_MASK, sanitized) };
+	return { text: out, restore: scrubbed => scrubbed };
 }
 
 /**
@@ -449,20 +452,32 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
  * Remove URL userinfo. Authentication is what makes a URL sensitive; the host,
  * path, query and surrounding markup stay readable. Handles `scheme://`,
  * JSON-escaped `scheme:\/\/`, and protocol-relative `//user:pass@host` forms,
- * including a raw `@` or an apostrophe inside the userinfo. Userinfo removal
- * runs before the assignment masks so a URL shaped like
+ * including a raw `@`, an apostrophe, or a `|` inside the userinfo. Userinfo
+ * removal runs before the assignment masks so a URL shaped like
  * `scheme://user:token=value@host` keeps its host.
+ *
+ * A Markdown table row treats `|` as a cell boundary; elsewhere it is part of
+ * the authority. The line is classified once and the matching pattern set is
+ * used, so a compact table cannot be merged into one URL.
  */
+const SCHEME_USERINFO = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
+const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>|]*@/gi;
+const RELATIVE_USERINFO = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>]*@/g;
+const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g;
+const ESCAPED_USERINFO = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
+const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>|]*@/g;
+
 function stripUrlUserinfo(text: string): string {
-	const withoutSchemeUserinfo = text.replace(
-		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>|]*@/gi,
-		"$1",
-	);
-	// JSON text can escape the slashes of a protocol-relative URL (`\/\/user@host`).
-	// Keep the spelling and drop only the userinfo.
-	return withoutSchemeUserinfo
-		.replace(/(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g, "//")
-		.replace(/(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>|]*@/g, "\\/\\/");
+	return text
+		.split("\n")
+		.map(line => {
+			const table = (line.match(/\|/g)?.length ?? 0) >= 2;
+			const withoutScheme = line.replace(table ? SCHEME_USERINFO_TABLE : SCHEME_USERINFO, "$1");
+			return withoutScheme
+				.replace(table ? RELATIVE_USERINFO_TABLE : RELATIVE_USERINFO, "//")
+				.replace(table ? ESCAPED_USERINFO_TABLE : ESCAPED_USERINFO, "\\/\\/");
+		})
+		.join("\n");
 }
 
 /**

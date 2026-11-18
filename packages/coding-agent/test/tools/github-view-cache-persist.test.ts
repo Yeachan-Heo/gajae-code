@@ -744,6 +744,7 @@ describe("github view cache persistence", () => {
 			`Binary files "a/${encoded}" and "b/${encoded}" differ`,
 			"diff --git a/unchanged b/unchanged",
 			`Binary files /dev/null and "b/${encoded}" differ`,
+			`Binary files a/report and notes and "b/${encoded}" differ`,
 			"",
 		].join("\n");
 		putCached({
@@ -810,6 +811,12 @@ describe("github view cache persistence", () => {
 			['{"token":{"value":"demo"},"keep":1}', '{"token":"«redacted»","keep":1}'],
 			['{"token":{"note":"left}opaque-demo-value"},"keep":1}', '{"token":"«redacted»","keep":1}'],
 			['{"token":[[1,2],"demo"],"keep":1}', '{"token":"«redacted»","keep":1}'],
+			[
+				'{"token":{"password":{"example":"demo"},"note":"opaque-demo-value"},"keep":1}',
+				'{"token":"«redacted»","keep":1}',
+			],
+			['{"token":{"note":"demo"}}', '{"token":"«redacted»"}'],
+			['{"token":{"note":"opaque-demo-value"', '{"token":"«redacted»"'],
 		];
 		cases.forEach(([body, expected], index) => {
 			const number = 90 + index;
@@ -831,7 +838,11 @@ describe("github view cache persistence", () => {
 	});
 
 	it("strips userinfo from escaped scheme-relative links and keeps table cells apart", () => {
-		const body = ["json \\/\\/user:opaque@host/x", "|//docs.example|'person@example.test'|"].join("\n");
+		const body = [
+			"json \\/\\/user:opaque@host/x",
+			"|//docs.example|'person@example.test'|",
+			"https://alice:demo|value@example.test/x",
+		].join("\n");
 		const url = `https://github.com/${TEST_REPO}/issues/92`;
 		putCached({
 			authKey: TEST_AUTH_KEY,
@@ -848,7 +859,9 @@ describe("github view cache persistence", () => {
 		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 92, true, TEST_AUTH_KEY);
 		expect(cached?.payload.body).toContain("json \\/\\/host/x");
 		expect(cached?.payload.body).toContain("|//docs.example|'person@example.test'|");
+		expect(cached?.payload.body).toContain("https://example.test/x");
 		expect(cached?.payload.body).not.toContain("opaque");
+		expect(cached?.payload.body).not.toContain("alice:demo");
 	});
 
 	it("keeps a sanitized diff path byte-stable across write and read", () => {
