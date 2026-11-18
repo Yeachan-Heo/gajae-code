@@ -2900,6 +2900,8 @@ interface ParsedDiffHeaderToken {
 	nextIndex: number;
 	/** Set when the token kept its C-style escaped source form. */
 	escaped?: boolean;
+	/** Latin-1 view of an invalid-UTF-8 quoted token, for credential scanning only. */
+	decoded?: string;
 }
 
 /**
@@ -2931,6 +2933,8 @@ interface PrDiffPathToken {
 	value: string;
 	/** Set when the token kept its C-style escaped source form. */
 	escaped?: boolean;
+	/** Latin-1 view of an invalid-UTF-8 token, for credential scanning only. */
+	decoded?: string;
 }
 
 function diffGitPathTokens(line: string): PrDiffPathToken[] {
@@ -3113,8 +3117,9 @@ export function maskPrDiffPathTokens(
 		// byte for byte.
 		for (let index = tokens.length - 1; index >= 0; index -= 1) {
 			const token = tokens[index] as PrDiffPathToken;
-			if (token.escaped) continue;
-			const sanitized = transform(token.value);
+			const candidate = token.escaped ? (token.decoded ?? token.value) : token.value;
+			const sanitized = transform(candidate);
+			if (token.escaped && sanitized === candidate) continue;
 			const replacement =
 				sanitized === token.value ? line.slice(token.start, token.end) : quotePrDiffPath(sanitized);
 			const sentinel = `${PR_DIFF_PATH_MASK}${sanitizedTokens.length}\u0000`;
@@ -3206,7 +3211,12 @@ function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeade
 					return { value: DIFF_PATH_DECODER.decode(Uint8Array.from(bytes)), nextIndex: i + 1 };
 				} catch {}
 			}
-			return { value: text.slice(startIndex + 1, i), nextIndex: i + 1, escaped: true };
+			return {
+				value: text.slice(startIndex + 1, i),
+				nextIndex: i + 1,
+				escaped: true,
+				decoded: bytes.map(byte => String.fromCharCode(byte)).join(""),
+			};
 		}
 		if (ch !== "\\") {
 			bytes.push(...DIFF_PATH_ENCODER.encode(ch));

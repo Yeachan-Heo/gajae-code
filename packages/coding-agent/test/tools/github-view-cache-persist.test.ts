@@ -626,6 +626,9 @@ describe("github view cache persistence", () => {
 		expect(cached).not.toBeNull();
 		expect(cached?.rendered).not.toContain(GITHUB_TOKEN);
 		expect(cached?.payload.unified).not.toContain(GITHUB_TOKEN);
+		expect(cached?.payload.unified).not.toContain("A1b2C3d4");
+		expect(cached?.payload.unified).not.toContain("8f4c2e1a9b7d6f3e5a0c9b8d7e6f5a4c");
+		expect(cacheFileBytes()).not.toContain("8f4c2e1a9b7d6f3e5a0c9b8d7e6f5a4c");
 		expect(cached?.payload.files).toHaveLength(2);
 		const slices = (cached?.payload.files ?? []).map(file =>
 			cached?.payload.unified.slice(file.startOffset, file.endOffset),
@@ -775,6 +778,8 @@ describe("github view cache persistence", () => {
 		const diff = [
 			`diff --git "a/${"\\377"}${GITHUB_TOKEN}" "b/${"\\377"}${GITHUB_TOKEN}"`,
 			`diff --git "a/${"\\377\\t"}${GITHUB_TOKEN}" "b/${"\\377\\t"}${GITHUB_TOKEN}"`,
+			`diff --git "a/${"\\377\\147"}${GITHUB_TOKEN.slice(1)}" "b/${"\\377\\147"}${GITHUB_TOKEN.slice(1)}"`,
+			`diff --git "a/${"\\377\\t"}Bearer 8f4c2e1a9b7d6f3e5a0c9b8d7e6f5a4c" "b/${"\\377\\t"}Bearer 8f4c2e1a9b7d6f3e5a0c9b8d7e6f5a4c"`,
 			"new file mode 100644",
 			"--- /dev/null",
 			`+++ "b/${"\\377"}${GITHUB_TOKEN}"`,
@@ -906,6 +911,7 @@ describe("github view cache persistence", () => {
 			'| a | b |\n| --- | --- |\n| "token": [\n\n  "array-fixture"\n] |\nhttps://alice:demo|value@example.test/x',
 			'# "token": ["dummy|split"]\n---|---\nhttps://cache-user:demo|opaque@example.test/x',
 			"+https://example-user:demo-password@example.test/x\n-https://example-user:other-password@example.test/y",
+			"xghp_0123456789012345file://localhost/home/cache-fixture/private.txt",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",

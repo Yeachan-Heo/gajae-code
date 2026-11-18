@@ -616,6 +616,7 @@ function stripUrlUserinfo(text: string): string {
  * text, so the cache cannot inherit that assumption.
  */
 const CACHE_VENDOR_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+	[/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»"],
 	[/github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
 	[/gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
 	[/(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
@@ -726,8 +727,11 @@ function scrubCacheText(text: string, diff = false): string {
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutAtSigns);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	let scrubbed = redactCrashSecrets(assignments.text);
-	scrubbed = scrubCacheVendorTokens(scrubbed);
+	// Paths are masked before vendor tokens: a token pattern can consume a
+	// following `file` scheme word, exposing a home path that would otherwise
+	// have been scrubbed first.
 	scrubbed = scrubHostPaths(scrubbed);
+	scrubbed = scrubCacheVendorTokens(scrubbed);
 	scrubbed = scrubbed.replaceAll(AT_SIGN_MASK, "@");
 	return containers.restore(authHeaders.restore(assignments.restore(scrubbed)));
 }
