@@ -330,6 +330,37 @@ function recomputeFileOffsetsAfterScrubbing(
 }
 
 /**
+ * Scrub path fields in file metadata objects.
+ * Filenames from diffs are untrusted and may contain credential-like strings.
+ * Since paths are secondary metadata used only for rendering/labeling, we
+ * redact them by stripping components that contain credential keywords or
+ * replacing with generic labels when content is redacted.
+ */
+function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unknown>[] {
+	return files.map((file, index) => {
+		const scrubbedFile = { ...file };
+		// For each path field, check if it contains credential-like patterns.
+		// If a path contains keywords like 'secret', 'token', 'key', 'password', etc.,
+		// it's safer to replace it with a generic placeholder.
+		const credentialPattern = /(?:secret|token|password|pass|api_?key|auth|credential|private|key)/i;
+
+		if (typeof scrubbedFile.path === "string") {
+			if (credentialPattern.test(scrubbedFile.path)) {
+				// Path contains credential-like patterns; redact it
+				scrubbedFile.path = `file-${index}`;
+			}
+		}
+		if (typeof scrubbedFile.oldPath === "string") {
+			if (credentialPattern.test(scrubbedFile.oldPath)) {
+				// oldPath contains credential-like patterns; redact it
+				scrubbedFile.oldPath = `file-${index}.old`;
+			}
+		}
+		return scrubbedFile;
+	});
+}
+
+/**
  * Scrub sensitive material from cache inputs before storage.
  * For pr-diff, scrubs the unified diff in both payload and rendered.
  * For other kinds, scrubs the rendered text using the shared redactor.
@@ -349,8 +380,11 @@ function scrubCacheInput<T>(kind: CacheKind, payload: T, rendered: string): { pa
 			const scrubbedUnified = scrubUnifiedDiff(payloadObj.unified);
 			let scrubbedFiles = payloadObj.files as Record<string, unknown>[] | undefined;
 
-			// Recompute file offsets after scrubbing, as redaction can change byte positions
+			// Scrub path metadata and recompute offsets after scrubbing
 			if (Array.isArray(scrubbedFiles) && scrubbedFiles.length > 0) {
+				// First scrub path fields which may contain credentials
+				scrubbedFiles = scrubFileMetadata(scrubbedFiles);
+				// Then recompute offsets, as redaction can change byte positions
 				scrubbedFiles = recomputeFileOffsetsAfterScrubbing(scrubbedUnified, scrubbedFiles);
 			}
 

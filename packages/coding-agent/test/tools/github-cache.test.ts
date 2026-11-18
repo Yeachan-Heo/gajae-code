@@ -770,3 +770,50 @@ describe("getOrFetchPr (gh-wired wrapper)", () => {
 		expect(spy).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe("Credential scrubbing in cached data", () => {
+	it("[P2] scrubs path fields in cached diff metadata", () => {
+		// Sensitive filenames should be scrubbed from cached file metadata
+		const credentialPath = "src/secret-api-key.json";
+		const normalPath = "src/main.ts";
+
+		const diffPayload = {
+			unified: `diff --git a/${credentialPath} b/${credentialPath}\nindex 1111111..2222222 100644\n--- a/${credentialPath}\n+++ b/${credentialPath}\n@@ -1 @@\n-secret\n+newsecret\n`,
+			files: [
+				{
+					path: credentialPath,
+					oldPath: credentialPath,
+					startOffset: 0,
+					endOffset: 100,
+				},
+				{
+					path: normalPath,
+					startOffset: 100,
+					endOffset: 200,
+				},
+			],
+		};
+
+		putCached({
+			repo: TEST_REPO,
+			kind: "pr-diff" as const,
+			number: 77,
+			includeComments: false,
+			payload: diffPayload,
+			rendered: diffPayload.unified,
+			authKey: TEST_AUTH_KEY,
+		});
+
+		const cached = getCached(TEST_REPO, "pr-diff", 77, false, TEST_AUTH_KEY);
+		expect(cached).not.toBeNull();
+		if (!cached) return;
+
+		// Sensitive filename should NOT appear in cached payload
+		const payloadJson = JSON.stringify(cached.payload);
+		expect(payloadJson).not.toContain("secret-api-key");
+		// The filename pattern should be redacted/replaced
+		expect(payloadJson).not.toContain("/src/secret");
+		// But normal paths should be visible
+		expect(payloadJson).toContain(normalPath);
+	});
+});

@@ -199,5 +199,30 @@ describe("unified diff scrubber", () => {
 			const scrubbedNoTrailing = scrubUnifiedDiff(diffNoTrailing);
 			expect(scrubbedNoTrailing.endsWith("\n")).toBe(false);
 		});
+
+		it("[P2] redacts multi-line PEM blocks in diff format", () => {
+			// A PEM block that spans multiple lines should be fully redacted
+			const diff = [
+				...HEADER,
+				"@@ -0,0 +1,3 @@",
+				"+-----BEGIN PRIVATE KEY-----",
+				"+MIIEvQIBADANBgkqhkiG9w0BAQE",
+				"+-----END PRIVATE KEY-----",
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// PEM content should be redacted
+			expect(scrubbed).not.toContain("BEGIN PRIVATE KEY");
+			expect(scrubbed).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQE");
+			expect(scrubbed).not.toContain("END PRIVATE KEY");
+
+			// Line count should be preserved
+			expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+
+			// Hunk header should be preserved
+			expect(scrubbed).toContain("@@ -0,0 +1,3 @@");
+		});
 	});
 });
