@@ -816,4 +816,105 @@ describe("Credential scrubbing in cached data", () => {
 		// But normal paths should be visible
 		expect(payloadJson).toContain(normalPath);
 	});
+
+	describe("pr-diff cache path scrubbing - false positive prevention", () => {
+		it("does not redact legitimate files in cache", async () => {
+			const diffPayload: Record<string, unknown> = {
+				unified:
+					"diff --git a/src/passport.js b/src/passport.js\nindex 1..2 100644\n--- a/src/passport.js\n+++ b/src/passport.js\n@@ -1,1 +1,1 @@\n const strategy = new LocalStrategy();",
+				files: [
+					{
+						path: "src/passport.js",
+						oldPath: "src/passport.js",
+						changes: 1,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 100,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 100, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// passport.js should NOT be redacted (it's a legitimate library)
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).toContain("passport.js");
+			expect(payloadJson).not.toContain("file-redacted");
+		});
+
+		it("does not redact authorization-service.ts in cache", async () => {
+			const diffPayload: Record<string, unknown> = {
+				unified:
+					"diff --git a/src/authorization-service.ts b/src/authorization-service.ts\nindex 1..2 100644\n--- a/src/authorization-service.ts\n+++ b/src/authorization-service.ts\n@@ -1,1 +1,1 @@\n export class AuthorizationService {}",
+				files: [
+					{
+						path: "src/authorization-service.ts",
+						oldPath: "src/authorization-service.ts",
+						changes: 1,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 101,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 101, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// authorization-service.ts should NOT be redacted
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).toContain("authorization-service.ts");
+			expect(payloadJson).not.toContain("file-redacted");
+		});
+
+		it("DOES redact actual credential files in cache", async () => {
+			const diffPayload: Record<string, unknown> = {
+				unified:
+					'diff --git a/config/secret-api-key.json b/config/secret-api-key.json\nindex 1..2 100644\n--- a/config/secret-api-key.json\n+++ b/config/secret-api-key.json\n@@ -1,1 +1,1 @@\n {\\"api\\": \\"sensitive\\"}',
+				files: [
+					{
+						path: "config/secret-api-key.json",
+						oldPath: "config/secret-api-key.json",
+						changes: 1,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 102,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 102, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// secret-api-key.json SHOULD be redacted
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).not.toContain("secret-api-key");
+			expect(payloadJson).toContain("file-redacted");
+		});
+	});
 });

@@ -333,26 +333,50 @@ function recomputeFileOffsetsAfterScrubbing(
  * Scrub path fields in file metadata objects.
  * Filenames from diffs are untrusted and may contain credential-like strings.
  * Since paths are secondary metadata used only for rendering/labeling, we
- * redact them by stripping components that contain credential keywords or
- * replacing with generic labels when content is redacted.
+ * redact them by replacing with generic labels when they clearly indicate credentials.
+ *
+ * We only redact path COMPONENTS that clearly indicate credentials,
+ * avoiding false positives like passport.js, keyboard.ts, authorization-service.ts
  */
 function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unknown>[] {
 	return files.map((file, index) => {
 		const scrubbedFile = { ...file };
-		// For each path field, check if it contains credential-like patterns.
-		// If a path contains keywords like 'secret', 'token', 'key', 'password', etc.,
-		// it's safer to replace it with a generic placeholder.
-		const credentialPattern = /(?:secret|token|password|pass|api_?key|auth|credential|private|key)/i;
+
+		const redactIfCredential = (path: string | undefined): string | undefined => {
+			if (typeof path !== "string") return path;
+
+			// Split path into components and check each one
+			const components = path.split("/");
+			let hasCredentialComponent = false;
+
+			for (const component of components) {
+				// Match only if the credential keyword is a clear part of the component name
+				// This includes patterns like:
+				// - secret-key, secret_key, secret.key
+				// - api-key.json, apikey.env
+				// - password.conf, .env.password
+				// But NOT: passport.js, keyboard.ts, authorization-service.ts
+				const credentialPattern =
+					/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
+
+				if (credentialPattern.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+			}
+
+			return hasCredentialComponent ? undefined : path;
+		};
 
 		if (typeof scrubbedFile.path === "string") {
-			if (credentialPattern.test(scrubbedFile.path)) {
-				// Path contains credential-like patterns; redact it
+			const redacted = redactIfCredential(scrubbedFile.path);
+			if (redacted === undefined) {
 				scrubbedFile.path = `file-${index}`;
 			}
 		}
 		if (typeof scrubbedFile.oldPath === "string") {
-			if (credentialPattern.test(scrubbedFile.oldPath)) {
-				// oldPath contains credential-like patterns; redact it
+			const redacted = redactIfCredential(scrubbedFile.oldPath);
+			if (redacted === undefined) {
 				scrubbedFile.oldPath = `file-${index}.old`;
 			}
 		}
