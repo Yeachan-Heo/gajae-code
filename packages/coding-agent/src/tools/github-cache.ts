@@ -653,8 +653,8 @@ function scrubHostPaths(text: string): string {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
 		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
-		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
-		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/root(?![A-Za-z0-9._-])/g, "~");
+		scrubbed = scrubbed.replace(/\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
+		scrubbed = scrubbed.replace(/\/root(?![A-Za-z0-9._-])/g, "~");
 		// JSON text can escape path separators; mask the same local paths in
 		// that spelling without changing the surrounding text.
 		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
@@ -683,8 +683,8 @@ function scrubHostPaths(text: string): string {
 		// A valid URL path is content. Only a malformed local authority (empty
 		// port on localhost) is treated as carrying a local path.
 		const localAuthority =
-			/^(?:[a-z][a-z0-9+.-]*:)?\/\/(?:localhost:(?=\/)|\/)/i.test(url) ||
-			/^(?:[a-z][a-z0-9+.-]*:)?\\\/\\\/(?:localhost:(?=\\\/)|\\\/)/i.test(url);
+			/^(?:[a-z][a-z0-9+.-]*:)?\/\/(?:localhost(?::(?=\/))?\/|\/)/i.test(url) ||
+			/^(?:[a-z][a-z0-9+.-]*:)?\\\/\\\/(?:localhost(?::(?=\\\/))?\\\/|\\\/)/i.test(url);
 		if (!localAuthority) return url;
 		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
@@ -723,14 +723,12 @@ function scrubCacheText(text: string, diff = false): string {
 	// The shared URL rule does not know about Markdown cell separators and can
 	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
 	// (userinfo was already removed) so only our authority pass sees them.
-	const withoutAtSigns = containers.text.replaceAll("@", AT_SIGN_MASK);
+	// Host paths come off before any token/assignment redactor can consume a
+	// following scheme word and turn a local path into a remote-looking span.
+	const withoutAtSigns = scrubHostPaths(containers.text).replaceAll("@", AT_SIGN_MASK);
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutAtSigns);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	let scrubbed = redactCrashSecrets(assignments.text);
-	// Paths are masked before vendor tokens: a token pattern can consume a
-	// following `file` scheme word, exposing a home path that would otherwise
-	// have been scrubbed first.
-	scrubbed = scrubHostPaths(scrubbed);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
 	scrubbed = scrubbed.replaceAll(AT_SIGN_MASK, "@");
 	return containers.restore(authHeaders.restore(assignments.restore(scrubbed)));

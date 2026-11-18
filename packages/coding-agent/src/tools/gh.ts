@@ -2949,6 +2949,7 @@ function diffGitPathTokens(line: string): PrDiffPathToken[] {
 			end: trailStart + oldToken.nextIndex,
 			value: oldToken.value,
 			escaped: oldToken.escaped,
+			decoded: oldToken.decoded,
 		});
 		const newStart = skipDiffHeaderSpaces(trail, oldToken.nextIndex);
 		if (newStart >= trail.length) return tokens;
@@ -2958,6 +2959,7 @@ function diffGitPathTokens(line: string): PrDiffPathToken[] {
 			end: quotedNew ? trailStart + quotedNew.nextIndex : line.length,
 			value: quotedNew ? quotedNew.value : trail.slice(newStart),
 			escaped: quotedNew?.escaped,
+			decoded: quotedNew?.decoded,
 		});
 		return tokens;
 	}
@@ -2973,6 +2975,7 @@ function diffGitPathTokens(line: string): PrDiffPathToken[] {
 			end: trailStart + newToken.nextIndex,
 			value: newToken.value,
 			escaped: newToken.escaped,
+			decoded: newToken.decoded,
 		});
 		return tokens;
 	}
@@ -2993,6 +2996,7 @@ function singlePathToken(line: string, prefix: string): PrDiffPathToken[] {
 			end: quoted ? quoted.nextIndex : line.length,
 			value: quoted ? quoted.value : line.slice(start),
 			escaped: quoted?.escaped,
+			decoded: quoted?.decoded,
 		},
 	];
 }
@@ -3010,6 +3014,7 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 			end: prefix.length + first.nextIndex,
 			value: first.value,
 			escaped: first.escaped,
+			decoded: first.decoded,
 		});
 		const afterAnd = body.indexOf(" and ", first.nextIndex);
 		if (afterAnd === -1) return tokens;
@@ -3020,6 +3025,7 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 			end: prefix.length + (quotedSecond ? quotedSecond.nextIndex : body.length),
 			value: quotedSecond ? quotedSecond.value : body.slice(secondStart),
 			escaped: quotedSecond?.escaped,
+			decoded: quotedSecond?.decoded,
 		});
 		return tokens;
 	}
@@ -3055,6 +3061,7 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 		end: prefix.length + (quotedSecond ? quotedSecond.nextIndex : body.length),
 		value: quotedSecond ? quotedSecond.value : body.slice(secondStart),
 		escaped: quotedSecond?.escaped,
+		decoded: quotedSecond?.decoded,
 	});
 	return tokens;
 }
@@ -3235,10 +3242,10 @@ function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeade
 	return undefined;
 }
 
-function parseDiffPathLine(line: string, prefix: string): { value: string; escaped?: boolean } {
+function parseDiffPathLine(line: string, prefix: string): { value: string; escaped?: boolean; decoded?: string } {
 	const rest = line.slice(prefix.length);
 	const token = parseDiffQuotedToken(rest, 0);
-	return token ? { value: token.value, escaped: token.escaped } : { value: rest };
+	return token ? { value: token.value, escaped: token.escaped, decoded: token.decoded } : { value: rest };
 }
 
 function stripPrDiffPathPrefix(value: string, prefix: "a/" | "b/"): string | undefined {

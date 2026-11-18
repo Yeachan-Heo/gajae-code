@@ -912,6 +912,8 @@ describe("github view cache persistence", () => {
 			'# "token": ["dummy|split"]\n---|---\nhttps://cache-user:demo|opaque@example.test/x',
 			"+https://example-user:demo-password@example.test/x\n-https://example-user:other-password@example.test/y",
 			"xghp_0123456789012345file://localhost/home/cache-fixture/private.txt",
+			"xghp_012345678901234Afile://localhost/home/cache-fixture/private.txt",
+			"ghp_0123456789012345file://localhost/home/cache-fixture/private.txt",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
