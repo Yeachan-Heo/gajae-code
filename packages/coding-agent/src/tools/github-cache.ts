@@ -660,6 +660,19 @@ function scrubHostPaths(text: string): string {
 			? `${scheme}${authority}${scrubbedPath}`
 			: `${scheme}${authority}/${scrubbedPath}`;
 	};
+	// A URL path is usually content, but `/home/<account>` and `/Users/<account>`
+	// still name this machine's account even when the surrounding text looks
+	// like a URL. Keep the URL shape and mask only the account segment.
+	const scrubHomeSegmentInUrl = (url: string): string => {
+		// A valid URL path is content. Only a malformed local authority (empty
+		// port on localhost) is treated as carrying a local path.
+		const localAuthority =
+			/^[a-z][a-z0-9+.-]*:\/\/localhost:(?=\/)/i.test(url) || /^[a-z][a-z0-9+.-]*:\/\/\//i.test(url);
+		if (!localAuthority) return url;
+		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
+		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|]+/g, "$1~");
+		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
+	};
 	// A URL's path is content, not a local path, so only scrub outside URL spans.
 	// `|` ends a span so a compact Markdown table row does not shield the next
 	// cell's home path.
@@ -669,7 +682,7 @@ function scrubHostPaths(text: string): string {
 		const index = match.index ?? 0;
 		const url = match[0];
 		out += scrubLocal(text.slice(last, index));
-		out += /^file:/i.test(url) ? scrubFileUrl(url) : url;
+		out += /^file:/i.test(url) ? scrubFileUrl(url) : scrubHomeSegmentInUrl(url);
 		last = index + url.length;
 	}
 	return out + scrubLocal(text.slice(last));
