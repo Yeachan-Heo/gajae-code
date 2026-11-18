@@ -275,12 +275,15 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		let progressTimer: Timer | undefined;
 
 		// A busy user message must not sit behind this observation window: end
-		// the wait so the tool boundary handles the steer next, while every
+		// the wait so the tool boundary handles the message next, while every
 		// watched job keeps running and still delivers its result on completion
-		// (`subagent await` parity). Nothing is folded: the jobs are already in
-		// the background, so no grace window or `busyPromptMode` gate applies.
+		// (`subagent await` parity). Interrupts on steering arrivals (steer mode)
+		// or follow-up queue additions (queue mode). Nothing is folded: the jobs
+		// are already in the background, so no grace window applies.
 		const steeringWaitAbort = new AbortController();
+		const followUpWaitAbort = new AbortController();
 		const steered = this.session.waitForUserSteering?.(steeringWaitAbort.signal).then(() => "steered" as const);
+		const queued = this.session.waitForFollowUpQueued?.(followUpWaitAbort.signal).then(() => "steered" as const);
 		const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
 		const onAbort = () => abortResolve();
 		let waitOutcome: "settled" | "steered";
@@ -297,12 +300,16 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			emitProgress();
 			if (signal?.aborted) onAbort();
 			else signal?.addEventListener("abort", onAbort, { once: true });
+			const steerSignals: Promise<"steered">[] = [];
+			if (steered) steerSignals.push(steered);
+			if (queued) steerSignals.push(queued);
 			waitOutcome = await Promise.race([
 				Promise.race([...racePromises, abortPromise]).then(() => "settled" as const),
-				...(steered ? [steered] : []),
+				...steerSignals,
 			]);
 		} finally {
 			steeringWaitAbort.abort();
+			followUpWaitAbort.abort();
 			signal?.removeEventListener("abort", onAbort);
 			manager.unwatchJobs(watchedJobIds);
 			clearTimeout(timeoutHandle);

@@ -115,6 +115,22 @@ describe("job await steer passthrough", () => {
 		await held.job.promise;
 	}, 10_000);
 
+	// In queue mode, a follow-up message queued during the job await should
+	// interrupt the wait just like a steer does in steer mode.
+	it("interrupts on queued follow-up messages in queue mode", async () => {
+		harness.setBusyPromptMode("queue");
+		const held = registerHeldJob("queue-mode follow-up");
+		const resultPromise = new JobTool(harness.session).execute("job-await-queue-followup", { poll: [held.id] });
+		await Bun.sleep(20);
+		harness.queueFollowUp("queued message");
+		const result = await resultPromise;
+
+		expect(textOf(result)).toContain(INTERRUPTED);
+		expect(harness.manager.getJob(held.id)?.status).toBe("running");
+		held.gate.resolve("follow-up result");
+		await held.job.promise;
+	}, 10_000);
+
 	it("passes through an await over a task-backed job without cancelling it", async () => {
 		const held = registerHeldJob("subagent task", harness.manager, "task");
 		const resultPromise = new JobTool(harness.session).execute("job-await-task", { poll: [held.id] });
