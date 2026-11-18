@@ -928,6 +928,7 @@ describe("github view cache persistence", () => {
 			"-Cookie: color=red; sid=cache-only-canary-X2m8",
 			"-Authorization: Basic Zm9vOmJhcg==",
 			"-Cookie: {\n-  sid: fixture-opaque-Q8m4\n-}",
+			"-Cookie: \n  sid=fixture-opaque-Q8m4",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
