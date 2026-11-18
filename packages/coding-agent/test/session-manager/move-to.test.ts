@@ -7,7 +7,6 @@ import {
 	loadEntriesFromFile,
 	type SessionHeader,
 	SessionManager,
-	type SessionMessageEntry,
 	syncSessionMoveDirectory,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@gajae-code/coding-agent/tools/path-utils";
@@ -71,22 +70,6 @@ function hasAssistantEntry(entries: unknown[]): boolean {
 			(e as any).type === "message" &&
 			"message" in e &&
 			(e as any).message?.role === "assistant",
-	);
-}
-
-function isMessageEntry(entry: unknown): entry is SessionMessageEntry {
-	return (
-		typeof entry === "object" &&
-		entry !== null &&
-		"type" in entry &&
-		(entry as { type?: string }).type === "message" &&
-		"message" in entry
-	);
-}
-
-function getUserMessages(entries: unknown[]): SessionMessageEntry[] {
-	return entries.filter(
-		(entry): entry is SessionMessageEntry => isMessageEntry(entry) && entry.message.role === "user",
 	);
 }
 

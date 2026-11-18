@@ -1,7 +1,7 @@
 ### Fixed
 
-- Restored `moveTo` relocation for non-shared sessions to simpler header patch + rewrite approach, reverting header-only patch complexity that drew multiple P1s (#7860)
+- `SessionManager.moveTo` rewrites the header cwd and recreates the transcript at the new location again; #7858 had dropped that rewrite (#7860).
 
-### Removed
+### Changed
 
-- Move Session tool in shared root TUI sessions returns to unsupported (pre-#7858 behavior); move in shared sessions requires fenced design pending #7856 follow-up
+- Move Session in a shared root TUI session is refused again, as before #7858, until a design exists that cannot drop entries other processes have saved (#7856).
