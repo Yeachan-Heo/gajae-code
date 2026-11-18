@@ -41,6 +41,15 @@ export interface InternalUrlExpansionOptions {
 	sessionCwd?: string;
 	/** Agent directory for this session. User rules use it. */
 	sessionAgentDir?: string;
+	/**
+	 * How the expanded text is read afterwards. `"shell"` (default) is command
+	 * text the shell parses, so quoting, multi-line, and nested-expansion guards
+	 * apply. `"data"` is a value the executor passes verbatim (an env value): no
+	 * shell parses it, so those guards would refuse legitimate content without
+	 * protecting anything. URL authorization and the shell-bearing path refusal
+	 * still apply, and a data replacement is never shell-escaped.
+	 */
+	context?: "shell" | "data";
 }
 
 /**
@@ -475,16 +484,35 @@ async function sessionScopedRulePath(
  * A canonical path carrying shell syntax can change the command that re-reads
  * the substituted text (arithmetic, heredocs, `eval`, `source`). Refuse it
  * fail-closed instead of trying to enumerate every such context.
+ * A backslash is the shell's escape character, so it stays in this set: it is
+ * only accepted after the separator normalization below has removed it.
  */
 const RULE_PATH_SHELL_SYNTAX = /[$`;&|<>()'"\\\n\r]/;
 
-function refuseShellBearingRulePath(resolvedPath: string): string {
-	if (RULE_PATH_SHELL_SYNTAX.test(resolvedPath)) {
+/**
+ * A drive-qualified Windows path. NTFS forbids `\` inside a name, so in such a
+ * path every backslash is a separator and the forward-slash spelling names the
+ * same file. The bash-compatible shell the bash tool runs on Windows reads `\`
+ * as an escape, so the forward-slash spelling is the only one that is both the
+ * intended file and free of shell syntax.
+ * UNC paths (`\\server\share\...`) are deliberately not rewritten: their
+ * `//server/share` spelling is not reliably accepted by every Windows shell, so
+ * they stay refused instead of guessed at.
+ */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+
+/**
+ * Return `resolvedPath` in the form the bash tool's shell reads as that same
+ * file, or refuse it when shell syntax survives that form.
+ */
+export function refuseShellBearingRulePath(resolvedPath: string): string {
+	const shellPath = WINDOWS_DRIVE_PATH.test(resolvedPath) ? resolvedPath.replaceAll("\\", "/") : resolvedPath;
+	if (RULE_PATH_SHELL_SYNTAX.test(shellPath)) {
 		throw new ToolError(
 			"rule:// URL resolved to a path containing shell syntax and cannot be expanded in a bash command.",
 		);
 	}
-	return resolvedPath;
+	return shellPath;
 }
 
 async function resolveInternalUrlToPath(

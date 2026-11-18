@@ -14,7 +14,12 @@ import type { Skill } from "../../src/extensibility/skills";
 import { resolveLocalUrlToPath } from "../../src/internal-urls";
 import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
-import { expandInternalUrls, expandSkillUrls, resolveSkillUrl } from "../../src/tools/bash-skill-urls";
+import {
+	expandInternalUrls,
+	expandSkillUrls,
+	refuseShellBearingRulePath,
+	resolveSkillUrl,
+} from "../../src/tools/bash-skill-urls";
 import { ToolError } from "../../src/tools/tool-errors";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
@@ -1191,6 +1196,32 @@ describe("expandInternalUrls session scope", () => {
 		},
 	);
 
+	it.skipIf(process.platform !== "win32")(
+		"expands an in-root rule whose canonical path carries Windows separators",
+		async () => {
+			const repo = await mkdtemp(path.join(tmpdir(), "bash-rule-win-path-"));
+			try {
+				const sourcePath = path.join(repo, ".agent", "rules", "deploy.md");
+				await mkdir(path.dirname(sourcePath), { recursive: true });
+				await writeFile(sourcePath, "windows-rule");
+				const router = createInternalRouter({ "rule://deploy": { sourcePath } });
+				const expanded = await expandInternalUrls("cat rule://deploy", {
+					skills: [],
+					internalRouter: router,
+					sessionCwd: repo,
+					sessionAgentDir: path.join(repo, "agent"),
+				});
+				// The resolved path is drive-qualified and backslash-separated on
+				// Windows; the shell reads the forward-slash spelling of the same file.
+				const real = await realpath(sourcePath);
+				expect(real).toContain("\\");
+				expect(expanded).toBe(`cat '${real.replaceAll("\\", "/")}'`);
+			} finally {
+				await rm(repo, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it.skipIf(process.platform === "win32" || !symlinkSupported)(
 		"does not leak a foreign session path when its rule link cannot be resolved",
 		async () => {
@@ -1409,6 +1440,54 @@ describe("expandInternalUrls session scope", () => {
 			}),
 			{ seed: PROPERTY_SEED, numRuns: 64 },
 		);
+	});
+});
+
+/**
+ * A Windows rule path reached this guard with backslashes and was refused, so
+ * every approved `rule://` expansion failed on Windows. A backslash is a
+ * separator there and an escape in the shell, so the guard has to translate
+ * rather than refuse, and still refuse when a backslash can be an escape.
+ */
+describe("refuseShellBearingRulePath", () => {
+	it("expresses a Windows drive path in the separator form the shell reads", () => {
+		expect(refuseShellBearingRulePath("C:\\Users\\me\\work\\repo\\.agent\\rules\\deploy.md")).toBe(
+			"C:/Users/me/work/repo/.agent/rules/deploy.md",
+		);
+		expect(refuseShellBearingRulePath("d:\\rules\\deploy.md")).toBe("d:/rules/deploy.md");
+	});
+
+	it("keeps the POSIX path it is given", () => {
+		expect(refuseShellBearingRulePath("/home/me/work/repo/.agents/rules/deploy.md")).toBe(
+			"/home/me/work/repo/.agents/rules/deploy.md",
+		);
+	});
+
+	it("still refuses a backslash that the shell would read as an escape", () => {
+		// Not Windows-shaped, so a backslash is a literal name character that an
+		// unquoted or doubly-quoted context would consume as an escape.
+		expect(() => refuseShellBearingRulePath("/home/me/rules/odd\\name.md")).toThrow(/shell syntax/);
+		// A UNC path has no forward-slash spelling every Windows shell accepts.
+		expect(() => refuseShellBearingRulePath("\\\\server\\share\\rules\\deploy.md")).toThrow(/shell syntax/);
+	});
+
+	it("still refuses shell syntax that survives separator translation", () => {
+		for (const resolvedPath of [
+			"C:\\repo\\$(touch pwned)\\rule.md",
+			"C:\\repo\\x; touch pwned;#\\rule.md",
+			"C:\\repo\\`whoami`\\rule.md",
+			"C:\\repo\\a&b\\rule.md",
+			"C:\\repo\\a|b\\rule.md",
+			"C:\\repo\\a<b\\rule.md",
+			"C:\\repo\\a>b\\rule.md",
+			"C:\\repo\\a(b)\\rule.md",
+			"C:\\repo\\a'b\\rule.md",
+			'C:\\repo\\a"b\\rule.md',
+			"C:\\repo\\a\nb\\rule.md",
+			"C:\\repo\\a\rb\\rule.md",
+		]) {
+			expect(() => refuseShellBearingRulePath(resolvedPath)).toThrow(/shell syntax/);
+		}
 	});
 });
 
