@@ -2433,7 +2433,9 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 					return { content: [{ type: "text" as const, text: "LAZY-BODY" }] };
 				},
 			};
+			const lazyEntered = Promise.withResolvers<void>();
 			const lazyRead = new LazyAgentTool(BUILTIN_TOOL_DESCRIPTORS.read!, undefined, async () => {
+				lazyEntered.resolve();
 				await lazyGate.promise;
 				return fakeRead;
 			});
@@ -2446,7 +2448,9 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 				[secretReadRule()],
 				{ interruptMode: "always" },
 			);
-			await run(session, "start lazy reads");
+			const runPromise = run(session, "start lazy reads");
+			await lazyEntered.promise;
+			await runPromise;
 
 			expect(toolResultText(session, "eval-1")).toContain("BLOCKED");
 			lazyGate.resolve();

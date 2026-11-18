@@ -14946,6 +14946,8 @@ export class AgentSession {
 					ctx: never,
 				) => {
 					return await this.sessionManager.runWithCwdReadLease(async () => {
+						// Lease admission can wait for a writer; fence before the target starts.
+						if (signal?.aborted) throw new ToolAbortError();
 						const admittedGeneration = this.sessionManager.getCwdGeneration();
 						const result = await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 						// The lease keeps writers out for the whole execution, so this can

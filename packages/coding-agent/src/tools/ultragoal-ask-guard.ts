@@ -5,7 +5,7 @@ import {
 	isUltragoalAskBlocked,
 	type UltragoalAskBlockDiagnostic,
 } from "../gjc-runtime/ultragoal-guard";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 
 const ULTRAGOAL_ASK_GUARD = Symbol.for("gajae-code.ultragoalAskGuard");
 
@@ -79,6 +79,9 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 				// The caller session id is the only binding, so a foreign session's
 				// durable run can never gate this ask.
 				await assertUltragoalAskAllowed(getCwd(), getContext(), getSessionAgentDir(), args[1]);
+				// The guard awaits; do not start the ask if the call was cancelled.
+				const signal = args[2] as AbortSignal | undefined;
+				if (signal?.aborted) throw new ToolAbortError();
 				return Reflect.apply(target.execute, target, args);
 			};
 		},
