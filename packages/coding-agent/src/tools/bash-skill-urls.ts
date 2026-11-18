@@ -377,14 +377,18 @@ function pathStaysInside(root: string, candidate: string): boolean {
 }
 
 /**
- * True when `candidate` is spelled inside `root`, ignoring case on Windows. This
- * answers provenance — was the request written under the configured directory —
- * and never identity: discovery stores the configured prefix, while the same
- * directory's real path can carry other casing or a symlinked home. Containment
- * decisions use {@link pathStaysInside} on the verified on-disk root instead.
+ * True when `candidate` is spelled inside `root`, folding case. This answers
+ * provenance — was the request written under the configured directory — and
+ * never identity: discovery stores the configured prefix, the same directory's
+ * real path can carry other casing, and a case-insensitive volume resolves the
+ * two spellings to one directory. Containment decisions use
+ * {@link pathStaysInside} on the verified on-disk root instead, which is exact
+ * wherever the path namespace is exact.
  */
 function pathSpelledInside(root: string, candidate: string): boolean {
-	const relative = path.relative(path.resolve(root), path.resolve(candidate));
+	const foldedRoot = path.resolve(root).toLowerCase();
+	const foldedCandidate = path.resolve(candidate).toLowerCase();
+	const relative = path.relative(foldedRoot, foldedCandidate);
 	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
