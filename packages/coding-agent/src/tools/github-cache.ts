@@ -315,12 +315,11 @@ const BOUNDED_CREDENTIAL_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-credential-`;
 const BOUNDED_AUTHORIZATION_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-auth-`;
 
 function restoreMasked(scrubbed: string, prefix: string, values: readonly string[]): string {
-	let restored = scrubbed;
-	for (let index = 0; index < values.length; index += 1) {
-		// Function replacer: a `$&`/`$'` sequence in sanitized text must stay literal.
-		restored = restored.replaceAll(`${prefix}${index}\u0000`, () => values[index] ?? "");
-	}
-	return restored;
+	if (values.length === 0) return scrubbed;
+	// One pass with a function replacer: a `$&`/`$'` sequence in sanitized text
+	// must stay literal, and a large cache value can hold many slots.
+	const pattern = new RegExp(`${escapeRegExp(prefix)}(\\d+)\u0000`, "g");
+	return scrubbed.replace(pattern, (_match, index: string) => values[Number(index)] ?? "");
 }
 
 const AT_SIGN_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-at-\u0000`;
@@ -824,9 +823,11 @@ function isSingleQuoteItemStart(text: string, index: number): boolean {
  * The whole header and container are masked with a nonce sentinel while the
  * line-level passes run, then restored. Replacement preserves the skeleton:
  * quotes, backticks, brackets, commas, whitespace, and line-leading diff
- * markers are copied, only item content is replaced. A multiline container
- * therefore keeps its line count and diff hunk shape, and each item keeps a
- * paired opening and closing quote.
+ * markers, backticks, and `:` separators are copied, only item content is
+ * replaced. A terminated container therefore keeps its line count and diff
+ * hunk shape, each terminated item keeps a paired opening and closing quote,
+ * and a multiline item keeps each physical line's diff prefix. An unterminated
+ * string keeps its remaining lines (redacted) with no invented closer.
  */
 const CREDENTIAL_CONTAINER_NAME = /^(?:[A-Za-z0-9]+-)*(?:cookies?|authorization|auth)$/i;
 const CONTAINER_REDACTION = "«redacted»";
@@ -844,9 +845,25 @@ interface CredentialContainerSpan {
 	terminated: boolean;
 }
 
+/** True when `ch` is horizontal whitespace, including non-ASCII blanks. */
+function isHorizontalBlank(ch: string | undefined): boolean {
+	return ch !== undefined && ch !== "\n" && ch !== "\r" && /\s/.test(ch);
+}
+
 /** True when `ch` is part of a container's structural skeleton. */
 function isContainerSkeleton(ch: string): boolean {
-	return ch === " " || ch === "\t" || ch === "\r" || ch === "\n" || ",[]{}:`".includes(ch);
+	return ch === " " || ch === "\t" || ch === "\r" || ch === "\n" || ",[]{}:".includes(ch);
+}
+
+/** True when `ch` opens a string inside container content. */
+function isContainerStringOpener(text: string, index: number): boolean {
+	const ch = text[index];
+	return ch === '"' || ch === "`" || (ch === "'" && !isWordApostrophe(text, index));
+}
+
+/** True when `index` is a diff marker at the start of a physical line. */
+function isLineLeadingDiffMarker(text: string, index: number, start: number): boolean {
+	return index > start && text[index - 1] === "\n" && (text[index] === "+" || text[index] === "-");
 }
 
 /** Index of the quote that closes the string opened at `start`, or -1. */
@@ -865,14 +882,14 @@ function findStringEnd(text: string, start: number, quote: string): number {
 /** Skip blanks; a line-leading header whose value starts on the next line is still its value. */
 function skipHeaderValueTrivia(text: string, start: number, allowNextLine: boolean): number {
 	let index = start;
-	while (text[index] === " " || text[index] === "\t") index++;
+	while (isHorizontalBlank(text[index])) index++;
 	if (!allowNextLine) return index;
 	if (text[index] !== "\n" && text[index] !== "\r") return index;
 	if (text[index] === "\r") index++;
 	if (text[index] !== "\n") return index;
 	index++;
 	if (text[index] === "+" || text[index] === "-") index++;
-	while (text[index] === " " || text[index] === "\t") index++;
+	while (isHorizontalBlank(text[index])) index++;
 	return index;
 }
 
@@ -888,7 +905,7 @@ function matchCredentialHeaderAt(text: string, start: number, allowNextLine: boo
 	if (index === nameStart) return null;
 	if (!CREDENTIAL_CONTAINER_NAME.test(text.slice(nameStart, index))) return null;
 	if (text[index] === '"' || text[index] === "'") index++;
-	while (text[index] === " " || text[index] === "\t") index++;
+	while (isHorizontalBlank(text[index])) index++;
 	if (text[index] !== ":" && text[index] !== "=") return null;
 	return {
 		headerStart: nameStart,
@@ -900,7 +917,7 @@ function matchCredentialHeaderAt(text: string, start: number, allowNextLine: boo
 function matchLineCredentialHeader(text: string, lineStart: number): CredentialHeaderMatch | null {
 	let index = lineStart;
 	if (text[index] === "+" || text[index] === "-") index++;
-	while (text[index] === " " || text[index] === "\t") index++;
+	while (isHorizontalBlank(text[index])) index++;
 	return matchCredentialHeaderAt(text, index, true);
 }
 
@@ -908,7 +925,7 @@ function matchLineCredentialHeader(text: string, lineStart: number): CredentialH
 function matchQuotedMemberHeader(text: string, quoteStart: number, quoteEnd: number): CredentialHeaderMatch | null {
 	if (!CREDENTIAL_CONTAINER_NAME.test(text.slice(quoteStart + 1, quoteEnd))) return null;
 	let index = quoteEnd + 1;
-	while (text[index] === " " || text[index] === "\t") index++;
+	while (isHorizontalBlank(text[index])) index++;
 	if (text[index] !== ":" && text[index] !== "=") return null;
 	const valueStart = skipHeaderValueTrivia(text, index + 1, true);
 	if (text[valueStart] !== "[" && text[valueStart] !== "{") return null;
@@ -924,6 +941,7 @@ function opensContainer(text: string, match: CredentialHeaderMatch): boolean {
 function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 	const spans: CredentialContainerSpan[] = [];
 	const stack: { closer: string; credential: CredentialHeaderMatch | null }[] = [];
+	let openCredentialContainers = 0;
 	let quote: string | null = null;
 	let pending: CredentialHeaderMatch | null = null;
 	for (let index = 0; index < text.length; index++) {
@@ -953,12 +971,11 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 		// A credential header may also sit mid-line (`trace Authorization: [`).
 		// Its left boundary is a non-name byte, so ordinary words cannot start a
 		// header of their own.
-		if (
-			ch !== undefined &&
-			/[A-Za-z]/.test(ch) &&
-			(index === 0 || !/[A-Za-z0-9_-]/.test(text[index - 1] as string)) &&
-			stack.every(entry => entry.credential === null)
-		) {
+		const previous = text[index - 1];
+		const atMarkedLineStart = (previous === "+" || previous === "-") && (index < 2 || text[index - 2] === "\n");
+		const leftBoundary =
+			index === 0 || (!/[A-Za-z0-9_-]/.test(previous as string) && previous !== "-" ? true : atMarkedLineStart);
+		if (ch !== undefined && /[A-Za-z]/.test(ch) && leftBoundary && openCredentialContainers === 0) {
 			const header = matchCredentialHeaderAt(text, index, false);
 			if (header !== null && opensContainer(text, header)) {
 				pending = header;
@@ -970,7 +987,7 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 			const close = findStringEnd(text, index, ch);
 			// A quoted member name (`"auth":`) is a header at any depth, but never
 			// inside a credential container that is already being emptied.
-			if (close !== -1 && stack.every(entry => entry.credential === null)) {
+			if (close !== -1 && openCredentialContainers === 0) {
 				const header = matchQuotedMemberHeader(text, index, close);
 				if (header !== null) {
 					pending = header;
@@ -994,10 +1011,9 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 			continue;
 		}
 		if (ch === "[" || ch === "{") {
-			stack.push({
-				closer: ch === "[" ? "]" : "}",
-				credential: pending !== null && pending.valueStart === index ? pending : null,
-			});
+			const credential = pending !== null && pending.valueStart === index ? pending : null;
+			if (credential !== null) openCredentialContainers++;
+			stack.push({ closer: ch === "[" ? "]" : "}", credential });
 			pending = null;
 			continue;
 		}
@@ -1008,6 +1024,7 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 		if (!top || top.closer !== ch) continue;
 		stack.pop();
 		if (top.credential !== null) {
+			openCredentialContainers--;
 			spans.push({
 				headerStart: top.credential.headerStart,
 				valueStart: top.credential.valueStart,
@@ -1029,46 +1046,58 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 	return spans.sort((left, right) => left.headerStart - right.headerStart);
 }
 
-/** Replace container content while copying its structural skeleton. */
-function redactContainerBody(text: string, span: CredentialContainerSpan): string {
-	const contentEnd = span.terminated ? span.valueEnd - 1 : span.valueEnd;
-	let out = text.slice(span.valueStart, span.valueStart + 1);
-	let index = span.valueStart + 1;
-	while (index < contentEnd) {
+/**
+ * Replace every non-skeleton run in [start, end) with one redaction marker while
+ * copying whitespace, brackets, commas, and line-leading diff markers. The
+ * emitted text keeps the region's physical line count and diff prefixes.
+ */
+function redactSkeletonRegion(text: string, start: number, end: number): string {
+	let out = "";
+	let index = start;
+	while (index < end) {
 		const ch = text[index] as string;
-		if (ch === '"' || ch === "`" || (ch === "'" && !isWordApostrophe(text, index))) {
-			const close = findStringEnd(text, index, ch);
-			if (close === -1 || close >= contentEnd) {
-				out += `${ch}${CONTAINER_REDACTION}`;
-				index = contentEnd;
-				continue;
-			}
-			out += `${ch}${CONTAINER_REDACTION}${ch}`;
-			index = close + 1;
-			continue;
-		}
-		if (index > span.valueStart + 1 && text[index - 1] === "\n" && (ch === "+" || ch === "-")) {
-			out += ch;
-			index++;
-			continue;
-		}
-		if (isContainerSkeleton(ch)) {
+		if (isContainerSkeleton(ch) || isLineLeadingDiffMarker(text, index, start)) {
 			out += ch;
 			index++;
 			continue;
 		}
 		let runEnd = index + 1;
 		while (
-			runEnd < contentEnd &&
+			runEnd < end &&
 			!isContainerSkeleton(text[runEnd] as string) &&
-			text[runEnd] !== '"' &&
-			text[runEnd] !== "`" &&
-			!(text[runEnd] === "'" && !isWordApostrophe(text, runEnd))
+			!isLineLeadingDiffMarker(text, runEnd, start)
 		) {
 			runEnd++;
 		}
 		out += CONTAINER_REDACTION;
 		index = runEnd;
+	}
+	return out;
+}
+
+/** Replace container content while copying its structural skeleton. */
+function redactContainerBody(text: string, span: CredentialContainerSpan): string {
+	const contentEnd = span.terminated ? span.valueEnd - 1 : span.valueEnd;
+	let out = text.slice(span.valueStart, span.valueStart + 1);
+	let index = span.valueStart + 1;
+	while (index < contentEnd) {
+		if (isContainerStringOpener(text, index)) {
+			const opener = text[index] as string;
+			const close = findStringEnd(text, index, opener);
+			const stringEnd = close === -1 || close >= contentEnd ? contentEnd : close;
+			// A single-line item collapses to one marker; a multiline one keeps its
+			// physical lines so a diff hunk's count and prefixes stay valid.
+			const multiline =
+				text.slice(index + 1, stringEnd).includes("\n") || text.slice(index + 1, stringEnd).includes("\r");
+			out += opener + (multiline ? redactSkeletonRegion(text, index + 1, stringEnd) : CONTAINER_REDACTION);
+			if (stringEnd < contentEnd) out += opener;
+			index = stringEnd < contentEnd ? stringEnd + 1 : contentEnd;
+			continue;
+		}
+		let regionEnd = index;
+		while (regionEnd < contentEnd && !isContainerStringOpener(text, regionEnd)) regionEnd++;
+		out += redactSkeletonRegion(text, index, regionEnd);
+		index = regionEnd;
 	}
 	if (span.terminated) out += text[span.valueEnd - 1];
 	return out;

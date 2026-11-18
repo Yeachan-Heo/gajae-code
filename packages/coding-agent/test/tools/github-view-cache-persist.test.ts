@@ -1742,6 +1742,35 @@ describe("github view cache persistence", () => {
 			expect(cacheFileBytes()).not.toContain("inline-auth-opaque-13");
 		});
 
+		it("finds a marked container after an unrelated prose opener", () => {
+			const body = '{\n-Cookie: [\n-  doesn\'t,\n-  "prose-open-opaque-14"\n-]\n }';
+			storeBody(1314, body);
+			const stored = readBody(1314);
+			expect(stored).not.toContain("prose-open-opaque-14");
+			expect(stored).toContain("-]");
+			expect(stored).not.toContain("\u0000");
+			expect(cacheFileBytes()).not.toContain("prose-open-opaque-14");
+		});
+
+		it("continues a container opener across a non-ASCII blank", () => {
+			const body = '+Cookie:\n+\u00a0[\n+"nbsp-opaque-15"\n+]';
+			storeBody(1315, body);
+			const stored = readBody(1315);
+			expect(stored).not.toContain("nbsp-opaque-15");
+			expect(stored).not.toContain("\u0000");
+			expect(cacheFileBytes()).not.toContain("nbsp-opaque-15");
+		});
+
+		it("keeps the line count of a multiline quoted item", () => {
+			const body = "Cookie: [\n  'one\n+two multiline-opaque-16'\n]";
+			storeBody(1316, body);
+			const stored = readBody(1316) ?? "";
+			expect(stored).not.toContain("multiline-opaque-16");
+			expect(stored.split("\n").length).toBe(body.split("\n").length);
+			expect(stored).toContain("\n+");
+			expect(stored).not.toContain("\u0000");
+		});
+
 		it("keeps a well-formed diff container's line accounting", () => {
 			const diff = [
 				"diff --git a/a b/a",
