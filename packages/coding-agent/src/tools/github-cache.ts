@@ -508,14 +508,19 @@ function tableRowFlags(lines: string[]): boolean[] {
 			opener = null;
 		}
 	}
+	const indentOf = (row: string): number => row.length - row.trimStart().length;
 	for (let i = 0; i < lines.length; i++) {
 		if (fenced[i] === true) continue;
-		const trimmed = (rows[i] ?? "").trim();
+		const raw = rows[i] ?? "";
+		// Four or more columns is an indented code block, never a table row.
+		if (indentOf(raw) >= 4) continue;
+		const trimmed = raw.trim();
 		if (trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"))) flags[i] = true;
 	}
 	let covered = -1;
 	for (let i = 1; i < lines.length; i++) {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
+		if (indentOf(rows[i] ?? "") >= 4 || indentOf(rows[i - 1] ?? "") >= 4) continue;
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
 		flags[i - 1] = true;
 		flags[i] = true;
@@ -523,7 +528,7 @@ function tableRowFlags(lines: string[]): boolean[] {
 		for (; j < lines.length; j++) {
 			if (fenced[j] === true) break;
 			const row = rows[j] ?? "";
-			if (row.trim() === "" || !row.includes("|")) break;
+			if (row.trim() === "" || !row.includes("|") || indentOf(row) >= 4) break;
 			flags[j] = true;
 		}
 		covered = j - 1;
