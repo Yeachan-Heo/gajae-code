@@ -170,9 +170,14 @@ function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][]
 	return redacted;
 }
 
-/** Decode `\u` escapes in every string leaf, so banner detection sees the text a reader sees. */
+/**
+ * Decode `\u` escapes in every string leaf, so banner detection sees the text a reader sees.
+ * Tool arguments can carry one encoded layer and the value itself can spell another, which
+ * the renderer used to decode after this prepass; decoding twice here keeps banner pairing
+ * and the printed value on the same characters instead of materialising a banner later.
+ */
 function decodeValueStrings(value: unknown): unknown {
-	if (typeof value === "string") return decodeUnicodeEscapeText(value);
+	if (typeof value === "string") return decodeUnicodeEscapeText(decodeUnicodeEscapeText(value));
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
 	const decoded = Object.create(null) as Record<string, unknown>;
@@ -210,10 +215,14 @@ function serializeParameterValue(value: unknown): string {
 	return typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
 }
 
-/** Text of one tool-argument value: scrubbed, decoded, then escaped for XML. */
+/**
+ * Text of one tool-argument value: scrubbed, then escaped for XML.
+ * Decoding happened in the entry pairing, so the scrubber sees the same characters that
+ * were checked for a private-key block.
+ */
 function formatArgumentText(value: unknown, key: string): string {
 	const structured = redactStructuredSecrets(value, key, { headerPairs: isHeaderCollectionKey });
-	return escapeXmlText(redactCrashSecrets(decodeUnicodeEscapeText(serializeParameterValue(structured))));
+	return escapeXmlText(redactCrashSecrets(serializeParameterValue(structured)));
 }
 
 /** Keywords whose value is one concrete literal, so a credential-named property's own data can be masked. */

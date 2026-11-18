@@ -500,6 +500,30 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
+	it("removes a private-key block that only appears after two escape layers", () => {
+		const body = "DOUBLE_ESCAPED_PEM_BODY";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-double-escaped-banner",
+						name: "request",
+						arguments: {
+							body: `\\u005cu002d----BEGIN RSA PRIVATE KEY-----\n${body}`,
+							private_key: pem("RSA", "END"),
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
 	it("removes a private-key block split across bash output and its truncation notice", () => {
 		const body = "NOTICE_SPLIT_BODY";
 		const dumped = dump([
