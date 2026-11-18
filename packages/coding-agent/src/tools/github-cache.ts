@@ -304,13 +304,18 @@ function escapeRegExp(value: string): string {
  * redactor: their grammars are not a single value token.
  */
 const BOUNDED_CREDENTIAL_ASSIGNMENT =
-	/(?<![A-Za-z0-9])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|\{((?:\\.|[^{}\\\r\n])*)\}|\[((?:\\.|[^[\]\\\r\n])*)\]|([^\s"'`|;&,<>#]+)|(?=[\r\n]|$))/gi;
+	/(?<![A-Za-z0-9])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|\{((?:\\.|[^{}\\\r\n])*)\}|\[((?:\\.|[^[\]\\\r\n])*)\]|([^\s"'`|;&,<>#\u0000]+)|(?=[\r\n]|$))/gi;
 
 /**
  * Sentinels are nonce-prefixed so a literal NUL sequence in user text cannot
  * alias a mask slot and be replaced or deleted by restoration.
  */
-const CACHE_MASK_NONCE = Math.random().toString(36).slice(2);
+/**
+ * Hex only: a base36 nonce can end in `sk`, which makes the sentinel
+ * `gjc-…sk-container-…` match the vendor `sk-…` scrub and leave a NUL fragment
+ * that exact-match restoration cannot recover.
+ */
+const CACHE_MASK_NONCE = `${Math.random().toString(16).slice(2)}${Math.random().toString(16).slice(2)}`;
 const BOUNDED_CREDENTIAL_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-credential-`;
 const BOUNDED_AUTHORIZATION_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-auth-`;
 
@@ -452,7 +457,7 @@ function maskParameterizedAuthValues(text: string): string {
 				const preserved = /\s+cookie\s*:\s*[[{]/i.exec(rest) ?? /\u0000gjc-[a-z0-9]+-container-/i.exec(rest);
 				end = preserved ? valueStart + preserved.index : limit;
 			} else {
-				while (end < text.length && !/[\s,;]/.test(text[end])) end++;
+				while (end < text.length && !/[\s,;\u0000]/.test(text[end])) end++;
 			}
 		}
 		out += text.slice(last, index) + match[1] + match[2] + match[3] + match[4] + "«redacted»";
@@ -464,7 +469,7 @@ function maskParameterizedAuthValues(text: string): string {
 function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
 	const sanitized: string[] = [];
 	const masked = text.replace(
-		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
+		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,\u0000]+))/gi,
 		(
 			_match: string,
 			label: string,
@@ -855,15 +860,26 @@ function isContainerSkeleton(ch: string): boolean {
 	return ch === " " || ch === "\t" || ch === "\r" || ch === "\n" || ",[]{}:".includes(ch);
 }
 
+/** True when the byte at `index` follows an odd backslash run. */
+function isEscapedAt(text: string, index: number): boolean {
+	let slashes = 0;
+	while (text[index - 1 - slashes] === "\\") slashes++;
+	return slashes % 2 === 1;
+}
+
 /** True when `ch` opens a string inside container content. */
 function isContainerStringOpener(text: string, index: number): boolean {
 	const ch = text[index];
-	return ch === '"' || ch === "`" || (ch === "'" && !isWordApostrophe(text, index));
+	return (
+		(ch === '"' || ch === "`" || ch === "'") &&
+		(ch !== "'" || !isWordApostrophe(text, index)) &&
+		!isEscapedAt(text, index)
+	);
 }
 
 /** True when `index` is a diff marker at the start of a physical line. */
-function isLineLeadingDiffMarker(text: string, index: number, start: number): boolean {
-	return index > start && text[index - 1] === "\n" && (text[index] === "+" || text[index] === "-");
+function isLineLeadingDiffMarker(text: string, index: number): boolean {
+	return text[index - 1] === "\n" && (text[index] === "+" || text[index] === "-");
 }
 
 /** Index of the quote that closes the string opened at `start`, or -1. */
@@ -937,15 +953,35 @@ function opensContainer(text: string, match: CredentialHeaderMatch): boolean {
 	return text[match.valueStart] === "[" || text[match.valueStart] === "{";
 }
 
+/** Diff side a physical line belongs to: new, old, both, or not a hunk line. */
+type DiffSide = "+" | "-" | " ";
+
+/** Classify the side of the hunk line starting at `lineStart`. */
+function diffLineSide(text: string, lineStart: number): DiffSide {
+	const ch = text[lineStart];
+	if (ch !== "+" && ch !== "-" && ch !== " ") return " ";
+	// `+++`/`---` are file headers, not hunk lines.
+	if (text[lineStart + 1] === ch && text[lineStart + 2] === ch && text[lineStart + 3] === " ") return " ";
+	return ch;
+}
+
+/** True when a closer on `closerSide` can end a container opened on `openerSide`. */
+function sideCanClose(openerSide: DiffSide, closerSide: DiffSide): boolean {
+	if (openerSide === " ") return true;
+	return closerSide === openerSide || closerSide === " ";
+}
+
 /** All credential header container spans, in text order. */
-function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
+function findCredentialContainerSpans(text: string, diff = false): CredentialContainerSpan[] {
 	const spans: CredentialContainerSpan[] = [];
-	const stack: { closer: string; credential: CredentialHeaderMatch | null }[] = [];
+	const stack: { closer: string; credential: CredentialHeaderMatch | null; side: DiffSide }[] = [];
 	let openCredentialContainers = 0;
 	let quote: string | null = null;
 	let pending: CredentialHeaderMatch | null = null;
+	let side: DiffSide = " ";
 	for (let index = 0; index < text.length; index++) {
 		const ch = text[index];
+		if (index === 0 || text[index - 1] === "\n") side = diff ? diffLineSide(text, index) : " ";
 		if ((index === 0 || text[index - 1] === "\n") && stack.length === 0) {
 			const header = matchLineCredentialHeader(text, index);
 			// A prose quote cannot cross a credential header line.
@@ -975,7 +1011,10 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 		const atMarkedLineStart = (previous === "+" || previous === "-") && (index < 2 || text[index - 2] === "\n");
 		const leftBoundary = index === 0 || atMarkedLineStart || !/[A-Za-z0-9_-]/.test(previous as string);
 		if (ch !== undefined && /[A-Za-z]/.test(ch) && leftBoundary && openCredentialContainers === 0) {
-			const header = matchCredentialHeaderAt(text, index, false);
+			// A line start (plain or marked) may place the value on the next line;
+			// a mid-line header must keep its value on the same line.
+			const allowNextLine = index === 0 || previous === "\n" || atMarkedLineStart;
+			const header = matchCredentialHeaderAt(text, index, allowNextLine);
 			if (header !== null && opensContainer(text, header)) {
 				pending = header;
 				index = header.valueStart - 1;
@@ -1012,7 +1051,7 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 		if (ch === "[" || ch === "{") {
 			const credential = pending !== null && pending.valueStart === index ? pending : null;
 			if (credential !== null) openCredentialContainers++;
-			stack.push({ closer: ch === "[" ? "]" : "}", credential });
+			stack.push({ closer: ch === "[" ? "]" : "}", credential, side });
 			pending = null;
 			continue;
 		}
@@ -1021,6 +1060,9 @@ function findCredentialContainerSpans(text: string): CredentialContainerSpan[] {
 		// A stray or mismatched closer cannot end a container; leaving the
 		// opener on the stack makes the span fail closed instead.
 		if (!top || top.closer !== ch) continue;
+		// In a unified diff the two sides are different texts: an old-side `-]`
+		// must not close a new-side `+[`, or the added items after it survive.
+		if (diff && top.credential !== null && !sideCanClose(top.side, side)) continue;
 		stack.pop();
 		if (top.credential !== null) {
 			openCredentialContainers--;
@@ -1055,21 +1097,24 @@ function redactSkeletonRegion(text: string, start: number, end: number): string 
 	let index = start;
 	while (index < end) {
 		const ch = text[index] as string;
-		if (isContainerSkeleton(ch) || isLineLeadingDiffMarker(text, index, start)) {
+		// `\X` is one content escape, never structure: an escaped bracket or
+		// quote must not be emitted as a real one, or the next scrub misreads it.
+		if (isLineLeadingDiffMarker(text, index) || (isContainerSkeleton(ch) && !isEscapedAt(text, index))) {
 			out += ch;
 			index++;
 			continue;
 		}
 		let runEnd = index + 1;
-		while (
-			runEnd < end &&
-			!isContainerSkeleton(text[runEnd] as string) &&
-			!isLineLeadingDiffMarker(text, runEnd, start)
-		) {
+		while (runEnd < end) {
+			if (text[runEnd] === "\\") {
+				runEnd += 2;
+				continue;
+			}
+			if (isLineLeadingDiffMarker(text, runEnd) || isContainerSkeleton(text[runEnd] as string)) break;
 			runEnd++;
 		}
 		out += CONTAINER_REDACTION;
-		index = runEnd;
+		index = Math.min(runEnd, end);
 	}
 	return out;
 }
@@ -1107,19 +1152,35 @@ function redactContainerBody(text: string, span: CredentialContainerSpan): strin
  * restore function. The header itself is masked too, so no later line-level or
  * shared rule can collapse it, delete its opener, or reformat a diff hunk.
  */
-function redactCredentialContainersInSection(text: string): { text: string; restore: (scrubbed: string) => string } {
-	const spans = findCredentialContainerSpans(text);
-	if (spans.length === 0) return { text, restore: scrubbed => scrubbed };
-	const masked: string[] = [];
+function redactCredentialContainersInSection(text: string, masked: string[], diff: boolean): string {
+	const spans = findCredentialContainerSpans(text, diff);
+	if (spans.length === 0) return text;
 	let out = "";
 	let last = 0;
 	for (const span of spans) {
 		if (span.headerStart < last) continue;
-		out += `${text.slice(last, span.headerStart)}${CONTAINER_MASK}${masked.length}\u0000`;
-		masked.push(text.slice(span.headerStart, span.valueStart) + redactContainerBody(text, span));
+		out += text.slice(last, span.headerStart);
+		const redacted = text.slice(span.headerStart, span.valueStart) + redactContainerBody(text, span);
+		// One sentinel per physical line keeps the masked text's line layout (and
+		// blank lines) intact for Markdown table classification and URL userinfo
+		// stripping; a single sentinel would join a blank line away.
+		const lines = redacted.split("\n");
+		lines.forEach((line, index) => {
+			if (index > 0) out += "\n";
+			if (line.trim() === "") {
+				out += line;
+				return;
+			}
+			// Keep leading indentation outside the sentinel: a later Markdown or
+			// diff pass classifies lines by their prefix, and a sentinel at column
+			// zero would look like a table row or a hunk line.
+			const indent = /^[ \t]*/.exec(line)?.[0] ?? "";
+			out += `${indent}${CONTAINER_MASK}${masked.length}\u0000`;
+			masked.push(line.slice(indent.length));
+		});
 		last = span.valueEnd;
 	}
-	return { text: out + text.slice(last), restore: scrubbed => restoreMasked(scrubbed, CONTAINER_MASK, masked) };
+	return out + text.slice(last);
 }
 
 /**
@@ -1135,25 +1196,35 @@ function redactCredentialContainers(
 	const regions: [number, number][] = [];
 	let regionStart = 0;
 	if (diff) {
-		for (;;) {
-			const boundary = text.indexOf("\ndiff --git ", regionStart);
-			if (boundary === -1) break;
-			regions.push([regionStart, boundary + 1]);
-			regionStart = boundary + 1;
+		// File and hunk headers are structural boundaries: an unterminated
+		// container fails closed inside its hunk instead of erasing later hunks
+		// or files, which would corrupt the stored patch and its slices.
+		const cuts: number[] = [];
+		for (const marker of ["\ndiff --git ", "\n@@ "]) {
+			let from = 0;
+			for (;;) {
+				const boundary = text.indexOf(marker, from);
+				if (boundary === -1) break;
+				cuts.push(boundary + 1);
+				from = boundary + 1;
+			}
+		}
+		cuts.sort((left, right) => left - right);
+		for (const cut of cuts) {
+			if (cut <= regionStart) continue;
+			regions.push([regionStart, cut]);
+			regionStart = cut;
 		}
 	}
 	regions.push([regionStart, text.length]);
-	const restores: ((scrubbed: string) => string)[] = [];
+	// Slots are allocated across all regions: a per-region table would make
+	// region A's slot 0 and region B's slot 0 alias one sentinel pattern.
+	const masked: string[] = [];
 	let out = "";
 	for (const [start, end] of regions) {
-		const section = redactCredentialContainersInSection(text.slice(start, end));
-		out += section.text;
-		restores.push(section.restore);
+		out += redactCredentialContainersInSection(text.slice(start, end), masked, diff);
 	}
-	return {
-		text: out,
-		restore: scrubbed => restores.reduce((value, restore) => restore(value), scrubbed),
-	};
+	return { text: out, restore: scrubbed => restoreMasked(scrubbed, CONTAINER_MASK, masked) };
 }
 
 /** Text-level scrub for everything the view cache persists or serves back. */
@@ -1183,12 +1254,12 @@ function scrubCacheText(text: string, diff = false): string {
 	// Digest/Negotiate headers carry parameters after the scheme; mask the rest
 	// of the header line so a `response=` parameter cannot survive.
 	const withoutParameterizedAuth = withoutPem.replace(
-		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
+		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)(?:(?!\u0000gjc-)[^\r\n])*/gi,
 		"$1 «redacted»",
 	);
 	const withoutLineAuth = maskParameterizedAuthValues(withoutParameterizedAuth)
 		.replace(
-			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)(?:(?!\u0000gjc-)[^\r\n])*/gi,
 			"$1$2$3 «redacted»",
 		)
 		.replace(
@@ -1200,15 +1271,15 @@ function scrubCacheText(text: string, diff = false): string {
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
 	const withoutCookies = withoutBearer
 		.replace(
-			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*(?![^\S\r\n]*\r?\n[^\S\r\n]*[[{])(?=[^\S\r\n]*\r?\n)(?:\r?\n[-+]?[^\S\r\n]+[^\r\n]*)+/gi,
+			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*(?![^\S\r\n]*\r?\n[^\S\r\n]*[[{])(?=[^\S\r\n]*\r?\n)(?:\r?\n[-+]?[^\S\r\n]+(?:(?!\u0000gjc-)[^\r\n])*)+/gi,
 			"$1$2Cookie: «redacted»",
 		)
 		.replace(
-			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))(?!\u0000gjc-)[^\r\n]+/gi,
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))(?:(?!\u0000gjc-)[^\r\n])+/gi,
 			"$1$2$3«redacted»",
 		)
 		.replace(
-			/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))(?!\u0000gjc-)[^\r\n]+/gi,
+			/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))(?:(?!\u0000gjc-)[^\r\n])+/gi,
 			"$1«redacted»",
 		);
 	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);

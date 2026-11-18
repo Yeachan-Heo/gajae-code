@@ -1771,6 +1771,212 @@ describe("github view cache persistence", () => {
 			expect(stored).not.toContain("\u0000");
 		});
 
+		it("does not let an old-side closer end a new-side container", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1,2 +1,3 @@",
+				"+Cookie: [",
+				' "first",',
+				"-]",
+				'+  "alt-side-opaque-17"',
+				"+]",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1317,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1317, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("alt-side-opaque-17");
+			expect(unified).toContain("@@ -1,2 +1,3 @@");
+			expect(unified).not.toContain("\u0000");
+		});
+
+		it("masks diff containers per file with unique slots", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -0,0 +1,3 @@",
+				"+Cookie: [",
+				'+  "file-a-opaque-18"',
+				"+]",
+				"diff --git a/b b/b",
+				"index 3333333..4444444 100644",
+				"--- a/b",
+				"+++ b/b",
+				"@@ -0,0 +1,4 @@",
+				"+Cookie: [",
+				'+  "file-b-line-19"',
+				'+  "file-b-opaque-20"',
+				"+]",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1318,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1318, false, TEST_AUTH_KEY);
+			const unified = cached?.payload.unified ?? "";
+			expect(cached?.payload.files.map(file => file.path)).toEqual(["a", "b"]);
+			expect(unified).not.toContain("file-a-opaque-18");
+			expect(unified).not.toContain("file-b-opaque-20");
+			expect(unified).toContain("@@ -0,0 +1,3 @@");
+			expect(unified).toContain("@@ -0,0 +1,4 @@");
+			expect(unified).not.toContain("\u0000");
+		});
+
+		it("keeps the next hunk when a diff container never closes", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -0,0 +1,2 @@",
+				"+Auth: [",
+				'+  "unclosed-hunk-opaque-21"',
+				"@@ -10,2 +10,2 @@",
+				"-old",
+				"+keep",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1319,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1319, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("unclosed-hunk-opaque-21");
+			expect(unified).toContain("@@ -10,2 +10,2 @@");
+			expect(unified).toContain("+keep");
+			expect(unified).not.toContain("\u0000");
+		});
+
+		it("keeps a hunk intact when a scalar Cookie precedes an Auth container", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -0,0 +1,3 @@",
+				"+Cookie: sid=scalar; Auth: [",
+				'+  "scalar-auth-opaque-22"',
+				"+]",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1320,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const unified =
+				getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1320, false, TEST_AUTH_KEY)?.payload.unified ?? "";
+			expect(unified).not.toContain("scalar-auth-opaque-22");
+			expect(unified.split("\n")).toContain("+]");
+			expect(unified).not.toContain("\u0000");
+		});
+
+		it("keeps escaped pairs symmetric on the next scrub", () => {
+			const body = 'Cookie: [\n  opaque\\[value,\n  "other"\n]\nvisible diagnostic';
+			storeBody(1321, body);
+			const stored = readBody(1321) ?? "";
+			expect(stored).not.toContain("opaque\\[value");
+			expect(stored).toContain("visible diagnostic");
+			expect(stored).not.toContain("\u0000");
+			storeBody(1322, stored);
+			expect(readBody(1322)).toBe(stored);
+		});
+
+		it("does not re-lex an escaped quote in container content", () => {
+			const body = 'Cookie: [bare\\"tail]\nafter=keep';
+			storeBody(1323, body);
+			const stored = readBody(1323) ?? "";
+			expect(stored).not.toContain("bare");
+			expect(stored).toContain("after=keep");
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("keeps a code-indented URL out of table classification", () => {
+			const body = '"Cookie": [\n    ] https://cache-user:demo|opaque@example.test/x\n---|---';
+			storeBody(1324, body);
+			const stored = readBody(1324) ?? "";
+			expect(stored).not.toContain("demo|opaque");
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("recognizes a marked container whose value is on the next line", () => {
+			const body = "{\n-Cookie:\n- [\n- marked-value-opaque-25\n- ]\n}";
+			storeBody(1325, body);
+			const stored = readBody(1325) ?? "";
+			expect(stored).not.toContain("marked-value-opaque-25");
+			expect(stored).not.toContain("\u0000");
+		});
+
+		it("keeps the next file's header after a scalar Cookie and unclosed Auth", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -0,0 +1,2 @@",
+				"+Cookie: sid=sample; Auth: [",
+				'+  "next-file-opaque-26"',
+				"diff --git a/b b/b",
+				"index 3333333..4444444 100644",
+				"--- a/b",
+				"+++ b/b",
+				"@@ -1 +1 @@",
+				"-old",
+				"+new",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1326,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+			const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1326, false, TEST_AUTH_KEY);
+			const unified = cached?.payload.unified ?? "";
+			expect(unified).not.toContain("next-file-opaque-26");
+			expect(cached?.payload.files.map(file => file.path)).toContain("b");
+			expect(unified).toContain("diff --git a/b b/b");
+			expect(unified).toContain("+new");
+			expect(unified).not.toContain("\u0000");
+		});
+
 		it("keeps a well-formed diff container's line accounting", () => {
 			const diff = [
 				"diff --git a/a b/a",
