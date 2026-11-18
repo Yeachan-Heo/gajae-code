@@ -656,11 +656,26 @@ export class ChatDaemonRuntime {
 		attachment: SessionAttachment,
 		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
 	): Promise<void> {
-		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+		const currentAttachment = this.#attachments.get(attachment.sessionId);
+		// Only remove if it's the exact attachment being reported as removed.
+		// If the attachment has already been replaced with a new generation,
+		// do not interfere with the transition to the successor.
+		if (currentAttachment !== attachment) {
+			// Generation changed: a newer attachment has already taken over
+			return;
+		}
 		if (reason === "replaced_same_generation") {
 			const retirement = this.#trackRetirement(attachment);
 			this.#attachments.delete(attachment.sessionId);
 			await retirement;
+			return;
+		}
+		if (reason === "replaced") {
+			// Generation changed: defer cleanup to avoid interfering with the new attachment adoption
+			const retirement = this.#trackRetirement(attachment);
+			this.#attachments.delete(attachment.sessionId);
+			// Do not await here: let retirement proceed in the background while new attachment is adopted
+			void retirement;
 			return;
 		}
 		this.#attachments.delete(attachment.sessionId);
