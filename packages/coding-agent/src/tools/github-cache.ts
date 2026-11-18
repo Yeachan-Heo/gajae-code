@@ -509,18 +509,46 @@ function tableRowFlags(lines: string[]): boolean[] {
 		}
 	}
 	const indentOf = (row: string): number => row.length - row.trimStart().length;
+	// A table can be nested in a list and indented past four columns, where a
+	// top-level four-space line is code. Track list continuations so the two are
+	// distinguished without a full Markdown parser.
+	const inList = new Array<boolean>(rows.length).fill(false);
+	let listIndent: number | null = null;
+	for (let i = 0; i < rows.length; i++) {
+		const row = rows[i] ?? "";
+		const marker = /^(\s*)(?:[-+*]|\d+[.)])\s+/.exec(row);
+		if (marker) {
+			listIndent = (marker[0] ?? "").length;
+			inList[i] = true;
+			continue;
+		}
+		if (row.trim() === "") {
+			inList[i] = listIndent !== null;
+			continue;
+		}
+		if (listIndent !== null && indentOf(row) >= listIndent) {
+			inList[i] = true;
+			continue;
+		}
+		listIndent = null;
+	}
 	for (let i = 0; i < lines.length; i++) {
 		if (fenced[i] === true) continue;
 		const raw = rows[i] ?? "";
-		// Four or more columns is an indented code block, never a table row.
-		if (indentOf(raw) >= 4) continue;
+		// Four or more columns outside a list is an indented code block, never a
+		// table row.
+		if (indentOf(raw) >= 4 && inList[i] !== true) continue;
 		const trimmed = raw.trim();
 		if (trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"))) flags[i] = true;
 	}
 	let covered = -1;
 	for (let i = 1; i < lines.length; i++) {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
-		if (indentOf(rows[i] ?? "") >= 4 || indentOf(rows[i - 1] ?? "") >= 4) continue;
+		if (
+			(indentOf(rows[i] ?? "") >= 4 && inList[i] !== true) ||
+			(indentOf(rows[i - 1] ?? "") >= 4 && inList[i - 1] !== true)
+		)
+			continue;
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
 		flags[i - 1] = true;
 		flags[i] = true;
@@ -528,7 +556,7 @@ function tableRowFlags(lines: string[]): boolean[] {
 		for (; j < lines.length; j++) {
 			if (fenced[j] === true) break;
 			const row = rows[j] ?? "";
-			if (row.trim() === "" || !row.includes("|") || indentOf(row) >= 4) break;
+			if (row.trim() === "" || !row.includes("|") || (indentOf(row) >= 4 && inList[j] !== true)) break;
 			flags[j] = true;
 		}
 		covered = j - 1;

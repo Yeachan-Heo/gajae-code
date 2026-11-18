@@ -865,7 +865,8 @@ describe("github view cache persistence", () => {
 			"```text\r\n|https://alice:demo|value@example.test/x|\r\n```\r\n",
 			"```text\n    ```\r\n|https://alice:demo|value@example.test/x|\r\n```\n",
 			"- item\n\n    ```text\n    |https://alice:demo|value@example.test/x|\n    ```\n",
-			"    |https://alice:demo|value@example.test/x|\r\n",
+			"plain text\n\n    |https://alice:demo|value@example.test/x|\r\n",
+			"10. Item\n\n    | URL | Contact |\n    |---|---|\n    |https://docs.example|person@example.test|",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
@@ -893,6 +894,7 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).toContain("```text\nhttps://example.test/x\n---|---\n```");
 		expect(cached?.payload.body).toContain("|https://example.test/z|keep|");
 		expect(cached?.payload.body).toContain("|https://docs.example|person@example.test|");
+		expect(cached?.payload.body).toContain("    |https://docs.example|person@example.test|");
 		expect(cached?.payload.body).toContain("https://example.test/x");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 		expect(cached?.payload.body).not.toContain("opaque");
