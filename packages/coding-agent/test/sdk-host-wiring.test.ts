@@ -34,10 +34,6 @@ import type {
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
 
-// Tests that use the lifecycle capability need to auto-start the SDK broker.
-// Clear GJC_SDK_BROKER_AUTOSTART so it's not inherited from an enclosing gjc session.
-delete process.env.GJC_SDK_BROKER_AUTOSTART;
-
 test("extension API cannot set the private recovery bypass", () => {
 	const api = undefined as ExtensionAPI | undefined;
 	if (api) {
@@ -171,6 +167,10 @@ type SdkPermissionProvider =
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
 const restoreEnv: (() => void)[] = [];
+// Tests that use the lifecycle capability need to auto-start the SDK broker.
+// Clear GJC_SDK_BROKER_AUTOSTART so it's not inherited from an enclosing gjc session,
+// allowing tests to auto-start the SDK broker. This is scoped to this test file only.
+delete process.env.GJC_SDK_BROKER_AUTOSTART;
 afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
 	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();

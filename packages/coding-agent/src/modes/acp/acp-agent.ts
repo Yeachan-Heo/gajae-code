@@ -4474,7 +4474,7 @@ export class AcpAgent implements Agent {
 					waiter.correlation = correlation;
 					waiter.acknowledged = true;
 					this.#bindUncertainAbortOwner(id, waiter, correlation);
-					const deferred = waiter.deferredFrames.find(({ frame }) => {
+					const terminalIndex = waiter.deferredFrames.findIndex(({ frame }) => {
 						const candidate = receivedSdkEvent(frame)?.event;
 						if (!candidate) return false;
 						const candidateOutcome = terminalOutcome(candidate);
@@ -4489,8 +4489,9 @@ export class AcpAgent implements Agent {
 							correlationsExactlyMatch(candidateCorrelation, correlation)
 						);
 					});
-					if (deferred) {
-						waiter.deferredFrames.length = 0;
+					if (terminalIndex !== -1) {
+						const bufferedFrames = waiter.deferredFrames.splice(0, terminalIndex + 1);
+						const terminalFrame = bufferedFrames[terminalIndex]!;
 						waiter.terminalReserved = true;
 						clearPromptWatchdog(waiter);
 						await record.frameTail;
@@ -4501,7 +4502,20 @@ export class AcpAgent implements Agent {
 							waiter.settled
 						)
 							return { kind: "ownership_lost" };
-						await this.#handleSdkFrame(id, adapter, deferred.frame, record.publicationGeneration);
+						// Replay non-terminal frames before the terminal to preserve buffered progress.
+						// Only replay frames that match the current prompt's correlation.
+						for (let i = 0; i < terminalIndex; i++) {
+							const { frame: bufferedFrame, publicationGeneration: bufferedGeneration } = bufferedFrames[i]!;
+							const bufferedEvent = receivedSdkEvent(bufferedFrame)?.event;
+							if (!bufferedEvent) continue;
+							const bufferedCorrelation = sdkFrameCorrelation(bufferedFrame, bufferedEvent);
+							// Only replay frames that match the current prompt's correlation.
+							if (bufferedCorrelation && correlationsExactlyMatch(bufferedCorrelation, correlation)) {
+								await this.#handleSdkFrame(id, adapter, bufferedFrame, bufferedGeneration);
+							}
+						}
+						// Replay the terminal frame with its original generation.
+						await this.#handleSdkFrame(id, adapter, terminalFrame.frame, terminalFrame.publicationGeneration);
 						return { kind: "terminal" };
 					}
 				}
