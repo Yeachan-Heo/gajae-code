@@ -11063,28 +11063,37 @@ export class AgentSession {
 	}
 
 	#reconcileTtsrConsumptionFromMessages(): void {
-		// If ttsr_injection markers failed to publish in a previous session but custom messages
-		// were persisted, reconcile the consumption state by checking the message history.
-		// This prevents duplicate reminders when the marker publication fails (#7838).
+		// A committed reminder can outlive its missing ttsr_injection marker and be compacted out
+		// of Agent context. Reconcile consumption without restoring the reminder text (#7838).
 		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
 			return;
 		}
 		// Latest published checkpoint per rule. A legacy entry without one only proves the rule
 		// was delivered, so it maps to undefined unless a checkpointed entry exists.
 		const checkpoints = new Map<string, number | undefined>();
-		for (const message of this.agent.state.messages) {
-			if (message.role !== "custom" || message.customType !== "ttsr-injection") {
-				continue;
-			}
-			const rawCount = (message.details as { messageCount?: unknown } | undefined)?.messageCount;
+		const collectCheckpoints = (details: unknown) => {
+			const rawCount = (details as { messageCount?: unknown } | undefined)?.messageCount;
 			const checkpoint = typeof rawCount === "number" && Number.isFinite(rawCount) ? rawCount : undefined;
-			for (const ruleName of this.#extractTtsrRuleNames(message.details)) {
+			for (const ruleName of this.#extractTtsrRuleNames(details)) {
 				const previous = checkpoints.get(ruleName);
 				if (checkpoint === undefined) {
 					if (!checkpoints.has(ruleName)) checkpoints.set(ruleName, undefined);
 				} else {
 					checkpoints.set(ruleName, previous === undefined ? checkpoint : Math.max(previous, checkpoint));
 				}
+			}
+		};
+		// getBranch() walks the active leaf's ancestors, including entries before compaction.
+		// getEntries() would also include inactive sibling branches and consume their rules.
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "custom_message" && entry.customType === "ttsr-injection") {
+				collectCheckpoints(entry.details);
+			}
+		}
+		// Keep live-only evidence for in-memory sessions and definitively rejected publication.
+		for (const message of this.agent.state.messages) {
+			if (message.role === "custom" && message.customType === "ttsr-injection") {
+				collectCheckpoints(message.details);
 			}
 		}
 		if (checkpoints.size === 0) return;
@@ -11368,7 +11377,7 @@ export class AgentSession {
 				if (injection && details) {
 					// Persist before any live mutation. A shared session refuses the legacy append,
 					// so publish through the admitted path like other in-turn custom messages
-					// (#7815). Only a typed stale/rejected result proves retrying in memory is safe.
+					// (#7815). Only a typed rejected result permits retrying in memory.
 					try {
 						await this.#appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
 					} catch (error) {
@@ -11538,7 +11547,7 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					// A stale/rejected publication lets us retry with the reminder in
+					// A rejected publication lets us retry with the reminder in
 					// memory only. Consume it in this live manager to avoid a repeatMode
 					// once interrupt loop, but do not persist a marker that would suppress
 					// the still-eligible rule when this session is reopened.
