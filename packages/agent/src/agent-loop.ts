@@ -4705,6 +4705,17 @@ async function runLoopBody(
 				config.requeueSteeringMessages?.(pendingMessages);
 				break;
 			}
+			// A tool can be interrupted by either steering or follow-up. If steering is
+			// empty but follow-ups are available, deliver them at this tool boundary too,
+			// rather than deferring to the main loop. This ensures queue-mode messages are
+			// delivered immediately when job poll is interrupted, not after job completion.
+			if (!loopSignal.aborted) {
+				const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+				if (followUpMessages.length > 0) {
+					pendingMessages = followUpMessages;
+					continue;
+				}
+			}
 			// An aborted run must not open another turn: the provider rejects it before
 			// the first token and the attempt only appends an aborted assistant message.
 			// The run's steering (which the poll above deliberately leaves queued once
