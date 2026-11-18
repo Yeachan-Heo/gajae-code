@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getGithubCacheDbPath, logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
+import { scrubUnifiedDiff } from "./github-diff-parser";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -283,12 +284,46 @@ export interface PutCachedInput<T = unknown> {
 	fetchedAt?: number;
 }
 
+/**
+ * Scrub sensitive material from cache inputs before storage.
+ * For pr-diff, scrubs the unified diff in both payload and rendered.
+ * For other kinds, scrubs the rendered text using the shared redactor.
+ */
+function scrubCacheInput<T>(kind: CacheKind, payload: T, rendered: string): { payload: T; rendered: string } {
+	let scrubbedPayload = payload;
+	let scrubbedRendered = rendered;
+
+	if (kind === "pr-diff") {
+		// For diffs, scrub the unified diff text using the structural parser.
+		scrubbedRendered = scrubUnifiedDiff(rendered);
+
+		// Also scrub the payload's unified field if present.
+		const payloadObj = payload as Record<string, unknown>;
+		if (typeof payloadObj.unified === "string") {
+			scrubbedPayload = {
+				...payloadObj,
+				unified: scrubUnifiedDiff(payloadObj.unified),
+			} as unknown as T;
+		}
+	}
+
+	return { payload: scrubbedPayload, rendered: scrubbedRendered };
+}
+
 export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 	const db = openDb();
 	if (!db) return;
 	try {
 		const fetchedAt = input.fetchedAt ?? Date.now();
-		const payloadJson = JSON.stringify(input.payload);
+
+		// Scrub sensitive material before storage.
+		const { payload: scrubbedPayload, rendered: scrubbedRendered } = scrubCacheInput(
+			input.kind,
+			input.payload as Record<string, unknown>,
+			input.rendered,
+		);
+
+		const payloadJson = JSON.stringify(scrubbedPayload);
 		db.prepare(
 			"INSERT OR REPLACE INTO github_view_cache (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(
@@ -299,7 +334,7 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 			input.includeComments ? 1 : 0,
 			fetchedAt,
 			payloadJson,
-			input.rendered,
+			scrubbedRendered,
 			input.sourceUrl ?? null,
 		);
 		protectDbFiles(getGithubCacheDbPath());
