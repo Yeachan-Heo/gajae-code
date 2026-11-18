@@ -167,7 +167,7 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 						signal.addEventListener("abort", settle, { once: true });
 						return promise;
 					},
-				})
+				}),
 	};
 	return {
 		session,
