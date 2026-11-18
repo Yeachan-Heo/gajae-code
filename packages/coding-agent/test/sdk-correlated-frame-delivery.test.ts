@@ -583,6 +583,73 @@ isolatedSdkHostTest("backlog rejection of progress keeps the terminal deliverabl
 	}
 });
 
+isolatedSdkHostTest("multibyte progress with a split surrogate pair reaches the requester intact", async () => {
+	// #7867: a ~6 KB Korean progress frame whose streamed text ends in half of an
+	// astral character. JSON.stringify escapes the unpaired surrogate, and the
+	// native validator used to reject the whole frame as invalid_frame.
+	const { handlers, sessionContext, frames, correlation } = await activePrompt("multibyte-progress");
+	const korean = "한국어 응답을 스트리밍합니다. ".repeat(120);
+	const delta = `${korean}🦞`.slice(0, -1);
+	const message = { role: "assistant", content: [{ type: "text", text: delta }] };
+	await handlers.get("message_update")?.(
+		{ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta } },
+		sessionContext,
+	);
+	await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "completed", messages: [] }, sessionContext);
+	await waitFor(() => correlatedTerminal(frames, correlation)?.type === "agent_end", "agent_end", 2000);
+	const progress = frames.find(
+		frame => frame.type === "event" && frame.kind === "message_update" && frame.commandId === correlation.commandId,
+	) as { payload: { event: { assistantMessageEvent: { delta: string } } } } | undefined;
+	expect(Buffer.byteLength(JSON.stringify(progress))).toBeGreaterThan(6_000);
+	expect(progress?.payload.event.assistantMessageEvent.delta).toBe(`${korean}\ufffd`);
+});
+
+isolatedSdkHostTest("invalid_frame rejection of progress keeps the terminal deliverable", async () => {
+	const { handlers, sessionContext, frames, correlation } = await activePrompt("invalid-progress");
+	const original = NotificationServer.prototype.sendTo;
+	let rejected = false;
+	const send = spyOn(NotificationServer.prototype, "sendTo").mockImplementation(function (
+		this: NotificationServer,
+		id,
+		json,
+	) {
+		const frame = JSON.parse(json) as { type?: string; kind?: string };
+		if (!rejected && frame.type === "event" && frame.kind === "message_update") {
+			rejected = true;
+			throw new Error("sdk directed delivery rejected: cause=invalid_frame frameBytes=6152");
+		}
+		return original.call(this, id, json);
+	});
+	try {
+		const first = { role: "assistant", content: [{ type: "text", text: "dropped" }] };
+		await handlers.get("message_update")?.(
+			{ type: "message_update", message: first, assistantMessageEvent: { type: "text_delta", delta: "dropped" } },
+			sessionContext,
+		);
+		const second = { role: "assistant", content: [{ type: "text", text: "droppedkept" }] };
+		await handlers.get("message_update")?.(
+			{ type: "message_update", message: second, assistantMessageEvent: { type: "text_delta", delta: "kept" } },
+			sessionContext,
+		);
+		await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "completed", messages: [] }, sessionContext);
+		await waitFor(() => correlatedTerminal(frames, correlation)?.type === "agent_end", "agent_end", 2000);
+		expect(rejected).toBe(true);
+		const deltas = frames
+			.filter(
+				frame =>
+					frame.type === "event" && frame.kind === "message_update" && frame.commandId === correlation.commandId,
+			)
+			.map(
+				frame =>
+					(frame as { payload: { event: { assistantMessageEvent: { delta: string } } } }).payload.event
+						.assistantMessageEvent.delta,
+			);
+		expect(deltas).toEqual(["kept"]);
+	} finally {
+		send.mockRestore();
+	}
+});
+
 isolatedSdkHostTest("one backlog rejection of agent_end is retried", async () => {
 	const { handlers, sessionContext, frames, correlation } = await activePrompt("backlog-terminal-once");
 	const original = NotificationServer.prototype.sendTo;
@@ -829,7 +896,7 @@ isolatedSdkHostTest("fatal progress delivery failure still abandons the prompt",
 		const frame = JSON.parse(json) as { type?: string; kind?: string };
 		if (!rejected && frame.type === "event" && frame.kind === "message_update") {
 			rejected = true;
-			throw new Error("sdk directed delivery rejected: cause=connection_closed frameBytes=200");
+			throw new Error("sdk directed delivery rejected: cause=connection_unavailable frameBytes=200");
 		}
 		return original.call(this, id, json);
 	});

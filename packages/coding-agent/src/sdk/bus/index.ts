@@ -286,6 +286,19 @@ const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
  */
 const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
 /**
+ * Native directed-delivery rejection causes that concern one frame rather than
+ * the destination connection: the frame's own encoding, size, or capability
+ * gate, or a momentarily full writer. Every other cause (`connection_unavailable`
+ * or an unclassified native failure) means nothing more can reach that
+ * connection.
+ */
+const FRAME_LOCAL_DIRECTED_DELIVERY_CAUSES: ReadonlySet<string> = new Set([
+	"invalid_frame",
+	"oversized_frame",
+	"unauthorized",
+	"writer_backlog_full",
+]);
+/**
  * #4743: bounded wait for durable reconciliation quiescence during session
  * teardown. Expiry is OBSERVABLE (owner-release failure), never silently
  * treated as drained. Read per drain so the env override is effective for
@@ -5606,7 +5619,7 @@ export function createNotificationsExtension(
 			connectionId: string;
 			abandoned: boolean;
 			terminalRetry?: Promise<void>;
-			backlogDropLogged?: boolean;
+			frameDropLogged?: boolean;
 			failed: boolean;
 			terminal: boolean;
 			retainCorrelation: boolean;
@@ -6033,21 +6046,25 @@ export function createNotificationsExtension(
 			if (!activeRuntime) return;
 			const fail = (cause: string, frameBytes: number, failedJson = JSON.stringify(frame)) => {
 				// A non-terminal frame only reports progress from a still-running
-				// prompt. Abandon its delivery on failure instead of publishing a
-				// synthetic terminal that could race the real run and make ACP
-				// settle the prompt while provider/tool execution continues.
+				// prompt, so its failure never publishes a synthetic terminal that
+				// could race the real run and make ACP settle the prompt while
+				// provider/tool execution continues. A frame-local rejection drops
+				// only this frame: the prompt's later frames, including its real
+				// terminal, must still reach the requester instead of leaving it to
+				// time out (#7867). Any other cause means the connection itself is
+				// gone, which ends the prompt's delivery.
 				if (frame.type !== "agent_end" && frame.type !== "agent_failed") {
-					if (cause === "writer_backlog_full") {
-						if (!submission.backlogDropLogged) {
-							submission.backlogDropLogged = true;
-							logger.warn(
-								`sdk: correlated non-terminal delivery dropped: cause=${cause} frameBytes=${frameBytes}`,
-							);
-						}
+					if (!FRAME_LOCAL_DIRECTED_DELIVERY_CAUSES.has(cause)) {
+						logger.warn(
+							`sdk: correlated non-terminal delivery abandoned: cause=${cause} frameBytes=${frameBytes}`,
+						);
+						abandonPrompt(submission);
 						return;
 					}
-					logger.warn(`sdk: correlated non-terminal delivery abandoned: cause=${cause} frameBytes=${frameBytes}`);
-					abandonPrompt(submission);
+					if (!submission.frameDropLogged) {
+						submission.frameDropLogged = true;
+						logger.warn(`sdk: correlated non-terminal delivery dropped: cause=${cause} frameBytes=${frameBytes}`);
+					}
 					return;
 				}
 				if (cause === "writer_backlog_full") {
