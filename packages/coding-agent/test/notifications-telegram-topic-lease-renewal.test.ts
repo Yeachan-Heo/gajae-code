@@ -445,10 +445,24 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 		const nowRef = { now: 1_000 };
 		const harness = await trustedAttachedSession(agentDir, nowRef);
 		try {
+			// Identity was replayed; the topic exists and the identity header was sent.
+			expect(harness.bot.calls.some(call => call.method === "createForumTopic")).toBe(true);
+			expect((await persistedTopic(agentDir, SESSION_ID)).identitySent).toBe(true);
+
+			// Advance past the 20s host-lease TTL while the attachment stays live and
+			// owned. Before the fix every later frame was rejected pre-send.
 			nowRef.now += HEARTBEAT_TTL_MS + 1_000;
-			await expect(
-				harness.send({ type: "turn_stream", phase: "finalized", text: "no" }, "lease-session:1:1"),
-			).rejects.toThrow("trusted attachment lease is stale");
+			await harness.send(
+				{ type: "turn_stream", phase: "finalized", text: "post-identity update" },
+				"lease-session:1:3",
+			);
+
+			const sent = harness.bot.calls.filter(call => call.method === "sendMessage");
+			expect(sent.length).toBeGreaterThan(0);
+			expect(sent.at(-1)?.body.message_thread_id).toBe(555);
+			const topic = await persistedTopic(agentDir, SESSION_ID);
+			expect(topic.authorityState).toBe("active");
+			expect((topic.leaseExpiresAt ?? 0) > nowRef.now).toBe(true);
 		} finally {
 			harness.daemon.requestStop();
 		}
@@ -461,7 +475,7 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 		const harness = await trustedAttachedSession(agentDir, nowRef);
 		try {
 			nowRef.now += HEARTBEAT_TTL_MS + 1_000;
-			harness.daemon.refreshOwnershipHeartbeat(SESSION_ID);
+			await harness.daemon.refreshOwnershipHeartbeat(SESSION_ID);
 			const persisted = await persistedTopic(agentDir, SESSION_ID);
 			expect(persisted.leaseExpiresAt).toBe(nowRef.now + HEARTBEAT_TTL_MS);
 		} finally {

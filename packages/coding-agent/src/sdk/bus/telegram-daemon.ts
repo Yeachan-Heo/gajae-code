@@ -874,6 +874,7 @@ export async function writeTopicRegistryAtomic(
 			new Error("topic registry destination disappeared after generation validation"),
 		);
 	if (!destinationExists) {
+		await ensureDir(fsImpl, parent);
 		try {
 			await fsImpl.writeFile(file, serialized, { mode: 0o600, flag: "wx" });
 		} catch (error) {
@@ -4860,6 +4861,13 @@ export class TelegramNotificationDaemon {
 
 	cancelDoctorRestart(): void {
 		if (!this.stopRequested) this.effects.openAdmission();
+	}
+
+	/** @internal Test-only method to refresh ownership heartbeat for all active topics. */
+	async refreshOwnershipHeartbeat(sessionId: string): Promise<void> {
+		// Calls renewActiveTopicLeases which iterates all sessions and re-arms expired leases.
+		// sessionId is for test instrumentation only; the method renews all sessions.
+		await this.renewActiveTopicLeases();
 	}
 
 	#lifecycleActor(): SessionLifecycleActor {
