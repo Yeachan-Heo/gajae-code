@@ -154,6 +154,14 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		secrets: ["opaquecredential123"],
 		survives: ["bearer\\n", "\\ndiagnostic=keep", "code"],
 	},
+	// The serialized shape prints the escaped break on one physical line. The space after the
+	// assignment's `=` is string content, so the isolated token is not a padded base64 token.
+	{
+		name: "serialized assignment continuation after a bare auth cue",
+		text: '{"code":{"detail":"Basic\\ndiagnostic= keep"}}',
+		secrets: [],
+		survives: [],
+	},
 	{
 		name: "unpaired private-key body keeps a nested sibling",
 		text: UNPAIRED_WITH_SIBLING,
@@ -180,6 +188,14 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		text: UNPAIRED_PADDED_TWO_SPACES,
 		secrets: ["-----BEGIN RSA PRIVATE KEY-----", UNPAIRED_BODY],
 		survives: ["Note: keep", 'note:"keep-me"'],
+		preview: true,
+	},
+	{
+		name: "unpaired private-key body keeps a comma-separated note",
+		// A comma in the still-open serialized string is content, not the end of the value.
+		text: '{"message":"fixture","code":{"detail":"-----BEGIN RSA PRIVATE KEY-----  \\nQk9EWUJPRFlCT0RZQk9EWQ==\\nNote, keep","note":"keep-me"}}',
+		secrets: ["-----BEGIN RSA PRIVATE KEY-----", "Qk9EWUJPRFlCT0RZQk9EWQ=="],
+		survives: ["Note, keep", '"note":"keep-me"'],
 		preview: true,
 	},
 	{

@@ -168,6 +168,20 @@ describe("crash redaction classification", () => {
 		expect(redacted).not.toContain("opaquecredential123");
 	});
 
+	it("keeps an assignment continuation in the raw and serialized shapes", () => {
+		const raw = "Basic\ndiagnostic= keep";
+		const serialized = '{"code":{"detail":"Basic\\ndiagnostic= keep"}}';
+		const token = "Zml4dHVyZTpwYXNzd29yZA==";
+
+		expect(redactCrashSecrets(raw)).toBe(raw);
+		expect(redactCrashSecrets(serialized)).toBe(serialized);
+		// The positive shape is unchanged: a padded token in the same place is still masked, and
+		// the diagnostic after it is still kept.
+		expect(redactCrashSecrets(`{"code":{"detail":"Basic\\n${token} diagnostic=keep"}}`)).toBe(
+			`{"code":{"detail":"Basic\\n«redacted-auth» diagnostic=keep"}}`,
+		);
+	});
+
 	it("bounds an unpaired private-key replacement to the body it owns", () => {
 		const nested = '{message:"fixture", code:{detail:"-----BEGIN RSA PRIVATE KEY-----\\nBODY", note:"keep-me"}}';
 		const prose = '{code:"PEM example: -----BEGIN RSA PRIVATE KEY-----; diagnostic=keep"}';
@@ -471,6 +485,24 @@ describe("recordFatalCrash", () => {
 		expect(JSON.parse(payload as string)).toEqual({ code: { detail: "«redacted-private-key»", note: "keep-me" } });
 	});
 
+	it("keeps a comma-separated note after an unpaired private-key body", () => {
+		const target = tempCrashLog();
+		const body = "Qk9EWUJPRFlCT0RZQk9EWQ==";
+		// Two trailing spaces on the banner and a base64 body: a comma in the still-open JSON
+		// string used to close the value, so the body scan erased `Note` as if it were body.
+		const reason = {
+			message: "fixture",
+			code: { detail: `-----BEGIN RSA PRIVATE KEY-----  \n${body}\nNote, keep`, note: "keep-me" },
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		const payload = JSON.parse(contents.split("\n").find(line => line.startsWith('{"code"')) as string);
+
+		expect(payload).toEqual({ code: { detail: "«redacted-private-key»\nNote, keep", note: "keep-me" } });
+		expect(payload.code.detail).not.toContain(body);
+	});
+
 	it("keeps prose after an unpaired private-key banner", () => {
 		const target = tempCrashLog();
 		const reason = { code: "PEM example: -----BEGIN RSA PRIVATE KEY-----; diagnostic=keep" };
@@ -502,6 +534,18 @@ describe("recordFatalCrash", () => {
 
 		expect(contents).not.toContain("opaquecredential123");
 		expect(contents).toContain('"detail":"bearer\\n«redacted-auth»\\ndiagnostic=keep"');
+	});
+
+	it("keeps a diagnostic assignment that opens a nested captured string", () => {
+		const target = tempCrashLog();
+		const reason = { message: "fixture", code: { detail: "Basic\ndiagnostic= keep" } };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		const payload = contents.split("\n").find(line => line.startsWith('{"code"'));
+
+		expect(payload).toBe('{"code":{"detail":"Basic\\ndiagnostic= keep"}}');
+		expect(JSON.parse(payload as string)).toEqual({ code: { detail: "Basic\ndiagnostic= keep" } });
 	});
 
 	it("masks an auth continuation inside a captured string field", () => {

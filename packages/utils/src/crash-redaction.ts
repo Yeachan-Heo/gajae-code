@@ -168,8 +168,13 @@ function lineBreakLengthAt(text: string, at: number): number {
 	return serialized < 0 ? 0 : serialized - at;
 }
 
-/** Characters that can close a serialized value holding a PEM body. */
-function isSerializedValueEnd(character: string | undefined): boolean {
+/**
+ * Characters that can close a serialized value holding a PEM body. Inside a quoted serialized
+ * value only that value's own quote ends it: a comma there is string content, not a delimiter.
+ */
+function isSerializedValueEnd(character: string | undefined, quote: string | undefined): boolean {
+	if (character === undefined) return false;
+	if (quote !== undefined) return character === quote;
 	return (
 		character === '"' ||
 		character === "'" ||
@@ -178,6 +183,16 @@ function isSerializedValueEnd(character: string | undefined): boolean {
 		character === "]" ||
 		character === ")"
 	);
+}
+
+/**
+ * The quote that opened the serialized string still containing `at`, if any. A serialized string
+ * cannot hold a raw line break, so its opening quote is on the same physical line. Text inside
+ * that string is bounded by the quote alone; spaces and commas are content, not delimiters.
+ */
+function serializedValueQuoteAt(text: string, at: number): string | undefined {
+	const lineStart = text.lastIndexOf("\n", at - 1) + 1;
+	return quoteAt(text, { at: lineStart, quote: undefined }, at, lineStart);
 }
 
 /**
@@ -190,6 +205,9 @@ function isSerializedValueEnd(character: string | undefined): boolean {
  * a replacement bounded here never deletes it.
  */
 function unpairedPrivateKeyBodyEnd(text: string, headerEnd: number): number {
+	// A banner inside a quoted serialized value is ended by that value's quote, never by a comma
+	// or brace that is string content.
+	const valueQuote = serializedValueQuoteAt(text, headerEnd);
 	let bannerEnd = headerEnd;
 	while (text[bannerEnd] === " " || text[bannerEnd] === "\t") bannerEnd++;
 	const firstBreak = lineBreakLengthAt(text, bannerEnd);
@@ -212,9 +230,10 @@ function unpairedPrivateKeyBodyEnd(text: string, headerEnd: number): number {
 		let trailing = bodyEnd;
 		while (text[trailing] === " " || text[trailing] === "\t") trailing++;
 		const nextBreak = lineBreakLengthAt(text, trailing);
-		// A break or the serialized value's closing delimiter ends the body line; any other text
-		// after the base64 run (a colon, another word) means this line is not body at all.
-		if (nextBreak === 0 && trailing < text.length && !isSerializedValueEnd(text[trailing])) break;
+		// A break or the delimiter that actually closes this serialized value ends the body line;
+		// any other text after the base64 run (a colon, another word, a comma inside the still-open
+		// string) means this line is not body at all.
+		if (nextBreak === 0 && trailing < text.length && !isSerializedValueEnd(text[trailing], valueQuote)) break;
 		end = bodyEnd;
 		if (nextBreak === 0) break;
 		cursor = trailing + nextBreak;
@@ -1059,7 +1078,7 @@ const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]
 const URI_AT_LINE_START = /^[ \t]*[^A-Za-z0-9+.-]*[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
 /** token68/base64: the trailing `=` is padding, not an assignment separator. */
-const BASE64_CONTINUATION_LINE = /^[ \t]*[A-Za-z0-9+/]{8,}={0,2}[ \t]*$/;
+const BASE64_CONTINUATION_LINE = /^[ \t]*([A-Za-z0-9+/]{8,})(={0,2})[ \t]*$/;
 /**
  * A padded token at the start of a line: base64 characters, then one or two `=` and the field
  * separator. The padding must complete a group of four. An all-lower-case payload can be an
@@ -1082,6 +1101,13 @@ function startsWithPaddedToken(line: string): boolean {
 	return DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line.slice(match[0].length));
 }
 
+/** Whether `line` is one base64 token68 value whose group of four is complete. */
+function startsWithBase64Continuation(line: string): boolean {
+	const match = BASE64_CONTINUATION_LINE.exec(line);
+	if (match === null) return false;
+	return ((match[1] as string).length + (match[2] as string).length) % 4 === 0;
+}
+
 /**
  * Whether a continuation line names a diagnostic field. Base64 is the exception: its padding is
  * not `key=value`, so `Basic\nZml4dHVyZTpwYXNzd29yZA==` stays a credential continuation. A
@@ -1089,7 +1115,7 @@ function startsWithPaddedToken(line: string): boolean {
  */
 function startsDiagnosticAssignment(line: string): boolean {
 	return (
-		!BASE64_CONTINUATION_LINE.test(line) &&
+		!startsWithBase64Continuation(line) &&
 		!startsWithPaddedToken(line) &&
 		DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line)
 	);
@@ -1118,6 +1144,54 @@ function serializedLineBreakEnd(text: string, at: number): number {
 }
 
 /**
+ * The logical line a continuation token belongs to, for classification only. Inside a quoted
+ * serialized value a space or comma after a token is string content, so the guards must read the
+ * whole value line; the token-sized replacement range stays `token`. The line ends at the quote
+ * that closes the value or at the next escaped break, and a trailing run of value delimiters is
+ * not part of the line the guards read.
+ */
+function serializedContinuationLine(line: string, start: number, token: string, quote: string | undefined): string {
+	if (quote === undefined) return token;
+	let end = start;
+	while (end < line.length && line[end] !== quote && serializedLineBreakEnd(line, end) < 0) end++;
+	// A comma, brace or bracket right before the closing quote is content that would also end an
+	// unquoted value, so it is not part of the line the guards read.
+	while (end > start) {
+		const character = line[end - 1];
+		if (character !== "," && character !== "}" && character !== "]" && character !== ")") break;
+		end--;
+	}
+	return line.slice(start, end).trimEnd();
+}
+
+/** Forward-only quote state for one physical line, so each character is scanned once per pass. */
+interface SerializedQuoteScan {
+	at: number;
+	quote: string | undefined;
+}
+
+/** The quote still open at `target`, advancing the scan forward to it. */
+function quoteAt(text: string, scan: SerializedQuoteScan, target: number, start: number): string | undefined {
+	while (scan.at < target) {
+		const character = text[scan.at] as string;
+		if (character === "\\") {
+			scan.at += 2;
+			continue;
+		}
+		if (scan.quote !== undefined) {
+			if (character === scan.quote) scan.quote = undefined;
+			scan.at++;
+			continue;
+		}
+		if (character === '"' || character === "'" || character === "`") {
+			if (opensQuotedValue(text, scan.at, start)) scan.quote = character;
+		}
+		scan.at++;
+	}
+	return scan.quote;
+}
+
+/**
  * Mask the credential a serialized value carries after an escaped line break. The escaped form
  * prints on one physical line, so the continuation rules would never see the value; the guards
  * are the same ones the physical continuation uses.
@@ -1129,6 +1203,7 @@ function collectEscapedContinuations(
 	out: RedactionRange[],
 ): void {
 	ESCAPED_AUTH_CUE.lastIndex = 0;
+	const quoteScan: SerializedQuoteScan = { at: 0, quote: undefined };
 	for (let match = ESCAPED_AUTH_CUE.exec(line); match !== null; ) {
 		const start = match.index + match[0].length;
 		let end = start;
@@ -1141,8 +1216,9 @@ function collectEscapedContinuations(
 		)
 			end++;
 		const token = line.slice(start, end);
+		const logical = serializedContinuationLine(line, start, token, quoteAt(line, quoteScan, start, 0));
 		const hasUriValue = structure === "blind" ? carriesUrlCredential(token) : URI_AT_LINE_START.test(token);
-		if (end - start >= 8 && !startsDiagnosticAssignment(token) && !hasUriValue) {
+		if (end - start >= 8 && !startsDiagnosticAssignment(logical) && !hasUriValue) {
 			out.push({ start: base + start, end: base + end, label: "«redacted-auth»" });
 		}
 		ESCAPED_AUTH_CUE.lastIndex = Math.max(ESCAPED_AUTH_CUE.lastIndex, end);
