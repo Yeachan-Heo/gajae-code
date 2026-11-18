@@ -5515,6 +5515,7 @@ export class TelegramNotificationDaemon {
 		if (reason === "removed" && !session.logicalSessionIdTrusted) {
 			// Router disappearance alone is not durable archive authority.
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+			this.#prunePublicationReceipts();
 			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
@@ -5536,6 +5537,7 @@ export class TelegramNotificationDaemon {
 				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+			this.#prunePublicationReceipts();
 			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
@@ -5543,6 +5545,7 @@ export class TelegramNotificationDaemon {
 		}
 		this.#dropSession(session, "router_session_removed");
 		this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+		this.#prunePublicationReceipts();
 		void this.#persistPublicationReceipts().catch(() => {
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 		});
@@ -5980,7 +5983,14 @@ export class TelegramNotificationDaemon {
 			this.#claimedPublications.delete(publicationId);
 			this.#ambiguousPublications.delete(publicationId);
 		}
+		const loadedCleanupReceipts = this.#cleanupReceipts.size;
 		this.#prunePublicationReceipts();
+		if (this.#cleanupReceipts.size < loadedCleanupReceipts)
+			await this.#persistPublicationReceipts().catch(error =>
+				logger.warn(
+					`notifications: pruned Telegram cleanup receipts were not persisted: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				),
+			);
 		const uncertainCount = this.#claimedPublications.size + this.#ambiguousPublications.size;
 		if (uncertainCount > 0)
 			logger.warn(
@@ -5989,6 +5999,15 @@ export class TelegramNotificationDaemon {
 	}
 
 	#prunePublicationReceipts(): void {
+		let completedCleanup = 0;
+		for (const receipt of this.#cleanupReceipts.values()) if (receipt.state === "completed") completedCleanup++;
+		// Completed receipts are terminal; pending and failed receipts retain outstanding work.
+		for (const [subscriptionId, receipt] of this.#cleanupReceipts) {
+			if (completedCleanup <= TELEGRAM_PRESENTATION_STATE_LIMIT) break;
+			if (receipt.state !== "completed") continue;
+			this.#cleanupReceipts.delete(subscriptionId);
+			completedCleanup--;
+		}
 		while (this.#deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
 			const oldest = [...this.#deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
 			if (oldest === undefined) return;

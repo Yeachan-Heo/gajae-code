@@ -65,6 +65,16 @@ function notificationSubscription(
 import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
+const CLEANUP_RECEIPT_LIMIT = 4_096;
+
+function completedCleanupReceipts(count: number): Record<string, { sessionId: string; state: string }> {
+	return Object.fromEntries(
+		Array.from({ length: count }, (_, index) => [
+			`seed:${index}`,
+			{ sessionId: `session-${index}`, state: "completed" },
+		]),
+	);
+}
 
 function tempAgentDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-supervisor-test-"));
@@ -381,6 +391,115 @@ describe("Telegram provider supervisor ownership", () => {
 			});
 			await restarted.publicationReceiptHarnessForTest().loadPresentationState();
 			expect(restarted.attachmentRoutingHarnessForTest().cleanupReceipts()).toEqual(routing.cleanupReceipts());
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	test("bounds completed cleanup receipts during session churn without evicting outstanding work", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const statePath = path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json");
+			await Bun.write(
+				statePath,
+				JSON.stringify({
+					version: 4,
+					delivered: {},
+					cleanupReceipts: {
+						...completedCleanupReceipts(CLEANUP_RECEIPT_LIMIT - 2),
+						failed: { sessionId: "failed", state: "failed" },
+						pending: { sessionId: "pending", state: "pending" },
+					},
+				}),
+			);
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "churn",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			const receipts = daemon.publicationReceiptHarnessForTest();
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			await receipts.loadPresentationState();
+			for (let index = 0; index < 5; index++) {
+				const subscription = notificationSubscription(`churn-${index}`);
+				routing.attach(subscription);
+				await routing.remove(subscription, index === 0 ? "removed" : "replaced");
+				await receipts.drainPersistence();
+			}
+			const live = routing.cleanupReceipts();
+			expect(live.filter(receipt => receipt.state === "completed")).toHaveLength(CLEANUP_RECEIPT_LIMIT);
+			const ids = new Set(live.map(receipt => receipt.subscriptionId));
+			for (const id of ["seed:0", "seed:1", "seed:2"]) expect(ids.has(id)).toBe(false);
+			for (const id of ["seed:3", "failed", "pending", "test:churn-0:1", "test:churn-4:1"])
+				expect(ids.has(id)).toBe(true);
+			const persisted = await Bun.file(statePath).json();
+			expect(Object.keys(persisted.cleanupReceipts)).toEqual(live.map(receipt => receipt.subscriptionId));
+			expect(persisted.cleanupReceipts.failed.state).toBe("failed");
+			expect(persisted.cleanupReceipts.pending.state).toBe("pending");
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	test("prunes oversized cleanup receipts on load and preserves publication suppression", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const statePath = path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json");
+			await Bun.write(
+				statePath,
+				JSON.stringify({
+					version: 4,
+					delivered: { delivered: 1 },
+					rejected: { rejected: 2 },
+					cleanupReceipts: {
+						...completedCleanupReceipts(CLEANUP_RECEIPT_LIMIT + 3),
+						failed: { sessionId: "failed", state: "failed" },
+					},
+				}),
+			);
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "load",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			const receipts = daemon.publicationReceiptHarnessForTest();
+			await receipts.loadPresentationState();
+			const live = daemon.attachmentRoutingHarnessForTest().cleanupReceipts();
+			expect(live.filter(receipt => receipt.state === "completed")).toHaveLength(CLEANUP_RECEIPT_LIMIT);
+			expect(live.find(receipt => receipt.subscriptionId === "failed")?.state).toBe("failed");
+			expect(live.some(receipt => receipt.subscriptionId === "seed:2")).toBe(false);
+			expect(live.some(receipt => receipt.subscriptionId === "seed:3")).toBe(true);
+			const persisted = await Bun.file(statePath).json();
+			expect(Object.keys(persisted.cleanupReceipts)).toEqual(live.map(receipt => receipt.subscriptionId));
+			expect(receipts.publicationShouldSuppress("delivered")).toBe(true);
+			expect(receipts.publicationShouldSuppress("rejected")).toBe(true);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	test("loading cleanup receipts within the bound does not rewrite the state file", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const statePath = path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json");
+			await Bun.write(
+				statePath,
+				JSON.stringify({
+					version: 4,
+					delivered: {},
+					cleanupReceipts: completedCleanupReceipts(CLEANUP_RECEIPT_LIMIT),
+				}),
+			);
+			const before = fs.statSync(statePath);
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "unchanged",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			await daemon.publicationReceiptHarnessForTest().loadPresentationState();
+			const after = fs.statSync(statePath);
+			expect(after.ino).toBe(before.ino);
+			expect(after.mtimeMs).toBe(before.mtimeMs);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
