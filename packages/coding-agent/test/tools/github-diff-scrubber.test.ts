@@ -127,11 +127,11 @@ describe("unified diff scrubber", () => {
 			const diff = [
 				...HEADER,
 				"@@ -0,0 +1,5 @@",
-				'+Authorization: [',
+				"+Authorization: [",
 				'+  "quoted-bracket-secret: ]"',
 				'+  "another-secret"',
-				'+]',
-				'+keep this line',
+				"+]",
+				"+keep this line",
 				"",
 			].join("\n");
 
@@ -150,7 +150,7 @@ describe("unified diff scrubber", () => {
 			const diff = [
 				...HEADER,
 				'@@ -1,1 +1,1 @@ function getAuth(secret="auth-token-in-context") {',
-				' content line',
+				" content line",
 				"",
 			].join("\n");
 
@@ -168,14 +168,7 @@ describe("unified diff scrubber", () => {
 
 		it("[P2] preserves no-newline marker order", () => {
 			// No-newline markers should come after the line they're attached to, not separately
-			const diff = [
-				...HEADER,
-				"@@ -1,2 +1,1 @@",
-				" line1",
-				"-line2",
-				"\\ No newline at end of file",
-				"",
-			].join("\n");
+			const diff = [...HEADER, "@@ -1,2 +1,1 @@", " line1", "-line2", "\\ No newline at end of file", ""].join("\n");
 
 			const scrubbed = scrubUnifiedDiff(diff);
 
@@ -194,12 +187,7 @@ describe("unified diff scrubber", () => {
 
 		it("[P4] preserves terminal newline framing", () => {
 			// Input ending with newline should output ending with newline
-			const diff = [
-				...HEADER,
-				"@@ -1,2 +1,2 @@",
-				" line1",
-				" line2",
-			].join("\n") + "\n";
+			const diff = `${[...HEADER, "@@ -1,2 +1,2 @@", " line1", " line2"].join("\n")}\n`;
 
 			const scrubbed = scrubUnifiedDiff(diff);
 
