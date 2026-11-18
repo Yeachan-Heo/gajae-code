@@ -1562,7 +1562,7 @@ describe("github view cache persistence", () => {
 		// redactor collapse the header and leave the following line alone.
 		const ESCAPED_AUTH_COOKIE =
 			'Cookie: [\n  "sid=a; Authorization: Token token=\\"container-auth-secret-1\\"",\n  "container-opaque-2"\n]\nafter=keep';
-		const REDACTED_COOKIE = "Cookie: «redacted»\nafter=keep";
+		const REDACTED_COOKIE = 'Cookie: [\n  "«redacted»",\n  "«redacted»"\n]\nafter=keep';
 
 		function storeBody(number: number, body: string): void {
 			putCached({
@@ -1629,6 +1629,60 @@ describe("github view cache persistence", () => {
 			expect(cached?.rendered).toBe(REDACTED_COOKIE);
 		});
 
+		it("does not leak when an escaped auth value precedes an inline Cookie container", () => {
+			// Regression pin for the same-line opener: the parameterized auth value
+			// used to delete through the end of the line, taking the inline opener
+			// with it and leaving the container's items to the shared redactor.
+			const body = String.raw`Authorization: Token token=\"stub\" Cookie: [
+  "same-line-opaque-7"
+]`;
+			storeBody(1307, body);
+			const stored = readBody(1307);
+			expect(stored).not.toContain("same-line-opaque-7");
+			expect(stored).toContain("«redacted»");
+			expect(stored).not.toContain("\u0000");
+			expect(cacheFileBytes()).not.toContain("same-line-opaque-7");
+		});
+
+		it("keeps the next file's patch when a diff container never closes", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -1 +1,2 @@",
+				"-old",
+				"+Auth: [",
+				'+"truncated-diff-opaque-8"',
+				"diff --git a/b b/b",
+				"index 3333333..4444444 100644",
+				"--- a/b",
+				"+++ b/b",
+				"@@ -1 +1 @@",
+				"-old",
+				"+new",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1308,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+
+			const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1308, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			expect(cached?.payload.unified).not.toContain("truncated-diff-opaque-8");
+			expect(cacheFileBytes()).not.toContain("truncated-diff-opaque-8");
+			expect(cached?.payload.unified).toContain("diff --git a/b b/b");
+			expect(cached?.payload.unified).toContain("+new");
+			expect(cached?.payload.files.map(file => file.path)).toContain("b");
+		});
+
 		it("still redacts a plain single-line Cookie header", () => {
 			const body = "Cookie: sid=plain-cookie-secret; theme=dark";
 			storeBody(1305, body);
@@ -1645,6 +1699,59 @@ describe("github view cache persistence", () => {
 			expect(stored).not.toContain("truncated-opaque-6");
 			expect(cacheFileBytes()).not.toContain("truncated-auth-secret-5");
 			expect(cacheFileBytes()).not.toContain("truncated-opaque-6");
+		});
+
+		it("does not treat a bracketed backtick item as the container end", () => {
+			const body = 'Cookie: [\n  `opaque]backtick-secret-9`,\n  "backtick-opaque-9"\n]\nafter=keep';
+			storeBody(1309, body);
+			const stored = readBody(1309);
+			expect(stored).not.toContain("backtick-secret-9");
+			expect(stored).not.toContain("backtick-opaque-9");
+			expect(stored).toContain("`«redacted»`");
+			expect(cacheFileBytes()).not.toContain("backtick-opaque-9");
+		});
+
+		it("does not treat an escaped bracket as the container end", () => {
+			const body = 'Cookie: [\n  opaque\\]escaped-secret-10,\n  "escaped-opaque-10"\n]\nafter=keep';
+			storeBody(1310, body);
+			const stored = readBody(1310);
+			expect(stored).not.toContain("escaped-secret-10");
+			expect(stored).not.toContain("escaped-opaque-10");
+			expect(cacheFileBytes()).not.toContain("escaped-opaque-10");
+		});
+
+		it("keeps a well-formed diff container's line accounting", () => {
+			const diff = [
+				"diff --git a/a b/a",
+				"index 1111111..2222222 100644",
+				"--- a/a",
+				"+++ b/a",
+				"@@ -0,0 +1,3 @@",
+				"+Cookie: [",
+				'+  "diff-container-secret-11"',
+				"+]",
+				"",
+			].join("\n");
+			putCached({
+				authKey: TEST_AUTH_KEY,
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 1311,
+				includeComments: false,
+				payload: parsePrUnifiedDiff(diff),
+				rendered: diff,
+				fetchedAt: 1,
+			});
+
+			const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 1311, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			const unified = cached?.payload.unified ?? "";
+			expect(unified).not.toContain("diff-container-secret-11");
+			expect(cacheFileBytes()).not.toContain("diff-container-secret-11");
+			expect(unified).toContain("@@ -0,0 +1,3 @@");
+			expect(unified.split("\n")).toContain("+Cookie: [");
+			expect(unified.split("\n")).toContain('+  "«redacted»"');
+			expect(unified.split("\n")).toContain("+]");
 		});
 	});
 });
