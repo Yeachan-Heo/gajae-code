@@ -935,7 +935,9 @@ describe("github view cache persistence", () => {
 			"Cookie:\u00A0{\n\tsid: cache-nbsp-map-canary\n}",
 			'Cookie:\n\u00A0[\n"sid=cache-list-opaque-Q8m4"\n]',
 			'+Cookie:\n+ [\n+   "sid=fixture-cookie-Q8m4"\n+ ]',
+			'+Cookie:\n+ [\n+  { "EncryptionKey": [\n+"synthetic-opaque-marked-Q8m4"\n+  ] }\n+ ]',
 			'Cookie:\u00A0\r\n [\r\n   "sid=fixture-cookie-Q8m4"\r\n ]',
+			"Cookie: \u00A0\nEncryptionKey:\n  synthetic-opaque-Q8m4",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
@@ -1007,6 +1009,8 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("cache-nbsp-map-canary");
 		expect(cacheFileBytes()).not.toContain("cache-list-opaque-Q8m4");
 		expect(cacheFileBytes()).not.toContain("fixture-cookie-Q8m4");
+		expect(cacheFileBytes()).not.toContain("synthetic-opaque-marked-Q8m4");
+		expect(cacheFileBytes()).not.toContain("synthetic-opaque-Q8m4");
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");
 		expect(cacheFileBytes()).not.toContain("/root#top");
