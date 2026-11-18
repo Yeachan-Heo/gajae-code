@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import type { AssistantMessage, Message, TextContent, ToolCall, ToolResultMessage, Usage } from "@gajae-code/ai";
 import { SessionManager } from "../src/session/session-manager";
+import { mulberry32 } from "../test/helpers/seeded-random";
 
 const PACKAGE_NAME = "@gajae-code/coding-agent";
 const BENCH_NAME = "session-get-entries";
@@ -78,16 +79,6 @@ function parseArgs(argv: string[]): CliArgs {
 	return args;
 }
 
-function mulberry32(seed: number): () => number {
-	let state = seed;
-	return () => {
-		state |= 0;
-		state = (state + 0x6d2b79f5) | 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
 
 function smallText(index: number): string {
 	const random = mulberry32(0xface + index);

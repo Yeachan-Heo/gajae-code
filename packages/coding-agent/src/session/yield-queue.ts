@@ -19,8 +19,32 @@ export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
 	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
+	/** Hold delivery admission across draining, message construction and injection. */
+	withIdleAdmission?(body: () => Promise<void>, signal?: AbortSignal): Promise<void>;
 	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
+	/**
+	 * Release per-entry delivery claims after idle entries are dropped without
+	 * delivery. Called once per kind while dropping a terminal admission failure.
+	 */
+	onIdleEntriesDropped?(kind: string, entries: readonly unknown[]): void;
+}
+
+/**
+ * Thrown when idle delivery admission failed in a way the session can never
+ * retry (startup readiness rejected or the session was disposed). Retaining
+ * entries past that point strands them forever, so the queue drops them.
+ */
+export class TerminalIdleAdmissionError extends Error {
+	readonly admissionError: unknown;
+
+	constructor(admissionError: unknown) {
+		super(admissionError instanceof Error ? admissionError.message : String(admissionError), {
+			cause: admissionError,
+		});
+		this.name = "TerminalIdleAdmissionError";
+		this.admissionError = admissionError;
+	}
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -89,6 +113,33 @@ export class YieldQueue {
 			this.#idleFlushPending = false;
 			this.#idleFlushPendingOwner = undefined;
 		}
+		if (mode === "idle") {
+			try {
+				const deliverySignal = signal ?? this.#options.getIdleFlushSignal?.();
+				if (this.#options.withIdleAdmission) {
+					await this.#options.withIdleAdmission(() => this.#flushEntries(mode, deliverySignal), deliverySignal);
+				} else {
+					await this.#flushEntries(mode, deliverySignal);
+				}
+			} catch (error) {
+				if (error instanceof TerminalIdleAdmissionError) {
+					// Readiness itself failed, so no later admission can deliver these
+					// entries: drop them instead of retaining work that never drains.
+					this.clear((kind, entries) => this.#options.onIdleEntriesDropped?.(kind, entries));
+					logger.warn("Yield queue idle delivery dropped after terminal admission failure", {
+						error: formatError(error.admissionError),
+					});
+				} else {
+					// Admission failed before draining: retain the original entries for a later owned retry.
+					logger.warn("Yield queue idle admission failed", { error: formatError(error) });
+				}
+			}
+			return;
+		}
+		await this.#flushEntries(mode, signal);
+	}
+
+	async #flushEntries(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
 		const idleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const entries = this.#drain(kind);
@@ -108,7 +159,7 @@ export class YieldQueue {
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
+				await this.#options.injectIdle(idleMessages, signal);
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}

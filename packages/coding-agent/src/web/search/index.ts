@@ -93,11 +93,28 @@ function formatProviderFailure(error: unknown, provider: SearchProvider): string
 	return `${provider.id}: ${formatProviderError(error, provider)}`;
 }
 
+function formatProviderFailureList(failures: Array<{ provider: SearchProvider; error: unknown }>): string {
+	return failures.map(f => formatProviderFailure(f.error, f.provider)).join("; ");
+}
+
 function formatFallbackWarning(
 	failures: Array<{ provider: SearchProvider; error: unknown }>,
 	provider: SearchProvider,
 ): string {
-	return `Web search provider fallback: ${failures.map(f => formatProviderFailure(f.error, f.provider)).join("; ")}; using ${provider.label}.`;
+	return `Web search provider fallback: ${formatProviderFailureList(failures)}; using ${provider.label}.`;
+}
+
+/**
+ * Provider status text kept for the model. The fence is applied after this
+ * tail cut, so a long body cannot drop the opening marker.
+ */
+export const SEARCH_PROVIDER_STATUS_MAX_CHARS = 2_000;
+
+/** Keep the tail of provider-authored status text, then fence that tail. */
+export function frameSearchProviderStatus(status: string): string {
+	const cap = SEARCH_PROVIDER_STATUS_MAX_CHARS;
+	const kept = status.length <= cap ? status : status.slice(status.length - cap);
+	return wrapUntrustedContent(kept);
 }
 
 /** Truncate text for tool output */
@@ -350,9 +367,12 @@ async function executeSearchUnscoped(
 
 				const text = formatSearchResponseForLlm(response);
 				const warning = failures.length > 0 ? formatFallbackWarning(failures, provider) : undefined;
+				const modelText = warning
+					? `Warning: Web search provider fallback: ${frameSearchProviderStatus(formatProviderFailureList(failures))}; using ${provider.label}.\n\n${text}`
+					: text;
 
 				return {
-					content: [{ type: "text" as const, text: warning ? `Warning: ${warning}\n\n${text}` : text }],
+					content: [{ type: "text" as const, text: modelText }],
 					details: { response, ...(warning ? { warning } : {}) },
 				};
 			} catch (error) {
@@ -373,13 +393,15 @@ async function executeSearchUnscoped(
 	const baseMessage = lastFailure
 		? formatProviderError(lastFailure.error, lastFailure.provider)
 		: `Unknown error from ${lastProvider.label}`;
-	const message =
+	const failureText = formatProviderFailureList(failures);
+	const message = providers.length > 1 ? `All web search providers failed: ${failureText}` : baseMessage;
+	const modelText =
 		providers.length > 1
-			? `All web search providers failed: ${failures.map(f => formatProviderFailure(f.error, f.provider)).join("; ")}`
-			: baseMessage;
+			? `Error: All web search providers failed: ${frameSearchProviderStatus(failureText)}`
+			: `Error: ${frameSearchProviderStatus(message)}`;
 
 	return {
-		content: [{ type: "text" as const, text: `Error: ${message}` }],
+		content: [{ type: "text" as const, text: modelText }],
 		details: { response: { provider: lastProvider.id, sources: [] }, error: message },
 	};
 }

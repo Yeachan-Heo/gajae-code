@@ -500,13 +500,16 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		this.#heartbeat?.cancel();
 		this.#heartbeat = undefined;
 		if (this.#stopped || this.#reconnect) return;
-		const reconnectAt = this.#now() + minimumDelayMs;
+		// Reconnect synchronously to the requested minimum. Deriving an absolute deadline and
+		// immediately subtracting a second `#now()` only remeasured the clock: the timer received
+		// `minimumDelayMs` minus however much the clock ticked inside this synchronous block, so a
+		// 1000 ms resume delay became 999 ms on a loaded event loop.
 		this.#reconnect = this.#setTimeout(
 			() => {
 				this.#reconnect = undefined;
 				this.#connect(this.#resumeGatewayUrl ?? this.#gatewayUrl ?? "wss://gateway.discord.gg");
 			},
-			Math.max(0, reconnectAt - this.#now()),
+			Math.max(0, minimumDelayMs),
 		);
 	}
 

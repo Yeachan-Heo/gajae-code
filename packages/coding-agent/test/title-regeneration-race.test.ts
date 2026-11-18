@@ -73,6 +73,14 @@ function createTitleSession(messages: AgentMessage[], secretsEnabled?: boolean):
 	} as unknown as AgentSession;
 }
 
+/** Production renames go through AgentSession, which owns the session manager. */
+function bindSessionManager(session: AgentSession, manager: ReturnType<typeof createManager>): void {
+	Object.assign(session, {
+		sessionManager: manager,
+		setSessionName: (name: string, source: string) => manager.setSessionName(name, source),
+	});
+}
+
 function titleResponse(title: string): unknown {
 	return {
 		stopReason: "stop",
@@ -161,6 +169,7 @@ async function renameOutbound(
 			.mockResolvedValue(titleResponse("Generated Title") as never);
 		const session = createTitleSession([user(text)], secretsEnabled);
 		const manager = createManager();
+		bindSessionManager(session, manager);
 		if (movedCwd) await manager.moveTo(movedCwd);
 		if (entry === "tui") {
 			const controller = new CommandController(createTuiContext(session, manager, vi.fn()));
@@ -199,6 +208,7 @@ describe("session title regeneration ordering", () => {
 		const messages = [user("Investigate the original task")];
 		const session = createTitleSession(messages);
 		const manager = createManager();
+		bindSessionManager(session, manager);
 		const showStatus = vi.fn();
 		const controller = new CommandController(createTuiContext(session, manager, showStatus));
 
@@ -225,6 +235,7 @@ describe("session title regeneration ordering", () => {
 		const messages = [user("Investigate the original task")];
 		const session = createTitleSession(messages);
 		const manager = createManager();
+		bindSessionManager(session, manager);
 		const output: string[] = [];
 		const runtime = {
 			session,

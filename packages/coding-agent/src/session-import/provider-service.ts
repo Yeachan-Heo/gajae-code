@@ -392,6 +392,10 @@ export async function materializeExternalSessionImport(
 			importedAt,
 		};
 		manager.appendCustomEntry(EXTERNAL_IMPORT_PROVENANCE_CUSTOM_TYPE, provenance);
+		// Shared-append admission cannot be latched on this manager: it was created for a new
+		// session above and has never taken a shared publication, and the import publishes its
+		// whole resident graph through the title/ensureOnDisk path immediately after these
+		// appends. The legacy appends are therefore admitted by construction.
 		manager.appendCustomMessageEntry(
 			EXTERNAL_IMPORT_CONTEXT_CUSTOM_TYPE,
 			prepared.contextText,

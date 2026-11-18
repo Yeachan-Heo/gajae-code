@@ -23,6 +23,7 @@ import {
 	persistCoordinatorRuntimeStateFromEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
 import { exactIdentityNativeBindings, installExactIdentityNatives } from "./helpers/exact-identity-natives";
+import { readJson } from "./helpers/read-json";
 
 /**
  * The state-file lock has TWO on-disk shapes to survive, because the two base writers did
@@ -78,10 +79,6 @@ async function tempRoot(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-lock-"));
 	tempDirs.push(dir);
 	return dir;
-}
-
-async function readJson(file: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
 }
 
 async function waitForPath(

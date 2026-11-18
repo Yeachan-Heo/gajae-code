@@ -6,6 +6,7 @@ import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/s
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
 import { initialPhaseForSkill } from "../../src/skill-state/initial-phase";
 import { buildWorkflowStateReceipt } from "../../src/skill-state/workflow-state-contract";
+import { readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -20,10 +21,6 @@ async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 		else delete process.env.GJC_SESSION_ID;
 		await fs.rm(dir, { recursive: true, force: true });
 	}
-}
-
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
 }
 
 async function readAuditEntries(cwd: string): Promise<Array<Record<string, unknown>>> {

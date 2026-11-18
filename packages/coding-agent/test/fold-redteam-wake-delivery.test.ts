@@ -11,6 +11,7 @@
  * most one fresh turn per merge window.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AsyncJobManager } from "../src/async";
 import type { AsyncJob } from "../src/async/job-manager";
 import { type FoldAdapter, FoldCoordinator, type FoldDeliveryDisposition } from "../src/session/fold-coordinator";
@@ -72,14 +73,8 @@ function coordinatorHarness() {
 	return { coordinator, fenceArmed, fenceReleased, stops };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 5 });
 
 afterEach(() => {
 	AsyncJobManager.resetForTests();

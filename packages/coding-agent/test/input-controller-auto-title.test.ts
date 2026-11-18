@@ -87,6 +87,7 @@ function createContext(opts: {
 			agent: { metadataForProvider: () => undefined },
 			prompt,
 			followUp,
+			setSessionName,
 			isLocallyHandledSlashCommand: (text: string) =>
 				(opts.handledCommands ?? []).some(name => text === `/${name}` || text.startsWith(`/${name} `)),
 		},
@@ -100,7 +101,6 @@ function createContext(opts: {
 			getCwd: () => process.cwd(),
 			getSessionName: () => sessionName,
 			getSessionId: () => sessionId,
-			setSessionName,
 		},
 		showError: vi.fn(),
 		showStatus: vi.fn(),

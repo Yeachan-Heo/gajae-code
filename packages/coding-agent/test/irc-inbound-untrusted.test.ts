@@ -8,6 +8,7 @@ import { type CustomMessage, convertToLlm } from "@gajae-code/coding-agent/sessi
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { IrcTool } from "@gajae-code/coding-agent/tools/irc";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 
 registerMockApi();
 
@@ -46,14 +47,6 @@ const IRC_TEXT_FRAGMENTS = [
 	"\u202e",
 	"e\u0301",
 ];
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
 
 function randomUnicodeCodePoint(random: () => number): string {
 	const ranges = [
@@ -179,7 +172,7 @@ describe("IRC inbound untrusted framing", () => {
 	});
 
 	it("holds seeded arbitrary IRC framing properties (seed 0x1ac68351)", async () => {
-		const random = seededRandom(0x1ac68351);
+		const random = lcgUnit(0x1ac68351);
 		const { session } = createRecipient();
 
 		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {
@@ -199,7 +192,7 @@ describe("IRC inbound untrusted framing", () => {
 	});
 
 	it("preserves generated message values in the incoming prompt (seed 0x5eed6851)", async () => {
-		const random = seededRandom(0x5eed6851);
+		const random = lcgUnit(0x5eed6851);
 		const { session, prompts } = createRecipient();
 		const messageMarker = "Message:\n";
 

@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { SECURE_LOCAL_PROOF_FIELD, secureLocalFrameOperation } from "../secure-local-controls";
+import { lifecycleFingerprint } from "./lifecycle-fingerprint";
 
 export type SdkErrorCode =
 	| "invalid_input"
@@ -37,6 +39,18 @@ export class SdkClientError extends Error {
 		this.details = details;
 		this.transport = options.transport === true;
 		if (reconnect) this.reconnect = reconnect;
+	}
+}
+
+/** Bound a caller-visible operation by a timeout that reports `SdkClientError("timeout")`. */
+export async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	const timeout = Promise.withResolvers<never>();
+	try {
+		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
+		return await Promise.race([promise, timeout.promise]);
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 
@@ -174,6 +188,8 @@ type Incarnation = {
 	readonly generation: number;
 	readonly cycle: Cycle;
 	readonly socket: WebSocket;
+	/** Identity established by this socket's hello, never inherited across reconnects. */
+	connectionId?: string;
 	phase: "opening" | "hello" | "active" | "retired";
 	tornDown: boolean;
 	openTimer?: NodeJS.Timeout;
@@ -190,6 +206,7 @@ type Incarnation = {
 type Pending = {
 	readonly incarnation: Incarnation;
 	readonly connectedOnly: boolean;
+	readonly sensitive: boolean;
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
@@ -236,7 +253,7 @@ function parseFrame(value: unknown): Frame {
  * mutating callback can never desynchronize the advertised identity or the
  * reconciliation fingerprint from the request that was actually sent.
  */
-function deepFreeze<T>(value: T): T {
+export function deepFreeze<T>(value: T): T {
 	if (value && typeof value === "object") {
 		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
 		Object.freeze(value);
@@ -276,21 +293,6 @@ function sinkThenable(value: unknown): void {
 	}
 }
 
-function lifecycleFingerprint(operation: string, input: unknown): string {
-	const identity =
-		input !== null && typeof input === "object" && !Array.isArray(input)
-			? { ...(input as Record<string, unknown>) }
-			: input;
-	if (identity !== null && typeof identity === "object" && !Array.isArray(identity)) {
-		const lifecycleIdentity = identity as Record<string, unknown>;
-		delete lifecycleIdentity.coordinatorSidecarSigningKey;
-		delete lifecycleIdentity.coordinatorSidecarKeyId;
-	}
-	return createHash("sha256")
-		.update(JSON.stringify({ operation, input: identity }))
-		.digest("hex");
-}
-
 function inputFingerprint(input: unknown): string {
 	return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
@@ -316,6 +318,7 @@ export class SdkClient {
 	#cycleGeneration = 0;
 	#incarnationGeneration = 0;
 	#pending = new Map<string, Pending>();
+	#sensitivePending = new Set<string>();
 	#sentRecords = new Map<string, SdkSentRecord>();
 	#frameHandlers = new Set<SdkFrameHandler>();
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
@@ -520,7 +523,32 @@ export class SdkClient {
 			const error = this.#deadlineError();
 			throw options.connectedOnly ? new SdkPreparedDispatchError(error) : error;
 		}
-		const id = randomUUID();
+		const snapshot: unknown = JSON.parse(JSON.stringify(frame));
+		if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot))
+			throw new SdkClientError("invalid_input", "SDK request must serialize to a frame.");
+		frame = snapshot as Frame;
+		if (frame.type === "query_request" && Object.hasOwn(frame, "operation"))
+			throw new SdkClientError("invalid_input", "Query requests cannot shadow their query with an operation.");
+		// Only secure-local frames preserve the exact correlation identity covered
+		// by their proof. A proof field on an ordinary request grants no identity.
+		const signed = secureLocalFrameOperation(frame) !== undefined && Object.hasOwn(frame, SECURE_LOCAL_PROOF_FIELD);
+		if (
+			signed &&
+			(typeof frame[SECURE_LOCAL_PROOF_FIELD] !== "string" || typeof frame.id !== "string" || frame.id.length === 0)
+		)
+			throw new SdkClientError(
+				"invalid_input",
+				"Signed SDK requests require an exact nonempty correlation identity.",
+			);
+		const requireSignedConnection = (): void => {
+			if (signed && (!incarnation.connectionId || frame.connectionId !== incarnation.connectionId))
+				throw new SdkPreparedDispatchError(
+					transportError("connection_closed", "SDK transport identity changed after signing."),
+				);
+		};
+		requireSignedConnection();
+		const id = signed ? (frame.id as string) : randomUUID();
+		if (this.#pending.has(id)) throw new SdkClientError("invalid_input", "SDK request identity is already pending.");
 		const requestFrame = {
 			...frame,
 			id,
@@ -536,15 +564,20 @@ export class SdkClient {
 		const sentIdempotencyKey =
 			typeof serializedFrame.idempotencyKey === "string" ? serializedFrame.idempotencyKey : undefined;
 		const isSpawn = sentOperation === "session.spawn";
-		const sentFingerprint = isSpawn
-			? undefined
-			: typeof serializedFrame.operation === "string"
-				? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
-				: inputFingerprint(serializedFrame.input ?? {});
+		const sensitive = secureLocalFrameOperation(serializedFrame) !== undefined;
+		if (sensitive && this.#sensitivePending.size >= 256)
+			throw new SdkClientError("unavailable", "Too many pending secure-local SDK requests.");
+		const sentFingerprint =
+			isSpawn || sensitive
+				? undefined
+				: typeof serializedFrame.operation === "string"
+					? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+					: inputFingerprint(serializedFrame.input ?? {});
 		const deferred = Promise.withResolvers<unknown>();
 		const pending: Pending = {
 			incarnation,
 			connectedOnly: options.connectedOnly === true,
+			sensitive,
 			resolve: deferred.resolve,
 			reject: deferred.reject,
 			sent: false,
@@ -564,6 +597,7 @@ export class SdkClient {
 			),
 		};
 		this.#pending.set(id, pending);
+		if (sensitive) this.#sensitivePending.add(id);
 		if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
 			const error = transportError("unavailable", "SDK WebSocket is not connected");
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
@@ -573,7 +607,7 @@ export class SdkClient {
 			try {
 				const observerResult = options.beforeDispatch({
 					frame: serializedFrame,
-					connectionId: this.connectionId,
+					connectionId: incarnation.connectionId,
 					generation: incarnation.generation,
 				});
 				if (isThenable(observerResult)) {
@@ -635,6 +669,12 @@ export class SdkClient {
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
 		}
+		try {
+			requireSignedConnection();
+		} catch (error) {
+			this.#settlePending(id, pending, error instanceof Error ? error : new Error(String(error)));
+			return await deferred.promise;
+		}
 		// Handoff bookkeeping is reentrancy-safe: `sent` flips BEFORE the wire
 		// write so a send that synchronously triggers a close event or response
 		// retires this request as already-sent (uncertain_after_send on close,
@@ -647,12 +687,13 @@ export class SdkClient {
 		// it deliberately has no lifecycle fingerprint. Retain the common sent
 		// record anyway so an uncertain transport result tells the caller which
 		// key can join that durable claim.
-		this.#rememberSentRecord({
-			id,
-			...(sentOperation === undefined ? {} : { operation: sentOperation }),
-			...(sentIdempotencyKey === undefined ? {} : { idempotencyKey: sentIdempotencyKey }),
-			...(sentFingerprint === undefined ? {} : { fingerprint: sentFingerprint }),
-		});
+		if (!sensitive)
+			this.#rememberSentRecord({
+				id,
+				...(sentOperation === undefined ? {} : { operation: sentOperation }),
+				...(sentIdempotencyKey === undefined ? {} : { idempotencyKey: sentIdempotencyKey }),
+				...(sentFingerprint === undefined ? {} : { fingerprint: sentFingerprint }),
+			});
 		try {
 			incarnation.socket.send(serializedRequest);
 		} catch (error) {
@@ -680,7 +721,7 @@ export class SdkClient {
 		try {
 			const observerResult = options.onDispatch?.({
 				frame: serializedFrame,
-				connectionId: this.connectionId,
+				connectionId: incarnation.connectionId,
 				generation: incarnation.generation,
 			});
 			if (isThenable(observerResult)) sinkThenable(observerResult);
@@ -1002,15 +1043,20 @@ export class SdkClient {
 				frame.connectionId === this.connectionId
 			)
 				return;
+			incarnation.connectionId = frame.connectionId;
 			this.connectionId = frame.connectionId;
 			this.#notifyReconnectHandlers();
 		}
 		if (!this.#isActive(incarnation)) return;
 		const id =
 			typeof frame.id === "string" ? frame.id : typeof frame.requestId === "string" ? frame.requestId : undefined;
+		let sensitive = false;
+		let correlated = false;
 		if (id) {
 			const pending = this.#pending.get(id);
 			if (pending?.incarnation === incarnation) {
+				sensitive = pending.sensitive;
+				correlated = true;
 				this.#settlePending(
 					id,
 					pending,
@@ -1020,6 +1066,7 @@ export class SdkClient {
 				);
 			}
 		}
+		if (sensitive || (!correlated && (frame.type === "control_response" || frame.type === "query_response"))) return;
 		this.#notifyFrameHandlers(frame);
 	}
 
@@ -1056,13 +1103,11 @@ export class SdkClient {
 	#acceptHello(incarnation: Incarnation, frame: Frame): void {
 		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello") return;
 		if (incarnation.helloTimer) clearTimeout(incarnation.helloTimer);
-		const reconnecting =
-			typeof frame.connectionId === "string" &&
-			frame.connectionId.length > 0 &&
-			this.connectionId !== undefined &&
-			this.connectionId !== frame.connectionId;
-		if (typeof frame.connectionId === "string" && frame.connectionId.length > 0)
-			this.connectionId = frame.connectionId;
+		const connectionId =
+			typeof frame.connectionId === "string" && frame.connectionId.length > 0 ? frame.connectionId : undefined;
+		const reconnecting = this.connectionId !== undefined && this.connectionId !== connectionId;
+		incarnation.connectionId = connectionId;
+		this.connectionId = connectionId;
 		incarnation.phase = "active";
 		this.#currentSocketRecord = incarnation;
 		incarnation.cycle.phase = "complete";
@@ -1083,6 +1128,7 @@ export class SdkClient {
 	): void {
 		if (this.#pending.get(id) !== pending) return;
 		this.#pending.delete(id);
+		this.#sensitivePending.delete(id);
 		clearTimeout(pending.timer);
 		if (responseReceived) pending.onResponse?.();
 		if (result instanceof Error) {

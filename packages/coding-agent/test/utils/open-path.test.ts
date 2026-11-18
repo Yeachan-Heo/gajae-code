@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { Subprocess } from "bun";
 import { openPath } from "../../src/utils/open";
+import { mulberry32 } from "../helpers/seeded-random";
 
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 
@@ -30,17 +31,6 @@ function openerArgv(platform: NodeJS.Platform, target: string): string[] {
 	if (platform === "win32") return ["rundll32", "url.dll,FileProtocolHandler", target];
 	return ["xdg-open", target];
 }
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 function hasAsciiControl(value: string): boolean {
 	for (let i = 0; i < value.length; i++) {
 		const code = value.charCodeAt(i);

@@ -24,7 +24,7 @@ pub struct BrokerRequest {
 	pub idempotency_key: Option<String>,
 }
 
-/// The G01--G07 broker operation identifiers.
+/// Explicit broker operation identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrokerOperation {
 	#[serde(rename = "session.list")]
@@ -38,6 +38,8 @@ pub enum BrokerOperation {
 	SessionCreate,
 	#[serde(rename = "session.fork")]
 	SessionFork,
+	#[serde(rename = "session.revise")]
+	SessionRevise,
 	#[serde(rename = "session.resume")]
 	SessionResume,
 	#[serde(rename = "session.close")]
@@ -147,6 +149,25 @@ mod tests {
 			json!({"type":"broker_response","id":"g1","ok":false,"indexSeq":22,"error":{"code":"endpoint_stale","message":"endpoint changed"}})
 		);
 		assert_eq!(serde_json::from_value::<BrokerServerFrame>(response_value).unwrap(), response);
+	}
+
+	#[test]
+	fn revision_request_preserves_exact_target_and_idempotency_key() {
+		let value = json!({
+			"type": "broker_request",
+			"id": "revise-1",
+			"operation": "session.revise",
+			"input": {"sessionId": "session-1", "entryId": "entry-1", "body": "replacement"},
+			"idempotencyKey": "actor-scoped-revision"
+		});
+		let decoded: BrokerClientFrame = serde_json::from_value(value.clone()).unwrap();
+		let BrokerClientFrame::BrokerRequest(request) = &decoded else {
+			panic!("expected a broker request");
+		};
+		assert_eq!(request.operation, BrokerOperation::SessionRevise);
+		assert_eq!(request.input["entryId"], "entry-1");
+		assert_eq!(request.idempotency_key.as_deref(), Some("actor-scoped-revision"));
+		assert_eq!(serde_json::to_value(decoded).unwrap(), value);
 	}
 
 	#[test]

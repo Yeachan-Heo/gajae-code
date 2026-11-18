@@ -1,7 +1,9 @@
 import { matchesKittySequence as nativeMatchesKittySequence } from "@gajae-code/natives";
 import { parseKittySequence } from "../src/keys";
+import { createBench } from "./harness";
 
 const ITERATIONS = 2000;
+const bench = createBench(ITERATIONS);
 const LOCK_MASK = 64 + 128;
 
 const samples = [
@@ -23,18 +25,6 @@ function matchesKittySequenceJs(data: string, expectedCodepoint: number, expecte
 	if (parsed.baseLayoutKey !== undefined && parsed.baseLayoutKey === expectedCodepoint) return true;
 	return false;
 }
-
-function bench(name: string, fn: () => void): number {
-	const start = Bun.nanoseconds();
-	for (let i = 0; i < ITERATIONS; i++) {
-		fn();
-	}
-	const elapsed = (Bun.nanoseconds() - start) / 1e6;
-	const perOp = (elapsed / ITERATIONS).toFixed(6);
-	console.log(`${name}: ${elapsed.toFixed(2)}ms total (${perOp}ms/op)`);
-	return elapsed;
-}
-
 console.log(`Kitty sequence match benchmark (${ITERATIONS} iterations)\n`);
 
 bench("js/parse+match", () => {

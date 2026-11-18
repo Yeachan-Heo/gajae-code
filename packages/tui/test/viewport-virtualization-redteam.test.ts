@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal, visible } from "./virtual-terminal";
 
 const FLAG = "PI_TUI_VIRTUAL_VIEWPORT";
 
@@ -67,16 +67,6 @@ function makeRows(count: number): string[] {
 
 function boundaryRows(count: number): string[] {
 	return Array.from({ length: count }, (_value, index) => `boundary-${index}`);
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
-}
-
-function capture(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 function applyLines(state: ScenarioState, component: ScriptedLines): void {
@@ -323,14 +313,14 @@ async function runScenario(
 	try {
 		tui.start();
 		await settle(term);
-		snapshots.push(capture(term));
+		snapshots.push(visible(term));
 
 		for (const step of scenario.steps) {
 			step.mutate(state, tui, term);
 			applyLines(state, component);
 			tui.requestRender();
 			await settle(term);
-			snapshots.push(capture(term));
+			snapshots.push(visible(term));
 		}
 	} finally {
 		tui.stop();

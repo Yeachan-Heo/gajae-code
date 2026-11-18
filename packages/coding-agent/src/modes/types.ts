@@ -1,6 +1,12 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai/core";
+import type {
+	AssistantMessage,
+	CredentialRemovalTarget,
+	ImageContent,
+	Message,
+	UsageReport,
+} from "@gajae-code/ai/core";
 import type { Component, Container, EditorTheme, Loader, SlashCommand, Spacer, Text, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
@@ -385,7 +391,7 @@ export interface InteractiveModeContext {
 	// Command handling
 	handleExportCommand(text: string): Promise<void>;
 	handleShareCommand(): Promise<void>;
-	handleCopyCommand(sub?: string): void;
+	handleCopyCommand(): void;
 	handleTodoCommand(args: string): Promise<void>;
 	handleSessionCommand(): Promise<void>;
 	handleJobsCommand(): Promise<void>;
@@ -470,7 +476,8 @@ export interface InteractiveModeContext {
 	handleBtwFollowUp(question: string): Promise<"accepted" | "busy" | "closed" | "rejected">;
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
-	cycleThinkingLevel(): void;
+	handleBtwHandoff(): Promise<void>;
+	cycleThinkingLevel(): Promise<void>;
 	cycleRoleModel(options?: { temporary?: boolean }): Promise<void>;
 	toggleToolOutputExpansion(): void;
 	setToolsExpanded(expanded: boolean): void;
@@ -537,4 +544,9 @@ export interface OAuthSelectorOptions {
 	 * cannot reach this machine.
 	 */
 	manualCode?: boolean;
+	/**
+	 * Credentials to remove after successful OAuth login. Used when re-logging in
+	 * to keep the disabled credential until the new login succeeds.
+	 */
+	credentialsToRemoveAfterLogin?: readonly CredentialRemovalTarget[];
 }

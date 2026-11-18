@@ -1,18 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import { PROVIDER_ACTIVATION_BUDGET_MS, PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
 import type { SessionAttachment } from "../src/sdk/router";
 import { SessionRouter } from "../src/sdk/router/session-router";
 
-const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
-	const deadline = Date.now() + 2_000;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error(`Timed out waiting for ${label}`);
-};
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 2_000, { intervalMs: 5, label });
 
 test("SessionRouter rejects request preparation when reconciliation outlives its deadline", async () => {
 	let refreshes = 0;

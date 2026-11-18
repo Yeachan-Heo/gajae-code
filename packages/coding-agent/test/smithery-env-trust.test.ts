@@ -1,7 +1,7 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
+import { beforeAll, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * Three Smithery reads decide where credentials go and where registry data comes
@@ -27,23 +27,7 @@ interface Resolved {
 	apiBaseUrl: string;
 }
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-smithery-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
-
-function projectDir(dotenv?: string): string {
-	const dir = tempDir();
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { tempDir, projectDir } = createTrustTempDirs("gjc-smithery-trust-");
 
 /**
  * Per-attempt budget for one probe child.

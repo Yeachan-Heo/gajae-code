@@ -1,10 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-	MANAGED_ARTIFACT_MAX_FILE_BYTES,
-	ManagedSessionDescendantStore,
-} from "../src/session/internal/managed-session-storage";
+import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/sdk/session-readonly/inspection";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import {
 	SessionManager,
 	SessionNearLimitAppendError,

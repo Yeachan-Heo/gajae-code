@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CURRENT_SESSION_VERSION, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
 /**
  * Resume listing reads every candidate transcript's trailing bytes to recover a

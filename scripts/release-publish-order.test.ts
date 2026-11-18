@@ -530,7 +530,7 @@ describe("native release binary coverage", () => {
 		expect(workflow).toContain("{ os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }");
 		expect(workflow).toContain("target_id: darwin-x64");
 		expect(workflow).toContain("binary_path: packages/coding-agent/binaries/gjc-darwin-x64");
-		expect(workflow).toContain("{ os: macos-14, platform: darwin, arch: arm64 }");
+		expect(workflow).toContain("{ os: macos-15, platform: darwin, arch: arm64 }");
 		expect(workflow).toContain("target_id: darwin-arm64");
 		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*");
 	});

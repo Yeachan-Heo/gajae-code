@@ -86,6 +86,37 @@ describe("internal-urls docs index loading", () => {
 		DOCS_PROBE_TIMEOUT_MS + 5_000,
 	);
 
+	it(
+		"the install guide retry recipe is read from its documented config path",
+		() => {
+			const stdout = runBunEval(`
+			const fs = await import("node:fs/promises");
+			const os = await import("node:os");
+			const path = await import("node:path");
+			const { Settings } = await import("@gajae-code/coding-agent/config/settings");
+			const document = await Bun.file("../../docs/install.md").text();
+			const section = document.split("## Retry configuration")[1];
+			const documentedPath = section?.match(/Provider retry budgets live in \x60(~[^\x60]+)\x60/)?.[1];
+			const yaml = section?.match(/\x60\x60\x60yaml\\n([\\s\\S]*?)\x60\x60\x60/)?.[1];
+			if (!documentedPath?.startsWith("~/") || !yaml) throw new Error("missing retry config recipe");
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-install-retry-docs-"));
+			try {
+				const agentDir = path.join(root, ".gjc", "agent");
+				const cwd = path.join(root, "project");
+				await fs.mkdir(agentDir, { recursive: true });
+				await fs.mkdir(cwd);
+				await Bun.write(path.join(root, documentedPath.slice(2)), yaml);
+				const settings = await Settings.loadReadonly({ cwd, agentDir });
+				console.log(JSON.stringify({ request: settings.get("retry.requestMaxRetries"), stream: settings.get("retry.streamMaxRetries") }));
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		`);
+			expect(JSON.parse(stdout.trim())).toEqual({ request: 4, stream: 100 });
+		},
+		DOCS_PROBE_TIMEOUT_MS + 5_000,
+	);
+
 	it("embeds exactly the docs corpus that exists on disk", async () => {
 		const onDisk = await scanDocsCorpus();
 

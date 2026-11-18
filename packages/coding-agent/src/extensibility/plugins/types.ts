@@ -132,6 +132,13 @@ export interface PluginRuntimeState {
 	enabledFeatures: string[] | null;
 	/** Whether the plugin is enabled */
 	enabled: boolean;
+	/**
+	 * Set by `plugin link`: the package is a symlink into a local checkout, not a
+	 * registry dependency. It is deliberately absent from package.json
+	 * `dependencies` (bun would copy a `file:` spec or fail to resolve a `link:` one),
+	 * so this flag is what makes it discoverable.
+	 */
+	linked?: boolean;
 }
 
 /**

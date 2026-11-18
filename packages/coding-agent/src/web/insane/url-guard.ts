@@ -71,7 +71,7 @@ function isBlockedHostname(hostname: string): boolean {
 	);
 }
 
-function isPrivateIPv4(address: string): boolean {
+export function isPrivateIPv4(address: string): boolean {
 	const parts = address.split(".").map(part => Number.parseInt(part, 10));
 	if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true;
 	const [a, b, c] = parts;
@@ -150,12 +150,20 @@ const BLOCKED_GLOBAL_IPV6_RANGES = [
 	ipv6Cidr("3ffe::", 16), // returned 6bone range
 	ipv6Cidr("3fff::", 20), // documentation
 ] as const;
+const NAT64_PREFIX = ipv6Cidr("64:ff9b::", 96); // well-known NAT64 prefix (RFC 6052)
+const NAT64_LOCAL_USE = ipv6Cidr("64:ff9b:1::", 48); // local-use prefix (RFC 8215)
 
 function isPrivateIPv6(address: string): boolean {
 	const bytes = parseIPv6Bytes(address);
 	if (!bytes) return true;
 	const isIPv4Mapped = bytes.subarray(0, 10).every(byte => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
 	if (isIPv4Mapped) return isPrivateIPv4(`${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`);
+	// NAT64 local-use prefix (RFC 8215) is always blocked.
+	if (matchesIPv6Cidr(bytes, NAT64_LOCAL_USE)) return true;
+	// NAT64 well-known prefix (RFC 6052): extract embedded IPv4 and check if it is private.
+	if (matchesIPv6Cidr(bytes, NAT64_PREFIX)) {
+		return isPrivateIPv4(`${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`);
+	}
 	return (
 		!matchesIPv6Cidr(bytes, IPV6_GLOBAL_UNICAST) ||
 		BLOCKED_GLOBAL_IPV6_RANGES.some(cidr => matchesIPv6Cidr(bytes, cidr))
@@ -168,6 +176,11 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
 	if (family === 4) return isPrivateIPv4(address);
 	if (family === 6) return isPrivateIPv6(address);
 	return true; // not a recognizable IP -> treat as unsafe
+}
+
+/** URL.hostname retains IPv6 brackets in Node/Bun; net APIs expect the bare literal. */
+export function normalizeUrlHostname(hostname: string): string {
+	return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
 }
 
 /**
@@ -197,7 +210,7 @@ export async function validatePublicHttpUrl(
 		return { ok: false, reason: "localhost or internal host" };
 	}
 
-	const hostname = url.hostname.replace(/^\[|\]$/g, "");
+	const hostname = normalizeUrlHostname(url.hostname);
 	const literalFamily = net.isIP(hostname);
 	if (literalFamily !== 0) {
 		if (isPrivateOrSpecialAddress(hostname)) {
@@ -240,7 +253,7 @@ export async function guardedPublicFetch(
 	const headers = new Headers(init.headers);
 	headers.delete("host");
 	headers.set("Host", logicalUrl.host);
-	const hostname = logicalUrl.hostname.replace(/^\[|\]$/g, "");
+	const hostname = normalizeUrlHostname(logicalUrl.hostname);
 	const tls =
 		logicalUrl.protocol === "https:"
 			? { rejectUnauthorized: true, ...(net.isIP(hostname) === 0 ? { serverName: hostname } : {}) }
