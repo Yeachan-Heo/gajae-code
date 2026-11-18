@@ -28,8 +28,8 @@ const codexModel = {
 
 const codexSolModel = {
 	...codexModel,
-	id: "gpt-6.1-sol",
-	name: "gpt-6.1-sol",
+	id: "gpt-6.2-sol",
+	name: "gpt-6.2-sol",
 	contextWindow: 373_000,
 } satisfies Model<"openai-codex-responses">;
 
@@ -175,7 +175,7 @@ describe("legacy model profile aliases", () => {
 		expect(session.committedModelSelections).toHaveLength(1);
 		expect(session.model).toBe(codexSolModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:low"]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.2-sol:low"]);
 		expect(session.getActivatedModelProfile()).toBe("codex-medium");
 		expect(settings.get("modelProfile.default")).toBe("codex-standard");
 	});
@@ -194,7 +194,7 @@ describe("legacy model profile aliases", () => {
 		expect(session.committedModelSelections).toHaveLength(1);
 		expect(session.model).toBe(codexSolModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:low"]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.2-sol:low"]);
 		expect(session.disposed).toBe(false);
 		expect(settings.get("modelProfile.default")).toBe("codex-medium");
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
@@ -247,7 +247,7 @@ describe("legacy model profile aliases", () => {
 		expect(session.committedModelSelections).toHaveLength(1);
 		expect(session.model).toBe(codexSolModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
-		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:medium"]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.2-sol:medium"]);
 		expect(session.getActivatedModelProfile()).toBe("codex-pro");
 		expect(settings.get("modelProfile.default")).toBe("codex-sol61");
 	});
@@ -266,7 +266,7 @@ describe("legacy model profile aliases", () => {
 		expect(session.committedModelSelections).toHaveLength(1);
 		expect(session.model).toBe(codexSolModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
-		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.1-sol:medium"]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-6.2-sol:medium"]);
 		expect(session.disposed).toBe(false);
 		expect(settings.get("modelProfile.default")).toBe("codex-pro");
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Medium);

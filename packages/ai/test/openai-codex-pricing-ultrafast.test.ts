@@ -29,20 +29,19 @@ describe("Codex gpt-5.6-sol ultrafast exclusion", () => {
 		}
 	});
 
-	test("gpt-6-astra and gpt-6.1-sol support ultrafast on each bundled provider", async () => {
+	test("GPT-6 Astra and GPT-6.1/6.2 Astra and Sol support ultrafast on each bundled provider", async () => {
+		const ultrafastIds = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"];
 		const providers = getBundledProviders();
 		for (const provider of providers) {
 			const providerModels = getBundledModels(provider as never);
-			const gpt6Astra = providerModels.find(m => m.id === "gpt-6-astra");
-			if (gpt6Astra) {
-				const supportsUltrafast = modelSupportsUltrafastTier(gpt6Astra);
-				expect(supportsUltrafast).toBe(true);
+			for (const id of ultrafastIds) {
+				const model = providerModels.find(m => m.id === id);
+				if (model) expect(modelSupportsUltrafastTier(model)).toBe(true);
 			}
-			const gpt61Sol = providerModels.find(m => m.id === "gpt-6.1-sol");
-			if (gpt61Sol) {
-				const supportsUltrafast = modelSupportsUltrafastTier(gpt61Sol);
-				expect(supportsUltrafast).toBe(true);
-			}
+		}
+		for (const provider of ["openai", "openai-codex", "opencode-zen"] as const) {
+			const ids = getBundledModels(provider).map(model => model.id);
+			expect(ids).toEqual(expect.arrayContaining(["gpt-6.2-astra", "gpt-6.2-sol"]));
 		}
 	});
 });

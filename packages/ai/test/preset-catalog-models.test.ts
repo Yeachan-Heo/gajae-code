@@ -47,6 +47,27 @@ describe("preset catalog model entries", () => {
 		]);
 	});
 
+	test("bundles GPT-6.2 Astra and Sol with the thinking ladders used by model profiles", () => {
+		for (const [id, name] of [
+			["gpt-6.2-astra", "GPT-6.2 Astra"],
+			["gpt-6.2-sol", "GPT-6.2 Sol"],
+		] as const) {
+			const model = getBundledModel("openai-codex", id);
+			expect(model).toMatchObject({
+				id,
+				name,
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 1_050_000,
+				maxTokens: 128_000,
+			});
+			expect(getSupportedEfforts(model)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+		}
+	});
+
 	test("bundles Claude Fable 5.2 as a first-party Anthropic model with published pricing", () => {
 		const fable = getBundledModel("anthropic", "claude-fable-5-2");
 		expect(fable).toMatchObject({

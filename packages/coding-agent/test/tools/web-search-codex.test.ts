@@ -239,7 +239,7 @@ describe("searchCodex model selection", () => {
 	beforeEach(() => {
 		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
 		delete process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL;
-		mockDiscovery(["gpt-6.1-sol", "gpt-6-luna"]);
+		mockDiscovery(["gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-luna"]);
 	});
 
 	afterEach(() => {
@@ -257,34 +257,40 @@ describe("searchCodex model selection", () => {
 		}
 	});
 
-	it("uses Sol by default and requests the web_search tool", async () => {
-		using _hook = mockCodexFetch("gpt-6.1-sol");
+	it("uses GPT-6.2 Sol by default and requests the web_search tool", async () => {
+		using _hook = mockCodexFetch("gpt-6.2-sol");
 
 		const result = await searchCodex(makeSearchParams("default codex model"));
 
 		expectAuthenticatedDiscovery();
 		expect(capturedRequest).not.toBeNull();
 		expect(capturedRequest?.url).toBe("https://chatgpt.com/backend-api/codex/responses");
-		expect(capturedRequest?.body?.model).toBe("gpt-6.1-sol");
+		expect(capturedRequest?.body?.model).toBe("gpt-6.2-sol");
 		expect(capturedRequest?.body?.tools).toEqual([{ type: "web_search", search_context_size: "high" }]);
 		expect(capturedRequest?.body?.tool_choice).toEqual({ type: "web_search" });
-		expect(result.model).toBe("gpt-6.1-sol");
+		expect(result.model).toBe("gpt-6.2-sol");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
 	});
 
 	it("falls back to the default model when PI_CODEX_WEB_SEARCH_MODEL is blank", async () => {
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "   ";
-		using _hook = mockCodexFetch("gpt-6.1-sol");
+		using _hook = mockCodexFetch("gpt-6.2-sol");
 
 		const result = await searchCodex(makeSearchParams("blank codex model"));
 
 		expect(capturedRequest).not.toBeNull();
-		expect(capturedRequest?.body?.model).toBe("gpt-6.1-sol");
-		expect(result.model).toBe("gpt-6.1-sol");
+		expect(capturedRequest?.body?.model).toBe("gpt-6.2-sol");
+		expect(result.model).toBe("gpt-6.2-sol");
 	});
 
 	it.each([
 		{ name: "Sol-only", ids: ["gpt-6.1-sol"], expected: "gpt-6.1-sol" },
+		{ name: "GPT-6.2 Sol-only", ids: ["gpt-6.2-sol"], expected: "gpt-6.2-sol" },
+		{
+			name: "reverse-order Luna/6.1 Sol/6.2 Sol",
+			ids: ["gpt-6-luna", "gpt-6.1-sol", "gpt-6.2-sol"],
+			expected: "gpt-6.2-sol",
+		},
 		{ name: "Luna-only", ids: ["gpt-6-luna"], expected: "gpt-6-luna" },
 		{ name: "reverse-order Luna/Sol", ids: ["gpt-6-luna", "gpt-6.1-sol"], expected: "gpt-6.1-sol" },
 		{ name: "non-preferred plus Luna", ids: ["gpt-6-astra", "gpt-6-luna"], expected: "gpt-6-luna" },
@@ -528,13 +534,13 @@ describe("searchCodex model selection", () => {
 	it("lets blank GJC shadow the legacy override and select the default", async () => {
 		process.env.GJC_OPENAI_CODE_WEB_SEARCH_MODEL = "   ";
 		process.env.PI_CODEX_WEB_SEARCH_MODEL = "gpt-5.4-mini";
-		using _hook = mockCodexFetch("gpt-6.1-sol");
+		using _hook = mockCodexFetch("gpt-6.2-sol");
 
 		const result = await searchCodex(makeSearchParams("blank documented override"));
 
 		expectAuthenticatedDiscovery();
-		expect(capturedRequest?.body?.model).toBe("gpt-6.1-sol");
-		expect(result.model).toBe("gpt-6.1-sol");
+		expect(capturedRequest?.body?.model).toBe("gpt-6.2-sol");
+		expect(result.model).toBe("gpt-6.2-sol");
 	});
 
 	it("forces web_search tool choice and extracts markdown link citations when annotations are absent", async () => {
