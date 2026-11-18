@@ -27,7 +27,7 @@ Cell fields:
 - Every batched tool is read-only and needs no approval: `read`, `search`, `find`, `ast_grep`, or `lsp` lookups.
 - This session does not ask for approval on tool calls. Where it does, a nested call waits for approval inside the cell timeout (default 30 s) and can be cancelled before it runs; make direct calls instead.
 
-Never batch `bash`, `edit`, `write`, or other side-effecting tools through eval: call them directly so approval, interruption, and backgrounding behave normally. Skip eval when one direct call suffices.
+Never batch `bash`, `edit`, `write`, or other side-effecting tools through eval: call them directly so approval, interruption, and backgrounding behave normally. `eval` itself cannot be called from inside a cell; add another cell to the same eval call instead. Skip eval when one direct call suffices.
 </instruction>
 
 <prelude>

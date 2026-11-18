@@ -194,6 +194,8 @@ export interface AskAnswerSource {
 export interface NestedToolScope {
 	/** Model-facing tool call id of the eval call that opened this scope. */
 	readonly parentToolCallId: string;
+	/** Aborts nested work still parked in an await when the eval call settles. */
+	readonly abortController: AbortController;
 	/** Rules whose interrupting match invalidated this scope. */
 	invalidatedBy?: string[];
 	/** Set when the model-facing eval call settled; late nested calls must not run. */

@@ -25,6 +25,11 @@ import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import type {
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../src/session/client-bridge";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import type { NestedToolScope, ToolSession } from "../src/tools";
@@ -1006,6 +1011,11 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			streamToolArgs?: boolean;
 			streamText?: string;
 			toolInterruptPolicy?: "abort_tools" | "finish_tools";
+			sdkPermissionProvider?: (
+				toolCall: ClientBridgePermissionToolCall,
+				options: ClientBridgePermissionOption[],
+				signal?: AbortSignal,
+			) => Promise<ClientBridgePermissionOutcome>;
 		} = {},
 	) {
 		const tools = sessionTools.map(tool => tool as AgentTool);
@@ -1079,6 +1089,10 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		});
+		if (options.sdkPermissionProvider) {
+			session.setSdkPermissionMode("prompt");
+			session.setSdkPermissionProvider(options.sdkPermissionProvider);
+		}
 		const triggered: string[][] = [];
 		session.subscribe(event => {
 			if (event.type === "ttsr_triggered") triggered.push(event.rules.map(rule => rule.name));
@@ -2084,7 +2098,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			const text = toolResultText(session, "eval-1");
 			expect(text).toContain(READ_RULE_CONTENT);
 			expect(text).toContain("The nested read call was not executed");
-			expect(text).toContain("was not executed because the rule is configured to interrupt");
+			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
 			expect(text).not.toContain("allowed to run because the rule is configured not to interrupt");
 			expect(injectedNames(session)).toEqual(["secret-reads"]);
 			// No stream abort/retry: the eval turn and the final turn only.
@@ -2186,8 +2200,59 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			// A detached nested call that resumes after the eval result was produced
 			// must not reach the tool or re-claim rules against a finished call id.
 			const late = session.getToolForExecution("read", { nestedToolScope: scope! })!;
-			await expect(late.execute("late-read", { path: "late.txt", _i: "test" })).rejects.toThrow("already settled");
+			await expect(late.execute("late-read", { path: "late.txt", _i: "test" })).rejects.toThrow(
+				/aborted|already settled/i,
+			);
 			expect(reads).toHaveLength(1);
+		});
+
+		it("aborts a nested call parked on approval when the eval call settles", async () => {
+			const bashCalls: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const approval = Promise.withResolvers<ClientBridgePermissionOutcome>();
+			let bashApprovals = 0;
+			const asked: string[] = [];
+			const { session } = createSession(
+				[evalToolFor(() => session), bashTool],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"tool.bash({ command: 'echo X' }).catch(() => {}); await new Promise(resolve => setTimeout(resolve, 50)); return 'CELL-DONE';",
+						),
+					],
+				],
+				[],
+				{
+					sdkPermissionProvider: toolCall => {
+						asked.push(toolCall.toolName);
+						if (toolCall.toolName !== "bash") {
+							return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+						}
+						bashApprovals += 1;
+						return approval.promise;
+					},
+				},
+			);
+			await run(session, "start bash");
+			expect(asked).toEqual(["eval", "bash"]);
+			expect(bashApprovals).toBe(1);
+			expect(toolResultText(session, "eval-1")).toContain("CELL-DONE");
+
+			// Approval arrives only after the eval result was produced; the parked call
+			// must already have been aborted instead of dispatching now.
+			approval.resolve({ outcome: "selected", optionId: "allow_once" });
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
 		});
 
 		it("runs nested calls in a new eval call after an earlier eval was invalidated", async () => {
@@ -2207,6 +2272,56 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
 			expect(toolResultText(session, "eval-1")).toContain("invalidated by an interrupting TTSR match");
 			expect(toolResultText(session, "eval-2")).toContain("FILE-BODY");
+		});
+
+		it("matches a short condition early in long nested arguments", async () => {
+			const reads: unknown[] = [];
+			const filler = `FILLER-${"x".repeat(400)}`;
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`try { await tool.read({ path: 'secrets.txt', content: '${filler}' }); } catch (error) { console.log(String(error?.message ?? error)); }`,
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+
+			// The condition matches the early path field; the long trailing content
+			// must not hide it behind the incremental-stream tail window.
+			expect(reads).toEqual([]);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("The nested read call was not executed");
+		});
+
+		it("refuses eval called from inside eval without breaking the outer cell", async () => {
+			const reads: unknown[] = [];
+			const outerCode = `try {
+			   await tool.eval({ cells: [{ language: 'js', code: "console.log('INNER-RAN')" }] });
+			 } catch (error) { console.log('NESTED-EVAL-REFUSED:' + String(error?.message ?? error)); }
+			 return await tool.read({ path: 'public.txt' });`;
+			const { session } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", outerCode)]],
+				[],
+			);
+			await run(session, "batch reads");
+
+			// Recursion would rebind attribution to the synthetic bridge id; refuse it
+			// while other nested calls in the same cell keep working.
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("NESTED-EVAL-REFUSED");
+			expect(text).toContain("eval cannot be called from inside eval");
+			expect(text).not.toContain("INNER-RAN");
+			expect(text).toContain("FILE-BODY");
 		});
 
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
@@ -2292,7 +2407,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			const text = toolResultText(session, "eval-1");
 			expect(text).toContain("TTSR-ALIAS-REMINDER");
 			expect(text).toContain("The nested apply_patch call was not executed");
-			expect(text).toContain("was not executed because the rule is configured to interrupt");
+			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
 		});
 	});
 });

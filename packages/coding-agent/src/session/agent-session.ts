@@ -10964,11 +10964,17 @@ export class AgentSession {
 	 */
 	#releasePerToolTtsrInjections(toolCallId?: string): void {
 		if (toolCallId === undefined) {
-			for (const scope of this.#nestedToolScopes.values()) scope.closed = true;
+			for (const scope of this.#nestedToolScopes.values()) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
 			this.#nestedToolScopes.clear();
 		} else {
 			const scope = this.#nestedToolScopes.get(toolCallId);
-			if (scope) scope.closed = true;
+			if (scope) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
 			this.#nestedToolScopes.delete(toolCallId);
 		}
 		const ids =
@@ -11002,6 +11008,7 @@ export class AgentSession {
 		const blockedRuleNames = new Set(nestedScope?.invalidatedBy ?? []);
 		if (nestedScope) {
 			nestedScope.closed = true;
+			nestedScope.abortController.abort();
 			this.#nestedToolScopes.delete(ctx.toolCall.id);
 		}
 		// An aborted call's result is replaced by the loop's aborted result, so a
@@ -11246,7 +11253,7 @@ export class AgentSession {
 		args: unknown,
 		signal: AbortSignal | undefined,
 	): Promise<void> {
-		if (signal?.aborted) return;
+		if (signal?.aborted) throw new ToolAbortError();
 		this.#assertNestedToolScopeActive(scope);
 		const manager = this.#ttsrManager;
 		if (!manager?.hasRules()) return;
@@ -11256,11 +11263,12 @@ export class AgentSession {
 			// Match the name the cell invoked (including a custom wire name such as
 			// `apply_patch`), exactly like the direct-call pre-dispatch path.
 			toolName: callName,
-			// Complete arguments, not a stream continuation: give each nested call its own buffer.
+			// Complete arguments, not a stream continuation: scan the whole snapshot for
+			// regex conditions, and keep AST snapshot dedupe isolated per nested call.
 			streamKey: `nested:${scope.parentToolCallId}:${crypto.randomUUID()}`,
 			filePaths: this.#extractTtsrFilePathsFromArgs(args),
 		};
-		const matched = manager.checkDelta(JSON.stringify(args) ?? "", matchContext);
+		const matched = manager.checkSnapshot(JSON.stringify(args) ?? "", matchContext);
 		if (manager.hasAstRules()) {
 			const matcherTool = await this.#materializeTtsrMatcherTool(tool);
 			const astMatched = matcherTool
@@ -11296,13 +11304,22 @@ export class AgentSession {
 					ctx: AgentToolContext | undefined,
 				) => {
 					if (!scope.closed) this.#nestedToolScopes.set(scope.parentToolCallId, scope);
-					await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, signal);
-					// Keep the model-facing call as the attribution target through any
-					// nesting depth, including eval calling eval.
-					// The bridge calls without a context, so this object carries only the
-					// scope; tools that need the full context still receive it when known.
-					const nestedCtx = { ...ctx, nestedToolScope: scope } as AgentToolContext;
-					return await target.execute(toolCallId, args as never, signal, onUpdate, nestedCtx);
+					const callSignal = signal
+						? AbortSignal.any([signal, scope.abortController.signal])
+						: scope.abortController.signal;
+					await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
+					// Dispatch fence, immediately before the call with no await between:
+					// the eval may have settled or been invalidated during preflight, and a
+					// settled scope has aborted callSignal for anything parked further in.
+					if (callSignal.aborted) throw new ToolAbortError();
+					this.#assertNestedToolScopeActive(scope);
+					try {
+						return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
+					} finally {
+						// The result was produced after its eval settled, so any rule this call
+						// claimed has no result to fold into: restore it for a later call.
+						if (scope.closed) this.#releasePerToolTtsrInjections(scope.parentToolCallId);
+					}
 				};
 			},
 		}) as T;

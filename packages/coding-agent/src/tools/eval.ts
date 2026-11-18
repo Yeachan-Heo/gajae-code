@@ -235,7 +235,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		params: z.infer<typeof evalSchema>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
-		ctx?: AgentToolContext,
+		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
 		if (this.session && bashRestrictionBlocksEval(this.session)) {
 			throw new ToolError("Eval is unavailable while this session's bash allowlist or read-only profile is active.");
@@ -254,20 +254,34 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const sessionFile = session.getSessionFile?.() ?? null;
 		const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? null;
 		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
-		// Reuse the model-facing eval call's scope through any nesting depth, so
-		// nested tool reminders fold into that call's result and a late nested call
-		// cannot claim or invalidate a finished eval.
-		const nestedToolScope: NestedToolScope = ctx?.nestedToolScope ?? { parentToolCallId: toolCallId };
+		// Reuse the model-facing eval call's scope, so nested tool reminders fold into
+		// that call's result and a late nested call cannot claim or invalidate a
+		// finished eval. Nested eval is refused: it would otherwise rebind the
+		// attribution to its synthetic bridge call id and the backend cannot re-enter
+		// its own kernel session.
+		const nestedToolScope: NestedToolScope = { parentToolCallId: toolCallId, abortController: new AbortController() };
+		const rejectNestedEval = (name: string): void => {
+			if (name === "eval") {
+				throw new ToolError("eval cannot be called from inside eval; add another cell to this eval call instead.");
+			}
+		};
 		const evalSession: ToolSession = {
 			...session,
 			cwd,
 			settings,
 			getSessionFile: () => sessionFile,
 			getEvalKernelOwnerId: () => kernelOwnerId,
+			getToolByName: name => {
+				rejectNestedEval(name);
+				return session.getToolByName?.(name);
+			},
 			// Nested `tool.<name>()` calls are attributed to this eval call so the
 			// session can apply tool-scoped TTSR rules and fold reminders into it.
 			getToolForExecution: session.getToolForExecution
-				? name => session.getToolForExecution?.(name, { nestedToolScope })
+				? name => {
+						rejectNestedEval(name);
+						return session.getToolForExecution?.(name, { nestedToolScope });
+					}
 				: undefined,
 		};
 		const sessionAbortController = new AbortController();
