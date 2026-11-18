@@ -4872,29 +4872,57 @@ describe("ModelRegistry", () => {
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {
-			await Settings.init({
-				inMemory: true,
-				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
+			// Rapid-MLX discovery leaves through the direct loopback transport, so the
+			// global fetch hook cannot see it. Watch the endpoint itself; the positive
+			// control below proves the observation channel is live when the provider is
+			// enabled, so an empty probe list is the disabled guard and not a blind spot.
+			const rapidMlxProbes: string[] = [];
+			const rapidMlxServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					rapidMlxProbes.push(pathname);
+					if (pathname === "/v1/models") {
+						return Response.json({ data: [{ id: "rapid-mlx-probe-model", context_window: 131_072 }] });
+					}
+					return new Response("not found", { status: 404 });
 				},
 			});
-			const requestedUrls: string[] = [];
-			using _hook = hookFetch(input => {
-				requestedUrls.push(String(input));
-				throw new Error(`Unexpected URL: ${String(input)}`);
-			});
-
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refresh("online");
-
-			const disabledProbeUrls = requestedUrls.filter(
-				url =>
-					url.includes("127.0.0.1:11434") ||
-					url.includes("127.0.0.1:8080") ||
-					url.includes("127.0.0.1:1234") ||
-					url === "http://localhost:8000/v1/models",
+			const restoreRapidMlxBaseUrl = setEnvForTest(
+				"RAPID_MLX_BASE_URL",
+				`http://127.0.0.1:${rapidMlxServer.port}/v1`,
 			);
-			expect(disabledProbeUrls).toEqual([]);
+			try {
+				await Settings.init({
+					inMemory: true,
+					overrides: {
+						disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
+					},
+				});
+				const requestedUrls: string[] = [];
+				using _hook = hookFetch(input => {
+					requestedUrls.push(String(input));
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh("online");
+
+				const disabledProbeUrls = requestedUrls.filter(
+					url =>
+						url.includes("127.0.0.1:11434") || url.includes("127.0.0.1:8080") || url.includes("127.0.0.1:1234"),
+				);
+				expect(disabledProbeUrls).toEqual([]);
+				expect(rapidMlxProbes).toEqual([]);
+
+				settings.override("disabledProviders", []);
+				await registry.refresh("online");
+				expect(rapidMlxProbes).toContain("/v1/models");
+			} finally {
+				restoreRapidMlxBaseUrl();
+				rapidMlxServer.stop(true);
+			}
 		});
 		test("rebuilds implicit discovery when disabled providers change without models.json", async () => {
 			await Settings.init({
