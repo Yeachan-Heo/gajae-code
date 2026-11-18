@@ -752,11 +752,11 @@ function scrubCacheText(text: string, diff = false): string {
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
 	const withoutCookies = withoutBearer
 		.replace(
-			/(^|\n)([-+]?)cookie[^\S\r\n]*:[^\S\r\n]*\r?\n[-+]?[^\S\r\n]*[[{][^\r\n]*(?:\r?\n[-+]?[^\r\n]*)*?\r?\n[-+]?[^\S\r\n]*[\]}][^\r\n]*/gi,
+			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*\r?\n[-+][^\S\r\n]*[[{][^\r\n]*(?:\r?\n[-+]?[^\r\n]*)*?\r?\n[-+]?[^\S\r\n]*[\]}][^\r\n]*/gi,
 			"$1$2Cookie: «redacted»",
 		)
 		.replace(
-			/(^|\n)([-+]?)cookie[^\S\r\n]*:[^\S\r\n]*(?![^\S\r\n]*\r?\n[^\S\r\n]*[[{])(?=[^\S\r\n]*\r?\n)(?:\r?\n[-+]?[^\S\r\n]+[^\r\n]*)+/gi,
+			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*(?![^\S\r\n]*\r?\n[^\S\r\n]*[[{])(?=[^\S\r\n]*\r?\n)(?:\r?\n[-+]?[^\S\r\n]+[^\r\n]*)+/gi,
 			"$1$2Cookie: «redacted»",
 		)
 		.replace(
