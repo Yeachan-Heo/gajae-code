@@ -61,11 +61,10 @@ function takeRedactedTextRun(parts: string[]): string | undefined {
 	if (parts.length === 0) return undefined;
 	// Blocks are rendered with a newline between them, which would split a banner that straddles
 	// two blocks, so they are paired while still adjacent and only then joined for display. A
-	// single block needs no pairing, and pairing it would replace the block before the scrubber
-	// could also mask the credential container around its footer.
+	// single block needs no pairing; `redactDumpText` still replaces it before container masking.
 	// Message text is literal, not encoded JSON, so its `\u` escapes are evidence and stay.
 	const paired = parts.length > 1 ? (redactCrossFieldPrivateKeys(parts, { decodeEscapes: false }) as string[]) : parts;
-	const redacted = redactCrashSecrets(paired.join("\n"));
+	const redacted = redactDumpText(paired.join("\n"));
 	parts.length = 0;
 	return redacted;
 }
@@ -111,6 +110,17 @@ function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]):
 }
 
 /**
+ * Scrub one block of dump text.
+ * A complete private-key block is replaced before the credential-container pass: when the
+ * block's footer sits inside a container, that pass removes the footer first, so the later
+ * block scan can no longer recognize the block and the body stays printed. Containers keep
+ * masking everything the block does not cover.
+ */
+function redactDumpText(text: string): string {
+	return redactCrashSecrets(redactPrivateKeyRanges(text, findPrivateKeySpans(text)));
+}
+
+/**
  * Locate private-key blocks that span sibling argument values.
  * Leaves are joined in serialization order without a separator so a banner split
  * mid-token is still paired, and each block is mapped back to ranges of the
@@ -142,18 +152,22 @@ function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][
 	return spansByValue;
 }
 
-/** Collect every string leaf of a value tree in serialization order. */
-function collectStringLeaves(value: unknown, out: string[]): void {
-	if (typeof value === "string") {
-		out.push(value);
-		return;
-	}
+/**
+ * Collect the text the renderer emits for every leaf of a value tree, in serialization order.
+ * Private-key body text can pass through a numeric, boolean or null argument, which is printed by
+ * `JSON.stringify`, so those characters belong to the paired stream too: leaving them out let a
+ * block be recognized across two string siblings while the digits between them stayed printed.
+ */
+function collectSerializedLeaves(value: unknown, out: string[]): void {
 	if (Array.isArray(value)) {
-		for (const item of value) collectStringLeaves(item, out);
+		for (const item of value) collectSerializedLeaves(item, out);
 		return;
 	}
-	if (value === null || typeof value !== "object") return;
-	for (const nested of Object.values(value)) collectStringLeaves(nested, out);
+	if (value !== null && typeof value === "object") {
+		for (const nested of Object.values(value)) collectSerializedLeaves(nested, out);
+		return;
+	}
+	out.push(serializeParameterValue(value));
 }
 
 /**
@@ -164,7 +178,13 @@ function collectStringLeaves(value: unknown, out: string[]): void {
 function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][], cursor: { index: number }): unknown {
 	if (typeof value === "string") return redactPrivateKeyRanges(value, spans[cursor.index++] ?? []);
 	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor));
-	if (value === null || typeof value !== "object") return value;
+	if (value === null || typeof value !== "object") {
+		// Every printed scalar consumed one leaf, so it advances the cursor too. A number, boolean
+		// or null has no textual form that can keep part of a block, so a covered one is replaced
+		// whole instead of keeping a fragment of the key.
+		const covered = spans[cursor.index++] ?? [];
+		return covered.length > 0 ? PRIVATE_KEY_REDACTION_MARKER : value;
+	}
 	const redacted = Object.create(null) as Record<string, unknown>;
 	for (const [key, nested] of Object.entries(value)) {
 		redacted[key] = applyPrivateKeySpans(nested, spans, cursor);
@@ -239,7 +259,7 @@ function redactCrossFieldPrivateKeys(values: readonly unknown[], options?: Cross
 	const decodeEscapes = options?.decodeEscapes ?? true;
 	const decoded = decodeEscapes ? values.map(decodeValueStrings) : [...values];
 	const leaves: string[] = [];
-	for (const value of decoded) collectStringLeaves(value, leaves);
+	for (const value of decoded) collectSerializedLeaves(value, leaves);
 	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
 	const cursor = { index: 0 };
 	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
@@ -418,7 +438,8 @@ function formatArgsAsXml(
  * Format messages and session metadata as markdown/plain text (same shape as /dump clipboard export).
  * Text runs, tool-argument sections, and each rendered Bash or Python execution
  * section are scrubbed inside that section so a private-key banner cannot pair
- * across unrelated messages.
+ * across unrelated messages. Each section's text replaces a complete private-key
+ * block before the credential-container pass can remove that block's footer.
  */
 export function formatSessionDumpText(options: FormatSessionDumpTextOptions): string {
 	const lines: string[] = [];
@@ -430,7 +451,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			if (systemPrompt.length > 1) {
 				lines.push(`### System Prompt ${index + 1}\n`);
 			}
-			lines.push(redactCrashSecrets(systemPrompt[index]));
+			lines.push(redactDumpText(systemPrompt[index]));
 			lines.push("\n");
 		}
 	}
@@ -449,7 +470,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 		lines.push("## Available Tools\n");
 		for (const tool of tools) {
 			lines.push(`<tool name="${redactCrashSecrets(tool.name)}">`);
-			lines.push(redactCrashSecrets(tool.description));
+			lines.push(redactDumpText(tool.description));
 			const parametersClean = stripTypeBoxFields(tool.parameters);
 			lines.push(`\nParameters:\n${formatArgsAsXml(parametersClean as Record<string, unknown>, "schema")}`);
 			lines.push("<" + "/tool>\n");
@@ -462,7 +483,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 		if (msg.role === "user" || msg.role === "developer") {
 			lines.push(msg.role === "developer" ? "## Developer\n" : "## User\n");
 			if (typeof msg.content === "string") {
-				lines.push(redactCrashSecrets(msg.content));
+				lines.push(redactDumpText(msg.content));
 			} else {
 				const textRun: string[] = [];
 				for (const c of msg.content) {
@@ -491,7 +512,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 					const redactedText = takeRedactedTextRun(textRun);
 					if (redactedText !== undefined) lines.push(redactedText);
 					lines.push("<thinking>");
-					lines.push(redactCrashSecrets(c.thinking));
+					lines.push(redactDumpText(c.thinking));
 					lines.push("</thinking>\n");
 				} else if (c.type === "toolCall") {
 					const redactedText = takeRedactedTextRun(textRun);
@@ -534,21 +555,21 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 				lines.push("## Bash Execution\n");
 				// The renderer emits the sections in reading order, so scrubbing its output pairs a
 				// private-key block across command, output and notice without ordering assumptions.
-				lines.push(redactCrashSecrets(bashExecutionToText(bashMsg)));
+				lines.push(redactDumpText(bashExecutionToText(bashMsg)));
 				lines.push("\n");
 			}
 		} else if (msg.role === "pythonExecution") {
 			const pythonMsg = msg as PythonExecutionMessage;
 			if (!pythonMsg.excludeFromContext) {
 				lines.push("## Python Execution\n");
-				lines.push(redactCrashSecrets(pythonExecutionToText(pythonMsg)));
+				lines.push(redactDumpText(pythonExecutionToText(pythonMsg)));
 				lines.push("\n");
 			}
 		} else if (msg.role === "custom" || msg.role === "hookMessage") {
 			const customMsg = msg as CustomMessage | HookMessage;
 			lines.push(`## ${redactCrashSecrets(customMsg.customType)}\n`);
 			if (typeof customMsg.content === "string") {
-				lines.push(redactCrashSecrets(customMsg.content));
+				lines.push(redactDumpText(customMsg.content));
 			} else {
 				const textRun: string[] = [];
 				for (const c of customMsg.content) {
@@ -568,13 +589,13 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const branchMsg = msg as BranchSummaryMessage;
 			lines.push("## Branch Summary\n");
 			lines.push(`(from branch: ${redactCrashSecrets(branchMsg.fromId)})\n`);
-			lines.push(redactCrashSecrets(branchMsg.summary));
+			lines.push(redactDumpText(branchMsg.summary));
 			lines.push("\n");
 		} else if (msg.role === "compactionSummary") {
 			const compactMsg = msg as CompactionSummaryMessage;
 			lines.push("## Compaction Summary\n");
 			lines.push(`(${compactMsg.tokensBefore} tokens before compaction)\n`);
-			lines.push(redactCrashSecrets(compactMsg.summary));
+			lines.push(redactDumpText(compactMsg.summary));
 			lines.push("\n");
 		} else if (msg.role === "fileMention") {
 			const fileMsg = msg as FileMentionMessage;
@@ -582,7 +603,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			for (const file of fileMsg.files) {
 				lines.push(`<file path="${redactCrashSecrets(file.path)}">`);
 				if (file.content) {
-					lines.push(redactCrashSecrets(file.content));
+					lines.push(redactDumpText(file.content));
 				}
 				if (file.image) {
 					lines.push("[Image attached]");

@@ -1282,7 +1282,7 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parameterValue(dumped, "b")).toBe("«redacted-private-key»");
 	});
 
-	it("masks the credential container that holds a private-key footer", () => {
+	it("removes a private-key block whose footer sits inside a credential container", () => {
 		const body = "CONTAINER_FOOTER_PEM_BODY";
 		const dumped = dump([
 			{
@@ -1296,13 +1296,31 @@ describe("formatSessionDumpText credential scrub", () => {
 			},
 		] as AgentMessage[]);
 
-		// The container value is masked, so its footer never completes a pairing. The unmatched
-		// opener therefore leaves the body readable exactly as it was before this change; fixing
-		// that would need the block scan to run before the container pass, which discloses the
-		// text after the container instead.
-		expect(dumped).toContain("private_key=«redacted»");
+		// The complete block is replaced before the container pass can remove its footer, so the
+		// body that precedes the container does not survive as an unmatched opener's payload.
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
 		expect(dumped).not.toContain(pem("RSA", "END"));
-		expect(dumped).toContain(body);
+	});
+
+	it("still masks a credential container that holds no private-key block", () => {
+		const secret = "CONTAINER_ONLY_SECRET_VALUE";
+		const dumped = dump([
+			{
+				role: "bashExecution",
+				command: "printenv",
+				output: `private_key={footer:"${secret}"}`,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		// Replacing the block first must not disable container masking for everything else.
+		expect(dumped).toContain("private_key=«redacted»");
+		expect(dumped).not.toContain(secret);
 	});
 
 	it("bounds unclosed credential containers in the session dump", () => {
@@ -1346,6 +1364,48 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(firstSecretPart);
 		expect(dumped).not.toContain(secondSecretPart);
 		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("removes a private-key block whose body passes through non-string arguments", () => {
+		const firstSecretPart = "MIIEowIB";
+		const secondSecretPart = "AAKCAQEAxGZ0000";
+		const digits = 987654321;
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-scalar-body",
+						name: "request",
+						arguments: {
+							retries: 3,
+							a: `${pem("RSA", "BEGIN")}\n${firstSecretPart}`,
+							bits: digits,
+							ready: true,
+							empty: null,
+							b: `${secondSecretPart}\n${pem("RSA", "END")}`,
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		// The block is written between the two banners, so every scalar it passes through is part
+		// of the key body and is replaced with it rather than printed as digits, `true` or `null`.
+		expect(parameterValue(dumped, "a")).toBe("«redacted-private-key»");
+		expect(parameterValue(dumped, "bits")).toBe("«redacted-private-key»");
+		expect(parameterValue(dumped, "ready")).toBe("«redacted-private-key»");
+		expect(parameterValue(dumped, "empty")).toBe("«redacted-private-key»");
+		expect(parameterValue(dumped, "b")).toBe("«redacted-private-key»");
+		expect(dumped).not.toContain(String(digits));
+		expect(dumped).not.toContain(firstSecretPart);
+		expect(dumped).not.toContain(secondSecretPart);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		// A number outside the block keeps its own printed form.
+		expect(parameterValue(dumped, "retries")).toBe("3");
+		expect(XMLValidator.validate(`<dump>${dumped}</dump>`)).toBe(true);
 	});
 
 	it("keeps an ordinary sentence in the session dump", () => {
