@@ -5515,6 +5515,7 @@ export class TelegramNotificationDaemon {
 		if (reason === "removed" && !session.logicalSessionIdTrusted) {
 			// Router disappearance alone is not durable archive authority.
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+			this.#prunePublicationReceipts();
 			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
@@ -5536,6 +5537,7 @@ export class TelegramNotificationDaemon {
 				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+			this.#prunePublicationReceipts();
 			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
@@ -5543,6 +5545,7 @@ export class TelegramNotificationDaemon {
 		}
 		this.#dropSession(session, "router_session_removed");
 		this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+		this.#prunePublicationReceipts();
 		void this.#persistPublicationReceipts().catch(() => {
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 		});
@@ -5980,7 +5983,14 @@ export class TelegramNotificationDaemon {
 			this.#claimedPublications.delete(publicationId);
 			this.#ambiguousPublications.delete(publicationId);
 		}
+		const loadedCleanupReceipts = this.#cleanupReceipts.size;
 		this.#prunePublicationReceipts();
+		if (this.#cleanupReceipts.size < loadedCleanupReceipts)
+			await this.#persistPublicationReceipts().catch(error =>
+				logger.warn(
+					`notifications: pruned Telegram cleanup receipts were not persisted: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				),
+			);
 		const uncertainCount = this.#claimedPublications.size + this.#ambiguousPublications.size;
 		if (uncertainCount > 0)
 			logger.warn(
@@ -5989,6 +5999,15 @@ export class TelegramNotificationDaemon {
 	}
 
 	#prunePublicationReceipts(): void {
+		let completedCleanup = 0;
+		for (const receipt of this.#cleanupReceipts.values()) if (receipt.state === "completed") completedCleanup++;
+		// Completed receipts are terminal; pending and failed receipts retain outstanding work.
+		for (const [subscriptionId, receipt] of this.#cleanupReceipts) {
+			if (completedCleanup <= TELEGRAM_PRESENTATION_STATE_LIMIT) break;
+			if (receipt.state !== "completed") continue;
+			this.#cleanupReceipts.delete(subscriptionId);
+			completedCleanup--;
+		}
 		while (this.#deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
 			const oldest = [...this.#deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
 			if (oldest === undefined) return;
@@ -7352,6 +7371,24 @@ export class TelegramNotificationDaemon {
 		return competingLiveClaim || competingRecoveryClaim ? { state: "ambiguous" as const } : authority;
 	}
 
+	#disconnectedResumeAuthority(binding: TopicEndpointBinding, excludedSession: AttachmentSession) {
+		if (this.#isClosedEndpoint(binding.logicalSessionId, binding.chatId, excludedSession))
+			return { state: "ambiguous" as const };
+		const competingLiveClaim = [...this.sessions.values()].some(
+			session => session !== excludedSession && this.#logicalSessionId(session) === binding.logicalSessionId,
+		);
+		const competingRecoveryClaim = [...this.sessions.values()].some(
+			session =>
+				session !== excludedSession &&
+				session.recoveryLease?.state === "pending" &&
+				session.recoveryLease.binding.chatId === binding.chatId &&
+				session.recoveryLease.binding.logicalSessionId === binding.logicalSessionId,
+		);
+		return competingLiveClaim || competingRecoveryClaim
+			? { state: "ambiguous" as const }
+			: this.topics.disconnectedResumeAuthority(binding, this.installationHostId, this.runtime.now());
+	}
+
 	#ownsLiveOpenEndpoint(session: AttachmentSession, binding: TopicEndpointBinding): boolean {
 		return (
 			this.sessions.get(session.sessionId) === session &&
@@ -7425,6 +7462,18 @@ export class TelegramNotificationDaemon {
 					() => {
 						if (!topicIsExclusive()) return "rejected";
 
+						if (
+							identitylessAdmission === "resume" &&
+							this.topics.get(candidateSessionId)?.authorityState === "disconnect_grace"
+						) {
+							const authority = this.topics.disconnectedResumeAuthority(
+								{ ...binding, logicalSessionId: candidateSessionId },
+								this.installationHostId,
+								this.runtime.now(),
+							);
+							if (authority.state !== "unique" || authority.sessionId !== candidateSessionId)
+								return "rejected" as const;
+						}
 						if (allowEndpointRotation && this.topics.get(candidateSessionId)?.authorityState === "inactive") {
 							retiredTopicState = this.topics.serialize();
 							this.topics.retireInactiveEndpointForSuccessor(candidateSessionId, binding);
@@ -10406,11 +10455,16 @@ export class TelegramNotificationDaemon {
 			// rekeyed A→B transport remains denied unless replay proves B.
 			const endpointAuthority = this.#endpointAuthority(endpointBinding, session);
 			const ownsLiveOpenEndpoint = this.#ownsLiveOpenEndpoint(session, endpointBinding);
+			const disconnectedAuthority =
+				replayIdentitySessionId === undefined
+					? this.#disconnectedResumeAuthority(endpointBinding, session)
+					: undefined;
 			const canResumeTransport =
-				endpointAuthority.state === "unique" &&
-				endpointAuthority.sessionId === session.sessionId &&
 				ownsLiveOpenEndpoint &&
-				this.topics.matchesEndpoint(session.sessionId, endpointBinding);
+				((endpointAuthority.state === "unique" &&
+					endpointAuthority.sessionId === session.sessionId &&
+					this.topics.matchesEndpoint(session.sessionId, endpointBinding)) ||
+					(disconnectedAuthority?.state === "unique" && disconnectedAuthority.sessionId === session.sessionId));
 			const inactiveSuccessor =
 				this.topics.get(session.sessionId)?.authorityState === "inactive" &&
 				this.topics.get(session.sessionId)?.chatId === endpointBinding.chatId;

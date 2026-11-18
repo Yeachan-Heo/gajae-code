@@ -1,6 +1,82 @@
 import { describe, expect, test } from "bun:test";
 import { DAEMON_GENERATION, SERVING_EPOCH } from "../src/sdk/bus/telegram-daemon-contract";
-import { parseTopicRegistryState, TopicRegistry, type TopicRegistryState } from "../src/sdk/bus/topic-registry";
+import {
+	parseTopicRegistryState,
+	type TopicCreateClaim,
+	type TopicEndpointBinding,
+	type TopicRecord,
+	TopicRegistry,
+	type TopicRegistryState,
+} from "../src/sdk/bus/topic-registry";
+
+test("disconnected resume authority requires exact unexpired unambiguous grace", () => {
+	const binding = { chatId: "42", transport: "telegram" as const, logicalSessionId: "s1" };
+	const record = {
+		topicId: "1",
+		topicOrigin: "daemon_created" as const,
+		identitySent: true,
+		createdAt: 1,
+		authorityState: "disconnect_grace" as const,
+		orphanedAt: 1,
+		disconnectGraceExpiresAt: 200,
+		chatId: "42",
+		telegramBinding: { chatId: "42", transport: "telegram" as const },
+		leaseOwner: "host",
+		leaseExpiresAt: 150,
+	};
+	const registry = new TopicRegistry({ version: 2, topics: { s1: record } });
+	expect(registry.disconnectedResumeAuthority(binding, "host", 100)).toEqual({ state: "unique", sessionId: "s1" });
+	expect(registry.endpointAuthority(binding)).toEqual({ state: "ambiguous" });
+	for (const patch of [
+		{ authorityState: "active" },
+		{ bindingMalformed: true },
+		{ archiveReason: "session_closed" },
+		{ topicId: "0" },
+		{ telegramBinding: undefined },
+		{ telegramBinding: { chatId: "43", transport: "telegram" } },
+		{ chatId: "43" },
+		{ disconnectGraceExpiresAt: undefined },
+		{ disconnectGraceExpiresAt: Number.NaN },
+		{ disconnectGraceExpiresAt: 100 },
+		{ disconnectGraceExpiresAt: 99 },
+		{ leaseOwner: "other", leaseExpiresAt: 101 },
+	]) {
+		const candidate = registry.get("s1")!;
+		Object.assign(candidate, patch);
+		expect(registry.disconnectedResumeAuthority(binding, "host", 100)).toEqual({ state: "ambiguous" });
+		Object.assign(candidate, record);
+		delete candidate.bindingMalformed;
+		delete candidate.archiveReason;
+	}
+	expect(registry.disconnectedResumeAuthority({ ...binding, logicalSessionId: "" }, "host", 100)).toEqual({
+		state: "ambiguous",
+	});
+	expect(registry.disconnectedResumeAuthority(binding, "", 100)).toEqual({ state: "ambiguous" });
+	expect(registry.disconnectedResumeAuthority(binding, "host", Number.NaN)).toEqual({ state: "ambiguous" });
+	expect(registry.disconnectedResumeAuthority({ ...binding, logicalSessionId: "missing" }, "host", 100)).toEqual({
+		state: "ambiguous",
+	});
+	const collision = new TopicRegistry({ version: 2, topics: { s1: record, s2: { ...record } } });
+	expect(collision.disconnectedResumeAuthority(binding, "host", 100)).toEqual({ state: "ambiguous" });
+	const transient = registry as unknown as {
+		staged: Map<string, TopicRecord>;
+		creatingBindings: Map<string, TopicEndpointBinding>;
+		createClaims: Map<string, TopicCreateClaim>;
+	};
+	const claim = { sessionId: "s1", authorityEpoch: 1, createdAt: 1, binding };
+	for (const [map, key, value] of [
+		[transient.staged, "s1", record],
+		[transient.staged, "other", record],
+		[transient.creatingBindings, "s1", binding],
+		[transient.creatingBindings, "other", binding],
+		[transient.createClaims, "s1", claim],
+		[transient.createClaims, "other", claim],
+	] as const) {
+		(map as Map<string, unknown>).set(key, value);
+		expect(registry.disconnectedResumeAuthority(binding, "host", 100)).toEqual({ state: "ambiguous" });
+		map.delete(key);
+	}
+});
 
 describe("TopicRegistry", () => {
 	test("creates a topic once and reuses it on resume", async () => {
@@ -781,7 +857,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 230 at serving epoch 88", () => {
+test("publishes exact durable authority generation 231 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -844,7 +920,7 @@ test("publishes exact durable authority generation 230 at serving epoch 88", () 
 	// Generation 228 restores the host console code page after shell commands and before Windows TUI frames (#7760).
 	// Generation 229 tracks completeness of ownership descent observations so transient identity resolution failures do not misclassify pre-existing processes as termination targets (#7765).
 	// Generation 230 composes that native ownership policy with retained replay and SDK notification-authority bindings.
-	expect(DAEMON_GENERATION).toBe(230);
+	expect(DAEMON_GENERATION).toBe(231);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {
