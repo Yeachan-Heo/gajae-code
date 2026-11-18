@@ -10996,29 +10996,28 @@ export class AgentSession {
 	}
 
 	/**
-	 * Restore rules claimed by a nested call that produced no foldable result:
-	 * either it never dispatched (a sibling interrupted while it was in preflight)
-	 * or its eval call settled first. Rules already folded for delivery stay
-	 * claimed, so a real reminder is neither dropped nor re-triggered.
+	 * Restore rules claimed by a nested call that was refused at the dispatch
+	 * fence. The call never ran, so its reminder has no result to fold into and
+	 * must stay eligible. Calls that dispatched are owned by the parent result and
+	 * cancellation paths, which settle their claims at fold or release points.
 	 */
 	#releaseUndeliveredNestedClaims(toolCallId: string, rules: Rule[]): void {
 		if (rules.length === 0) return;
 		const names = new Set(rules.map(rule => rule.name));
-		const foldedNames = new Set((this.#perToolTtsrFolded.get(toolCallId)?.rules ?? []).map(rule => rule.name));
 		const claims = this.#perToolTtsrClaims.get(toolCallId);
 		for (const name of names) {
-			if (foldedNames.has(name)) continue;
 			this.#ttsrManager?.releaseInjected(name, claims?.get(name));
 			claims?.delete(name);
 		}
 		const bucket = this.#perToolTtsrInjections.get(toolCallId);
 		if (bucket) {
-			const keeping = bucket.filter(rule => !names.has(rule.name) || foldedNames.has(rule.name));
+			const keeping = bucket.filter(rule => !names.has(rule.name));
 			if (keeping.length > 0) this.#perToolTtsrInjections.set(toolCallId, keeping);
 			else this.#perToolTtsrInjections.delete(toolCallId);
 		}
 		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
 	}
+
 
 	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
@@ -11336,26 +11335,21 @@ export class AgentSession {
 					const callSignal = signal
 						? AbortSignal.any([signal, scope.abortController.signal])
 						: scope.abortController.signal;
-					let claimed: Rule[] = [];
-					let dispatched = false;
+					const claimed = await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
 					try {
-						claimed = await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
 						// Dispatch fence, immediately before the call with no await between:
 						// the eval may have settled or been invalidated during preflight, and a
 						// settled or invalidated scope has aborted callSignal for anything
 						// parked further in.
 						this.#assertNestedToolScopeActive(scope);
 						if (callSignal.aborted) throw new ToolAbortError();
-						dispatched = true;
-						return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
-					} finally {
-						// Claims from a call that never dispatched, or that finished after its eval
-						// settled, have no result to fold into: restore those rules for a later
-						// call without touching reminders already folded for delivery.
-						if (!dispatched || scope.closed) {
-							this.#releaseUndeliveredNestedClaims(scope.parentToolCallId, claimed);
-						}
+					} catch (error) {
+						// This call never dispatched, so its claims have no result to fold into.
+						// Once dispatched, the parent result and cancellation paths own settlement.
+						this.#releaseUndeliveredNestedClaims(scope.parentToolCallId, claimed);
+						throw error;
 					}
+					return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
 				};
 			},
 		}) as T;
