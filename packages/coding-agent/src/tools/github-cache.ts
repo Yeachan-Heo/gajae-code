@@ -671,16 +671,17 @@ function scrubHostPaths(text: string): string {
 
 /** Text-level scrub for everything the view cache persists or serves back. */
 function scrubCacheText(text: string): string {
-	// Structured containers first: a partial flat match would hide the credential
+	// Userinfo comes off the raw text first: container masking can collapse a
+	// blank line that ended a Markdown table, and a later table classification
+	// would then hide a URL behind its cell separator.
+	const withoutUserinfo = stripUrlUserinfo(text);
+	// Structured containers next: a partial flat match would hide the credential
 	// label from the quote-aware container pass.
-	const containers = maskCredentialJsonContainers(text);
-	// Userinfo is removed from the raw text next: an assignment mask inside a
-	// URL's userinfo would hide the `@` delimiter the authority pass needs.
-	const withoutUserinfo = stripUrlUserinfo(containers.text);
+	const containers = maskCredentialJsonContainers(withoutUserinfo);
 	// The shared URL rule does not know about Markdown cell separators and can
 	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
 	// (userinfo was already removed) so only our authority pass sees them.
-	const withoutAtSigns = withoutUserinfo.replaceAll("@", AT_SIGN_MASK);
+	const withoutAtSigns = containers.text.replaceAll("@", AT_SIGN_MASK);
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutAtSigns);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	let scrubbed = redactCrashSecrets(assignments.text);

@@ -874,6 +874,7 @@ describe("github view cache persistence", () => {
 			"- item\n\n```\nliteral\n```\n\n    | A | B |\n    |---|---|\n    |https://alice:demo|value@example.test/x|",
 			"- item\n\n      |https://alice:demo|value@example.test/x|\n      |---|---|",
 			'"token": [\n    ] https://cache-user:demo|opaque@example.test/x\n---|---|---',
+			'| a | b |\n| --- | --- |\n| "token": [\n\n  "array-fixture"\n] |\nhttps://alice:demo|value@example.test/x',
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
@@ -905,6 +906,7 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).toContain("https://example.test/x");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 		expect(cached?.payload.body).not.toContain("demo|opaque");
+		expect(cached?.payload.body).not.toContain("demo|value");
 		expect(cached?.payload.body).not.toContain("opaque");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});
