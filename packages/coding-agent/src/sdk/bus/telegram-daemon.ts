@@ -7125,7 +7125,11 @@ export class TelegramNotificationDaemon {
 				? undefined
 				: { session, token: 0, logicalSessionId };
 	}
-	async #renewTopicLease(sessionId: string, session?: AttachmentSession): Promise<boolean> {
+	async #renewTopicLease(
+		sessionId: string,
+		session?: AttachmentSession,
+		admits: () => boolean = () => true,
+	): Promise<boolean> {
 		if (!this.#topicRegistryMutationAllowed() || !this.#topicAdmissionAllows(session)) return false;
 		const record = this.topics.get(sessionId);
 		if (!record) return true;
@@ -7139,6 +7143,7 @@ export class TelegramNotificationDaemon {
 		};
 		return this.#persistTopicMutation(
 			() =>
+				admits() &&
 				this.topics.acquireLease(
 					sessionId,
 					this.installationHostId,
@@ -7397,6 +7402,15 @@ export class TelegramNotificationDaemon {
 		let claim: { previousSessionId: string; hadDurableTopic: boolean } | undefined;
 		try {
 			claim = await this.#withRecoveryBindingClaim(async () => {
+				const topicIsExclusive = (): boolean => {
+					const record = this.topics.get(candidateSessionId);
+					return (
+						!record ||
+						Object.entries(this.topics.serialize().topics).every(
+							([id, other]) => id === candidateSessionId || other.topicId !== record.topicId,
+						)
+					);
+				};
 				const existing = this.topics.get(candidateSessionId);
 				const hadDurableTopic = existing !== undefined;
 				const previousBinding = existing
@@ -7409,6 +7423,8 @@ export class TelegramNotificationDaemon {
 				let retiredTopicState: TopicRegistryState | undefined;
 				const outcome = await this.#persistTopicMutation(
 					() => {
+						if (!topicIsExclusive()) return "rejected";
+
 						if (allowEndpointRotation && this.topics.get(candidateSessionId)?.authorityState === "inactive") {
 							retiredTopicState = this.topics.serialize();
 							this.topics.retireInactiveEndpointForSuccessor(candidateSessionId, binding);
@@ -7438,7 +7454,7 @@ export class TelegramNotificationDaemon {
 						};
 					return undefined;
 				}
-				if (!(await this.#renewTopicLease(candidateSessionId, session))) {
+				if (!(await this.#renewTopicLease(candidateSessionId, session, topicIsExclusive))) {
 					if (session.recoveryLease?.token === pendingToken)
 						session.recoveryLease = {
 							state: "rejected",
