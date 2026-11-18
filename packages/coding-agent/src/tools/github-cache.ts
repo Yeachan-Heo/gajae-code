@@ -651,6 +651,7 @@ function scrubHostPaths(text: string): string {
 	const scrubLocal = (chunk: string): string => {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
+		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/root(?![A-Za-z0-9._-])/g, "~");
 		// JSON text can escape path separators; mask the same local paths in
