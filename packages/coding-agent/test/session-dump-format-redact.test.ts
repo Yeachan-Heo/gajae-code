@@ -621,6 +621,52 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"default": true');
 	});
 
+	it("masks both spellings of a data keyword in either order under a credential-named property", () => {
+		const escapedFirst = "ESCAPED_FIRST_DEFAULT_SECRET";
+		const canonicalFirst = "CANONICAL_FIRST_DEFAULT_SECRET";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							api_key: { "def\\u0061ult": escapedFirst, default: escapedFirst },
+							client_secret: { default: canonicalFirst, "def\\u0061ult": canonicalFirst },
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain(escapedFirst);
+		expect(dumped).not.toContain(canonicalFirst);
+	});
+
+	it("masks an escaped credential key inside a JSON string payload", () => {
+		const secret = "escaped-string-payload-token";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-escaped-key-in-json-text",
+						name: "request",
+						arguments: { payload: `{"\\u0061pi_key":"${secret}"}` },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(secret);
+		expect(parameterValue(dumped, "payload")).toBe('{"api_key":"«redacted»"}');
+	});
+
 	it("keeps an ordinary decoded JSON blob in the session dump", () => {
 		const payload = '{"path": "src/auth", "note": "ok"}';
 		const dumped = dump([
