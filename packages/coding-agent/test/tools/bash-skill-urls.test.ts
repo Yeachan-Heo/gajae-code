@@ -841,6 +841,43 @@ describe("expandInternalUrls session scope", () => {
 	);
 
 	it.skipIf(!symlinkSupported)(
+		"refuses a user rule spelled at a case-variant spelling of the configured rules link",
+		async () => {
+			const home = await mkdtemp(path.join(tmpdir(), "bash-user-link-case-"));
+			const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(home);
+			try {
+				await mkdir(path.join(home, ".agents", "RULES"), { recursive: true });
+				await writeFile(path.join(home, ".agents", "RULES", "shared.md"), "case-link-rule");
+				// On a case-sensitive namespace `.rules` and `RULES` are two entries; the
+				// configured one is the link, so only its own spelling is the anchor.
+				await symlink(path.join(home, ".agents", "RULES"), path.join(home, ".agents", "rules"));
+				const targetSpelled = path.join(home, ".agents", "RULES", "shared.md");
+				const linkSpelled = path.join(home, ".agents", "rules", "shared.md");
+				setActiveRules([activeUserRule("shared", linkSpelled)]);
+				const cwd = path.join(home, "work", "project");
+				await mkdir(cwd, { recursive: true });
+				const options = { skills: [] as Skill[], sessionCwd: cwd, sessionAgentDir: path.join(home, "agent") };
+				// The configured spelling is the link, and it still expands.
+				await expectExpandsToSource(
+					"cat rule://shared",
+					{ ...options, internalRouter: createInternalRouter({ "rule://shared": { sourcePath: linkSpelled } }) },
+					targetSpelled,
+				);
+				await expect(
+					expandInternalUrls("cat rule://shared", {
+						...options,
+						internalRouter: createInternalRouter({ "rule://shared": { sourcePath: targetSpelled } }),
+					}),
+				).rejects.toThrow(/outside this session/);
+			} finally {
+				spy.mockRestore();
+				resetActiveRulesForTests();
+				await rm(home, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(!symlinkSupported)(
 		"expands a user rule spelled through a linked rules directory and refuses the same file at its target",
 		async () => {
 			const home = await mkdtemp(path.join(tmpdir(), "bash-user-link-root-"));
@@ -2068,6 +2105,14 @@ describe("bash session agent directory", () => {
 					tool.execute("call-env-prefixed-tab", {
 						command: 'printf "%s" "$PAYLOAD"',
 						env: { PAYLOAD: '"prefix rule://tabbed"' },
+					}),
+				).rejects.toThrow(/would change the value's quoting/);
+				// An escaped quote later in the value must not hide the run that closes
+				// right after the URL: this value is balanced and would be corrupted.
+				await expect(
+					tool.execute("call-env-json-escaped", {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: '{"message":"prefix rule://tabbed suffix","note":"a \\"quote"}' },
 					}),
 				).rejects.toThrow(/would change the value's quoting/);
 				// A lone apostrophe in prose is not a quoted run, so the same path is

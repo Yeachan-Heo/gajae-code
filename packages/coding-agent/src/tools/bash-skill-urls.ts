@@ -434,6 +434,16 @@ async function unlinkedDirectorySpelling(base: string, target: string): Promise<
 		} catch {
 			return undefined;
 		}
+		// A writer could replace the entry between the two calls. Re-reading the
+		// resolved path refuses a link that appeared there; a path-based check
+		// cannot be atomic, and whoever can race this directory can already write
+		// the rules inside it.
+		try {
+			const settled = await fs.lstat(current);
+			if (settled.isSymbolicLink() || !settled.isDirectory()) return undefined;
+		} catch {
+			return undefined;
+		}
 	}
 	return current;
 }
@@ -527,10 +537,20 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 			}
 			// A linked rules directory keeps the documented behavior: the link is the
 			// trust anchor for the request's spelling, its target for containment.
-			// The anchor keeps the synthesized `rules` name under either home spelling
-			// discovery may have stored; the link target is never provenance.
-			const linkRoots = [ruleRoot, path.join(canonicalHome, dirName, "rules")];
-			const spelledUnderLink = (candidate: string) => linkRoots.some(root => pathSpelledInside(root, candidate));
+			// The anchor keeps the synthesized `.agent`/`rules` names under either home
+			// spelling discovery may have stored; the link target is never provenance,
+			// so a request spelled at a case-variant target does not count as the link.
+			const anchorSuffix = `${path.sep}${dirName}${path.sep}rules`;
+			const spelledUnderLink = (candidate: string) => {
+				const resolved = path.resolve(candidate);
+				for (const homeSpelling of [home, canonicalHome]) {
+					if (resolved.length <= homeSpelling.length) continue;
+					if (resolved.slice(0, homeSpelling.length).toLowerCase() !== homeSpelling.toLowerCase()) continue;
+					const remainder = resolved.slice(homeSpelling.length);
+					if (remainder === anchorSuffix || remainder.startsWith(`${anchorSuffix}${path.sep}`)) return true;
+				}
+				return false;
+			};
 			if (!spelledUnderLink(lexical) || !spelledUnderLink(ruleLexical)) continue;
 			let linkedRoot: string;
 			try {
@@ -748,17 +768,24 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
 /**
- * The quote character enclosing `index` when that character is balanced in the
- * value, or `undefined`. A lone apostrophe in prose (`it's skill://x`) is not a
- * quoted run, and treating it as one would refuse an ordinary path.
+ * The quote character enclosing `index` when that run also closes after the
+ * match, or `undefined`. A data value may carry a lone apostrophe in prose
+ * (`it's ...`), which is not a quoted run, and a balanced-looking value can hide
+ * the closer behind an escaped quote; both are decided with the same escape
+ * rules as {@link enclosingQuote} instead of by counting characters.
  */
-function enclosingBalancedQuote(value: string, index: number): string | undefined {
+function enclosingClosedQuote(value: string, index: number): string | undefined {
 	const opened = enclosingQuote(value, index);
 	if (opened === undefined) return undefined;
-	const character = opened === "ansi-c" ? "'" : opened;
-	let count = 0;
-	for (const candidate of value) if (candidate === character) count++;
-	return count % 2 === 0 ? character : undefined;
+	for (let i = index; i < value.length; i++) {
+		const character = value[i];
+		if (character === "\\" && opened !== "'") {
+			i++;
+			continue;
+		}
+		if (opened === "ansi-c" ? character === "'" : character === opened) return opened;
+	}
+	return undefined;
 }
 
 function assertFitsQuotedValue(resolvedPath: string, quoted: boolean): void {
@@ -822,7 +849,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		if (!shellContext) {
 			assertFitsQuotedValue(
 				resolvedPath,
-				delimiter !== undefined || enclosingBalancedQuote(command, index) !== undefined,
+				delimiter !== undefined || enclosingClosedQuote(command, index) !== undefined,
 			);
 		}
 		// Command text replaces the whole token because the replacement brings its own
