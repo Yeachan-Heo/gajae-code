@@ -745,6 +745,7 @@ describe("github view cache persistence", () => {
 			"diff --git a/unchanged b/unchanged",
 			`Binary files /dev/null and "b/${encoded}" differ`,
 			`Binary files a/report and notes and "b/${encoded}" differ`,
+			`Binary files a/plain and b/token='left and ${secret}' differ`,
 			"",
 		].join("\n");
 		putCached({
@@ -842,6 +843,10 @@ describe("github view cache persistence", () => {
 			"json \\/\\/user:opaque@host/x",
 			"|//docs.example|'person@example.test'|",
 			"https://alice:demo|value@example.test/x",
+			"https://alice:opaque|canary|value@example.test/y",
+			"first|second",
+			"---|---",
+			"https://docs.example|'person@example.test'",
 		].join("\n");
 		const url = `https://github.com/${TEST_REPO}/issues/92`;
 		putCached({
@@ -860,6 +865,8 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).toContain("json \\/\\/host/x");
 		expect(cached?.payload.body).toContain("|//docs.example|'person@example.test'|");
 		expect(cached?.payload.body).toContain("https://example.test/x");
+		expect(cached?.payload.body).toContain("https://example.test/y");
+		expect(cached?.payload.body).toContain("first|second\n---|---\nhttps://docs.example|'person@example.test'");
 		expect(cached?.payload.body).not.toContain("opaque");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});

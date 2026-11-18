@@ -3019,11 +3019,17 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 		});
 		return tokens;
 	}
-	// An unquoted left path may itself contain ` and `. A quoted right operand
-	// starts at the last ` and "`; otherwise the right operand is the last ` and `
-	// segment.
-	const quotedSeparator = body.lastIndexOf(' and "');
-	const separator = quotedSeparator > 0 ? quotedSeparator : body.lastIndexOf(" and ");
+	// An unquoted left path may itself contain ` and `. The right operand is the
+	// last ` and ` segment whose remainder starts with `b/` or a quote; if no
+	// segment qualifies, fall back to the last ` and `.
+	let separator = -1;
+	for (const match of body.matchAll(/ and /g)) {
+		const candidate = match.index ?? 0;
+		if (candidate <= 0) continue;
+		const right = body.slice(candidate + " and ".length);
+		if (right.startsWith("b/") || right.startsWith('"')) separator = candidate;
+	}
+	if (separator === -1) separator = body.lastIndexOf(" and ");
 	if (separator <= 0) return tokens;
 	const secondStart = separator + " and ".length;
 	const quotedSecond = body.charAt(secondStart) === '"' ? parseDiffQuotedToken(body, secondStart) : undefined;

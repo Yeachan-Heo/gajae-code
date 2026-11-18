@@ -457,8 +457,10 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
  * `scheme://user:token=value@host` keeps its host.
  *
  * A Markdown table row treats `|` as a cell boundary; elsewhere it is part of
- * the authority. The line is classified once and the matching pattern set is
- * used, so a compact table cannot be merged into one URL.
+ * the authority. Table rows are detected from the row itself (edge pipes) or
+ * from the `---|---` delimiter row, because a 2-column row without edge pipes
+ * also has a single pipe. The line is classified once and the matching pattern
+ * set is used, so a compact table cannot be merged into one URL.
  */
 const SCHEME_USERINFO = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
 const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>|]*@/gi;
@@ -466,12 +468,32 @@ const RELATIVE_USERINFO = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>]*@/g;
 const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g;
 const ESCAPED_USERINFO = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
 const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>|]*@/g;
+const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
+
+function tableRowFlags(lines: string[]): boolean[] {
+	const flags = lines.map(line => {
+		const trimmed = line.trim();
+		return trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"));
+	});
+	for (let i = 1; i < lines.length; i++) {
+		if (!TABLE_DELIMITER_ROW.test(lines[i] ?? "") || !(lines[i - 1] ?? "").includes("|")) continue;
+		flags[i - 1] = true;
+		flags[i] = true;
+		for (let j = i + 1; j < lines.length; j++) {
+			const row = lines[j] ?? "";
+			if (row.trim() === "" || !row.includes("|")) break;
+			flags[j] = true;
+		}
+	}
+	return flags;
+}
 
 function stripUrlUserinfo(text: string): string {
-	return text
-		.split("\n")
-		.map(line => {
-			const table = (line.match(/\|/g)?.length ?? 0) >= 2;
+	const lines = text.split("\n");
+	const tables = tableRowFlags(lines);
+	return lines
+		.map((line, index) => {
+			const table = tables[index] === true;
 			const withoutScheme = line.replace(table ? SCHEME_USERINFO_TABLE : SCHEME_USERINFO, "$1");
 			return withoutScheme
 				.replace(table ? RELATIVE_USERINFO_TABLE : RELATIVE_USERINFO, "//")
