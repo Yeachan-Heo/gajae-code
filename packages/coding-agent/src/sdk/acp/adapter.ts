@@ -638,10 +638,24 @@ export class AcpSdkAdapter {
 		try {
 			const statusResult = await this.query("turn.prompt_status", { clientRef });
 			const status = object(statusResult);
-			if (status?.status === "unknown" || status?.status === "acknowledged" || status?.status === "completed") {
-				// Prompt was recorded before connection loss; return its status.
-				return statusResult;
+			// Map reconciliation statuses: "accepted", "in_flight", "terminal_ok", "failed", "unknown"
+			if (status?.status === "accepted" || status?.status === "in_flight" || status?.status === "terminal_ok") {
+				// Prompt was recorded and accepted (or processing). Transform to acknowledgement shape.
+				return {
+					accepted: true,
+					commandId: status.commandId,
+					turnId: status.turnId,
+				};
 			}
+			if (status?.status === "failed") {
+				// Prompt was recorded but failed. Return the error response.
+				return {
+					error: status.error,
+					commandId: status.commandId,
+					turnId: status.turnId,
+				};
+			}
+			// status.status === "unknown": no retained evidence of acceptance; don't treat as recovery.
 		} catch (statusError) {
 			// If prompt_status is not available or not found, try turn.result as fallback.
 			if (statusError instanceof AcpSdkAdapterError && statusError.code === "unknown_query") {
@@ -650,7 +664,28 @@ export class AcpSdkAdapter {
 						kind: "prompt",
 						clientRef,
 					});
-					return turnResult;
+					const turnResultObj = object(turnResult);
+					const result = object(turnResultObj?.result ?? turnResultObj);
+					// Check reconciliation status in fallback result
+					if (
+						result?.status === "accepted" ||
+						result?.status === "in_flight" ||
+						result?.status === "terminal_ok"
+					) {
+						return {
+							accepted: true,
+							commandId: result.commandId,
+							turnId: result.turnId,
+						};
+					}
+					if (result?.status === "failed") {
+						return {
+							error: result.error,
+							commandId: result.commandId,
+							turnId: result.turnId,
+						};
+					}
+					// result.status === "unknown": no evidence of acceptance.
 				} catch {
 					// Fallback also failed; original error will be thrown.
 				}
