@@ -2056,6 +2056,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			const text = toolResultText(session, "eval-1");
 			expect(text).toContain(READ_RULE_CONTENT);
 			expect(text).toContain("FILE-BODY");
+			expect(text).toContain("allowed to run because the rule is configured not to interrupt");
 			expect(ttsrManager.getInjectedRuleNames()).toEqual(["secret-reads"]);
 			expect(injectedNames(session)).toEqual(["secret-reads"]);
 		});
@@ -2083,6 +2084,8 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			const text = toolResultText(session, "eval-1");
 			expect(text).toContain(READ_RULE_CONTENT);
 			expect(text).toContain("The nested read call was not executed");
+			expect(text).toContain("was not executed because the rule is configured to interrupt");
+			expect(text).not.toContain("allowed to run because the rule is configured not to interrupt");
 			expect(injectedNames(session)).toEqual(["secret-reads"]);
 			// No stream abort/retry: the eval turn and the final turn only.
 			expect(modelMessages).toHaveLength(2);
@@ -2247,6 +2250,49 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(triggered).toEqual([]);
 			expect(await Bun.file(path.join(tempDir, "secrets.txt")).text()).toBe("x");
 			expect(toolResultText(session, "eval-1")).not.toContain(READ_RULE_CONTENT);
+		});
+
+		it("matches a nested call by its invoked wire alias", async () => {
+			const calls: unknown[] = [];
+			const wireAliasTool: AgentTool = {
+				name: "edit",
+				label: "Edit",
+				description: "edit",
+				customWireName: "apply_patch",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					calls.push(args);
+					return { content: [{ type: "text" as const, text: "PATCHED" }] };
+				},
+			};
+			const aliasRule = makeRule({
+				name: "alias-patch",
+				content: "TTSR-ALIAS-REMINDER: apply patch carefully.",
+				condition: ["ALIAS-MARKER"],
+				scope: ["tool:apply_patch"],
+			});
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), wireAliasTool],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"try { await tool.apply_patch({ content: 'ALIAS-MARKER' }); } catch (error) { console.log(String(error?.message ?? error)); }",
+						),
+					],
+				],
+				[aliasRule],
+				{ interruptMode: "always" },
+			);
+			await run(session, "apply patch");
+
+			// Direct calls match the invoked `apply_patch` name; nested calls must too.
+			expect(calls).toEqual([]);
+			expect(triggered).toEqual([["alias-patch"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("TTSR-ALIAS-REMINDER");
+			expect(text).toContain("The nested apply_patch call was not executed");
+			expect(text).toContain("was not executed because the rule is configured to interrupt");
 		});
 	});
 });

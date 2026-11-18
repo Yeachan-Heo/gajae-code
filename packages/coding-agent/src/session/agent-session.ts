@@ -452,6 +452,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import ttsrToolBlockedReminderTemplate from "../prompts/system/ttsr-tool-blocked-reminder.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
@@ -10996,6 +10997,9 @@ export class AgentSession {
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, signal?: AbortSignal): AfterToolCallResult | undefined {
 		// The eval call is settling, so any nested call that resumes later must not run.
 		const nestedScope = this.#nestedToolScopes.get(ctx.toolCall.id);
+		// Rules that interrupted a nested call were folded into this result without
+		// running; mark them so the reminder reports the block, not a passthrough.
+		const blockedRuleNames = new Set(nestedScope?.invalidatedBy ?? []);
 		if (nestedScope) {
 			nestedScope.closed = true;
 			this.#nestedToolScopes.delete(ctx.toolCall.id);
@@ -11010,7 +11014,14 @@ export class AgentSession {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
-		const reminder = rules.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r))).join("\n\n");
+		const reminder = rules
+			.map(r =>
+				prompt.render(
+					blockedRuleNames.has(r.name) ? ttsrToolBlockedReminderTemplate : ttsrToolReminderTemplate,
+					ttsrPromptFields(r),
+				),
+			)
+			.join("\n\n");
 		const block: TextContent = { type: "text", text: reminder };
 		this.#perToolTtsrFolded.set(ctx.toolCall.id, { rules, block });
 
@@ -11231,6 +11242,7 @@ export class AgentSession {
 	async #ttsrBeforeNestedToolCall(
 		tool: AgentTool,
 		scope: NestedToolScope,
+		callName: string,
 		args: unknown,
 		signal: AbortSignal | undefined,
 	): Promise<void> {
@@ -11241,7 +11253,9 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		const matchContext: TtsrMatchContext = {
 			source: "tool",
-			toolName: tool.name,
+			// Match the name the cell invoked (including a custom wire name such as
+			// `apply_patch`), exactly like the direct-call pre-dispatch path.
+			toolName: callName,
 			// Complete arguments, not a stream continuation: give each nested call its own buffer.
 			streamKey: `nested:${scope.parentToolCallId}:${crypto.randomUUID()}`,
 			filePaths: this.#extractTtsrFilePathsFromArgs(args),
@@ -11265,12 +11279,12 @@ export class AgentSession {
 		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
 			scope.invalidatedBy = matches.map(rule => rule.name);
 			throw new ToolError(
-				`${this.#formatTtsrAbortReason(matches)}. The nested ${tool.name} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
+				`${this.#formatTtsrAbortReason(matches)}. The nested ${callName} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
 			);
 		}
 	}
 
-	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope): T {
+	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope, callName: string): T {
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);
@@ -11282,7 +11296,7 @@ export class AgentSession {
 					ctx: AgentToolContext | undefined,
 				) => {
 					if (!scope.closed) this.#nestedToolScopes.set(scope.parentToolCallId, scope);
-					await this.#ttsrBeforeNestedToolCall(target, scope, args, signal);
+					await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, signal);
 					// Keep the model-facing call as the attribution target through any
 					// nesting depth, including eval calling eval.
 					// The bridge calls without a context, so this object carries only the
@@ -13571,7 +13585,7 @@ export class AgentSession {
 		if (!tool) return undefined;
 		const prepared = this.#prepareToolForExecution(tool);
 		const scope = options?.nestedToolScope;
-		return scope ? this.#wrapNestedToolForTtsr(prepared, scope) : prepared;
+		return scope ? this.#wrapNestedToolForTtsr(prepared, scope, name) : prepared;
 	}
 
 	/**
