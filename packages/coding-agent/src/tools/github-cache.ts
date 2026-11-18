@@ -419,7 +419,7 @@ function maskCredentialJsonContainers(
 /** Redact parameterized inline auth values such as `Token token="..."`. */
 function maskParameterizedAuthValues(text: string): string {
 	return text.replace(
-		/((?:"(?:(?:[A-Za-z0-9]+-)*authorization|auth)"|(?:(?:[A-Za-z0-9]+-)*authorization|auth))[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)([A-Za-z0-9_.-]+[ \t]*=[ \t]*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\\"(?:\\.|[^"\\\r\n])*\\"|\\'(?:\\.|[^'\\\r\n])*\\'|[^\s,;]+)/gi,
+		/((?:"(?:(?:[A-Za-z0-9]+-)*authorization|auth)"|(?:(?:[A-Za-z0-9]+-)*authorization|auth))[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)([A-Za-z0-9_.-]+[ \t]*=[ \t]*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\\"(?:\\(?![\\"])|[^"\\\r\n])*\\"|\\'(?:\\(?![\\'])|[^'\\\r\n])*\\'|[^\s,;]+)/gi,
 		"$1$2$3$4«redacted»",
 	);
 }
