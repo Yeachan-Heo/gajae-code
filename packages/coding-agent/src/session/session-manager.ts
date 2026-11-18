@@ -12473,6 +12473,7 @@ export class SessionManager {
 	}
 
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
+		// assertLegacyMutationAllowed now allows moves within exclusive transitions (#7856)
 		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
@@ -12579,7 +12580,6 @@ export class SessionManager {
 			this.destination !== previousDestination
 		)
 			throw new Error("Session cwd move admission changed during validation; retry after it settles.");
-		this.assertLegacyMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
@@ -12597,7 +12597,6 @@ export class SessionManager {
 		const hadPersistedSession = this.#ensuredOnDisk;
 		try {
 			await this.#runBeforeMoveListeners(moveDetails);
-			this.assertLegacyMutationAllowed("move session");
 		} catch (error) {
 			await this.#runMoveAbortListeners(moveDetails);
 			throw error;
@@ -12609,7 +12608,6 @@ export class SessionManager {
 			// Close the persist writer before moving files
 			try {
 				await this.#closePersistWriter();
-				this.assertLegacyMutationAllowed("move session");
 			} catch (error) {
 				await this.#runMoveAbortListeners(moveDetails);
 				throw error;

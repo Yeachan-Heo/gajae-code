@@ -45,6 +45,7 @@ import type {
 	OAuthProvider,
 	OAuthProviderId,
 } from "./utils/oauth/types";
+import { isLoopbackHostname } from "./utils/parse-bind";
 import { isSqliteError } from "./utils/sqlite-errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +74,10 @@ export function extractStructuredApiKeyToken(apiKey: string): string | undefined
 export interface MCPOAuthBinding {
 	/** Exact HTTP(S) origin of the MCP resource endpoint. */
 	resourceOrigin: string;
-	/** Exact canonical HTTP(S) token endpoint used to create and refresh the credential. */
+	/**
+	 * Canonical token endpoint used to create and refresh the credential.
+	 * Cleartext http is accepted only for a loopback host. Every other host is https.
+	 */
 	tokenEndpoint: string;
 }
 
@@ -98,22 +102,74 @@ export function resolveMCPOAuthResourceOrigin(value: string): string | undefined
 	return resolveCanonicalHttpUrl(value)?.origin;
 }
 
-export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined {
-	return resolveCanonicalHttpUrl(value)?.href;
+/**
+ * Cleartext token traffic has no remote observer only on loopback. Special-purpose
+ * and every other non-loopback address are not a cleartext exception.
+ *
+ * `URL` serializes every IPv4-mapped IPv6 literal as `[::ffff:<hi>:<lo>]`, so that
+ * single shape is the only mapped form that can reach this predicate; an
+ * unnormalized mapped literal fails closed instead of being read as dotted IPv4.
+ */
+function cleartextTokenEndpointAllowed(hostname: string): boolean {
+	const normalized = hostname
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "")
+		.replace(/\.+$/, "");
+	if (isLoopbackHostname(normalized)) return true;
+	const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(normalized);
+	if (!mapped) return false;
+	const high = Number.parseInt(mapped[1] ?? "", 16);
+	const low = Number.parseInt(mapped[2] ?? "", 16);
+	return isLoopbackHostname(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
 }
 
+/**
+ * Canonical token endpoint with the cleartext policy applied. Configuration and
+ * every token-use boundary admit only this shape; see
+ * {@link isMCPOAuthBindingTransportAdmitted} for the binding form.
+ */
+export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined {
+	const url = resolveCanonicalHttpUrl(value);
+	if (!url) return undefined;
+	if (url.protocol === "http:" && !cleartextTokenEndpointAllowed(url.hostname)) return undefined;
+	return url.href;
+}
+
+/**
+ * Persisted wire shape only: canonical http(s) URLs, no credentials, no fragment.
+ *
+ * A row written before the cleartext policy existed may carry a non-loopback HTTP
+ * token endpoint. Decoding must still accept its shape so one such row cannot
+ * invalidate the whole persisted or broker snapshot; the cleartext policy is
+ * applied separately at every token-use boundary.
+ */
 export function isCanonicalMCPOAuthBinding(binding: MCPOAuthBinding): boolean {
 	return (
 		resolveMCPOAuthResourceOrigin(binding.resourceOrigin) === binding.resourceOrigin &&
+		resolveCanonicalHttpUrl(binding.tokenEndpoint)?.href === binding.tokenEndpoint
+	);
+}
+
+/**
+ * Transport admission: the persisted wire shape plus the cleartext policy. A
+ * binding that fails here must never receive a refresh token, client secret, or
+ * authorization code, and must never be dispatched to an MCP server.
+ */
+export function isMCPOAuthBindingTransportAdmitted(binding: MCPOAuthBinding): boolean {
+	return (
+		isCanonicalMCPOAuthBinding(binding) &&
 		resolveMCPOAuthTokenEndpoint(binding.tokenEndpoint) === binding.tokenEndpoint
 	);
 }
 
-export function assertCanonicalMCPOAuthBinding(
+export function assertMCPOAuthBindingTransportAdmitted(
 	binding: MCPOAuthBinding | undefined,
 ): asserts binding is MCPOAuthBinding {
 	if (!binding || !isCanonicalMCPOAuthBinding(binding)) {
 		throw new Error("Invalid MCP OAuth credential binding");
+	}
+	if (!isMCPOAuthBindingTransportAdmitted(binding)) {
+		throw new Error("MCP OAuth token endpoint refused: cleartext HTTP is loopback-only");
 	}
 }
 
@@ -150,7 +206,7 @@ async function refreshBoundMCPOAuthCredential(
 	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	const binding = credential.mcpBinding;
-	assertCanonicalMCPOAuthBinding(binding);
+	assertMCPOAuthBindingTransportAdmitted(binding);
 	const params = new URLSearchParams({
 		grant_type: "refresh_token",
 		refresh_token: credential.refresh,
@@ -7730,7 +7786,7 @@ export class AuthStorage {
 			if (target.credential.mcpBinding && remoteRefresh) {
 				// Remote (broker) stores refresh MCP-bound rows server-side; the
 				// server runs the guarded local path against its own row.
-				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
 				const refreshedCredential = await remoteRefresh(id, stale, mcpClient, signal);
 				if (
 					refreshedCredential.mcpBinding?.resourceOrigin !== target.credential.mcpBinding.resourceOrigin ||
@@ -7746,7 +7802,7 @@ export class AuthStorage {
 				// stale-snapshot guard, memo recording, and failure provenance.
 				// The outer #oauthRefreshInFlight map already single-flights
 				// concurrent public force callers per row.
-				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
 				refreshed = await this.#refreshOAuthCredentialUnshared(
 					provider as Provider,
 					stale,

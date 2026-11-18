@@ -2802,6 +2802,28 @@ export class SelectorController {
 				{ manualCode },
 			);
 			await this.ctx.session.modelRegistry.refresh("online-if-uncached", this.ctx.session.credentialSessionId);
+
+			// Remove any disabled credentials after successful login (kept during re-login flow)
+			if (options?.credentialsToRemoveAfterLogin?.length) {
+				const authStorage = this.ctx.session.modelRegistry.authStorage;
+				const removalResult = authStorage.removeAuthCredentialsHard(
+					providerId,
+					options.credentialsToRemoveAfterLogin,
+				);
+				// Treat both "removed" (successfully deleted) and "conflict" (already purged)
+				// as successful cleanup. A conflict result means the disabled credentials were
+				// already removed by upsertAuthCredentialForProvider's purgeSupersededDisabledRows
+				// when re-logging into the same account identity, which is the desired state.
+				if (removalResult.kind === "conflict") {
+					// Already purged during upsert (same-account re-login); this is expected
+				} else if (removalResult.kind !== "removed") {
+					// This should never happen, but log it if it does
+					this.ctx.showError(
+						"Warning: Failed to remove old disabled credential after login. You may see duplicate accounts.",
+					);
+				}
+			}
+
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			const successMessage =
 				providerId === "opencodex"
@@ -2937,18 +2959,14 @@ export class SelectorController {
 									const authStorage = this.ctx.session.modelRegistry.authStorage;
 									const removalTargets = authStorage.listCredentialRemovalTargets(selectedProviderId);
 									const targetToRemove = removalTargets.find(target => target.id === credentialId);
-									if (targetToRemove) {
-										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [
-											targetToRemove,
-										]);
-										if (result.kind !== "removed") {
-											this.ctx.showError("Failed to clear disabled credential. Retry or re-login manually.");
-											return;
-										}
-									}
+									// Keep the disabled credential until new login succeeds; pass it to handleOAuthLogin
+									const reloginOptions = {
+										...options,
+										credentialsToRemoveAfterLogin: targetToRemove ? [targetToRemove] : undefined,
+									};
 									selector.stopValidation();
 									done();
-									await this.#handleOAuthLogin(selectedProviderId, options);
+									await this.#handleOAuthLogin(selectedProviderId, reloginOptions);
 								},
 								onAccountRemove: async targets => {
 									await this.#handleLogout(selectedProviderId, targets);

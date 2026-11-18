@@ -910,6 +910,7 @@ interface AcceptedQueueCancellation {
 	disposition: AcceptedQueueDisposition;
 	dispositionPromise: Promise<AcceptedQueueDisposition>;
 	resolveDisposition: (disposition: AcceptedQueueDisposition) => void;
+	ExecutionStarted: boolean;
 	removalTerminalization?: Promise<boolean>;
 	removalFailure?: unknown;
 }
@@ -3307,7 +3308,7 @@ function createControlSurface(
 			: { changed: true };
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
-	const pendingPreflights = new Map<string, Set<() => void>>();
+	const pendingPreflights = new Map<string, Set<() => void | boolean>>();
 	// The SDK connection that accepted the currently active prompt/skill, if
 	// any: terminal aborts are requester-scoped, so another connection must
 	// never stop it, and an agent-initiated turn (monitor/cron follow-up) has
@@ -3450,17 +3451,39 @@ function createControlSurface(
 			disposition: "preflight",
 			dispositionPromise: queueDisposition.promise,
 			resolveDisposition: queueDisposition.resolve,
+			ExecutionStarted: false,
 		};
 		let accepted = false;
 		let settled = false;
 		let submission: Promise<unknown> | undefined;
-		const cancelPreflight = () => {
+		let unregisteredOnExecutionStart = false;
+		const cancelPreflight = (): boolean => {
 			preflightController.abort();
-			if (settled) return;
+			// Issue #7853: Check if execution has started. Only return true if the submission
+			// is still in the preflight phase (accepted but NOT started). Once execution starts
+			// (at agent_start), we cannot cancel the preflight anymore.
+			const cancellationRecord = acceptedQueueCancellations.get(`${correlation.commandId}:${correlation.turnId}`);
+			if (cancellationRecord?.ExecutionStarted === true) {
+				// Execution has started; cannot cancel preflight after agent_start has fired.
+				// Unregister this callback so it won't be called again.
+				if (!unregisteredOnExecutionStart) {
+					unregisteredOnExecutionStart = true;
+					const requesterPreflights = currentRequesterPreflights();
+					requesterPreflights.delete(cancelPreflight);
+				}
+				return false; // Cannot cancel; execution has already started
+			}
+			if (accepted) {
+				// The preflight was accepted (durable write succeeded) and execution has NOT started yet.
+				// The signal is now aborted, which interrupts the preflight. This is a successful cancellation.
+				return true;
+			}
+			if (settled) return false; // Already settled and not accepted, didn't cancel
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			);
+			return true; // Successfully cancelled
 		};
 		const requesterPreflights = currentRequesterPreflights();
 		requesterPreflights.add(cancelPreflight);
@@ -3510,7 +3533,7 @@ function createControlSurface(
 		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
 		queueCancellation.queueCandidate = queuedAtDispatch;
 		if (queuedAtDispatch && queueCancellation.accepted) queueCancellation.disposition = "queued";
-		if (kind === "prompt")
+		if (kind === "prompt" || kind === "skill")
 			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
 		let queuedRunStartRefused = false;
@@ -3812,8 +3835,30 @@ function createControlSurface(
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
 		} finally {
-			requesterPreflights.delete(cancelPreflight);
-			if (requesterPreflights.size === 0) pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+			// Issue #7853: Keep the preflight in the set until the submission completes
+			// or is aborted, so that a terminal abort can still cancel an accepted preflight.
+			// Delete only happens after submission completes or abort successfully cancels it.
+			const connectionId = sdkControlRequesterContext.getStore() ?? "";
+			if (!submission) {
+				// Cleanup synchronously when dispatch throws before submission is assigned:
+				// imageUploads.redeem() throws before submission is created, leaving the
+				// preflight callback in the set indefinitely.
+				requesterPreflights.delete(cancelPreflight);
+				if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+					pendingPreflights.delete(connectionId);
+			}
+			void submission?.then(
+				() => {
+					requesterPreflights.delete(cancelPreflight);
+					if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+						pendingPreflights.delete(connectionId);
+				},
+				() => {
+					requesterPreflights.delete(cancelPreflight);
+					if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+						pendingPreflights.delete(connectionId);
+				},
+			);
 		}
 	};
 	const terminalAbort = async (
@@ -3895,20 +3940,33 @@ function createControlSurface(
 							code: "idempotency_conflict",
 						});
 					const persisted = stored(existing);
-					if (existing.turnDisposition === "stopped")
+					if (existing.turnDisposition === "stopped") {
+						const isPrefCancelled = existing.ownedWorkDisposition === "not_requested";
+						const isPreflightPath =
+							isPrefCancelled || (scope === "turn" && existing.ownedWorkDisposition === "uncertain");
 						return {
 							ok: true,
 							selection: scope,
 							turn: "stopped",
 							...(scope === "owned"
 								? {
-										ownedWork: existing.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+										ownedWork: isPrefCancelled
+											? "stopped"
+											: existing.ownedWorkDisposition === "stopped"
+												? "stopped"
+												: "uncertain",
 										automaticDelivery: "none",
 										resumeOnOwnedCompletion: false,
 									}
 								: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
+							...(isPreflightPath
+								? {
+										reason: isPrefCancelled ? "preflight_cancelled" : "worker_unsettled",
+									}
+								: {}),
 							replay: persisted,
 						};
+					}
 					if (existing.turnDisposition === "no_effect")
 						return {
 							ok: true,
@@ -3961,23 +4019,35 @@ function createControlSurface(
 								code: "idempotency_conflict",
 							});
 						return tombstone.turnDisposition === "stopped"
-							? {
-									ok: true,
-									selection: scope,
-									turn: "stopped",
-									...(scope === "owned"
-										? {
-												ownedWork: tombstone.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
-												automaticDelivery: "none",
-												resumeOnOwnedCompletion: false,
-											}
-										: {
-												ownedWork: "left_running",
-												automaticDelivery: "enabled",
-												resumeOnOwnedCompletion: true,
-											}),
-									replay: stored(tombstone),
-								}
+							? (() => {
+									const isPrefCancelled = tombstone.ownedWorkDisposition === "not_requested";
+									const isPreflightPath =
+										isPrefCancelled || (scope === "turn" && tombstone.ownedWorkDisposition === "uncertain");
+									return {
+										ok: true,
+										selection: scope,
+										turn: "stopped",
+										...(scope === "owned"
+											? {
+													ownedWork: isPrefCancelled
+														? "stopped"
+														: tombstone.ownedWorkDisposition === "stopped"
+															? "stopped"
+															: "uncertain",
+													automaticDelivery: "none",
+													resumeOnOwnedCompletion: false,
+												}
+											: {
+													ownedWork: "left_running",
+													automaticDelivery: "enabled",
+													resumeOnOwnedCompletion: true,
+												}),
+										...(isPreflightPath
+											? { reason: isPrefCancelled ? "preflight_cancelled" : "worker_unsettled" }
+											: {}),
+										replay: stored(tombstone),
+									};
+								})()
 							: tombstone.turnDisposition === "no_effect"
 								? {
 										ok: true,
@@ -4226,9 +4296,27 @@ function createControlSurface(
 			// of this abort — only the callbacks present when it was admitted are
 			// its to cancel, mirroring the full-bus capture (review thread P1).
 			const admittedRequesterPreflights = new Set(requesterPreflights ?? []);
+			let preflightsCancelledByAbort = false;
 			const cancelRequesterPreflights = () => {
-				for (const cancel of [...admittedRequesterPreflights]) cancel();
-				if (admittedRequesterPreflights.size > 0) {
+				let actualCancellations = 0;
+				for (const cancel of [...admittedRequesterPreflights]) {
+					if (cancel()) {
+						actualCancellations++;
+					}
+				}
+				if (actualCancellations > 0) {
+					// Issue #7853: Check if ANY cancellation record for this requester has
+					// started execution. If so, we can't be certain the specific invocation
+					// being aborted had its preflight cancelled—only mark stopped if the
+					// requester's cancellations are all pre-execution and we have no other
+					// active submissions with started execution on this connection.
+					const requesterCancellations = [...acceptedQueueCancellations.values()].filter(
+						r => r.connectionId === abortingConnectionId,
+					);
+					const hasStartedExecution = requesterCancellations.some(r => r.ExecutionStarted === true);
+					if (!hasStartedExecution) {
+						preflightsCancelledByAbort = true;
+					}
 					// Remove the admitted callbacks from the live set so a preflight
 					// added by a LATER submission is untouched by this abort (and the
 					// bucket cleanup below reflects what actually remains).
@@ -4570,16 +4658,23 @@ function createControlSurface(
 			steeringSnapshotConsumed = proof.status === "settled";
 			if (proof.status !== "settled" || proof.terminalScope === undefined) {
 				removeTerminalPublicationWaiter();
+				// Issue #7853: if preflights were successfully cancelled, the prompt never
+				// actually started execution, so the abort is effective. Settle as stopped
+				// instead of uncertain.
+				const turnValue = preflightsCancelledByAbort ? "stopped" : "uncertain";
+				const reason = preflightsCancelledByAbort ? "preflight_cancelled" : "worker_unsettled";
 				const result = {
 					ok: true,
 					selection: scope,
-					turn: "uncertain",
-					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					turn: turnValue,
+					ownedWork: scope === "turn" ? "left_running" : preflightsCancelledByAbort ? "stopped" : "uncertain",
 					automaticDelivery: scope === "turn" ? "enabled" : "none",
 					resumeOnOwnedCompletion: scope === "turn",
-					reason: "worker_unsettled",
+					reason,
 				};
-				const workerUnsettledPayloadHash = hashResult(result);
+				const payloadHash = hashResult(result);
+				const turnDisposition = preflightsCancelledByAbort ? "stopped" : "uncertain";
+				const ownedWorkDisposition = preflightsCancelledByAbort ? "not_requested" : "uncertain";
 				await transactBoundedTerminalScopes(scopes =>
 					scopes.map(record =>
 						(keyHash
@@ -4588,10 +4683,10 @@ function createControlSurface(
 						record.turnDisposition === "pending"
 							? {
 									...record,
-									turnDisposition: "uncertain",
-									ownedWorkDisposition: "uncertain",
-									responsePayloadHash: workerUnsettledPayloadHash,
-									replayPayloadHash: replayShapedHash(record, result, workerUnsettledPayloadHash),
+									turnDisposition,
+									ownedWorkDisposition,
+									responsePayloadHash: payloadHash,
+									replayPayloadHash: replayShapedHash(record, result, payloadHash),
 									terminalAt: Date.now(),
 								}
 							: record,
@@ -4858,8 +4953,10 @@ function createControlSurface(
 			const ownedPreflights = connectionId === undefined ? [] : [...(pendingPreflights.get(connectionId) ?? [])];
 			// Capture both phases before cancellation or any awaited terminal work:
 			// acceptance can settle its callback before agent_start owns the run.
-			for (const cancel of ownedPreflights) cancel();
-			let cancelledAdmission = ownedPreflights.length > 0;
+			let cancelledAdmission = false;
+			for (const cancel of ownedPreflights) {
+				if (cancel()) cancelledAdmission = true;
+			}
 			for (const request of ownedAdmissions) {
 				if (request.disposition !== "preflight" || request.controller.signal.aborted) continue;
 				request.controller.abort();
@@ -6009,6 +6106,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				else current.deadlineManager.onRunStarted(entry.correlation);
 			}
 			transitions = drained.map(({ kind, correlation }) => ({ kind, correlation }));
+			// Mark submissions as having started execution so cancelPreflight can distinguish
+			// preflight cancellations (which succeed) from aborts after agent_start (which don't).
+			for (const { correlation } of transitions) {
+				const cancellationRecord = acceptedQueueCancellations.get(`${correlation.commandId}:${correlation.turnId}`);
+				if (cancellationRecord) {
+					cancellationRecord.ExecutionStarted = true;
+				}
+			}
 		} else {
 			// Pair this agent_end with the oldest unmatched start. A delayed
 			// aborted-turn end that lands after a successor agent_start must
