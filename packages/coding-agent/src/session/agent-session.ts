@@ -10996,6 +10996,31 @@ export class AgentSession {
 	}
 
 	/**
+	 * Restore rules claimed by a nested call that produced no foldable result:
+	 * either it never dispatched (a sibling interrupted while it was in preflight)
+	 * or its eval call settled first. Rules already folded for delivery stay
+	 * claimed, so a real reminder is neither dropped nor re-triggered.
+	 */
+	#releaseUndeliveredNestedClaims(toolCallId: string, rules: Rule[]): void {
+		if (rules.length === 0) return;
+		const names = new Set(rules.map(rule => rule.name));
+		const foldedNames = new Set((this.#perToolTtsrFolded.get(toolCallId)?.rules ?? []).map(rule => rule.name));
+		const claims = this.#perToolTtsrClaims.get(toolCallId);
+		for (const name of names) {
+			if (foldedNames.has(name)) continue;
+			this.#ttsrManager?.releaseInjected(name, claims?.get(name));
+			claims?.delete(name);
+		}
+		const bucket = this.#perToolTtsrInjections.get(toolCallId);
+		if (bucket) {
+			const keeping = bucket.filter(rule => !names.has(rule.name) || foldedNames.has(rule.name));
+			if (keeping.length > 0) this.#perToolTtsrInjections.set(toolCallId, keeping);
+			else this.#perToolTtsrInjections.delete(toolCallId);
+		}
+		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
+	}
+
+	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
 	 * The claim stays provisional until #settlePerToolTtsrDelivery sees the
 	 * decorated result actually published.
@@ -11252,11 +11277,11 @@ export class AgentSession {
 		callName: string,
 		args: unknown,
 		signal: AbortSignal | undefined,
-	): Promise<void> {
-		if (signal?.aborted) throw new ToolAbortError();
+	): Promise<Rule[]> {
 		this.#assertNestedToolScopeActive(scope);
+		if (signal?.aborted) throw new ToolAbortError();
 		const manager = this.#ttsrManager;
-		if (!manager?.hasRules()) return;
+		if (!manager?.hasRules()) return [];
 		const generation = this.#promptGeneration;
 		const matchContext: TtsrMatchContext = {
 			source: "tool",
@@ -11281,15 +11306,19 @@ export class AgentSession {
 		// recheck before claiming or dispatching anything.
 		this.#assertNestedToolScopeActive(scope);
 		const matches = this.#withoutPendingTtsrRules(matched);
-		if (matches.length === 0) return;
+		if (matches.length === 0) return [];
 		const added = this.#addPerToolTtsrInjections(scope.parentToolCallId, matches);
 		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
 		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
 			scope.invalidatedBy = matches.map(rule => rule.name);
+			// Cancel nested calls still parked before dispatch (for example in an
+			// approval await) so an approval granted after this match cannot run them.
+			scope.abortController.abort();
 			throw new ToolError(
 				`${this.#formatTtsrAbortReason(matches)}. The nested ${callName} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
 			);
 		}
+		return added;
 	}
 
 	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope, callName: string): T {
@@ -11307,18 +11336,25 @@ export class AgentSession {
 					const callSignal = signal
 						? AbortSignal.any([signal, scope.abortController.signal])
 						: scope.abortController.signal;
-					await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
-					// Dispatch fence, immediately before the call with no await between:
-					// the eval may have settled or been invalidated during preflight, and a
-					// settled scope has aborted callSignal for anything parked further in.
-					if (callSignal.aborted) throw new ToolAbortError();
-					this.#assertNestedToolScopeActive(scope);
+					let claimed: Rule[] = [];
+					let dispatched = false;
 					try {
+						claimed = await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
+						// Dispatch fence, immediately before the call with no await between:
+						// the eval may have settled or been invalidated during preflight, and a
+						// settled or invalidated scope has aborted callSignal for anything
+						// parked further in.
+						this.#assertNestedToolScopeActive(scope);
+						if (callSignal.aborted) throw new ToolAbortError();
+						dispatched = true;
 						return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
 					} finally {
-						// The result was produced after its eval settled, so any rule this call
-						// claimed has no result to fold into: restore it for a later call.
-						if (scope.closed) this.#releasePerToolTtsrInjections(scope.parentToolCallId);
+						// Claims from a call that never dispatched, or that finished after its eval
+						// settled, have no result to fold into: restore those rules for a later
+						// call without touching reminders already folded for delivery.
+						if (!dispatched || scope.closed) {
+							this.#releaseUndeliveredNestedClaims(scope.parentToolCallId, claimed);
+						}
 					}
 				};
 			},

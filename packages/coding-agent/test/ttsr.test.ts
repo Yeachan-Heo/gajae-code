@@ -2255,6 +2255,65 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(bashCalls).toEqual([]);
 		});
 
+		it("aborts a nested call parked on approval when a sibling interrupts", async () => {
+			const bashCalls: unknown[] = [];
+			const reads: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const asked: string[] = [];
+			const code = `tool.bash({ command: 'echo X' }).catch(() => {});
+			 await new Promise(resolve => setTimeout(resolve, 50));
+			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('READ-BLOCKED'); }
+			 try { await tool.read({ path: 'public.txt' }); } catch (error) { console.log('AFTER:' + String(error?.message ?? error)); }
+			 await new Promise(resolve => setTimeout(resolve, 400));`;
+			const { session } = createSession(
+				[evalToolFor(() => session), bashTool, recordingRead(reads)],
+				[[evalCall("eval-1", code)]],
+				[secretReadRule()],
+				{
+					interruptMode: "always",
+					sdkPermissionProvider: (toolCall, _options, signal) => {
+						asked.push(toolCall.toolName);
+						if (toolCall.toolName !== "bash") {
+							return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+						}
+						// Approve 300 ms after the request, after the sibling interrupt, while
+						// the cell is still running; an abort must cancel it first.
+						return new Promise<ClientBridgePermissionOutcome>(resolve => {
+							const timer = setTimeout(() => resolve({ outcome: "selected", optionId: "allow_once" }), 300);
+							signal?.addEventListener(
+								"abort",
+								() => {
+									clearTimeout(timer);
+									resolve({ outcome: "cancelled" });
+								},
+								{ once: true },
+							);
+						});
+					},
+				},
+			);
+			await run(session, "start bash and read");
+
+			expect(asked).toEqual(["eval", "bash"]);
+			expect(reads).toEqual([]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("READ-BLOCKED");
+			expect(text).toContain("invalidated by an interrupting TTSR match");
+
+			// The parked call must not run even though approval was granted in-cell.
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
+		});
+
 		it("runs nested calls in a new eval call after an earlier eval was invalidated", async () => {
 			const reads: unknown[] = [];
 			const firstCode = `try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('CAUGHT'); }
