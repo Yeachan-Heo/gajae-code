@@ -401,7 +401,10 @@ interface ShellWordSpan {
  * `busybox` wrapper. A redirection target is not an argument word (Bash
  * strips it from argv), and the position before the redirection survives it:
  * `>out sh -c ...` invokes `sh`, while `cat >out sh -c ...` passes `sh` as
- * data.
+ * data. One redirection is one run of operator bytes (`&>`, `&>>`, `>>`, `>|`,
+ * `<>`, `>&`, `<&`), so no byte inside it separates commands, and a `&` after
+ * a completed target word is the background separator rather than the
+ * descriptor-duplication byte of `>&`.
  */
 function shellWordSpans(command: string): ShellWordSpan[] {
 	const words: ShellWordSpan[] = [];
@@ -475,6 +478,25 @@ function shellWordSpans(command: string): ShellWordSpan[] {
 			continue;
 		}
 		if (character === "&") {
+			// `&>word` / `&>>word` redirect stdout and stderr together; the `&`
+			// belongs to the operator, not to a command separator.
+			if (command[i + 1] === ">") {
+				flush(i);
+				if (redirectRestore === undefined) redirectRestore = atCommandStart;
+				redirectTargetPending = true;
+				i += 2;
+				while (command[i] === ">") i++;
+				continue;
+			}
+			if (redirectTargetPending && start >= 0) {
+				// The target word ended here, so this byte is the background
+				// separator, not the duplicate half of `>&`.
+				flush(i);
+				atCommandStart = true;
+				redirectTargetPending = false;
+				i++;
+				continue;
+			}
 			// `>&1` is a redirection, not a command separator; the duplicate
 			// target is the word after the `&`.
 			if (!redirectTargetPending) {
@@ -502,7 +524,10 @@ function shellWordSpans(command: string): ShellWordSpan[] {
 			}
 			if (redirectRestore === undefined) redirectRestore = atCommandStart;
 			redirectTargetPending = true;
+			// The rest of the run (`>`, `|`, `<`, `&`) is the same redirection
+			// operator; only the word after it is the target.
 			i++;
+			while (i < command.length && /[<>|&]/.test(command[i])) i++;
 			continue;
 		}
 		if (start < 0) start = i;
@@ -517,7 +542,8 @@ function shellWordSpans(command: string): ShellWordSpan[] {
  * Source span of every command word a child shell will parse as its `-c`
  * script, e.g. `sh -ec '...'`, `/bin/bash --norc -c ...`, `busybox sh -c ...`.
  * The script is the first operand after the flag cluster that contains `c`;
- * `-o NAME` consumes its operand before that scan continues.
+ * `-o NAME` consumes its operand before that scan continues, within this
+ * simple command only, because a separator starts a new one.
  *
  * Stopping rule: classification covers literal command positions (start of
  * text, separators, pipes, `(`, the documented `if`/`then`/`else`/`do`
@@ -568,7 +594,11 @@ function shellScriptWordSpans(command: string): Array<[number, number]> {
 						spans.push([words[j].start + 1 + commandFlag + 1, words[j].end]);
 					}
 				}
-				j += flags.endsWith("o") ? 2 : 1;
+				// `-o NAME` consumes one operand, but only inside this simple
+				// command: a separator ends the invocation, and the next word's
+				// command position says so.
+				const operand = words[j + 1];
+				j += flags.endsWith("o") && operand !== undefined && !operand.commandPosition ? 2 : 1;
 				continue;
 			}
 			// The first non-option operand is the script only when `-c` was
@@ -601,8 +631,10 @@ const SESSION_URL_ESCAPE = "URL is outside this session and cannot be expanded i
 /**
  * Appended to rule-URL refusals that describe a shell-context restriction, so a
  * model retries with the reader instead of guessing more shell spellings.
- * Containment and lookup refusals do not use it because the reader cannot
- * bypass them.
+ * Containment and lookup refusals do not use it: the reader route resolves a
+ * name against its own (process-global) rule snapshot and reads the rule's path
+ * with the reader's path rules, so a bash-session restriction need not be the
+ * reader's.
  */
 const RULE_READ_ALTERNATIVE = "Read the rule directly instead: read <rule-url>.";
 
@@ -1127,7 +1159,11 @@ function assertPathFitsDataValue(resolvedPath: string): void {
  * whitespace character is refused in a command whose `eval` re-parses the
  * substituted text. `source`/`.` are refused the same way as a conservative
  * policy margin even though they parse the file's contents, not the operand. A
- * rule URL inside a shell's `-c` script word is always refused.
+ * rule URL inside the `-c` script word of a shell invocation the literal
+ * command-position scan locates is refused; that scan models command position,
+ * separators, redirection targets, and the documented option forms, not the
+ * whole shell grammar, so an invocation it cannot locate is outside this
+ * refusal rather than proven safe.
  * Passing `context: "data"` expands a value the shell never parses (an env
  * value) instead of command text: the same authorization applies, but the
  * quoting and nested-expansion guards, which only describe shell reading, do

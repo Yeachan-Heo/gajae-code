@@ -2620,7 +2620,11 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 					expect(syntax.stderr).toBe("");
 					// Clause (b): executing it must succeed and read exactly the
 					// authorized rule file, so the operand canonicalizes there rather
-					// than reaching a sibling or decoy path.
+					// than reaching a sibling or decoy path. Clear both destinations
+					// first: a stale file from an earlier case must not satisfy this
+					// case's positive assertion.
+					await rm(path.join(fixture.authorized, "out"), { force: true });
+					await rm(path.join(fixture.authorized, "x"), { force: true });
 					const result = await runShell(emitted, fixture.authorized);
 					const redirected = await Bun.file(path.join(fixture.authorized, "out"))
 						.text()
@@ -2660,7 +2664,9 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 				// `c` first in a cluster still leaves a separate script operand.
 				'sh -ce "cat "rule://deploy',
 				'sh -c -e "cat "rule://deploy',
-				// `--` after `-c` ends options before the script operand.
+				// `--` after `-c` ends options before the script operand. Control:
+				// the parent scanner also refuses this one, so it is not evidence of
+				// the redirection fix.
 				'sh -c -- "cat "rule://deploy',
 				// Redirection targets are not argv, so they cannot hide the script,
 				// and a redirection before the command still leaves `sh` in position.
@@ -2671,6 +2677,116 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 				await expect(expandInternalUrls(command, options)).rejects.toThrow(/-c script word/);
 				await expect(expandInternalUrls(command, options)).rejects.toThrow(/read <rule-url>/);
 			}
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a script operand across every redirection operator form", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-redirect-"));
+		try {
+			const fixture = await writeFixture(parent, "proj[e]po");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+				sessionCwd: fixture.authorized,
+			};
+			for (const command of [
+				// One operator run has one target and never separates commands, so
+				// the operand scan still reaches the `-c` script word.
+				'sh -c >|out "cat "rule://deploy',
+				'sh -c &>out "cat "rule://deploy',
+				'sh -c &>>out "cat "rule://deploy',
+				'sh -c <>out "cat "rule://deploy',
+				'sh -c <&0 "cat "rule://deploy',
+				'sh -c >&2 "cat "rule://deploy',
+				// A redirection before the command still leaves the shell word in
+				// command position after the operator run.
+				'&>out sh -c "cat "rule://deploy',
+				'>|out sh -c "cat "rule://deploy',
+				// `&` after a completed target is the background separator, so the
+				// next word starts a command again.
+				"cat >out& sh -c rule://deploy",
+				"cat >out & sh -c rule://deploy",
+				// `-o` consumes an operand inside its own simple command only.
+				'sh -o echo -c "cat "rule://deploy',
+				// A real invocation sharing the command line stays refused.
+				"printf x &>out; sh -c 'cat rule://deploy'",
+				"sh -c 'cat rule://deploy' &>out",
+			]) {
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/-c script word/);
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/read <rule-url>/);
+			}
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("runs the command a combined redirection leaves in argument position", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-redirect-ok-"));
+		try {
+			const fixture = await writeFixture(parent, "proj[e]po");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+				sessionCwd: fixture.authorized,
+			};
+			const outPath = path.join(fixture.authorized, "out");
+			// `&>` and `&>>` between `printf` and a shell name leave `sh` as
+			// ordinary argument data; each case writes a fresh destination.
+			for (const command of ["printf '%s' &>out sh -c rule://deploy", "printf '%s' &>>out sh -c rule://deploy"]) {
+				await rm(outPath, { force: true });
+				const emitted = await expandInternalUrls(command, options);
+				expect(emitted).toContain(`'${fixture.canonical}'`);
+				const result = await runShell(emitted, fixture.authorized);
+				expect(result.code).toBe(0);
+				// `printf` reuses `%s`, so the target holds the three operands in
+				// order: both data words and the authorized path.
+				expect(await Bun.file(outPath).text()).toBe(`sh-c${fixture.canonical}`);
+			}
+			// Every file-target operator form redirects to its target word and still
+			// passes the authorized path through as the operand.
+			for (const operator of ["&>", "&>>", ">|"]) {
+				await rm(outPath, { force: true });
+				const emitted = await expandInternalUrls(`printf '%s' rule://deploy ${operator}out`, options);
+				expect(emitted).toContain(`'${fixture.canonical}'`);
+				const result = await runShell(emitted, fixture.authorized);
+				expect(result.code).toBe(0);
+				expect(await Bun.file(outPath).text()).toBe(fixture.canonical);
+			}
+			// `<>` opens its target read-write on stdin, so the path stays on stdout
+			// and the target word is still not argv.
+			{
+				await rm(outPath, { force: true });
+				const emitted = await expandInternalUrls("printf '%s' rule://deploy <>out", options);
+				expect(emitted).toContain(`'${fixture.canonical}'`);
+				const result = await runShell(emitted, fixture.authorized);
+				expect(result.code).toBe(0);
+				expect(result.stdout).toBe(fixture.canonical);
+				expect(await Bun.file(outPath).exists()).toBe(true);
+			}
+			// A descriptor-duplication target is not argv either.
+			for (const operator of ["<&0", ">&1"]) {
+				const emitted = await expandInternalUrls(`printf '%s' rule://deploy ${operator}`, options);
+				expect(emitted).toContain(`'${fixture.canonical}'`);
+				const result = await runShell(emitted, fixture.authorized);
+				expect(result.code).toBe(0);
+				expect(result.stdout).toBe(fixture.canonical);
+			}
+			// A plain `>file` ends at the background separator, and `wait` makes
+			// the write observable before the shell exits.
+			await rm(outPath, { force: true });
+			const background = await expandInternalUrls("printf '%s' rule://deploy >out& wait", options);
+			const backgroundRun = await runShell(background, fixture.authorized);
+			expect(backgroundRun.code).toBe(0);
+			expect(await Bun.file(outPath).text()).toBe(fixture.canonical);
+			// `-o` is bounded to its own command: `echo` starts a new one and
+			// prints the expanded operand.
+			const separate = await expandInternalUrls("sh -o; echo -c rule://deploy", options);
+			expect(separate).toContain(`'${fixture.canonical}'`);
+			const echoRun = await runShell(separate, fixture.authorized);
+			expect(echoRun.code).toBe(0);
+			expect(echoRun.stdout).toContain(`-c ${fixture.canonical}`);
 		} finally {
 			await rm(parent, { recursive: true, force: true });
 		}
@@ -2733,7 +2849,8 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 			expect(dataRun.code).toBe(0);
 			expect(dataRun.stdout).toContain(fixture.canonical);
 			// `--` before any `-c` makes `-c` an operand, not an option: the URL is
-			// data and expands, and sh reads no script from it.
+			// data and expands, and sh reads no script from it. Control: the parent
+			// scanner allows this too, so it is not pre-fix failure evidence.
 			expect(await expandInternalUrls("sh -- -c cat rule://deploy", options)).toContain(`'${fixture.canonical}'`);
 			// A redirection target is not argv: `sh` after one is still ordinary
 			// argument data for `cat`.
