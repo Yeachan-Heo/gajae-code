@@ -240,40 +240,52 @@ impl OutputDecoder {
 
 	#[cfg(windows)]
 	fn drain_acp(&mut self, eof: bool) -> String {
-		if self.pending.is_empty() {
-			return String::new();
-		}
+		let mut out = String::new();
 
-		// Look for a newline in the ACP-encoded data to determine where this line ends.
-		// Once we find a newline, reset back to UTF-8 mode for the next line.
-		let mut line_end = None;
-		let mut index = 0;
-		while index < self.pending.len() {
-			if self.pending[index] == b'\n' {
-				line_end = Some(index + 1);
-				break;
+		loop {
+			if self.pending.is_empty() {
+				return out;
 			}
-			let Some(char_len) = acp_character_len(self.state.fallback_codepage, &self.pending[index..], eof) else {
-				break;
-			};
-			index += char_len;
+
+			// Look for a newline in the ACP-encoded data to determine where this line ends.
+			// Once we find a newline, reset back to UTF-8 mode for the next line.
+			let mut line_end = None;
+			let mut index = 0;
+			while index < self.pending.len() {
+				if self.pending[index] == b'\n' {
+					line_end = Some(index + 1);
+					break;
+				}
+				let Some(char_len) = acp_character_len(self.state.fallback_codepage, &self.pending[index..], eof) else {
+					break;
+				};
+				index += char_len;
+			}
+
+			let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, &self.pending, eof));
+			if len == 0 {
+				return out;
+			}
+
+			let decoded = decode_codepage(self.state.fallback_codepage, &self.pending[..len])
+				.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
+			self.pending.drain(..len);
+			out.push_str(&decoded);
+
+			// If we found a line ending (newline), reset back to UTF-8 mode for the next line.
+			if line_end.is_some() {
+				self.state.mode = Mode::Utf8;
+				// Continue processing remaining data in UTF-8 mode.
+				if !self.pending.is_empty() {
+					out.push_str(&self.drain_utf8(eof));
+				}
+				return out;
+			}
+
+			// No newline found and we've processed all complete ACP sequences.
+			// Return and wait for more data or EOF.
+			return out;
 		}
-
-		let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, &self.pending, eof));
-		if len == 0 {
-			return String::new();
-		}
-
-		let decoded = decode_codepage(self.state.fallback_codepage, &self.pending[..len])
-			.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
-		self.pending.drain(..len);
-
-		// If we found a line ending (newline), reset back to UTF-8 mode for the next line.
-		if line_end.is_some() {
-			self.state.mode = Mode::Utf8;
-		}
-
-		decoded
 	}
 }
 
@@ -643,6 +655,24 @@ mod tests {
 		let result = decoder.push(utf8_line);
 		assert_eq!(result, "中文\n", "UTF-8 line after invalid byte should decode as UTF-8, not ACP");
 
+		assert_eq!(decoder.finish(), "");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn acp_multiple_lines_in_single_chunk() {
+		// Test that when a single chunk contains multiple ACP-encoded lines,
+		// all lines are decoded in one call, not just the first line.
+		// Before fix: only the first line is returned, second line stays in buffer.
+		// After fix: both lines are decoded and returned.
+		let mut decoder = OutputDecoder::with_fallback_codepage(936); // GBK
+		// GBK for 中 is D6 D0, GBK for 文 is CE C4
+		// Push two complete GBK-encoded lines in a single chunk:
+		// "中\n文\n" (each character is 2 bytes in GBK)
+		let chunk = &[0xd6, 0xd0, b'\n', 0xce, 0xc4, b'\n'];
+		let result = decoder.push(chunk);
+		// Expected: both lines decoded and returned
+		assert_eq!(result, "中\n文\n", "Both GBK lines should decode in one call");
 		assert_eq!(decoder.finish(), "");
 	}
 }
