@@ -387,11 +387,15 @@ const PROJECT_RULE_DIR_NAMES = [".agent", ".agents"] as const;
 /**
  * On-disk spelling of `target` when every component below `base` is a real
  * directory, or `undefined` when one is missing or is a link (junction).
- * `realpath` cannot answer this question: it reports a link target, and
- * promoting that target to a trust root would let a linked rule directory grant
- * everything it points at. It also reports the on-disk case, which a synthesized
- * `.agent` spelling misses on a case-insensitive volume. An exact name wins over
- * a case-folded one, so a directory holding both keeps the synthesized spelling.
+ *
+ * The configured spelling decides which directory is meant. On a
+ * case-insensitive volume `lstat` resolves `.agent` to the `.AGENT` entry the
+ * user created and `realpath` then reports that on-disk case, so a real
+ * directory is still matched; on a case-sensitive volume an absent `.agent`
+ * stays absent instead of being promoted from a case-variant sibling that
+ * discovery would never treat as the configured rules directory. `realpath` is
+ * only taken after `lstat` proved the component is not a link, because a linked
+ * rule directory must not become the trust root.
  */
 async function unlinkedDirectorySpelling(base: string, target: string): Promise<string | undefined> {
 	const resolvedBase = path.resolve(base);
@@ -401,18 +405,16 @@ async function unlinkedDirectorySpelling(base: string, target: string): Promise<
 	}
 	let current = resolvedBase;
 	for (const part of relative.split(path.sep)) {
-		let names: string[];
+		const requested = path.join(current, part);
+		let entry: fsTypes.Stats;
 		try {
-			names = await fs.readdir(current);
+			entry = await fs.lstat(requested);
 		} catch {
 			return undefined;
 		}
-		const match = names.includes(part) ? part : names.find(name => name.toLowerCase() === part.toLowerCase());
-		if (match === undefined) return undefined;
-		current = path.join(current, match);
+		if (!entry.isDirectory() || entry.isSymbolicLink()) return undefined;
 		try {
-			const entry = await fs.lstat(current);
-			if (entry.isSymbolicLink() || !entry.isDirectory()) return undefined;
+			current = await fs.realpath(requested);
 		} catch {
 			return undefined;
 		}
@@ -486,23 +488,25 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 		if (realRule !== realTarget) continue;
 		for (const dirName of PROJECT_RULE_DIR_NAMES) {
 			const ruleRoot = path.join(home, dirName, "rules");
-			// An unlinked rules directory is its own on-disk spelling, so a `.AGENT`
-			// written by the user still matches. A linked one keeps the documented
-			// behavior: the link target is the rules directory, and the request has to
-			// be spelled under the link itself.
+			// An unlinked rules directory is its own on-disk spelling, so a real
+			// directory the user created with other casing still matches without
+			// promoting a case-variant sibling that discovery never loaded.
 			const unlinkedRoot = await unlinkedDirectorySpelling(home, ruleRoot);
-			let boundary = unlinkedRoot;
-			if (boundary === undefined) {
-				try {
-					boundary = await fs.realpath(ruleRoot);
-				} catch {
-					continue;
-				}
-				if (!pathStaysInside(ruleRoot, lexical) || !pathStaysInside(ruleRoot, ruleLexical)) continue;
+			if (unlinkedRoot !== undefined) {
+				if (!pathStaysInside(unlinkedRoot, lexical) || !pathStaysInside(unlinkedRoot, ruleLexical)) continue;
+				if (pathStaysInside(unlinkedRoot, realTarget)) return realTarget;
+				continue;
 			}
-			if (pathStaysInside(boundary, lexical) && pathStaysInside(boundary, ruleLexical)) {
-				if (pathStaysInside(boundary, realTarget)) return realTarget;
+			// A linked rules directory keeps the documented behavior: the link is the
+			// trust anchor for the request's spelling, its target for containment.
+			if (!pathStaysInside(ruleRoot, lexical) || !pathStaysInside(ruleRoot, ruleLexical)) continue;
+			let linkedRoot: string;
+			try {
+				linkedRoot = await fs.realpath(ruleRoot);
+			} catch {
+				continue;
 			}
+			if (pathStaysInside(linkedRoot, realTarget)) return realTarget;
 		}
 	}
 	return undefined;
