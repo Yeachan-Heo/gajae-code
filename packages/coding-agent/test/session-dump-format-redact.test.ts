@@ -1323,6 +1323,159 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(secret);
 	});
 
+	it("masks a container whose assignment is inside a complete private-key block", () => {
+		const body = "CONTAINER_OVERLAP_PEM_BODY";
+		const sibling = "CONTAINER_OVERLAP_SIBLING_SECRET";
+		const dumped = dump([
+			{
+				role: "user",
+				content: [
+					`before ${pem("RSA", "BEGIN")}`,
+					body,
+					"private_key={",
+					`  "footer": "${pem("RSA", "END")}",`,
+					`  "sibling": "${sibling}"`,
+					"}",
+					"after",
+				].join("\n"),
+				timestamp: 1,
+			},
+		] as AgentMessage[]);
+
+		// The block starts before the container and ends inside it, so its range and the container's
+		// range overlap: both must hold, and the text after the container has to survive.
+		expect(dumped).toContain("before");
+		expect(dumped).toContain("after");
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(sibling);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("masks a container whose assignment is inside a paired private-key block", () => {
+		const body = "PAIRED_CONTAINER_PEM_BODY";
+		const sibling = "PAIRED_CONTAINER_SIBLING_SECRET";
+		const dumped = dump([
+			assistant(
+				[
+					{ type: "text", text: `before ${pem("RSA", "BEGIN")}\n${body}` },
+					{
+						type: "text",
+						text: `private_key={\n  "footer": "${pem("RSA", "END")}",\n  "sibling": "${sibling}"\n}\nafter`,
+					},
+				],
+				1,
+			),
+		]);
+
+		// Same overlap through the adjacent-run pairing path: the blocks are paired while still
+		// adjacent, and the paired ranges are then unified with the containers of the joined text.
+		expect(dumped).toContain("before");
+		expect(dumped).toContain("after");
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(sibling);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("keeps header records masked when a private-key block covers a numeric collection slot", () => {
+		const body = "MIXED_HEADER_PEM_BODY";
+		const secret = "MIXED_HEADER_RECORD_SECRET";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-mixed-header-pem",
+						name: "http",
+						arguments: {
+							body: `${pem("RSA", "BEGIN")}\n${body}`,
+							headers: [7, "X-Api-Key", `tail\n${pem("RSA", "END")}`, { name: "Authorization", value: secret }],
+							note: "unrelated note",
+						},
+					},
+				],
+				1,
+			),
+		]);
+
+		// The original slot is a number, so the collection is not a flat name/value list even though
+		// the mask replaces that slot with a string marker. Read as pairs, the record after it would
+		// lose its header context and print its value.
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).toContain('"Authorization"');
+		expect(dumped).toContain("unrelated note");
+		expect(dumped).not.toContain(secret);
+		expect(dumped).not.toContain(body);
+	});
+
+	it("keeps the leaf cursor aligned across a sparse array hole", () => {
+		const body = "SPARSE_PEM_BODY";
+		const sparse: unknown[] = [];
+		sparse[1] = `${pem("RSA", "BEGIN")}\n${body}`;
+		sparse[3] = `tail\n${pem("RSA", "END")}`;
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-sparse-pem",
+						name: "request",
+						arguments: { payload: sparse, note: "SURROUNDING_NOTE" },
+					},
+				],
+				1,
+			),
+		]);
+
+		// A hole prints as `null`, so it owns one leaf in both walks. If only one walk counts it, every
+		// slot after the hole is masked with the ranges of its predecessor.
+		expect(dumped).toContain("SURROUNDING_NOTE");
+		expect(dumped).toContain("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		expect(parameterValue(dumped, "payload")).toContain("null");
+	});
+
+	it("documents the rendered-schema trade-off for covered typed constraints", () => {
+		const body = "SCHEMA_TYPED_PEM_BODY";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							first: { type: "string", default: `${pem("RSA", "BEGIN")}\n${body}` },
+							limit: { type: "integer", minimum: 10, maximum: 20 },
+							flag: false,
+							second: { type: "string", default: `tail\n${pem("RSA", "END")}` },
+						},
+					},
+				},
+			],
+		});
+
+		const properties = JSON.parse(parameterValue(dumped, "properties") ?? "null");
+		expect(properties.first.default).toBe("«redacted-private-key»");
+		expect(properties.second.default).toBe("«redacted-private-key»");
+		// Documented trade-off: a covered number or boolean keeps its place but prints as the marker
+		// string. The rendered schema is a readable record of the declaration, not a schema that
+		// parses back to an equivalent one — keeping the type would mean printing the covered value.
+		expect(properties.limit.minimum).toBe("«redacted-private-key»");
+		expect(properties.limit.maximum).toBe("«redacted-private-key»");
+		expect(properties.flag).toBe("«redacted-private-key»");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
 	it("bounds unclosed credential containers in the session dump", () => {
 		const line = "secret={unclosed\n";
 		const measure = (lines: number): number => {

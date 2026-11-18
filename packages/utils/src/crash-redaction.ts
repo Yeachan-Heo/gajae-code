@@ -464,13 +464,23 @@ export function redactCrashSecrets(text: string): string {
 	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
+/**
+ * Scrub the line-bounded rules only, for a caller that already replaced the structural masks
+ * (credential containers and private-key blocks) from one detection pass over its original text.
+ * Re-running the structural passes here would classify output a previous stage produced, which is
+ * exactly the evidence loss a single detection pass exists to avoid.
+ */
+export function redactResidualCrashSecrets(text: string): string {
+	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES, false);
+}
+
 /** Historical redaction rules used only to validate v1 crash fingerprints. */
 export function redactCrashSecretsV1(text: string): string {
 	return redactCrashSecretsWithRules(text, V1_CREDENTIAL_REDACTION_RULES);
 }
 
-function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules): string {
-	let redacted = redactCredentialContainers(text, rules, rules !== V1_CREDENTIAL_REDACTION_RULES);
+function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules, structures = true): string {
+	let redacted = structures ? redactCredentialContainers(text, rules, rules !== V1_CREDENTIAL_REDACTION_RULES) : text;
 	// Block scalar bodies span lines and must be masked before line-bounded rules handle the header.
 	redacted = redactYamlBlockScalars(redacted, rules);
 	redacted = redacted.replace(
@@ -498,7 +508,7 @@ function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRul
 	// A PEM block carries the key material itself, so it is redacted whole rather
 	// than line by line. It runs before the narrower rules because they would
 	// otherwise chew on the base64 body and leave a truncated key behind.
-	redacted = redactPemPrivateKeys(redacted);
+	if (structures) redacted = redactPemPrivateKeys(redacted);
 	// Google API keys are a fixed 39-character shape that carries no label of its
 	// own, so the labeled-value rule below never sees one.
 	redacted = redacted.replace(
@@ -712,6 +722,41 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
 	return state.exhausted ? "«redacted»" : camelMasked;
 }
 
+/**
+ * Locate every credential container in `text` without mutating it.
+ * Ranges are the value the scrubber replaces: the opening bracket through its closing bracket, so
+ * a caller can keep the assignment that names the container in place. Both passes read `text`
+ * itself, so a container is classified from what the source says rather than from output a
+ * previous replacement produced. A scan that runs out of lookahead reports the whole text,
+ * because a cutoff cannot prove what it kept is safe for a later rule.
+ */
+export function findCredentialContainerSpans(text: string): PrivateKeySpan[] {
+	const rules = CURRENT_CREDENTIAL_REDACTION_RULES;
+	if (!rules.containerCandidatePattern.test(text)) return [];
+	const { assignment, camel } = containerAssignmentPatterns(rules);
+	const spans: PrivateKeySpan[] = [];
+	const state: ContainerScanState = { exhausted: false };
+	collectCredentialContainerSpans(text, assignment, true, state, spans);
+	// The camel pass scans the same original text instead of the generic pass's output. Its key
+	// pattern is expensive on a long run of one letter, so it only runs when a camel-shaped key is
+	// actually followed by an assignment; without one the container pattern cannot match.
+	if (!state.exhausted && rules.camelAssignmentCandidatePattern.test(text)) {
+		collectCredentialContainerSpans(text, camel, true, state, spans);
+	}
+	if (state.exhausted) return [{ start: 0, end: text.length }];
+	spans.sort((left, right) => left.start - right.start || right.end - left.end);
+	const merged: PrivateKeySpan[] = [];
+	for (const span of spans) {
+		const last = merged[merged.length - 1];
+		if (last !== undefined && span.start < last.end) {
+			if (span.end > last.end) merged[merged.length - 1] = { start: last.start, end: span.end };
+			continue;
+		}
+		merged.push(span);
+	}
+	return merged;
+}
+
 function containerAssignmentPatterns(rules: CredentialRedactionRules): { assignment: RegExp; camel: RegExp } {
 	return {
 		assignment: new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi"),
@@ -725,22 +770,35 @@ function redactCredentialContainersWithPattern(
 	bounded: boolean,
 	state: ContainerScanState,
 ): string {
+	const spans: PrivateKeySpan[] = [];
+	collectCredentialContainerSpans(text, assignment, bounded, state, spans);
+	return applyContainerSpans(text, spans);
+}
+
+/**
+ * Collect the value range of every credential container in one forward pass, without mutating the
+ * text. `maskedUntil` mirrors the replacement cursor: a match that starts inside a container already
+ * found is part of that container and is not scanned again.
+ */
+function collectCredentialContainerSpans(
+	text: string,
+	assignment: RegExp,
+	bounded: boolean,
+	state: ContainerScanState,
+	spans: PrivateKeySpan[],
+): void {
 	const budget = createContainerScanBudget(text.length, bounded);
 	const lineScan = createLineEndScan();
-	let output = "";
-	let copiedUntil = 0;
+	let maskedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
-		if (containerStart < copiedUntil) continue;
+		if (containerStart < maskedUntil) continue;
 		const suffixLength = text.length - containerStart;
 		if (budget.remaining < suffixLength) {
 			// The remaining lookahead cannot prove where this container ends, and a partial scan
-			// could leave a later closed container's contents behind. Redact the rest instead of
-			// guessing.
-			output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
-			copiedUntil = text.length;
+			// could leave a later closed container's contents behind.
 			state.exhausted = true;
-			break;
+			return;
 		}
 		const scan = findCredentialContainerEnd(text, containerStart, suffixLength, lineScan);
 		budget.remaining -= scan.scanned;
@@ -756,11 +814,23 @@ function redactCredentialContainersWithPattern(
 			assignment.lastIndex = containerEnd;
 			continue;
 		}
-		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
-		copiedUntil = containerEnd;
+		spans.push({ start: containerStart, end: containerEnd });
+		maskedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}
-	return copiedUntil === 0 ? text : output + text.slice(copiedUntil);
+}
+
+/** Replace each credential-container range with the container marker. */
+function applyContainerSpans(text: string, spans: readonly PrivateKeySpan[]): string {
+	if (spans.length === 0) return text;
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const span of spans) {
+		parts.push(text.slice(cursor, span.start), "«redacted»");
+		cursor = span.end;
+	}
+	parts.push(text.slice(cursor));
+	return parts.join("");
 }
 
 /** Whether a container pass gave up and masked a suffix it could not delimit. */

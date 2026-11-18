@@ -7,5 +7,7 @@
 
 ### Changed
 
+- `findCredentialContainerSpans` reports the credential-container ranges of the text it is given without mutating it, so a caller that also detects private-key blocks can apply both to its original text in one pass. `redactCredentialContainers` is built on the same scan and keeps its result.
+- `redactResidualCrashSecrets` runs the line-bounded rules only, for a caller that has already replaced the structural masks from its own detection pass. `redactCrashSecrets` keeps detecting and masking both.
 - `redactStructuredSecrets` only reads a flat name/value array or a `{ name, value }` record as header pairs when the caller opts in, by boolean or by a field-name predicate such as the new `isHeaderCollectionKey`, so ordinary data keeps its values.
 - `redactStructuredSecrets` takes a `resolveKey` hook so a caller that decodes names before serializing classifies the credential test, the header-collection test and the header-record member roles by the decoded name. Callers that pass no hook keep the name as given.

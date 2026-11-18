@@ -5,13 +5,14 @@ import type { AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import {
+	findCredentialContainerSpans,
 	findPrivateKeySpans,
 	isCredentialKey,
 	isHeaderCollectionKey,
 	PRIVATE_KEY_REDACTION_MARKER,
 	type PrivateKeySpan,
 	redactCrashSecrets,
-	redactStructuredSecrets,
+	redactResidualCrashSecrets,
 } from "@gajae-code/utils";
 import { buildCacheEconomicsWarning, type CacheWarningBuildState } from "./cache-economics";
 import {
@@ -59,12 +60,28 @@ function stripTypeBoxFields(obj: unknown): unknown {
 
 function takeRedactedTextRun(parts: string[]): string | undefined {
 	if (parts.length === 0) return undefined;
-	// Blocks are rendered with a newline between them, which would split a banner that straddles
-	// two blocks, so they are paired while still adjacent and only then joined for display. A
-	// single block needs no pairing; `redactDumpText` still replaces it before container masking.
-	// Message text is literal, not encoded JSON, so its `\u` escapes are evidence and stay.
-	const paired = parts.length > 1 ? (redactCrossFieldPrivateKeys(parts, { decodeEscapes: false }) as string[]) : parts;
-	const redacted = redactDumpText(paired.join("\n"));
+	let redacted: string;
+	if (parts.length === 1) {
+		// Message text is literal, not encoded JSON, so its `\u` escapes are evidence and stay.
+		redacted = redactDumpText(parts[0]);
+	} else {
+		// Blocks are rendered with a newline between them, which would split a banner that straddles
+		// two blocks, so the pairing is detected while the parts are still adjacent. Detection reads
+		// the original parts; the ranges are then mapped into the joined text so one application pass
+		// covers the paired blocks and the credential containers found in that same original text.
+		const spansByPart = crossFieldPrivateKeySpans(parts);
+		const joined = parts.join("\n");
+		const ranges: RedactionRange[] = [];
+		let offset = 0;
+		for (let index = 0; index < parts.length; index++) {
+			for (const span of spansByPart[index]) {
+				ranges.push({ start: offset + span.start, end: offset + span.end, marker: PRIVATE_KEY_REDACTION_MARKER });
+			}
+			offset += parts[index].length + 1;
+		}
+		ranges.push(...containerRanges(joined));
+		redacted = redactResidualCrashSecrets(applyRedactionRanges(joined, ranges));
+	}
 	parts.length = 0;
 	return redacted;
 }
@@ -96,28 +113,71 @@ function decodeUnicodeEscapeText(input: string, allowControlCharacters = false):
 	return input.replace(/\\\\u([0-9a-fA-F]{4})/g, decode).replace(/\\u([0-9a-fA-F]{4})/g, decode);
 }
 
-/** Redact the private-key blocks that a caller located in a wider source string. */
-function redactPrivateKeyRanges(text: string, spans: readonly PrivateKeySpan[]): string {
-	if (spans.length === 0) return text;
+/** One range of printed text replaced by a marker; overlapping ranges are merged before application. */
+interface RedactionRange extends PrivateKeySpan {
+	readonly marker: string;
+}
+
+const CONTAINER_REDACTION_MARKER = "«redacted»";
+
+/**
+ * Apply every range to the original text once. Detection always reads that original text, so the
+ * only way two ranges meet is as two masks that both have to hold: the merged region starts where
+ * the first one starts, ends where the furthest one ends, and prints the first one's marker.
+ * A private-key block that starts before a container and ends inside it therefore masks the
+ * container's remaining members instead of leaving them behind a destroyed assignment.
+ */
+function applyRedactionRanges(text: string, ranges: readonly RedactionRange[]): string {
+	if (ranges.length === 0) return text;
+	const sorted = [...ranges].sort((left, right) => left.start - right.start || right.end - left.end);
+	const merged: RedactionRange[] = [];
+	for (const range of sorted) {
+		const last = merged[merged.length - 1];
+		if (last !== undefined && range.start < last.end) {
+			if (range.end > last.end) {
+				merged[merged.length - 1] = { start: last.start, end: range.end, marker: last.marker };
+			}
+			continue;
+		}
+		merged.push(range);
+	}
 	const parts: string[] = [];
 	let cursor = 0;
-	for (const span of spans) {
-		parts.push(text.slice(cursor, span.start), PRIVATE_KEY_REDACTION_MARKER);
-		cursor = span.end;
+	for (const range of merged) {
+		parts.push(text.slice(cursor, range.start), range.marker);
+		cursor = range.end;
 	}
 	parts.push(text.slice(cursor));
 	return parts.join("");
 }
 
+/** Private-key ranges that a caller located in a wider source string. */
+function privateKeyRanges(spans: readonly PrivateKeySpan[]): RedactionRange[] {
+	return spans.map(span => ({ start: span.start, end: span.end, marker: PRIVATE_KEY_REDACTION_MARKER }));
+}
+
+/** Credential-container ranges of one original text. */
+function containerRanges(text: string): RedactionRange[] {
+	return findCredentialContainerSpans(text).map(span => ({
+		start: span.start,
+		end: span.end,
+		marker: CONTAINER_REDACTION_MARKER,
+	}));
+}
+
 /**
- * Scrub one block of dump text.
- * A complete private-key block is replaced before the credential-container pass: when the
- * block's footer sits inside a container, that pass removes the footer first, so the later
- * block scan can no longer recognize the block and the body stays printed. Containers keep
- * masking everything the block does not cover.
+ * Structural masks of one piece of text, applied in one pass over the text the caller detected
+ * them on, then the line-bounded rules that need no structural evidence.
  */
+function scrubText(text: string, privateKeys: readonly PrivateKeySpan[]): string {
+	return redactResidualCrashSecrets(
+		applyRedactionRanges(text, [...privateKeyRanges(privateKeys), ...containerRanges(text)]),
+	);
+}
+
+/** Scrub one block of dump text, detecting its private-key blocks in that same text. */
 function redactDumpText(text: string): string {
-	return redactCrashSecrets(redactPrivateKeyRanges(text, findPrivateKeySpans(text)));
+	return scrubText(text, findPrivateKeySpans(text));
 }
 
 /**
@@ -171,25 +231,46 @@ function collectSerializedLeaves(value: unknown, out: string[]): void {
 }
 
 /**
- * Apply the spans found for each leaf, in the order the leaf collection produced them.
- * Field names never take part: a name between two value halves would separate them, and a
- * rewritten name would destroy the argument identity the dump relies on.
+ * Content masks for the printed scalars of one value tree, in serialization order.
+ * Detection fills `spansByLeaf` from the original leaves; application consumes one entry per
+ * printed scalar, so both walks visit exactly the same slots, holes included.
  */
-function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][], cursor: { index: number }): unknown {
-	if (typeof value === "string") return redactPrivateKeyRanges(value, spans[cursor.index++] ?? []);
-	if (Array.isArray(value)) return value.map(item => applyPrivateKeySpans(item, spans, cursor));
-	if (value === null || typeof value !== "object") {
-		// Every printed scalar consumed one leaf, so it advances the cursor too. A number, boolean
-		// or null has no textual form that can keep part of a block, so a covered one is replaced
-		// whole instead of keeping a fragment of the key.
-		const covered = spans[cursor.index++] ?? [];
-		return covered.length > 0 ? PRIVATE_KEY_REDACTION_MARKER : value;
-	}
-	const redacted = Object.create(null) as Record<string, unknown>;
-	for (const [key, nested] of Object.entries(value)) {
-		redacted[key] = applyPrivateKeySpans(nested, spans, cursor);
-	}
-	return redacted;
+interface ValueRedactionPlan {
+	readonly spansByLeaf: readonly (readonly PrivateKeySpan[])[];
+	readonly cursor: { index: number };
+}
+
+/**
+ * Detect the private-key ranges that span sibling values, at any nesting depth, and pair them with
+ * the rendered leaves they will be applied to.
+ *
+ * Detection reads the decoded original tree: values are joined in traversal order, so a banner
+ * split across adjacent values is found, and each block is mapped back to ranges of the leaves it
+ * covers. Field names never enter the joined stream — a name between two halves would separate
+ * them, and a name never contributes characters to a block.
+ *
+ * This is the detection half of the single boundary: no leaf may be replaced before the structural
+ * walk has classified it, and no classification may read a replaced leaf.
+ */
+function createValueRedactionPlan(value: unknown): ValueRedactionPlan {
+	const leaves: string[] = [];
+	collectSerializedLeaves(value, leaves);
+	return { spansByLeaf: crossFieldPrivateKeySpans(leaves), cursor: { index: 0 } };
+}
+
+/** Take the next printed scalar's private-key ranges; every scalar consumes exactly one entry. */
+function takeLeafSpans(plan: ValueRedactionPlan): readonly PrivateKeySpan[] {
+	return plan.spansByLeaf[plan.cursor.index++] ?? [];
+}
+
+/**
+ * Advance the plan over a value a structural mask replaces whole. It collects the same leaves the
+ * plan collected, through the same walk, so collapsing a subtree cannot shift a later scalar.
+ */
+function skipValueLeaves(plan: ValueRedactionPlan, value: unknown): void {
+	const leaves: string[] = [];
+	collectSerializedLeaves(value, leaves);
+	plan.cursor.index += leaves.length;
 }
 
 /** Both escape layers an argument or schema field name can carry; control characters stay spelled. */
@@ -219,7 +300,9 @@ function decodeEscapedIdentity(input: string): string {
  */
 function decodeValueStrings(value: unknown): unknown {
 	if (typeof value === "string") return decodeEscapedText(value);
-	if (Array.isArray(value)) return value.map(decodeValueStrings);
+	// Holes are normalized to the `null` they print as, so the leaf collection and the application
+	// walk visit exactly the same slots instead of one counting a hole the other skips.
+	if (Array.isArray(value)) return Array.from(value, item => decodeValueStrings(item));
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
 	const decoded = Object.create(null) as Record<string, unknown>;
@@ -240,57 +323,85 @@ function fieldIdentity(key: string): string {
 	return decodeEscapedIdentity(key);
 }
 
-/**
- * Redact private-key blocks that span sibling values, at any nesting depth.
- * Values are joined in traversal order, so a banner split across adjacent values is found.
- * Field names never enter the joined stream: a name between two halves would separate them.
- * Names are decoded by the same prepass, so the credential name the structural scrubber
- * reads is the name the dump prints, but a name never contributes characters to a block.
- * A banner split across two values with another value in between is therefore not paired;
- * each half is still scrubbed on its own where it forms a complete block.
- * `decodeEscapes` is for encoded values (tool arguments and schema data); literal message
- * text opts out so its own `\u` spelling survives.
- */
-interface CrossFieldPrivateKeyOptions {
-	readonly decodeEscapes?: boolean;
-}
-
-function redactCrossFieldPrivateKeys(values: readonly unknown[], options?: CrossFieldPrivateKeyOptions): unknown[] {
-	const decodeEscapes = options?.decodeEscapes ?? true;
-	const decoded = decodeEscapes ? values.map(decodeValueStrings) : [...values];
-	const leaves: string[] = [];
-	for (const value of decoded) collectSerializedLeaves(value, leaves);
-	const spansByLeaf = crossFieldPrivateKeySpans(leaves);
-	const cursor = { index: 0 };
-	return decoded.map(value => applyPrivateKeySpans(value, spansByLeaf, cursor));
-}
-
 function serializeParameterValue(value: unknown): string {
 	return typeof value === "string" ? value : (JSON.stringify(value, null, "\t") ?? "null");
 }
 
 /**
- * Structural redaction for argument and schema data. Both recognitions read the name a field
- * stands for rather than its stored spelling, so a name the prepass had to keep escaped (a
- * sibling already held its decoded form) still masks its value and still classifies as a
- * header collection.
+ * One data value (a tool argument, or a schema's literal data) rebuilt from the original tree with
+ * the mask plan applied. Every recognition below reads `value`, which is always an unmodified
+ * original: a replaced leaf never feeds back into the classification of a header collection, a
+ * header record, or a credential name.
  */
-const STRUCTURED_REDACTION = {
-	headerPairs: isHeaderCollectionKey,
-	resolveKey: fieldIdentity,
-} as const;
+function sanitizeDataValue(value: unknown, fieldName: string | undefined, plan: ValueRedactionPlan): unknown {
+	if (fieldName !== undefined && isCredentialKey(fieldIdentity(fieldName))) {
+		skipValueLeaves(plan, value);
+		return "«redacted»";
+	}
+	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan));
+	if (value === null || typeof value !== "object") {
+		// A number, boolean or null has no textual form that can keep part of a block, so a covered
+		// one is replaced whole instead of keeping a fragment of the key.
+		return takeLeafSpans(plan).length > 0 ? PRIVATE_KEY_REDACTION_MARKER : value;
+	}
+	if (Array.isArray(value)) {
+		// A header collection is a flat name/value list only when the original slots say so: a slot a
+		// mask will replace still counts with the type it arrived with, so replacing a numeric slot
+		// can never turn a mixed collection into a name/value list and pair its records wrongly.
+		const headerCollection = fieldName !== undefined && isHeaderCollectionKey(fieldIdentity(fieldName));
+		const flatPairs =
+			headerCollection &&
+			value.length > 0 &&
+			value.length % 2 === 0 &&
+			value.every((item, index) => index % 2 === 1 || typeof item === "string");
+		const sanitized: unknown[] = [];
+		for (let index = 0; index < value.length; index++) {
+			const item = value[index];
+			if (flatPairs && index % 2 === 1) {
+				const headerName = value[index - 1];
+				if (typeof headerName === "string" && isCredentialKey(fieldIdentity(headerName))) {
+					skipValueLeaves(plan, item);
+					sanitized.push("«redacted»");
+					continue;
+				}
+			}
+			sanitized.push(sanitizeDataValue(item, flatPairs ? undefined : fieldName, plan));
+		}
+		return sanitized;
+	}
 
-/**
- * Text of one tool-argument value: scrubbed, then escaped for XML.
- * Decoding happened in the entry pairing, so the scrubber sees the same characters that
- * were checked for a private-key block.
- */
-function formatArgumentText(value: unknown, key: string): string {
-	const structured = redactStructuredSecrets(value, key, STRUCTURED_REDACTION);
-	// The structured pass already scrubbed every string leaf, so the serialized form only needs
-	// escaping. Rescanning it would mask a credential assignment inside a string value together
-	// with the quote JSON wrote to close that string.
-	return escapeXmlText(serializeParameterValue(structured));
+	const source = value as Record<string, unknown>;
+	const sourceKeys = Object.keys(source);
+	let hasCredentialHeaderName = false;
+	let hasHeaderValue = false;
+	for (const field of sourceKeys) {
+		const normalized = fieldIdentity(field).toLowerCase();
+		if (normalized === "value" || normalized === "values") hasHeaderValue = true;
+		if (normalized !== "name" && normalized !== "key") continue;
+		// The header name is read as the string it arrived as, before any mask can replace it.
+		const headerName = source[field];
+		if (typeof headerName === "string" && isCredentialKey(fieldIdentity(headerName))) hasCredentialHeaderName = true;
+	}
+	const maskHeaderValue =
+		fieldName !== undefined &&
+		isHeaderCollectionKey(fieldIdentity(fieldName)) &&
+		hasCredentialHeaderName &&
+		hasHeaderValue;
+	const redacted = Object.create(null) as Record<string, unknown>;
+	const scrubbedKeys = new Map<string, number>();
+	for (const field of sourceKeys) {
+		const redactedKey = uniqueScrubbedKey(redacted, field, scrubbedKeys);
+		const normalized = fieldIdentity(field).toLowerCase();
+		const member = source[field];
+		if (maskHeaderValue && (normalized === "value" || normalized === "values")) {
+			skipValueLeaves(plan, member);
+			redacted[redactedKey] =
+				normalized === "values" && Array.isArray(member) ? member.map(() => "«redacted»") : "«redacted»";
+			continue;
+		}
+		redacted[redactedKey] = sanitizeDataValue(member, field, plan);
+	}
+	return redacted;
 }
 
 /** Keywords whose value is one concrete literal, so a credential-named property's own data can be masked. */
@@ -304,16 +415,12 @@ const SCHEMA_VALUE_KEYWORDS = new Set(["default", "example", "examples", "const"
 const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
 
 /**
- * Scrub a data value inside a schema (a `default`, `example`, or `const`).
- * The value is data, not schema structure, so it is scrubbed with the same rules as tool
- * arguments: credential-named fields are masked, text is scrubbed, and a known header
- * collection keeps its value redaction. The schema entry prepass already decoded it.
+ * Replace every leaf of a data value with the marker, preserving its shape.
+ * The shape is kept so the dump still shows what the caller declared; a number or boolean that a
+ * mask covers prints as the string marker. The rendered schema is therefore a readable record of
+ * the declaration, not a schema that parses back to an equivalent one — keeping the covered
+ * value's type would mean printing the covered value.
  */
-function scrubSchemaData(value: unknown, propertyName?: string): unknown {
-	return redactStructuredSecrets(value, propertyName, STRUCTURED_REDACTION);
-}
-
-/** Replace every leaf of a data value with the marker, preserving its shape. */
 function maskSchemaData(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(maskSchemaData);
 	if (value === null || typeof value !== "object") return "«redacted»";
@@ -341,26 +448,19 @@ function uniqueScrubbedKey(target: Record<string, unknown>, key: string, nextSuf
 }
 
 /**
- * Entry point for one tool schema: pair a private-key block that spans any two of its
- * values once, then sanitize the paired tree. Recursion below never rescans a subtree.
- */
-function redactSchemaEntry(value: Record<string, unknown>): Record<string, unknown> {
-	const paired = redactCrossFieldPrivateKeys([value])[0] as Record<string, unknown>;
-	return sanitizeSchemaValue(paired) as Record<string, unknown>;
-}
-
-/**
- * Scrub a paired tool schema without destroying its definitions.
+ * Scrub a tool schema without destroying its definitions.
  * Names in a schema map (`properties`, `patternProperties`, `$defs`, `definitions`,
  * `dependentSchemas`) are schema structure, not credential assignments, so they stay
- * readable; only string leaves and data-carrying keywords are redacted. The entry
- * pairing already covered every value, so a map nested under one of those keywords
- * keeps its names as context without another pass.
+ * readable; only string leaves and data-carrying keywords are redacted. Every keyword and every
+ * name is classified on the original schema, and each printed scalar takes its one plan entry in
+ * the same walk, so a masked leaf can never change how a later entry is read.
  */
-function sanitizeSchemaValue(value: unknown, propertyName?: string): unknown {
-	if (typeof value === "string") return redactCrashSecrets(value);
-	if (Array.isArray(value)) return value.map(item => sanitizeSchemaValue(item, propertyName));
-	if (value === null || typeof value !== "object") return value;
+function sanitizeSchemaValue(value: unknown, propertyName: string | undefined, plan: ValueRedactionPlan): unknown {
+	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan));
+	if (Array.isArray(value)) return value.map(item => sanitizeSchemaValue(item, propertyName, plan));
+	if (value === null || typeof value !== "object") {
+		return takeLeafSpans(plan).length > 0 ? PRIVATE_KEY_REDACTION_MARKER : value;
+	}
 
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
@@ -375,19 +475,27 @@ function sanitizeSchemaValue(value: unknown, propertyName?: string): unknown {
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
 				// The definition keeps the name it was stored under; the credential test reads the name
 				// the definition stands for, so a collided spelling still masks its literal data.
-				schemas[uniqueScrubbedKey(schemas, name, nameSuffixes)] = sanitizeSchemaValue(schema, fieldIdentity(name));
+				schemas[uniqueScrubbedKey(schemas, name, nameSuffixes)] = sanitizeSchemaValue(
+					schema,
+					fieldIdentity(name),
+					plan,
+				);
 			}
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = schemas;
 			continue;
 		}
 		if (SCHEMA_VALUE_KEYWORDS.has(keyword)) {
-			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] =
-				propertyName !== undefined && isCredentialKey(propertyName)
-					? maskSchemaData(nested)
-					: scrubSchemaData(nested, propertyName);
+			if (propertyName !== undefined && isCredentialKey(propertyName)) {
+				// The literal is data under a credential-named property, so nothing of it may print;
+				// its leaves still take their plan entries even though the masked copy replaces them.
+				skipValueLeaves(plan, nested);
+				redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = maskSchemaData(nested);
+			} else {
+				redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitizeDataValue(nested, propertyName, plan);
+			}
 			continue;
 		}
-		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitizeSchemaValue(nested, propertyName);
+		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitizeSchemaValue(nested, propertyName, plan);
 	}
 	return redacted;
 }
@@ -397,39 +505,55 @@ function formatSchemaText(value: unknown): string {
 	return escapeXmlText(serializeParameterValue(value));
 }
 
+/** One `<parameter>` element, with a multi-line value indented as before. */
+function formatParameter(indent: string, escapedKey: string, text: string): string {
+	if (!text.includes("\n")) return `${indent}<parameter name="${escapedKey}">${text}</parameter>`;
+	const indentedText = text
+		.split("\n")
+		.map(line => `${indent}\t${line}`)
+		.join("\n");
+	return `${indent}<parameter name="${escapedKey}">\n${indentedText}\n${indent}</parameter>`;
+}
+
 /**
  * Serialize an object as XML parameter elements, one per key.
  * The generated `<parameter>` markup is never passed through the text scrubber:
  * a value ending in `KEY=<placeholder>` must not consume the closing tag, and a
  * private-key block spanning two values is redacted inside those values so each
  * parameter keeps its own identity.
+ *
+ * Both modes decode the arguments once, detect the plan over that original tree, and then walk
+ * it exactly once applying the masks. Detection therefore never reads a partially applied tree.
  */
 function formatArgsAsXml(
 	args: Record<string, unknown>,
 	mode: "arguments" | "schema" = "arguments",
 	indent = "\t",
 ): string {
-	const schema = mode === "schema" ? redactSchemaEntry(args) : undefined;
-	// A scrubbed schema key no longer matches the original argument name, so each mode walks its
-	// own entries: arguments over the value-paired tree, schemas over the sanitized schema.
-	// The intent field is the literal key the agent loop destructures: a field whose name
-	// merely resolves to it is an ordinary argument, so only that exact spelling is dropped.
-	// A schema root is not an argument, so a definition named `_i` stays part of the schema.
-	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
-	const entries = Object.entries(paired ?? args).filter(([key]) => mode === "schema" || key !== INTENT_FIELD);
+	const decoded = decodeValueStrings(args) as Record<string, unknown>;
+	const plan = createValueRedactionPlan(decoded);
 	const parts: string[] = [];
-	for (const [key, value] of entries) {
-		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
-		const text = schema === undefined ? formatArgumentText(value, key) : formatSchemaText(value);
-		if (text.includes("\n")) {
-			const indentedText = text
-				.split("\n")
-				.map(line => `${indent}\t${line}`)
-				.join("\n");
-			parts.push(`${indent}<parameter name="${escapedKey}">\n${indentedText}\n${indent}</parameter>`);
-		} else {
-			parts.push(`${indent}<parameter name="${escapedKey}">${text}</parameter>`);
+	if (mode === "schema") {
+		// A schema root is not an argument, so a definition named `_i` stays part of the schema,
+		// and every root entry is walked by the one structural pass.
+		const sanitized = sanitizeSchemaValue(decoded, undefined, plan) as Record<string, unknown>;
+		for (const [key, value] of Object.entries(sanitized)) {
+			const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
+			parts.push(formatParameter(indent, escapedKey, formatSchemaText(value)));
 		}
+		return parts.join("\n");
+	}
+	for (const [key, value] of Object.entries(decoded)) {
+		// The intent field is the literal key the agent loop destructures: a field whose name
+		// merely resolves to it is an ordinary argument, so only that exact spelling is dropped.
+		// A dropped entry still owns its leaves in the plan, so they are skipped explicitly.
+		if (key === INTENT_FIELD) {
+			skipValueLeaves(plan, value);
+			continue;
+		}
+		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));
+		const text = escapeXmlText(serializeParameterValue(sanitizeDataValue(value, key, plan)));
+		parts.push(formatParameter(indent, escapedKey, text));
 	}
 	return parts.join("\n");
 }
@@ -438,8 +562,9 @@ function formatArgsAsXml(
  * Format messages and session metadata as markdown/plain text (same shape as /dump clipboard export).
  * Text runs, tool-argument sections, and each rendered Bash or Python execution
  * section are scrubbed inside that section so a private-key banner cannot pair
- * across unrelated messages. Each section's text replaces a complete private-key
- * block before the credential-container pass can remove that block's footer.
+ * across unrelated messages. Each section detects its private-key blocks and credential containers
+ * on the original text and replaces both in one pass, so no mask can hide the evidence a later one
+ * needs.
  */
 export function formatSessionDumpText(options: FormatSessionDumpTextOptions): string {
 	const lines: string[] = [];
