@@ -346,9 +346,9 @@ function hasNestedExpansionContext(command: string): boolean {
  * conservative policy margin, not a claim that the operand is re-parsed.
  * Quote and escape characters are removed before matching so `e'val'` reads as
  * the builtin it becomes. A match anywhere is deliberate: `command eval`,
- * `builtin eval`, a later pipeline segment, and `xargs eval` all reach the same
- * builtin, and refusing a command that merely mentions the word is the
- * fail-closed direction. A literal assignment such as `x=eval` is included:
+ * `builtin eval`, and a later pipeline segment all reach the same builtin, and
+ * refusing a command that merely mentions the word is the fail-closed
+ * direction. A literal assignment such as `x=eval` is included:
  * `$x` reaches the builtin, and refusing the spelling is cheaper than proving
  * the indirection safe.
  * The trailing boundary includes the redirection operators: bash also ends a
@@ -364,10 +364,29 @@ const REPARSING_SHELL_BUILTIN = /(?:^|[\s;&|()`=])(?:eval|source|\.)(?=[\s;&|()<
  */
 const SCRIPT_SHELL_NAMES = new Set(["sh", "bash", "dash", "ksh", "zsh", "ash", "mksh", "pdksh"]);
 
+/**
+ * Keywords that leave the next word in command position. This list is the
+ * documented set, not a shell grammar: `while`, `until`, `{`, `!`, and the
+ * wrapper executables (`env`, `exec`, `command`, `sudo`, ...) are deliberately
+ * outside it.
+ */
+const SHELL_COMMAND_KEYWORDS = new Set(["if", "then", "else", "do"]);
+
+/** The only wrapper form this locator models: `busybox sh -c ...`. */
+const SHELL_WRAPPER_NAMES = new Set(["busybox"]);
+
+/** An assignment prefix leaves the command word that follows in position. */
+const SHELL_ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
 interface ShellWordSpan {
 	start: number;
 	end: number;
 	value: string;
+	/**
+	 * True only when this word starts a simple command. A shell name outside
+	 * command position is ordinary argument data, not an interpreter.
+	 */
+	commandPosition: boolean;
 }
 
 /**
@@ -375,14 +394,45 @@ interface ShellWordSpan {
  * escapes are resolved into `value`; operators and whitespace end a word.
  * This is a locator, not a shell parser: it only has to find which source word
  * holds a substitution, so ambiguous syntax falls back to the wider span.
+ *
+ * Command position is tracked from literal structure only: the start of the
+ * text, a separator (`;`, `&`, `|`, `(`, `)`, newline), the documented
+ * `if`/`then`/`else`/`do` keywords, an assignment prefix, and the documented
+ * `busybox` wrapper. A redirection target is not an argument word (Bash
+ * strips it from argv), and the position before the redirection survives it:
+ * `>out sh -c ...` invokes `sh`, while `cat >out sh -c ...` passes `sh` as
+ * data.
  */
 function shellWordSpans(command: string): ShellWordSpan[] {
 	const words: ShellWordSpan[] = [];
 	let value = "";
 	let start = -1;
 	let i = 0;
+	let atCommandStart = true;
+	let redirectRestore: boolean | undefined;
+	let redirectTargetPending = false;
 	const flush = (end: number) => {
-		if (start >= 0) words.push({ start, end, value });
+		if (start < 0) return;
+		const isRedirectTarget = redirectTargetPending;
+		redirectTargetPending = false;
+		if (isRedirectTarget) {
+			// Bash strips redirection targets from argv, so they are not option
+			// or script operands of the command that follows.
+			atCommandStart = redirectRestore ?? false;
+			redirectRestore = undefined;
+			start = -1;
+			value = "";
+			return;
+		}
+		words.push({ start, end, value, commandPosition: atCommandStart });
+		if (
+			atCommandStart &&
+			(SHELL_ASSIGNMENT_PREFIX.test(value) || SHELL_COMMAND_KEYWORDS.has(value) || SHELL_WRAPPER_NAMES.has(value))
+		) {
+			// The next word is still the command word.
+		} else {
+			atCommandStart = false;
+		}
 		start = -1;
 		value = "";
 	};
@@ -413,8 +463,45 @@ function shellWordSpans(command: string): ShellWordSpan[] {
 			i += 2;
 			continue;
 		}
-		if (/\s/.test(character) || ";&|()<>".includes(character)) {
+		if (character === "\n") {
 			flush(i);
+			if (!redirectTargetPending) atCommandStart = true;
+			i++;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			flush(i);
+			i++;
+			continue;
+		}
+		if (character === "&") {
+			// `>&1` is a redirection, not a command separator; the duplicate
+			// target is the word after the `&`.
+			if (!redirectTargetPending) {
+				flush(i);
+				atCommandStart = true;
+			}
+			i++;
+			continue;
+		}
+		if (character === ";" || character === "|" || character === "(" || character === ")") {
+			flush(i);
+			atCommandStart = true;
+			redirectTargetPending = false;
+			i++;
+			continue;
+		}
+		if (character === "<" || character === ">") {
+			// An all-digit word immediately before the operator is a file
+			// descriptor, not a command word.
+			if (start >= 0 && /^\d+$/.test(value)) {
+				start = -1;
+				value = "";
+			} else {
+				flush(i);
+			}
+			if (redirectRestore === undefined) redirectRestore = atCommandStart;
+			redirectTargetPending = true;
 			i++;
 			continue;
 		}
@@ -431,38 +518,64 @@ function shellWordSpans(command: string): ShellWordSpan[] {
  * script, e.g. `sh -ec '...'`, `/bin/bash --norc -c ...`, `busybox sh -c ...`.
  * The script is the first operand after the flag cluster that contains `c`;
  * `-o NAME` consumes its operand before that scan continues.
+ *
+ * Stopping rule: classification covers literal command positions (start of
+ * text, separators, pipes, `(`, the documented `if`/`then`/`else`/`do`
+ * keywords, an assignment prefix, and the documented `busybox` wrapper), the
+ * option forms above, and source spans. A shell name in any other position is
+ * ordinary argument data, not an interpreter. This is not a shell parser;
+ * wrappers and option forms outside this set are not modelled and must not be
+ * guessed at.
  */
 function shellScriptWordSpans(command: string): Array<[number, number]> {
 	const words = shellWordSpans(command);
 	const spans: Array<[number, number]> = [];
 	for (let i = 0; i < words.length; i++) {
+		if (!words[i].commandPosition) continue;
 		const name = words[i].value.split(/[\\/]/).pop() ?? "";
 		if (!SCRIPT_SHELL_NAMES.has(name)) continue;
-		let scripted = false;
+		let sawCommandFlag = false;
+		let endOfOptions = false;
 		let j = i + 1;
 		while (j < words.length) {
+			// A separator ended this simple command; the next word belongs to
+			// another command and is not this shell's option or script.
+			if (words[j].commandPosition) break;
 			const word = words[j].value;
-			if (word.startsWith("--")) {
+			if (!endOfOptions && word === "--") {
+				// `--` before any `-c` ends option parsing, so a later `-c` is an
+				// operand and starts no script; after `-c` the next operand is the
+				// script. Both fall out of scanning operands below.
+				endOfOptions = true;
 				j++;
 				continue;
 			}
-			if (!word.startsWith("-") || word === "-") break;
-			const flags = word.slice(1);
-			const scriptFlag = flags.indexOf("c");
-			if (scriptFlag >= 0) {
-				if (scriptFlag < flags.length - 1) {
-					// `-c'cat 'path`: the script is attached to the same argument,
-					// so its span starts after the `c` and ends with the word.
-					spans.push([words[j].start + 1 + scriptFlag + 1, words[j].end]);
-				} else {
-					scripted = true;
-					j++;
-				}
-				break;
+			if (!endOfOptions && word.startsWith("--")) {
+				j++;
+				continue;
 			}
-			j += flags.endsWith("o") ? 2 : 1;
+			if (!endOfOptions && word.startsWith("-") && word !== "-") {
+				const flags = word.slice(1);
+				const commandFlag = flags.indexOf("c");
+				if (commandFlag >= 0) {
+					sawCommandFlag = true;
+					if (commandFlag < flags.length - 1) {
+						// Some shells read the rest of the cluster as the script
+						// (`-c'cat 'path`), so that remainder stays a refused span.
+						// The remaining letters are also ordinary option flags
+						// (`-ce`), so the next operand is still the script and the
+						// scan continues instead of stopping here.
+						spans.push([words[j].start + 1 + commandFlag + 1, words[j].end]);
+					}
+				}
+				j += flags.endsWith("o") ? 2 : 1;
+				continue;
+			}
+			// The first non-option operand is the script only when `-c` was
+			// seen; otherwise option parsing ended at a normal operand.
+			if (sawCommandFlag) spans.push([words[j].start, words[j].end]);
+			break;
 		}
-		if (scripted && j < words.length) spans.push([words[j].start, words[j].end]);
 	}
 	return spans;
 }
@@ -486,8 +599,10 @@ function shellEscape(p: string): string {
 const SESSION_URL_ESCAPE = "URL is outside this session and cannot be expanded in a bash command";
 
 /**
- * Named in every rule-URL refusal so a model retries with the reader instead of
- * guessing more shell spellings.
+ * Appended to rule-URL refusals that describe a shell-context restriction, so a
+ * model retries with the reader instead of guessing more shell spellings.
+ * Containment and lookup refusals do not use it because the reader cannot
+ * bypass them.
  */
 const RULE_READ_ALTERNATIVE = "Read the rule directly instead: read <rule-url>.";
 
@@ -788,8 +903,11 @@ const RULE_PATH_SHELL_SYNTAX = /[$`;&|<>()'"\\\n\r]/;
  * the authorized root or split the path into different words. POSIX filenames
  * may legitimately contain `*`, `?`, `[`, `]`, `{`, and `}` (and this module
  * must not disable such a project), so they are refused only in that
- * second-parse context. Rule paths here are canonical and therefore absolute,
- * which leaves `~` no legitimate role in one.
+ * second-parse context. That context is `eval` plus `source`/`.` as a
+ * conservative policy margin: those builtins parse the file's contents, not
+ * the substituted operand, but the command is refused anyway rather than
+ * proving the operand harmless. Rule paths here are canonical and therefore
+ * absolute, which leaves `~` no legitimate role in one.
  */
 const RULE_PATH_REPARSED_SYNTAX = /[*?[\]{}~\s]/;
 
@@ -817,10 +935,11 @@ export function windowsDataValueSpelling(resolvedPath: string): string {
 /**
  * Return `resolvedPath` in the form the bash tool's shell reads as that same
  * file, or refuse it when shell syntax survives that form.
- * `reparsedByShell` marks a command whose builtin reads the substituted text
- * again (`eval`, `source`, `.`). A path that is safe in one parse is not
- * necessarily safe in two, so the glob/tilde/whitespace refusal applies only
- * then; see {@link RULE_PATH_REPARSED_SYNTAX}.
+ * `reparsedByShell` marks a command whose builtin re-reads the substituted
+ * text (`eval`) or one this policy refuses conservatively (`source`/`.`, which
+ * parse the file's contents rather than the operand). A path that is safe in
+ * one parse is not necessarily safe in two, so the glob/tilde/whitespace
+ * refusal applies only then; see {@link RULE_PATH_REPARSED_SYNTAX}.
  */
 export function refuseShellBearingRulePath(resolvedPath: string, reparsedByShell = false): string {
 	const shellPath = WINDOWS_DRIVE_PATH.test(resolvedPath) ? resolvedPath.replaceAll("\\", "/") : resolvedPath;
@@ -831,7 +950,7 @@ export function refuseShellBearingRulePath(resolvedPath: string, reparsedByShell
 	}
 	if (reparsedByShell && RULE_PATH_REPARSED_SYNTAX.test(shellPath)) {
 		throw new ToolError(
-			`rule:// URL resolved to a path containing a glob, tilde, or whitespace metacharacter and cannot be expanded in a command that may re-read the substituted text (eval, source, or .). ${RULE_READ_ALTERNATIVE}`,
+			`rule:// URL resolved to a path containing a glob, tilde, or whitespace metacharacter and cannot be expanded in a command that may re-read the substituted text (eval), or in a command containing source or . as a conservative policy margin. ${RULE_READ_ALTERNATIVE}`,
 		);
 	}
 	return shellPath;
@@ -1006,8 +1125,9 @@ function assertPathFitsDataValue(resolvedPath: string): void {
  * `options.rules` only; a missing list is an empty scope, never the
  * process-global snapshot. A resolved rule path carrying a glob, tilde, or
  * whitespace character is refused in a command whose `eval` re-parses the
- * substituted text; `source`/`.` are refused the same way as a conservative
- * margin. A rule URL inside a shell's `-c` script word is always refused.
+ * substituted text. `source`/`.` are refused the same way as a conservative
+ * policy margin even though they parse the file's contents, not the operand. A
+ * rule URL inside a shell's `-c` script word is always refused.
  * Passing `context: "data"` expands a value the shell never parses (an env
  * value) instead of command text: the same authorization applies, but the
  * quoting and nested-expansion guards, which only describe shell reading, do
@@ -1024,8 +1144,9 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 	const hasRuleUrl = matches.some(match => extractScheme(normalizeLocalScheme(unquoteToken(match[0]))) === "rule");
 	const nestedRuleContext = shellContext && hasRuleUrl && hasNestedExpansionContext(command);
 	// `eval` re-parses the substituted text; `source`/`.` are refused the same
-	// way as a conservative margin. A glob, tilde, or whitespace-bearing rule
-	// path is refused only in that context.
+	// way as a conservative policy margin even though they parse the file's
+	// contents. A glob, tilde, or whitespace-bearing rule path is refused only
+	// in that context.
 	const reparsedRuleContext = shellContext && hasRuleUrl && hasReparsingShellCommand(command);
 	// A shell's `-c` argument is a word the child parses again. The outer shell
 	// joins adjacent quoted segments and strips the substitution's quotes, so a
@@ -1040,6 +1161,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 
 		const rawUrl = unquoteToken(token);
 		const url = normalizeLocalScheme(rawUrl);
+		const scheme = extractScheme(url);
 		const quotedToken = token !== rawUrl;
 		const urlStart = index + (quotedToken ? 1 : 0);
 		const urlEnd = urlStart + rawUrl.length;
@@ -1053,12 +1175,12 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			);
 		}
 		const delimiter = quotedToken && !escapedAt(command, index) ? token[0] : undefined;
-		if (extractScheme(url) === "rule" && shellScriptSpans.some(([start, end]) => index >= start && index < end)) {
+		if (scheme === "rule" && shellScriptSpans.some(([start, end]) => index >= start && index < end)) {
 			throw new ToolError(
 				`rule:// URLs cannot be expanded inside a shell's -c script word, because that child shell parses the substituted text again. ${RULE_READ_ALTERNATIVE}`,
 			);
 		}
-		if (nestedRuleContext && extractScheme(url) === "rule") {
+		if (nestedRuleContext && scheme === "rule") {
 			throw new ToolError(
 				`rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets. ${RULE_READ_ALTERNATIVE}`,
 			);

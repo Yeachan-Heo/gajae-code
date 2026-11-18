@@ -2504,12 +2504,15 @@ describe("rule:// paths a second shell parse would expand", () => {
 
 /**
  * A string this module emits can change meaning under a second parse. The
- * product keeps the cheap emission rule -- the substituted operand is always
- * single-quoted, and substitution is refused when that word sits in a context
- * a second parse re-reads -- because spawning a shell per expansion is too
- * expensive for the hot path (a `bash -n` spawn measures in milliseconds).
- * These tests are the remaining defence: a new interpreter form must fail CI
- * rather than the product.
+ * product keeps the cheap emission rule: the substituted operand is always
+ * single-quoted. Refusal is context-specific: a `rule://` URL inside a shell's
+ * `-c` script word is refused unconditionally, while `eval` re-parses the
+ * substituted text and is refused only when the canonical path carries a
+ * metacharacter a second parse expands; `source`/`.` are refused the same way
+ * as a conservative policy margin even though they parse the file's contents.
+ * Spawning a shell per expansion is too expensive for the hot path (a
+ * `bash -n` spawn measures in milliseconds), so these tests are the remaining
+ * defence: a new form in this list must fail CI rather than the product.
  */
 describe("rule:// emitted command keeps its operand under a second parse", () => {
 	const SPECIAL_ROOTS = ["proj[e]po", "proj{a,b}", "proj name", "proj~x"] as const;
@@ -2615,13 +2618,19 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 					// The emitted command must be syntactically valid for the shell.
 					const syntax = await runShell(`bash -n -c ${shellEscape(emitted)}`, fixture.authorized);
 					expect(syntax.stderr).toBe("");
-					// Clause (b): executing it may not reach a sibling or decoy path, so
-					// the operand canonicalizes to exactly the authorized rule file.
+					// Clause (b): executing it must succeed and read exactly the
+					// authorized rule file, so the operand canonicalizes there rather
+					// than reaching a sibling or decoy path.
 					const result = await runShell(emitted, fixture.authorized);
 					const redirected = await Bun.file(path.join(fixture.authorized, "out"))
 						.text()
 						.catch(() => "");
-					const observed = `${result.stdout}${result.stderr}${redirected}`;
+					const redirectedX = await Bun.file(path.join(fixture.authorized, "x"))
+						.text()
+						.catch(() => "");
+					const observed = `${result.stdout}${result.stderr}${redirected}${redirectedX}`;
+					expect(result.code).toBe(0);
+					expect(observed).toContain("AUTHORIZED-RULE");
 					expect(observed).not.toContain("SECRET-OUTSIDE");
 					expect(observed).not.toContain("DECOY-");
 				}
@@ -2648,6 +2657,16 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 				'dash -c "cat "rule://deploy',
 				'busybox sh -c "cat "rule://deploy',
 				'sh -ec "cat "rule://deploy',
+				// `c` first in a cluster still leaves a separate script operand.
+				'sh -ce "cat "rule://deploy',
+				'sh -c -e "cat "rule://deploy',
+				// `--` after `-c` ends options before the script operand.
+				'sh -c -- "cat "rule://deploy',
+				// Redirection targets are not argv, so they cannot hide the script,
+				// and a redirection before the command still leaves `sh` in position.
+				'sh -c >out "cat "rule://deploy',
+				'sh >out -c "cat "rule://deploy',
+				'>out sh -c "cat "rule://deploy',
 			]) {
 				await expect(expandInternalUrls(command, options)).rejects.toThrow(/-c script word/);
 				await expect(expandInternalUrls(command, options)).rejects.toThrow(/read <rule-url>/);
@@ -2704,6 +2723,21 @@ describe("rule:// emitted command keeps its operand under a second parse", () =>
 			expect((await runShell(emitted, fixture.authorized)).stdout).toContain("AUTHORIZED-RULE");
 			// A URL in a separate word after the -c script is not inside the script.
 			expect(await expandInternalUrls('sh -c "cat " rule://deploy', options)).toContain(`'${fixture.canonical}'`);
+			// A shell name in ordinary argument position is data, not an
+			// interpreter: printf receives `sh`, `-c`, and the expanded rule path
+			// as three operands and never starts a child shell.
+			const shellNameAsData = "printf '%s' sh -c rule://deploy";
+			const dataEmitted = await expandInternalUrls(shellNameAsData, options);
+			expect(dataEmitted).toContain(`'${fixture.canonical}'`);
+			const dataRun = await runShell(dataEmitted, fixture.authorized);
+			expect(dataRun.code).toBe(0);
+			expect(dataRun.stdout).toContain(fixture.canonical);
+			// `--` before any `-c` makes `-c` an operand, not an option: the URL is
+			// data and expands, and sh reads no script from it.
+			expect(await expandInternalUrls("sh -- -c cat rule://deploy", options)).toContain(`'${fixture.canonical}'`);
+			// A redirection target is not argv: `sh` after one is still ordinary
+			// argument data for `cat`.
+			expect(await expandInternalUrls("cat >out sh -c rule://deploy", options)).toContain(`'${fixture.canonical}'`);
 		} finally {
 			await rm(parent, { recursive: true, force: true });
 		}
