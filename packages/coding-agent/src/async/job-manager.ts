@@ -3461,28 +3461,7 @@ export class AsyncJobManager {
 	markBackgrounded(jobId: string, generation: string, reason: FoldReason): boolean {
 		const job = this.#jobs.get(jobId);
 		if (!job || job.generation !== generation) return false;
-		if (job.metadata?.backgrounded === true) {
-			// A direct async start is already backgrounded, but a later `job` await
-			// can still be folded by a steer. Preserve the existing background state
-			// while recording the first fold reason and publishing its event.
-			if (job.metadata.foldReason !== undefined) return true;
-			job.metadata = { ...job.metadata, foldReason: reason };
-			for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
-				if (delivery.jobId === jobId && delivery.generation === generation) delivery.foldReason = reason;
-			}
-			this.#notifyChange();
-			const event: JobFoldEvent = { jobId, generation, reason };
-			for (const cb of this.#foldListeners) {
-				try {
-					cb(event);
-				} catch (error) {
-					logger.warn("Async job fold listener failed", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-			return true;
-		}
+		if (job.metadata?.backgrounded === true) return true;
 		job.metadata = { ...job.metadata, backgrounded: true, foldReason: reason };
 		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
 			if (delivery.jobId === jobId && delivery.generation === generation) {
