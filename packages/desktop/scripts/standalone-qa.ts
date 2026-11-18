@@ -216,11 +216,34 @@ export class StandaloneHost {
 		return { hostExitCode: code, hostDiagnostics: text };
 	}
 	async dispose(): Promise<void> {
-		await stop(this.child);
-		await bounded(this.frames, 5000, "Host cleanup final frame drain");
-		const text = await this.stderr.wait(1000);
-		assert(!cleanupWarning.test(text), `Host cleanup diagnostics: ${text}`);
-		if (!this.#closed && this.#failure) throw this.#failure;
+		const failures: unknown[] = [];
+		try {
+			await stop(this.child);
+		} catch (error) {
+			failures.push(error);
+		}
+		try {
+			await bounded(this.frames, 5000, "Host cleanup final frame drain");
+		} catch (error) {
+			failures.push(error);
+		}
+		if (!this.#closed && this.#failure) failures.push(this.#failure);
+		let text: string | undefined;
+		try {
+			text = await this.stderr.wait(1000);
+			if (cleanupWarning.test(text)) failures.push(new Error(`Host cleanup diagnostics: ${text}`));
+		} catch (error) {
+			failures.push(error);
+		}
+		if (failures.length) {
+			const evidence = {
+				hostExitCode: this.child.exitCode,
+				hostSignalCode: this.child.signalCode,
+				hostDiagnostics: text,
+			};
+			failures.push(new Error(`Host process evidence: ${JSON.stringify(evidence)}`));
+			throw new AggregateError(failures, "Host disposal failed; process evidence retained");
+		}
 	}
 }
 

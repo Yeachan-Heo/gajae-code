@@ -65,6 +65,7 @@ for (const fault of [
 	"fatal_after_shutdown",
 	"malformed_after_shutdown",
 	"early_eof",
+	"startup_syntax_error",
 	"cleanup_deadline",
 	"cleanup_rejected",
 	"cleanup_hidden_by_tail",
@@ -73,7 +74,9 @@ for (const fault of [
 ] as const) {
 	test(fault === "normal_eof"
 		? "standalone verifier closes stdin after acknowledged shutdown"
-		: `standalone verifier rejects ${fault} even with an exit-zero host`, async () => {
+		: fault === "startup_syntax_error"
+			? "standalone verifier retains bounded startup stderr and exit evidence alongside protocol failure"
+			: `standalone verifier rejects ${fault} even with an exit-zero host`, async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-verifier-fault-"));
 		const app = path.join(root, "Fixture.app");
 		const directory = path.join(app, "Contents/MacOS");
@@ -84,6 +87,10 @@ import * as path from "node:path";
 if (path.basename(process.argv[1]) === "gjc") { process.stdout.write("fixture-cli\\n"); process.exit(0); }
 if (process.argv[2] === "sdk") { process.stdout.write('{"id":"sdk/overview/summary"}\\n'); process.exit(0); }
 if (${JSON.stringify(fault)} === "early_eof") process.exit(0);
+if (${JSON.stringify(fault)} === "startup_syntax_error") {
+  process.stderr.write("discarded startup prefix\\n" + "ordinary startup diagnostic\\n".repeat(1000) + "SyntaxError: Unexpected identifier 'ep'\\n");
+  process.exit(1);
+}
 let buffer = "";
 for await (const chunk of Bun.stdin.stream()) {
   buffer += new TextDecoder().decode(chunk);
@@ -150,6 +157,13 @@ process.stdout.write(JSON.stringify(receipt));
 			} else {
 				expect(code).not.toBe(0);
 				expect(output).toBe("");
+				if (fault === "startup_syntax_error") {
+					expect(error).toContain("Host frame stream closed before shutdown");
+					expect(error).toContain("SyntaxError: Unexpected identifier 'ep'");
+					expect(error).toContain('"hostExitCode":1');
+					expect(error).toContain('"hostSignalCode":null');
+					expect(error).not.toContain("discarded startup prefix");
+				}
 				expect(error).toContain(
 					fault === "fatal_after_shutdown"
 						? "late fixture fatal"
