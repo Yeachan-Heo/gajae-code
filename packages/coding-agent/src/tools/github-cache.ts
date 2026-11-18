@@ -323,6 +323,78 @@ function restoreMasked(scrubbed: string, prefix: string, values: readonly string
 	return restored;
 }
 
+const BOUNDED_CONTAINER_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-container-`;
+const AT_SIGN_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-at-\u0000`;
+
+/**
+ * Find the end of a JSON object or array, honoring quoted strings and escapes so
+ * a `}` or `]` inside a string cannot end the value early.
+ */
+function findBalancedValueEnd(text: string, start: number): number {
+	const stack: string[] = [];
+	let inString = false;
+	let escaped = false;
+	for (let index = start; index < text.length; index += 1) {
+		const character = text.charAt(index);
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (character === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (character === '"') inString = false;
+			continue;
+		}
+		if (character === '"') {
+			inString = true;
+			continue;
+		}
+		if (character === "{") {
+			stack.push("}");
+			continue;
+		}
+		if (character === "[") {
+			stack.push("]");
+			continue;
+		}
+		if (character === "}" || character === "]") {
+			if (stack.pop() !== character) return -1;
+			if (stack.length === 0) return index + 1;
+		}
+	}
+	return -1;
+}
+
+/**
+ * A JSON-text credential whose value is an object or array has to be consumed
+ * with quote and depth awareness; the flat assignment mask would stop at a
+ * nested brace or a delimiter inside a string and leave the rest behind.
+ */
+function maskCredentialJsonContainers(text: string): { text: string; restore: (scrubbed: string) => string } {
+	if (!text.includes("{")) return { text, restore: scrubbed => scrubbed };
+	const sanitized: string[] = [];
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(
+		/(?<![A-Za-z0-9])"((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)"\s*:\s*/gi,
+	)) {
+		const valueStart = (match.index ?? 0) + match[0].length;
+		const first = text.charAt(valueStart);
+		if (first !== "{" && first !== "[") continue;
+		const end = findBalancedValueEnd(text, valueStart);
+		if (end === -1) continue;
+		out += text.slice(last, valueStart) + `${BOUNDED_CONTAINER_MASK}${sanitized.length}\u0000`;
+		sanitized.push('"«redacted»"');
+		last = end;
+	}
+	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
+	out += text.slice(last);
+	return { text: out, restore: scrubbed => restoreMasked(scrubbed, BOUNDED_CONTAINER_MASK, sanitized) };
+}
+
 /**
  * Authorization headers are redacted through the scheme word and the value, but
  * not through the rest of the line, so a table cell or shell command after the
@@ -466,15 +538,23 @@ function scrubHostPaths(text: string): string {
 
 /** Text-level scrub for everything the view cache persists or serves back. */
 function scrubCacheText(text: string): string {
-	// Userinfo is removed from the raw text first: an assignment mask inside a
+	// Structured containers first: a partial flat match would hide the credential
+	// label from the quote-aware container pass.
+	const containers = maskCredentialJsonContainers(text);
+	// Userinfo is removed from the raw text next: an assignment mask inside a
 	// URL's userinfo would hide the `@` delimiter the authority pass needs.
-	const withoutUserinfo = stripUrlUserinfo(text);
-	const authHeaders = maskBoundedAuthorizationHeaders(withoutUserinfo);
+	const withoutUserinfo = stripUrlUserinfo(containers.text);
+	// The shared URL rule does not know about Markdown cell separators and can
+	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
+	// (userinfo was already removed) so only our authority pass sees them.
+	const withoutAtSigns = withoutUserinfo.replaceAll("@", AT_SIGN_MASK);
+	const authHeaders = maskBoundedAuthorizationHeaders(withoutAtSigns);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	let scrubbed = redactCrashSecrets(assignments.text);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
 	scrubbed = scrubHostPaths(scrubbed);
-	return authHeaders.restore(assignments.restore(scrubbed));
+	scrubbed = scrubbed.replaceAll(AT_SIGN_MASK, "@");
+	return containers.restore(authHeaders.restore(assignments.restore(scrubbed)));
 }
 
 /** Scrub credential-shaped text and host paths inside a value before it is JSON-encoded or served back. */

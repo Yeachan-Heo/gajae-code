@@ -3025,12 +3025,18 @@ function binaryFileTokens(line: string): PrDiffPathToken[] {
 	const andIndex = rest.indexOf(" and ");
 	if (andIndex <= 0) return tokens;
 	const secondStart = andIndex + " and ".length;
-	const end = rest.endsWith(" differ") ? rest.length - " differ".length : rest.length;
+	const quotedSecond2 = rest.charAt(secondStart) === '"' ? parseDiffQuotedToken(rest, secondStart) : undefined;
+	const end = quotedSecond2
+		? quotedSecond2.nextIndex
+		: rest.endsWith(" differ")
+			? rest.length - " differ".length
+			: rest.length;
 	tokens.push({ start: prefix.length, end: prefix.length + andIndex, value: rest.slice(0, andIndex) });
 	tokens.push({
 		start: prefix.length + secondStart,
 		end: prefix.length + end,
-		value: rest.slice(secondStart, end),
+		value: quotedSecond2 ? quotedSecond2.value : rest.slice(secondStart, end),
+		escaped: quotedSecond2?.escaped,
 	});
 	return tokens;
 }
@@ -3278,6 +3284,14 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		}
 		if (line.startsWith("rename to ")) {
 			({ value: newPath, escaped: newPathEscaped } = parseDiffPathLine(line, "rename to "));
+			continue;
+		}
+		if (line.startsWith("copy from ")) {
+			({ value: oldPath, escaped: oldPathEscaped } = parseDiffPathLine(line, "copy from "));
+			continue;
+		}
+		if (line.startsWith("copy to ")) {
+			({ value: newPath, escaped: newPathEscaped } = parseDiffPathLine(line, "copy to "));
 			continue;
 		}
 		if (line.startsWith("Binary files ") && line.endsWith(" differ")) {

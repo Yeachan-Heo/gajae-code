@@ -742,6 +742,8 @@ describe("github view cache persistence", () => {
 		const diff = [
 			`diff --git "a/${encoded}" "b/${encoded}"`,
 			`Binary files "a/${encoded}" and "b/${encoded}" differ`,
+			"diff --git a/unchanged b/unchanged",
+			`Binary files /dev/null and "b/${encoded}" differ`,
 			"",
 		].join("\n");
 		putCached({
@@ -759,6 +761,8 @@ describe("github view cache persistence", () => {
 		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 69, false, TEST_AUTH_KEY);
 		expect(cached?.payload.unified).not.toContain(secret);
 		expect(cached?.payload.unified).toContain("differ");
+		expect(cached?.payload.unified).toContain("/dev/null");
+		expect(cached?.payload.unified).toContain("diff --git a/unchanged b/unchanged");
 	});
 
 	it("keeps unquoted operand spaces and replacement metacharacters", () => {
@@ -804,6 +808,8 @@ describe("github view cache persistence", () => {
 		const cases = [
 			['{"token":[1,2],"keep":1}', '{"token":"«redacted»","keep":1}'],
 			['{"token":{"value":"demo"},"keep":1}', '{"token":"«redacted»","keep":1}'],
+			['{"token":{"note":"left}opaque-demo-value"},"keep":1}', '{"token":"«redacted»","keep":1}'],
+			['{"token":[[1,2],"demo"],"keep":1}', '{"token":"«redacted»","keep":1}'],
 		];
 		cases.forEach(([body, expected], index) => {
 			const number = 90 + index;
@@ -878,10 +884,49 @@ describe("github view cache persistence", () => {
 		expect(first?.payload.unified.slice(file?.startOffset, file?.endOffset).startsWith('diff --git "a/plain"')).toBe(
 			true,
 		);
+		const db = openDb();
+		expect(db).not.toBeNull();
+		const row = db
+			?.prepare(
+				"SELECT payload, rendered FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
+			)
+			.get(TEST_AUTH_KEY, TEST_REPO, "pr-diff", 93, 0) as { payload: string; rendered: string } | null;
+		expect(row?.rendered).toBe(first?.payload.unified);
+		expect((JSON.parse(row?.payload ?? "{}") as { unified?: string }).unified).toBe(first?.payload.unified);
+	});
+
+	it("uses copy metadata to resolve an ambiguous diff header", () => {
+		const secret = "opaque-cache-value-1234567890";
+		const diff = [
+			"diff --git a/plain b/f b/x",
+			"similarity index 100%",
+			"copy from plain",
+			`copy to "f b/x/\\164oken=${secret}"`,
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 79,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain(secret);
+		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 79, false, TEST_AUTH_KEY);
+		expect(cached?.payload.files[0]?.path).toBe("f b/x/token=«redacted»");
+		expect(cached?.payload.files[0]?.oldPath).toBe("plain");
 	});
 
 	it("does not merge two compact table cells into one URL", () => {
-		const body = "|//example.test|dev@else.test|";
+		const body = [
+			"|//example.test|dev@else.test|",
+			"|https://docs.example|dev@else.test|",
+			"|https://docs.example|'person@example.test'|",
+		].join("\n");
 		const url = `https://github.com/${TEST_REPO}/issues/78`;
 		putCached({
 			authKey: TEST_AUTH_KEY,
@@ -896,7 +941,13 @@ describe("github view cache persistence", () => {
 		});
 
 		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 78, true, TEST_AUTH_KEY);
-		expect(cached?.payload.body).toBe("|//example.test|dev@else.test|");
+		expect(cached?.payload.body).toBe(
+			[
+				"|//example.test|dev@else.test|",
+				"|https://docs.example|dev@else.test|",
+				"|https://docs.example|'person@example.test'|",
+			].join("\n"),
+		);
 	});
 
 	it("drops a vendor token glued to an identifier", () => {
