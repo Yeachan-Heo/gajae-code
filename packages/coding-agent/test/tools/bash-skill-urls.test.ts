@@ -2152,10 +2152,11 @@ describe("bash session agent directory", () => {
 				});
 				expect(textOf(possessive)).toContain(await realpath(tabRule));
 				// A decomposed accent and an astral letter are word characters too, so
-				// their apostrophes stay prose.
+				// their apostrophes stay prose; both rows would invent a quoted run if the
+				// neighbours were read as UTF-16 units.
 				for (const [label, value] of [
 					["decomposed", "cafe\u0301's rule://tabbed and owners' notes"],
-					["astral", "\u03b1\u{1d6fc} rule://tabbed don't"],
+					["astral", "\u{1d736}' rule://tabbed and \u{1d737}' notes"],
 				] as const) {
 					const proseValue = await tool.execute(`call-env-${label}-tab`, {
 						command: 'printf "%s" "$PAYLOAD"',
