@@ -669,6 +669,21 @@ describe("recordFatalCrash", () => {
 		const camelOutput = redactCrashSecrets(camelInsideContainer);
 		expect(camelOutput).toContain("diagnostic=KEEP");
 		expect(camelOutput).not.toContain("BODY");
+
+		// The container masking removes the scalar header, so its body must not be read from the
+		// raw text: that phantom scalar swallowed the block that follows.
+		const phantomScalar = `secret={\npassword: |\n  }\n  -----BEGIN PRIVATE KEY-----\nSYNTHETIC-BODY\n-----END PRIVATE KEY-----`;
+		const phantomOutput = redactCrashSecrets(phantomScalar);
+		expect(phantomOutput).not.toContain("SYNTHETIC-BODY");
+		expect(phantomOutput).not.toContain("PRIVATE KEY");
+
+		// A scalar header inside a masked container must not redact the more-indented diagnostic
+		// that follows the container.
+		const phantomHeader = `secret={\n  password: |\n    filler\n    }\n    diagnostic=KEEP\nnote=keep\n-----BEGIN PRIVATE KEY-----\nBODY\n-----END PRIVATE KEY-----`;
+		const phantomHeaderOutput = redactCrashSecrets(phantomHeader);
+		expect(phantomHeaderOutput).toContain("diagnostic=KEEP");
+		expect(phantomHeaderOutput).toContain("note=keep");
+		expect(phantomHeaderOutput).not.toContain("BODY");
 	});
 
 	it("preserves later diagnostics after an unterminated credential container", () => {

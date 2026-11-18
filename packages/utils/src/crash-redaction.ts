@@ -114,18 +114,23 @@ interface AppliedRange extends TextRange {
 function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[]): string {
 	const containers: TextRange[] = [];
 	collectCredentialContainerRanges(text, CURRENT_CREDENTIAL_REDACTION_RULES, containers);
-	const scalars: TextRange[] = [];
-	redactYamlBlockScalars(text, CURRENT_CREDENTIAL_REDACTION_RULES, scalars);
-	const containerApplied = mergeMaskRanges([
+	const containerApplied = mergeMaskRanges(containers.map(range => ({ ...range, container: true })));
+	const containerMasked = applyMaskRanges(text, containerApplied);
+	// Scalars are read on the container-masked text, as the scrubber's own order does, and mapped
+	// back: a scalar header the container masking removed must not leave a phantom body behind.
+	const scalarMasked: TextRange[] = [];
+	redactYamlBlockScalars(containerMasked, CURRENT_CREDENTIAL_REDACTION_RULES, scalarMasked);
+	const scalars = mapMaskedRanges(scalarMasked, containerApplied);
+	const containerApplied2 = mergeMaskRanges([
 		...containers.map(range => ({ ...range, container: true })),
 		...scalars.map(range => ({ ...range, container: true })),
 	]);
-	const containerMasked = applyMaskRanges(text, containerApplied);
-	const survivors = mapMaskedRanges(findPrivateKeySpans(containerMasked), containerApplied);
+	const containerMasked2 = applyMaskRanges(text, containerApplied2);
+	const survivors = mapMaskedRanges(findPrivateKeySpans(containerMasked2), containerApplied2);
 	// A block whose opening banner sits inside a container or scalar was hidden by that masking,
 	// and the re-scan already pairs the block that survives; keeping the raw range would swallow
 	// the diagnostics between the hidden banner and the footer it happened to reach.
-	const visible = visibleSpans(spans, containerApplied);
+	const visible = visibleSpans(spans, containerApplied2);
 	return applyMaskRanges(
 		text,
 		mergeMaskRanges([
