@@ -120,4 +120,96 @@ describe("unified diff scrubber", () => {
 			expect(scrubbed).toContain("@@ -10,5 +20,7 @@");
 		});
 	});
+
+	describe("snowykr findings", () => {
+		it("[P2] preserves quote-aware redaction inside multiline containers", () => {
+			// A multiline credential array containing a quoted bracket should not early-exit credential state
+			const diff = [
+				...HEADER,
+				"@@ -0,0 +1,5 @@",
+				'+Authorization: [',
+				'+  "quoted-bracket-secret: ]"',
+				'+  "another-secret"',
+				'+]',
+				'+keep this line',
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// Both secrets should be redacted
+			expect(scrubbed).not.toContain("quoted-bracket-secret");
+			expect(scrubbed).not.toContain("another-secret");
+
+			// Keep line should NOT be redacted (credential state should exit after closing bracket)
+			expect(scrubbed).toContain("keep this line");
+		});
+
+		it("[P2] scrubs source-derived hunk context", () => {
+			// Hunk header may have optional context with credentials
+			const diff = [
+				...HEADER,
+				'@@ -1,1 +1,1 @@ function getAuth(secret="auth-token-in-context") {',
+				' content line',
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// Credential in hunk context should be redacted
+			expect(scrubbed).not.toContain("auth-token-in-context");
+
+			// Hunk header structure preserved
+			expect(scrubbed).toMatch(/@@ -1,1 \+1,1 @@/);
+
+			// Content line preserved
+			expect(scrubbed).toContain(" content line");
+		});
+
+		it("[P2] preserves no-newline marker order", () => {
+			// No-newline markers should come after the line they're attached to, not separately
+			const diff = [
+				...HEADER,
+				"@@ -1,2 +1,1 @@",
+				" line1",
+				"-line2",
+				"\\ No newline at end of file",
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// Extract the lines after the hunk header
+			const lines = scrubbed.split("\n");
+			const hunkIndex = lines.findIndex(l => l.startsWith("@@ "));
+			const contentLines = lines.slice(hunkIndex + 1);
+
+			// No-newline marker should be one of the last lines
+			const markerIndex = contentLines.indexOf("\\ No newline at end of file");
+			expect(markerIndex).toBeGreaterThanOrEqual(0);
+
+			// Marker should come after content lines (not at the beginning)
+			expect(markerIndex).toBeGreaterThan(0);
+		});
+
+		it("[P4] preserves terminal newline framing", () => {
+			// Input ending with newline should output ending with newline
+			const diff = [
+				...HEADER,
+				"@@ -1,2 +1,2 @@",
+				" line1",
+				" line2",
+			].join("\n") + "\n";
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// Terminal newline should be preserved
+			expect(scrubbed.endsWith("\n")).toBe(true);
+
+			// Input without trailing newline should not get one
+			const diffNoTrailing = [...HEADER, "@@ -1,2 +1,2 @@", " line1", " line2"].join("\n");
+			const scrubbedNoTrailing = scrubUnifiedDiff(diffNoTrailing);
+			expect(scrubbedNoTrailing.endsWith("\n")).toBe(false);
+		});
+	});
 });

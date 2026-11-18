@@ -102,9 +102,11 @@ export function openDb(): Database | null {
 		// Migrate any pre-existing table whose key/check constraint predates
 		// the current schema. The cache is regenerable, so we drop rows rather
 		// than running an in-place ALTER dance.
+		// Schema v5: Structural diff scrubbing with quote-aware bracket tracking.
+		// Invalidate all pre-v5 rows as they may contain unscrubbed credentials.
 		const userVersion = (db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
-		if (userVersion !== undefined && userVersion < 4) {
+		if (userVersion !== undefined && userVersion < 5) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
 		}
 		db.run(`
@@ -121,7 +123,7 @@ export function openDb(): Database | null {
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
 			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
-			PRAGMA user_version = 4;
+			PRAGMA user_version = 5;
 		`);
 		protectDbFiles(dbPath);
 		cachedDb = db;
@@ -285,9 +287,53 @@ export interface PutCachedInput<T = unknown> {
 }
 
 /**
+ * Recompute file offsets after scrubbing a unified diff.
+ * Scrubbing can change the diff's byte length, invalidating cached offsets.
+ * This function rescans the scrubbed diff to find each file's new byte range.
+ */
+function recomputeFileOffsetsAfterScrubbing(
+	unifiedDiff: string,
+	files: Record<string, unknown>[],
+): Record<string, unknown>[] {
+	if (files.length === 0) return files;
+
+	// Find all "diff --git" line positions in the scrubbed diff
+	const sectionStarts: number[] = [];
+	const re = /^diff --git /gm;
+	let m: RegExpExecArray | null = re.exec(unifiedDiff);
+	while (m !== null) {
+		sectionStarts.push(m.index);
+		if (re.lastIndex === m.index) re.lastIndex += 1;
+		m = re.exec(unifiedDiff);
+	}
+
+	// If we found a different number of sections, return unchanged
+	// (indicates parsing issue; don't corrupt the files array)
+	if (sectionStarts.length !== files.length) {
+		return files;
+	}
+
+	// Update each file's offset
+	const updated: Record<string, unknown>[] = [];
+	for (let i = 0; i < files.length; i += 1) {
+		const file = files[i];
+		const startOffset = sectionStarts[i] ?? 0;
+		const endOffset = sectionStarts[i + 1] ?? unifiedDiff.length;
+		updated.push({
+			...file,
+			startOffset,
+			endOffset,
+		});
+	}
+
+	return updated;
+}
+
+/**
  * Scrub sensitive material from cache inputs before storage.
  * For pr-diff, scrubs the unified diff in both payload and rendered.
  * For other kinds, scrubs the rendered text using the shared redactor.
+ * After scrubbing, recomputes file offsets to account for byte length changes.
  */
 function scrubCacheInput<T>(kind: CacheKind, payload: T, rendered: string): { payload: T; rendered: string } {
 	let scrubbedPayload = payload;
@@ -300,9 +346,18 @@ function scrubCacheInput<T>(kind: CacheKind, payload: T, rendered: string): { pa
 		// Also scrub the payload's unified field if present.
 		const payloadObj = payload as Record<string, unknown>;
 		if (typeof payloadObj.unified === "string") {
+			const scrubbedUnified = scrubUnifiedDiff(payloadObj.unified);
+			let scrubbedFiles = payloadObj.files as Record<string, unknown>[] | undefined;
+
+			// Recompute file offsets after scrubbing, as redaction can change byte positions
+			if (Array.isArray(scrubbedFiles) && scrubbedFiles.length > 0) {
+				scrubbedFiles = recomputeFileOffsetsAfterScrubbing(scrubbedUnified, scrubbedFiles);
+			}
+
 			scrubbedPayload = {
 				...payloadObj,
-				unified: scrubUnifiedDiff(payloadObj.unified),
+				unified: scrubbedUnified,
+				files: scrubbedFiles,
 			} as unknown as T;
 		}
 	}

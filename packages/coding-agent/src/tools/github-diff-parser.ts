@@ -18,7 +18,7 @@
 
 import { redactCrashSecrets } from "@gajae-code/utils";
 
-// Helper to split text while preserving empty lines
+// Helper to split text while preserving empty lines and tracking terminal newline.
 // Returns [lines, hasTrailingNewline]
 function splitLines(text: string): { lines: string[]; hasTrailingNewline: boolean } {
 	const result: string[] = [];
@@ -28,10 +28,10 @@ function splitLines(text: string): { lines: string[]; hasTrailingNewline: boolea
 		if (text[i] === "\n") {
 			result.push(current);
 			current = "";
-			hasTrailingNewline = i === text.length - 1; // Track if final char is newline
+			// hasTrailingNewline tracks whether the final split ended with newline
+			hasTrailingNewline = i === text.length - 1;
 		} else {
 			current += text[i];
-			hasTrailingNewline = false;
 		}
 	}
 	if (current.length > 0) {
@@ -44,8 +44,8 @@ function splitLines(text: string): { lines: string[]; hasTrailingNewline: boolea
 // Constants
 // ────────────────────────────────────────────────────────────────────────────
 
-/** Hunk header format: @@ -oldStart,oldCount +newStart,newCount @@ */
-const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+/** Hunk header format: @@ -oldStart,oldCount +newStart,newCount @@ or with optional context */
+const HUNK_HEADER_RE = /^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)(?: (.*))?$/;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Main scrubbing logic
@@ -160,6 +160,8 @@ interface HunkResult {
  * 2. Redacting the accumulated content to identify credentials
  * 3. Projecting redactions back onto individual diff lines
  * 4. Tracking credential state across hunk boundaries
+ * 5. Scrubbing optional source-derived context in hunk headers
+ * 6. Preserving no-newline markers in correct order
  */
 function redactHunk(
 	lines: string[],
@@ -178,14 +180,32 @@ function redactHunk(
 		};
 	}
 
-	// Parse the line counts
-	const oldCount = Number.parseInt(match[2] || "1", 10);
-	const newCount = Number.parseInt(match[4] || "1", 10);
+	// Extract hunk header parts: hunk metadata and optional source-derived context
+	const hunkHeaderCore = match[1];
+	const optionalContext = match[2] || "";
 
-	const result: string[] = [headerLine];
+	// Scrub the optional context (source-derived section) which may contain credentials
+	const scrubbedContext = optionalContext ? redactCrashSecrets(optionalContext) : "";
+	const scrubbedHeaderLine = scrubbedContext ? `${hunkHeaderCore} ${scrubbedContext}` : hunkHeaderCore;
+
+	// Parse the line counts from the core header
+	const coreMatch = hunkHeaderCore.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$/);
+	if (!coreMatch) {
+		return {
+			redactedLines: [scrubbedHeaderLine],
+			nextIndex: hunkHeaderIndex + 1,
+			state: inputState,
+		};
+	}
+
+	const oldCount = Number.parseInt(coreMatch[2] || "1", 10);
+	const newCount = Number.parseInt(coreMatch[4] || "1", 10);
+
+	const result: string[] = [scrubbedHeaderLine];
 	let i = hunkHeaderIndex + 1;
 	let oldLines = 0;
 	let newLines = 0;
+	let noNewlineMarker: string | null = null;
 
 	// Collect line info for credential redaction with context
 	const lineInfos: LineInfo[] = [];
@@ -220,8 +240,8 @@ function redactHunk(
 				newLines += 1;
 				i += 1;
 			} else if (prefix === "\\") {
-				// No-newline marker, doesn't count toward lines
-				result.push(line);
+				// No-newline marker: store for appending after all content lines
+				noNewlineMarker = line;
 				i += 1;
 			} else {
 				// Unexpected prefix, could be next hunk or file header
@@ -241,6 +261,11 @@ function redactHunk(
 		result.push(info.prefix + info.content);
 	}
 
+	// Append no-newline marker after all content lines (preserves order)
+	if (noNewlineMarker) {
+		result.push(noNewlineMarker);
+	}
+
 	return { redactedLines: result, nextIndex: i, state: outputState };
 }
 
@@ -249,7 +274,8 @@ function redactHunk(
  * Returns the redacted line infos and updated state.
  *
  * Strategy: Use accumulated redaction to identify where credentials are,
- * then apply smart line-by-line redaction that understands multi-line values.
+ * then apply smart line-by-line redaction that understands multi-line values
+ * with quote-aware bracket tracking.
  */
 function redactAccumulatedContentWithState(
 	lineInfos: LineInfo[],
@@ -291,7 +317,42 @@ function redactAccumulatedContentWithState(
 }
 
 /**
+ * Track whether we're inside a quoted string to avoid false bracket matches.
+ */
+function countBracketsQuoteAware(text: string): number {
+	let depth = 0;
+	let inString = false;
+	let stringChar: string | null = null;
+
+	for (let i = 0; i < text.length; i += 1) {
+		const char = text[i];
+
+		// Handle escape sequences
+		if (inString && char === "\\") {
+			i += 1; // Skip next character
+			continue;
+		}
+
+		// Track quote state
+		if ((char === '"' || char === "'") && (!inString || char === stringChar)) {
+			inString = !inString;
+			stringChar = inString ? char : null;
+			continue;
+		}
+
+		// Count brackets only when not inside a string
+		if (!inString) {
+			if (char === "[" || char === "{") depth += 1;
+			if (char === "]" || char === "}") depth -= 1;
+		}
+	}
+
+	return depth;
+}
+
+/**
  * Apply state-based redaction by identifying credential headers and their multi-line values.
+ * Uses quote-aware bracket tracking to avoid false matches on quoted brackets.
  * Returns redacted lines and updated state for use in subsequent hunks.
  */
 function applyStateBasedRedactionWithState(
@@ -330,18 +391,14 @@ function applyStateBasedRedactionWithState(
 			const redacted = redactCrashSecrets(line);
 			inCredentialValue = true;
 			bracketDepth = 0;
-			// Count brackets in this line too
-			for (const char of line) {
-				if (char === "[" || char === "{") bracketDepth += 1;
-				if (char === "]" || char === "}") bracketDepth -= 1;
-			}
+			// Count brackets in this line too, using quote-aware tracking
+			const lineDepthDelta = countBracketsQuoteAware(line);
+			bracketDepth += lineDepthDelta;
 			result.push({ ...info, content: redacted });
 		} else if (inCredentialValue) {
-			// We're in a credential value - track brackets
-			for (const char of line) {
-				if (char === "[" || char === "{") bracketDepth += 1;
-				if (char === "]" || char === "}") bracketDepth -= 1;
-			}
+			// We're in a credential value - track brackets with quote awareness
+			const lineDepthDelta = countBracketsQuoteAware(line);
+			bracketDepth += lineDepthDelta;
 
 			// Redact this line as part of the value
 			// But preserve pure structure lines like standalone brackets
