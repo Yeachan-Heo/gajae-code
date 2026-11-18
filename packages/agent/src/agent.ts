@@ -1441,6 +1441,15 @@ export class Agent {
 	}
 
 	/**
+	 * Notify follow-up waiters without queueing a message. Used by the session
+	 * when a deferred SDK follow-up is admitted, so job poll can interrupt
+	 * immediately without waiting for the message to enter the agent queue.
+	 */
+	notifyFollowUpWaiters(): void {
+		for (const notify of [...this.#followUpWaiters]) notify();
+	}
+
+	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 *
