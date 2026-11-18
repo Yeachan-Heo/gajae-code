@@ -505,10 +505,13 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 			// promoting a case-variant sibling that discovery never loaded.
 			const unlinkedRoot = await unlinkedDirectorySpelling(home, ruleRoot);
 			if (unlinkedRoot !== undefined) {
-				// Provenance is the request's spelling under the configured root; the
-				// directory's on-disk spelling may differ in case, or the trusted home
-				// may be reached through a link, so this gate folds case.
-				if (!pathSpelledInside(ruleRoot, lexical) || !pathSpelledInside(ruleRoot, ruleLexical)) continue;
+				// Provenance accepts either spelling discovery may have stored: the
+				// configured home, or the canonical home a caller supplied. The
+				// directory's on-disk spelling may also differ in case, or the trusted
+				// home may be reached through a link, so these gates fold case.
+				const underConfigured = (candidate: string) =>
+					pathSpelledInside(ruleRoot, candidate) || pathSpelledInside(unlinkedRoot, candidate);
+				if (!underConfigured(lexical) || !underConfigured(ruleLexical)) continue;
 				if (pathStaysInside(unlinkedRoot, realTarget)) return realTarget;
 				continue;
 			}
