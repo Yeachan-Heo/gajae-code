@@ -27,7 +27,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
-import type { ToolSession } from "../src/tools";
+import type { NestedToolScope, ToolSession } from "../src/tools";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "../src/tools/descriptors";
 import { EvalTool } from "../src/tools/eval";
 import { WriteTool } from "../src/tools/write";
@@ -2023,6 +2023,20 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			return tool as unknown as AgentTool;
 		}
 
+		function evalToolCapturingScope(
+			getSession: () => AgentSession,
+			onScope: (scope: NestedToolScope | undefined) => void,
+		): AgentTool {
+			const tool = new EvalTool({
+				...createToolSession(),
+				getToolForExecution: (name, options) => {
+					onScope(options?.nestedToolScope);
+					return getSession().getToolForExecution(name, options);
+				},
+			} as ToolSession);
+			return tool as unknown as AgentTool;
+		}
+
 		function evalCall(id: string, code: string): ToolCall {
 			return { type: "toolCall", id, name: "eval", arguments: { cells: [{ language: "js", code }] } };
 		}
@@ -2146,6 +2160,50 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(text).toContain("fulfilled,rejected,fulfilled");
 			expect(text).toContain("BODY:secrets.txt|BOOM|BODY:public.txt");
 			expect(text).toContain(READ_RULE_CONTENT);
+		});
+
+		it("refuses a nested call that resumes after its eval call settled", async () => {
+			const reads: unknown[] = [];
+			let scope: NestedToolScope | undefined;
+			const evalTool = evalToolCapturingScope(
+				() => session,
+				captured => {
+					scope = captured ?? scope;
+				},
+			);
+			const { session } = createSession(
+				[evalTool, recordingRead(reads)],
+				[[evalCall("eval-1", "return await tool.read({ path: 'public.txt' });")]],
+				[secretReadRule()],
+			);
+			await run(session, "read once");
+
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			expect(scope?.parentToolCallId).toBe("eval-1");
+			// A detached nested call that resumes after the eval result was produced
+			// must not reach the tool or re-claim rules against a finished call id.
+			const late = session.getToolForExecution("read", { nestedToolScope: scope! })!;
+			await expect(late.execute("late-read", { path: "late.txt", _i: "test" })).rejects.toThrow("already settled");
+			expect(reads).toHaveLength(1);
+		});
+
+		it("runs nested calls in a new eval call after an earlier eval was invalidated", async () => {
+			const reads: unknown[] = [];
+			const firstCode = `try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('CAUGHT'); }
+			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log(String(error?.message ?? error)); }`;
+			const { session } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", firstCode)], [evalCall("eval-2", "return await tool.read({ path: 'public.txt' });")]],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+			await run(session, "batch reads again");
+
+			// The invalidation is scoped to the interrupted eval call, not the session.
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			expect(toolResultText(session, "eval-1")).toContain("invalidated by an interrupting TTSR match");
+			expect(toolResultText(session, "eval-2")).toContain("FILE-BODY");
 		});
 
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {

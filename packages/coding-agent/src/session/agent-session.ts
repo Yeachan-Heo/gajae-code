@@ -33,6 +33,7 @@ import {
 	type AgentState,
 	type AgentTerminalOwnerContext,
 	type AgentTool,
+	type AgentToolContext,
 	activeToolForCallName,
 	assertImagePlaceholdersHavePayload,
 	type BeforeToolCallContext,
@@ -492,7 +493,7 @@ import {
 	selectDiscoverableToolNamesByServer,
 	selectRestorableDiscoveredBuiltinToolNames,
 } from "../tool-discovery/tool-index";
-import type { AskAnswerSource, ToolSession } from "../tools";
+import type { AskAnswerSource, NestedToolScope, ToolSession } from "../tools";
 import { computeEssentialBuiltinNames } from "../tools";
 import { AskTool } from "../tools/ask";
 import {
@@ -4890,13 +4891,11 @@ export class AgentSession {
 	 */
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
 	/**
-	 * Eval calls (keyed by their parent tool call id) that an interrupting nested
-	 * TTSR match invalidated, with the matched rule names. Eval code can catch the
-	 * interruption error, so the claim alone must not let a retried nested call
-	 * execute before the folded reminder reaches the model. Cleared when the eval
-	 * call's result is produced.
+	 * Active nested-tool scopes keyed by the model-facing eval call id. Each scope
+	 * is closed when that call's result is produced, so a nested call that resumes
+	 * after settlement cannot claim a reminder or invalidate a finished call.
 	 */
-	#invalidatedNestedEvals = new Map<string, string[]>();
+	#nestedToolScopes = new Map<string, NestedToolScope>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -10963,8 +10962,14 @@ export class AgentSession {
 	 * undo their provisional claims so the rules stay eligible.
 	 */
 	#releasePerToolTtsrInjections(toolCallId?: string): void {
-		if (toolCallId === undefined) this.#invalidatedNestedEvals.clear();
-		else this.#invalidatedNestedEvals.delete(toolCallId);
+		if (toolCallId === undefined) {
+			for (const scope of this.#nestedToolScopes.values()) scope.closed = true;
+			this.#nestedToolScopes.clear();
+		} else {
+			const scope = this.#nestedToolScopes.get(toolCallId);
+			if (scope) scope.closed = true;
+			this.#nestedToolScopes.delete(toolCallId);
+		}
 		const ids =
 			toolCallId === undefined
 				? new Set([
@@ -10989,8 +10994,12 @@ export class AgentSession {
 	 * decorated result actually published.
 	 */
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, signal?: AbortSignal): AfterToolCallResult | undefined {
-		// The eval call is settling, so its nested-call invalidation no longer gates anything.
-		this.#invalidatedNestedEvals.delete(ctx.toolCall.id);
+		// The eval call is settling, so any nested call that resumes later must not run.
+		const nestedScope = this.#nestedToolScopes.get(ctx.toolCall.id);
+		if (nestedScope) {
+			nestedScope.closed = true;
+			this.#nestedToolScopes.delete(ctx.toolCall.id);
+		}
 		// An aborted call's result is replaced by the loop's aborted result, so a
 		// folded reminder would never reach the model. A pending TTSR retry carries
 		// the bucket into its injection; any other cancellation releases it.
@@ -11192,6 +11201,26 @@ export class AgentSession {
 	}
 
 	/**
+	 * Refuse a nested call whose eval call already settled or was invalidated by an
+	 * interrupting match. Checked on entry and again after every await so a call
+	 * paused in lazy materialization or AST matching cannot resume into a finished
+	 * or invalidated eval. Eval code can catch these errors, which is why every
+	 * later call is refused rather than only the one that matched.
+	 */
+	#assertNestedToolScopeActive(scope: NestedToolScope): void {
+		if (scope.closed || this.#nestedToolScopes.get(scope.parentToolCallId) !== scope) {
+			throw new ToolError(
+				"This eval call already settled; nested tool calls cannot run after its result was produced.",
+			);
+		}
+		if (scope.invalidatedBy) {
+			throw new ToolError(
+				`This eval call was invalidated by an interrupting TTSR match (${scope.invalidatedBy.join(", ")}). No further nested tool calls will run in it; apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+	}
+
+	/**
 	 * Nested calls (eval `tool.<name>()`) dispatch outside the agent loop, so the
 	 * argument-stream and pre-dispatch matching above never see them. Apply the
 	 * same tool-scoped rules to the nested call's final arguments before it runs:
@@ -11201,21 +11230,12 @@ export class AgentSession {
 	 */
 	async #ttsrBeforeNestedToolCall(
 		tool: AgentTool,
-		parentToolCallId: string,
+		scope: NestedToolScope,
 		args: unknown,
 		signal: AbortSignal | undefined,
 	): Promise<void> {
 		if (signal?.aborted) return;
-		// A previous nested call in this eval already interrupted on a TTSR rule.
-		// Its error is catchable cell code, so refusing every later call is what
-		// keeps a caught interruption from being retried before the folded
-		// reminder is delivered with the eval result.
-		const invalidatedBy = this.#invalidatedNestedEvals.get(parentToolCallId);
-		if (invalidatedBy) {
-			throw new ToolError(
-				`This eval call was invalidated by an interrupting TTSR match (${invalidatedBy.join(", ")}). No further nested tool calls will run in it; apply the rule reminder folded into this result, then start a new eval call.`,
-			);
-		}
+		this.#assertNestedToolScopeActive(scope);
 		const manager = this.#ttsrManager;
 		if (!manager?.hasRules()) return;
 		const generation = this.#promptGeneration;
@@ -11223,7 +11243,7 @@ export class AgentSession {
 			source: "tool",
 			toolName: tool.name,
 			// Complete arguments, not a stream continuation: give each nested call its own buffer.
-			streamKey: `nested:${parentToolCallId}:${crypto.randomUUID()}`,
+			streamKey: `nested:${scope.parentToolCallId}:${crypto.randomUUID()}`,
 			filePaths: this.#extractTtsrFilePathsFromArgs(args),
 		};
 		const matched = manager.checkDelta(JSON.stringify(args) ?? "", matchContext);
@@ -11235,19 +11255,22 @@ export class AgentSession {
 			if (!astMatched || signal?.aborted || this.#promptGeneration !== generation) throw new ToolAbortError();
 			matched.push(...astMatched);
 		}
+		// A sibling nested call may have interrupted while this one was matching:
+		// recheck before claiming or dispatching anything.
+		this.#assertNestedToolScopeActive(scope);
 		const matches = this.#withoutPendingTtsrRules(matched);
 		if (matches.length === 0) return;
-		const added = this.#addPerToolTtsrInjections(parentToolCallId, matches);
+		const added = this.#addPerToolTtsrInjections(scope.parentToolCallId, matches);
 		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
 		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
-			this.#invalidatedNestedEvals.set(parentToolCallId, matches.map(rule => rule.name));
+			scope.invalidatedBy = matches.map(rule => rule.name);
 			throw new ToolError(
 				`${this.#formatTtsrAbortReason(matches)}. The nested ${tool.name} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
 			);
 		}
 	}
 
-	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, parentToolCallId: string): T {
+	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope): T {
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);
@@ -11256,10 +11279,16 @@ export class AgentSession {
 					args: unknown,
 					signal: AbortSignal | undefined,
 					onUpdate: never,
-					ctx: never,
+					ctx: AgentToolContext | undefined,
 				) => {
-					await this.#ttsrBeforeNestedToolCall(target, parentToolCallId, args, signal);
-					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+					if (!scope.closed) this.#nestedToolScopes.set(scope.parentToolCallId, scope);
+					await this.#ttsrBeforeNestedToolCall(target, scope, args, signal);
+					// Keep the model-facing call as the attribution target through any
+					// nesting depth, including eval calling eval.
+					// The bridge calls without a context, so this object carries only the
+					// scope; tools that need the full context still receive it when known.
+					const nestedCtx = { ...ctx, nestedToolScope: scope } as AgentToolContext;
+					return await target.execute(toolCallId, args as never, signal, onUpdate, nestedCtx);
 				};
 			},
 		}) as T;
@@ -13534,15 +13563,15 @@ export class AgentSession {
 
 	/**
 	 * Get a registered tool with the same guards used for model-facing execution.
-	 * With `parentToolCallId` (a nested call such as eval `tool.<name>()`), the
-	 * tool also applies tool-scoped TTSR rules before it runs.
+	 * With `nestedToolScope` (a nested call such as eval `tool.<name>()`), the tool
+	 * also applies tool-scoped TTSR rules before it runs.
 	 */
-	getToolForExecution(name: string, options?: { parentToolCallId?: string }): AgentTool | undefined {
+	getToolForExecution(name: string, options?: { nestedToolScope?: NestedToolScope }): AgentTool | undefined {
 		const tool = this.getToolByName(name);
 		if (!tool) return undefined;
 		const prepared = this.#prepareToolForExecution(tool);
-		const parentToolCallId = options?.parentToolCallId;
-		return parentToolCallId ? this.#wrapNestedToolForTtsr(prepared, parentToolCallId) : prepared;
+		const scope = options?.nestedToolScope;
+		return scope ? this.#wrapNestedToolForTtsr(prepared, scope) : prepared;
 	}
 
 	/**

@@ -2,6 +2,7 @@ import type { AgentToolContext, ToolCallContext } from "@gajae-code/agent-core";
 import type { Settings } from "../config/settings";
 import type { CustomToolContext } from "../extensibility/custom-tools/types";
 import type { ExtensionUIContext } from "../extensibility/extensions/types";
+import type { NestedToolScope } from "./index";
 
 export type InternalToolContext = Omit<CustomToolContext, "settings"> & { settings: Settings };
 
@@ -12,6 +13,12 @@ declare module "@gajae-code/agent-core" {
 		hasUI?: boolean;
 		toolNames?: string[];
 		toolCall?: ToolCallContext;
+		/**
+		 * Root-attribution scope when this execution is a nested call (eval
+		 * `tool.<name>()`). Nested tools use it to deliver TTSR reminders and
+		 * interruptions with the model-facing eval call's result.
+		 */
+		nestedToolScope?: NestedToolScope;
 	}
 }
 

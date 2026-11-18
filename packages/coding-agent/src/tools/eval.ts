@@ -11,7 +11,7 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
-import { resolveEvalBackends, type ToolSession } from ".";
+import { type NestedToolScope, resolveEvalBackends, type ToolSession } from ".";
 import {
 	formatStyledTruncationWarning,
 	resolveOutputMaxColumns,
@@ -235,7 +235,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		params: z.infer<typeof evalSchema>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
-		_ctx?: AgentToolContext,
+		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
 		if (this.session && bashRestrictionBlocksEval(this.session)) {
 			throw new ToolError("Eval is unavailable while this session's bash allowlist or read-only profile is active.");
@@ -254,6 +254,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const sessionFile = session.getSessionFile?.() ?? null;
 		const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? null;
 		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
+		// Reuse the model-facing eval call's scope through any nesting depth, so
+		// nested tool reminders fold into that call's result and a late nested call
+		// cannot claim or invalidate a finished eval.
+		const nestedToolScope: NestedToolScope = ctx?.nestedToolScope ?? { parentToolCallId: toolCallId };
 		const evalSession: ToolSession = {
 			...session,
 			cwd,
@@ -263,7 +267,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			// Nested `tool.<name>()` calls are attributed to this eval call so the
 			// session can apply tool-scoped TTSR rules and fold reminders into it.
 			getToolForExecution: session.getToolForExecution
-				? name => session.getToolForExecution?.(name, { parentToolCallId: toolCallId })
+				? name => session.getToolForExecution?.(name, { nestedToolScope })
 				: undefined,
 		};
 		const sessionAbortController = new AbortController();
