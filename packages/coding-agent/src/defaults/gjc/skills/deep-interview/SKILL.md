@@ -829,7 +829,7 @@ Spec structure:
 | {final} | {n} | {new} | {changed} | {stable} | {ratio}% |
 
 ## Residual Risks
-{Required when Exit Reason is `user_enough` or `hard_cap` and ambiguity was above the threshold: list each weakest component/dimension with its score and open gap, every closure-audit gap recorded instead of asked, and the rework risk of proceeding. Otherwise write "None — threshold met".}
+{Required whenever the closure audit found gaps (Phase 4a runs regardless of ambiguity threshold): list each weakest component/dimension with its score and open gap, every closure-audit gap recorded instead of asked, and the rework risk of proceeding. Otherwise write "None — no closure-audit gaps found".}
 
 ## Interview Transcript
 <details>

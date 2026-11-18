@@ -240,6 +240,18 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 		expect(phase4).toContain("## Residual Risks");
 	});
 
+	it("requires residual risks whenever closure-audit gaps are found, not just when threshold-exceeded and user exits early", () => {
+		const residualRisksIndex = skill.indexOf("## Residual Risks");
+		const interviewTranscriptIndex = skill.indexOf("## Interview Transcript");
+		const residualRisksSection = skill.slice(residualRisksIndex, interviewTranscriptIndex);
+		// Should mention closure-audit gaps as the trigger
+		expect(residualRisksSection).toContain("closure-audit gap");
+		// Should NOT require residual risks only when both conditions are met simultaneously:
+		// "Exit Reason is user_enough or hard_cap AND ambiguity above threshold"
+		// Instead, it should require residual risks whenever closure-audit gaps are found
+		expect(residualRisksSection).not.toContain("and ambiguity was above the threshold");
+	});
+
 	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
 		expect(skill).toMatch(/advisory fanout/i);
 		expect(skill).toMatch(/distinct from the milestone panel/i);
