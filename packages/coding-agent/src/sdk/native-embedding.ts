@@ -45,6 +45,7 @@ import {
 	type SdkRevisionResult,
 } from "./embedding";
 import { ExtensionInteractionService } from "./extension-interaction";
+import { createSessionImageInput, type SessionImageInput } from "./image-input";
 import {
 	adoptNativeRuntimeSelection,
 	bindNativeRuntimeInvocation,
@@ -105,6 +106,7 @@ export interface NativeEmbeddedRuntime {
 			"prompt" | "promptCustomMessage" | "sendUserMessage" | "submitUserMessage" | "continuePersistedHistory"
 		>
 	>;
+	readonly images: NativeMethods<Pick<SessionImageInput, "prompt" | "submitUserMessage">>;
 	readonly queue: NativeMethods<
 		Pick<
 			AgentSession,
@@ -674,6 +676,12 @@ function createNativeEmbeddedRuntime(
 				invokeNativeRuntime(handle, "prompt", () => session.submitUserMessage(...args)),
 			continuePersistedHistory: (...args) =>
 				invokeNativeRuntime(handle, "prompt", () => session.continuePersistedHistory(...args)),
+		}),
+		images: Object.freeze({
+			prompt: (...args) =>
+				invokeNativeRuntime(handle, "prompt", () => createSessionImageInput(session).prompt(...args)),
+			submitUserMessage: (...args) =>
+				invokeNativeRuntime(handle, "prompt", () => createSessionImageInput(session).submitUserMessage(...args)),
 		}),
 		queue: Object.freeze({
 			steer: (...args) => invokeNativeRuntime(handle, "queue", () => session.steer(...args)),

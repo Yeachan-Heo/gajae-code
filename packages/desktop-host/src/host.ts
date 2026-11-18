@@ -2331,9 +2331,13 @@ export class DesktopHost {
 					() => live.factory.revise(input, options),
 					runtime => runtime.session.revise(input, options),
 				);
-			}
-			else if (images.length) await createSessionImageInput(live.sdk).prompt(text, images, options);
-			else await admitted(live, sdk => sdk.prompt(text, options), runtime => runtime.prompt.prompt(text, options));
+			} else if (images.length) {
+				await admitted(
+					live,
+					sdk => createSessionImageInput(sdk).prompt(text, images, options),
+					runtime => runtime.images.prompt(text, images, options),
+				);
+			} else await admitted(live, sdk => sdk.prompt(text, options), runtime => runtime.prompt.prompt(text, options));
 			await live.sdk.waitForIdle();
 		} catch (error) {
 			await this.#delivery(
@@ -3092,7 +3096,11 @@ export class DesktopHost {
 				let submission: QueuedInputSubmission;
 				try {
 					submission = images.length
-						? await createSessionImageInput(live.sdk).submitUserMessage(text, images, options)
+						? await admitted(
+								live,
+								sdk => createSessionImageInput(sdk).submitUserMessage(text, images, options),
+								runtime => runtime.images.submitUserMessage(text, images, options),
+							)
 						: await admitted(
 								live,
 								sdk => sdk.submitUserMessage(text, { ...options, trackSubmission: true }),
