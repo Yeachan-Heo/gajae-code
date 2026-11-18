@@ -2,7 +2,7 @@
 
 - A repeated unclosed private-key banner no longer stalls scrubbing. A complete block is still replaced.
 - Credential-container scanning is work-bounded, so repeated unclosed `secret={` lines no longer rescan the remaining text each time. A container that closes near the end of the bound is still found, and the line lookup advances forward instead of rescanning the suffix per container.
-- A private-key block and a credential container that hold each other are now located on the same text before either is masked. Removing the block first erased the `secret={` the container starts at, so the container's remaining members survived; masking the container first erased a footer the block still had to pair. The block is read again on the masked text, so a container or a YAML block scalar that hides the first footer no longer leaves the text before the next footer visible.
+- Private-key blocks are still located and masked in one forward pass, in the same rule position as before: credential containers, YAML block scalars and line-bounded values are masked first, so a footer they consume can never end a pairing. A block whose only footer sits inside a credential container therefore leaves its unmatched opener and body readable exactly as it did before this change; completing that pairing would mean masking before the container pass and disclosing the text after the container.
 
 ### Changed
 

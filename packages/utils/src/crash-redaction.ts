@@ -85,133 +85,6 @@ function redactPemPrivateKeys(text: string): string {
 	return parts.join("");
 }
 
-interface TextRange {
-	start: number;
-	end: number;
-}
-
-/** A credential container's value is replaced whole, so it carries the plain marker. */
-const CONTAINER_REDACTION_MARKER = "«redacted»";
-
-interface MaskRange extends TextRange {
-	/** A credential container read this range; otherwise it is a private-key block. */
-	container: boolean;
-}
-
-interface AppliedRange extends TextRange {
-	marker: string;
-}
-
-/**
- * Mask private-key blocks and credential containers of one text in a single pass.
- * Removing a block first erases the `key={` a container starts at, and masking a container
- * first erases a footer the block still has to pair, so neither pass can read the other's
- * output. Both are located on the original text. A container can hold the footer the first
- * block scan paired, so the block is read again on the container-masked text — where the opener
- * still stands — and that reading is mapped back before anything is applied. A range a container
- * read carries the container marker, because the whole value was a credential.
- */
-function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[]): string {
-	const containers: TextRange[] = [];
-	collectCredentialContainerRanges(text, CURRENT_CREDENTIAL_REDACTION_RULES, containers);
-	const containerApplied = mergeMaskRanges(containers.map(range => ({ ...range, container: true })));
-	const containerMasked = applyMaskRanges(text, containerApplied);
-	// Scalars are read on the container-masked text, as the scrubber's own order does, and mapped
-	// back: a scalar header the container masking removed must not leave a phantom body behind.
-	const scalarMasked: TextRange[] = [];
-	redactYamlBlockScalars(containerMasked, CURRENT_CREDENTIAL_REDACTION_RULES, scalarMasked);
-	const scalars = mapMaskedRanges(scalarMasked, containerApplied);
-	const containerApplied2 = mergeMaskRanges([
-		...containers.map(range => ({ ...range, container: true })),
-		...scalars.map(range => ({ ...range, container: true })),
-	]);
-	const containerMasked2 = applyMaskRanges(text, containerApplied2);
-	const survivors = mapMaskedRanges(findPrivateKeySpans(containerMasked2), containerApplied2);
-	// A block whose opening banner sits inside a container or scalar was hidden by that masking,
-	// and the re-scan already pairs the block that survives; keeping the raw range would swallow
-	// the diagnostics between the hidden banner and the footer it happened to reach.
-	const visible = visibleSpans(spans, containerApplied2);
-	return applyMaskRanges(
-		text,
-		mergeMaskRanges([
-			...visible.map(span => ({ start: span.start, end: span.end, container: false })),
-			...containers.map(range => ({ start: range.start, end: range.end, container: true })),
-			...scalars.map(range => ({ start: range.start, end: range.end, container: true })),
-			...survivors.map(range => ({ ...range, container: false })),
-		]),
-	);
-}
-
-/** Merge ranges in text order; only overlapping ranges collapse, so adjacent ones stay distinct. */
-function mergeMaskRanges(ranges: readonly MaskRange[]): AppliedRange[] {
-	const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
-	const merged: { start: number; end: number; container: boolean }[] = [];
-	for (const range of sorted) {
-		const last = merged.at(-1);
-		if (last !== undefined && range.start < last.end) {
-			last.end = Math.max(last.end, range.end);
-			last.container ||= range.container;
-			continue;
-		}
-		merged.push({ start: range.start, end: range.end, container: range.container });
-	}
-	return merged.map(range => ({
-		...range,
-		marker: range.container ? CONTAINER_REDACTION_MARKER : PRIVATE_KEY_REDACTION_MARKER,
-	}));
-}
-
-function applyMaskRanges(text: string, ranges: readonly AppliedRange[]): string {
-	const parts: string[] = [];
-	let cursor = 0;
-	for (const range of ranges) {
-		parts.push(text.slice(cursor, range.start), range.marker);
-		cursor = range.end;
-	}
-	parts.push(text.slice(cursor));
-	return parts.join("");
-}
-
-/**
- * The block ranges whose opening banner this pass does not mask.
- * Both lists ascend and do not overlap, so one forward cursor keeps the check linear; a banner
- * that starts inside a masked range was hidden by that masking, so its raw range is dropped.
- */
-function visibleSpans(spans: readonly PrivateKeySpan[], applied: readonly AppliedRange[]): TextRange[] {
-	const visible: TextRange[] = [];
-	let cursor = 0;
-	for (const span of spans) {
-		while (cursor < applied.length && (applied[cursor] as AppliedRange).end <= span.start) cursor += 1;
-		const range = applied[cursor] as AppliedRange | undefined;
-		if (range === undefined || span.start < range.start) visible.push({ start: span.start, end: span.end });
-	}
-	return visible;
-}
-
-/**
- * Map ranges of the masked text back to the original in one forward pass.
- * Both lists ascend and the markers never overlap, so a cursor shared across the batch keeps
- * the mapping linear. A marker carries no block text, so a block cannot begin inside one; an
- * endpoint that lands inside is clamped to that marker's end instead of dropping the range.
- */
-function mapMaskedRanges(ranges: readonly TextRange[], applied: readonly AppliedRange[]): TextRange[] {
-	let cursor = 0;
-	let delta = 0;
-	const map = (maskedIndex: number): number => {
-		while (cursor < applied.length) {
-			const appliedRange = applied[cursor] as AppliedRange;
-			const maskedStart = appliedRange.start - delta;
-			const maskedEnd = maskedStart + appliedRange.marker.length;
-			if (maskedIndex < maskedStart) break;
-			if (maskedIndex < maskedEnd) return appliedRange.end;
-			delta += appliedRange.end - appliedRange.start - appliedRange.marker.length;
-			cursor += 1;
-		}
-		return maskedIndex + delta;
-	};
-	return ranges.map(range => ({ start: map(range.start), end: map(range.end) }));
-}
-
 const CREDENTIAL_KEY_SEPARATOR = "[._\\t -]*";
 const CREDENTIAL_KEY_LABELS = `api${CREDENTIAL_KEY_SEPARATOR}key|apikey|account${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}signature|access${CREDENTIAL_KEY_SEPARATOR}token|refresh${CREDENTIAL_KEY_SEPARATOR}token|id${CREDENTIAL_KEY_SEPARATOR}token|session${CREDENTIAL_KEY_SEPARATOR}key|session${CREDENTIAL_KEY_SEPARATOR}token|client${CREDENTIAL_KEY_SEPARATOR}secret|aws${CREDENTIAL_KEY_SEPARATOR}secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}key${CREDENTIAL_KEY_SEPARATOR}base|secret${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|encryption${CREDENTIAL_KEY_SEPARATOR}key|signing${CREDENTIAL_KEY_SEPARATOR}key|password${CREDENTIAL_KEY_SEPARATOR}(?:confirmation|confirm)|password|passwd|pwd|pw|passphrase|auth|authorization|bearer|private${CREDENTIAL_KEY_SEPARATOR}token|token|secrets?|credentials?|private${CREDENTIAL_KEY_SEPARATOR}key|cookies?`;
 const CREDENTIAL_KEY_LABELS_V1 = CREDENTIAL_KEY_LABELS.replace("|pw|", "|");
@@ -343,7 +216,7 @@ function lineBounds(text: string, start: number): { contentEnd: number; nextLine
 	return { contentEnd, nextLineStart };
 }
 
-function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules, ranges?: TextRange[]): string {
+function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): string {
 	const output: string[] = [];
 	let copiedUntil = 0;
 	let lineStart = 0;
@@ -388,7 +261,6 @@ function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules, r
 				"«redacted»",
 				text.slice(bodyTextEnd, bodyLine.nextLineStart),
 			);
-			ranges?.push({ start: bodyLineStart + indentation, end: bodyTextEnd });
 			copiedBodyUntil = bodyLine.nextLineStart;
 			bodyLineStart = bodyLine.nextLineStart;
 		}
@@ -589,12 +461,7 @@ function uniqueStructuredKey(
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	// A block and a container that hold each other have to be located on the same text: removing
-	// the block first erases the assignment the container starts at, and masking the container
-	// first erases a footer the block still has to pair.
-	const spans = findPrivateKeySpans(text);
-	const masked = spans.length === 0 ? text : maskBlocksAndContainers(text, spans);
-	return redactCrashSecretsWithRules(masked, CURRENT_CREDENTIAL_REDACTION_RULES);
+	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
 /** Historical redaction rules used only to validate v1 crash fingerprints. */
@@ -847,34 +714,7 @@ function containerAssignmentPatterns(rules: CredentialRedactionRules): { assignm
 	};
 }
 
-/**
- * Collect the ranges the container passes mask, in the coordinates of the original text.
- * The camel pass reads the generic-masked text, as the scrubber's own order does, so a camel
- * spelling inside a container that is already masked cannot invent a range; what it does find
- * is mapped back through the markers.
- */
-function collectCredentialContainerRanges(text: string, rules: CredentialRedactionRules, ranges: TextRange[]): void {
-	if (!rules.containerCandidatePattern.test(text)) return;
-	const { assignment, camel } = containerAssignmentPatterns(rules);
-	const generic: TextRange[] = [];
-	redactCredentialContainersWithPattern(text, assignment, true, generic);
-	for (const range of generic) ranges.push(range);
-	if (generic.length === 0) {
-		redactCredentialContainersWithPattern(text, camel, true, ranges);
-		return;
-	}
-	const applied = mergeMaskRanges(generic.map(range => ({ ...range, container: true })));
-	const camelRanges: TextRange[] = [];
-	redactCredentialContainersWithPattern(applyMaskRanges(text, applied), camel, true, camelRanges);
-	for (const range of mapMaskedRanges(camelRanges, applied)) ranges.push(range);
-}
-
-function redactCredentialContainersWithPattern(
-	text: string,
-	assignment: RegExp,
-	bounded: boolean,
-	ranges?: TextRange[],
-): string {
+function redactCredentialContainersWithPattern(text: string, assignment: RegExp, bounded: boolean): string {
 	const budget = createContainerScanBudget(text.length, bounded);
 	const lineScan = createLineEndScan();
 	let output = "";
@@ -888,7 +728,6 @@ function redactCredentialContainersWithPattern(
 			// could leave a later closed container's contents behind. Redact the rest instead of
 			// guessing.
 			output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
-			ranges?.push({ start: containerStart, end: text.length });
 			copiedUntil = text.length;
 			break;
 		}
@@ -907,7 +746,6 @@ function redactCredentialContainersWithPattern(
 			continue;
 		}
 		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
-		ranges?.push({ start: containerStart, end: containerEnd });
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}
