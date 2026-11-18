@@ -166,6 +166,11 @@ type SdkPermissionProvider =
 
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
+const restoreEnv: (() => void)[] = [];
+// Tests that use the lifecycle capability need to auto-start the SDK broker.
+// Clear GJC_SDK_BROKER_AUTOSTART so it's not inherited from an enclosing gjc session,
+// allowing tests to auto-start the SDK broker. This is scoped to this test file only.
+delete process.env.GJC_SDK_BROKER_AUTOSTART;
 afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
 	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
@@ -179,6 +184,7 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
+	for (const restore of restoreEnv.splice(0)) restore();
 });
 
 const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
@@ -12607,6 +12613,103 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 
 	// Exactly one execution happened across the whole reconnect/reconcile flow.
 	expect(deliveries).toHaveLength(1);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("turn.result reports a prompt admitted during preflight, then its cancellation by requester disconnect (#7867)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-admitted-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-admitted-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const preflightEntered = Promise.withResolvers<void>();
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			// A long pre-prompt compaction: acknowledgement waits until preflight finishes.
+			const cancelled = Promise.withResolvers<never>();
+			options?.preflightSignal?.addEventListener(
+				"abort",
+				() => cancelled.reject(Object.assign(new Error("preflight cancelled"), { code: "cancelled" })),
+				{ once: true },
+			);
+			preflightEntered.resolve();
+			await cancelled.promise;
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const connect = async () => {
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		const opened = Promise.withResolvers<void>();
+		socket.addEventListener("open", () => opened.resolve(), { once: true });
+		socket.addEventListener("error", () => opened.reject(new Error("WS error")), { once: true });
+		await opened.promise;
+		const query = async (id: string): Promise<Record<string, unknown>> => {
+			socket.send(
+				JSON.stringify({
+					type: "query_request",
+					id,
+					query: "turn.result",
+					input: { kind: "prompt", clientRef: "admitted-ref" },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "query_response" && frame.id === id),
+				`${id} response`,
+			);
+			return frames.find(frame => frame.type === "query_response" && frame.id === id)!;
+		};
+		return { socket, frames, query };
+	};
+
+	const requester = await connect();
+	requester.socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "prompt-admitted",
+			operation: "turn.prompt",
+			input: { text: "compact first", clientRef: "admitted-ref" },
+		}),
+	);
+	await preflightEntered.promise;
+	const observer = await connect();
+	const admitted = await observer.query("status-admitted");
+	expect(admitted).toMatchObject({
+		ok: true,
+		result: { status: "admitted", kind: "prompt", clientRef: "admitted-ref", receiptState: "absent" },
+	});
+	const { commandId, turnId } = admitted.result as { commandId: string; turnId: string };
+	expect(typeof commandId).toBe("string");
+	expect(typeof turnId).toBe("string");
+
+	// The requester disappears while preflight runs: the host cancels the submission, and the
+	// observer learns definitively that it never ran instead of reading `unknown`.
+	await closeSocket(requester.socket);
+	let rejected: Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 50; attempt++) {
+		rejected = await observer.query(`status-rejected-${attempt}`);
+		if ((rejected.result as { status?: unknown } | undefined)?.status === "failed") break;
+		await Bun.sleep(20);
+	}
+	expect(rejected).toMatchObject({
+		ok: true,
+		result: {
+			status: "failed",
+			kind: "prompt",
+			clientRef: "admitted-ref",
+			commandId,
+			turnId,
+			receiptState: "missing",
+			error: { message: expect.stringContaining("never ran") },
+		},
+	});
+	expect(rejected?.result).not.toHaveProperty("outcome");
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
