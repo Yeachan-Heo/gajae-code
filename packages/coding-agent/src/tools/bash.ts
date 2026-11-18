@@ -1478,6 +1478,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
 		const internalUrlOptions: InternalUrlExpansionOptions = {
 			skills: this.session.skills ?? [],
+			// Session-scoped: the rule registry is process-global, so `rule://` must
+			// resolve against this session's own list instead of the last one loaded.
+			rules: this.session.rules,
 			internalRouter: InternalUrlRouter.instance(),
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,

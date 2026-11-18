@@ -8,10 +8,10 @@ import * as utils from "@gajae-code/utils";
 import { getMemoriesDir } from "@gajae-code/utils";
 import fc from "fast-check";
 import { registerOwnedDeletionRoot, safeRm } from "../../../../scripts/safe-cleanup";
-import { resetActiveRulesForTests, setActiveRules } from "../../src/capability/rule";
+import { getActiveRules, type Rule, resetActiveRulesForTests, setActiveRules } from "../../src/capability/rule";
 import { disposeAllShellSessions } from "../../src/exec/bash-executor";
 import type { Skill } from "../../src/extensibility/skills";
-import { resolveLocalUrlToPath } from "../../src/internal-urls";
+import { InternalUrlRouter, resolveLocalUrlToPath } from "../../src/internal-urls";
 import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
 import {
@@ -618,7 +618,8 @@ describe("expandInternalUrls session scope", () => {
 			await writeFile(agentsRule, "agents-user-rule");
 			await writeFile(agentRule, "agent-user-rule");
 			await execFileAsync("git", ["init", "-q", repo]);
-			setActiveRules([activeUserRule("name", agentsRule), activeUserRule("check", agentRule)]);
+			const userRules = [activeUserRule("name", agentsRule), activeUserRule("check", agentRule)];
+			setActiveRules(userRules);
 			const router = createInternalRouter({
 				"rule://name": { sourcePath: agentsRule },
 				"rule://dotted": { sourcePath: dotted },
@@ -626,6 +627,7 @@ describe("expandInternalUrls session scope", () => {
 			});
 			const options = {
 				skills: [] as Skill[],
+				rules: userRules,
 				internalRouter: router,
 				sessionCwd: cwd,
 				sessionAgentDir: path.join(trusted, "agent"),
@@ -659,11 +661,12 @@ describe("expandInternalUrls session scope", () => {
 			await writeFile(cursorRule, "cursor-rule");
 			await writeFile(windsurfRule, "windsurf-rule");
 			await execFileAsync("git", ["init", "-q", repo]);
-			setActiveRules([
+			const userRules = [
 				activeUserRule("notes", homeNotes),
 				activeUserRule("style", cursorRule, "cursor"),
 				activeUserRule("global_rules", windsurfRule, "windsurf"),
-			]);
+			];
+			setActiveRules(userRules);
 			const router = createInternalRouter({
 				"rule://other": { sourcePath: undiscovered },
 				"rule://notes": { sourcePath: homeNotes },
@@ -672,6 +675,7 @@ describe("expandInternalUrls session scope", () => {
 			});
 			const options = {
 				skills: [] as Skill[],
+				rules: userRules,
 				internalRouter: router,
 				sessionCwd: cwd,
 				sessionAgentDir: path.join(trusted, "agent"),
@@ -702,11 +706,13 @@ describe("expandInternalUrls session scope", () => {
 				await writeFile(secret, "secret");
 				await symlink(secret, link);
 				await execFileAsync("git", ["init", "-q", cwd]);
-				setActiveRules([activeUserRule("name", link)]);
+				const userRules = [activeUserRule("name", link)];
+				setActiveRules(userRules);
 				const router = createInternalRouter({ "rule://name": { sourcePath: link } });
 				await expect(
 					expandInternalUrls("cat rule://name", {
 						skills: [],
+						rules: userRules,
 						internalRouter: router,
 						sessionCwd: cwd,
 						sessionAgentDir: path.join(trusted, "agent"),
@@ -737,13 +743,15 @@ describe("expandInternalUrls session scope", () => {
 				// Discovery stores the configured home spelling, which reaches the same
 				// directory through the link the trusted home is.
 				const linkSpelledRule = path.join(linkHome, ".agents", "rules", "check.md");
-				setActiveRules([activeUserRule("check", linkSpelledRule)]);
+				const userRules = [activeUserRule("check", linkSpelledRule)];
+				setActiveRules(userRules);
 				const cwd = path.join(realHome, "work", "project");
 				await mkdir(cwd, { recursive: true });
 				await expectExpandsToSource(
 					"cat rule://check",
 					{
 						skills: [],
+						rules: userRules,
 						internalRouter: createInternalRouter({ "rule://check": { sourcePath: linkSpelledRule } }),
 						sessionCwd: cwd,
 						sessionAgentDir: path.join(realHome, "agent"),
@@ -773,13 +781,15 @@ describe("expandInternalUrls session scope", () => {
 				await writeFile(rule, "canonical-home-rule");
 				// Discovery run with a canonical home stores that spelling, and the
 				// router hands it back unchanged.
-				setActiveRules([activeUserRule("check", rule)]);
+				const userRules = [activeUserRule("check", rule)];
+				setActiveRules(userRules);
 				const cwd = path.join(realHome, "work", "project");
 				await mkdir(cwd, { recursive: true });
 				await expectExpandsToSource(
 					"cat rule://check",
 					{
 						skills: [],
+						rules: userRules,
 						internalRouter: createInternalRouter({ "rule://check": { sourcePath: rule } }),
 						sessionCwd: cwd,
 						sessionAgentDir: path.join(realHome, "agent"),
@@ -812,10 +822,16 @@ describe("expandInternalUrls session scope", () => {
 				// Discovery stored the canonical home; the `rules` component stays the
 				// configured link name, so provenance holds and the target contains.
 				const canonicalSpelled = path.join(realHome, ".agents", "rules", "check.md");
-				setActiveRules([activeUserRule("check", canonicalSpelled)]);
+				const userRules = [activeUserRule("check", canonicalSpelled)];
+				setActiveRules(userRules);
 				const cwd = path.join(realHome, "work", "project");
 				await mkdir(cwd, { recursive: true });
-				const options = { skills: [] as Skill[], sessionCwd: cwd, sessionAgentDir: path.join(realHome, "agent") };
+				const options = {
+					skills: [] as Skill[],
+					rules: userRules,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(realHome, "agent"),
+				};
 				await expectExpandsToSource(
 					"cat rule://check",
 					{
@@ -859,10 +875,16 @@ describe("expandInternalUrls session scope", () => {
 				await symlink(path.join(home, ".agents", "RULES"), path.join(home, ".agents", "rules"));
 				const targetSpelled = path.join(home, ".agents", "RULES", "shared.md");
 				const linkSpelled = path.join(home, ".agents", "rules", "shared.md");
-				setActiveRules([activeUserRule("shared", linkSpelled)]);
+				const userRules = [activeUserRule("shared", linkSpelled)];
+				setActiveRules(userRules);
 				const cwd = path.join(home, "work", "project");
 				await mkdir(cwd, { recursive: true });
-				const options = { skills: [] as Skill[], sessionCwd: cwd, sessionAgentDir: path.join(home, "agent") };
+				const options = {
+					skills: [] as Skill[],
+					rules: userRules,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(home, "agent"),
+				};
 				// The configured spelling is the link, and it still expands.
 				await expectExpandsToSource(
 					"cat rule://shared",
@@ -895,10 +917,16 @@ describe("expandInternalUrls session scope", () => {
 				await writeFile(path.join(outside, "shared.md"), "linked-user-rule");
 				await symlink(outside, rulesLink);
 				const linkSpelled = path.join(rulesLink, "shared.md");
-				setActiveRules([activeUserRule("shared", linkSpelled)]);
+				const userRules = [activeUserRule("shared", linkSpelled)];
+				setActiveRules(userRules);
 				const cwd = path.join(home, "work", "project");
 				await mkdir(cwd, { recursive: true });
-				const options = { skills: [] as Skill[], sessionCwd: cwd, sessionAgentDir: path.join(home, "agent") };
+				const options = {
+					skills: [] as Skill[],
+					rules: userRules,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(home, "agent"),
+				};
 				// A linked rules directory is the documented case: the link root is the
 				// request's trust anchor, its target the containment boundary.
 				await expectExpandsToSource(
@@ -1916,6 +1944,9 @@ function createAgentDirBashTool(
 		bashRestrictionProfile: readOnlyPrefixes ? ("read-only" as const) : undefined,
 		bashAllowedPrefixes: readOnlyPrefixes ? [...readOnlyPrefixes] : undefined,
 		skills: [],
+		// A production session hands the bash tool its own rule snapshot; the
+		// process-global registry is no longer the bash lookup source.
+		rules: getActiveRules(),
 		settings: {
 			has(key: string) {
 				return this.get(key) !== undefined;
@@ -2345,4 +2376,166 @@ describe("bash session agent directory", () => {
 			}
 		},
 	);
+});
+
+function ruleFor(name: string, rulePath: string, level: "project" | "user" = "project"): Rule {
+	return {
+		name,
+		path: rulePath,
+		content: name,
+		_source: { provider: "test", providerName: "test", path: rulePath, level },
+	};
+}
+
+/**
+ * `eval` re-parses its arguments as command text, and `source`/`.` execute a
+ * file's text. A single-quoted substitution protects a path from the shell that
+ * reads the command, but not from that second parse: a canonical path carrying
+ * a glob or tilde metacharacter can then select a matching sibling directory's
+ * file outside the authorized root. The refusal is value-located, so the same
+ * characters stay usable in a command the shell parses once.
+ */
+describe("rule:// paths a second shell parse would expand", () => {
+	it("refuses a glob-bearing rule path through eval, source, and the dot builtin", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-reparse-"));
+		try {
+			const authorized = path.join(parent, "proj*");
+			const rulePath = path.join(authorized, ".agent", "rules", "deploy.md");
+			const cwd = authorized;
+			await mkdir(path.dirname(rulePath), { recursive: true });
+			await writeFile(rulePath, "deploy-rule");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: rulePath } }),
+				sessionCwd: cwd,
+			};
+			for (const command of ["eval cat rule://deploy", "source rule://deploy", ". rule://deploy"]) {
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/re-parses/);
+			}
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses every metacharacter a second parse expands, and only in that context", () => {
+		for (const name of ["*", "?", "[", "]", "{", "}", "~", " "]) {
+			const resolved = `/work/proj${name}/.agent/rules/deploy.md`;
+			expect(() => refuseShellBearingRulePath(resolved, true)).toThrow(/re-parses/);
+			// A command parsed once keeps them literal, so a legitimate project
+			// directory spelling must keep working there.
+			expect(refuseShellBearingRulePath(resolved)).toBe(resolved);
+		}
+	});
+
+	it("keeps a rule under an authorized root containing glob characters expandable", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-glob-root-"));
+		try {
+			// POSIX filenames may legitimately contain `[` and `{`. Widening the
+			// unconditional refusal set would make this authorized rule unusable.
+			const authorized = path.join(parent, "proj[1]{x}");
+			const rulePath = path.join(authorized, ".agent", "rules", "plain.md");
+			const cwd = authorized;
+			await mkdir(path.dirname(rulePath), { recursive: true });
+			await writeFile(rulePath, "plain-rule");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://plain": { sourcePath: rulePath } }),
+				sessionCwd: cwd,
+			};
+			await expectExpandsToSource("cat rule://plain", options, rulePath);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a normal rule path expandable through the same re-parsing builtins", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-reparse-ok-"));
+		try {
+			const authorized = path.join(parent, "project");
+			const rulePath = path.join(authorized, ".agent", "rules", "plain.md");
+			const cwd = authorized;
+			await mkdir(path.dirname(rulePath), { recursive: true });
+			await writeFile(rulePath, "plain-rule");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://plain": { sourcePath: rulePath } }),
+				sessionCwd: cwd,
+			};
+			const expected = shellEscape(await realpath(rulePath));
+			for (const command of ["eval cat rule://plain", "source rule://plain", ". rule://plain"]) {
+				await expect(expandInternalUrls(command, options)).resolves.toContain(expected);
+			}
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"executes a normal rule path through eval, source, and the dot builtin",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-reparse-run-"));
+			try {
+				const cwd = path.join(parent, "repo");
+				const rulePath = path.join(cwd, ".agent", "rules", "script.md");
+				await mkdir(path.dirname(rulePath), { recursive: true });
+				await writeFile(rulePath, "printf 'sourced-rule\\n'\n");
+				setActiveRules([ruleFor("script", rulePath)]);
+				const tool = createAgentDirBashTool(cwd, path.join(parent, "agent"), path.join(parent, "settings-agent"));
+				for (const command of ["eval sh rule://script", "source rule://script", ". rule://script"]) {
+					expect(textOf(await tool.execute(`call-${command}`, { command }))).toContain("sourced-rule");
+				}
+			} finally {
+				resetActiveRulesForTests();
+				await disposeAllShellSessions();
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+});
+
+/**
+ * `rule://` name lookup used to read the process-global snapshot, which the
+ * last top-level session overwrites. Two sessions with different rule sets must
+ * each resolve only their own rules, and a caller with no session rule list
+ * must fail closed instead of borrowing whichever session loaded last.
+ */
+describe("rule:// session-scoped rule lookup", () => {
+	it("resolves each session's rule and reports the other session's rule unknown", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-two-sessions-"));
+		try {
+			const firstCwd = path.join(parent, "first");
+			const secondCwd = path.join(parent, "second");
+			const firstRule = path.join(firstCwd, ".agent", "rules", "shared.md");
+			const firstOnly = path.join(firstCwd, ".agent", "rules", "only-first.md");
+			const secondRule = path.join(secondCwd, ".agent", "rules", "shared.md");
+			await mkdir(path.dirname(firstRule), { recursive: true });
+			await mkdir(path.dirname(secondRule), { recursive: true });
+			await writeFile(firstRule, "first-rule");
+			await writeFile(firstOnly, "first-only-rule");
+			await writeFile(secondRule, "second-rule");
+			const firstRules = [ruleFor("shared", firstRule), ruleFor("only-first", firstOnly)];
+			const secondRules = [ruleFor("shared", secondRule)];
+			// The process-global snapshot belongs to `first`. If session `second`
+			// reads it, the same URL resolves first's file (or is judged foreign)
+			// instead of second's own rule.
+			setActiveRules(firstRules);
+			const router = InternalUrlRouter.instance();
+			const firstOptions = { skills: [], rules: firstRules, internalRouter: router, sessionCwd: firstCwd };
+			const secondOptions = { skills: [], rules: secondRules, internalRouter: router, sessionCwd: secondCwd };
+
+			await expectExpandsToSource("cat rule://shared", firstOptions, firstRule);
+			await expectExpandsToSource("cat rule://shared", secondOptions, secondRule);
+			await expectExpandsToSource("cat rule://only-first", firstOptions, firstOnly);
+			await expect(expandInternalUrls("cat rule://only-first", secondOptions)).rejects.toThrow(
+				/Unknown rule: only-first/,
+			);
+			// No session rule list: fail closed rather than fall back to `first`'s
+			// process-global snapshot.
+			const withoutRules = { skills: [], internalRouter: router, sessionCwd: secondCwd };
+			await expect(expandInternalUrls("cat rule://shared", withoutRules)).rejects.toThrow(/Unknown rule: shared/);
+		} finally {
+			resetActiveRulesForTests();
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
 });

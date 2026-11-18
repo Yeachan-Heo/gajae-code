@@ -5,14 +5,17 @@
  * - rule://<name> - Reads rule content
  */
 import { getActiveRules } from "../capability/rule";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class RuleProtocolHandler implements ProtocolHandler {
 	readonly scheme = "rule";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const rules = getActiveRules();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		// A caller that supplies a rule scope owns it: an empty list means no rule
+		// is visible, not "read another session's registry". Callers that omit the
+		// property (the reader route) keep the process-global snapshot.
+		const rules = context?.rules ?? getActiveRules();
 
 		const ruleName = url.rawHost || url.hostname;
 		if (!ruleName) {

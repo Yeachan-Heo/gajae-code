@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, getTrustedHomeDir, isEnoent } from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
-import { getActiveRules } from "../capability/rule";
+import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import {
 	initializeLocalRoot,
@@ -12,7 +12,7 @@ import {
 	resolveLocalUrlToPath,
 } from "../internal-urls/local-protocol";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
-import type { InternalResource } from "../internal-urls/types";
+import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import { normalizeLocalScheme } from "./path-utils";
 import { ToolError } from "./tool-errors";
 
@@ -28,7 +28,7 @@ type SupportedInternalScheme = (typeof SUPPORTED_INTERNAL_SCHEMES)[number];
 
 interface InternalUrlResolver {
 	canHandle(input: string): boolean;
-	resolve(input: string): Promise<InternalResource>;
+	resolve(input: string, context?: ResolveContext): Promise<InternalResource>;
 }
 
 export interface InternalUrlExpansionOptions {
@@ -41,6 +41,12 @@ export interface InternalUrlExpansionOptions {
 	sessionCwd?: string;
 	/** Agent directory for this session. User rules use it. */
 	sessionAgentDir?: string;
+	/**
+	 * Rules loaded for this session. `rule://` resolves only against this list;
+	 * an absent list resolves no rule rather than falling back to the
+	 * process-global snapshot that another session owns.
+	 */
+	rules?: readonly Rule[];
 	/**
 	 * How the expanded text is read afterwards. `"shell"` (default) is command
 	 * text the shell parses, so quoting, multi-line, and nested-expansion guards
@@ -331,6 +337,24 @@ function hasNestedExpansionContext(command: string): boolean {
 	);
 }
 
+/**
+ * Shell builtins whose own parse reads the substituted text again: `eval`
+ * re-parses its arguments as command text, and `source`/`.` execute a file's
+ * text. The single quotes this module adds survive the command's first parse
+ * but not that second one, so a path they protected can be re-split or
+ * re-expanded there.
+ * Quote and escape characters are removed before matching so `e'val'` reads as
+ * the builtin it becomes. A match anywhere is deliberate: `command eval`,
+ * `builtin eval`, a later pipeline segment, and `xargs eval` all reach the same
+ * builtin, and refusing a command that merely mentions the word is the
+ * fail-closed direction.
+ */
+const REPARSING_SHELL_BUILTIN = /(?:^|[\s;&|()`])(?:eval|source|\.)(?=\s|$)/;
+
+function hasReparsingShellCommand(command: string): boolean {
+	return REPARSING_SHELL_BUILTIN.test(command.replace(/['"\\]/g, ""));
+}
+
 function unquoteToken(token: string): string {
 	if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
 		return token.slice(1, -1);
@@ -502,10 +526,11 @@ async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string
 }
 
 /**
- * Real path of an active user rule that stays inside the trusted home
- * `.agent/rules` or `.agents/rules` directory. Other user-rule roots stay out.
+ * Real path of a user rule among the requesting session's rules that stays
+ * inside the trusted home `.agent/rules` or `.agents/rules` directory. Other
+ * user-rule roots stay out.
  */
-async function discoveredUserRulePath(sourcePath: string): Promise<string | undefined> {
+async function discoveredUserRulePath(rules: readonly Rule[], sourcePath: string): Promise<string | undefined> {
 	const home = path.resolve(getTrustedHomeDir());
 	let canonicalHome = home;
 	try {
@@ -515,7 +540,7 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 	}
 	const lexical = path.resolve(sourcePath);
 	const realTarget = await canonicalPathOrAncestor(lexical, SESSION_URL_ESCAPE);
-	for (const rule of getActiveRules()) {
+	for (const rule of rules) {
 		if (rule._source.level !== "user") continue;
 		const ruleLexical = path.resolve(rule.path);
 		let realRule: string;
@@ -606,18 +631,20 @@ async function sessionScopedRulePath(
 	sourcePath: string,
 	sessionCwd: string,
 	sessionAgentDir: string | undefined,
+	sessionRules: readonly Rule[],
+	reparsedByShell: boolean,
 ): Promise<string> {
 	const agentDir = sessionAgentDir?.trim() ? sessionAgentDir : getAgentDir();
 	const repoRoot = await findRepoRoot(sessionCwd);
 	for (const root of [repoRoot ?? path.resolve(sessionCwd), path.resolve(agentDir)]) {
 		const contained = await containedExpansionPath(root, sourcePath);
-		if (contained) return refuseShellBearingRulePath(contained);
+		if (contained) return refuseShellBearingRulePath(contained, reparsedByShell);
 	}
-	const userRule = await discoveredUserRulePath(sourcePath);
-	if (userRule) return refuseShellBearingRulePath(userRule);
+	const userRule = await discoveredUserRulePath(sessionRules, sourcePath);
+	if (userRule) return refuseShellBearingRulePath(userRule, reparsedByShell);
 	if (!repoRoot) {
 		const ancestorRule = await discoveredAncestorRulePath(sessionCwd, sourcePath);
-		if (ancestorRule) return refuseShellBearingRulePath(ancestorRule);
+		if (ancestorRule) return refuseShellBearingRulePath(ancestorRule, reparsedByShell);
 	}
 	throw new ToolError(`rule:// ${SESSION_URL_ESCAPE}.`);
 }
@@ -630,6 +657,19 @@ async function sessionScopedRulePath(
  * only accepted after the separator normalization below has removed it.
  */
 const RULE_PATH_SHELL_SYNTAX = /[$`;&|<>()'"\\\n\r]/;
+
+/**
+ * Characters a second shell parse expands or splits instead of reading
+ * literally: pathname-glob metacharacters, tilde, and whitespace. The
+ * substitution is single-quoted, so a command parsed once keeps them literal;
+ * only a command that re-parses the text can turn one into a selection outside
+ * the authorized root or split the path into different words. POSIX filenames
+ * may legitimately contain `*`, `?`, `[`, `]`, `{`, and `}` (and this module
+ * must not disable such a project), so they are refused only in that
+ * second-parse context. Rule paths here are canonical and therefore absolute,
+ * which leaves `~` no legitimate role in one.
+ */
+const RULE_PATH_REPARSED_SYNTAX = /[*?[\]{}~\s]/;
 
 /**
  * A drive-qualified Windows path. NTFS forbids `\` inside a name, so in such a
@@ -655,12 +695,21 @@ export function windowsDataValueSpelling(resolvedPath: string): string {
 /**
  * Return `resolvedPath` in the form the bash tool's shell reads as that same
  * file, or refuse it when shell syntax survives that form.
+ * `reparsedByShell` marks a command whose builtin reads the substituted text
+ * again (`eval`, `source`, `.`). A path that is safe in one parse is not
+ * necessarily safe in two, so the glob/tilde/whitespace refusal applies only
+ * then; see {@link RULE_PATH_REPARSED_SYNTAX}.
  */
-export function refuseShellBearingRulePath(resolvedPath: string): string {
+export function refuseShellBearingRulePath(resolvedPath: string, reparsedByShell = false): string {
 	const shellPath = WINDOWS_DRIVE_PATH.test(resolvedPath) ? resolvedPath.replaceAll("\\", "/") : resolvedPath;
 	if (RULE_PATH_SHELL_SYNTAX.test(shellPath)) {
 		throw new ToolError(
 			"rule:// URL resolved to a path containing shell syntax and cannot be expanded in a bash command.",
+		);
+	}
+	if (reparsedByShell && RULE_PATH_REPARSED_SYNTAX.test(shellPath)) {
+		throw new ToolError(
+			"rule:// URL resolved to a path containing a glob, tilde, or whitespace metacharacter and cannot be expanded in a command that re-parses its arguments (eval, source, or .).",
 		);
 	}
 	return shellPath;
@@ -675,6 +724,8 @@ async function resolveInternalUrlToPath(
 	sessionCwd?: string,
 	sessionAgentDir?: string,
 	enclosedInQuote = false,
+	sessionRules?: readonly Rule[],
+	reparsedByShell = false,
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
@@ -736,7 +787,10 @@ async function resolveInternalUrlToPath(
 
 	let resource: InternalResource;
 	try {
-		resource = await internalRouter.resolve(url);
+		// `rule://` resolves against the requesting session's rules. An absent list
+		// becomes an empty scope, so the lookup reports the rule unknown instead of
+		// reading the process-global snapshot another session installed.
+		resource = await internalRouter.resolve(url, scheme === "rule" ? { rules: sessionRules ?? [] } : undefined);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ToolError(
@@ -754,7 +808,13 @@ async function resolveInternalUrlToPath(
 				"rule:// URLs must be a standalone shell argument in bash commands; a rule:// URL inside a quoted argument cannot be expanded safely.",
 			);
 		}
-		return sessionScopedRulePath(resource.sourcePath, sessionCwd, sessionAgentDir);
+		return sessionScopedRulePath(
+			resource.sourcePath,
+			sessionCwd,
+			sessionAgentDir,
+			sessionRules ?? [],
+			reparsedByShell,
+		);
 	}
 
 	return path.resolve(resource.sourcePath);
@@ -818,7 +878,11 @@ function assertPathFitsDataValue(resolvedPath: string): void {
  * before resolution.
  * `rule://` expands to a session, repository, or agent-directory path, a non-Git
  * ancestor rule under the trusted home, or a discovered user rule under
- * `.agent/rules`, `.agents/rules`, or the agent directory.
+ * `.agent/rules`, `.agents/rules`, or the agent directory. Lookup uses
+ * `options.rules` only; a missing list is an empty scope, never the
+ * process-global snapshot. A resolved rule path carrying a glob, tilde, or
+ * whitespace character is refused in a command whose `eval`, `source`, or `.`
+ * builtin would parse the substituted text again.
  * Passing `context: "data"` expands a value the shell never parses (an env
  * value) instead of command text: the same authorization applies, but the
  * quoting and nested-expansion guards, which only describe shell reading, do
@@ -832,10 +896,12 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 
 	const shellContext = options.context !== "data";
 	let expanded = command;
-	const nestedRuleContext =
-		shellContext &&
-		hasNestedExpansionContext(command) &&
-		matches.some(match => extractScheme(normalizeLocalScheme(unquoteToken(match[0]))) === "rule");
+	const hasRuleUrl = matches.some(match => extractScheme(normalizeLocalScheme(unquoteToken(match[0]))) === "rule");
+	const nestedRuleContext = shellContext && hasRuleUrl && hasNestedExpansionContext(command);
+	// `eval`, `source`, and `.` remove the quoting this module adds and read the
+	// substituted path again, so a glob, tilde, or whitespace-bearing rule path is
+	// refused only there.
+	const reparsedRuleContext = shellContext && hasRuleUrl && hasReparsingShellCommand(command);
 	for (let i = matches.length - 1; i >= 0; i--) {
 		const match = matches[i];
 		const token = match[0];
@@ -871,6 +937,8 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.sessionCwd,
 			options.sessionAgentDir,
 			shellContext && (enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index)),
+			options.rules,
+			reparsedRuleContext,
 		);
 		let replacement: string;
 		if (shellContext) {
