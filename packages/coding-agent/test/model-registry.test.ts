@@ -4877,6 +4877,7 @@ describe("ModelRegistry", () => {
 			// control below proves the observation channel is live when the provider is
 			// enabled, so an empty probe list is the disabled guard and not a blind spot.
 			const rapidMlxProbes: string[] = [];
+			const rapidMlxAuthorizations: (string | null)[] = [];
 			const rapidMlxServer = Bun.serve({
 				port: 0,
 				hostname: "127.0.0.1",
@@ -4884,21 +4885,27 @@ describe("ModelRegistry", () => {
 					const pathname = new URL(request.url).pathname;
 					rapidMlxProbes.push(pathname);
 					if (pathname === "/v1/models") {
+						rapidMlxAuthorizations.push(request.headers.get("authorization"));
 						return Response.json({ data: [{ id: "rapid-mlx-probe-model", context_window: 131_072 }] });
 					}
 					return new Response("not found", { status: 404 });
 				},
 			});
-			const restoreRapidMlxBaseUrl = setEnvForTest(
-				"RAPID_MLX_BASE_URL",
-				`http://127.0.0.1:${rapidMlxServer.port}/v1`,
-			);
+			const rapidMlxBaseUrl = `http://127.0.0.1:${rapidMlxServer.port}/v1`;
 			try {
-				// Credential resolution pins a value inherited at process start, so an
-				// ambient RAPID_MLX_BASE_URL would silently win over the test endpoint.
-				// Fail loudly here, inside the cleanup scope, instead of leaving the
-				// positive control to fail for an unexplained reason.
-				expect($credentialEnv("RAPID_MLX_BASE_URL")).toBe(`http://127.0.0.1:${rapidMlxServer.port}/v1`);
+				// The endpoint is fixture-owned: an explicit keyless provider entry pins
+				// the base URL and selects no credentials, so neither an ambient
+				// RAPID_MLX_BASE_URL (which credential resolution would otherwise prefer
+				// over the environment assignment) nor an ambient RAPID_MLX_API_KEY can
+				// redirect or authenticate this probe.
+				writeRawModelsJson({
+					"rapid-mlx": {
+						baseUrl: rapidMlxBaseUrl,
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "rapid-mlx" },
+					},
+				});
 				await Settings.init({
 					inMemory: true,
 					overrides: {
@@ -4924,8 +4931,12 @@ describe("ModelRegistry", () => {
 				settings.override("disabledProviders", []);
 				await registry.refresh("online");
 				expect(rapidMlxProbes).toContain("/v1/models");
+				// The configured entry is keyless, so no ambient credential may be
+				// attached to the probe, and the discovered row must keep the fixture
+				// endpoint rather than an inherited environment one.
+				expect(rapidMlxAuthorizations).toEqual([null]);
+				expect(registry.find("rapid-mlx", "rapid-mlx-probe-model")?.baseUrl).toBe(rapidMlxBaseUrl);
 			} finally {
-				restoreRapidMlxBaseUrl();
 				rapidMlxServer.stop(true);
 			}
 		});
