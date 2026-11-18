@@ -732,6 +732,13 @@ function closesMatchingContainer(text: string, end: number, match: string): bool
 	return false;
 }
 
+/** True when the character at `index` is preceded by an odd backslash run. */
+function isEscapedAt(text: string, index: number): boolean {
+	let slashes = 0;
+	for (let i = index - 1; i >= 0 && text[i] === "\\"; i--) slashes++;
+	return slashes % 2 === 1;
+}
+
 /** Double-quote state from the outermost open container to a match. */
 function insideContainerQuote(text: string, end: number): boolean {
 	const stack: number[] = [];
@@ -743,7 +750,7 @@ function insideContainerQuote(text: string, end: number): boolean {
 	const start = stack.length > 0 ? (stack[0] ?? 0) : 0;
 	let quoted = false;
 	for (let i = start + 1; i < end; i++) {
-		if (text[i] !== '"' || text[i - 1] === "\\") continue;
+		if (text[i] !== '"' || isEscapedAt(text, i)) continue;
 		quoted = !quoted;
 	}
 	return quoted;
@@ -754,7 +761,7 @@ function hasLocalDoubleQuotePair(match: string): boolean {
 	const first = match.indexOf('"');
 	if (first < 0) return false;
 	for (let i = first + 1; i < match.length; i++) {
-		if (match[i] === '"' && match[i - 1] !== "\\") return true;
+		if (match[i] === '"' && !isEscapedAt(match, i)) return true;
 	}
 	return false;
 }

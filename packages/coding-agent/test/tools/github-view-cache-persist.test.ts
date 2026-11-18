@@ -945,6 +945,7 @@ describe("github view cache persistence", () => {
 			'Cookie: [\n  "first\n-Cookie: sid=",\n  "outer-opaque-canary-43"\n]',
 			'Cookie: [\n  "first\n-Cookie: sid=inner \'theme\'",\n  "round44-opaque-array-cookie"\n]',
 			' {\n-Cookie: sid="round44\'opaque-cookie"\n+x\n }',
+			' {\n"path": "ends\\\\",\n-Cookie: theme=\'light\'; sid=round45-opaque-session\n }',
 			'Cookie: [\n  "first\n-Cookie: sid=inner",\n  "outer-opaque-canary"\n]',
 			'Cookie:\u00A0\r\n [\r\n   "sid=fixture-cookie-Q8m4"\r\n ]',
 			"Cookie: \u00A0\nEncryptionKey:\n  synthetic-opaque-Q8m4",
@@ -1029,6 +1030,7 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("outer-opaque-canary-43");
 		expect(cacheFileBytes()).not.toContain("round44-opaque-array-cookie");
 		expect(cacheFileBytes()).not.toContain("round44'opaque-cookie");
+		expect(cacheFileBytes()).not.toContain("round45-opaque-session");
 		expect(cacheFileBytes()).not.toContain("outer-opaque-canary");
 		expect(cacheFileBytes()).not.toContain("synthetic-opaque-Q8m4");
 		expect(cacheFileBytes()).not.toContain("/root/config");
