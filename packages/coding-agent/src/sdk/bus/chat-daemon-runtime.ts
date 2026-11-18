@@ -599,13 +599,15 @@ export class ChatDaemonRuntime {
 	}
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
-		const revivedTransport = this.#attachments.get(attachment.sessionId) === attachment;
+		const currentAttachment = this.#attachments.get(attachment.sessionId);
+		const revivedTransport = currentAttachment === attachment;
 		if (revivedTransport) {
 			this.#presentation?.connectSession(attachment.sessionId, {
 				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
 			});
 			return;
 		}
+
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const barrier = (async () => {
@@ -714,7 +716,8 @@ export class ChatDaemonRuntime {
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
-		await this.#attachmentBarriers.get(attachment.sessionId);
+		const barrier = this.#attachmentBarriers.get(attachment.sessionId);
+		if (barrier) await barrier;
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		const normalizedFrame = correlated.body;
 		const publicationId =
@@ -735,12 +738,14 @@ export class ChatDaemonRuntime {
 			// unpositioned session_ready frame deliberately carries no ring
 			// generation; reject only an explicit, conflicting Router-owned value.
 			if (correlated.generation !== undefined && correlated.generation !== attachment.generation) return;
+			// Use stable publication ID for session_ready so replays use the same nonce
+			const stablePublicationId = publicationId ?? `session-ready:${sessionId}`;
 			await this.#resume(
 				sessionId,
 				attachment.generation,
 				attachment.authorityId,
 				"GJC session ready.",
-				publicationId,
+				stablePublicationId,
 			);
 			return;
 		}
