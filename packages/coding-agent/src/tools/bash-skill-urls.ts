@@ -485,6 +485,12 @@ async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string
  */
 async function discoveredUserRulePath(sourcePath: string): Promise<string | undefined> {
 	const home = path.resolve(getTrustedHomeDir());
+	let canonicalHome = home;
+	try {
+		canonicalHome = await fs.realpath(home);
+	} catch {
+		// The configured spelling stands when the home cannot be resolved.
+	}
 	const lexical = path.resolve(sourcePath);
 	const realTarget = await canonicalPathOrAncestor(lexical, SESSION_URL_ESCAPE);
 	for (const rule of getActiveRules()) {
@@ -517,7 +523,11 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 			}
 			// A linked rules directory keeps the documented behavior: the link is the
 			// trust anchor for the request's spelling, its target for containment.
-			if (!pathSpelledInside(ruleRoot, lexical) || !pathSpelledInside(ruleRoot, ruleLexical)) continue;
+			// The anchor keeps the synthesized `rules` name under either home spelling
+			// discovery may have stored; the link target is never provenance.
+			const linkRoots = [ruleRoot, path.join(canonicalHome, dirName, "rules")];
+			const spelledUnderLink = (candidate: string) => linkRoots.some(root => pathSpelledInside(root, candidate));
+			if (!spelledUnderLink(lexical) || !spelledUnderLink(ruleLexical)) continue;
 			let linkedRoot: string;
 			try {
 				linkedRoot = await fs.realpath(ruleRoot);

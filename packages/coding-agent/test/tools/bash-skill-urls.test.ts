@@ -794,6 +794,53 @@ describe("expandInternalUrls session scope", () => {
 	);
 
 	it.skipIf(!symlinkSupported)(
+		"expands a canonical-home rule through a linked rules directory and refuses its target spelling",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-user-home-link-both-"));
+			const realHome = path.join(parent, "real-home");
+			const linkHome = path.join(parent, "home-link");
+			const target = path.join(parent, "rules-target");
+			await mkdir(realHome);
+			await mkdir(target);
+			await symlink(realHome, linkHome);
+			const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(linkHome);
+			try {
+				await mkdir(path.join(realHome, ".agents"), { recursive: true });
+				await symlink(target, path.join(realHome, ".agents", "rules"));
+				await writeFile(path.join(target, "check.md"), "both-links-rule");
+				// Discovery stored the canonical home; the `rules` component stays the
+				// configured link name, so provenance holds and the target contains.
+				const canonicalSpelled = path.join(realHome, ".agents", "rules", "check.md");
+				setActiveRules([activeUserRule("check", canonicalSpelled)]);
+				const cwd = path.join(realHome, "work", "project");
+				await mkdir(cwd, { recursive: true });
+				const options = { skills: [] as Skill[], sessionCwd: cwd, sessionAgentDir: path.join(realHome, "agent") };
+				await expectExpandsToSource(
+					"cat rule://check",
+					{
+						...options,
+						internalRouter: createInternalRouter({ "rule://check": { sourcePath: canonicalSpelled } }),
+					},
+					path.join(target, "check.md"),
+				);
+				// The link target itself is not the configured rule root.
+				await expect(
+					expandInternalUrls("cat rule://check", {
+						...options,
+						internalRouter: createInternalRouter({
+							"rule://check": { sourcePath: path.join(target, "check.md") },
+						}),
+					}),
+				).rejects.toThrow(/outside this session/);
+			} finally {
+				spy.mockRestore();
+				resetActiveRulesForTests();
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(!symlinkSupported)(
 		"expands a user rule spelled through a linked rules directory and refuses the same file at its target",
 		async () => {
 			const home = await mkdtemp(path.join(tmpdir(), "bash-user-link-root-"));
