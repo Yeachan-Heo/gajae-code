@@ -1516,6 +1516,7 @@ describe("github view cache persistence", () => {
 				"fixture-auth-item",
 				"fixture-private-auth",
 				"fixture-retained-auth-52",
+				"fixture-retained-auth-53",
 				"fixture-opaque-session",
 				"cookie-array-private-canary",
 				"fixture-second-opaque",

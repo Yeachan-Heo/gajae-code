@@ -331,11 +331,11 @@ const AT_SIGN_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-at-\u0000`;
  */
 function findBalancedValueEnd(text: string, start: number): number {
 	const stack: string[] = [];
-	let inString = false;
+	let quote: string | null = null;
 	let escaped = false;
 	for (let index = start; index < text.length; index += 1) {
 		const character = text.charAt(index);
-		if (inString) {
+		if (quote) {
 			if (escaped) {
 				escaped = false;
 				continue;
@@ -344,11 +344,11 @@ function findBalancedValueEnd(text: string, start: number): number {
 				escaped = true;
 				continue;
 			}
-			if (character === '"') inString = false;
+			if (character === quote) quote = null;
 			continue;
 		}
-		if (character === '"') {
-			inString = true;
+		if (character === '"' || (character === "'" && !isWordApostrophe(text, index))) {
+			quote = character;
 			continue;
 		}
 		if (character === "{") {
