@@ -482,24 +482,28 @@ function tableRowFlags(lines: string[]): boolean[] {
 	const fenced = new Array<boolean>(lines.length).fill(false);
 	// Splitting on "\n" leaves "\r" on CRLF input, and "." does not match it.
 	const rows = lines.map(line => line.replace(/\r$/, ""));
-	let opener: { marker: string; length: number } | null = null;
+	let opener: { marker: string; length: number; indent: number } | null = null;
 	for (let i = 0; i < lines.length; i++) {
-		const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(rows[i] ?? "");
+		const match = /^( *)(`{3,}|~{3,})(.*)$/.exec(rows[i] ?? "");
 		if (opener === null) {
 			if (match) {
-				const marker = match[1] ?? "";
-				opener = { marker: marker.charAt(0), length: marker.length };
+				const marker = match[2] ?? "";
+				opener = { marker: marker.charAt(0), length: marker.length, indent: (match[1] ?? "").length };
 				fenced[i] = true;
 			}
 			continue;
 		}
 		fenced[i] = true;
-		const marker = match?.[1] ?? "";
+		const marker = match?.[2] ?? "";
+		// GFM allows a closing marker up to three columns beyond its container;
+		// a list-nested fence can therefore be indented deeper than its opener
+		// by the container width. A much deeper run is literal code.
 		if (
 			match &&
 			marker.charAt(0) === opener.marker &&
 			marker.length >= opener.length &&
-			(match[2] ?? "").trim() === ""
+			(match[3] ?? "").trim() === "" &&
+			(match[1] ?? "").length <= opener.indent + 3
 		) {
 			opener = null;
 		}
