@@ -41,6 +41,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 	afterEach(async () => {
 		if (session) {
 			await session.dispose();
+			await session.modelRegistry.dispose();
 		}
 		authStorage?.close();
 		authStorage = undefined;

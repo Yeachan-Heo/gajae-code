@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -76,6 +77,8 @@ export interface LifecycleLedgerEntry {
 	fingerprint?: string;
 	/** True only when a session.close request supplied immutable generation authority. */
 	closeAuthorityBound?: boolean;
+	/** Set only on unkeyed rows that mirror a spawn-authority claim; see `hasLegacyIdentity`. */
+	spawnAnchor?: true;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -181,7 +184,7 @@ function isBoundedLedgerJson(value: unknown, depth = 0, budget = { fields: 0 }):
 	);
 }
 
-function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
+export function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 	if (typeof value !== "object" || value === null || Array.isArray(value) || !isBoundedLedgerJson(value)) return false;
 	const entry = value as Partial<LifecycleLedgerEntry>;
 	return (
@@ -199,9 +202,11 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 		typeof entry.ts === "number" &&
 		Number.isSafeInteger(entry.ts) &&
 		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.spawnAnchor === undefined || entry.spawnAnchor === true) &&
 		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
+/** Ledger digests: bigint becomes a decimal string and `undefined`-valued keys are omitted. */
 function canonicalJson(value: unknown): string {
 	if (typeof value === "bigint") return JSON.stringify(value.toString());
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -233,7 +238,65 @@ function retirementCreateIdentity(response: unknown): string | undefined {
 	return typeof createIdentity === "string" && createIdentity.length > 0 ? createIdentity : undefined;
 }
 
-function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
+/**
+ * Refusal codes that may mark an unkeyed (pre-index) `terminal_error` row as
+ * effect-free. Unkeyed lifecycle rows were written only by v0.11.0 through
+ * v0.13.0; from v0.13.1 every lifecycle row carries an `operationKey`. In each
+ * of those releases these codes reached a lifecycle response only through (a)
+ * the model-profile validation of a create/fork/resume launch, which returns
+ * before the request's first `effect_started` transition, or (b) a pass-through
+ * that runs after an `effect_started` transition recording the session id and
+ * an effect marker. Transitions carry earlier fields forward and no writer
+ * clears either field, so a row with one of these codes and no session id or
+ * marker came from (a). Every other code stays fenced, including spawn,
+ * readiness, close, and cleanup failures and generic `invalid_input`, because
+ * no such per-release proof exists for it. Add a code only with that proof.
+ */
+const PRE_EFFECT_REFUSAL_CODES: ReadonlySet<string> = new Set([
+	"model_profile_registry_error",
+	"unknown_model_profile",
+]);
+/** Every field those releases wrote on a refused request's terminal row. */
+const PRE_EFFECT_REFUSAL_ROW_FIELDS: ReadonlySet<string> = new Set([
+	"version",
+	"identity",
+	"requestHash",
+	"state",
+	"ts",
+	"response",
+	"responseDigest",
+]);
+const PRE_EFFECT_REFUSAL_ERROR_FIELDS: ReadonlySet<string> = new Set(["code", "message", "details"]);
+/**
+ * History states that show an effect may have started. `terminal_uncertain` is
+ * included because restart recovery and corruption quarantine write it without
+ * knowing whether an effect began. A pre-effect refusal goes from `accepted`
+ * straight to its `terminal_error`, so its history never holds any of these.
+ */
+const EFFECT_WITNESS_STATES: ReadonlySet<string> = new Set(["effect_started", "awaiting_ready", "terminal_uncertain"]);
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/** `{ ok: false, error: { code, message, details? } }` with an allowlisted code and nothing else. */
+function isPreEffectRefusalResponse(value: unknown): boolean {
+	const response = plainRecord(value);
+	const error = plainRecord(response?.error);
+	return (
+		response !== undefined &&
+		error !== undefined &&
+		response.ok === false &&
+		Object.entries(response).every(([key, val]) => val === undefined || key === "ok" || key === "error") &&
+		Object.entries(error).every(([key, val]) => val === undefined || PRE_EFFECT_REFUSAL_ERROR_FIELDS.has(key)) &&
+		typeof error.code === "string" &&
+		PRE_EFFECT_REFUSAL_CODES.has(error.code)
+	);
+}
+
+export function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
 	const cleanupPendingResponse =
 		response?.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined;
@@ -288,8 +351,10 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 export class LifecycleLedger {
 	#file: string;
 	#corruptFile: string;
+	#spawnAnchorAttestationFile: string;
 	#entries: LifecycleLedgerEntry[] = [];
 	#byIdentity = new Map<string, LifecycleLedgerEntry>();
+	#attestedSpawnAnchors: ReadonlySet<string> = new Set();
 	#limits: Required<LifecycleLedgerLimits>;
 	#rowCount = 0;
 	#byteCount = 0;
@@ -311,6 +376,7 @@ export class LifecycleLedger {
 	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
 		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 		this.#corruptFile = `${this.#file}.corrupt`;
+		this.#spawnAnchorAttestationFile = path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json");
 		this.#limits = {
 			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
 			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
@@ -326,6 +392,7 @@ export class LifecycleLedger {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
 		this.#byIdentity.clear();
+		this.#attestedSpawnAnchors = new Set();
 		this.#warnings = [];
 		this.#rowCount = 0;
 		this.#byteCount = 0;
@@ -399,6 +466,7 @@ export class LifecycleLedger {
 			}
 		}
 		if (tornTail) await this.#sealTornTail();
+		await this.#loadAttestedSpawnAnchors(new Set([...invalidIdentities, ...uncertainAfterCorruption]));
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
@@ -426,6 +494,12 @@ export class LifecycleLedger {
 	 * `terminal_uncertain` is a durable terminal record too: an operation that concluded
 	 * uncertainly persists that conclusion, and refusing to read it back would report a
 	 * synced row as unpersisted and replace its true reason with a generic one.
+	 *
+	 * Shape damage is scoped to the identity that asks. A decodable row naming a
+	 * different identity cannot verify this request, and startup already quarantines
+	 * it; letting one unrelated oversized receipt reject the whole file made every
+	 * later lifecycle result unverifiable on that agent directory (#7134). Rows for
+	 * this identity, undecodable rows, and unsupported state versions stay strict.
 	 */
 	async readTerminal(identity: string, requestHash: string): Promise<TerminalReadBack> {
 		const sourceRead = await this.#readBoundedSourceReadOnly();
@@ -450,6 +524,12 @@ export class LifecycleLedger {
 			try {
 				const value = parseLifecycleJson(line);
 				assertSupportedStateVersion(this.#file, value);
+				// A decodable row that names another identity cannot verify this request.
+				// Skip it before full validation so one unrelated malformed row (for
+				// example an artifact snapshot over the JSON bounds) does not withhold
+				// proof for every identity. A row naming this identity stays strict.
+				const rowIdentity = (value as { identity?: unknown }).identity;
+				if (typeof rowIdentity === "string" && rowIdentity !== identity) continue;
 				if (!isLifecycleLedgerEntry(value)) return { kind: "rejected", reason: "shape" };
 				entry = value;
 			} catch {
@@ -659,6 +739,9 @@ export class LifecycleLedger {
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
 	async #syncDirectory(): Promise<void> {
+		// Windows does not support fsync on directory handles; the temporary file is
+		// still synced before its atomic rename. Same rule as lifecycle.ts syncDirectory.
+		if (process.platform === "win32") return;
 		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
 		try {
 			await directory.sync();
@@ -671,10 +754,29 @@ export class LifecycleLedger {
 		incoming?: { readonly bytes: number; readonly rows: number },
 	): Promise<boolean> {
 		const anchors = new Map<string, LifecycleLedgerEntry>();
+		// An unkeyed terminal_error row is effect-free only if its history never
+		// reached an effect witness state (see #isPreEffectRefusal), so keep the first
+		// such row as a witness instead of collapsing that history to anchor + latest.
+		// Only keep the witness when the latest terminal row could potentially be a
+		// pre-effect refusal: it must have only allowed fields and an allowlisted error response.
+		const effectWitnesses = new Map<string, LifecycleLedgerEntry>();
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
 			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
 				anchors.set(entry.identity, entry);
+			if (
+				EFFECT_WITNESS_STATES.has(entry.state) &&
+				!effectWitnesses.has(entry.identity) &&
+				latest?.state === "terminal_error" &&
+				latest.operationKey === undefined &&
+				entry.requestHash === latest.requestHash &&
+				// Only preserve the witness if the latest row could qualify as pre-effect refusal
+				Object.entries(latest).every(
+					([field, value]) => value === undefined || PRE_EFFECT_REFUSAL_ROW_FIELDS.has(field),
+				) &&
+				isPreEffectRefusalResponse(latest.response)
+			)
+				effectWitnesses.set(entry.identity, entry);
 		}
 		const compacted = new Map(this.#byIdentity);
 		if (replacement) compacted.set(replacement.identity, replacement);
@@ -684,6 +786,8 @@ export class LifecycleLedger {
 				const anchor = anchors.get(identity);
 				if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
 				next.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
+				const witness = effectWitnesses.get(identity);
+				if (witness) next.push(witness);
 				if (latest.state !== "accepted") next.push(latest);
 			}
 			return next;
@@ -801,14 +905,20 @@ export class LifecycleLedger {
 	/**
 	 * Live legacy rows predate the operation/key index. Their opaque identities
 	 * cannot establish that a different target is safe, so callers must reject
-	 * rather than create a second admission. A fresh session.create may ignore
-	 * final legacy rows: exact legacy identities are still resolved before this
-	 * check, and uncertain rows retain their session-scoped fences.
+	 * rather than create a second admission. Spawn-claim anchors are unkeyed but
+	 * are not legacy requests and never fence (see #isSpawnAnchor). A fresh
+	 * session.create may ignore final legacy rows: exact legacy identities are
+	 * still resolved before this check, and uncertain rows retain their
+	 * session-scoped fences.
 	 *
-	 * A session-targeted request passes `sessionTarget` to ignore terminal legacy
-	 * rows that record only other sessions, unless the row is the caller's key
-	 * reused across targets (`keyReuseIdentities`). Terminal rows recording the
-	 * target or no session, uncertain rows, and live rows keep the fence because
+	 * A session-targeted request passes `sessionTarget` to ignore a
+	 * `terminal_error` row that proves it was refused before any effect started
+	 * (see #isPreEffectRefusal), even when the row is the caller's key reused
+	 * across targets (`keyReuseIdentities`): an operation that changed nothing
+	 * cannot be related to any target, and reusing its key repeats no effect. It
+	 * also ignores other terminal legacy rows that record only other sessions,
+	 * unless the row is the caller's reused key. Terminal rows recording the target, other terminal
+	 * rows with no session, uncertain rows, and live rows keep the fence because
 	 * they cannot prove the requested target is unrelated.
 	 */
 	hasLegacyIdentity(
@@ -820,16 +930,40 @@ export class LifecycleLedger {
 	): boolean {
 		const target = options.sessionTarget;
 		const unrelatedTerminal = (entry: LifecycleLedgerEntry): boolean => {
-			if (!target || !terminal(entry.state) || target.keyReuseIdentities.has(entry.identity)) return false;
+			if (!target || !terminal(entry.state)) return false;
+			if (this.#isPreEffectRefusal(entry)) return true;
+			if (target.keyReuseIdentities.has(entry.identity)) return false;
 			const sessionIds = recordedSessionIds(entry);
 			return sessionIds.length > 0 && !sessionIds.includes(target.sessionId);
 		};
 		return [...this.#byIdentity.values()].some(
 			entry =>
 				entry.operationKey === undefined &&
+				!this.#isSpawnAnchor(entry) &&
 				!(options.ignoreFinalRows && final(entry.state)) &&
 				!unrelatedTerminal(entry) &&
 				!excludedIdentities?.has(entry.identity),
+		);
+	}
+	/**
+	 * True only for a `terminal_error` row whose own content proves a refusal
+	 * before any effect: its response is an allowlisted refusal (see
+	 * PRE_EFFECT_REFUSAL_CODES) and the row carries no field beyond those a refused
+	 * request wrote, so no session id, effect marker, effect intent, durable
+	 * effects, startup failure, cleanup state, or unrecognised field. Retained
+	 * history that reached `effect_started`, `awaiting_ready`, or
+	 * `terminal_uncertain` (EFFECT_WITNESS_STATES) disqualifies it as well;
+	 * #compact keeps that history for such rows, so the answer survives
+	 * compaction and restart.
+	 */
+	#isPreEffectRefusal(entry: LifecycleLedgerEntry): boolean {
+		return (
+			entry.state === "terminal_error" &&
+			Object.entries(entry).every(
+				([field, value]) => value === undefined || PRE_EFFECT_REFUSAL_ROW_FIELDS.has(field),
+			) &&
+			isPreEffectRefusalResponse(entry.response) &&
+			!this.#entries.some(row => row.identity === entry.identity && EFFECT_WITNESS_STATES.has(row.state))
 		);
 	}
 	/** Sessions recorded by terminal legacy rows, for deriving key-reuse identities. */
@@ -906,6 +1040,83 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
+	/**
+	 * Spawn-claim anchors are unkeyed rows that only mirror a spawn-authority claim;
+	 * they are never target-inclusive lifecycle requests, so they never fence a
+	 * different admission, even after their claim leaves the spawn-authority
+	 * journal. Current writers mark them with `spawnAnchor: true` in the row, which
+	 * survives migration, compaction, eviction and restarts.
+	 *
+	 * Mirrors written before that marker carry no durable field that tells them
+	 * apart from a pre-index legacy request: file position and `ts` are not
+	 * provenance, because `migrateIdentity` rewrites accepted legacy rows in place
+	 * with the current wall clock. Such rows therefore stay fenced unless an
+	 * operator lists them in {@link #spawnAnchorAttestationFile}; see
+	 * {@link #loadAttestedSpawnAnchors}.
+	 */
+	#isSpawnAnchor(entry: LifecycleLedgerEntry): boolean {
+		return entry.spawnAnchor === true || this.#attestedSpawnAnchors.has(entry.identity);
+	}
+	/**
+	 * Loads the operator-written spawn-anchor attestation. The broker never writes
+	 * or derives this file. A listed identity is exempt only while its whole
+	 * history is the single unkeyed, unmarked `accepted` row a spawn mirror writes,
+	 * with no session target and no quarantined or corruption-uncertain history; any
+	 * other listed identity, and every identity of an unreadable file, stays fenced.
+	 * The file is optional and only ever lifts fences, so failing to read it leaves
+	 * the attested set empty instead of failing the ledger open.
+	 */
+	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
+		let text: string;
+		try {
+			text = await fs.readFile(this.#spawnAnchorAttestationFile, "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") return;
+			this.#warnings.push("Unreadable spawn-anchor attestation ignored");
+			logger.warn("sdk broker: spawn-anchor attestation is unreadable; pre-marker mirrors stay fenced", {
+				code: code ?? "unknown",
+			});
+			return;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch {
+			value = undefined;
+		}
+		const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+		if (
+			record?.version !== 1 ||
+			!Array.isArray(record.identities) ||
+			!record.identities.every(identity => typeof identity === "string")
+		) {
+			this.#warnings.push("Malformed spawn-anchor attestation ignored");
+			return;
+		}
+		const rowCounts = new Map<string, number>();
+		for (const entry of this.#entries) rowCounts.set(entry.identity, (rowCounts.get(entry.identity) ?? 0) + 1);
+		const attested = new Set<string>();
+		let rejected = 0;
+		for (const identity of new Set(record.identities as string[])) {
+			const entry = this.#byIdentity.get(identity);
+			if (
+				entry !== undefined &&
+				rowCounts.get(identity) === 1 &&
+				!quarantined.has(identity) &&
+				entry.state === "accepted" &&
+				entry.operationKey === undefined &&
+				entry.spawnAnchor === undefined &&
+				entry.fingerprint === undefined &&
+				entry.intendedSessionId === undefined &&
+				entry.closeAuthorityBound === undefined
+			)
+				attested.add(identity);
+			else rejected += 1;
+		}
+		if (rejected > 0) this.#warnings.push("Spawn-anchor attestation entries that are not spawn-mirror rows ignored");
+		this.#attestedSpawnAnchors = attested;
+	}
 	async begin(
 		identity: string,
 		requestHash: string,
@@ -914,9 +1125,11 @@ export class LifecycleLedger {
 			fingerprint?: string;
 			intendedSessionId?: string;
 			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
 		} = {},
+		conflictsWithKeyHolder?: (holder: LifecycleLedgerEntry) => boolean,
 	): Promise<BeginResult> {
-		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
+		return this.#mutate(async () => this.#begin(identity, requestHash, metadata, conflictsWithKeyHolder));
 	}
 
 	async #begin(
@@ -927,9 +1140,17 @@ export class LifecycleLedger {
 			fingerprint?: string;
 			intendedSessionId?: string;
 			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
 		},
+		conflictsWithKeyHolder?: (holder: LifecycleLedgerEntry) => boolean,
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
+		// Under the ledger mutex, so of two concurrent first uses of one operation key
+		// for different identities only the first is admitted.
+		if (!prior && metadata.operationKey !== undefined && conflictsWithKeyHolder) {
+			const holder = this.findAnyByOperationKey(metadata.operationKey);
+			if (holder && conflictsWithKeyHolder(holder)) return { kind: "idempotency_conflict" };
+		}
 		if (!prior)
 			return {
 				kind: "new",
@@ -941,6 +1162,7 @@ export class LifecycleLedger {
 					fingerprint: metadata.fingerprint,
 					intendedSessionId: metadata.intendedSessionId,
 					closeAuthorityBound: metadata.closeAuthorityBound,
+					spawnAnchor: metadata.spawnAnchor,
 					state: "accepted",
 					ts: Date.now(),
 				}),
@@ -960,6 +1182,29 @@ export class LifecycleLedger {
 		if (prior.state === "accepted") return { kind: "new", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
+	/** A runtime busy refusal proves no close effect; retain key binding, not a terminal result. */
+	async retryCloseRefusal(identity: string): Promise<void> {
+		await this.#mutate(async () => {
+			const previous = this.#byIdentity.get(identity);
+			if (
+				!previous?.operationKey?.startsWith("session.close\u0000") ||
+				(previous.state !== "accepted" && previous.state !== "effect_started")
+			)
+				throw new Error("Cannot retry a settled or non-close lifecycle operation");
+			await this.#compact({
+				version: previous.version,
+				identity,
+				requestHash: previous.requestHash,
+				operationKey: previous.operationKey,
+				fingerprint: previous.fingerprint,
+				intendedSessionId: previous.intendedSessionId,
+				closeAuthorityBound: previous.closeAuthorityBound,
+				state: "accepted",
+				ts: Date.now(),
+			});
+		});
+	}
+
 	async transition(
 		identity: string,
 		state: LifecycleState,

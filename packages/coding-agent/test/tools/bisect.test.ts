@@ -18,6 +18,28 @@ function session(cwd: string): ToolSession {
 	return { cwd, hasUI: false, getSessionFile: () => null } as unknown as ToolSession;
 }
 
+/** Set or clear the agent pane identity the tmux guard reads from the process environment. */
+async function withTmuxEnv(env: { TMUX: string; TMUX_PANE: string } | null, run: () => Promise<void>): Promise<void> {
+	const saved = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE };
+	const apply = (key: "TMUX" | "TMUX_PANE", value: string | undefined) => {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	};
+	try {
+		if (env === null) {
+			delete process.env.TMUX;
+			delete process.env.TMUX_PANE;
+		} else {
+			process.env.TMUX = env.TMUX;
+			process.env.TMUX_PANE = env.TMUX_PANE;
+		}
+		await run();
+	} finally {
+		apply("TMUX", saved.TMUX);
+		apply("TMUX_PANE", saved.TMUX_PANE);
+	}
+}
+
 // ── temp-repo helpers ────────────────────────────────────────────────────────
 
 async function gitRun(cwd: string, args: string[]): Promise<string> {
@@ -43,6 +65,15 @@ async function makeRepo(): Promise<string> {
 	await gitRun(dir, ["config", "user.name", "Bisect Test"]);
 	await gitRun(dir, ["config", "commit.gpgsign", "false"]);
 	return dir;
+}
+
+async function commitPredicate(cwd: string, flag: string, script: string, message: string): Promise<string> {
+	await fs.writeFile(path.join(cwd, "flag.txt"), flag);
+	await fs.writeFile(path.join(cwd, "seq.txt"), `${message}\n`);
+	await fs.writeFile(path.join(cwd, "predicate.sh"), script);
+	await gitRun(cwd, ["add", "-A"]);
+	await gitRun(cwd, ["commit", "-q", "-m", message]);
+	return gitRun(cwd, ["rev-parse", "HEAD"]);
 }
 
 async function commitFlag(cwd: string, content: string, message: string): Promise<string> {
@@ -345,6 +376,198 @@ describe("BisectTool.execute", () => {
 				stepTimeoutMs: 60_000,
 			}),
 		).rejects.toThrow(/ancestor/i);
+	});
+
+	itWithRepo("blocks a self-pane tmux send-keys predicate before the shell starts", async repo => {
+		const good = await commitFlag(repo, "PASS\n", "c0");
+		await commitFlag(repo, "FAIL\n", "c1");
+		const head = await gitRun(repo, ["rev-parse", "HEAD"]);
+		const marker = path.join(os.tmpdir(), `gjc-bisect-self-${process.pid}.txt`);
+		await fs.rm(marker, { force: true });
+		try {
+			await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+				await expect(
+					new BisectTool(session(repo)).execute("call", {
+						good,
+						bad: "HEAD",
+						run: `tmux send-keys -t %7 x; echo reached > '${marker}'; exit 1`,
+						invert: false,
+						maxSteps: 5,
+						stepTimeoutMs: 5_000,
+					}),
+				).rejects.toThrow(/this agent pane/);
+			});
+			expect(await Bun.file(marker).exists()).toBe(false);
+			expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(head);
+			expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
+			expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
+		} finally {
+			await fs.rm(marker, { force: true });
+		}
+	});
+
+	itWithRepo("still runs an ordinary predicate while a tmux pane identity is set", async repo => {
+		const good = await commitFlag(repo, "PASS\n", "c0");
+		await commitFlag(repo, "PASS\n", "c1 still ok");
+		const bug = await commitFlag(repo, "FAIL\n", "c2 introduce bug");
+		await commitFlag(repo, "FAIL\n", "c3");
+		await commitFlag(repo, "FAIL\n", "c4 head");
+		await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+			const result = await new BisectTool(session(repo)).execute("call", {
+				good,
+				bad: "HEAD",
+				run: "grep -q PASS flag.txt",
+				invert: false,
+				maxSteps: 40,
+				stepTimeoutMs: 60_000,
+			});
+			expect(result.details?.concluded).toBe(true);
+			expect(result.details?.culprit).toBe(bug);
+		});
+	});
+
+	itWithRepo("blocks a self-pane command checked out inside a predicate script", async repo => {
+		const marker = path.join(os.tmpdir(), `gjc-bisect-cand-${process.pid}.txt`);
+		await fs.rm(marker, { force: true });
+		const safe = "grep -q PASS flag.txt\n";
+		const poisoned = `tmux send-keys -t %7 x; echo reached > '${marker}'; exit 1\n`;
+		const good = await commitPredicate(repo, "PASS\n", safe, "c0");
+		await commitPredicate(repo, "PASS\n", poisoned, "c1");
+		await commitPredicate(repo, "FAIL\n", poisoned, "c2");
+		await commitPredicate(repo, "FAIL\n", poisoned, "c3");
+		await commitPredicate(repo, "FAIL\n", safe, "c4 head");
+		const head = await gitRun(repo, ["rev-parse", "HEAD"]);
+		try {
+			await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+				await expect(
+					new BisectTool(session(repo)).execute("call", {
+						good,
+						bad: "HEAD",
+						run: "sh ./predicate.sh",
+						invert: false,
+						maxSteps: 8,
+						stepTimeoutMs: 15_000,
+					}),
+				).rejects.toThrow(/this agent pane/);
+			});
+			expect(await Bun.file(marker).exists()).toBe(false);
+			expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(head);
+			expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
+			expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
+		} finally {
+			await fs.rm(marker, { force: true });
+		}
+	});
+
+	itWithRepo("refuses a safe predicate script when a PATH override is an unresolved expansion", async repo => {
+		const marker = path.join(os.tmpdir(), `gjc-bisect-unresolved-${process.pid}.txt`);
+		await fs.rm(marker, { force: true });
+		const safe = "grep -q PASS flag.txt\n";
+		const good = await commitPredicate(repo, "PASS\n", safe, "c0");
+		await commitPredicate(repo, "FAIL\n", safe, "c1");
+		const head = await gitRun(repo, ["rev-parse", "HEAD"]);
+		try {
+			await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+				await expect(
+					new BisectTool(session(repo)).execute("call", {
+						good,
+						bad: "HEAD",
+						run: `PATH="$UNKNOWN_BIN" sh ./predicate.sh; echo reached > '${marker}'`,
+						invert: false,
+						maxSteps: 5,
+						stepTimeoutMs: 5_000,
+					}),
+				).rejects.toThrow(/PATH override contains an unresolved shell expansion/);
+			});
+			expect(await Bun.file(marker).exists()).toBe(false);
+			expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(head);
+			expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
+			expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
+		} finally {
+			await fs.rm(marker, { force: true });
+		}
+	});
+
+	it.skipIf(!Bun.which("sh") || !Bun.which("grep"))(
+		"still runs a safe predicate script when PATH is a resolved static directory list",
+		async () => {
+			const shBin = Bun.which("sh");
+			const grepBin = Bun.which("grep");
+			if (!shBin || !grepBin) throw new Error("sh and grep are required for this test");
+			const commandPath = [...new Set([path.dirname(shBin), path.dirname(grepBin)])].join(":");
+			expect(commandPath.includes("$")).toBe(false);
+			const repo = await makeRepo();
+			try {
+				const safe = "grep -q PASS flag.txt\n";
+				const good = await commitPredicate(repo, "PASS\n", safe, "c0");
+				await commitPredicate(repo, "PASS\n", safe, "c1 still ok");
+				const bug = await commitPredicate(repo, "FAIL\n", safe, "c2 introduce bug");
+				await commitPredicate(repo, "FAIL\n", safe, "c3");
+				await commitPredicate(repo, "FAIL\n", safe, "c4 head");
+				await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+					const result = await new BisectTool(session(repo)).execute("call", {
+						good,
+						bad: "HEAD",
+						run: `PATH=${commandPath} sh ./predicate.sh`,
+						invert: false,
+						maxSteps: 40,
+						stepTimeoutMs: 60_000,
+					});
+					expect(result.details?.concluded).toBe(true);
+					expect(result.details?.culprit).toBe(bug);
+				});
+			} finally {
+				await fs.rm(repo, { recursive: true, force: true }).catch(() => {});
+			}
+		},
+	);
+
+	itWithRepo("still runs a safe predicate script at every candidate", async repo => {
+		const safe = "grep -q PASS flag.txt\n";
+		const good = await commitPredicate(repo, "PASS\n", safe, "c0");
+		await commitPredicate(repo, "PASS\n", safe, "c1 still ok");
+		const bug = await commitPredicate(repo, "FAIL\n", safe, "c2 introduce bug");
+		await commitPredicate(repo, "FAIL\n", safe, "c3");
+		await commitPredicate(repo, "FAIL\n", safe, "c4 head");
+		await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+			const result = await new BisectTool(session(repo)).execute("call", {
+				good,
+				bad: "HEAD",
+				run: "sh ./predicate.sh",
+				invert: false,
+				maxSteps: 40,
+				stepTimeoutMs: 60_000,
+			});
+			expect(result.details?.concluded).toBe(true);
+			expect(result.details?.culprit).toBe(bug);
+		});
+	});
+
+	itWithRepo("still runs tmux send-keys aimed at a different pane", async repo => {
+		const good = await commitFlag(repo, "PASS\n", "c0");
+		await commitFlag(repo, "PASS\n", "c1 still ok");
+		const bug = await commitFlag(repo, "FAIL\n", "c2 introduce bug");
+		await commitFlag(repo, "FAIL\n", "c3");
+		await commitFlag(repo, "FAIL\n", "c4 head");
+		const marker = path.join(os.tmpdir(), `gjc-bisect-other-${process.pid}.txt`);
+		await fs.rm(marker, { force: true });
+		try {
+			await withTmuxEnv({ TMUX: `${path.join(repo, "no-tmux-sock")},1,0`, TMUX_PANE: "%7" }, async () => {
+				const result = await new BisectTool(session(repo)).execute("call", {
+					good,
+					bad: "HEAD",
+					run: `tmux send-keys -t %99 x; echo reached > '${marker}'; grep -q PASS flag.txt`,
+					invert: false,
+					maxSteps: 40,
+					stepTimeoutMs: 15_000,
+				});
+				expect(result.details?.concluded).toBe(true);
+				expect(result.details?.culprit).toBe(bug);
+			});
+			expect(await Bun.file(marker).text()).toContain("reached");
+		} finally {
+			await fs.rm(marker, { force: true });
+		}
 	});
 
 	it("rejects outside a git repository", async () => {

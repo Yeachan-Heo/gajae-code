@@ -6,14 +6,16 @@ import * as path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import {
-	canonicalBindingOpenFlags,
 	cleanupAuthorityMatches,
+	listManagedCandidates,
+	resolveManagedScope,
+} from "../../src/sdk/session-readonly/scope";
+import {
+	canonicalBindingOpenFlags,
 	detachArtifactRootForMigration,
 	fsyncCanonicalBinding,
-	listManagedCandidates,
 	matchesMigrationArtifactRoot,
 	openManagedCandidateForWrite,
-	resolveManagedScope,
 	restorePreparedArtifactRoot,
 } from "../../src/session/internal/managed-session-scope";
 

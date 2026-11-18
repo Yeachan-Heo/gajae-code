@@ -12,7 +12,7 @@ import {
 import { stripOuterDoubleQuotes } from "@gajae-code/coding-agent/tools/path-utils";
 import * as native from "@gajae-code/natives";
 import { getConfigRootDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
-import { resolveManagedScope } from "../../src/session/internal/managed-session-scope";
+import { resolveManagedScope } from "../../src/sdk/session-readonly/scope";
 import { makeAssistantMessage } from "./helpers";
 
 function forceImmediateNativeCleanup(): () => void {

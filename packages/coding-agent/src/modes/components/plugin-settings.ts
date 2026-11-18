@@ -218,12 +218,12 @@ export class PluginDetailComponent extends Container {
 						label: `  ${key}`,
 						description: schema.description || `Configure ${key}`,
 						currentValue: String(currentValue ?? schema.default ?? ""),
-						submenu: (cv, done) =>
+						submenu: (cv, done, stored) =>
 							new ConfigEnumSubmenu(
 								key,
 								schema.description || `Select value for ${key}`,
 								schema.values,
-								cv,
+								stored ?? cv,
 								value => {
 									this.callbacks.onConfigChange(key, value);
 									done(value);
@@ -238,18 +238,9 @@ export class PluginDetailComponent extends Container {
 						label: `  ${key}`,
 						description: schema.description || `Configure ${key}`,
 						currentValue: displayValue,
-						submenu: (cv, done) =>
-							new ConfigInputSubmenu(
-								key,
-								schema,
-								cv === "(not set)" ? "" : cv,
-								value => {
-									const parsed = schema.type === "number" ? Number(value) : value;
-									this.callbacks.onConfigChange(key, parsed);
-									done(String(value));
-								},
-								() => done(),
-							),
+						submenu: createPluginTextSubmenu(key, schema, (configKey, value) => {
+							this.callbacks.onConfigChange(configKey, value);
+						}),
 					});
 				}
 			}
@@ -351,12 +342,13 @@ class ConfigEnumSubmenu extends Container {
  */
 class ConfigInputSubmenu extends Container {
 	#input: Input;
+	#edited = false;
 
 	constructor(
 		key: string,
 		schema: PluginSettingSchema,
 		currentValue: string,
-		private readonly onSubmit: (value: string) => void,
+		private readonly onSubmit: (value: string, edited: boolean) => void,
 		private readonly onCancel: () => void,
 	) {
 		super();
@@ -385,10 +377,10 @@ class ConfigInputSubmenu extends Container {
 		if (!schema.secret && currentValue) {
 			this.#input.setValue(currentValue);
 		}
-
+		this.#input.onEdit = () => (this.#edited = true);
 		this.#input.onSubmit = value => {
 			if (value.trim()) {
-				this.onSubmit(value);
+				this.onSubmit(value, this.#edited);
 			} else {
 				this.onCancel();
 			}
@@ -402,6 +394,38 @@ class ConfigInputSubmenu extends Container {
 	handleInput(data: string): void {
 		handleInputOrEscape(data, this.#input, this.onCancel);
 	}
+}
+
+export function commitPluginConfigValue(
+	stored: string,
+	submitted: string,
+	type: PluginSettingSchema["type"],
+	edited: boolean,
+): unknown {
+	if (type === "string" && !edited) return stored;
+	return type === "number" ? Number(submitted) : submitted;
+}
+
+export function createPluginTextSubmenu(
+	key: string,
+	schema: PluginSettingSchema,
+	onConfigChange: (key: string, value: unknown) => void,
+): NonNullable<SettingItem["submenu"]> {
+	return (cv, done, stored) => {
+		const prefill = cv === "(not set)" ? "" : cv;
+		const original = stored ?? prefill;
+		return new ConfigInputSubmenu(
+			key,
+			schema,
+			prefill,
+			(value, edited) => {
+				const committed = commitPluginConfigValue(original, value, schema.type, edited);
+				onConfigChange(key, committed);
+				done(String(committed), edited);
+			},
+			() => done(),
+		);
+	};
 }
 
 // =============================================================================

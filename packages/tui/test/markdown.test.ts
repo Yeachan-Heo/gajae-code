@@ -8,6 +8,7 @@ import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Chalk } from "chalk";
 import { LRUCache } from "lru-cache/raw";
 import { marked } from "marked";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import {
 	__markdownPerfCounters,
 	clearRenderCache,
@@ -430,7 +431,7 @@ describe("Markdown accounted cache limits", () => {
 		expect(theme.highlightCode).toHaveBeenCalledTimes(1);
 	});
 
-	it("verifies language and code on delimiter-colliding highlight keys", () => {
+	it("strips NUL from language and code before highlight keys are built", () => {
 		const calls: Array<{ code: string; lang?: string }> = [];
 		const theme = {
 			...defaultMarkdownTheme,
@@ -443,11 +444,13 @@ describe("Markdown accounted cache limits", () => {
 		const second = new Markdown(`\`\`\`a\x00b\nc\n\`\`\``, 0, 0, theme).render(80).join("\n");
 
 		expect(calls).toEqual([
-			{ code: "b\x00c", lang: "a" },
-			{ code: "c", lang: "a\x00b" },
+			{ code: "bc", lang: "a" },
+			{ code: "c", lang: "ab" },
 		]);
-		expect(first).toContain("a:b\x00c");
-		expect(second).toContain("a\x00b:c");
+		expect(first).toContain("a:bc");
+		expect(second).toContain("ab:c");
+		expect(first).not.toContain("\x00");
+		expect(second).not.toContain("\x00");
 	});
 
 	// 24 documents of ~70KB each, re-checked after every render: deterministic
@@ -1788,13 +1791,6 @@ bar`,
 		describe("generated destinations", () => {
 			const seed = 0x0518_c0de;
 			const caseCount = 64;
-			const seededRandom = (initial: number): (() => number) => {
-				let state = initial >>> 0;
-				return () => {
-					state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-					return state / 0x1_0000_0000;
-				};
-			};
 			const pick = <T>(random: () => number, values: readonly T[]): T =>
 				values[Math.floor(random() * values.length)];
 			// Filename characters, including URI delimiters, percent signs, spaces and non-ASCII text.
@@ -1811,7 +1807,7 @@ bar`,
 				Array.from({ length: 1 + Math.floor(random() * 3) }, () => randomSegment(random));
 
 			it("round-trips percent-encoded relative paths and fragments to the same file and fragment", () => {
-				const random = seededRandom(seed);
+				const random = lcgUnit(seed);
 				for (let caseIndex = 0; caseIndex < caseCount; caseIndex++) {
 					const segments = randomSegments(random);
 					const fragment = random() < 0.5 ? "" : `L${Math.floor(random() * 1000)}`;
@@ -1828,7 +1824,7 @@ bar`,
 			});
 
 			it("round-trips unencoded relative paths without URI delimiters to the same file", () => {
-				const random = seededRandom(seed ^ 0x5a5a_5a5a);
+				const random = lcgUnit(seed ^ 0x5a5a_5a5a);
 				const delimiterFree = (segment: string): string => segment.replaceAll(/[%#?]/gu, "_");
 				for (let caseIndex = 0; caseIndex < caseCount; caseIndex++) {
 					const segments = randomSegments(random).map(delimiterFree);
@@ -1842,7 +1838,7 @@ bar`,
 			});
 
 			it("leaves generated scheme URLs unchanged", () => {
-				const random = seededRandom(seed ^ 0x0f0f_0f0f);
+				const random = lcgUnit(seed ^ 0x0f0f_0f0f);
 				for (let caseIndex = 0; caseIndex < caseCount; caseIndex++) {
 					const scheme = pick(random, ["https", "http", "mailto", "vscode", "git+ssh"]);
 					const target = `${scheme}://example.com/${randomSegments(random).map(encodeURIComponent).join("/")}`;
@@ -1851,8 +1847,8 @@ bar`,
 				}
 			});
 
-			it("never links generated destinations containing a control character", () => {
-				const random = seededRandom(seed ^ 0x3c3c_3c3c);
+			it("links generated destinations after a control character is removed", () => {
+				const random = lcgUnit(seed ^ 0x3c3c_3c3c);
 				// Line breaks end the Markdown destination and tabs are expanded to spaces before parsing.
 				const controls = [
 					...Array.from({ length: 0x20 }, (_, code) => String.fromCharCode(code)),
@@ -1869,7 +1865,7 @@ bar`,
 					expect(
 						renderedDestination(target),
 						`seed ${seed}, case ${caseIndex}, control U+${control.charCodeAt(0).toString(16)}`,
-					).toBeUndefined();
+					).toBe(renderedDestination(base));
 				}
 			});
 		});
@@ -1892,12 +1888,18 @@ bar`,
 			{ name: "ESC", control: "\x1b" },
 			{ name: "BEL", control: "\x07" },
 			{ name: "NUL", control: "\x00" },
-		])("rejects OSC 8 destinations containing $name", ({ control }) => {
+		])("links OSC 8 destinations after $name is removed", ({ control }) => {
 			const target = `https://example.com/a${control}b`;
 			const markdown = new Markdown(`[source](<${target}>)`, 0, 0, defaultMarkdownTheme);
 			const output = markdown.render(80).join("\n");
+			const destinations = [...output.matchAll(/\x1b\]8;;([^\x07]*)\x07/gu)].map(match => match[1]);
 
-			expect(output).not.toContain("\x1b]8;;");
+			expect(destinations.length).toBeGreaterThan(0);
+			expect(output).not.toContain(`a${control}b`);
+			for (const destination of destinations) {
+				expect(destination).not.toContain(control);
+				expect(/[\u0000-\u001f\u007f-\u009f]/u.test(destination)).toBe(false);
+			}
 		});
 
 		it("should keep every wrapped URL fragment clickable with the same OSC 8 target (#4711)", () => {

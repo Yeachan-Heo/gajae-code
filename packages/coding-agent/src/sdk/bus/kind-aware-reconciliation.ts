@@ -9,6 +9,7 @@ import {
 	failedPromptOutcome,
 	failureEvidence,
 	failureProviderDiagnostic,
+	isPreservedProviderFailure,
 	type PromptFailureEvidence,
 	providerDiagnosticField,
 	publicTerminalOutcome,
@@ -43,18 +44,6 @@ import type {
 } from "./reconciliation-store";
 
 const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
-const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
-	"provider_down",
-	"provider_unavailable",
-	"provider_rejected",
-	"upstream_stream_interrupted",
-	"argument_validation",
-	"execution",
-	"upstream_error",
-	"transport_reset",
-]);
-const isPreservedProviderFailure = (code: string | undefined): boolean =>
-	code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
 const STOP_REASONS: readonly SdkPromptStopReason[] = [
 	"end_turn",
 	"max_tokens",

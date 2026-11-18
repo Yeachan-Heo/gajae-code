@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "./helpers/trust-temp-dirs";
 
 /**
  * Every bash tool command runs with `getShellConfig().env`. bash sources
@@ -35,11 +35,15 @@ const HOOK_KEYS = [
 	"PERL5LIB",
 	"JAVA_TOOL_OPTIONS",
 	"JDK_JAVA_OPTIONS",
+	"GTK_MODULES",
+	"GTK3_MODULES",
+	"GTK_PATH",
 	"LD_PRELOAD",
 	"LD_AUDIT",
 	"LD_LIBRARY_PATH",
 	"DYLD_LIBRARY_PATH",
 	"GIT_ASKPASS",
+	"SSH_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",
 	"GIT_SEQUENCE_EDITOR",
@@ -69,18 +73,8 @@ type Probe = Record<
 	NPM_NODE_OPTIONS_NAMES: string[];
 };
 
-const tempDirs: string[] = [];
-
-function tempDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-spawn-env-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const trustDirs = createTrustTempDirs("gjc-spawn-env-trust-");
+const { tempDir, projectDir } = trustDirs;
 
 async function probeIn(cwd: string, autoload: boolean, inherited: Record<string, string> = {}): Promise<Probe> {
 	const env: Record<string, string> = {};
@@ -104,6 +98,10 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
 	"GIT_ASKPASS=./hook.sh",
+	"SSH_ASKPASS=./hook.sh",
+	"GTK_MODULES=planted",
+	"GTK3_MODULES=planted",
+	"GTK_PATH=./gtk",
 	"GIT_EXEC_PATH=./git-exec",
 	"GIT_PROXY_COMMAND=./proxy.sh",
 	"GIT_SEQUENCE_EDITOR=./hook.sh",
@@ -131,10 +129,14 @@ describe.each([
 	["no dotenv autoload", false],
 ] as const)("bash spawn env hook variables (%s)", (_label, autoload) => {
 	it("drops shell and git hook variables declared by the project .env", async () => {
-		const probe = await probeIn(tempDir(PLANTED), autoload);
+		const probe = await probeIn(projectDir(PLANTED), autoload);
 		expect(probe).toMatchObject({
 			BASH_ENV: null,
 			GIT_ASKPASS: null,
+			SSH_ASKPASS: null,
+			GTK_MODULES: null,
+			GTK3_MODULES: null,
+			GTK_PATH: null,
 			GIT_EXEC_PATH: null,
 			GIT_PROXY_COMMAND: null,
 			GIT_SEQUENCE_EDITOR: null,
@@ -177,13 +179,13 @@ describe.each([
 	});
 
 	it("drops a dynamic project declaration", async () => {
-		const probe = await probeIn(tempDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload);
+		const probe = await probeIn(projectDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload);
 		expect(probe.BASH_ENV).toBeNull();
 	});
 
 	it("drops a dynamic-only hook declaration without a parsed value", async () => {
 		const value = "./hook\r.sh";
-		const probe = await probeIn(tempDir(`BASH_ENV=${value}\n`), autoload, { BASH_ENV: value });
+		const probe = await probeIn(projectDir(`BASH_ENV=${value}\n`), autoload, { BASH_ENV: value });
 		expect(probe).toMatchObject({
 			LIVE_BASH_ENV: value,
 			PROJECT_DYNAMIC_BASH_ENV: true,
@@ -214,7 +216,7 @@ describe.each([
 	});
 
 	it("does not let the project .env replace an inherited value", async () => {
-		const probe = await probeIn(tempDir("BASH_ENV=./hook.sh\n"), autoload, { BASH_ENV: "/opt/operator/bashenv" });
+		const probe = await probeIn(projectDir("BASH_ENV=./hook.sh\n"), autoload, { BASH_ENV: "/opt/operator/bashenv" });
 		expect(probe.BASH_ENV).toBe("/opt/operator/bashenv");
 	});
 
@@ -223,14 +225,14 @@ describe.each([
 	// is ambiguous. Like the credential snapshot (`$inheritedEnv`), these fail
 	// closed: the hook variable is dropped rather than risk running project code.
 	it("drops an inherited value the project .env repeats verbatim (ambiguous, fails closed)", async () => {
-		const probe = await probeIn(tempDir("BASH_ENV=/opt/operator/bashenv\n"), autoload, {
+		const probe = await probeIn(projectDir("BASH_ENV=/opt/operator/bashenv\n"), autoload, {
 			BASH_ENV: "/opt/operator/bashenv",
 		});
 		expect(probe.BASH_ENV).toBeNull();
 	});
 
 	it("drops an inherited value when the project .env declares the key dynamically (ambiguous, fails closed)", async () => {
-		const probe = await probeIn(tempDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload, {
+		const probe = await probeIn(projectDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload, {
 			BASH_ENV: "/opt/operator/bashenv",
 		});
 		expect(probe.BASH_ENV).toBeNull();
@@ -239,7 +241,7 @@ describe.each([
 
 describe("bash spawn env Bun startup options", () => {
 	it("drops a project BUN_OPTIONS declaration before a child Bun runtime starts", async () => {
-		const probe = await probeIn(tempDir("BUN_OPTIONS=--preload=./project-preload.ts\n"), false);
+		const probe = await probeIn(projectDir("BUN_OPTIONS=--preload=./project-preload.ts\n"), false);
 		expect(probe.BUN_OPTIONS).toBeNull();
 	});
 
@@ -253,7 +255,7 @@ describe("bash spawn env interpreter injection", () => {
 	for (const autoload of [true, false]) {
 		it(`drops project interpreter and loader declarations (autoload=${autoload})`, async () => {
 			const probe = await probeIn(
-				tempDir(
+				projectDir(
 					"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nPYTHONUSERBASE=./userbase\nPYTHONSTARTUP=./startup.py\nJAVA_TOOL_OPTIONS=-javaagent:./agent.jar\nJDK_JAVA_OPTIONS=-javaagent:./agent.jar\nLD_PRELOAD=./planted.so\nLD_AUDIT=./audit.so\nLD_LIBRARY_PATH=./lib\nDYLD_LIBRARY_PATH=./lib\n",
 				),
 				autoload,
@@ -275,7 +277,7 @@ describe("bash spawn env interpreter injection", () => {
 
 	it("keeps interpreter variables the launching shell exported with a different value", async () => {
 		const probe = await probeIn(
-			tempDir(
+			projectDir(
 				"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nPYTHONUSERBASE=./userbase\nPYTHONSTARTUP=./startup.py\nJAVA_TOOL_OPTIONS=-javaagent:./agent.jar\nJDK_JAVA_OPTIONS=-javaagent:./agent.jar\nLD_LIBRARY_PATH=./lib\n",
 			),
 			true,
@@ -305,7 +307,7 @@ describe("bash spawn env tool configuration programs", () => {
 	for (const autoload of [true, false]) {
 		it(`drops project tool-config and sibling injection declarations (autoload=${autoload})`, async () => {
 			const probe = await probeIn(
-				tempDir(
+				projectDir(
 					[
 						"PERLLIB=./lib",
 						"_JAVA_OPTIONS=-javaagent:./a.jar",
@@ -349,14 +351,14 @@ describe("bash spawn env tool configuration programs", () => {
 	]) {
 		for (const autoload of [true, false]) {
 			it(`drops a project ${name} declaration (autoload=${autoload})`, async () => {
-				const probe = await probeIn(tempDir(`${name}=./planted\n`), autoload);
+				const probe = await probeIn(projectDir(`${name}=./planted\n`), autoload);
 				expect(probe.NPM_NODE_OPTIONS_NAMES).toEqual([]);
 			});
 		}
 	}
 
 	it("keeps tool configuration the launching shell exported", async () => {
-		const probe = await probeIn(tempDir("RIPGREP_CONFIG_PATH=./rgconfig\nMAKEFLAGS=SHELL=./x.sh\n"), true, {
+		const probe = await probeIn(projectDir("RIPGREP_CONFIG_PATH=./rgconfig\nMAKEFLAGS=SHELL=./x.sh\n"), true, {
 			RIPGREP_CONFIG_PATH: "/home/operator/.ripgreprc",
 			MAKEFLAGS: "-j8",
 		});

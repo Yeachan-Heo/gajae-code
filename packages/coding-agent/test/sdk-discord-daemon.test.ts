@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
+import { createDiscordAdapter } from "../src/sdk/bus/chat-adapters";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import {
 	type ChatEffect,
@@ -11,9 +13,9 @@ import {
 	type ChatEffectReceipt,
 	type EnqueueChatEffect,
 } from "../src/sdk/bus/chat-effect-journal";
-
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { DiscordConversation } from "../src/sdk/bus/discord-conversation";
+import * as DiscordDaemonApi from "../src/sdk/bus/discord-daemon";
 import {
 	DiscordAttachmentBindingError,
 	type DiscordLeaseRecoveryScheduler,
@@ -26,6 +28,7 @@ import type {
 	DiscordProvider,
 	DiscordThread,
 } from "../src/sdk/bus/discord-provider";
+import { NotificationPresentationEngine } from "../src/sdk/bus/engine";
 import { SdkClientError } from "../src/sdk/client/client";
 import type { SessionAttachment } from "../src/sdk/router";
 
@@ -162,9 +165,21 @@ class FakeDiscordProvider implements DiscordProvider {
 	async stop(): Promise<void> {}
 }
 
+const FIXTURE_ACTOR_ID = "member";
+const TURN_PROMPT = '/sdk control turn.prompt {"text":"ping"}';
+
+function discordDaemon(options: DiscordNotificationDaemonOptions): DiscordNotificationDaemon {
+	return new DiscordNotificationDaemon({
+		...options,
+		authorizedActorIds: options.authorizedActorIds ?? [FIXTURE_ACTOR_ID],
+	});
+}
+
 async function withDaemon(
 	run: (daemon: DiscordNotificationDaemon, provider: FakeDiscordProvider, agentDir: string) => Promise<void>,
-	overrides: Partial<Pick<DiscordNotificationDaemonOptions, "resolveAttachment" | "onCommand" | "now">> = {},
+	overrides: Partial<
+		Pick<DiscordNotificationDaemonOptions, "resolveAttachment" | "onCommand" | "now" | "authorizedActorIds">
+	> = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-daemon-"));
 	let daemon: DiscordNotificationDaemon | undefined;
@@ -172,7 +187,7 @@ async function withDaemon(
 		const provider = new FakeDiscordProvider();
 		actionCustomIds.clear();
 
-		daemon = new DiscordNotificationDaemon({
+		daemon = discordDaemon({
 			agentDir,
 			guildId: "guild",
 			parentChannelId: "parent",
@@ -191,6 +206,237 @@ async function withDaemon(
 		await daemon?.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
+}
+
+async function inboundEffectIds(agentDir: string): Promise<string[]> {
+	const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+	return (await journal.list())
+		.filter(effect => effect.kind === "discord.inbound.command" || effect.kind === "discord.inbound.action")
+		.map(effect => effect.id);
+}
+
+/** Config-file actor admission. Does not inject the fixture allowlist. */
+async function withConfigDaemon(
+	configBody: string | undefined,
+	run: (
+		daemon: DiscordNotificationDaemon,
+		agentDir: string,
+		commands: string[],
+		frames: Record<string, unknown>[],
+	) => Promise<void>,
+	authorizedActorIds?: readonly string[],
+): Promise<void> {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-actor-config-"));
+	let daemon: DiscordNotificationDaemon | undefined;
+	const commands: string[] = [];
+	const frames: Record<string, unknown>[] = [];
+	try {
+		if (configBody !== undefined) await fs.writeFile(path.join(agentDir, "config.yml"), configBody);
+		actionCustomIds.clear();
+		daemon = new DiscordNotificationDaemon({
+			agentDir,
+			guildId: "guild",
+			parentChannelId: "parent",
+			provider: new FakeDiscordProvider(),
+			resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+				sessionId,
+				generation: expectedGeneration,
+				isCurrent: () => true,
+				send: frame => {
+					frames.push(frame);
+				},
+				sendMaintenance: () => {},
+			}),
+			onCommand: async (_sessionId, command) => {
+				commands.push(command);
+				return true;
+			},
+			...(authorizedActorIds === undefined ? {} : { authorizedActorIds }),
+		});
+		await run(daemon, agentDir, commands, frames);
+	} finally {
+		await daemon?.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}
+
+async function seedRecoveredCommand(
+	agentDir: string,
+	threadId: string,
+	eventId: string,
+	authorId?: string,
+	withReceipt = true,
+): Promise<string> {
+	const effectId = `discord:app:guild:parent:${threadId}:${eventId}`;
+	await new ChatEffectJournal({ agentDir, transport: "discord" }).enqueue({
+		id: effectId,
+		kind: "discord.inbound.command",
+		transport: "discord",
+		sessionId: "session",
+		endpointGeneration: 1,
+		payload: {
+			type: "command",
+			content: TURN_PROMPT,
+			idempotencyKey: effectId,
+			routing: {
+				guildId: "guild",
+				parentId: "parent",
+				threadId,
+				eventId,
+				kind: "command",
+				...(authorId === undefined ? {} : { authorId }),
+			},
+		},
+	});
+	if (!withReceipt) return effectId;
+	const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+	const key = `app:guild:parent:${threadId}`;
+	const mapping = await store.read(key);
+	if (!mapping) throw new Error("missing conversation");
+	await store.write(key, mapping.generation, {
+		...mapping,
+		generation: mapping.generation + 1,
+		updatedAt: 1,
+		inboundDispatches: [
+			...(mapping.inboundDispatches ?? []),
+			{
+				key: eventId,
+				eventId,
+				kind: "command",
+				endpointGeneration: 1,
+				effectId,
+				idempotencyKey: effectId,
+			},
+		],
+	});
+	return effectId;
+}
+
+async function seedDeferredAction(
+	agentDir: string,
+	threadId: string,
+	eventId: string,
+	actionId: string,
+	actionNonce: string,
+	authorId?: string,
+): Promise<string> {
+	const effectId = `discord:app:guild:parent:${threadId}:${eventId}`;
+	const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+	await journal.enqueue({
+		id: effectId,
+		kind: "discord.inbound.action",
+		transport: "discord",
+		sessionId: "session",
+		endpointGeneration: 1,
+		payload: {
+			type: "reply",
+			id: actionId,
+			answer: "yes",
+			idempotencyKey: effectId,
+			routing: {
+				guildId: "guild",
+				parentId: "parent",
+				threadId,
+				eventId,
+				interactionId: `interaction-${eventId}`,
+				kind: "action",
+				actionId,
+				actionNonce,
+				...(authorId === undefined ? {} : { authorId }),
+			},
+		},
+	});
+	const lease = await journal.claim(effectId, "owner", 1_000);
+	if (!lease) throw new Error("missing action lease");
+	await journal.record(effectId, { owner: "owner", epoch: lease.epoch }, "accepted", { status: "deferred" });
+	const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+	const key = `app:guild:parent:${threadId}`;
+	const mapping = await store.read(key);
+	if (!mapping) throw new Error("missing conversation");
+	await store.write(key, mapping.generation, {
+		...mapping,
+		generation: mapping.generation + 1,
+		updatedAt: mapping.updatedAt,
+		inboundDispatches: [
+			...(mapping.inboundDispatches ?? []),
+			{
+				key: eventId,
+				eventId,
+				interactionId: `interaction-${eventId}`,
+				kind: "action",
+				actionId,
+				actionNonce,
+				endpointGeneration: 1,
+				effectId,
+				idempotencyKey: effectId,
+			},
+		],
+	});
+	return effectId;
+}
+
+async function recoverCommands(
+	agentDir: string,
+	provider: FakeDiscordProvider,
+	onCommand: (command: string) => void,
+	frames?: Record<string, unknown>[],
+): Promise<void> {
+	const restarted = discordDaemon({
+		agentDir,
+		guildId: "guild",
+		parentChannelId: "parent",
+		provider,
+		resolveAttachment: async sessionId => ({
+			sessionId,
+			generation: 1,
+			isCurrent: () => true,
+			send: frame => {
+				frames?.push(frame);
+			},
+			sendMaintenance: () => {},
+		}),
+		onCommand: async (_sessionId, command) => {
+			onCommand(command);
+			return true;
+		},
+	});
+	try {
+		await restarted.start();
+	} finally {
+		await restarted.stop();
+	}
+}
+
+async function sendCommandAndAction(daemon: DiscordNotificationDaemon, authorId: string): Promise<void> {
+	const conversation = await daemon.notify({
+		sessionId: "session",
+		endpointGeneration: 1,
+		content: "Choose",
+		actionId: "ask",
+		options: ["Yes"],
+	});
+	const threadId = conversation.threadId!;
+	await daemon.handleInbound({
+		id: "actor-command",
+		guildId: "guild",
+		parentId: "parent",
+		threadId,
+		authorId,
+		content: TURN_PROMPT,
+	});
+	await daemon.handleInbound({
+		id: "actor-action",
+		guildId: "guild",
+		parentId: "parent",
+		threadId,
+		authorId,
+		interaction: {
+			id: "interaction-actor-action",
+			token: "token-actor-action",
+			customId: actionCustomIds.get(threadId)!,
+			value: "yes",
+		},
+	});
 }
 
 function inbound(threadId: string, id: string, generation = 1, customId?: string): DiscordInboundEvent {
@@ -234,7 +480,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				await release.promise;
 				return await originalCreate(input);
 			};
-			const other = new DiscordNotificationDaemon({
+			const other = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -276,7 +522,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					attachmentAuthorityId: "predecessor",
 					content: "predecessor",
 				});
-				const retiring = new DiscordNotificationDaemon({
+				const retiring = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -352,7 +598,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 	test("restores a durable mapping after daemon restart without creating another thread", async () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const first = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -481,7 +727,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						],
 					},
 				]);
-				const restarted = new DiscordNotificationDaemon({
+				const restarted = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -729,7 +975,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					expect(beforeRecovery?.leaseExpiresAt ?? 0).toBeGreaterThan(0);
 					expect(JSON.stringify(beforeRecovery)).not.toContain("token-live-recovery-barrier");
 
-					recovery = new DiscordNotificationDaemon({
+					recovery = discordDaemon({
 						agentDir,
 						guildId: "guild",
 						parentChannelId: "parent",
@@ -855,7 +1101,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				).rejects.toThrow("disconnected");
 				expect(provider.creates).toBe(1);
 				now = 60_001;
-				const restarted = new DiscordNotificationDaemon({
+				const restarted = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -950,7 +1196,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					seenEventIds: [],
 					seenInteractionIds: [],
 				}));
-				const restarted = new DiscordNotificationDaemon({
+				const restarted = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1032,7 +1278,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					seenEventIds: [],
 					seenInteractionIds: [],
 				}));
-				const restarted = new DiscordNotificationDaemon({
+				const restarted = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1115,7 +1361,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				seenEventIds: [],
 				seenInteractionIds: [],
 			}));
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -1210,7 +1456,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				await expect(
 					daemon.handleInbound(inbound(conversation.threadId!, `restart-${staleBinding}`, 1)),
 				).rejects.toThrow("callback failed");
-				const restarted = new DiscordNotificationDaemon({
+				const restarted = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1481,7 +1727,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					},
 					sendMaintenance: () => {},
 				});
-				const first = new DiscordNotificationDaemon({
+				const first = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1503,7 +1749,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				const blocked = first.handleInbound(inbound(conversation.threadId!, "claim-before-send", 1));
 				await entered.promise;
 				now = 60_001;
-				const restarted = new DiscordNotificationDaemon({
+				const restarted = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1531,7 +1777,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				await expect(
 					restarted.handleInbound(inbound(retry.threadId!, "definite-pre-send", 1, retryCustomId)),
 				).rejects.toThrow("Discord interaction callback failed");
-				const afterPreSend = new DiscordNotificationDaemon({
+				const afterPreSend = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1563,7 +1809,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					},
 					sendMaintenance: () => {},
 				});
-				const sender = new DiscordNotificationDaemon({
+				const sender = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1573,7 +1819,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 				await sender.handleInbound(inbound(uncertain.threadId!, "uncertain-post-send", 1, uncertainCustomId));
 				expect(frames).toHaveLength(2);
-				const afterUncertain = new DiscordNotificationDaemon({
+				const afterUncertain = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1721,7 +1967,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						expect(prepared?.generation).toBeGreaterThan(1);
 
 						now = 60_001;
-						recovery = new DiscordNotificationDaemon({
+						recovery = discordDaemon({
 							agentDir,
 							guildId: "guild",
 							parentChannelId: "parent",
@@ -1785,7 +2031,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				const effects = await fs.readFile(path.join(agentDir, "sdk", "daemons", "discord", "effects.json"), "utf8");
 				expect(effects).not.toContain("token-deferred-retry");
 
-				const recovered = new DiscordNotificationDaemon({
+				const recovered = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -1830,7 +2076,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			);
 			expect(provider.messages).toHaveLength(1);
 			expect([...provider.messageNonces.keys()][0]).toMatch(/^gjc-[a-f0-9]{21}$/);
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -1864,7 +2110,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			).rejects.toThrow("Discord disconnected after accepting post");
 			const threadId = provider.messages[0]!.threadId;
 			const publishedCustomId = actionCustomIds.get(threadId)!;
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -1925,7 +2171,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			expect(provider.messages).toHaveLength(1);
 			expect(actionCustomIds.get(threadId)).toBe(publishedCustomId);
 
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -1988,10 +2234,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						threadId: conversation.threadId!,
 						eventId: "orphan-command",
 						kind: "command",
+						authorId: "member",
 					},
 				},
 			});
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2013,6 +2260,168 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await restarted.stop();
 		});
 	});
+	test("still allows a relative Discord notification path", async () => {
+		await withDaemon(async (daemon, provider) => {
+			await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "see notes/todo.txt",
+			});
+			expect(provider.messages.some(message => message.content === "see notes/todo.txt")).toBe(true);
+		});
+	});
+
+	test("still allows an opted-out Discord absolute path", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const engine = new NotificationPresentationEngine([createDiscordAdapter()], { redact: false });
+			const [rendered] = engine.fanout({
+				type: "frame",
+				sessionId: "session",
+				frame: { type: "context_update", text: "Build at /srv/prod" },
+			});
+			const content = (rendered?.body as { content: string }).content;
+			expect(content).toContain("/srv/prod");
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content,
+				literal: true,
+			});
+			expect(provider.messages.some(message => message.content.includes("/srv/prod"))).toBe(true);
+			expect(provider.messages.some(message => message.content.includes("<path>"))).toBe(false);
+			await new ChatEffectJournal({ agentDir, transport: "discord" }).enqueue({
+				id: `notification:${conversation.threadId}:opt-out-replay`,
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					threadId: conversation.threadId,
+					content: "Keep /srv/optout",
+					nonce: "opt-out-replay",
+					literal: true,
+				},
+			});
+			await daemon.start();
+			expect(provider.messages.find(message => message.content.includes("/srv/optout"))?.content).toContain(
+				"/srv/optout",
+			);
+		});
+	});
+
+	test("masks a redacted Discord frame at the provider", async () => {
+		await withDaemon(async (daemon, provider) => {
+			const engine = new NotificationPresentationEngine([createDiscordAdapter()], { redact: true });
+			const [rendered] = engine.fanout({
+				type: "frame",
+				sessionId: "session",
+				frame: { type: "context_update", text: "Build at /srv/prod" },
+			});
+			const content = (rendered?.body as { content: string }).content;
+			expect(content).not.toContain("/srv/prod");
+			await daemon.notify({ sessionId: "session", endpointGeneration: 1, content });
+			expect(provider.messages.some(message => message.content.includes("/srv/prod"))).toBe(false);
+		});
+	});
+
+	test("keeps Discord ask option text readable", async () => {
+		await withDaemon(async (daemon, provider) => {
+			await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "Choose /srv/prod or /srv/staging",
+				actionId: "ask-1",
+				options: ["Use /srv/prod", "Use /srv/staging"],
+			});
+			const ask = provider.messages.find(message => message.content.includes("/srv/prod"));
+			expect(ask?.content).toContain("/srv/staging");
+			expect(JSON.stringify(ask?.components)).toContain("Use /srv/prod");
+			expect(JSON.stringify(ask?.components)).toContain("Use /srv/staging");
+		});
+	});
+
+	test("refuses a replayed Discord notification that has no string body", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "see notes/todo.txt",
+			});
+			expect(conversation.threadId).toBeTruthy();
+			const threadId = conversation.threadId!;
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			for (const [suffix, content] of [
+				["bad-null", null],
+				["bad-number", 7],
+				["bad-object", { text: "hidden" }],
+			] as const) {
+				await journal.enqueue({
+					id: `notification:${threadId}:${suffix}`,
+					kind: "post-message",
+					transport: "discord",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: { threadId, content, nonce: suffix },
+				});
+			}
+			await journal.enqueue({
+				id: `notification:${threadId}:plain-status`,
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId, content: "status ok", nonce: "plain-status" },
+			});
+			await daemon.start();
+			expect(provider.messages.some(message => message.content === "status ok")).toBe(true);
+			expect(provider.messages.some(message => message.content == null || typeof message.content !== "string")).toBe(
+				false,
+			);
+			expect(provider.messages.some(message => message.content === "7")).toBe(false);
+			expect(JSON.stringify(provider.messages)).not.toContain("hidden");
+		});
+	});
+
+	test("scrubs a replayed Discord notification frame", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "see notes/todo.txt",
+			});
+			expect(provider.messages.some(message => message.content === "see notes/todo.txt")).toBe(true);
+			expect(conversation.endpointGeneration).toBe(1);
+			await new ChatEffectJournal({ agentDir, transport: "discord" }).enqueue({
+				id: `notification:${conversation.threadId}:legacy-frame`,
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					threadId: conversation.threadId,
+					content: "alert xoxb-secret-token at /home/alice/private/repo",
+					nonce: "legacy-frame-nonce",
+				},
+			});
+			await daemon.start();
+			const replayed = provider.messages.find(message => message.content.includes("alert"));
+			expect(replayed?.content).not.toContain("xoxb-secret-token");
+			expect(replayed?.content).not.toContain("/home/alice/private/repo");
+			await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "Choose /srv/prod or /srv/staging",
+				actionId: "ask-1",
+				options: ["Use /srv/prod", "Use /srv/staging"],
+			});
+			const ask = provider.messages.find(message => message.content.includes("/srv/prod"));
+			expect(ask?.content).toContain("/srv/staging");
+			expect(JSON.stringify(ask?.components)).toContain("Use /srv/prod");
+			expect(JSON.stringify(ask?.components)).toContain("Use /srv/staging");
+		});
+	});
+
 	test("completes recovery before Gateway delivery", async () => {
 		const commands: string[] = [];
 		await withDaemon(async (daemon, provider, agentDir) => {
@@ -2034,6 +2443,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						threadId: conversation.threadId!,
 						eventId: "recovered",
 						kind: "command",
+						authorId: "member",
 					},
 				},
 			});
@@ -2042,7 +2452,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				interaction: undefined,
 				content: "/sdk early",
 			};
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2098,7 +2508,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				},
 			});
 			await daemon.resolveAction("session", "ask");
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2154,7 +2564,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				options: ["Yes"],
 			});
 			expect(actionCustomIds.get(conversation.threadId!)).not.toBe(oldCustomId);
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2301,7 +2711,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				throw new Error("callback unavailable");
 			};
 			provider.startEvent = inbound(conversation.threadId!, "callback-health", 1);
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2336,7 +2746,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				}
 				return { sessionId, generation: 1, isCurrent: () => true, send: () => {}, sendMaintenance: () => {} };
 			};
-			const first = new DiscordNotificationDaemon({
+			const first = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2364,13 +2774,14 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						threadId: conversation.threadId!,
 						eventId: "leased-command",
 						kind: "command",
+						authorId: "member",
 					},
 				},
 			});
 			await journal.claim(leasedEffectId, "dead-worker", 10);
 			const commands: string[] = [];
 			const recoveryScheduler = new ManualLeaseRecoveryScheduler();
-			restarted = new DiscordNotificationDaemon({
+			restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2419,7 +2830,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await journal.claim(stoppedEffectId, "dead-worker", 10);
 			const stoppedCommands: string[] = [];
 			const stoppedRecoveryScheduler = new ManualLeaseRecoveryScheduler(0);
-			restarted = new DiscordNotificationDaemon({
+			restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2480,7 +2891,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					await fs.readFile(path.join(agentDir, "sdk", "daemons", "discord", "effects.json"), "utf8"),
 				).not.toContain("token-defer-response-lost");
 
-				const recovery = new DiscordNotificationDaemon({
+				const recovery = discordDaemon({
 					agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
@@ -2698,7 +3109,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			}
 			expect(await journal.read(effectId)).toMatchObject({ state: "terminal" });
 
-			const restarted = new DiscordNotificationDaemon({
+			const restarted = discordDaemon({
 				agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
@@ -2830,5 +3241,324 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			);
 			expect(new Set(archiveEffects.map(effect => effect.id)).size).toBe(2);
 		});
+	});
+
+	test("still allows a listed actor to submit /sdk control turn.prompt", async () => {
+		const commands: string[] = [];
+		await withDaemon(
+			async daemon => {
+				const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+				await daemon.handleInbound({
+					id: "listed-turn",
+					guildId: "guild",
+					parentId: "parent",
+					threadId: conversation.threadId!,
+					authorId: FIXTURE_ACTOR_ID,
+					content: TURN_PROMPT,
+				});
+				expect(commands).toEqual([TURN_PROMPT]);
+			},
+			{
+				onCommand: async (_sessionId, command) => {
+					commands.push(command);
+					return true;
+				},
+			},
+		);
+	});
+
+	test("drops an unlisted non-bot author's /sdk control turn.prompt", async () => {
+		const commands: string[] = [];
+		await withDaemon(
+			async (daemon, provider) => {
+				const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+				const before = provider.messages.length;
+				await daemon.handleInbound({
+					id: "unlisted-turn",
+					guildId: "guild",
+					parentId: "parent",
+					threadId: conversation.threadId!,
+					authorId: "stranger-200",
+					content: TURN_PROMPT,
+				});
+				expect(commands).toEqual([]);
+				expect(provider.messages.length).toBe(before);
+			},
+			{
+				onCommand: async (_sessionId, command) => {
+					commands.push(command);
+					return true;
+				},
+			},
+		);
+	});
+
+	test("still allows the actor named in the global discord config to submit /sdk control turn.prompt", async () => {
+		const commands: string[] = [];
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-actor-config-"));
+		let daemon: DiscordNotificationDaemon | undefined;
+		try {
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				'notifications:\n  discord:\n    authorizedUserId: "owner-100"\n',
+			);
+			const provider = new FakeDiscordProvider();
+			daemon = new DiscordNotificationDaemon({
+				agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					sessionId,
+					generation: expectedGeneration,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onCommand: async (_sessionId, command) => {
+					commands.push(command);
+					return true;
+				},
+			});
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await daemon.handleInbound({
+				id: "config-listed-turn",
+				guildId: "guild",
+				parentId: "parent",
+				threadId: conversation.threadId!,
+				authorId: "owner-100",
+				content: TURN_PROMPT,
+			});
+			expect(commands).toEqual([TURN_PROMPT]);
+		} finally {
+			await daemon?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("drops a non-bot /sdk control turn.prompt when that author is absent from the global discord config", async () => {
+		const commands: string[] = [];
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-actor-config-"));
+		let daemon: DiscordNotificationDaemon | undefined;
+		try {
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				'notifications:\n  discord:\n    authorizedUserIds:\n      - "owner-100"\n',
+			);
+			const provider = new FakeDiscordProvider();
+			daemon = new DiscordNotificationDaemon({
+				agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					sessionId,
+					generation: expectedGeneration,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onCommand: async (_sessionId, command) => {
+					commands.push(command);
+					return true;
+				},
+			});
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			const before = provider.messages.length;
+			await daemon.handleInbound({
+				id: "config-unlisted-turn",
+				guildId: "guild",
+				parentId: "parent",
+				threadId: conversation.threadId!,
+				authorId: "stranger-200",
+				content: TURN_PROMPT,
+			});
+			expect(commands).toEqual([]);
+			expect(provider.messages.length).toBe(before);
+		} finally {
+			await daemon?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("drops a command and a component action when discord actor config is missing", async () => {
+		await withConfigDaemon(undefined, async (daemon, agentDir, commands, frames) => {
+			await sendCommandAndAction(daemon, "owner-100");
+			expect(commands).toEqual([]);
+			expect(frames).toEqual([]);
+			expect(await inboundEffectIds(agentDir)).toEqual([]);
+		});
+	});
+
+	test("drops a command and a component action when the discord actor list is empty", async () => {
+		await withConfigDaemon(
+			"notifications:\n  discord:\n    authorizedUserIds: []\n",
+			async (daemon, agentDir, commands, frames) => {
+				await sendCommandAndAction(daemon, "owner-100");
+				expect(commands).toEqual([]);
+				expect(frames).toEqual([]);
+				expect(await inboundEffectIds(agentDir)).toEqual([]);
+			},
+		);
+	});
+
+	test("drops a command and a component action when the discord actor config cannot be read", async () => {
+		await withConfigDaemon("notifications: [\n", async (daemon, agentDir, commands, frames) => {
+			await sendCommandAndAction(daemon, "owner-100");
+			expect(commands).toEqual([]);
+			expect(frames).toEqual([]);
+			expect(await inboundEffectIds(agentDir)).toEqual([]);
+		});
+	});
+
+	test("drops a command and a component action when the explicit actor override is empty", async () => {
+		await withConfigDaemon(
+			'notifications:\n  discord:\n    authorizedUserId: "owner-100"\n',
+			async (daemon, agentDir, commands, frames) => {
+				await sendCommandAndAction(daemon, "owner-100");
+				expect(commands).toEqual([]);
+				expect(frames).toEqual([]);
+				expect(await inboundEffectIds(agentDir)).toEqual([]);
+			},
+			[],
+		);
+	});
+
+	test("still allows a command and a component action for an authorizedUserIds actor", async () => {
+		await withConfigDaemon(
+			'notifications:\n  discord:\n    authorizedUserIds:\n      - " owner-100 "\n',
+			async (daemon, _agentDir, commands, frames) => {
+				await sendCommandAndAction(daemon, "owner-100");
+				expect(commands).toEqual([TURN_PROMPT]);
+				expect(frames).toMatchObject([{ type: "reply", id: "ask", answer: "yes" }]);
+			},
+		);
+	});
+
+	test("startup recovery drops an authorless durable command and an authorless orphan", async () => {
+		const commands: string[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			const threadId = conversation.threadId!;
+			const receiptEffectId = await seedRecoveredCommand(agentDir, threadId, "authorless-receipt");
+			const orphanEffectId = await seedRecoveredCommand(agentDir, threadId, "authorless-orphan", undefined, false);
+			const before = provider.messages.length;
+			await recoverCommands(agentDir, provider, command => commands.push(command));
+			expect(commands).toEqual([]);
+			expect(provider.messages.length).toBe(before);
+			expect(JSON.stringify(provider.messages)).not.toContain("turn.prompt");
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			expect(await journal.read(receiptEffectId)).toMatchObject({
+				state: "terminal",
+				receipt: { status: "actor_unauthorized" },
+			});
+			expect(await journal.read(orphanEffectId)).toMatchObject({
+				state: "terminal",
+				receipt: { status: "actor_unauthorized" },
+			});
+		});
+	});
+
+	test("startup recovery drops a durable command whose author is not on the allowlist", async () => {
+		const commands: string[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await seedRecoveredCommand(agentDir, conversation.threadId!, "unlisted-recovery", "stranger-200");
+			const before = provider.messages.length;
+			await recoverCommands(agentDir, provider, command => commands.push(command));
+			expect(commands).toEqual([]);
+			expect(provider.messages.length).toBe(before);
+			expect(JSON.stringify(provider.messages)).not.toContain("turn.prompt");
+		});
+	});
+
+	test("still allows startup recovery of a listed actor command with surrounding whitespace", async () => {
+		const commands: string[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await seedRecoveredCommand(agentDir, conversation.threadId!, "listed-recovery", " member ");
+			await recoverCommands(agentDir, provider, command => commands.push(command));
+			expect(commands).toEqual([TURN_PROMPT]);
+		});
+	});
+
+	test("startup recovery drops an authorless deferred component action", async () => {
+		const commands: string[] = [];
+		const frames: Record<string, unknown>[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "Choose",
+				actionId: "ask",
+				options: ["Yes"],
+			});
+			const mapping = await new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" }).read(
+				`app:guild:parent:${conversation.threadId}`,
+			);
+			expect(mapping?.pendingActionNonce).toBeTruthy();
+			await seedDeferredAction(
+				agentDir,
+				conversation.threadId!,
+				"authorless-action",
+				mapping!.pendingActionId!,
+				mapping!.pendingActionNonce!,
+			);
+			await recoverCommands(agentDir, provider, command => commands.push(command), frames);
+			expect(commands).toEqual([]);
+			expect(frames).toEqual([]);
+		});
+	});
+
+	test("still allows startup recovery of a listed actor deferred component action", async () => {
+		const frames: Record<string, unknown>[] = [];
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				content: "Choose",
+				actionId: "ask",
+				options: ["Yes"],
+			});
+			const mapping = await new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" }).read(
+				`app:guild:parent:${conversation.threadId}`,
+			);
+			await seedDeferredAction(
+				agentDir,
+				conversation.threadId!,
+				"listed-action",
+				mapping!.pendingActionId!,
+				mapping!.pendingActionNonce!,
+				" member ",
+			);
+			await recoverCommands(agentDir, provider, () => {}, frames);
+			expect(frames).toMatchObject([{ type: "reply", id: "ask", answer: "yes" }]);
+		});
+	});
+
+	test.skipIf(
+		typeof DiscordDaemonApi.discordInboundActorAllowed !== "function" ||
+			typeof DiscordDaemonApi.discordActorIdsFromConfig !== "function",
+	)("property: discord actor allowlist membership, seed 69501, 64 inputs", () => {
+		const actorAllowed = DiscordDaemonApi.discordInboundActorAllowed;
+		const idsFromConfig = DiscordDaemonApi.discordActorIdsFromConfig;
+		const snowflake = fc.stringMatching(/^[1-9][0-9]{1,8}$/);
+		fc.assert(
+			fc.property(
+				snowflake,
+				fc.array(snowflake, { minLength: 0, maxLength: 4 }),
+				fc.boolean(),
+				(author, listed, includeAuthor) => {
+					const ids = includeAuthor ? [...listed, author] : listed.filter(id => id !== author);
+					const allowed = idsFromConfig({
+						notifications: { discord: { authorizedUserIds: ids.map(id => ` ${id} `) } },
+					});
+					expect(actorAllowed(author, allowed)).toBe(includeAuthor);
+					expect(actorAllowed("  ", allowed)).toBe(false);
+					expect(actorAllowed(author, new Set())).toBe(false);
+				},
+			),
+			{ seed: 69501, numRuns: 64 },
+		);
 	});
 });

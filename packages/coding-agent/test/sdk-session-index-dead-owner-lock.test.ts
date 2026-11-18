@@ -2,11 +2,16 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { acquireFileLock, FileLockAcquireError } from "../src/config/file-lock";
+import {
+	acquireFileLock,
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+	FileLockAcquireError,
+} from "../src/config/file-lock";
 import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 import { SessionIndex, sessionIndexStartupLockOptions } from "../src/sdk/broker/session-index";
 
 const holderFixture = path.join(import.meta.dir, "fixtures", "session-index-lock-holder.ts");
+const hostlessRemoverFixture = path.join(import.meta.dir, "fixtures", "hostless-lock-remover.ts");
 const roots: string[] = [];
 const children: Bun.Subprocess[] = [];
 
@@ -135,6 +140,33 @@ describe("session-index dead-owner reclaim", () => {
 		const { ms } = await openIndex(dir, 60_000);
 		expect(ms).toBeLessThan(2_000);
 		expect(await fs.exists(removing)).toBe(false);
+		expect(await fs.exists(`${file}.lock`)).toBe(false);
+	});
+
+	it("reclaims a quiescent .removing left by a hostless owner killed mid-release", async () => {
+		const dir = await makeAgentDir();
+		const file = indexPath(dir);
+		const child = Bun.spawn([process.execPath, hostlessRemoverFixture, file, "after-scrub"], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		children.push(child);
+		await child.exited;
+		expect(child.signalCode).toBe("SIGKILL");
+		const removing = `${file}.lock.removing`;
+		const record = (await Bun.file(`${removing}.owner`).json()) as { owner: LockInfo };
+		expect(record.owner.pid).toBe(child.pid);
+		expect(record.owner.owner_host_id).toBeUndefined();
+		const aged = new Date(Date.now() - FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS - 1_000);
+		for (const entry of await fs.readdir(removing)) await fs.utimes(path.join(removing, entry), aged, aged);
+		await fs.utimes(removing, aged, aged);
+		await fs.utimes(`${removing}.owner`, aged, aged);
+
+		const { ms } = await openIndex(dir, 60_000);
+		expect(ms).toBeLessThan(2_000);
+		expect(await fs.exists(removing)).toBe(false);
+		expect(await fs.exists(`${removing}.owner`)).toBe(false);
 		expect(await fs.exists(`${file}.lock`)).toBe(false);
 	});
 

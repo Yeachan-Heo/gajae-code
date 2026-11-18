@@ -1,13 +1,14 @@
 import { getAgentDir, VERSION } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClientError } from "../client/client";
+import { bounded, SdkClientError } from "../client/client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
+	SessionLifecycleMutationOperation,
 	SessionLifecycleMutationRequest,
-	SessionLifecycleOperation,
 	SessionLifecycleService,
 } from "../lifecycle/service";
+import { isSessionLifecycleMutationOperation } from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
@@ -162,30 +163,6 @@ function mcpOperationError(
 const MCP_LIFECYCLE_ACTOR = { id: "gjc-sdk-mcp", namespace: "sdk:mcp" } as const;
 const ROUTER_START_TIMEOUT_MS = 3_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
-type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
-
-function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
-}
-
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: NodeJS.Timeout | undefined;
-	const timeout = Promise.withResolvers<never>();
-	try {
-		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
-		return await Promise.race([promise, timeout.promise]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
-}
-
 class McpSessionListBrokerResponseError extends Error {
 	readonly #response: Arguments;
 
@@ -282,7 +259,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 	}
 
 	async function runLifecycle(
-		operation: LifecycleMutationOperation,
+		operation: SessionLifecycleMutationOperation,
 		input: Arguments,
 		requestKey: string,
 	): Promise<unknown> {
@@ -370,7 +347,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 					ok: false,
 					error: { code: "invalid_input", message: "idempotencyKey must be a non-empty string" },
 				};
-			if (isLifecycleOperation(operation) && !idempotencyKey)
+			if (isSessionLifecycleMutationOperation(operation) && !idempotencyKey)
 				return {
 					ok: false,
 					error: { code: "invalid_input", message: "idempotencyKey is required for lifecycle operations" },
@@ -381,7 +358,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 					await start();
 					return await paginatedSessionList(router, input);
 				}
-				if (!isLifecycleOperation(operation))
+				if (!isSessionLifecycleMutationOperation(operation))
 					return {
 						ok: false,
 						error: { code: "unknown_operation", message: `Unknown global operation: ${operation}` },

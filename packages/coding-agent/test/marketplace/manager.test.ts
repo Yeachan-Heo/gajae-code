@@ -648,7 +648,7 @@ describe("MarketplaceManager", () => {
 			expect(updates).toEqual([]);
 		});
 
-		it("checkForUpdates skips plugins with no catalog version", async () => {
+		it("checkForUpdates reports nothing when catalog has no version and manifest matches", async () => {
 			await ctx.manager.addMarketplace(FIXTURE_DIR);
 			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
 
@@ -661,6 +661,119 @@ describe("MarketplaceManager", () => {
 
 			const updates = await ctx.manager.checkForUpdates();
 			expect(updates).toEqual([]);
+		});
+
+		it("checkForUpdates falls back to the plugin manifest when the catalog entry has no version", async () => {
+			// Copy the fixture so the plugin manifest can be bumped without touching the repo.
+			const marketplaceDir = path.join(ctx.tmpDir, "versionless-marketplace");
+			fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
+			const catalogFile = path.join(marketplaceDir, ".claude-plugin", "marketplace.json");
+			const catalog = (await Bun.file(catalogFile).json()) as {
+				plugins: Array<Record<string, unknown>>;
+			};
+			delete catalog.plugins[0].version;
+			await Bun.write(catalogFile, `${JSON.stringify(catalog, null, 2)}\n`);
+
+			await ctx.manager.addMarketplace(marketplaceDir);
+			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+
+			const manifestFile = path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
+			const manifest = (await Bun.file(manifestFile).json()) as Record<string, unknown>;
+			await Bun.write(manifestFile, `${JSON.stringify({ ...manifest, version: "1.1.0" }, null, 2)}\n`);
+
+			const updates = await ctx.manager.checkForUpdates();
+			expect(updates).toEqual([
+				{ pluginId: "hello-plugin@test-marketplace", scope: "user", from: "1.0.0", to: "1.1.0" },
+			]);
+
+			const results = await ctx.manager.upgradeAllPlugins();
+			expect(results).toEqual([
+				{ pluginId: "hello-plugin@test-marketplace", scope: "user", from: "1.0.0", to: "1.1.0" },
+			]);
+			expect(await ctx.manager.checkForUpdates()).toEqual([]);
+		});
+
+		it("checkForUpdates reports nothing when neither the catalog nor the manifest declares a version", async () => {
+			const marketplaceDir = path.join(ctx.tmpDir, "unversioned-marketplace");
+			fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
+			const catalogFile = path.join(marketplaceDir, ".claude-plugin", "marketplace.json");
+			const catalog = (await Bun.file(catalogFile).json()) as {
+				plugins: Array<Record<string, unknown>>;
+			};
+			catalog.plugins[0].version = "nightly";
+			await Bun.write(catalogFile, `${JSON.stringify(catalog, null, 2)}\n`);
+
+			await ctx.manager.addMarketplace(marketplaceDir);
+			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+
+			// The catalog drops its version and the manifest never had one: no version evidence, no update.
+			const catalogPath = await getCatalogPath();
+			const cached = (await Bun.file(catalogPath).json()) as { plugins: Array<Record<string, unknown>> };
+			delete cached.plugins[0].version;
+			await Bun.write(catalogPath, `${JSON.stringify(cached, null, 2)}\n`);
+			const manifestFile = path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
+			const { version: _dropped, ...manifest } = (await Bun.file(manifestFile).json()) as Record<string, unknown>;
+			await Bun.write(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+
+			expect(await ctx.manager.checkForUpdates()).toEqual([]);
+		});
+
+		describe("untrusted manifest fallback", () => {
+			async function installVersionlessPlugin(): Promise<string> {
+				const marketplaceDir = path.join(ctx.tmpDir, "hostile-marketplace");
+				fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
+				await ctx.manager.addMarketplace(marketplaceDir);
+				await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+				// The catalog later drops its version, so update detection falls back to the manifest.
+				const catalogPath = await getCatalogPath();
+				const cached = (await Bun.file(catalogPath).json()) as { plugins: Array<Record<string, unknown>> };
+				delete cached.plugins[0].version;
+				await Bun.write(catalogPath, `${JSON.stringify(cached, null, 2)}\n`);
+				return path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
+			}
+
+			it.skipIf(process.platform === "win32")(
+				"ignores a manifest symlinked to a device instead of reading it forever",
+				async () => {
+					const manifestFile = await installVersionlessPlugin();
+					fs.rmSync(manifestFile);
+					fs.symlinkSync("/dev/zero", manifestFile);
+					expect(await ctx.manager.checkForUpdates()).toEqual([]);
+				},
+				5_000,
+			);
+
+			it.skipIf(process.platform === "win32")("ignores a manifest symlinked outside the plugin", async () => {
+				const manifestFile = await installVersionlessPlugin();
+				const outside = path.join(ctx.tmpDir, "outside-plugin.json");
+				await Bun.write(outside, JSON.stringify({ name: "hello-plugin", version: "9.9.9" }));
+				fs.rmSync(manifestFile);
+				fs.symlinkSync(outside, manifestFile);
+				expect(await ctx.manager.checkForUpdates()).toEqual([]);
+			});
+
+			it.skipIf(process.platform === "win32")("ignores a manifest reached through a symlinked parent", async () => {
+				const manifestFile = await installVersionlessPlugin();
+				const outsideDir = path.join(ctx.tmpDir, "outside-claude-plugin");
+				fs.mkdirSync(outsideDir);
+				await Bun.write(
+					path.join(outsideDir, "plugin.json"),
+					JSON.stringify({ name: "hello-plugin", version: "9.9.9" }),
+				);
+				const parent = path.dirname(manifestFile);
+				fs.rmSync(parent, { recursive: true });
+				fs.symlinkSync(outsideDir, parent);
+				expect(await ctx.manager.checkForUpdates()).toEqual([]);
+			});
+
+			it("ignores an oversized manifest", async () => {
+				const manifestFile = await installVersionlessPlugin();
+				await Bun.write(
+					manifestFile,
+					JSON.stringify({ name: "hello-plugin", version: "9.9.9", padding: "x".repeat(512 * 1024) }),
+				);
+				expect(await ctx.manager.checkForUpdates()).toEqual([]);
+			});
 		});
 
 		it("checkForUpdates handles missing catalog gracefully", async () => {

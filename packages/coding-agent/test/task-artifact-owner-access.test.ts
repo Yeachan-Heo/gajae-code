@@ -25,6 +25,7 @@ import {
 	type TaskArtifactOwnerLocator,
 	type TaskArtifactOwnerStorageContext,
 } from "../src/session/task-artifact-owner-codec";
+import { expectedDirectoryRoot } from "./helpers/managed-directory-root";
 
 interface OwnerFixture {
 	readonly root: string;
@@ -40,17 +41,6 @@ const fixtureRoots: string[] = [];
 afterEach(() => {
 	for (const root of fixtureRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-
-function expectedDirectoryRoot(pathname: string): ManagedDirectoryRoot {
-	const stat = fs.lstatSync(pathname, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("fixture_directory_invalid");
-	return {
-		canonicalPath: path.resolve(pathname),
-		dev: BigInt.asUintN(64, stat.dev),
-		ino: BigInt.asUintN(64, stat.ino),
-	};
-}
-
 async function makeOwnerFixture(): Promise<OwnerFixture> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "task-owner-access-"));
 	fixtureRoots.push(root);

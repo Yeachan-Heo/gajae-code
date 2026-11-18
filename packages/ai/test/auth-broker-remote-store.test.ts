@@ -48,6 +48,35 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 	let remote: RemoteAuthCredentialStore | undefined;
 	const token = "remote-store-bearer";
 
+	test("refuses a transport-disallowed MCP binding before the broker refresh RPC", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		// Isolate the presentation sidecar: the default path is a single shared
+		// file under the config root, and writing it here would leak into the
+		// usage-attribution tests that run after this one.
+		remote = new RemoteAuthCredentialStore({
+			client,
+			streamSnapshots: false,
+			presentationPath: path.join(tempDir, "presentations.json"),
+		});
+		await remote.refreshSnapshot();
+		const entry = remote.listAuthCredentials("anthropic")[0];
+		if (entry?.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		const rpc = vi.spyOn(client, "refreshMCPCredential");
+		// A direct store caller must not hand the broker a client secret for a
+		// binding the transport policy already refuses.
+		await expect(
+			remote.refreshMCPOAuthCredential(
+				entry.id,
+				{
+					...entry.credential,
+					mcpBinding: { resourceOrigin: "https://legacy.example", tokenEndpoint: "http://192.0.0.9/token" },
+				},
+				{ clientId: "legacy-client", clientSecret: "LEGACY_CLIENT_SECRET" },
+			),
+		).rejects.toThrow("cleartext HTTP is loopback-only");
+		expect(rpc).not.toHaveBeenCalled();
+	});
+
 	beforeEach(async () => {
 		for (const key of ANTHROPIC_ENV) {
 			savedEnv[key] = process.env[key];

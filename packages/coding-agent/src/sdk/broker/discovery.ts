@@ -530,6 +530,22 @@ export function heartbeatBrokerDiscoveryRetained(
 ): Promise<boolean> {
 	return publication.heartbeat(heartbeatAt);
 }
+
+/**
+ * Publication url the broker writes for itself: `ws://127.0.0.1:<port>` with an
+ * optional trailing slash, and that port equal to the record's port. The host
+ * field check stays; this is the url field beside it.
+ */
+const OWNED_LOOPBACK_WS_URL = /^ws:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/?$/;
+
+function ownedLoopbackBrokerUrl(url: unknown, port: unknown): boolean {
+	if (typeof url !== "string" || typeof port !== "number" || !Number.isSafeInteger(port)) return false;
+	const match = OWNED_LOOPBACK_WS_URL.exec(url);
+	if (!match) return false;
+	const parsed = Number(match[1]);
+	return parsed === port && parsed >= 1 && parsed <= 65_535;
+}
+
 export async function readBrokerDiscovery(
 	agentDir: string,
 	ttlMs = BROKER_HEARTBEAT_TTL_MS,
@@ -543,6 +559,7 @@ export async function readBrokerDiscovery(
 			d.version !== SDK_STATE_VERSION ||
 			d.protocolVersion !== 3 ||
 			d.host !== "127.0.0.1" ||
+			!ownedLoopbackBrokerUrl(d.url, d.port) ||
 			!d.token ||
 			!Number.isSafeInteger(d.pid) ||
 			d.pid <= 0 ||

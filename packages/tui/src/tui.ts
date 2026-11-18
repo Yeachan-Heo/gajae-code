@@ -115,6 +115,28 @@ const SEGMENT_RESET = "\x1b[0m";
  */
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const TERMINAL_TOKEN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]_P^X][\s\S]*?(?:\x07|\x1b\\)|[\s\S])?|[^\x1b]+/gu;
+
+/**
+ * Last OSC 8 control in effect at `column`, including ones emitted right before
+ * that cell. `extractSegments` drops non-SGR controls on its split boundary, so
+ * the splice re-emits this to keep a link open (or closed) across it.
+ */
+function hyperlinkAt(line: string, column: number): string {
+	if (!line.includes("\x1b]8;")) return "";
+	let hyperlink = "";
+	let cell = 0;
+	for (const [token] of line.matchAll(TERMINAL_TOKEN)) {
+		if (token.startsWith("\x1b]8;")) {
+			hyperlink = token;
+			continue;
+		}
+		const width = visibleWidth(token);
+		if (width > 0 && cell + width > column) break;
+		cell += width;
+	}
+	return hyperlink;
+}
 /** Discrete mouse-wheel notch size in terminal rows (xterm/less-style). */
 export const DEFAULT_WHEEL_LINES = 3;
 /** Row step cadence while a held drag rests on the transcript edge. */
@@ -4111,9 +4133,16 @@ export class TUI extends Container {
 			);
 			const after = columns.end < width ? sliceByColumn(rendered, columns.end, width - columns.end, false) : "";
 			const painted = `${before}\x1b[7m${selected}\x1b[27m${after}`;
-			const head = originColumn > 0 ? sliceByColumn(painted, 0, originColumn, false) : "";
-			const tail = originColumn < width ? sliceByColumn(painted, originColumn, width - originColumn, false) : "";
-			highlighted[lineIndex] = `${head}${originMarker}${tail}${annotationSuffix}`;
+			// Segment extraction keeps later reverse-video controls out of the prefix.
+			const { before: head, after: tail } = extractSegments(
+				painted,
+				originColumn,
+				originColumn,
+				width - originColumn,
+				false,
+			);
+			highlighted[lineIndex] =
+				`${head}${originMarker}${hyperlinkAt(painted, originColumn)}${tail}${annotationSuffix}`;
 		}
 		return highlighted;
 	}

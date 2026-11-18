@@ -56,6 +56,7 @@ function text(message: AgentMessage): string {
 function createHarness(
 	options: {
 		onConvert?: (messages: AgentMessage[]) => Promise<void>;
+		getApiKey?: () => Promise<string>;
 		onPayload?: () => void;
 		onResponse?: () => void;
 		onSseEvent?: () => void;
@@ -94,7 +95,7 @@ function createHarness(
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry: {
-			getApiKey: async () => "test-key",
+			getApiKey: options.getApiKey ?? (async () => "test-key"),
 			getAvailable: () => [model],
 			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
@@ -115,6 +116,47 @@ function createHarness(
 }
 
 describe("AgentSession ephemeral context", () => {
+	it("idle close rejects background provider admission before credential lookup", async () => {
+		const getApiKey = vi.fn(async () => "test-key");
+		const { session, model } = createHarness({ getApiKey });
+		session.prepareCloseIfIdle();
+		await expect(session.runEphemeralTurn({ promptText: "after close" })).rejects.toMatchObject({ code: "busy" });
+		expect(getApiKey).not.toHaveBeenCalled();
+		expect(model.calls).toHaveLength(0);
+	});
+	it("idle close refuses background credential preflight", async () => {
+		const key = Promise.withResolvers<string>();
+		const { session } = createHarness({ getApiKey: () => key.promise });
+		const pending = session.runEphemeralTurn({ promptText: "held" });
+		try {
+			expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+		} finally {
+			key.resolve("test-key");
+			await pending;
+		}
+	});
+	it("idle close keeps ownership of an aborted background credential lookup until real settlement", async () => {
+		const key = Promise.withResolvers<string>();
+		const { session, model } = createHarness({ getApiKey: () => key.promise });
+		const abort = new AbortController();
+		const pending = session.runEphemeralTurn({ promptText: "held", signal: abort.signal });
+		abort.abort();
+		await expect(pending).rejects.toBeDefined();
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+		key.resolve("test-key");
+		for (let i = 0; i < 50; i++) await Promise.resolve();
+		expect(model.calls).toHaveLength(0);
+		expect(() => session.prepareCloseIfIdle()).not.toThrow();
+	});
+	it("idle close rejects background injection without a reply", async () => {
+		const { session } = createHarness();
+		const before = structuredClone(session.messages);
+		session.prepareCloseIfIdle();
+		await expect(
+			session.respondAsBackground({ from: "test", message: "after close", awaitReply: false }),
+		).rejects.toMatchObject({ code: "busy" });
+		expect(session.messages).toEqual(before);
+	});
 	it("replays only text-visible retained exchanges without mutating session history", async () => {
 		const { session, model, snapshots, providerContexts } = createHarness();
 		const contextExchanges = [
@@ -149,6 +191,33 @@ describe("AgentSession ephemeral context", () => {
 		expect(session.messages).toEqual(sessionBefore);
 		expect(model.calls[0]?.context.tools).toEqual([]);
 		expect(model.calls[0]?.options?.toolChoice).toBe("none");
+	});
+
+	it("captures caller text before credential preflight yields", async () => {
+		const key = Promise.withResolvers<string>();
+		const { session, providerContexts, snapshots } = createHarness({ getApiKey: () => key.promise });
+		const contextExchanges = [{ question: "captured question", answer: "captured answer" }];
+		const capture = {
+			question: "captured current prompt",
+			scope: session.createBtwConversationScope("btw test instruction"),
+		};
+		const before = structuredClone(session.messages);
+		const turn = session.runEphemeralTurn({ purpose: "btw", turn: capture, contextExchanges });
+
+		capture.question = "mutated prompt";
+		contextExchanges[0]!.question = "mutated question";
+		contextExchanges[0]!.answer = "mutated answer";
+		contextExchanges.push({ question: "late question", answer: "late answer" });
+		key.resolve("test-key");
+		await turn;
+
+		expect(providerContexts[0]?.messages.map(message => `${message.role}:${text(message as AgentMessage)}`)).toEqual([
+			"user:captured question",
+			"assistant:captured answer",
+			"user:captured current prompt",
+		]);
+		expect(session.messages).toEqual(before);
+		expect(snapshots).toEqual([]);
 	});
 
 	it("marks tool-result images on a background ephemeral request and leaves user images", async () => {

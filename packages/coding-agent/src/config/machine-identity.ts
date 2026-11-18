@@ -135,7 +135,7 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 	const runCommand =
 		deps.runCommand ??
 		((command: string, args: readonly string[]) =>
-			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore" }));
+			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore", windowsHide: true }));
 
 	let rawId: string | undefined;
 	if (platform === "linux") {
@@ -153,8 +153,12 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 		const result = runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
 		if (result.exitCode === 0) rawId = parseWindowsMachineGuid(new TextDecoder().decode(result.stdout));
 	} else if (platform === "darwin") {
-		const result = runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
-		if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
+		try {
+			const result = runCommand("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
+			if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	} else {
 		throw new Error(`machine-local identity is unsupported on ${platform}`);
 	}

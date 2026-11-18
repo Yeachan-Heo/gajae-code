@@ -40,8 +40,8 @@ function watchdogUnavailable(error: unknown): Error {
 	});
 }
 
-function noteLiveWatchdogLost(): void {
-	if (!workerIsLive) return;
+function noteLiveWatchdogLost(worker: Worker): void {
+	if (!workerIsLive || liveWorker !== worker) return;
 	workerIsLive = false;
 	liveWorker = undefined;
 	workerReady = undefined;
@@ -151,14 +151,14 @@ function ensureWorker(): Promise<void> {
 			failBeforeReady(`publication liveness watchdog failed: ${message}`);
 			return;
 		}
-		noteLiveWatchdogLost();
+		noteLiveWatchdogLost(worker);
 	});
 	const onGone: EventListener = () => {
 		if (!settled) {
 			failBeforeReady("publication liveness watchdog closed before ready");
 			return;
 		}
-		noteLiveWatchdogLost();
+		noteLiveWatchdogLost(worker);
 	};
 	worker.addEventListener("close", onGone);
 	worker.addEventListener("exit", onGone);

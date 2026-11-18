@@ -10,6 +10,7 @@ import { loadCapability } from "../discovery";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import sshDescriptionBase from "../prompts/tools/ssh.md" with { type: "text" };
+import { escapePromptMetadata } from "../session/messages";
 import type { SessionArtifactPublication } from "../session/session-manager";
 import {
 	DEFAULT_MAX_BYTES,
@@ -73,7 +74,9 @@ async function formatHostEntry(host: SSHHost): Promise<string> {
 		shell = `unknown/${info.shell}`;
 	}
 
-	return `- ${host.name} (${host.host}) | ${shell}`;
+	// Names and destinations come from repository ssh.json. Encode them before
+	// interpolation so they stay on one line and cannot close <instruction>.
+	return `- ${escapePromptMetadata(host.name)} (${escapePromptMetadata(host.host)}) | ${shell}`;
 }
 
 async function formatDescription(hosts: SSHHost[]): Promise<string> {
@@ -82,7 +85,8 @@ async function formatDescription(hosts: SSHHost[]): Promise<string> {
 		return baseDescription;
 	}
 	const hostList = (await Promise.all(hosts.map(formatHostEntry))).join("\n");
-	return `${baseDescription}\n\nAvailable hosts:\n${hostList}`;
+	// Encode each entry first. Frame the finished list; this text is not truncated.
+	return `${baseDescription}\n\nAvailable hosts:\n${wrapUntrustedContent(hostList)}`;
 }
 
 function quoteRemotePath(value: string): string {
@@ -339,7 +343,8 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<SSHToolDetails>> {
 		if (!this.#allowedHosts.has(host)) {
-			throw new ToolError(`Unknown SSH host: ${host}. Available hosts: ${this.hostNames.join(", ")}`);
+			const listed = this.hostNames.map(name => escapePromptMetadata(name)).join(", ");
+			throw new ToolError(`Unknown SSH host: ${escapePromptMetadata(host)}. Available hosts: ${listed}`);
 		}
 
 		const hostConfig = this.hostsByName.get(host);

@@ -82,6 +82,13 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	resolveModel: ModelResolver;
 	/** Supplier for the source-backed model catalog used by `/v1/models`. */
 	listModels: () => Iterable<Model<Api>>;
+	/**
+	 * Live inbound bearer allow-list. When omitted, `bearerTokens` stays the
+	 * process snapshot. A non-empty result replaces that snapshot for later
+	 * requests, so a rotated token stops matching. An empty result or a thrown
+	 * read keeps the last non-empty set and does not open no-auth mode.
+	 */
+	currentBearerTokens?: (signal: AbortSignal) => ReadonlySet<string> | Promise<ReadonlySet<string>>;
 }
 
 export interface AuthGatewayModelCatalog {
@@ -667,9 +674,23 @@ async function markManagedGatewayCredentialFailure(
 		}
 		if (trigger.class === "auth") {
 			await storage.invalidateCredentialMatching(model.provider, apiKey, signal);
-		} else if (trigger.class === "quota" || trigger.class === "rate_limit" || trigger.class === "credential") {
+		} else if (trigger.class === "quota" || trigger.class === "rate_limit") {
+			// A concurrency-limited (too_many_concurrent_requests) failure does not indicate
+			// the credential is rate-limited or unhealthy; it only means the account hit the
+			// concurrent request ceiling. Skip credential backoff for concurrency-limited
+			// failures so the same credential can be retried after a brief wait via the
+			// managed fallback controller, without being biased away by usage-limit backoff.
+			if (!trigger.concurrencyLimited) {
+				await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
+					retryAfterMs: trigger.retryAfterMs,
+				});
+			}
+		} else if (trigger.class === "credential") {
+			// An account-specific model rejection leaves the account usable for
+			// other models, so the backoff is scoped to the rejected model.
 			await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
 				retryAfterMs: trigger.retryAfterMs,
+				modelId: model.id,
 			});
 		} else {
 			return;
@@ -695,11 +716,11 @@ async function markManagedGatewayCredentialFailure(
 /**
  * Records a provider-confirmed account-specific model rejection against the
  * leased credential on the ordinary (non-managed) gateway path. The leased
- * account is excluded from future selection so later requests stop picking the
- * same model-incompatible account, but the credential is never invalidated: it
- * may still serve other models. Never returns a replacement key — the current
- * request surfaces the provider's own error and the next lease picks another
- * credential.
+ * account is excluded from future selection for the rejected model so later
+ * requests stop picking the same model-incompatible account, but the
+ * credential is never invalidated and stays selectable for other models.
+ * Never returns a replacement key — the current request surfaces the
+ * provider's own error and the next lease picks another credential.
  */
 async function markUnmanagedGatewayCredentialModelFailure(
 	storage: AuthStorage,
@@ -718,6 +739,7 @@ async function markUnmanagedGatewayCredentialModelFailure(
 	try {
 		await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
 			retryAfterMs: trigger.retryAfterMs,
+			modelId: model.id,
 		});
 		logger.debug("auth-gateway recorded credential model rejection", {
 			format,
@@ -1278,8 +1300,24 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	if (catalog.models.length === 0) {
 		throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
 	}
-	const tokens = new Set<string>(opts.bearerTokens);
-	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
+	const bootTokens = new Set<string>(opts.bearerTokens);
+	assertAuthenticatedOrLoopback(bind, bootTokens.size, "auth-gateway");
+	let acceptedTokens: ReadonlySet<string> = bootTokens;
+	const tokensFor = async (signal: AbortSignal): Promise<ReadonlySet<string>> => {
+		const load = opts.currentBearerTokens;
+		if (!load || signal.aborted) return acceptedTokens;
+		try {
+			const live = await load(signal);
+			if (!signal.aborted && live.size > 0) acceptedTokens = new Set(live);
+		} catch (error) {
+			if (!signal.aborted) {
+				logger.warn("auth-gateway bearer reload failed", {
+					error: cleanReason(error) ?? "bearer reload failed",
+				});
+			}
+		}
+		return acceptedTokens;
+	};
 	const version = opts.version;
 
 	let listenPort = bind.port;
@@ -1287,6 +1325,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		hostname: bind.hostname,
 		port: bind.port,
 		fetch: async (req): Promise<Response> => {
+			const tokens = await tokensFor(req.signal);
 			const url = new URL(req.url);
 			const pathname = url.pathname;
 			const peer = resolvePeer(req);

@@ -57,7 +57,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-editor-component-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "starReminder.enabled": false } });
 		authStorage = await AuthStorage.create(":memory:");
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");

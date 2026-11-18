@@ -2,6 +2,112 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Added
+
+- Bundled Claude Fable 5.2 (`claude-fable-5-2`) for the Anthropic API, Amazon Bedrock (`us.` and `global.` inference profiles; AWS documents no in-region endpoint), and the gateway providers that list it, at Anthropic's published $8/$40 per MTok pricing.
+
+- Bundled `gemini-4-carbon` (Gemini 4 Carbon) in the `google`, `google-gemini-cli`, and `google-vertex` providers, with `google-level` thinking (`low`, `medium`, `high`) and models.dev pricing ($2/$10 per 1M tokens, $0.10 cache read) (#7745).
+
+### Fixed
+
+- A provider's cached model list in `models.db` is now rewritten after a successful models.dev fetch even when the stored row was written under a different discovery provenance, so `/model` lists newly published models (such as `anthropic/claude-fable-5-2`) instead of keeping an old snapshot forever. The rewrite uses compare-and-swap and is skipped when another writer changed the row concurrently (#7748).
+
+- Anthropic model discovery now lists `/v1/models`. The registry passes the provider's transport origin (`https://api.anthropic.com`, to which the Messages client appends `/v1/messages`), and discovery appended only `/models`, so every refresh hit `https://api.anthropic.com/models`, got a 404, and kept serving the bundled catalog: models opened on an account after the release (for example `claude-fable-5-2`) never appeared in `/model`. Discovery now appends `/v1` to the path (keeping any query and never doubling an existing `/v1`), and discovered models keep the transport origin as their `baseUrl`, including ids that have no bundled or models.dev reference.
+
+- A discovered Claude model that neither the bundled catalog nor models.dev lists yet now borrows its capabilities (reasoning, input, context window, output limit, pricing) from the newest same-family catalog model whose version is not above its own, and its thinking levels are derived from its own id. Previously such a model was registered as non-reasoning with placeholder limits, so `/model` offered no thinking levels for it. Only plain release ids (`claude-<family>-<version>`, optionally with a snapshot date) take part on both sides, so a product variant such as `-fast` neither lends nor borrows; id-specific pricing tiers are not copied. The borrowed price and limits are an estimate until the catalog or models.dev lists the model, and an exact reference replaces them on the next successful listing (a failed listing keeps serving the cached row, as it does for every discovered provider). Ids outside a recognized Claude family, product variants, and ids older than every catalog model of their family keep the generic defaults.
+
+- `GJC_DEBUG_ANTIGRAVITY_DISCOVERY=1` printed the discovery endpoint verbatim, so a custom `GOOGLE_ANTIGRAVITY_BASE_URL` carrying proxy credentials or a query key leaked them to stderr. The dump now prints the same origin-only form the debug logger already used. The variable is now documented in `docs/environment-variables.md`.
+
+- Claude Fable 5.1+ now advertise auto-only tool choice, so forced `tool_choice` requests downgrade to `auto` instead of returning Anthropic's 400 error.
+- Fable requests drop `temperature`, `top_p`, and `top_k`, which every Fable model rejects with a 400 error. Bedrock Converse requests for Fable, Opus 4.7+, and Haiku 5+ also omit `temperature` and `topP` from `inferenceConfig`.
+- Direct Anthropic Fable usage, including date-pinned ids from runtime discovery, prices 1-hour cache writes at twice the input rate instead of the 5-minute rate.
+- Amazon Bedrock Fable models advertise `max` thinking effort, which AWS documents for Converse; it was capped at `high`.
+- Amazon Bedrock no longer advertises `eu.anthropic.claude-fable-5-1`; AWS lists no EU Geo inference profile for Fable 5.1/5.2, so EU callers use the `global.` profile.
+- Direct Anthropic Claude Fable 5.2 advertises `max` effort alongside `xhigh`.
+
+- OpenAI-compatible completions providers normalize an SDK connection timeout before response headers to the typed first-event timeout for every provider, not only Alibaba Token Plan. A slow relay that timed out before headers produced an untyped error that the managed fallback chain classified as `other`, so the task failed instead of retrying or failing over.
+
+## [0.20.0] - 2026-11-08
+
+### Added
+
+- The default Anthropic transport accepts a synchronous `onProviderDispatch` hook that observes or vetoes the final request. The hook receives an independent copy taken after payload transforms and compression; if it throws, the request is rejected before network I/O and is not retried. Custom clients are not observed, and transforms inside a custom `fetch` are not covered.
+
+- `gpt-image-2.6-sunburst` and `gpt-image-2.6-flare` are in the bundled catalog under `openai` and `openai-codex`, with the same image-only shape as `gpt-image-2`, so a provider-qualified image role can select them.
+
+### Fixed
+
+- Codex ChatGPT-account model rejections that the backend labels `code=model_not_found` (instead of `invalid_request_error`) are flagged as credential-specific again, so the session rotates once to the next unpinned OAuth account instead of ending the turn with the raw provider error. A `model_not_found` without the ChatGPT-account wording is unchanged (#7604).
+- auth-gateway: a credential-specific model rejection now backs off the leased credential only for the rejected model on both the managed and ordinary paths, so the same account keeps serving other models; quota and rate-limit failures keep their credential-wide backoff. `AuthStorage.markUsageLimitReachedMatching` accepts an optional `modelId` for this scope (#7604).
+
+- Image-only models no longer send a chat Responses request. They remain available for the image role.
+
+- Claude Sonnet 5.5 cache reads on the direct Anthropic API and Bedrock are priced at 0.05x input ($0.10/MTok, $0.11 for the regional premium) instead of Sonnet 5's $0.20, so usage cost totals no longer overstate Sonnet 5.5.
+
+- A rejected tool call no longer echoes the caller's arguments. The validation failure used to end with `Received arguments:` and a copy of the whole payload — files, paths, free text and any credential a caller put in an argument — which then reached the transcript and every journal that stores errors. The message now ends with `Rejected fields:` and the paths that were rejected (bounded to 12, then `… and N more`), which is what repairs the call; the per-issue lines still name the constraint without repeating the value.
+
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Accept a supplied endpoint configuration in generic, simple and direct OpenAI, Azure, Anthropic/Foundry/ZCode and Vertex calls, including credential preflight, while credentials and ADC remain live/shared.
+
+### Fixed
+
+- Google Cloud Code Assist streams (`google-gemini-cli` and `google-antigravity`, e.g. `gemini-4-argon`) now use a 300-second idle window instead of the shared 120-second default. Cloud Code Assist sends a `functionCall` part only after the whole call is generated, so a large `bash`/`write` tool call left minutes of silence after the preceding text and the turn failed with `Provider stream stalled while waiting for the next event`, discarding the streamed output (#7474). `PI_STREAM_IDLE_TIMEOUT_MS` and an explicit `streamIdleTimeoutMs` still take precedence.
+
+- Kiro (OAuth and `ksk_` API key) now requests native reasoning through `additionalModelRequestFields` instead of a prompt-tag imitation:
+  - Claude Opus/Sonnet 4.6+ and 5.x, plus Kimi K3, get adaptive thinking with `output_config.effort`.
+  - GPT 5.6 gets `reasoning.effort`, and an explicit off sends `effort: "none"`.
+  - Other models keep the prompt fallback (#7405).
+- Kiro streams now parse `reasoningContentEvent` into thinking blocks and replay the returned `signature` or `redactedContent` on later assistant turns (#7405).
+
+- OpenRouter models use the long-context rates OpenRouter publishes in `pricing.overrides` (for example `openai/*` above 272K input tokens), so cost estimates above the threshold are no longer billed at the base rate.
+
+- Preserve caller fetch transports and OAuth credential type through simple dispatch, and keep explicit endpoints authoritative except canonical OpenAI OAuth routing.
+- Exclude project-dotenv-only Vertex project/location values from credential preflight, matching the provider's trusted routing policy.
+
+### Bug Fixes
+
+- auth-storage: Apply model-scoped backoff in both OAuth resolution branches to prevent model-specific quota exhaustion from blocking other models' access to the same credential
+- auth-storage: `isCredentialAvailable` accepts the requested model id so AgentSession rotation and compaction no longer skip credentials whose backoff is scoped to another model
+- auth-storage: Exhausted usage limits without a usable reset time keep their scope — a reset-less wide limit still blocks the whole credential and a reset-less model-scoped limit blocks only its model — and a reported wide limit is no longer narrowed to the failing model by `markUsageLimitReached`
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Added
+
+- GPT-6.1 Terra model support with pricing ($1/$5 standard, $2/$7.50 long-context, $0.05/$0.10 cache). Terra is the cheaper and newer successor to GPT-5.6 Terra.
+
+### Fixed
+
+- Grouped Google Antigravity usage limits into their shared quota pools (`Claude / GPT-OSS`, `Gemini Argon`, and `Gemini`), classified 5-hour versus 7-day weekly reset windows, and registered an Antigravity ranking strategy so credential ranking and preference caps evaluate each model pool independently (#7267).
+- Versioned the Google Antigravity usage-report cache identity (`|schema:2`) so cache rows written before the 5h/7d window split and quota-pool separation are never read back by a newer binary; provider-scoped cache purges still match both key shapes (#7267).
+
+- An auth broker with a bearer reader applies that allow-list on the next request, and a replaced bearer is refused without restarting the process.
+
+- The auth gateway applies a replaced inbound bearer on the next request instead of keeping the boot snapshot.
+
+- Cursor prompt history frames tool-result text as untrusted content and neutralizes reserved control tokens in that text.
+
+- Honor cancellation while fetching GitLab Duo direct-access tokens and forward caller first-event and idle stream watchdog settings to all GitLab Duo inference backends.
+
+- An OAuth callback that does not carry this login's state returns 400 and leaves the in-flight login waiting.
+
+- Cancel and release Ollama response readers after terminal chunks or parsing failures without waiting for stalled transport cleanup.
+
+- OpenCodex model discovery resolves `OPENCODEX_HOME` from the launching shell and user-owned env files, so a project `.env` cannot choose `runtime-port.json`. A rejected live value is removed from the process environment. Later Bun spawns set that name to the trusted directory captured at the first rejection, or to empty when none is trusted, so a later discovery and a child working directory cannot restore an older rejected value.
+
+- Orphan Responses and Codex tool outputs are escaped and framed as user notes after the length cap.
+
+- Anthropic Sonnet 5 and later now send adaptive `thinking.display: "summarized"`, matching Opus 4.7+, Fable and Haiku 5+. They default `display` to `"omitted"`, so without the opt-in thinking tokens were billed but no thinking content streamed back.
+
+- The local usage cache stores the presentation usage report, without the provider raw payload.
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

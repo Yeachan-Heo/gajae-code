@@ -1,0 +1,4 @@
+### Fixed
+
+- Hook import migration now validates the hooks directory root is a real directory (not a symlink or regular file) before planning to generate hook modules, matching the safety checks already in place for skills and commands. Without `--force`, unsafe destinations are skipped; with `--force`, they fail with a clear error. This prevents the migration from planning to write hooks to unsafe locations that could escape the project, and allows timeouts or permission denials during native discovery to be handled gracefully (#7847).
+- Hook import migration now properly distinguishes between I/O errors (like permission denied) and destination structure errors (like a file where a directory should be), reporting `failed_invalid_destination` for structure errors to match the semantics of other migration types.

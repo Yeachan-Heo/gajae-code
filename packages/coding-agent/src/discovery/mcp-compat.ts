@@ -9,7 +9,7 @@
  * foreign files are never implicit competing runtime authorities, and user-home
  * (`~/.claude`, `~/.codex`) configuration is never scanned.
  */
-import { tryParseJson } from "@gajae-code/utils";
+import { isRecord, tryParseJson } from "@gajae-code/utils";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadResult, SourceMeta } from "../capability/types";
 import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
@@ -20,10 +20,6 @@ const PROVIDER_IDS = {
 } as const;
 
 const PROTOTYPE_SENSITIVE_SERVER_NAMES = new Set(["__proto__", "prototype", "constructor"]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isStringRecord(value: unknown): value is Record<string, string> {
 	return isRecord(value) && Object.values(value).every(item => typeof item === "string");

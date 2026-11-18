@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * `buildAnthropicClientOptions()` installs Foundry CA and mTLS material from
@@ -25,18 +25,7 @@ interface ResolvedTls {
 	env: Record<(typeof TLS_KEYS)[number], string | null>;
 }
 
-const tempDirs: string[] = [];
-
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-foundry-tls-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { projectDir } = createTrustTempDirs("gjc-foundry-tls-trust-");
 
 async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<ResolvedTls> {
 	const env: Record<string, string> = {};

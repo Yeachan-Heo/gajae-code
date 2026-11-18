@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
 import {
-	CURRENT_SESSION_VERSION,
 	loadEntriesFromFile,
 	parseSessionEntries,
 	type SessionHeader,

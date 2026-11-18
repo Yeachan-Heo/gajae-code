@@ -1,4 +1,5 @@
 import { Container, type SelectItem, SelectList, Spacer, Text, truncateToWidth } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import {
 	applyGjcBundleUpdate,
 	type GjcLifecycleContext,
@@ -24,6 +25,11 @@ import { sanitizeStatusText } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
 const MAX_RUNTIME_FINDING_DISPLAY_WIDTH = 120;
+
+/** Registry strings are one row. Keep each newline as a space, then drop controls. */
+function bundleRowText(value: string): string {
+	return sanitizeText(value).replace(/\n/g, " ");
+}
 
 /** Injectable lifecycle boundary; Settings never reads registries or executes bundle code. */
 export interface GjcBundleLifecyclePort {
@@ -151,7 +157,11 @@ export class GjcBundleSettingsComponent extends Container {
 				break;
 			case "error":
 				this.#renderActionList([
-					{ value: "retry", label: "Retry", description: this.#message ?? "Unable to load GJC bundles." },
+					{
+						value: "retry",
+						label: "Retry",
+						description: this.#message ? bundleRowText(this.#message) : "Unable to load GJC bundles.",
+					},
 				]);
 				break;
 			case "empty":
@@ -211,8 +221,8 @@ export class GjcBundleSettingsComponent extends Container {
 						: "runtime current";
 			return {
 				value: identityKey(bundle.identity),
-				label: `${bundle.identity.name} (${bundle.identity.scope})`,
-				description: `v${bundle.version} · ${intent}${quarantine} · ${effective}`,
+				label: `${bundleRowText(bundle.identity.name)} (${bundleRowText(bundle.identity.scope)})`,
+				description: `v${bundleRowText(bundle.version)} · ${intent}${quarantine} · ${effective}`,
 			};
 		});
 		this.#renderActionList(items);
@@ -226,21 +236,38 @@ export class GjcBundleSettingsComponent extends Container {
 			return;
 		}
 		this.addChild(
-			new Text(theme.fg("muted", `  ${bundle.identity.name} (${bundle.identity.scope}) · v${bundle.version}`), 0, 0),
+			new Text(
+				theme.fg(
+					"muted",
+					`  ${bundleRowText(bundle.identity.name)} (${bundleRowText(bundle.identity.scope)}) · v${bundleRowText(bundle.version)}`,
+				),
+				0,
+				0,
+			),
 		);
-		if (bundle.description) this.addChild(new Text(theme.fg("muted", `  ${bundle.description}`), 0, 0));
-		this.addChild(new Text(theme.fg("dim", `  Source: ${bundle.source.display}`), 0, 0));
-		if (bundle.source.ref) this.addChild(new Text(theme.fg("dim", `  Ref: ${bundle.source.ref}`), 0, 0));
-		if (bundle.source.sha) this.addChild(new Text(theme.fg("dim", `  SHA: ${bundle.source.sha}`), 0, 0));
+		if (bundle.description)
+			this.addChild(new Text(theme.fg("muted", `  ${bundleRowText(bundle.description)}`), 0, 0));
+		this.addChild(new Text(theme.fg("dim", `  Source: ${bundleRowText(bundle.source.display)}`), 0, 0));
+		if (bundle.source.ref)
+			this.addChild(new Text(theme.fg("dim", `  Ref: ${bundleRowText(bundle.source.ref)}`), 0, 0));
+		if (bundle.source.sha)
+			this.addChild(new Text(theme.fg("dim", `  SHA: ${bundleRowText(bundle.source.sha)}`), 0, 0));
 		this.addChild(
-			new Text(theme.fg("dim", `  Installed: ${bundle.installedAt} · Updated: ${bundle.updatedAt}`), 0, 0),
+			new Text(
+				theme.fg(
+					"dim",
+					`  Installed: ${bundleRowText(bundle.installedAt)} · Updated: ${bundleRowText(bundle.updatedAt)}`,
+				),
+				0,
+				0,
+			),
 		);
 		if (!bundle.source.updatable) {
 			this.addChild(
 				new Text(
 					theme.fg(
 						"warning",
-						`  Update unsupported: ${bundle.source.unsupportedReason ?? "This source cannot be refreshed."}`,
+						`  Update unsupported: ${bundleRowText(bundle.source.unsupportedReason ?? "This source cannot be refreshed.")}`,
 					),
 					0,
 					0,
@@ -264,7 +291,7 @@ export class GjcBundleSettingsComponent extends Container {
 				);
 			}
 		}
-		if (this.#message) this.addChild(new Text(theme.fg("warning", `  ${this.#message}`), 0, 0));
+		if (this.#message) this.addChild(new Text(theme.fg("warning", `  ${bundleRowText(this.#message)}`), 0, 0));
 		const actions: SelectItem[] = [];
 		if (bundle.enabled || !bundle.quarantined) {
 			actions.push({
@@ -283,7 +310,7 @@ export class GjcBundleSettingsComponent extends Container {
 			const action = surface.enabled ? "disable" : surface.quarantined ? "blocked" : "enable";
 			actions.push({
 				value: `surface:${surface.extensionId}:${action}`,
-				label: `${surface.name} (${surface.kind})`,
+				label: `${bundleRowText(surface.name)} (${bundleRowText(surface.kind)})`,
 				description: `${surface.enabled ? "enabled" : "disabled"}${surface.quarantined ? " · quarantined" : ""}`,
 			});
 		}
@@ -293,8 +320,23 @@ export class GjcBundleSettingsComponent extends Container {
 	#renderUpdateReview(): void {
 		const preview = this.#preview;
 		if (!preview) return;
-		this.addChild(new Text(theme.fg("muted", `  ${preview.identity.name} (${preview.identity.scope})`), 0, 0));
-		this.addChild(new Text(theme.fg("muted", `  v${preview.current.version} → v${preview.candidateVersion}`), 0, 0));
+		this.addChild(
+			new Text(
+				theme.fg("muted", `  ${bundleRowText(preview.identity.name)} (${bundleRowText(preview.identity.scope)})`),
+				0,
+				0,
+			),
+		);
+		this.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					`  v${bundleRowText(preview.current.version)} → v${bundleRowText(preview.candidateVersion)}`,
+				),
+				0,
+				0,
+			),
+		);
 		this.addChild(
 			new Text(
 				theme.fg(

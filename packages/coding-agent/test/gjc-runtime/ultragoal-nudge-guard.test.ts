@@ -34,6 +34,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-succession";
 import { assertUltragoalAskAllowed } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
 import { YAML } from "bun";
+import { mulberry32 } from "../helpers/seeded-random";
 
 const TEST_SESSION_ID = "ultragoal-nudge-guard-test-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
@@ -73,17 +74,6 @@ const GENERATED_GOAL_STATUSES = [
 	"review_blocked",
 	"superseded",
 ] as const;
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let value = state;
-		value = Math.imul(value ^ (value >>> 15), value | 1);
-		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-		return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-	};
-}
 
 /** Hand off `goalIds` to a successor run by planting the source's ownership fence on disk. */
 async function plantFence(cwd: string, goalIds: string[]): Promise<void> {

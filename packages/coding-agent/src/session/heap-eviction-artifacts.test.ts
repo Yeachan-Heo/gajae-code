@@ -6,9 +6,10 @@ import * as path from "node:path";
 import type { ToolResultMessage } from "@gajae-code/ai/core";
 import { ArtifactProtocolHandler } from "../internal-urls/artifact-protocol";
 import { parseInternalUrl } from "../internal-urls/parse";
+import { CURRENT_SESSION_VERSION } from "../sdk/session-readonly/format";
 import type { EvictedToolOutputHandle } from "../tools/output-meta";
 import { ArtifactManager } from "./artifacts";
-import { CURRENT_SESSION_VERSION, loadEntriesFromFile, parseSessionEntries, SessionManager } from "./session-manager";
+import { loadEntriesFromFile, parseSessionEntries, SessionManager } from "./session-manager";
 import { DEFAULT_ARTIFACT_MAX_BYTES } from "./streaming-output";
 
 function toolResult(text: string, details?: unknown): ToolResultMessage {

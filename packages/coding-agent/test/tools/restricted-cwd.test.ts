@@ -1,12 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, symlink } from "node:fs/promises";
+import { mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertCwdInsideWorkspace } from "../../src/tools/restricted-cwd";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 describe("assertCwdInsideWorkspace", () => {
 	it("allows the workspace and rejects a directory outside it", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "restricted-cwd-"));
+		const root = await tempDirs.mkdtemp(path.join(tmpdir(), "restricted-cwd-"));
 		const workspace = path.join(root, "repo");
 		const outside = path.join(root, "outside");
 		await mkdir(workspace);

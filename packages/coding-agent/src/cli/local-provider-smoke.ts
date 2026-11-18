@@ -1,3 +1,4 @@
+import { isRecord } from "@gajae-code/utils";
 import chalk from "chalk";
 import { ModelsConfigFile } from "../config/model-registry";
 import type { ModelsConfig } from "../config/models-config-schema";
@@ -79,10 +80,6 @@ interface ClassifiedFailure {
 
 const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_SMOKE_PROMPT = "Reply with ok.";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
 
 function resolveApiKey(apiKey: string | undefined, apiKeyEnv: string | undefined): string | undefined {
 	if (apiKeyEnv) return Bun.env[apiKeyEnv];

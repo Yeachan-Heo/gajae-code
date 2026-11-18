@@ -1424,6 +1424,7 @@ describe("provider slash command", () => {
 			{
 				session: {
 					modelRegistry: {
+						getError: () => undefined,
 						refresh: async (mode: string) => {
 							refreshedMode = mode;
 						},
@@ -1463,7 +1464,7 @@ describe("provider slash command", () => {
 		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
 		expect(command?.handle).toBeTruthy();
 		const runtime = {
-			session: { modelRegistry: { refresh: async () => undefined } },
+			session: { modelRegistry: { refresh: async () => undefined, getError: () => undefined } },
 			sessionManager: {},
 			settings: {},
 			cwd: process.cwd(),
@@ -1514,7 +1515,7 @@ describe("provider slash command", () => {
 				text: "/provider add",
 			},
 			{
-				session: { modelRegistry: { refresh: async () => undefined } },
+				session: { modelRegistry: { refresh: async () => undefined, getError: () => undefined } },
 				sessionManager: {},
 				settings: {},
 				cwd: process.cwd(),
@@ -1535,7 +1536,7 @@ describe("provider slash command", () => {
 		const outputs: string[] = [];
 		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
 		const runtime = {
-			session: { modelRegistry: { refresh: async () => undefined } },
+			session: { modelRegistry: { refresh: async () => undefined, getError: () => undefined } },
 			sessionManager: {},
 			settings: {},
 			cwd: process.cwd(),
@@ -1582,7 +1583,7 @@ describe("provider slash command", () => {
 		setAgentDir(tempAgentDir);
 		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
 		const runtime = {
-			session: { modelRegistry: { refresh: async () => undefined } },
+			session: { modelRegistry: { refresh: async () => undefined, getError: () => undefined } },
 			sessionManager: {},
 			settings: {},
 			cwd: process.cwd(),

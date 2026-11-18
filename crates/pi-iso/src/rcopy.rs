@@ -120,8 +120,53 @@ fn is_git_worktree(path: &Path) -> bool {
 	std::fs::symlink_metadata(path.join(".git")).is_ok()
 }
 
+fn strip_ascii_prefix_ignore_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+	let (head, tail) = name.split_at_checked(prefix.len())?;
+	head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
+fn digits_after(rest: &str, prefix: &str) -> bool {
+	let Some(digits) = strip_ascii_prefix_ignore_case(rest, prefix) else {
+		return false;
+	};
+	!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// `GIT_CONFIG_{COUNT,PARAMETERS,GLOBAL,SYSTEM,KEY_n,VALUE_n}` in any ASCII
+/// case.
+fn is_git_config_channel(name: &str) -> bool {
+	let Some(rest) = strip_ascii_prefix_ignore_case(name, "GIT_CONFIG_") else {
+		return false;
+	};
+	rest.eq_ignore_ascii_case("COUNT")
+		|| rest.eq_ignore_ascii_case("PARAMETERS")
+		|| rest.eq_ignore_ascii_case("GLOBAL")
+		|| rest.eq_ignore_ascii_case("SYSTEM")
+		|| digits_after(rest, "KEY_")
+		|| digits_after(rest, "VALUE_")
+}
+
+/// Explicit environment for an isolation `git` child.
+///
+/// Project dotenv is already in this process, and this spawn is not the
+/// filtered TypeScript git helper. The channel can set `core.hooksPath`.
+/// The child gets a copy of the process environment with those names
+/// removed. `GIT_AUTHOR_NAME` and `GIT_CONFIG_NOSYSTEM` stay.
+pub(crate) fn git_process_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+	std::env::vars_os()
+		.filter(|(key, _)| key.to_str().is_none_or(|name| !is_git_config_channel(name)))
+		.collect()
+}
+
+fn git_command(program: &Path) -> std::process::Command {
+	let mut command = std::process::Command::new(program);
+	command.env_clear();
+	command.envs(git_process_env());
+	command
+}
+
 fn git_worktree_add(lower: &Path, merged: &Path) -> IsoResult<()> {
-	let output = std::process::Command::new("git")
+	let output = git_command(Path::new("git"))
 		.arg("-C")
 		.arg(lower)
 		.args(["worktree", "add", "--detach"])
@@ -147,7 +192,7 @@ fn git_worktree_add(lower: &Path, merged: &Path) -> IsoResult<()> {
 }
 
 fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
-	let output = std::process::Command::new("git")
+	let output = git_command(Path::new("git"))
 		.arg("-C")
 		.arg(merged)
 		.args(["worktree", "remove", "--force"])
@@ -211,7 +256,7 @@ fn seed_dirty_state(lower: &Path, merged: &Path) -> IsoResult<()> {
 }
 
 fn git_capture(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
-	let output = std::process::Command::new("git")
+	let output = git_command(Path::new("git"))
 		.arg("-C")
 		.arg(cwd)
 		.args(args)
@@ -249,7 +294,7 @@ fn git_apply_with_program(
 	extra: &[&str],
 ) -> IsoResult<()> {
 	use std::io::{Read as _, Write as _};
-	let mut child = std::process::Command::new(program)
+	let mut child = git_command(program)
 		.arg("-C")
 		.arg(cwd)
 		.args(["apply", "--binary", "--whitespace=nowarn"])

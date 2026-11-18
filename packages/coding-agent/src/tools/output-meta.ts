@@ -808,6 +808,80 @@ function hasOuterUntrustedFence(text: string): boolean {
 	);
 }
 
+function fenceLineCount(text: string): number {
+	let lines = 1;
+	for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lines++;
+	return lines;
+}
+
+function hideFenceCloser(value: string): string {
+	return value.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
+}
+
+/** Fence whose opener the tail cut removed. Null when every opener is still in the tail. */
+function splitFenceAt(text: string, cut: number): { bodyStart: number; bodyEnd: number; closeEnd: number } | null {
+	let search = 0;
+	while (search <= cut && search < text.length) {
+		const openStart = text.indexOf(UNTRUSTED_FENCE_OPEN, search);
+		if (openStart < 0 || openStart >= cut) return null;
+		const bodyStart = openStart + UNTRUSTED_FENCE_OPEN.length;
+		const bodyEnd = text.indexOf(UNTRUSTED_FENCE_CLOSE, bodyStart);
+		if (bodyEnd < 0) return null;
+		const closeEnd = bodyEnd + UNTRUSTED_FENCE_CLOSE.length;
+		if (cut < closeEnd) return { bodyStart, bodyEnd, closeEnd };
+		search = closeEnd;
+	}
+	return null;
+}
+
+/**
+ * Put the opener back when the line budget and the byte budget both have
+ * room for the tags, the trusted suffix, and one body line. Lines before
+ * the cut stay dropped. If either budget is short, the unfenced plain tail
+ * is returned instead of an empty fence.
+ */
+function repairSplitFenceTail(
+	fullText: string,
+	truncated: TruncationResult,
+	options: { maxBytes: number; maxLines: number },
+): TruncationResult {
+	if (!truncated.truncated || !fullText.endsWith(truncated.content)) return truncated;
+	const cut = fullText.length - truncated.content.length;
+	const split = splitFenceAt(fullText, cut);
+	if (!split) return truncated;
+	const retained = cut < split.bodyEnd ? fullText.slice(Math.max(cut, split.bodyStart), split.bodyEnd) : "";
+	const suffix = fullText.slice(Math.max(cut, split.closeEnd));
+	const escaped = hideFenceCloser(retained);
+	if (escaped.length === 0) return truncated;
+	const shellLines = fenceLineCount(`${UNTRUSTED_FENCE_OPEN}.${UNTRUSTED_FENCE_CLOSE}${suffix}`) - 1;
+	let bodyLines = options.maxLines - shellLines;
+	const tagBytes =
+		Buffer.byteLength(UNTRUSTED_FENCE_OPEN, "utf-8") + Buffer.byteLength(UNTRUSTED_FENCE_CLOSE, "utf-8");
+	const innerBytes = options.maxBytes - tagBytes - Buffer.byteLength(suffix, "utf-8");
+	if (bodyLines < 1 || innerBytes < 1) return truncated;
+	let fitted: string | undefined;
+	while (bodyLines >= 1) {
+		const body = truncateTail(escaped, { maxBytes: innerBytes, maxLines: bodyLines }).content;
+		if (body.length === 0) break;
+		const content = `${UNTRUSTED_FENCE_OPEN}${body}${UNTRUSTED_FENCE_CLOSE}${suffix}`;
+		const over = fenceLineCount(content) - options.maxLines;
+		if (over <= 0 && Buffer.byteLength(content, "utf-8") <= options.maxBytes) {
+			fitted = content;
+			break;
+		}
+		if (over <= 0) break;
+		bodyLines -= over;
+	}
+	if (!fitted) return truncated;
+	return {
+		...truncated,
+		content: fitted,
+		truncated: true,
+		outputLines: fenceLineCount(fitted),
+		outputBytes: Buffer.byteLength(fitted, "utf-8"),
+	};
+}
+
 /**
  * Tail truncation keeps a suffix, so an outer untrusted-content fence loses its
  * opening tag. Reapply that fence around the retained body. Embedded closing
@@ -818,7 +892,7 @@ function truncateTailKeepingUntrustedFence(
 	options: { maxBytes: number; maxLines: number },
 ): TruncationResult {
 	const truncated = truncateTail(fullText, options);
-	if (!hasOuterUntrustedFence(fullText)) return truncated;
+	if (!hasOuterUntrustedFence(fullText)) return repairSplitFenceTail(fullText, truncated, options);
 	if (truncated.content.startsWith(UNTRUSTED_FENCE_OPEN) && truncated.content.endsWith(UNTRUSTED_FENCE_CLOSE)) {
 		return truncated;
 	}

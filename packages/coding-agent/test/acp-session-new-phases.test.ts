@@ -10,7 +10,7 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 
 setDefaultTimeout(20_000);
 
-type Fixture = { agent: AcpAgent; cwd: string; dispose: () => void };
+type Fixture = { agent: AcpAgent; cwd: string; requests: Record<string, unknown>[]; dispose: () => void };
 
 async function createFixture(attachFails: boolean): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@acp-new-phases-");
@@ -19,6 +19,7 @@ async function createFixture(attachFails: boolean): Promise<Fixture> {
 	const sessionId = "new-phases-session";
 	const token = "new-phases-token";
 	const abort = new AbortController();
+	const requests: Record<string, unknown>[] = [];
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -34,6 +35,18 @@ async function createFixture(attachFails: boolean): Promise<Fixture> {
 			async message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				if (frame.type === "broker_request") {
+					requests.push(frame);
+					if (frame.operation === "broker.status") {
+						socket.send(
+							JSON.stringify({
+								type: "broker_response",
+								id: frame.id,
+								ok: true,
+								result: { capabilities: { ephemeralSessions: true } },
+							}),
+						);
+						return;
+					}
 					if (frame.operation === "session.create") {
 						const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 						await fs.mkdir(path.dirname(endpointPath), { recursive: true });
@@ -136,6 +149,7 @@ async function createFixture(attachFails: boolean): Promise<Fixture> {
 	return {
 		agent,
 		cwd,
+		requests,
 		dispose: () => {
 			abort.abort();
 			server.stop(true);
@@ -145,12 +159,82 @@ async function createFixture(attachFails: boolean): Promise<Fixture> {
 }
 
 describe("ACP newSession phase timing", () => {
+	it("advertises extension understanding and preserves temporary initial attach and close", async () => {
+		const fixture = await createFixture(false);
+		try {
+			const initialized = await fixture.agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			expect(initialized._meta).toMatchObject({ gjc: { ephemeralSessions: true } });
+			const response = await fixture.agent.newSession({
+				cwd: fixture.cwd,
+				mcpServers: [],
+				_meta: { gjc: { ephemeral: true } },
+			});
+			expect(fixture.requests.find(request => request.operation === "session.create")?.input).toMatchObject({
+				ephemeral: true,
+			});
+			const existing = { sessionId: response.sessionId, cwd: fixture.cwd, mcpServers: [] };
+			const requestsBefore = fixture.requests.length;
+			await expect(fixture.agent.loadSession(existing)).rejects.toMatchObject({ code: "operation_prohibited" });
+			await expect(fixture.agent.resumeSession(existing)).rejects.toMatchObject({ code: "operation_prohibited" });
+			expect(fixture.requests).toHaveLength(requestsBefore);
+			await expect(fixture.agent.closeSession({ sessionId: response.sessionId })).resolves.toEqual({});
+			expect(fixture.requests.filter(request => request.operation === "session.close")).toHaveLength(1);
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("rejects nonboolean temporary intent before any broker mutation", async () => {
+		const fixture = await createFixture(false);
+		try {
+			for (const ephemeral of [null, "true", 1, {}, []]) {
+				await expect(
+					fixture.agent.newSession({
+						cwd: fixture.cwd,
+						mcpServers: [],
+						_meta: { gjc: { ephemeral } },
+					}),
+				).rejects.toMatchObject({ code: "invalid_input" });
+			}
+			expect(fixture.requests).toHaveLength(0);
+		} finally {
+			fixture.dispose();
+		}
+	});
+
+	it("treats explicit false as ordinary creation", async () => {
+		const fixture = await createFixture(false);
+		try {
+			const response = await fixture.agent.newSession({
+				cwd: fixture.cwd,
+				mcpServers: [],
+				_meta: { gjc: { ephemeral: false } },
+			});
+			expect(fixture.requests.find(request => request.operation === "session.create")?.input).not.toHaveProperty(
+				"ephemeral",
+			);
+			expect(fixture.requests.some(request => request.operation === "broker.status")).toBe(false);
+			await expect(
+				fixture.agent.resumeSession({
+					sessionId: response.sessionId,
+					cwd: fixture.cwd,
+					mcpServers: [],
+				}),
+			).resolves.toBeDefined();
+		} finally {
+			fixture.dispose();
+		}
+	});
+
 	it("logs one success event with all phase durations", async () => {
 		const fixture = await createFixture(false);
 		const debug = vi.spyOn(logger, "debug").mockImplementation(() => {});
 		try {
 			const response = await fixture.agent.newSession({ cwd: fixture.cwd, mcpServers: [] });
 			expect(response.sessionId).toBe("new-phases-session");
+			expect(fixture.requests.find(request => request.operation === "session.create")?.input).not.toHaveProperty(
+				"ephemeral",
+			);
 			const entries = debug.mock.calls.filter(([event]) => event === "acp_session_new_phases");
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.[1]).toMatchObject({ outcome: "ok", sessionId: response.sessionId });

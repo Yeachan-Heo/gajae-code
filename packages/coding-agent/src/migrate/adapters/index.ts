@@ -5,6 +5,7 @@
  * instruction candidates, and source-level diagnostics. Adapters never connect to
  * anything.
  */
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
@@ -47,12 +48,87 @@ export function getAdapter(source: MigrateSource): Adapter {
 	return ADAPTERS[source];
 }
 
+const SOURCE_READ_FLAGS =
+	fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0);
+
+/** Lexical containment after `path.resolve`. Symlink checks are separate. */
+export function migrateSourceInsideRoot(root: string, target: string): boolean {
+	const relative = path.relative(path.resolve(root), path.resolve(target));
+	return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function unsafeSource(message: string): NodeJS.ErrnoException {
+	return Object.assign(new Error(message), { code: "EUNSAFE" });
+}
+
+/**
+ * Resolve `target` without following a symlink at or below `root`.
+ * The root itself may be a symlink (a project opened through a linked path).
+ * Without `root`, return the path so the read can follow a final symlink.
+ * Codex and OpenCode pass no root; Claude Code passes a project or home root.
+ */
+async function locateSource(target: string, root: string | undefined, kind: "file" | "dir"): Promise<string> {
+	const resolved = path.resolve(target);
+	if (root === undefined) return resolved;
+	if (!migrateSourceInsideRoot(root, resolved)) throw unsafeSource(`source escapes root: ${resolved}`);
+	const relative = path.relative(path.resolve(root), resolved);
+	const parts = relative === "" ? [] : relative.split(path.sep).filter(part => part !== "" && part !== ".");
+	let current = path.resolve(root);
+	if (parts.length === 0) {
+		if (kind === "dir") return current;
+		throw unsafeSource(`source is not a regular file: ${resolved}`);
+	}
+	for (const [index, part] of parts.entries()) {
+		current = path.join(current, part);
+		const stat = await fs.lstat(current);
+		if (stat.isSymbolicLink()) throw unsafeSource(`refusing to follow symlink: ${current}`);
+		const last = index === parts.length - 1;
+		if (!last && !stat.isDirectory()) throw unsafeSource(`source ancestor is not a real directory: ${current}`);
+		if (last && kind === "file" && !stat.isFile()) throw unsafeSource(`source is not a regular file: ${current}`);
+		if (last && kind === "dir" && !stat.isDirectory())
+			throw unsafeSource(`source is not a real directory: ${current}`);
+	}
+	return current;
+}
+
+async function readRegularSource(filePath: string, root?: string): Promise<string> {
+	// No-follow applies only when a project or home root is passed. Rootless
+	// reads keep the previous `readFile` follow (Codex and OpenCode configs).
+	if (root === undefined) return fs.readFile(filePath, "utf-8");
+	const openPath = await locateSource(filePath, root, "file");
+	const handle = await fs.open(openPath, SOURCE_READ_FLAGS);
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile()) throw unsafeSource(`source is not a regular file: ${openPath}`);
+		return await handle.readFile("utf-8");
+	} finally {
+		await handle.close();
+	}
+}
+
+function sourceReadDiagnostic(
+	error: unknown,
+	filePath: string,
+	source: MigrateSource,
+	type: SourceDiagnostic["type"],
+	absent: string,
+): SourceDiagnostic {
+	if (isEnoent(error)) return { source, type, status: "skipped_absent_source", message: absent };
+	return {
+		source,
+		type,
+		status: "failed_io",
+		message: `failed to read ${filePath}: ${(error as Error).message}`,
+	};
+}
+
 /** Collect one source instruction file without interpreting or rewriting its content. */
 export async function collectInstructionFile(
 	filePath: string,
 	source: MigrateSource,
+	root?: string,
 ): Promise<{ candidates: InstructionCandidate[]; diagnostics: SourceDiagnostic[] }> {
-	const read = await readSourceText(filePath, source, "instruction");
+	const read = await readSourceText(filePath, source, "instruction", root);
 	if ("diagnostic" in read) return { candidates: [], diagnostics: [read.diagnostic] };
 	return {
 		candidates: [{ source, name: path.basename(filePath), content: read.text }],
@@ -65,23 +141,12 @@ export async function readSourceText(
 	filePath: string,
 	source: MigrateSource,
 	type: SourceDiagnostic["type"],
+	root?: string,
 ): Promise<{ text: string } | { diagnostic: SourceDiagnostic }> {
 	try {
-		return { text: await fs.readFile(filePath, "utf-8") };
+		return { text: await readRegularSource(filePath, root) };
 	} catch (error) {
-		if (isEnoent(error)) {
-			return {
-				diagnostic: { source, type, status: "skipped_absent_source", message: `no ${type} config at ${filePath}` },
-			};
-		}
-		return {
-			diagnostic: {
-				source,
-				type,
-				status: "failed_io",
-				message: `failed to read ${filePath}: ${(error as Error).message}`,
-			},
-		};
+		return { diagnostic: sourceReadDiagnostic(error, filePath, source, type, `no ${type} config at ${filePath}`) };
 	}
 }
 
@@ -93,20 +158,14 @@ export async function readOptionalJson(
 	filePath: string,
 	source: MigrateSource,
 	type: SourceDiagnostic["type"],
+	root?: string,
 ): Promise<{ data: Record<string, unknown> } | { diagnostic: SourceDiagnostic } | { absent: true }> {
 	let text: string;
 	try {
-		text = await fs.readFile(filePath, "utf-8");
+		text = await readRegularSource(filePath, root);
 	} catch (error) {
 		if (isEnoent(error)) return { absent: true };
-		return {
-			diagnostic: {
-				source,
-				type,
-				status: "failed_io",
-				message: `failed to read ${filePath}: ${(error as Error).message}`,
-			},
-		};
+		return { diagnostic: sourceReadDiagnostic(error, filePath, source, type, `no ${type} config at ${filePath}`) };
 	}
 	return parseSourceJson(text, filePath, source, type);
 }
@@ -145,11 +204,13 @@ export function parseSourceJson(
 export async function collectSkillDir(
 	dir: string,
 	source: MigrateSource,
+	root?: string,
 ): Promise<{ candidates: SkillCandidate[]; diagnostics: SourceDiagnostic[] }> {
 	const candidates: SkillCandidate[] = [];
 	const diagnostics: SourceDiagnostic[] = [];
 	let entries: string[];
 	try {
+		if (root !== undefined) await locateSource(dir, root, "dir");
 		const dirents = await fs.readdir(dir, { withFileTypes: true });
 		entries = dirents.filter(d => d.isDirectory()).map(d => d.name);
 	} catch (error) {
@@ -173,7 +234,7 @@ export async function collectSkillDir(
 
 	for (const name of entries.sort()) {
 		const skillFile = `${dir}/${name}/SKILL.md`;
-		const read = await readSourceText(skillFile, source, "skill");
+		const read = await readSourceText(skillFile, source, "skill", root);
 		if ("diagnostic" in read) {
 			// A subdir without SKILL.md is simply not a skill; only surface non-absent errors.
 			if (read.diagnostic.status !== "skipped_absent_source") diagnostics.push(read.diagnostic);
@@ -313,9 +374,18 @@ function importedAgentTools(raw: unknown, warnings: string[]): string[] | undefi
 export async function collectMarkdownAgents(
 	dir: string,
 	source: MigrateSource,
+	root?: string,
 ): Promise<{ candidates: AgentCandidate[]; diagnostics: SourceDiagnostic[] }> {
 	const candidates: AgentCandidate[] = [];
 	const diagnostics: SourceDiagnostic[] = [];
+	if (root !== undefined) {
+		try {
+			await locateSource(dir, root, "dir");
+		} catch (error) {
+			diagnostics.push(sourceReadDiagnostic(error, dir, source, "agent", `no agents dir at ${dir}`));
+			return { candidates, diagnostics };
+		}
+	}
 	const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error: unknown) => {
 		if (isEnoent(error)) {
 			diagnostics.push({
@@ -340,7 +410,7 @@ export async function collectMarkdownAgents(
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
 		const entryPath = path.join(dir, entry.name);
-		const read = await readSourceText(entryPath, source, "agent");
+		const read = await readSourceText(entryPath, source, "agent", root);
 		if ("diagnostic" in read) {
 			diagnostics.push(read.diagnostic);
 			continue;
@@ -389,15 +459,23 @@ export async function collectMarkdownAgents(
 export async function collectMarkdownCommands(
 	dir: string,
 	source: MigrateSource,
-	options: { recursive?: boolean } = {},
+	options: { recursive?: boolean; root?: string } = {},
 ): Promise<{ candidates: SlashCommandCandidate[]; diagnostics: SourceDiagnostic[] }> {
 	const candidates: SlashCommandCandidate[] = [];
 	const diagnostics: SourceDiagnostic[] = [];
 	const validNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-	async function walk(currentDir: string, parentSegments: string[], root = false): Promise<void> {
+	async function walk(currentDir: string, parentSegments: string[], listingRoot = false): Promise<void> {
+		if (listingRoot && options.root !== undefined) {
+			try {
+				await locateSource(currentDir, options.root, "dir");
+			} catch (error) {
+				diagnostics.push(sourceReadDiagnostic(error, dir, source, "command", `no commands dir at ${dir}`));
+				return;
+			}
+		}
 		const entries = await fs.readdir(currentDir, { withFileTypes: true }).catch((error: unknown) => {
-			if (root && isEnoent(error)) {
+			if (listingRoot && isEnoent(error)) {
 				diagnostics.push({
 					source,
 					type: "command",
@@ -436,7 +514,7 @@ export async function collectMarkdownCommands(
 				continue;
 			}
 
-			const read = await readSourceText(entryPath, source, "command");
+			const read = await readSourceText(entryPath, source, "command", options.root);
 			if ("diagnostic" in read) {
 				diagnostics.push(read.diagnostic);
 				continue;
