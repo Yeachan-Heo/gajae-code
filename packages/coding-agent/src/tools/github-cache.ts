@@ -480,9 +480,11 @@ const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$
 function tableRowFlags(lines: string[]): boolean[] {
 	const flags = new Array<boolean>(lines.length).fill(false);
 	const fenced = new Array<boolean>(lines.length).fill(false);
+	// Splitting on "\n" leaves "\r" on CRLF input, and "." does not match it.
+	const rows = lines.map(line => line.replace(/\r$/, ""));
 	let opener: { marker: string; length: number } | null = null;
 	for (let i = 0; i < lines.length; i++) {
-		const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(lines[i] ?? "");
+		const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(rows[i] ?? "");
 		if (opener === null) {
 			if (match) {
 				const marker = match[1] ?? "";
@@ -504,19 +506,19 @@ function tableRowFlags(lines: string[]): boolean[] {
 	}
 	for (let i = 0; i < lines.length; i++) {
 		if (fenced[i] === true) continue;
-		const trimmed = (lines[i] ?? "").trim();
+		const trimmed = (rows[i] ?? "").trim();
 		if (trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"))) flags[i] = true;
 	}
 	let covered = -1;
 	for (let i = 1; i < lines.length; i++) {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
-		if (!TABLE_DELIMITER_ROW.test(lines[i] ?? "") || !(lines[i - 1] ?? "").includes("|")) continue;
+		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
 		flags[i - 1] = true;
 		flags[i] = true;
 		let j = i + 1;
 		for (; j < lines.length; j++) {
 			if (fenced[j] === true) break;
-			const row = lines[j] ?? "";
+			const row = rows[j] ?? "";
 			if (row.trim() === "" || !row.includes("|")) break;
 			flags[j] = true;
 		}
