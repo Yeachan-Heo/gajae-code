@@ -443,7 +443,9 @@ function maskParameterizedAuthValues(text: string): string {
 			const quote = slashes > 0 && slashes % 2 === 1 ? text[valueStart + slashes] : "";
 			if (quote === '"' || quote === "'") {
 				const lineEnd = text.indexOf("\n", valueStart);
-				end = lineEnd === -1 ? text.length : lineEnd;
+				const limit = lineEnd === -1 ? text.length : lineEnd;
+				const cookieContainer = /\s+cookie\s*:\s*[[{]/i.exec(text.slice(valueStart, limit));
+				end = cookieContainer ? valueStart + cookieContainer.index : limit;
 			} else {
 				while (end < text.length && !/[\s,;]/.test(text[end])) end++;
 			}
