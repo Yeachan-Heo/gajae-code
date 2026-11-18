@@ -879,6 +879,7 @@ describe("github view cache persistence", () => {
 			'# "token": ["dummy|split"]\n---|---\nhttps://cache-user:demo|opaque@example.test/x',
 			"+https://example-user:demo-password@example.test/x\n-https://example-user:other-password@example.test/y",
 			"-/home/demo-user/config",
+			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
@@ -915,6 +916,9 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).not.toContain("other-password");
 		expect(cached?.payload.body).not.toContain("sample-pass");
 		expect(cached?.payload.body).not.toContain("/home/demo-user");
+		expect(cached?.payload.body).not.toContain("alpha|beta");
+		expect(cacheFileBytes()).not.toContain("dummy|split");
+		expect(cacheFileBytes()).not.toContain("alpha|beta");
 		expect(cached?.payload.body).not.toContain("opaque");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});

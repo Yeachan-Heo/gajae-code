@@ -561,8 +561,9 @@ function tableRowFlags(lines: string[]): boolean[] {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
 		if (isIndentedCode(i) || isIndentedCode(i - 1)) continue;
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
-		// A heading, list item, or blockquote is a block, not a table header.
-		if (/^ {0,3}(?:#{1,6}(?:\s|$)|[-+*]\s|\d+[.)]\s|>)/.test(rows[i - 1] ?? "")) continue;
+		// A heading, list item, or blockquote is a block, not a table header,
+		// including when nested at a list content baseline.
+		if (/^(?:#{1,6}(?:\s|$)|[-+*]\s|\d+[.)]\s|>)/.test((rows[i - 1] ?? "").trimStart())) continue;
 		// GFM requires the header and delimiter to declare the same cell count;
 		// a prose line that happens to contain a pipe is not a header.
 		const cellsOf = (row: string): number => {
