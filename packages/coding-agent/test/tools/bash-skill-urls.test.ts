@@ -2164,6 +2164,32 @@ describe("bash session agent directory", () => {
 					});
 					expect(textOf(proseValue)).toContain(await realpath(tabRule));
 				}
+				// An elided apostrophe (`'twas`) must not open a run that hides the real
+				// double-quoted field: the control character in the path is refused.
+				const controlRule = path.join(project, "ctrl\u0001.md");
+				await writeFile(controlRule, "control-rule");
+				setActiveRules([
+					{ name: "tabbed", path: tabRule, content: "tabbed", _source: ruleSource(tabRule) },
+					{ name: "ctrl", path: controlRule, content: "control", _source: ruleSource(controlRule) },
+				]);
+				await expect(
+					tool.execute("call-env-elision-shadow", {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: '# \'tis a comment\r\nfile: "prefix rule://ctrl suffix"' },
+					}),
+				).rejects.toThrow(/would change the value's quoting/);
+				// An elision and a possessive around a bare URL are prose, not a run.
+				const elision = await tool.execute("call-env-elision-tab", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: "'Twas rule://tabbed and the owners' choice" },
+				});
+				expect(textOf(elision)).toContain(await realpath(tabRule));
+				// A candidate the consumer reads as an escape is not a URL at all.
+				const escaped = await tool.execute("call-env-escaped-tab", {
+					command: 'printf "%s" "$PAYLOAD"',
+					env: { PAYLOAD: '{"message":"prefix \\rule://tabbed"}' },
+				});
+				expect(textOf(escaped)).toContain("\\rule://tabbed");
 				// A lone apostrophe in prose is not a quoted run, so the same path is
 				// accepted there instead of being refused as quoted data.
 				const prose = await tool.execute("call-env-prose-tab", {

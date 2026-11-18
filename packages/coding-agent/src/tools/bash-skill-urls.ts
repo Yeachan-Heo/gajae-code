@@ -787,70 +787,40 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
  */
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
-const WORD_CHARACTER = /[\p{L}\p{N}\p{M}_]/u;
-
 /**
- * The character next to `index` as a whole code point, so an astral letter is one
- * neighbour instead of two surrogate halves.
- */
-function neighbourAt(value: string, index: number, step: -1 | 1): string | undefined {
-	if (step === -1) {
-		if (index === 0) return undefined;
-		const unit = value.charCodeAt(index - 1);
-		if (unit >= 0xdc00 && unit <= 0xdfff && index >= 2) return value.slice(index - 2, index);
-		return value[index - 1];
-	}
-	if (index + 1 >= value.length) return undefined;
-	const unit = value.charCodeAt(index + 1);
-	if (unit >= 0xd800 && unit <= 0xdbff) return value.slice(index + 1, index + 3);
-	return value[index + 1];
-}
-
-/**
- * True when the character at `index` delimits a quoted run in a data value. A
- * double quote always does. An apostrophe inside a word (`it's`, `owners'`,
- * `cafe\u0301's`) is prose: it opens a run only at a word start and closes it
- * only at a word end, which is how a contraction or a possessive is written.
- */
-function isDataQuote(value: string, index: number, opening: boolean): boolean {
-	const character = value[index];
-	if (character === '"') return true;
-	if (character !== "'") return false;
-	const neighbour = neighbourAt(value, index, opening ? -1 : 1);
-	return !(neighbour !== undefined && WORD_CHARACTER.test(neighbour));
-}
-
-/**
- * The quote character enclosing `index` when that run also closes after the
- * match, or `undefined`. A data value is not shell text: an apostrophe inside a
- * word is prose, and a value with balanced-looking quotes can hide the closer
- * behind an escaped quote. Both are decided with the same escape rules used to
- * find the opener instead of by counting characters.
+ * True when `index` sits inside a double-quoted run that closes after it. Data
+ * values quote structurally with double quotes (JSON, YAML); an apostrophe is
+ * prose in contractions, possessives, and elisions (`it's`, `owners'`,
+ * `'twas`), so it never delimits here and cannot shadow a real quote. A quote
+ * behind a backslash is escaped, not a delimiter.
  */
 function enclosingClosedQuote(value: string, index: number): string | undefined {
-	let opened: string | undefined;
+	let inside = false;
 	for (let i = 0; i < index; i++) {
 		const character = value[i];
-		if (opened === undefined) {
-			if (isDataQuote(value, i, true)) opened = character;
-			continue;
-		}
-		if (character === "\\" && opened === '"') {
+		if (character === "\\") {
 			i++;
 			continue;
 		}
-		if (character === opened && isDataQuote(value, i, false)) opened = undefined;
+		if (character === '"') inside = !inside;
 	}
-	if (opened === undefined) return undefined;
+	if (!inside) return undefined;
 	for (let i = index; i < value.length; i++) {
 		const character = value[i];
-		if (character === "\\" && opened === '"') {
+		if (character === "\\") {
 			i++;
 			continue;
 		}
-		if (character === opened && isDataQuote(value, i, false)) return opened;
+		if (character === '"') return '"';
 	}
 	return undefined;
+}
+
+/** True when a backslash immediately before `index` escapes it (odd run). */
+function escapedAt(value: string, index: number): boolean {
+	let count = 0;
+	for (let i = index - 1; i >= 0 && value[i] === "\\"; i--) count++;
+	return count % 2 === 1;
 }
 
 function assertFitsQuotedValue(resolvedPath: string, quoted: boolean): void {
@@ -892,6 +862,9 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 
 		const rawUrl = unquoteToken(token);
 		const url = normalizeLocalScheme(rawUrl);
+		// A value escaped by a backslash is not a URL: the consumer reads the escape,
+		// so expanding the text after it would change the value instead of its path.
+		if (!shellContext && escapedAt(command, index)) continue;
 		if (nestedRuleContext && extractScheme(url) === "rule") {
 			throw new ToolError(
 				"rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets.",
