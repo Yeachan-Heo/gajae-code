@@ -571,6 +571,15 @@ describe("calculateCost", () => {
 			cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
 		});
 
+		for (const provider of ["openai", "openai-codex"] as const) {
+			const sol62 = getBundledModel(provider, "gpt-6.2-sol");
+			expect(sol62.cost).toEqual({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 });
+			expect(sol62.longContextPricing).toEqual({
+				threshold: 272_000,
+				cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
+			});
+		}
+
 		const luna = getBundledModel("openai-codex", "gpt-6-luna");
 		expect(luna.cost).toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 });
 		expect(luna.longContextPricing).toEqual({
@@ -619,6 +628,36 @@ describe("calculateCost", () => {
 
 		expect(threshold.cost.total).toBeCloseTo(2.122, 8);
 		expect(aboveThreshold.cost.total).toBeCloseTo(4.219025, 8);
+	});
+
+	it("bundles GPT-6.2 Astra pricing and switches it only above 272K input tokens", () => {
+		for (const provider of ["openai", "openai-codex"] as const) {
+			const model = getBundledModel(provider, "gpt-6.2-astra");
+			expect(model.cost).toEqual({ input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 });
+			expect(model.longContextPricing).toEqual({
+				threshold: 272_000,
+				cost: { input: 16, output: 60, cacheRead: 0.8, cacheWrite: 20 },
+			});
+
+			const usage = (cacheWrite: number): Usage => ({
+				input: 200_000,
+				output: 1_000,
+				cacheRead: 72_000,
+				cacheWrite,
+				totalTokens: 273_000 + cacheWrite,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			});
+			const threshold = usage(0);
+			const aboveThreshold = usage(1);
+
+			calculateCost(model, threshold);
+			calculateCost(model, aboveThreshold);
+
+			// 200K input @ $8 + 1K output @ $40 + 72K cacheRead @ $0.40
+			expect(threshold.cost.total).toBeCloseTo(1.6688, 8);
+			// same request one cache-write token past the threshold, at 2x/1.5x rates
+			expect(aboveThreshold.cost.total).toBeCloseTo(3.31762, 8);
+		}
 	});
 
 	it("keeps GPT-5.6 short-context pricing at exactly 272K input tokens", () => {
