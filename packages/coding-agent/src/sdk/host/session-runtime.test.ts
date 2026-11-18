@@ -10432,7 +10432,46 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("a pre-acceptance failure rejects the submission without creating a record", async () => {
+	test("a submission in preflight reports admitted with the correlation its acknowledgement carries (#7867)", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-admitted-"));
+		try {
+			const preflightEntered = Promise.withResolvers<void>();
+			const preflightRelease = Promise.withResolvers<void>();
+			const harness = await invocationHarness("terminalize-admitted", cwd, {
+				sendUserMessage: async (_content, options) => {
+					// A pre-prompt compaction holds the acknowledgement for as long as it runs.
+					preflightEntered.resolve();
+					await preflightRelease.promise;
+					await options?.onPreflightAcceptCommit?.();
+				},
+			});
+			const acknowledgement = harness.control("turn.prompt", { text: "hello", clientRef: "admitted-ref" });
+			await preflightEntered.promise;
+			const admitted = await harness.query("turn.result", { kind: "prompt", clientRef: "admitted-ref" });
+			const page = admitted.result as Record<string, unknown>;
+			expect(page).toMatchObject({
+				status: "admitted",
+				kind: "prompt",
+				clientRef: "admitted-ref",
+				receiptState: "absent",
+			});
+			preflightRelease.resolve();
+			const accepted = await acknowledgement;
+			expect(accepted.ok).toBe(true);
+			expect({ commandId: page.commandId, turnId: page.turnId }).toEqual({
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			});
+			const status = await harness.query("turn.result", { kind: "prompt", clientRef: "admitted-ref" });
+			expect((status.result as Record<string, unknown>).status).toMatch(/accepted|in_flight|terminal_ok/);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a pre-acceptance failure rejects the submission definitely without creating a record", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-preflight-"));
 		try {
 			const harness = await invocationHarness("terminalize-preflight", cwd, {
@@ -10443,7 +10482,18 @@ describe("post-acceptance invocation terminalization", () => {
 			const rejected = await harness.control("turn.prompt", { text: "hello", clientRef: "preflight-ref" });
 			expect(rejected.ok).toBe(false);
 			const status = await harness.query("turn.prompt_status", { clientRef: "preflight-ref" });
-			expect(status.result as Record<string, unknown>).toEqual({ status: "unknown", receiptState: "unknown" });
+			// A client whose acknowledgement was lost learns the submission never ran (#7867).
+			expect(status.result as Record<string, unknown>).toMatchObject({
+				status: "failed",
+				kind: "prompt",
+				clientRef: "preflight-ref",
+				receiptState: "missing",
+				error: { code: "busy", message: expect.stringContaining("never ran") },
+			});
+			expect(status.result).not.toHaveProperty("outcome");
+			const rejectedPage = status.result as { commandId?: unknown; turnId?: unknown };
+			expect(rejectedPage.commandId).toEqual(expect.any(String));
+			expect(rejectedPage.turnId).toEqual(expect.any(String));
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);

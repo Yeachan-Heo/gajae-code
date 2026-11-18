@@ -2718,8 +2718,9 @@ function sdkControlSurface(
 	) => void,
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
-	admitPrompt: (clientRef?: string) => void,
-	releasePromptAdmission: (clientRef?: string) => void,
+	/** Reserves the clientRef; the returned binder publishes the generated correlation to `turn.result`. */
+	admitPrompt: (clientRef?: string) => (correlation: { commandId: string; turnId: string }) => void,
+	releasePromptAdmission: (clientRef?: string, rejection?: { cause: unknown }) => void,
 	awaitReconciliationReady: () => Promise<void> = async () => {},
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
@@ -3081,6 +3082,7 @@ function sdkControlSurface(
 		// that finds the loop busy at dispatch is queued as steering (below), and
 		// one the session itself diverts reports that through onDispatchDisposition.
 		const admission = createAdmissionWorkLease(hostWorkLease, deliverAs !== undefined, promoteWorkLease);
+		let bindAdmission: ((correlation: { commandId: string; turnId: string }) => void) | undefined;
 		if (trackReconciliation) {
 			// Restart recovery must be committed before a tracked prompt reserves capacity,
 			// otherwise it can admit against pre-hydration state or a lost clientRef.
@@ -3093,7 +3095,7 @@ function sdkControlSurface(
 				});
 			}
 			try {
-				admitPrompt(trimmedClientRef);
+				bindAdmission = admitPrompt(trimmedClientRef);
 			} catch (error) {
 				admission.abandon();
 				throw error;
@@ -3148,6 +3150,9 @@ function sdkControlSurface(
 		const submissionSettled = Promise.withResolvers<void>();
 		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		// Preflight (a pre-prompt compaction, for example) can outlast the client's
+		// acknowledgement budget; make the admission observable until it settles.
+		bindAdmission?.(correlation);
 		let queuedRunRefused = false;
 		const imageLifecycle = onCorrelation?.(correlation, preflightController.signal, submissionSettled.promise);
 		const key = preflightKey(requesterConnectionId, correlation);
@@ -3288,7 +3293,7 @@ function sdkControlSurface(
 			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
 		} catch (error) {
 			admission.abandon();
-			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
+			if (trackReconciliation) releasePromptAdmission(trimmedClientRef, { cause: error });
 			throw error;
 		} finally {
 			pendingPreflightCancellations.delete(key);
@@ -5800,14 +5805,19 @@ export function createNotificationsExtension(
 		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
 		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
-		const admitPromptSubmission = (clientRef?: string) => kindReconciliation.admit("prompt", clientRef);
+		const admitPromptSubmission = (clientRef?: string) => {
+			kindReconciliation.admit("prompt", clientRef);
+			return (correlation: { commandId: string; turnId: string }) =>
+				kindReconciliation.bindAdmission("prompt", clientRef, correlation);
+		};
 		const notePromptReconciliationAccepted = async (
 			correlation: { commandId: string; turnId: string },
 			clientRef?: string,
 		) => {
 			await kindReconciliation.noteAccepted("prompt", correlation, clientRef);
 		};
-		const releasePromptAdmission = (clientRef?: string) => kindReconciliation.releaseAdmission("prompt", clientRef);
+		const releasePromptAdmission = (clientRef?: string, rejection?: { cause: unknown }) =>
+			kindReconciliation.releaseAdmission("prompt", clientRef, rejection);
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,

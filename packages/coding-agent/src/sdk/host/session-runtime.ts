@@ -79,6 +79,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { PreflightAdmissionLedger } from "../preflight-admissions";
 import { autosaveWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	PromptDeadlineManager,
@@ -1028,8 +1029,13 @@ interface InvocationRecord extends InvocationCorrelation {
 export interface InvocationReconciliation {
 	/** Shared v2 reconciliation owner; present for durable terminal admission. */
 	readonly store?: SdkOnlyReconciliationStore;
-	admit(kind: InvocationKind, clientRef?: string): void;
-	release(kind: InvocationKind, clientRef?: string): void;
+	/**
+	 * Reserves the clientRef. The generated `correlation` stays observable through
+	 * `turn.result` as `admitted` until the submission is accepted or released.
+	 */
+	admit(kind: InvocationKind, clientRef?: string, correlation?: InvocationCorrelation): void;
+	/** Releases an unaccepted admission; a `rejection` is reported by `turn.result` as a definite failure. */
+	release(kind: InvocationKind, clientRef?: string, rejection?: { cause: unknown }): void;
 	noteAccepted(kind: InvocationKind, correlation: InvocationCorrelation, clientRef?: string): Promise<void>;
 	noteTransition(
 		kind: InvocationKind,
@@ -1182,6 +1188,7 @@ export function createInvocationReconciliation(
 	const PENDING_TERMINAL_OUTCOME_RETRY_DELAY_MS = 25;
 	const records = new Map<string, InvocationRecord>();
 	const reservations = new Map<string, InvocationKind>();
+	const admissions = new PreflightAdmissionLedger();
 	const reservationCounts = new Map<InvocationKind, number>([
 		["prompt", 0],
 		["skill", 0],
@@ -1445,7 +1452,7 @@ export function createInvocationReconciliation(
 	};
 	return {
 		store,
-		admit(kind, clientRef) {
+		admit(kind, clientRef, correlation) {
 			cleanup();
 			const active = [...records.values()].filter(
 				record => record.kind === kind && record.terminalAt === undefined,
@@ -1465,12 +1472,16 @@ export function createInvocationReconciliation(
 						{ code: "client_ref_conflict" },
 					);
 				reservations.set(ref(kind, clientRef), kind);
+				if (correlation && kind !== "steer") admissions.admitted(kind, clientRef, correlation);
 			}
 			reservationCounts.set(kind, reservedCount + 1);
 		},
-		release(kind, clientRef) {
+		release(kind, clientRef, rejection) {
 			if (clientRef !== undefined) reservations.delete(ref(kind, clientRef));
 			reservationCounts.set(kind, Math.max(0, (reservationCounts.get(kind) ?? 1) - 1));
+			if (kind === "steer") return;
+			if (rejection) admissions.rejected(kind, clientRef, rejection.cause);
+			else admissions.accepted(kind, clientRef);
 		},
 		async noteAccepted(kind, correlation, clientRef) {
 			const recordKey = key(kind, correlation);
@@ -1494,6 +1505,7 @@ export function createInvocationReconciliation(
 			}
 			if (clientRef !== undefined) reservations.delete(ref(kind, clientRef));
 			reservationCounts.set(kind, Math.max(0, (reservationCounts.get(kind) ?? 1) - 1));
+			if (kind !== "steer") admissions.accepted(kind, clientRef);
 		},
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
@@ -1976,7 +1988,8 @@ export function createInvocationReconciliation(
 		},
 		lookupResult(kind, selector) {
 			const result = this.lookup(kind, selector) as Record<string, unknown>;
-			return result.status === "unknown" ? result : { kind, ...result };
+			if (result.status !== "unknown") return { kind, ...result };
+			return (kind === "steer" ? undefined : admissions.lookup(kind, selector)) ?? result;
 		},
 		listDeadlineRecoveryPendingPrompts() {
 			return [...records.values()]
@@ -3413,8 +3426,10 @@ function createControlSurface(
 		// (review thread P1).
 		const requesterConnectionId = sdkControlRequesterContext.getStore();
 		const retainedClientRef = normalizeClientRef(clientRef);
-		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
+		// Preflight (a pre-prompt compaction, for example) can outlast the client's
+		// acknowledgement budget; the admission stays observable until it settles.
+		reconciliation.admit(kind, retainedClientRef, correlation);
 		onCreated?.(correlation);
 		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
@@ -3809,7 +3824,7 @@ function createControlSurface(
 			if (!submission) settleAcceptedImageSubmission?.(correlation);
 			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
-			if (!accepted) reconciliation.release(kind, retainedClientRef);
+			if (!accepted) reconciliation.release(kind, retainedClientRef, { cause: error });
 			throw error;
 		} finally {
 			requesterPreflights.delete(cancelPreflight);
