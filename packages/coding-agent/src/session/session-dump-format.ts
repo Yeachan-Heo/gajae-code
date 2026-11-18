@@ -170,19 +170,36 @@ function applyPrivateKeySpans(value: unknown, spans: readonly PrivateKeySpan[][]
 	return redacted;
 }
 
+/** Both escape layers an argument or schema value can carry before the renderer prints it. */
+function decodeEscapedText(input: string): string {
+	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input));
+}
+
 /**
- * Decode `\u` escapes in every string leaf, so banner detection sees the text a reader sees.
+ * Decode `\u` escapes in every string leaf and every field name, so banner detection,
+ * credential-name recognition and the printed value all see the characters a reader sees.
  * Tool arguments can carry one encoded layer and the value itself can spell another, which
  * the renderer used to decode after this prepass; decoding twice here keeps banner pairing
  * and the printed value on the same characters instead of materialising a banner later.
+ * Field names are part of that decoded representation: a name spelled with an escape is only
+ * credential-shaped once resolved, and it is the structural prepass — not a later pass over
+ * the serialized text — that has to recognize it.
  */
 function decodeValueStrings(value: unknown): unknown {
-	if (typeof value === "string") return decodeUnicodeEscapeText(decodeUnicodeEscapeText(value));
+	if (typeof value === "string") return decodeEscapedText(value);
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
 	const decoded = Object.create(null) as Record<string, unknown>;
 	for (const [key, nested] of Object.entries(value)) {
-		decoded[key] = decodeValueStrings(nested);
+		const name = decodeEscapedText(key);
+		if (name === key || !Object.hasOwn(decoded, name)) {
+			decoded[name] = decodeValueStrings(nested);
+			continue;
+		}
+		// Two spellings decode to one field name. The later entry keeps its original spelling so
+		// no argument disappears, and a credential name it decodes to masks that entry rather
+		// than leaving its value to the generic text scrub.
+		decoded[key] = isCredentialKey(name) ? "«redacted»" : decodeValueStrings(nested);
 	}
 	return decoded;
 }
@@ -190,8 +207,10 @@ function decodeValueStrings(value: unknown): unknown {
 /**
  * Redact private-key blocks that span sibling values, at any nesting depth.
  * Values are joined in traversal order, so a banner split across adjacent values is found.
- * Field names never take part: a name between two halves would separate them, and a
- * rewritten name would destroy the argument identity the dump relies on. A banner split
+ * Field names never enter the joined stream: a name between two halves would separate them.
+ * Names are decoded by the same prepass, so the credential name the structural scrubber
+ * reads is the name the dump prints, but a name never contributes characters to a block.
+ * A banner split
  * across two values with another value in between is therefore not paired; each half is
  * still scrubbed on its own where it forms a complete block.
  * `decodeEscapes` is for encoded values (tool arguments and schema data); literal message

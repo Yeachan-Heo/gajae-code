@@ -320,6 +320,100 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(pem("RSA", "END"));
 	});
 
+	it("masks a nested escaped credential key whose value is an escaped PEM block", () => {
+		const body = "ESCAPED_NESTED_PEM_BODY";
+		// A JSON-encoded payload keeps the name and the value escaped: the name is only
+		// credential-shaped once the escape is resolved, and the block arrives on one line.
+		const escapedPem = `${pem("RSA", "BEGIN")}\\n${body}\\n${pem("RSA", "END")}`;
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-escaped-credential-pem",
+						name: "request",
+						arguments: { payload: { "api\\u005fkey": escapedPem } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+		expect(parameterValue(dumped, "payload")).toContain('"«redacted»"');
+	});
+
+	it("masks an escaped PEM block the block scan cannot close under a nested escaped credential key", () => {
+		const body = "TRUNCATED_ESCAPED_PEM_BODY";
+		// The export was truncated before the footer, so no complete block exists for the block
+		// scan; the decoded credential name is what has to remove the banner and the body.
+		const escapedPem = `${pem("RSA", "BEGIN")}\\n${body}`;
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-truncated-escaped-pem",
+						name: "request",
+						arguments: { payload: { "api\\u005fkey": escapedPem } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(parameterValue(dumped, "payload")).toContain('"«redacted»"');
+	});
+
+	it("masks an escaped PEM whose banner survives the block scan under a decoded credential name", () => {
+		const body = "UNREADABLE_BANNER_PEM_BODY";
+		// Three escape layers leave the banner unreadable to the block scan; the credential name,
+		// readable after the same decode, is what removes the banner and the body.
+		const escapedBanner = `-----BEGIN PRIVA${"\\\\\\"}u0054E KEY-----`;
+		const escapedPem = `${escapedBanner}\\n${body}\\n${pem("RSA", "END")}`;
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-unreadable-banner-pem",
+						name: "request",
+						arguments: { payload: { "api\\u005fkey": escapedPem } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain("PRIVA");
+		expect(parameterValue(dumped, "payload")).toContain('"«redacted»"');
+	});
+
+	it("keeps an ordinary decoded JSON blob in the session dump", () => {
+		const payload = '{"path": "src/auth", "note": "ok"}';
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-plain-json-blob",
+						name: "read",
+						arguments: { payload },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(parameterValue(dumped, "payload")).toBe('{"path": "src/auth", "note": "ok"}');
+		expect(dumped).not.toContain("«redacted");
+	});
+
 	it("masks a schema default object that holds credential-named values", () => {
 		const tokenDefault = "SCHEMA_DEFAULT_SECRET";
 		const nestedDefault = "NESTED_SCHEMA_SECRET";
