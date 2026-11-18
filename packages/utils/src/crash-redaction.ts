@@ -90,38 +90,96 @@ interface TextRange {
 	end: number;
 }
 
+/** A credential container's value is replaced whole, so it carries the plain marker. */
+const CONTAINER_REDACTION_MARKER = "«redacted»";
+
+interface MaskRange extends TextRange {
+	/** A credential container read this range; otherwise it is a private-key block. */
+	container: boolean;
+}
+
+interface AppliedRange extends TextRange {
+	marker: string;
+}
+
 /**
  * Mask private-key blocks and credential containers of one text in a single pass.
  * Removing a block first erases the `key={` a container starts at, and masking a container
- * first removes a footer the block still has to pair, so when the two overlap neither pass can
- * read the other's output. Both are located on the original text and merged here; a merged
- * range carries the container marker because the whole value was a credential.
+ * first erases a footer the block still has to pair, so neither pass can read the other's
+ * output. Both are located on the original text. A container can hold the footer the first
+ * block scan paired, so the block is read again on the container-masked text — where the opener
+ * still stands — and that reading is mapped back before anything is applied. A range a container
+ * read carries the container marker, because the whole value was a credential.
  */
 function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[]): string {
 	const containers: TextRange[] = [];
 	collectCredentialContainerRanges(text, CURRENT_CREDENTIAL_REDACTION_RULES, containers);
+	const scalars: TextRange[] = [];
+	redactYamlBlockScalars(text, CURRENT_CREDENTIAL_REDACTION_RULES, scalars);
+	const containerApplied = mergeMaskRanges([
+		...containers.map(range => ({ ...range, container: true })),
+		...scalars.map(range => ({ ...range, container: true })),
+	]);
+	const containerMasked = applyMaskRanges(text, containerApplied);
+	const survivors = findPrivateKeySpans(containerMasked).map(span => mapMaskedRange(span, containerApplied));
+	return applyMaskRanges(
+		text,
+		mergeMaskRanges([
+			...spans.map(span => ({ start: span.start, end: span.end, container: false })),
+			...containers.map(range => ({ start: range.start, end: range.end, container: true })),
+			...scalars.map(range => ({ start: range.start, end: range.end, container: true })),
+			...survivors.map(range => ({ ...range, container: false })),
+		]),
+	);
+}
+
+/** Merge ranges in text order; only overlapping ranges collapse, so adjacent ones stay distinct. */
+function mergeMaskRanges(ranges: readonly MaskRange[]): AppliedRange[] {
+	const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
 	const merged: { start: number; end: number; container: boolean }[] = [];
-	const ranges = [
-		...spans.map(span => ({ start: span.start, end: span.end, container: false })),
-		...containers.map(range => ({ start: range.start, end: range.end, container: true })),
-	].sort((a, b) => a.start - b.start || a.end - b.end);
-	for (const range of ranges) {
+	for (const range of sorted) {
 		const last = merged.at(-1);
-		if (last !== undefined && range.start <= last.end) {
+		if (last !== undefined && range.start < last.end) {
 			last.end = Math.max(last.end, range.end);
 			last.container ||= range.container;
 			continue;
 		}
-		merged.push({ ...range });
+		merged.push({ start: range.start, end: range.end, container: range.container });
 	}
+	return merged.map(range => ({
+		...range,
+		marker: range.container ? CONTAINER_REDACTION_MARKER : PRIVATE_KEY_REDACTION_MARKER,
+	}));
+}
+
+function applyMaskRanges(text: string, ranges: readonly AppliedRange[]): string {
 	const parts: string[] = [];
 	let cursor = 0;
-	for (const range of merged) {
-		parts.push(text.slice(cursor, range.start), range.container ? "«redacted»" : PRIVATE_KEY_REDACTION_MARKER);
+	for (const range of ranges) {
+		parts.push(text.slice(cursor, range.start), range.marker);
 		cursor = range.end;
 	}
 	parts.push(text.slice(cursor));
 	return parts.join("");
+}
+
+/**
+ * Map one range of the masked text back to the original. A marker carries no block text, so a
+ * block can only start and end in copied text; a position inside one is clamped to its end.
+ */
+function mapMaskedRange(range: TextRange, applied: readonly AppliedRange[]): TextRange {
+	const map = (maskedIndex: number): number => {
+		let delta = 0;
+		for (const appliedRange of applied) {
+			const maskedStart = appliedRange.start - delta;
+			const maskedEnd = maskedStart + appliedRange.marker.length;
+			if (maskedIndex < maskedStart) break;
+			if (maskedIndex < maskedEnd) return appliedRange.end;
+			delta += appliedRange.end - appliedRange.start - appliedRange.marker.length;
+		}
+		return maskedIndex + delta;
+	};
+	return { start: map(range.start), end: map(range.end) };
 }
 
 const CREDENTIAL_KEY_SEPARATOR = "[._\\t -]*";
@@ -255,7 +313,7 @@ function lineBounds(text: string, start: number): { contentEnd: number; nextLine
 	return { contentEnd, nextLineStart };
 }
 
-function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): string {
+function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules, ranges?: TextRange[]): string {
 	const output: string[] = [];
 	let copiedUntil = 0;
 	let lineStart = 0;
@@ -300,6 +358,7 @@ function redactYamlBlockScalars(text: string, rules: CredentialRedactionRules): 
 				"«redacted»",
 				text.slice(bodyTextEnd, bodyLine.nextLineStart),
 			);
+			ranges?.push({ start: bodyLineStart + indentation, end: bodyTextEnd });
 			copiedBodyUntil = bodyLine.nextLineStart;
 			bodyLineStart = bodyLine.nextLineStart;
 		}

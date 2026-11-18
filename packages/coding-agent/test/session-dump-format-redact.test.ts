@@ -593,6 +593,31 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"type": "number"');
 	});
 
+	it("keeps both schema default members when two token-shaped keys share one marker", () => {
+		const first = "ghp_FIRSTTOKEN0123456789AB";
+		const second = "ghp_SECONDTOKEN0123456789A";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: { api_key: { type: "object", default: { [first]: first, [second]: second } } },
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain(first);
+		expect(dumped).not.toContain(second);
+		// Both members survive: the marker plus one suffix for the second key.
+		expect(dumped.match(/«redacted-github-token»/g) ?? []).toHaveLength(2);
+	});
+
 	it("masks both spellings of a data keyword under a credential-named property", () => {
 		const escapedDefault = "ESCAPED_DEFAULT_SECRET";
 		const canonicalDefault = "CANONICAL_DEFAULT_SECRET";

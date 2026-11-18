@@ -642,6 +642,18 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets(blockFirst)).not.toContain("BEGIN PRIVATE KEY");
 		expect(redactCrashSecrets(footerHolder)).not.toContain("BODY_TEXT");
 		expect(redactCrashSecrets(footerHolder)).not.toContain("END PRIVATE KEY");
+
+		// The container holds the first footer, so the block must be read again on the
+		// container-masked text to reach the second one and the line between them.
+		const secondFooter = `-----BEGIN PRIVATE KEY-----\nsecret={"footer":"-----END PRIVATE KEY-----"}\nOPAQUE_LINE\n-----END PRIVATE KEY-----`;
+		expect(redactCrashSecrets(secondFooter)).not.toContain("OPAQUE_LINE");
+		expect(redactCrashSecrets(secondFooter)).not.toContain("PRIVATE KEY");
+
+		// A YAML block scalar under a credential name holds the footer, so its body is part of
+		// the same removal even though the scalar sits between the opener and the footer.
+		const yamlScalar = `-----BEGIN PRIVATE KEY-----\npassword: |\n  -----END PRIVATE KEY-----\n  OPAQUE_YAML_TAIL\nnote=keep`;
+		expect(redactCrashSecrets(yamlScalar)).not.toContain("OPAQUE_YAML_TAIL");
+		expect(redactCrashSecrets(yamlScalar)).toContain("note=keep");
 	});
 
 	it("preserves later diagnostics after an unterminated credential container", () => {

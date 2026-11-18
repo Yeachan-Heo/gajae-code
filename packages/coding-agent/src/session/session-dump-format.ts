@@ -308,8 +308,11 @@ function maskSchemaData(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(maskSchemaData);
 	if (value === null || typeof value !== "object") return "«redacted»";
 	const masked = Object.create(null) as Record<string, unknown>;
+	const scrubbedKeys = new Map<string, number>();
 	for (const [key, nested] of Object.entries(value)) {
-		masked[redactCrashSecrets(key)] = maskSchemaData(nested);
+		// Two token-shaped keys scrub to one marker, so the marker alone would let the second
+		// property replace the first; the suffix keeps both definitions in the dump.
+		masked[uniqueScrubbedKey(masked, key, scrubbedKeys)] = maskSchemaData(nested);
 	}
 	return masked;
 }
