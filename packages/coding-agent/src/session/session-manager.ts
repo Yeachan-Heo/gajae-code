@@ -17386,6 +17386,11 @@ export class SessionManager {
 
 		// Write atomically to a temp file, then replace
 		await this.#queuePersistTask(async () => {
+			// Close any open persist writer before atomically replacing the file.
+			// The writer's fd points to the old inode; after replacement, the writer
+			// would point to stale identity and later appends would fail.
+			await this.#closePersistWriterInternal();
+
 			this.#withSessionPersistenceFenceSync(() => {
 				const dir = path.resolve(sessionFile, "..");
 				const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.tmp`);
@@ -17394,6 +17399,10 @@ export class SessionManager {
 					this.#storage.writeTextSync(tempPath, newContent);
 					const replacement = this.#replaceSessionFileSync(tempPath, sessionFile);
 					if (replacement.kind === "restored_previous") throw replacement.error;
+					// Update managedPersistExpectedIdentity to reflect the new file inode.
+					// After replacing the file, the transcript's inode has changed and we must
+					// capture the new identity for subsequent managed appends.
+					this.#adoptManagedPersistIdentity(sessionFile);
 				} catch (err) {
 					void this.#storage.unlink(tempPath).catch(() => {});
 					throw toError(err);
