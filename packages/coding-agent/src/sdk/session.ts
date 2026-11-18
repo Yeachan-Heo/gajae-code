@@ -3523,7 +3523,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			goalToolAllowedOps: options.goalToolAllowedOps,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
 			getToolByName: name => session?.getToolByName(name),
-			getToolForExecution: name => session?.getToolForExecution(name),
+			getToolForExecution: (name, toolOptions) => session?.getToolForExecution(name, toolOptions),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
 			getMasterBashCapability: () => masterModeContext?.getCapability(),

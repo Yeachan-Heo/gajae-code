@@ -18,7 +18,7 @@ import {
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
-import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { ToolAbortError, ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { guardToolForUltragoalAsk } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
 
 const TEST_SESSION_ID = "ultragoal-ask-guard-test-session";
@@ -477,5 +477,67 @@ describe("ultragoal ask guard", () => {
 			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
 			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
+	});
+});
+
+describe("ultragoal ask guard cancellation", () => {
+	it("does not invoke ask when the call is aborted during the guard", async () => {
+		const calls: number[] = [];
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(async () => {
+				calls.push(1);
+			}),
+			() => process.cwd(),
+			() => ({}),
+			() => undefined,
+		);
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(guarded.execute("ask-1", {} as never, controller.signal)).rejects.toBeInstanceOf(ToolAbortError);
+		expect(calls).toEqual([]);
+	});
+
+	it("keeps the cancellation fence when the same tool is guarded twice", async () => {
+		const calls: number[] = [];
+		const raw = stubAskTool(async () => {
+			calls.push(1);
+		});
+		const once = guardToolForUltragoalAsk(
+			raw,
+			() => process.cwd(),
+			() => ({}),
+			() => undefined,
+		);
+		// SDK startup can guard one wrapper while a later nested lookup starts from
+		// the raw registry object; the marker must not leak to that target.
+		const fromRaw = guardToolForUltragoalAsk(
+			raw,
+			() => process.cwd(),
+			() => ({}),
+			() => undefined,
+		);
+		const controller = new AbortController();
+		controller.abort();
+
+		expect(fromRaw).not.toBe(raw);
+		expect(fromRaw).not.toBe(once);
+		await expect(fromRaw.execute("ask-1", {} as never, controller.signal)).rejects.toBeInstanceOf(ToolAbortError);
+		expect(calls).toEqual([]);
+	});
+
+	it("invokes ask when the call is not aborted", async () => {
+		const calls: number[] = [];
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(async () => {
+				calls.push(1);
+			}),
+			() => process.cwd(),
+			() => ({}),
+			() => undefined,
+		);
+
+		await guarded.execute("ask-1", {} as never, new AbortController().signal);
+		expect(calls).toEqual([1]);
 	});
 });
