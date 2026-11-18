@@ -71,6 +71,28 @@ const GPT_6_1_TERRA_PRICING: TieredPricing = {
 	},
 };
 
+// GPT-6.2 Astra: $8/$40 standard, cache read $0.40, cache write $10 (30m) / $20 (12h);
+// inputs past 272K apply 2x to input/cache and 1.5x to output.
+// https://developers.openai.com/api/docs/models/gpt-6.2-astra
+const GPT_6_2_ASTRA_PRICING: TieredPricing = {
+	cost: { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 },
+	longContextPricing: {
+		threshold: LONG_CONTEXT_THRESHOLD,
+		cost: { input: 16, output: 60, cacheRead: 0.8, cacheWrite: 20 },
+	},
+};
+
+// GPT-6.2 Sol: $2/$10 standard, cache read $0.10, cache write $2.50 (30m) / $5 (12h);
+// inputs past 272K apply 2x to input/cache and 1.5x to output.
+// https://developers.openai.com/api/docs/models/gpt-6.2-sol
+const GPT_6_2_SOL_PRICING: TieredPricing = {
+	cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+	longContextPricing: {
+		threshold: LONG_CONTEXT_THRESHOLD,
+		cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
+	},
+};
+
 // GPT-6 Luna: $0.10/$0.50 standard, cache read $0.01, cache write $0.125;
 // inputs past 272K apply 2x to input/cache and 1.5x to output.
 const GPT_6_LUNA_PRICING: TieredPricing = {
@@ -87,6 +109,8 @@ const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
 	["gpt-6-sol", GPT_6_SOL_PRICING],
 	["gpt-6.1-sol", GPT_6_1_SOL_PRICING],
 	["gpt-6.1-terra", GPT_6_1_TERRA_PRICING],
+	["gpt-6.2-astra", GPT_6_2_ASTRA_PRICING],
+	["gpt-6.2-sol", GPT_6_2_SOL_PRICING],
 	["gpt-6-luna", GPT_6_LUNA_PRICING],
 	["gpt-5.6", GPT_5_6_SOL_PRICING],
 	["gpt-5.6-sol", GPT_5_6_SOL_PRICING],

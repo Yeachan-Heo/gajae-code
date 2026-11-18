@@ -44,22 +44,22 @@ const expectedProfiles: Array<{
 		name: "codex-medium",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-6.1-sol:low",
-			executor: "openai-codex/gpt-6.1-sol:low",
-			planner: "openai-codex/gpt-6.1-sol:high",
-			critic: "openai-codex/gpt-6.1-sol:xhigh",
-			architect: "openai-codex/gpt-6.1-sol:high",
+			default: "openai-codex/gpt-6.2-sol:low",
+			executor: "openai-codex/gpt-6.2-sol:low",
+			planner: "openai-codex/gpt-6.2-sol:high",
+			critic: "openai-codex/gpt-6.2-sol:xhigh",
+			architect: "openai-codex/gpt-6.2-sol:high",
 		},
 	},
 	{
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-6.1-sol:medium",
-			executor: "openai-codex/gpt-6.1-sol:medium",
-			planner: "openai-codex/gpt-6.1-sol:high",
-			critic: "openai-codex/gpt-6.1-sol:max",
-			architect: "openai-codex/gpt-6.1-sol:xhigh",
+			default: "openai-codex/gpt-6.2-sol:medium",
+			executor: "openai-codex/gpt-6.2-sol:medium",
+			planner: "openai-codex/gpt-6.2-sol:high",
+			critic: "openai-codex/gpt-6.2-sol:max",
+			architect: "openai-codex/gpt-6.2-sol:xhigh",
 		},
 	},
 	{
@@ -77,33 +77,33 @@ const expectedProfiles: Array<{
 		name: "astra-lite",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-6-astra:medium",
+			default: "openai-codex/gpt-6.2-astra:medium",
 			executor: "openai-codex/gpt-6-luna:xhigh",
-			planner: "openai-codex/gpt-6-astra:xhigh",
-			critic: "openai-codex/gpt-6.1-sol:high",
-			architect: "openai-codex/gpt-6.1-sol:xhigh",
+			planner: "openai-codex/gpt-6.2-astra:xhigh",
+			critic: "openai-codex/gpt-6.2-sol:high",
+			architect: "openai-codex/gpt-6.2-sol:xhigh",
 		},
 	},
 	{
 		name: "astra-default",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-6-astra:medium",
+			default: "openai-codex/gpt-6.2-astra:medium",
 			executor: "openai-codex/gpt-6-luna:max",
-			planner: "openai-codex/gpt-6-astra:xhigh",
-			critic: "openai-codex/gpt-6.1-sol:xhigh",
-			architect: "openai-codex/gpt-6.1-sol:xhigh",
+			planner: "openai-codex/gpt-6.2-astra:xhigh",
+			critic: "openai-codex/gpt-6.2-sol:xhigh",
+			architect: "openai-codex/gpt-6.2-sol:xhigh",
 		},
 	},
 	{
 		name: "astra-heavy",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-6-astra:medium",
-			executor: "openai-codex/gpt-6.1-sol:max",
-			planner: "openai-codex/gpt-6.1-sol:max",
-			critic: "openai-codex/gpt-6-astra:max",
-			architect: "openai-codex/gpt-6-astra:max",
+			default: "openai-codex/gpt-6.2-astra:medium",
+			executor: "openai-codex/gpt-6.2-sol:max",
+			planner: "openai-codex/gpt-6.2-sol:max",
+			critic: "openai-codex/gpt-6.2-astra:max",
+			architect: "openai-codex/gpt-6.2-astra:max",
 		},
 	},
 	{
@@ -672,21 +672,21 @@ const expectedProfiles: Array<{
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
 			default: "anthropic/claude-opus-5-5:medium",
-			executor: "openai-codex/gpt-6.1-sol:low",
+			executor: "openai-codex/gpt-6.2-sol:low",
 			planner: "anthropic/claude-sonnet-5-5",
-			critic: "openai-codex/gpt-6.1-sol:xhigh",
-			architect: "openai-codex/gpt-6.1-sol:high",
+			critic: "openai-codex/gpt-6.2-sol:xhigh",
+			architect: "openai-codex/gpt-6.2-sol:high",
 		},
 	},
 	{
 		name: "codex-opencodego",
 		requiredProviders: ["openai-codex", "opencode-go"],
 		mapping: {
-			default: "openai-codex/gpt-6.1-sol:low",
+			default: "openai-codex/gpt-6.2-sol:low",
 			executor: "opencode-go/deepseek-v4-pro",
 			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
-			architect: "openai-codex/gpt-6.1-sol:high",
+			architect: "openai-codex/gpt-6.2-sol:high",
 		},
 	},
 	{
@@ -694,19 +694,19 @@ const expectedProfiles: Array<{
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
 			default: "anthropic/claude-fable-5-1:high",
-			executor: "openai-codex/gpt-6.1-sol:medium",
+			executor: "openai-codex/gpt-6.2-sol:medium",
 			planner: "anthropic/claude-opus-5-5:medium",
 			critic: "anthropic/claude-opus-5-5:high",
-			architect: "openai-codex/gpt-6.1-sol:xhigh",
+			architect: "openai-codex/gpt-6.2-sol:xhigh",
 		},
 	},
 	{
 		name: "astra-fable",
 		requiredProviders: ["openai-codex", "anthropic"],
 		mapping: {
-			default: "openai-codex/gpt-6-astra:medium",
+			default: "openai-codex/gpt-6.2-astra:medium",
 			executor: "openai-codex/gpt-6-luna:max",
-			planner: "openai-codex/gpt-6-astra:xhigh",
+			planner: "openai-codex/gpt-6.2-astra:xhigh",
 			critic: "anthropic/claude-fable-5-1:xhigh",
 			architect: "anthropic/claude-fable-5-1:xhigh",
 		},
@@ -715,7 +715,7 @@ const expectedProfiles: Array<{
 		name: "astra-fable-opus",
 		requiredProviders: ["openai-codex", "anthropic"],
 		mapping: {
-			default: "openai-codex/gpt-6-astra:medium",
+			default: "openai-codex/gpt-6.2-astra:medium",
 			executor: "openai-codex/gpt-6-luna:max",
 			planner: "anthropic/claude-opus-5-5:medium",
 			critic: "anthropic/claude-fable-5-1:xhigh",
@@ -779,7 +779,7 @@ function builtinMapping(name: string): Record<Role, string> {
 }
 
 function lowerSolToLuna(selector: string): string {
-	const match = /^openai-codex\/(gpt-6\.1-sol|gpt-6-luna):(.+)$/.exec(selector);
+	const match = /^openai-codex\/(gpt-6\.2-sol|gpt-6-luna):(.+)$/.exec(selector);
 	if (!match) throw new Error(`Expected Codex Sol or Luna selector, got: ${selector}`);
 	return `openai-codex/gpt-6-luna:${match[2]}`;
 }
