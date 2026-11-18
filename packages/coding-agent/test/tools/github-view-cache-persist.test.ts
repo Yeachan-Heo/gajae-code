@@ -1485,6 +1485,8 @@ describe("github view cache persistence", () => {
 			'-Auth: [\n-  "fixture-auth-array-canary",\n-Cookie: sid=fixture-cookie]',
 			'-Auth: [\n-  "fixture-auth-item",\n-Cookie: sid=first\'fixture-opaque-session]',
 			"-Auth: [\n-  \"fixture-private-auth\",\n-Cookie: sid=first'fixture'last],",
+			'Auth: ["first\nAuthorization: Digest value",\n"fixture-retained-auth-52"]',
+			'{"auth":["token=left\\"tail",\n"fixture-retained-auth-52"]}',
 			'Cookie: ["first",\n  "cookie-array-private-canary",\n-Cookie: sid=display]',
 			'-Cookie: [first,\n-  "fixture-second-opaque",\n-Cookie: sid=display]',
 		];
@@ -1513,6 +1515,7 @@ describe("github view cache persistence", () => {
 				"fixture-auth-array-canary",
 				"fixture-auth-item",
 				"fixture-private-auth",
+				"fixture-retained-auth-52",
 				"fixture-opaque-session",
 				"cookie-array-private-canary",
 				"fixture-second-opaque",

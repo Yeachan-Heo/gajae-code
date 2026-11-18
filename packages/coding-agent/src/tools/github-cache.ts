@@ -427,7 +427,10 @@ function maskBoundedAuthorizationHeaders(text: string): { text: string; restore:
 			spacing: string,
 			doubleQuoted: string | undefined,
 			singleQuoted: string | undefined,
+			offset: number,
+			text: string,
 		) => {
+			if (insideContainerQuote(text, offset)) return _match;
 			const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
 			const sentinel = `${BOUNDED_AUTHORIZATION_MASK}${sanitized.length}\u0000`;
 			sanitized.push(`${label}${scheme}${spacing}${quote}«redacted»${quote}`);
@@ -735,29 +738,34 @@ function isContainerOpenerLine(text: string, index: number): boolean {
 	);
 }
 
+/** True when a single quote sits between word characters. */
+function isWordApostrophe(text: string, index: number): boolean {
+	return /[A-Za-z0-9]/.test(text[index - 1] ?? "") && /[A-Za-z0-9]/.test(text[index + 1] ?? "");
+}
+
 /** Quote-aware bracket scan up to `end`. */
 function scanStructure(text: string, end: number): { stack: { ch: string; index: number }[]; quoted: boolean } {
 	const stack: { ch: string; index: number }[] = [];
-	let quoted = false;
+	let quote: string | null = null;
 	for (let i = 0; i < end; i++) {
 		const ch = text[i];
 		if ((i === 0 || text[i - 1] === "\n") && stack.length === 0) {
 			const lineEnd = text.indexOf("\n", i);
 			const line = text.slice(i, lineEnd === -1 ? text.length : lineEnd);
-			if (startsCredentialHeader(line)) quoted = false;
+			if (startsCredentialHeader(line)) quote = null;
 		}
-		if (quoted) {
-			if (ch === '"' && !isEscapedAt(text, i)) quoted = false;
+		if (quote) {
+			if (ch === quote && !isEscapedAt(text, i)) quote = null;
 			continue;
 		}
-		if (ch === '"') {
-			quoted = true;
+		if (ch === '"' || (ch === "'" && !isWordApostrophe(text, i))) {
+			quote = ch;
 			continue;
 		}
 		if (ch === "{" || ch === "[") stack.push({ ch, index: i });
 		else if (ch === "}" || ch === "]") stack.pop();
 	}
-	return { stack, quoted };
+	return { stack, quoted: quote !== null };
 }
 
 /** True when a match carries a Cookie-owned structural closer. */
@@ -765,15 +773,15 @@ function closesMatchingContainer(text: string, end: number, match: string): bool
 	const scan = scanStructure(text, end);
 	if (scan.quoted) return false;
 	const stack = [...scan.stack];
-	let quoted = false;
+	let quote: string | null = null;
 	for (let i = 0; i < match.length; i++) {
 		const ch = match[i];
-		if (quoted) {
-			if (ch === '"' && !isEscapedAt(match, i)) quoted = false;
+		if (quote) {
+			if (ch === quote && !isEscapedAt(match, i)) quote = null;
 			continue;
 		}
-		if (ch === '"') {
-			quoted = true;
+		if (ch === '"' || (ch === "'" && !isWordApostrophe(match, i))) {
+			quote = ch;
 			continue;
 		}
 		if (ch === "{" || ch === "[") {
@@ -812,6 +820,24 @@ function hasLocalDoubleQuotePair(match: string): boolean {
 	return false;
 }
 
+/** Redact a whole Auth/Authorization container through its balanced end. */
+function maskAuthContainers(text: string): string {
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(
+		/((?:"(?:[A-Za-z0-9]+-)*(?:authorization|auth)"|(?:[A-Za-z0-9]+-)*(?:authorization|auth))[ \t]*[:=][ \t]*)([[{])/gi,
+	)) {
+		const index = match.index ?? 0;
+		if (index < last) continue;
+		const valueStart = index + match[0].length - 1;
+		const end = findBalancedValueEnd(text, valueStart);
+		const stop = end === -1 ? text.length : end;
+		out += text.slice(last, index) + `${match[1]}«redacted»`;
+		last = stop;
+	}
+	return out + text.slice(last);
+}
+
 function scrubCacheText(text: string, diff = false): string {
 	// Userinfo comes off the raw text first: container masking can collapse a
 	// blank line that ended a Markdown table, and a later table classification
@@ -835,18 +861,29 @@ function scrubCacheText(text: string, diff = false): string {
 	);
 	// Digest/Negotiate headers carry parameters after the scheme; mask the rest
 	// of the header line so a `response=` parameter cannot survive.
-	const withoutParameterizedAuth = withoutPem.replace(
+	const withoutAuthContainers = maskAuthContainers(withoutPem);
+	const withoutParameterizedAuth = withoutAuthContainers.replace(
 		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
 		"$1 «redacted»",
 	);
 	const withoutLineAuth = withoutParameterizedAuth
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
-			"$1$2$3 «redacted»",
+			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
+				insideContainerQuote(text, offset) ? match : `${lineStart}${marker}${label} «redacted»`,
 		)
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s|;"'`&,]+)/gi,
-			"$1$2$3$4$5«redacted»",
+			(
+				match: string,
+				lineStart: string,
+				marker: string,
+				label: string,
+				scheme: string,
+				space: string,
+				offset: number,
+				text: string,
+			) => (insideContainerQuote(text, offset) ? match : `${lineStart}${marker}${label}${scheme}${space}«redacted»`),
 		);
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutLineAuth);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
