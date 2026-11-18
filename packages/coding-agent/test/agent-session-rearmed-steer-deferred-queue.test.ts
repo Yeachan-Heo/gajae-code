@@ -98,11 +98,15 @@ describe("AgentSession re-armed steer detection in deferred queue", () => {
 
 			// Wait for the abort to complete
 			await running.catch(() => {});
-			await session.waitForIdle();
 
 			// The critical check: hasQueuedSteering should detect the re-armed steer
-			// even if it's in the deferred SDK follow-up queue, not the agent's queue
+			// even if it's in the deferred SDK follow-up queue, not the agent's queue.
+			// IMPORTANT: Assert BEFORE waitForIdle() to catch the steer while it's still
+			// in #deferredSdkFollowUps, before the continuation drains it.
 			expect(session.hasQueuedSteering).toBe(true);
+
+			// Now allow the idle processing to proceed
+			await session.waitForIdle();
 
 			// The queued messages should still reflect the re-armed steer as a follow-up
 			const queued = session.getQueuedMessages();
