@@ -16,7 +16,7 @@
  * search. State is tracked per-file to handle multi-hunk containers.
  */
 
-import { redactCrashSecrets } from "@gajae-code/pi-utils";
+import { redactCrashSecrets } from "@gajae-code/utils";
 
 // Helper to split text while preserving empty lines
 function splitLines(text: string): string[] {
