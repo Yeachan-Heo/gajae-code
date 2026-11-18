@@ -54,10 +54,10 @@ function launchFixture(env: Record<string, string> = {}): { terminal: IPty; outp
 		cwd: process.cwd(),
 		env: { ...baseEnv, TERM: "xterm-256color", ...env },
 	});
-	terminal.onData(data => {
+	terminal.onData((data: string) => {
 		captured += data;
 	});
-	terminal.onExit(event => {
+	terminal.onExit((event: { exitCode: number; signal?: string }) => {
 		captured += `\nPTY_FIXTURE_EXIT:${event.exitCode}:${event.signal}\n`;
 	});
 	return { terminal, output: () => captured };

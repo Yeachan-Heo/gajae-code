@@ -3,5 +3,8 @@
 	"include": [
 		"src",
 		"test"
+	],
+	"exclude": [
+		"test/pty/**"
 	]
 }
