@@ -565,8 +565,11 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 		method,
 		"bootstrap"
 			| "project.open"
+			| "project.refresh"
 			| "session.create"
 			| "session.select"
+			| "session.connect"
+			| "session.disconnect"
 			| "session.rename"
 			| "session.delete"
 			| "session.star"
@@ -967,6 +970,24 @@ mod tests {
 			count += 1;
 		}
 		assert!(count > 0, "method catalog must not be empty");
+	}
+
+	#[test]
+	fn forwards_connection_and_discovery_envelopes() {
+		for (method, params) in [
+			("project.refresh", json!({"projectId": "project"})),
+			("session.connect", json!({
+				"sessionId": "session",
+				"selection": {"snapshotDigest": "fixture-digest", "targetLeafId": null},
+				"legacyAttestation": {"snapshotDigest": "fixture-digest", "acknowledged": true}
+			})),
+			("session.disconnect", json!({"sessionId": "session"})),
+		] {
+			let request = json!({"id": "native-contract", "method": method, "params": params});
+			let encoded = encode_engine_request(&request).expect("admitted host method");
+			assert_eq!(encoded.last(), Some(&b'\n'));
+			assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), request);
+		}
 	}
 
 	#[test]
