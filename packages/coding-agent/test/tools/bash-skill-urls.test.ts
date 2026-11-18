@@ -19,6 +19,7 @@ import {
 	expandSkillUrls,
 	refuseShellBearingRulePath,
 	resolveSkillUrl,
+	windowsDataValueSpelling,
 	windowsPathIsInside,
 } from "../../src/tools/bash-skill-urls";
 import { ToolError } from "../../src/tools/tool-errors";
@@ -1878,6 +1879,22 @@ describe("windowsPathIsInside", () => {
 	it("rejects a path outside the root", () => {
 		expect(windowsPathIsInside("C:\\work\\Repo", "C:\\work\\Repo2\\rule.md")).toBe(false);
 		expect(windowsPathIsInside("C:\\work\\Repo", "D:\\work\\Repo\\rule.md")).toBe(false);
+	});
+});
+
+/**
+ * A data value cannot carry the shell spelling of a Windows path: a quoted value
+ * has no shell escaping, and a raw `\` would break it.
+ */
+describe("windowsDataValueSpelling", () => {
+	it("uses the separator that needs no escaping", () => {
+		expect(windowsDataValueSpelling("C:\\repo\\.agent\\rules\\x.md")).toBe("C:/repo/.agent/rules/x.md");
+		expect(windowsDataValueSpelling("c:/repo/x.md")).toBe("c:/repo/x.md");
+	});
+
+	it("leaves a POSIX and a UNC path alone", () => {
+		expect(windowsDataValueSpelling("/repo/.agent/rules/x.md")).toBe("/repo/.agent/rules/x.md");
+		expect(windowsDataValueSpelling("\\\\server\\share\\x.md")).toBe("\\\\server\\share\\x.md");
 	});
 });
 

@@ -643,6 +643,15 @@ const RULE_PATH_SHELL_SYNTAX = /[$`;&|<>()'"\\\n\r]/;
 const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
 
 /**
+ * Spelling of a Windows path for a data value: `/` names the same file and needs
+ * no escaping inside a quoted value, unlike the `\` the shell spelling uses.
+ * Exported because a POSIX host cannot produce a drive-qualified path.
+ */
+export function windowsDataValueSpelling(resolvedPath: string): string {
+	return WINDOWS_DRIVE_PATH.test(resolvedPath) ? resolvedPath.replaceAll("\\", "/") : resolvedPath;
+}
+
+/**
  * Return `resolvedPath` in the form the bash tool's shell reads as that same
  * file, or refuse it when shell syntax survives that form.
  */
@@ -880,13 +889,18 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.sessionAgentDir,
 			shellContext && (enclosingQuote(command, index) !== undefined || unsafeExpansionPrefix(command, index)),
 		);
-		const replacement = shellContext && !options.noEscape ? shellEscape(resolvedPath) : resolvedPath;
 		const delimiter = token === rawUrl ? undefined : token[0];
-		// The replacement lands in the quote the token carries or, for a URL inside
-		// a longer quoted run, the quote still open at that position.
-		if (!shellContext) {
+		let replacement: string;
+		if (shellContext) {
+			replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);
+		} else {
+			// A data value carries no shell spelling, so a Windows path uses `/`,
+			// which names the same file and needs no escaping inside quotes.
+			replacement = windowsDataValueSpelling(resolvedPath);
+			// The replacement lands in the quote the token carries or, for a URL
+			// inside a longer quoted run, the quote still open at that position.
 			assertFitsQuotedValue(
-				resolvedPath,
+				replacement,
 				delimiter !== undefined || enclosingClosedQuote(command, index) !== undefined,
 			);
 		}
