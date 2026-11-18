@@ -725,12 +725,14 @@ function startsCredentialHeader(line: string): boolean {
 	);
 }
 
-/** True when the line containing `index` begins a Cookie header. */
-function isCookieHeaderLine(text: string, index: number): boolean {
+/** True when the line containing `index` is a bare credential container opener. */
+function isContainerOpenerLine(text: string, index: number): boolean {
 	const start = text.lastIndexOf("\n", index) + 1;
 	const end = text.indexOf("\n", index);
 	const line = text.slice(start, end === -1 ? text.length : end);
-	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*cookie)\b/i.test(line);
+	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*(?:cookie|authorization|auth))[ \t]*["']?[ \t]*[:=][ \t]*[[{][ \t]*$/i.test(
+		line,
+	);
 }
 
 /** Quote-aware bracket scan up to `end`. */
@@ -783,7 +785,7 @@ function closesMatchingContainer(text: string, end: number, match: string): bool
 		if (!top || !((ch === "]" && top.ch === "[") || (ch === "}" && top.ch === "{"))) continue;
 		const rest = match.slice(i + 1).trim();
 		if (rest !== "" && rest !== ",") continue;
-		if (!isCookieHeaderLine(text, top.index)) return false;
+		if (!isContainerOpenerLine(text, top.index)) return false;
 		stack.pop();
 		return true;
 	}
