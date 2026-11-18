@@ -713,6 +713,20 @@ describe("formatSessionDumpText credential scrub", () => {
 		}
 	});
 
+	it("keeps a schema definition named like the intent field", () => {
+		// The intent field is an argument concept; a schema root definition with that name is
+		// schema structure and stays readable.
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [{ name: "x", description: "", parameters: { "\\u005fi": { type: "string" } } }],
+		});
+
+		expect(dumped).toContain('"type": "string"');
+		expect(dumped).toContain("Parameters");
+	});
+
 	it("classifies an encoded tab separator in an argument name like the tab itself", () => {
 		// The credential labels accept a tab separator, so a field name has to resolve to the same
 		// identity; the printed dump still keeps the control character spelled out.

@@ -403,9 +403,12 @@ function formatArgsAsXml(
 	// A scrubbed schema key no longer matches the original argument name, so each mode walks its
 	// own entries: arguments over the value-paired tree, schemas over the sanitized schema.
 	// The intent field is the field that resolves to its name, so an escaped spelling of it is
-	// not dumped as an ordinary argument either.
+	// not dumped as an ordinary argument either. A schema root is not an argument, so a
+	// definition named `_i` stays part of the schema.
 	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
-	const entries = Object.entries(paired ?? args).filter(([key]) => fieldIdentity(key) !== INTENT_FIELD);
+	const entries = Object.entries(paired ?? args).filter(
+		([key]) => mode === "schema" || fieldIdentity(key) !== INTENT_FIELD,
+	);
 	const parts: string[] = [];
 	for (const [key, value] of entries) {
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));

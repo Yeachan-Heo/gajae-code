@@ -654,6 +654,21 @@ describe("recordFatalCrash", () => {
 		const yamlScalar = `-----BEGIN PRIVATE KEY-----\npassword: |\n  -----END PRIVATE KEY-----\n  OPAQUE_YAML_TAIL\nnote=keep`;
 		expect(redactCrashSecrets(yamlScalar)).not.toContain("OPAQUE_YAML_TAIL");
 		expect(redactCrashSecrets(yamlScalar)).toContain("note=keep");
+
+		// An opening banner hidden inside a credential scalar is not a block opener: the scan
+		// above already pairs the real block further down, and the diagnostics between them stay.
+		const hiddenOpener = `password: |\n  -----BEGIN PRIVATE KEY-----\n  placeholder\nnote=keep\n-----BEGIN PRIVATE KEY-----\nBODY\n-----END PRIVATE KEY-----`;
+		const hiddenOutput = redactCrashSecrets(hiddenOpener);
+		expect(hiddenOutput).toContain("note=keep");
+		expect(hiddenOutput).not.toContain("BODY");
+		expect(hiddenOutput).not.toContain("PRIVATE KEY");
+
+		// A camelCase key inside an already masked container is not a container opener, so the
+		// diagnostic that follows it survives alongside the real block.
+		const camelInsideContainer = `secret={"value":"myPassword={fake"} diagnostic=KEEP\n-----BEGIN PRIVATE KEY-----\nBODY\n-----END PRIVATE KEY-----`;
+		const camelOutput = redactCrashSecrets(camelInsideContainer);
+		expect(camelOutput).toContain("diagnostic=KEEP");
+		expect(camelOutput).not.toContain("BODY");
 	});
 
 	it("preserves later diagnostics after an unterminated credential container", () => {

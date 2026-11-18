@@ -122,10 +122,14 @@ function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[])
 	]);
 	const containerMasked = applyMaskRanges(text, containerApplied);
 	const survivors = mapMaskedRanges(findPrivateKeySpans(containerMasked), containerApplied);
+	// A block whose opening banner sits inside a container or scalar was hidden by that masking,
+	// and the re-scan already pairs the block that survives; keeping the raw range would swallow
+	// the diagnostics between the hidden banner and the footer it happened to reach.
+	const visible = spans.filter(span => !isInsideMaskedRange(span.start, containerApplied));
 	return applyMaskRanges(
 		text,
 		mergeMaskRanges([
-			...spans.map(span => ({ start: span.start, end: span.end, container: false })),
+			...visible.map(span => ({ start: span.start, end: span.end, container: false })),
 			...containers.map(range => ({ start: range.start, end: range.end, container: true })),
 			...scalars.map(range => ({ start: range.start, end: range.end, container: true })),
 			...survivors.map(range => ({ ...range, container: false })),
@@ -161,6 +165,18 @@ function applyMaskRanges(text: string, ranges: readonly AppliedRange[]): string 
 	}
 	parts.push(text.slice(cursor));
 	return parts.join("");
+}
+
+/**
+ * Whether a position falls inside a range this pass masks. Applied ranges ascend and do not
+ * overlap, so the scan stops at the first range that starts at or after the position.
+ */
+function isInsideMaskedRange(position: number, applied: readonly AppliedRange[]): boolean {
+	for (const range of applied) {
+		if (range.start > position) return false;
+		if (position < range.end) return true;
+	}
+	return false;
 }
 
 /**
@@ -822,13 +838,26 @@ function containerAssignmentPatterns(rules: CredentialRedactionRules): { assignm
 	};
 }
 
-/** Collect the ranges a container pass masks, in the coordinates of the text it reads. */
+/**
+ * Collect the ranges the container passes mask, in the coordinates of the original text.
+ * The camel pass reads the generic-masked text, as the scrubber's own order does, so a camel
+ * spelling inside a container that is already masked cannot invent a range; what it does find
+ * is mapped back through the markers.
+ */
 function collectCredentialContainerRanges(text: string, rules: CredentialRedactionRules, ranges: TextRange[]): void {
 	if (!rules.containerCandidatePattern.test(text)) return;
 	const { assignment, camel } = containerAssignmentPatterns(rules);
-	// Each pattern reads the original text so every recorded range is in original coordinates.
-	redactCredentialContainersWithPattern(text, assignment, true, ranges);
-	redactCredentialContainersWithPattern(text, camel, true, ranges);
+	const generic: TextRange[] = [];
+	redactCredentialContainersWithPattern(text, assignment, true, generic);
+	ranges.push(...generic);
+	if (generic.length === 0) {
+		redactCredentialContainersWithPattern(text, camel, true, ranges);
+		return;
+	}
+	const applied = mergeMaskRanges(generic.map(range => ({ ...range, container: true })));
+	const camelRanges: TextRange[] = [];
+	redactCredentialContainersWithPattern(applyMaskRanges(text, applied), camel, true, camelRanges);
+	ranges.push(...mapMaskedRanges(camelRanges, applied));
 }
 
 function redactCredentialContainersWithPattern(
