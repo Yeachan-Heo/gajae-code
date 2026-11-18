@@ -5022,12 +5022,15 @@ describe("ModelRegistry", () => {
 					return Response.json({ data: [{ id: "omlx-proxy-probe-model" }] });
 				},
 			});
-			const proxiedRequests: string[] = [];
+			const proxiedRequests: { url: string; authorization: string | null }[] = [];
 			const proxyServer = Bun.serve({
 				port: 0,
 				hostname: "127.0.0.1",
 				fetch(request) {
-					proxiedRequests.push(request.url);
+					proxiedRequests.push({
+						url: request.url,
+						authorization: request.headers.get("authorization"),
+					});
 					return new Response("forwarded through the proxy", { status: 502 });
 				},
 			});
@@ -5080,9 +5083,10 @@ describe("ModelRegistry", () => {
 					child.exited,
 				]);
 				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-				// The request target was the configured proxy, addressed with the
-				// absolute endpoint URL...
-				expect(proxiedRequests).toEqual([`${endpointBaseUrl}/models`]);
+				// The credentialed probe reached the configured proxy...
+				expect(proxiedRequests.filter(request => request.url === `${endpointBaseUrl}/models`)).toEqual([
+					{ url: `${endpointBaseUrl}/models`, authorization: "Bearer omlx-proxy-probe-key" },
+				]);
 				// ...and no direct socket was opened to the implicit endpoint.
 				expect(endpointProbes).toEqual([]);
 				// The proxy refused the request, so no direct-socket catalog may slip in.
