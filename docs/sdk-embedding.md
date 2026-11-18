@@ -306,8 +306,23 @@ requires independent native admission and all ownership vetoes.
 `listEmbeddedProjectSessions` preserves display arrays and separately reports
 strict complete/incomplete inventory. `forkEmbeddedSession` copies captured history
 to independent destination membership and durably pins the selected execution
-checkpoint, rather than inferring it from a physical metadata tail. Deletion checks
-all owner vetoes before cleanup and requires a verified positive deletion outcome.
+checkpoint, rather than inferring it from a physical metadata tail.
+
+An App performing a selected-entry fork can supply `reserveSelectedForkTranscript`.
+Both captured-copy implementations await the `staging` reservation before
+publishing the copy. The subsequent admitted branch awaits the one-shot
+`successor` reservation before publishing either a non-root branch or an empty-root
+new session. Each callback receives the producer's SDK transcript ID and canonical
+final file together; rejection prevents publication. This is a consumer catalog
+hook, not a storage visibility or ownership rule. The desktop catalog persists
+exact project, ID and file bindings before acknowledging the reservation, then
+suppresses only those exact pairs from its own automatic imports, including after
+restart. The explicitly committed successor row and SDK inventories stay visible.
+Failed compensation for an already-written catalog row is a separate recovery
+case; the reservation does not undo that write.
+
+Deletion checks all owner vetoes before cleanup and requires a verified positive
+deletion outcome.
 A `cleanup_pending` error retains an opaque same-process `retry` handle and exact
 native cleanup evidence; missing transcript bytes never authorize another delete
 or replacement cleanup. Ordinary artifact cleanup may retain its receipt-bound

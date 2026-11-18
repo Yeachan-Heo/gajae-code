@@ -712,7 +712,16 @@ export async function listEmbeddedProjectSessions(input: { cwd: string; agentDir
 
 /** Fork complete captured history with a separately selected execution checkpoint. */
 export async function forkEmbeddedSession(
-	input: { file: string; cwd: string; selection?: { snapshotDigest: string; targetLeafId: string | null } } & (
+	input: {
+		file: string;
+		cwd: string;
+		selection?: { snapshotDigest: string; targetLeafId: string | null };
+		reserveSelectedForkTranscript?: (identity: {
+			readonly role: "staging" | "successor";
+			readonly sessionId: string;
+			readonly file: string;
+		}) => Promise<void>;
+	} & (
 		| { directory: string; agentDir?: string }
 		| { agentDir: string; managed: true }
 	),
@@ -728,6 +737,7 @@ export async function forkEmbeddedSession(
 		});
 	// Copy consent before the first await; callers cannot change the selected digest/target in flight.
 	const selection = input.selection ? Object.freeze({ ...input.selection }) : undefined;
+	const reserveSelectedForkTranscript = input.reserveSelectedForkTranscript;
 	if (selection && selection.snapshotDigest !== checkpoint.snapshotDigest)
 		throw Object.assign(new Error("Fork source changed since selection"), { code: "stale_snapshot", checkpoint });
 	if (!selection && (checkpoint.kind === "ambiguous" || checkpoint.kind === "legacy_tail"))
@@ -790,7 +800,7 @@ export async function forkEmbeddedSession(
 			"copy-retain",
 			"auto",
 			undefined,
-			{ executionTargetLeafId: target },
+			{ executionTargetLeafId: target, reserveSelectedForkTranscript },
 		);
 		if (fork.kind !== "forked")
 			throw Object.assign(new Error("Could not publish forked session"), { code: fork.reason, outcome: fork });

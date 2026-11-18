@@ -35630,6 +35630,7 @@ export class AgentSession {
 		assertNativeRuntimeInvocation(this);
 		const previousSessionId = this.sessionId;
 		this.#beginSessionTransition("branch");
+		let reserveSelectedForkTranscript = this.sessionManager.takeSelectedForkTranscriptReservation();
 		try {
 			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
 			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
@@ -35668,8 +35669,11 @@ export class AgentSession {
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flush();
 			const prepared = selectedEntry.parentId
-				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId)
-				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
+				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId, reserveSelectedForkTranscript)
+				: await this.sessionManager.prepareNewSession(
+						{ parentSession: previousSessionFile },
+						reserveSelectedForkTranscript,
+					);
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
@@ -35754,6 +35758,7 @@ export class AgentSession {
 
 			return { selectedText, cancelled: false };
 		} finally {
+			reserveSelectedForkTranscript = undefined;
 			this.#reconnectToAgent();
 			this.#endSessionTransition();
 			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();

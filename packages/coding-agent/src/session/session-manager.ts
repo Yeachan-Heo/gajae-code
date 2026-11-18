@@ -414,6 +414,13 @@ export interface SessionHeader extends MutableSessionHeaderFields {
 	parentSession?: string;
 }
 
+/** Exact prepublication reservation for one selected-entry embedded fork. @internal */
+export type SelectedForkTranscriptReservation = (identity: {
+	readonly role: "staging" | "successor";
+	readonly sessionId: string;
+	readonly file: string;
+}) => Promise<void>;
+
 export interface NewSessionOptions {
 	parentSession?: string;
 	/** Skip flushing the current session and delete it instead of saving. */
@@ -8163,6 +8170,9 @@ export class SessionManager {
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
 	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
 	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
+	#selectedForkTranscriptReservation:
+		| { readonly sessionId: string; readonly file: string | undefined; readonly reserve: SelectedForkTranscriptReservation }
+		| undefined;
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -11264,17 +11274,139 @@ export class SessionManager {
 		return prepared.sessionFile;
 	}
 
+	/** Consume the selected-entry fork's sole successor reservation under the branch lease. @internal */
+	takeSelectedForkTranscriptReservation(): SelectedForkTranscriptReservation | undefined {
+		const pending = this.#selectedForkTranscriptReservation;
+		this.#selectedForkTranscriptReservation = undefined;
+		return pending?.sessionId === this.#sessionId && pending.file === this.#sessionFile ? pending.reserve : undefined;
+	}
+
+	async #reserveSelectedForkTranscript(
+		reserve: SelectedForkTranscriptReservation,
+		role: "staging" | "successor",
+		sessionId: string,
+		file: string | undefined,
+	): Promise<void> {
+		if (!file) throw new Error("fork_transcript_session_file_unavailable");
+		this.#assertArtifactOpen();
+		const sourceId = this.#sessionId;
+		const sourceFile = this.#sessionFile;
+		const generation = this.getSessionIdentityGeneration();
+		const revisions = this.revisionSnapshot();
+		const cwd = this.cwd;
+		const destination = this.destination;
+		const sourceDescriptor = role === "successor" && sourceFile ? this.#storage.statSync(sourceFile) : undefined;
+		const assertTargetAbsent = (): void => {
+			if (this.#storage instanceof FileSessionStorage) {
+				try {
+					fs.lstatSync(file);
+				} catch (error) {
+					if (isEnoent(error)) return;
+					throw error;
+				}
+			} else if (!this.#storage.existsSync(file)) return;
+			throw new Error("selected_fork_reservation_target_exists");
+		};
+		assertTargetAbsent();
+		// Resolve the existing ancestor, not the absent transcript itself. This also
+		// covers an eager fork whose final directory is still privately staged.
+		const canonicalTarget = (): { file: string; directory: string } => {
+			let directory = path.dirname(path.resolve(file));
+			const suffix = [path.basename(file)];
+			for (;;) {
+				try {
+					const canonicalDirectory = fs.realpathSync(directory);
+					return { file: path.join(canonicalDirectory, ...suffix), directory: canonicalDirectory };
+				} catch (error) {
+					if (!isEnoent(error) || path.dirname(directory) === directory) throw error;
+					// A dangling directory symlink is not an absent destination.
+					try {
+						fs.lstatSync(directory);
+					} catch (statError) {
+						if (!isEnoent(statError)) throw statError;
+						suffix.unshift(path.basename(directory));
+						directory = path.dirname(directory);
+						continue;
+					}
+					throw new Error("selected_fork_reservation_path_changed");
+				}
+			}
+		};
+		const target =
+			this.#storage instanceof FileSessionStorage
+				? canonicalTarget()
+				: { file: path.resolve(file), directory: path.dirname(path.resolve(file)) };
+		const targetDirectoryDescriptor =
+			this.#storage instanceof FileSessionStorage ? fs.statSync(target.directory, { bigint: true }) : undefined;
+		const directory = resolveEquivalentPath(this.getSessionDir());
+		const directoryDescriptor =
+			this.#storage instanceof FileSessionStorage ? fs.statSync(directory, { bigint: true }) : undefined;
+		const identity = Object.freeze({ role, sessionId, file: target.file });
+		// No owner publication lock is held while the host durably reserves this pair.
+		await reserve(identity);
+		this.#assertArtifactOpen();
+		if (
+			this.#sessionId !== sourceId ||
+			this.#sessionFile !== sourceFile ||
+			this.getSessionIdentityGeneration() !== generation ||
+			this.#entryRevision !== revisions.entry ||
+			this.#leafRevision !== revisions.leaf ||
+			this.#headerExportRevision !== revisions.headerExport ||
+			this.#labelRevision !== revisions.label ||
+			this.#replayMetadataRevision !== revisions.replayMetadata ||
+			this.cwd !== cwd ||
+			this.destination !== destination ||
+			(sourceDescriptor && (!sourceFile || !sameDescriptor(sourceDescriptor, this.#storage.statSync(sourceFile))))
+		)
+			throw new Error("selected_fork_reservation_identity_changed");
+		assertTargetAbsent();
+		if (this.#storage instanceof FileSessionStorage && directoryDescriptor && targetDirectoryDescriptor) {
+			const current = fs.lstatSync(directory, { bigint: true });
+			const currentTargetDirectory = fs.lstatSync(target.directory, { bigint: true });
+			if (sourceDescriptor && sourceFile) {
+				const currentSource = fs.lstatSync(sourceFile, { bigint: true });
+				if (
+					!currentSource.isFile() ||
+					currentSource.isSymbolicLink() ||
+					currentSource.dev !== sourceDescriptor.dev ||
+					currentSource.ino !== sourceDescriptor.ino
+				)
+					throw new Error("selected_fork_reservation_source_changed");
+			}
+			if (
+				!current.isDirectory() ||
+				current.isSymbolicLink() ||
+				current.dev !== directoryDescriptor.dev ||
+				current.ino !== directoryDescriptor.ino ||
+				!currentTargetDirectory.isDirectory() ||
+				currentTargetDirectory.isSymbolicLink() ||
+				currentTargetDirectory.dev !== targetDirectoryDescriptor.dev ||
+				currentTargetDirectory.ino !== targetDirectoryDescriptor.ino ||
+				resolveEquivalentPath(this.getSessionDir()) !== directory ||
+				canonicalTarget().file !== target.file
+			)
+				throw new Error("selected_fork_reservation_path_changed");
+		}
+		if (destination.kind === "managed") this.#managedTranscriptStore(file).assertBound();
+	}
+
 	/**
 	 * Allocate a fresh successor without publishing it through the manager's public
 	 * getters. The returned authority is deliberately immutable so readiness work
 	 * can resolve local:// against the successor while the predecessor stays live.
 	 * @internal
 	 */
-	async prepareNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
-		return this.#publication.prepare(() => this.#prepareNewSessionAdmitted(options));
+	async prepareNewSession(
+		options?: NewSessionOptions,
+		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation,
+	): Promise<PreparedNewSession> {
+		return this.#publication.prepare(() => this.#prepareNewSessionAdmitted(options, reserveSelectedForkTranscript));
 	}
 
-	async #prepareNewSessionAdmitted(options?: NewSessionOptions): Promise<PreparedNewSession> {
+	async #prepareNewSessionAdmitted(
+		options?: NewSessionOptions,
+		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation,
+	): Promise<PreparedNewSession> {
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
 		if (this.#ownerMembership && this.#heldPublicationEntries.size) {
@@ -11282,7 +11414,29 @@ export class SessionManager {
 			await this.flush();
 		}
 		await this.#closePersistWriter();
-		return this.#publication.prepare(() => this.#allocatePreparedNewSession(options));
+		const stage = await this.#publication.prepare(() => this.#allocatePreparedNewSession(options));
+		if (!reserveSelectedForkTranscript) return stage;
+		try {
+			await this.#reserveSelectedForkTranscript(
+				reserveSelectedForkTranscript,
+				"successor",
+				stage.sessionId,
+				stage.sessionFile,
+			);
+			this.#getPreparedNewSessionStage(stage);
+			this.#assertRecoveryHydrationWritable();
+			return stage;
+		} catch (error) {
+			try {
+				await this.discardPreparedNewSession(stage);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"Fork reservation and staged session cleanup both failed.",
+				);
+			}
+			throw error;
+		}
 	}
 
 	async #allocatePreparedNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
@@ -11758,11 +11912,17 @@ export class SessionManager {
 	}
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
-	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
-		return this.#publication.prepare(() => this.#prepareBranchedSessionAdmitted(leafId));
+	async prepareBranchedSession(
+		leafId: string,
+		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation,
+	): Promise<PreparedNewSession> {
+		return this.#publication.prepare(() => this.#prepareBranchedSessionAdmitted(leafId, reserveSelectedForkTranscript));
 	}
 
-	async #prepareBranchedSessionAdmitted(leafId: string): Promise<PreparedNewSession> {
+	async #prepareBranchedSessionAdmitted(
+		leafId: string,
+		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation,
+	): Promise<PreparedNewSession> {
 		this.assertLegacyMutationAllowed("prepare branched session");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
@@ -11830,6 +11990,18 @@ export class SessionManager {
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
+			if (reserveSelectedForkTranscript) {
+				await this.#reserveSelectedForkTranscript(
+					reserveSelectedForkTranscript,
+					"successor",
+					stage.sessionId,
+					stage.sessionFile,
+				);
+				this.#getPreparedNewSessionStage(stage);
+				this.assertLegacyMutationAllowed("prepare branched session");
+				this.#assertRecoveryHydrationWritable();
+				this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session", true);
+			}
 			await this.#ensurePreparedNewSessionOnDiskAdmitted(stage);
 			return stage;
 		} catch (error) {
@@ -21252,6 +21424,7 @@ export class SessionManager {
 	}
 
 	#beginArtifactClose(): void {
+		this.#selectedForkTranscriptReservation = undefined;
 		if (!this.#artifactClosing) {
 			this.#artifactClosing = true;
 			this.#artifactLifecycle = Symbol("session-artifact-close");
@@ -26475,6 +26648,7 @@ export class SessionManager {
 	async #tryForkFromCapturedBounded(
 		snapshot: CapturedSessionTranscriptSnapshot,
 		executionTargetLeafId?: string | null,
+		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation,
 	): Promise<StrictSessionForkResult | undefined> {
 		if (
 			this.#effectiveSessionMemoryMode(snapshot.identity.size) !== "enabled" ||
@@ -26605,6 +26779,16 @@ export class SessionManager {
 		this.#applyFreshSessionMetadata(fresh);
 		const withPublication = <T>(body: () => T): T =>
 			executionTargetLeafId === undefined ? body() : this.#withOwnerPublicationSync(body);
+		if (reserveSelectedForkTranscript) {
+			await this.#reserveSelectedForkTranscript(
+				reserveSelectedForkTranscript,
+				"staging",
+				fresh.sessionId,
+				fresh.sessionFile,
+			);
+			const beforeWrite = snapshot.revalidate();
+			if (beforeWrite.kind !== "valid") return beforeWrite;
+		}
 		if (executionTargetLeafId !== undefined) this.#ensureOwnerMembershipSync();
 		const staged = withPublication(() =>
 			snapshot.storage.openStagedWriter!(fresh.sessionFile!, {
@@ -26669,6 +26853,9 @@ export class SessionManager {
 			await this.#initSessionFile(fresh.sessionFile);
 			if (executionTargetLeafId !== undefined) await this.#initializeCapturedFork(forkTarget);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			this.#selectedForkTranscriptReservation = reserveSelectedForkTranscript
+				? { sessionId: this.#sessionId, file: this.#sessionFile, reserve: reserveSelectedForkTranscript }
+				: undefined;
 			return { kind: "forked", manager: this };
 		} catch (error) {
 			try {
@@ -27938,8 +28125,12 @@ export class SessionManager {
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		sourceEntryId?: string | null,
-		nativeResume?: { readonly executionTargetLeafId: string | null },
+		nativeResume?: {
+			readonly executionTargetLeafId: string | null;
+			readonly reserveSelectedForkTranscript?: SelectedForkTranscriptReservation;
+		},
 	): Promise<StrictSessionForkResult> {
+		nativeResume = nativeResume ? Object.freeze({ ...nativeResume }) : undefined;
 		if (
 			sourceEntryId !== undefined &&
 			sourceEntryId !== null &&
@@ -27996,7 +28187,11 @@ export class SessionManager {
 			}
 			let bounded: StrictSessionForkResult | undefined;
 			try {
-				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot, nativeResume?.executionTargetLeafId);
+				bounded = await boundedManager.#tryForkFromCapturedBounded(
+					snapshot,
+					nativeResume?.executionTargetLeafId,
+					nativeResume?.reserveSelectedForkTranscript,
+				);
 			} catch (error) {
 				boundedManager.#clearBoundedManagedSource();
 				await boundedManager.close().catch(() => {});
@@ -28142,6 +28337,17 @@ export class SessionManager {
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition);
 			manager.#retireEphemeralArtifacts();
+			if (nativeResume?.reserveSelectedForkTranscript) {
+				const finalFile = manager.#sessionFile
+					? path.join(dir, path.basename(manager.#sessionFile))
+					: undefined;
+				await manager.#reserveSelectedForkTranscript(
+					nativeResume.reserveSelectedForkTranscript,
+					"staging",
+					manager.#sessionId,
+					finalFile,
+				);
+			}
 			if (nativeResume) manager.#ensureOwnerMembershipSync();
 			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 			const beforeWrite = snapshot.revalidate();
@@ -28303,6 +28509,13 @@ export class SessionManager {
 				if (manager.#effectiveSessionMemoryMode() === "enabled") manager.#retireColdEntries();
 			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
+			manager.#selectedForkTranscriptReservation = nativeResume?.reserveSelectedForkTranscript
+				? {
+						sessionId: manager.#sessionId,
+						file: manager.#sessionFile,
+						reserve: nativeResume.reserveSelectedForkTranscript,
+					}
+				: undefined;
 			return { kind: "forked", manager };
 		} catch (error) {
 			if (directoryPublicationUncertain) throw error;
