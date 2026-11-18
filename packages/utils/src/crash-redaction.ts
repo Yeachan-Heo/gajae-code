@@ -359,10 +359,20 @@ export interface StructuredRedactionOptions {
 	 * `paths: ["auth", "src"]` or `{ name: "token", value: "identifier" }` keeps its values.
 	 */
 	readonly headerPairs?: boolean | ((key: string | undefined) => boolean);
+	/**
+	 * How a field name is read as a credential name. Defaults to the name as given, which is what
+	 * a caller that already decodes names before serializing wants; a caller whose names can
+	 * still carry an encoded spelling passes a predicate over the decoded name instead.
+	 */
+	readonly credentialKey?: (key: string) => boolean;
 }
 
 function allowsHeaderPairs(options: StructuredRedactionOptions | undefined, key: string | undefined): boolean {
 	return typeof options?.headerPairs === "function" ? options.headerPairs(key) : options?.headerPairs === true;
+}
+
+function isCredentialField(options: StructuredRedactionOptions | undefined, key: string): boolean {
+	return options?.credentialKey ? options.credentialKey(key) : isCredentialKey(key);
 }
 
 /**
@@ -370,7 +380,7 @@ function allowsHeaderPairs(options: StructuredRedactionOptions | undefined, key:
  * `key` lets callers preserve credential-field context when formatting one value.
  */
 export function redactStructuredSecrets(value: unknown, key?: string, options?: StructuredRedactionOptions): unknown {
-	if (key !== undefined && isCredentialKey(key)) return "«redacted»";
+	if (key !== undefined && isCredentialField(options, key)) return "«redacted»";
 	if (typeof value === "string") return redactCrashSecrets(value);
 	if (Array.isArray(value)) {
 		const headerPairs = allowsHeaderPairs(options, key);
@@ -383,7 +393,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 			return value.map((item, index) => {
 				if (index % 2 === 1) {
 					const field = value[index - 1];
-					if (typeof field === "string" && isCredentialKey(field)) return "«redacted»";
+					if (typeof field === "string" && isCredentialField(options, field)) return "«redacted»";
 				}
 				return redactStructuredSecrets(item, undefined, options);
 			});
@@ -401,7 +411,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 		if (normalized === "value" || normalized === "values") hasHeaderValue = true;
 		if (normalized !== "name" && normalized !== "key") continue;
 		const headerName = source[field];
-		if (typeof headerName === "string" && isCredentialKey(headerName)) hasCredentialHeaderName = true;
+		if (typeof headerName === "string" && isCredentialField(options, headerName)) hasCredentialHeaderName = true;
 	}
 	const redactHeaderValue = allowsHeaderPairs(options, key) && hasCredentialHeaderName && hasHeaderValue;
 	const redacted = Object.create(null) as Record<string, unknown>;

@@ -175,6 +175,12 @@ function decodeEscapedText(input: string): string {
 	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input));
 }
 
+/** Suffix that keeps a field name distinct when two spellings decode to the same name. */
+const DUPLICATE_NAME_SUFFIX = /#\d+$/;
+
+/** An integer-like key is enumerated before every other field, so it must keep its spelling. */
+const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
+
 /**
  * Decode `\u` escapes in every string leaf and every field name, so banner detection,
  * credential-name recognition and the printed value all see the characters a reader sees.
@@ -182,26 +188,47 @@ function decodeEscapedText(input: string): string {
  * the renderer used to decode after this prepass; decoding twice here keeps banner pairing
  * and the printed value on the same characters instead of materialising a banner later.
  * Field names are part of that decoded representation: a name spelled with an escape is only
- * credential-shaped once resolved, and it is the structural prepass — not a later pass over
- * the serialized text — that has to recognize it.
+ * credential-shaped once resolved, and it is this prepass — not a later pass over the
+ * serialized text — that has to recognize it.
+ * The spelling every entry is stored under keeps the pairing stream in its original order and
+ * keeps every entry: a name that would reorder the enumeration or that a sibling already holds
+ * keeps the spelling it arrived with, and only a name that cannot stay distinct gets `#n`.
  */
 function decodeValueStrings(value: unknown): unknown {
 	if (typeof value === "string") return decodeEscapedText(value);
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
 	const decoded = Object.create(null) as Record<string, unknown>;
+	const nextSuffix = new Map<string, number>();
 	for (const [key, nested] of Object.entries(value)) {
 		const name = decodeEscapedText(key);
-		if (name === key || !Object.hasOwn(decoded, name)) {
-			decoded[name] = decodeValueStrings(nested);
-			continue;
-		}
-		// Two spellings decode to one field name. The later entry keeps its original spelling so
-		// no argument disappears, and a credential name it decodes to masks that entry rather
-		// than leaving its value to the generic text scrub.
-		decoded[key] = isCredentialKey(name) ? "«redacted»" : decodeValueStrings(nested);
+		const storage = name === key || ARRAY_INDEX_NAME.test(name) || Object.hasOwn(decoded, name) ? key : name;
+		const field = Object.hasOwn(decoded, storage) ? uniqueDecodedFieldName(decoded, storage, nextSuffix) : storage;
+		decoded[field] = decodeValueStrings(nested);
 	}
 	return decoded;
+}
+
+/** Next free `name#n` for a field name two entries claim; the map keeps the scan linear. */
+function uniqueDecodedFieldName(
+	target: Record<string, unknown>,
+	name: string,
+	nextSuffix: Map<string, number>,
+): string {
+	let suffix = nextSuffix.get(name) ?? 2;
+	while (Object.hasOwn(target, `${name}#${suffix}`)) suffix += 1;
+	nextSuffix.set(name, suffix + 1);
+	return `${name}#${suffix}`;
+}
+
+/**
+ * The name a stored field stands for: escapes resolved, and the `#n` a duplicate needed removed.
+ * Recognition reads this instead of the stored spelling, because a name that only becomes
+ * credential- or header-shaped after decoding keeps the spelling it arrived with when a sibling
+ * already holds the decoded form.
+ */
+function fieldIdentity(key: string): string {
+	return decodeEscapedText(key).replace(DUPLICATE_NAME_SUFFIX, "");
 }
 
 /**
@@ -210,9 +237,8 @@ function decodeValueStrings(value: unknown): unknown {
  * Field names never enter the joined stream: a name between two halves would separate them.
  * Names are decoded by the same prepass, so the credential name the structural scrubber
  * reads is the name the dump prints, but a name never contributes characters to a block.
- * A banner split
- * across two values with another value in between is therefore not paired; each half is
- * still scrubbed on its own where it forms a complete block.
+ * A banner split across two values with another value in between is therefore not paired;
+ * each half is still scrubbed on its own where it forms a complete block.
  * `decodeEscapes` is for encoded values (tool arguments and schema data); literal message
  * text opts out so its own `\u` spelling survives.
  */
@@ -235,12 +261,23 @@ function serializeParameterValue(value: unknown): string {
 }
 
 /**
+ * Structural redaction for argument and schema data. Both recognitions read the name a field
+ * stands for rather than its stored spelling, so a name the prepass had to keep escaped (a
+ * sibling already held its decoded form) still masks its value and still classifies as a
+ * header collection.
+ */
+const STRUCTURED_REDACTION = {
+	headerPairs: (key: string | undefined) => isHeaderCollectionKey(key === undefined ? undefined : fieldIdentity(key)),
+	credentialKey: (key: string) => isCredentialKey(fieldIdentity(key)),
+} as const;
+
+/**
  * Text of one tool-argument value: scrubbed, then escaped for XML.
  * Decoding happened in the entry pairing, so the scrubber sees the same characters that
  * were checked for a private-key block.
  */
 function formatArgumentText(value: unknown, key: string): string {
-	const structured = redactStructuredSecrets(value, key, { headerPairs: isHeaderCollectionKey });
+	const structured = redactStructuredSecrets(value, key, STRUCTURED_REDACTION);
 	return escapeXmlText(redactCrashSecrets(serializeParameterValue(structured)));
 }
 
@@ -261,7 +298,7 @@ const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "$defs",
  * collection keeps its value redaction. The schema entry prepass already decoded it.
  */
 function scrubSchemaData(value: unknown, propertyName?: string): unknown {
-	return redactStructuredSecrets(value, propertyName, { headerPairs: isHeaderCollectionKey });
+	return redactStructuredSecrets(value, propertyName, STRUCTURED_REDACTION);
 }
 
 /** Replace every leaf of a data value with the marker, preserving its shape. */
@@ -313,19 +350,22 @@ function sanitizeSchemaValue(value: unknown, propertyName?: string): unknown {
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
 	const scrubbedKeys = new Map<string, number>();
-	const dataFields = Object.keys(source).filter(field => SCHEMA_VALUE_KEYWORDS.has(field));
 	for (const [field, nested] of Object.entries(source)) {
-		const dataIndex = dataFields.indexOf(field);
-		if (SCHEMA_MAP_KEYWORDS.has(field) && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+		// Keywords are recognized by the name they stand for, so an escaped keyword a sibling forced
+		// to keep its spelling is still a map or a data keyword rather than an ordinary field.
+		const keyword = decodeEscapedText(field);
+		if (SCHEMA_MAP_KEYWORDS.has(keyword) && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const schemas = Object.create(null) as Record<string, unknown>;
 			const nameSuffixes = new Map<string, number>();
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
-				schemas[uniqueScrubbedKey(schemas, name, nameSuffixes)] = sanitizeSchemaValue(schema, name);
+				// The definition keeps the name it was stored under; the credential test reads the name
+				// the definition stands for, so a collided spelling still masks its literal data.
+				schemas[uniqueScrubbedKey(schemas, name, nameSuffixes)] = sanitizeSchemaValue(schema, fieldIdentity(name));
 			}
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = schemas;
 			continue;
 		}
-		if (dataIndex >= 0) {
+		if (SCHEMA_VALUE_KEYWORDS.has(keyword)) {
 			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] =
 				propertyName !== undefined && isCredentialKey(propertyName)
 					? maskSchemaData(nested)

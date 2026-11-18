@@ -394,6 +394,132 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parameterValue(dumped, "payload")).toContain('"«redacted»"');
 	});
 
+	it("masks both arguments when two spellings decode to one credential name", () => {
+		const escapedSecret = "ESCAPED_DUPLICATE_SECRET";
+		const plainSecret = "PLAIN_DUPLICATE_SECRET";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-decoded-name-duplicate",
+						name: "request",
+						arguments: { payload: { "api\\u005fkey": escapedSecret, api_key: plainSecret } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		const payload = parameterValue(dumped, "payload") ?? "";
+		expect(payload).not.toContain(escapedSecret);
+		expect(payload).not.toContain(plainSecret);
+		expect(payload.match(/«redacted»/g) ?? []).toHaveLength(2);
+	});
+
+	it("masks a later escaped credential spelling when the plain name already holds the field", () => {
+		const plainSecret = "PLAIN_FIRST_SECRET";
+		const escapedSecret = "ESCAPED_SECOND_SECRET";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-decoded-name-duplicate-reversed",
+						name: "request",
+						arguments: { payload: { api_key: plainSecret, "api\\u005fkey": escapedSecret } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		const payload = parameterValue(dumped, "payload") ?? "";
+		expect(payload).not.toContain(plainSecret);
+		expect(payload).not.toContain(escapedSecret);
+		expect(payload.match(/«redacted»/g) ?? []).toHaveLength(2);
+	});
+
+	it("keeps the pairing order when an escaped name decodes to an array index", () => {
+		const body = "NUMERIC_NAME_PEM_BODY";
+		// Decoded to `12`, the name would be enumerated ahead of `head` and split the block from
+		// its footer, so the stored spelling has to survive for the pairing to stay in order.
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-numeric-name-pairing",
+						name: "request",
+						arguments: {
+							payload: { head: `${pem("RSA", "BEGIN")}\\n${body}`, "\\u0031\\u0032": `\\n${pem("RSA", "END")}` },
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
+	it("keeps header-pair redaction for an escaped header collection name", () => {
+		const escapedSecret = "ESCAPED_HEADER_SECRET";
+		const suffixedSecret = "SUFFIXED_HEADER_SECRET";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-escaped-header-alias",
+						name: "http",
+						arguments: {
+							payload: {
+								"head\\u0065rs": ["X-Api-Key", escapedSecret, "Accept", "application/json"],
+								headers: ["Authorization", suffixedSecret],
+							},
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		const payload = parameterValue(dumped, "payload") ?? "";
+		expect(payload).not.toContain(escapedSecret);
+		expect(payload).not.toContain(suffixedSecret);
+		expect(payload).toContain('"X-Api-Key"');
+		expect(payload).toContain('"application/json"');
+	});
+
+	it("keeps both schema definitions when an escaped credential name collides with a plain one", () => {
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							api_key: { type: "string", minLength: 10 },
+							"api\\u005fkey": { type: "number" },
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).toContain('"api_key"');
+		expect(dumped).toContain('"type": "string"');
+		expect(dumped).toContain('"minLength": 10');
+		expect(dumped).toContain('"type": "number"');
+	});
+
 	it("keeps an ordinary decoded JSON blob in the session dump", () => {
 		const payload = '{"path": "src/auth", "note": "ok"}';
 		const dumped = dump([
