@@ -899,6 +899,52 @@ export class TopicRegistry {
 			: { state: "ambiguous" };
 	}
 
+	/** Resolve the exact disconnected topic an identity-less replay may resume, without broadening active inbound authority. */
+	disconnectedResumeAuthority(binding: TopicEndpointBinding, hostId: string, now: number): TopicEndpointAuthority {
+		const sessionId = binding.logicalSessionId;
+		if (
+			!hasValidBinding(binding) ||
+			!isValidBindingString(sessionId) ||
+			!isValidBindingString(hostId) ||
+			!Number.isFinite(now)
+		)
+			return { state: "ambiguous" };
+		const record = this.topics.get(sessionId);
+		if (
+			record?.authorityState !== "disconnect_grace" ||
+			record.bindingMalformed ||
+			record.archiveReason !== undefined ||
+			!isValidTopicId(record.topicId) ||
+			!hasCompleteBinding(record) ||
+			record.disconnectGraceExpiresAt === undefined ||
+			!Number.isFinite(record.disconnectGraceExpiresAt) ||
+			record.disconnectGraceExpiresAt <= now ||
+			record.chatId !== binding.chatId ||
+			record.telegramBinding?.chatId !== binding.chatId ||
+			(record.leaseOwner !== undefined && record.leaseOwner !== hostId && (record.leaseExpiresAt ?? 0) > now) ||
+			this.createClaims.has(sessionId) ||
+			this.creatingBindings.has(sessionId) ||
+			this.staged.has(sessionId)
+		)
+			return { state: "ambiguous" };
+		if (
+			[...this.topics].some(([id, candidate]) => id !== sessionId && candidate.topicId === record.topicId) ||
+			[...this.staged].some(([id, candidate]) => id !== sessionId && candidate.topicId === record.topicId) ||
+			[...this.creatingBindings].some(
+				([id, candidate]) =>
+					id !== sessionId && candidate.logicalSessionId === sessionId && candidate.chatId === binding.chatId,
+			) ||
+			[...this.createClaims].some(
+				([id, candidate]) =>
+					id !== sessionId &&
+					candidate.binding?.logicalSessionId === sessionId &&
+					candidate.binding.chatId === binding.chatId,
+			)
+		)
+			return { state: "ambiguous" };
+		return { state: "unique", sessionId };
+	}
+
 	/** Resolve a uniquely bound logical owner for callers that only need the owner. */
 	uniqueSessionForEndpoint(binding: TopicEndpointBinding): string | undefined {
 		const authority = this.endpointAuthority(binding);
