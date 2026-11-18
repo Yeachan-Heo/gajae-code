@@ -1083,7 +1083,7 @@ const RESIDUAL_TRAILING_WHOLE_MATCH_RULES: readonly { readonly pattern: RegExp; 
  * Line-bounded rules of one original text. Every pattern is attempted on one physical line only,
  * so no rule can consume a line terminator or reinterpret text produced by another rule.
  */
-const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*$/i;
+const AUTH_SCHEME_AT_LINE_END = /(?:^|:)[ \t]*(?:Bearer|Basic|Token)[ \t]*$/i;
 /** A URI may follow the cue after any run of wrapper characters, as in `**https://…**`. */
 const URI_AT_LINE_START = /^[ \t]*[^A-Za-z0-9+.-]*[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
