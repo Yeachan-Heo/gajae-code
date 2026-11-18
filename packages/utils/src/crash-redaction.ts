@@ -360,19 +360,24 @@ export interface StructuredRedactionOptions {
 	 */
 	readonly headerPairs?: boolean | ((key: string | undefined) => boolean);
 	/**
-	 * How a field name is read as a credential name. Defaults to the name as given, which is what
-	 * a caller that already decodes names before serializing wants; a caller whose names can
-	 * still carry an encoded spelling passes a predicate over the decoded name instead.
+	 * How a stored field name is resolved before it is classified. Defaults to the name as given,
+	 * which is what a caller that already decodes names before serializing wants; a caller whose
+	 * names can still carry an encoded spelling resolves them here instead, so the credential
+	 * test, the header-collection test and the header-record member names all read one spelling.
 	 */
-	readonly credentialKey?: (key: string) => boolean;
+	readonly resolveKey?: (key: string) => string;
 }
 
 function allowsHeaderPairs(options: StructuredRedactionOptions | undefined, key: string | undefined): boolean {
 	return typeof options?.headerPairs === "function" ? options.headerPairs(key) : options?.headerPairs === true;
 }
 
+function resolvedField(options: StructuredRedactionOptions | undefined, key: string): string {
+	return options?.resolveKey ? options.resolveKey(key) : key;
+}
+
 function isCredentialField(options: StructuredRedactionOptions | undefined, key: string): boolean {
-	return options?.credentialKey ? options.credentialKey(key) : isCredentialKey(key);
+	return isCredentialKey(resolvedField(options, key));
 }
 
 /**
@@ -407,7 +412,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 	let hasCredentialHeaderName = false;
 	let hasHeaderValue = false;
 	for (const field of sourceKeys) {
-		const normalized = field.toLowerCase();
+		const normalized = resolvedField(options, field).toLowerCase();
 		if (normalized === "value" || normalized === "values") hasHeaderValue = true;
 		if (normalized !== "name" && normalized !== "key") continue;
 		const headerName = source[field];
@@ -418,7 +423,7 @@ export function redactStructuredSecrets(value: unknown, key?: string, options?: 
 	const nextSuffixByKey = new Map<string, number>();
 	for (const field of sourceKeys) {
 		const redactedKey = uniqueStructuredKey(redacted, redactCrashSecrets(field), nextSuffixByKey);
-		const normalized = field.toLowerCase();
+		const normalized = resolvedField(options, field).toLowerCase();
 		if (redactHeaderValue && (normalized === "value" || normalized === "values")) {
 			const headerValue = source[field];
 			redacted[redactedKey] =

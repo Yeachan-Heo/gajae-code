@@ -257,7 +257,7 @@ function serializeParameterValue(value: unknown): string {
  */
 const STRUCTURED_REDACTION = {
 	headerPairs: (key: string | undefined) => isHeaderCollectionKey(key === undefined ? undefined : fieldIdentity(key)),
-	credentialKey: (key: string) => isCredentialKey(fieldIdentity(key)),
+	resolveKey: fieldIdentity,
 } as const;
 
 /**
@@ -386,8 +386,10 @@ function formatArgsAsXml(
 	const schema = mode === "schema" ? redactSchemaEntry(args) : undefined;
 	// A scrubbed schema key no longer matches the original argument name, so each mode walks its
 	// own entries: arguments over the value-paired tree, schemas over the sanitized schema.
+	// The intent field is the field that resolves to its name, so an escaped spelling of it is
+	// not dumped as an ordinary argument either.
 	const paired = mode === "arguments" ? (redactCrossFieldPrivateKeys([args])[0] as Record<string, unknown>) : schema;
-	const entries = Object.entries(paired ?? args).filter(([key]) => key !== INTENT_FIELD);
+	const entries = Object.entries(paired ?? args).filter(([key]) => fieldIdentity(key) !== INTENT_FIELD);
 	const parts: string[] = [];
 	for (const [key, value] of entries) {
 		const escapedKey = escapeXmlAttribute(redactCrashSecrets(key));

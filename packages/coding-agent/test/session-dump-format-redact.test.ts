@@ -518,6 +518,55 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(payload).toContain("public-note");
 	});
 
+	it("masks an escaped header-record value member", () => {
+		const escapedSecret = "ESCAPED_RECORD_MEMBER_SECRET";
+		const canonicalSecret = "CANONICAL_RECORD_MEMBER_SECRET";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-escaped-header-record-member",
+						name: "http",
+						arguments: {
+							payload: {
+								headers: [{ name: "Authorization", value: canonicalSecret, "val\\u0075e": escapedSecret }],
+							},
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		const payload = parameterValue(dumped, "payload") ?? "";
+		expect(payload).not.toContain(escapedSecret);
+		expect(payload).not.toContain(canonicalSecret);
+		expect(payload).toContain('"name": "Authorization"');
+	});
+
+	it("keeps the intent field out when a sibling spells its name with an escape", () => {
+		// The field that resolves to `_i` is the intent field, whichever spelling the payload used,
+		// and the real intent field must not be displaced by the escaped spelling.
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-escaped-intent-field",
+						name: "request",
+						arguments: { "\\u005fi": "escaped-intent-value", _i: "intent-value", note: "kept-note" },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain("intent-value");
+		expect(dumped).not.toContain("escaped-intent-value");
+		expect(dumped).toContain("kept-note");
+	});
+
 	it("keeps both schema definitions when an escaped credential name collides with a plain one", () => {
 		const dumped = formatSessionDumpText({
 			messages: [],
