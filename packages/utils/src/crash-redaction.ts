@@ -34,12 +34,11 @@ export function asOriginalText(value: string): OriginalText {
 }
 
 /**
- * Replace every detection range in one pass over the original text. This is the only function that
- * turns `OriginalText` into `RedactedText`; overlapping ranges merge, and the range that starts
- * first (the longer one on a tie) keeps its label. A label may be a marker or empty to delete.
+ * Merge overlapping or touching ranges in application order. The range that starts first (the
+ * longer one on a tie) keeps its label, so a container's mask owns the line rules inside it.
  */
-export function applyRedactions(original: OriginalText, ranges: RedactionRanges): RedactedText {
-	if (ranges.length === 0) return original as unknown as RedactedText;
+export function mergeRedactionRanges(ranges: RedactionRanges): RedactionRange[] {
+	if (ranges.length === 0) return [];
 	const sorted = [...ranges].sort((left, right) => left.start - right.start || right.end - left.end);
 	const merged: RedactionRange[] = [];
 	for (const range of sorted) {
@@ -53,6 +52,16 @@ export function applyRedactions(original: OriginalText, ranges: RedactionRanges)
 		}
 		merged.push(range);
 	}
+	return merged;
+}
+
+/**
+ * Replace every detection range in one pass over the original text. This is the only function that
+ * turns `OriginalText` into `RedactedText`; overlapping ranges merge, and the range that starts
+ * first (the longer one on a tie) keeps its label. A label may be a marker or empty to delete.
+ */
+export function applyRedactions(original: OriginalText, ranges: RedactionRanges): RedactedText {
+	const merged = mergeRedactionRanges(ranges);
 	if (merged.length === 0) return original as unknown as RedactedText;
 	const parts: string[] = [];
 	let cursor = 0;
@@ -134,6 +143,27 @@ function findPrivateKeySpansIn(text: string): PrivateKeySpan[] {
 /** Locate the private-key blocks of one original text. */
 export function findPrivateKeySpans(text: OriginalText): PrivateKeySpan[] {
 	return findPrivateKeySpansIn(text);
+}
+
+/**
+ * The start of the earliest private-key opener that no footer closes, or -1. A caller that bounds
+ * a preview can keep an opener while cutting its footer, so the preview must mask from here on.
+ */
+export function findUnpairedPrivateKeyBanner(text: string): number {
+	const spans = findPrivateKeySpansIn(text);
+	let at = 0;
+	while (at < text.length) {
+		const begin = text.indexOf(PEM_BEGIN, at);
+		if (begin < 0) return -1;
+		const headerEnd = privateKeyMarkerEnd(text, begin, PEM_BEGIN);
+		if (headerEnd < 0) {
+			at = begin + PEM_BEGIN.length;
+			continue;
+		}
+		if (!spans.some(span => begin >= span.start && begin < span.end)) return begin;
+		at = headerEnd;
+	}
+	return -1;
 }
 
 /** Historical v1 pairing: first opener with the first footer after it, stopping when unmatched. */
@@ -325,18 +355,28 @@ function lineBounds(text: string, start: number): { contentEnd: number; nextLine
 	return { contentEnd, nextLineStart };
 }
 
+export type CrashMaskStructure = "structured" | "blind";
+
 /**
  * Locate the printed body text of every credential-named block scalar, one span per non-empty
  * body line. The spans exclude the line's indentation and trailing whitespace, exactly the text
  * the YAML rule replaces, so a caller can mask them alongside its own structural ranges instead
  * of letting a later pass re-read structure this one already classified.
+ *
+ * A structure-blind scan only accepts a header in the first column: that is the one shape whose
+ * role does not depend on the containers and quoted values around it. It therefore can never
+ * mask more than the structure-aware scan, which is what makes the containment property testable.
  */
-function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedactionRules): PrivateKeySpan[] {
+function findYamlBlockScalarSpansWithRules(
+	text: string,
+	rules: CredentialRedactionRules,
+	structure: CrashMaskStructure = "structured",
+): PrivateKeySpan[] {
 	const spans: PrivateKeySpan[] = [];
 	// A header line inside a credential container is data the container owns, not YAML structure:
 	// the container's close bounds the scalar, so the body scan cannot walk past it into unrelated
 	// text that merely looks indented.
-	const containers = findCredentialContainerSpansIn(text, rules);
+	const containers = structure === "blind" ? [] : findCredentialContainerSpansIn(text, rules);
 	let quotedContainers: PrivateKeySpan[] | undefined;
 	let lineStart = 0;
 
@@ -347,17 +387,25 @@ function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedact
 			lineStart = nextLineStart;
 			continue;
 		}
-		// A "header" inside a quoted container value is data, not a block scalar.
-		quotedContainers ??= findQuotedContainerDataSpansIn(text);
-		if (
-			positionInsideSpans(quotedContainers, lineStart) ||
-			positionInsideSpans(quotedContainers, lineStart + header.indentation)
-		) {
-			lineStart = nextLineStart;
-			continue;
+		if (structure === "blind") {
+			if (header.indentation !== 0) {
+				lineStart = nextLineStart;
+				continue;
+			}
+		} else {
+			// A "header" inside a quoted container value is data, not a block scalar.
+			quotedContainers ??= findQuotedContainerDataSpansIn(text);
+			if (
+				positionInsideSpans(quotedContainers, lineStart) ||
+				positionInsideSpans(quotedContainers, lineStart + header.indentation)
+			) {
+				lineStart = nextLineStart;
+				continue;
+			}
 		}
 
-		const bodyLimit = containingContainerEnd(containers, lineStart) ?? text.length;
+		const bodyLimit =
+			structure === "blind" ? text.length : (containingContainerEnd(containers, lineStart) ?? text.length);
 		let bodyLineStart = nextLineStart;
 		while (bodyLineStart < bodyLimit) {
 			const bodyLine = lineBounds(text, bodyLineStart);
@@ -393,8 +441,35 @@ function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedact
 	return spans;
 }
 
-/** A container assignment under any key, not only a credential-named one. */
-const ANY_CONTAINER_ASSIGNMENT = /(?<![A-Za-z0-9_.-])[A-Za-z_][A-Za-z0-9_.-]{0,127}[ \t]*[:=][ \t]*(?=[[{])/g;
+/**
+ * A container assignment under any key, not only a credential-named one. A quoted mapping key
+ * (`"wrapper": [...]`) heads the same container as a bare one, so the bound must accept it.
+ */
+const ANY_CONTAINER_ASSIGNMENT =
+	/(?<![A-Za-z0-9_.-])(?:"[^"\r\n]{0,127}"|'[^'\r\n]{0,127}'|[A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*[:=][ \t]*(?=[[{])/g;
+
+/**
+ * A quote opens a bracketed value only after the delimiter that introduces it (`[`, `{`, `,`,
+ * `:` or `=`). An apostrophe inside a plain scalar (`don't`) is data, and treating it as an
+ * opening quote hides the container's real close.
+ */
+function opensQuotedValue(text: string, index: number, start: number): boolean {
+	let previous = index - 1;
+	while (
+		previous >= start &&
+		(text[previous] === " " || text[previous] === "\t" || text[previous] === "\n" || text[previous] === "\r")
+	)
+		previous--;
+	if (previous < start) return false;
+	const character = text[previous];
+	return character === "[" || character === "{" || character === "," || character === ":" || character === "=";
+}
+
+/** Whether `position` sits on a comment line: only leading whitespace precedes the `#`. */
+function positionOnCommentLine(text: string, position: number): boolean {
+	const lineStart = text.lastIndexOf("\n", position - 1) + 1;
+	return /^[ \t]*#/.test(text.slice(lineStart, position));
+}
 
 /**
  * Quoted regions that belong to a bracketed container value. A YAML block-scalar header found
@@ -405,6 +480,13 @@ function findQuotedContainerDataSpansIn(text: string): PrivateKeySpan[] {
 	const spans: PrivateKeySpan[] = [];
 	ANY_CONTAINER_ASSIGNMENT.lastIndex = 0;
 	for (let match = ANY_CONTAINER_ASSIGNMENT.exec(text); match !== null; ) {
+		// A comment line is not YAML structure, so it cannot open a container that would
+		// suppress the header scan for the real document below it.
+		if (positionOnCommentLine(text, match.index)) {
+			ANY_CONTAINER_ASSIGNMENT.lastIndex = match.index + match[0].length;
+			match = ANY_CONTAINER_ASSIGNMENT.exec(text);
+			continue;
+		}
 		const containerStart = ANY_CONTAINER_ASSIGNMENT.lastIndex;
 		const containerEnd = findCredentialContainerEnd(
 			text,
@@ -427,7 +509,10 @@ function findQuotedContainerDataSpansIn(text: string): PrivateKeySpan[] {
 				}
 				continue;
 			}
-			if (character === '"' || character === "'" || character === "`") {
+			if (
+				(character === '"' || character === "'" || character === "`") &&
+				opensQuotedValue(text, index, containerStart)
+			) {
 				quote = character;
 				quoteStart = index;
 			}
@@ -871,11 +956,27 @@ const RESIDUAL_TRAILING_WHOLE_MATCH_RULES: readonly { readonly pattern: RegExp; 
  * so no rule can consume a line terminator or reinterpret text produced by another rule.
  */
 const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*$/i;
-const URI_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+/** A URI may follow the cue directly or after one wrapper character, as in `_https://…_`. */
+const URI_AT_LINE_START = /^[ \t]*[^A-Za-z0-9+.-]?[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
+/** token68/base64: the trailing `=` is padding, not an assignment separator. */
+const BASE64_CONTINUATION_LINE = /^[ \t]*[A-Za-z0-9+/]{8,}={0,2}[ \t]*$/;
 const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
 
-function collectResidualRanges(text: OriginalText): RedactionRange[] {
+/**
+ * Whether a continuation line names a diagnostic field. Base64 is the exception: its padding is
+ * not `key=value`, so `Basic\nZml4dHVyZTpwYXNzd29yZA==` stays a credential continuation.
+ */
+function startsDiagnosticAssignment(line: string): boolean {
+	return !BASE64_CONTINUATION_LINE.test(line) && DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line);
+}
+
+/** Whether a line already carries a URL whose userinfo rule masks its own credential. */
+function carriesUrlCredential(line: string): boolean {
+	return findUrlCredentialSpansIn(line).length > 0;
+}
+
+function collectResidualRanges(text: OriginalText, structure: CrashMaskStructure = "structured"): RedactionRange[] {
 	const ranges: RedactionRange[] = [];
 	let lineStart = 0;
 	while (lineStart <= text.length) {
@@ -895,7 +996,8 @@ function collectResidualRanges(text: OriginalText): RedactionRange[] {
 			const nextLine = text.slice(nextStart, nextContentEnd);
 			// A URI supplies its own credentials; the scheme word is not the value of the cue above,
 			// so a continuation must not swallow the whole adjacent URL.
-			if (!DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(nextLine) && !URI_AT_LINE_START.test(nextLine)) {
+			const hasUriValue = structure === "blind" ? carriesUrlCredential(nextLine) : URI_AT_LINE_START.test(nextLine);
+			if (!startsDiagnosticAssignment(nextLine) && !hasUriValue) {
 				let start = 0;
 				while (start < nextLine.length && (nextLine[start] === " " || nextLine[start] === "\t")) start++;
 				let end = start;
@@ -947,7 +1049,7 @@ function collectAuthorizationRanges(line: string, base: number, out: RedactionRa
 		const valueStart = match.index + prefix.length;
 		const value = line.slice(valueStart, match.index + match[0].length);
 		if (
-			!/^(?:Bearer|Basic|Token)[ \t]/.test(value) &&
+			!/^(?:Bearer|Basic|Token)[ \t]/i.test(value) &&
 			parseCredentialYamlBlockScalarHeader(match[0]) === undefined &&
 			match[0].length > prefix.length
 		) {
@@ -967,7 +1069,11 @@ function spansOverlap(left: PrivateKeySpan, right: PrivateKeySpan): boolean {
  * credential containers, URL userinfo and YAML block-scalar bodies. Detection reads only
  * `original`; no range here is derived from another range's output.
  */
-function collectStructuralRanges(original: OriginalText, privateKeySpans: readonly PrivateKeySpan[]): RedactionRange[] {
+function collectStructuralRanges(
+	original: OriginalText,
+	privateKeySpans: readonly PrivateKeySpan[],
+	structure: CrashMaskStructure,
+): RedactionRange[] {
 	return [
 		...privateKeySpans.map(span => ({ start: span.start, end: span.end, label: PRIVATE_KEY_REDACTION_MARKER })),
 		...findCredentialContainerSpans(original).map(span => ({ ...span, label: "«redacted»" })),
@@ -977,20 +1083,62 @@ function collectStructuralRanges(original: OriginalText, privateKeySpans: readon
 		...findUrlCredentialSpans(original)
 			.filter(span => !privateKeySpans.some(key => spansOverlap(span, key)))
 			.map(span => ({ ...span, label: "«redacted-url-credential»" })),
-		...findYamlBlockScalarSpans(original).map(span => ({ ...span, label: "«redacted»" })),
+		...findYamlBlockScalarSpansFor(original, structure).map(span => ({ ...span, label: "«redacted»" })),
 	];
+}
+
+function findYamlBlockScalarSpansFor(original: OriginalText, structure: CrashMaskStructure): PrivateKeySpan[] {
+	return structure === "blind"
+		? findYamlBlockScalarSpansWithRules(original, CURRENT_CREDENTIAL_REDACTION_RULES, "blind")
+		: findYamlBlockScalarSpans(original);
 }
 
 /**
  * Every mask of one original text, in one classification pass: the structural ranges above plus
  * the line-bounded rules, which return their own ranges instead of editing text. Callers pass
  * private-key ranges they mapped from a wider original source; otherwise the text itself is read.
+ * `structure` selects the structure-aware pass or the blind baseline the containment property
+ * compares it against; the blind pass only removes suppression gates, never a detector.
  */
 export function collectCrashRedactionRanges(
 	original: OriginalText,
 	privateKeySpans: readonly PrivateKeySpan[] = findPrivateKeySpans(original),
+	structure: CrashMaskStructure = "structured",
 ): RedactionRanges {
-	return [...collectStructuralRanges(original, privateKeySpans), ...collectResidualRanges(original)];
+	return [
+		...collectStructuralRanges(original, privateKeySpans, structure),
+		...collectResidualRanges(original, structure),
+	];
+}
+
+/** One masked text and the ranges of its input that were replaced. */
+export interface MaskedCrashText {
+	readonly text: RedactedText;
+	readonly masks: readonly RedactionRange[];
+}
+
+/**
+ * Structure-aware masking, the output `redactCrashSecrets` produces: credential containers, URL
+ * userinfo, paired private-key blocks and YAML block-scalar bodies all suppress or bound the
+ * line rules, so this is the path where a wrong gate can hide a secret.
+ */
+export function maskStructured(text: string): MaskedCrashText {
+	return maskCrashText(text, "structured");
+}
+
+/**
+ * Structure-blind baseline over the same collectors: no credential-container bound, no
+ * quoted-value gate and no indentation-dependent header. Its masks are the ones any correct
+ * structure-aware pass must still cover, so a gate that suppresses one of them is a bug.
+ */
+export function maskStructureBlind(text: string): MaskedCrashText {
+	return maskCrashText(text, "blind");
+}
+
+function maskCrashText(text: string, structure: CrashMaskStructure): MaskedCrashText {
+	const original = asOriginalText(text);
+	const masks = mergeRedactionRanges(collectCrashRedactionRanges(original, findPrivateKeySpans(original), structure));
+	return { text: applyRedactions(original, masks), masks };
 }
 
 /**
@@ -1001,8 +1149,7 @@ export function collectCrashRedactionRanges(
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	const original = asOriginalText(text);
-	return applyRedactions(original, collectCrashRedactionRanges(original));
+	return maskStructured(text).text;
 }
 
 /** Historical redaction rules used only to validate v1 crash fingerprints. */
@@ -1508,7 +1655,7 @@ function findCredentialContainerEnd(
 			if (character === quote) quote = undefined;
 			continue;
 		}
-		if (character === '"' || character === "'" || character === "`") {
+		if ((character === '"' || character === "'" || character === "`") && opensQuotedValue(text, index, start)) {
 			quote = character;
 			continue;
 		}

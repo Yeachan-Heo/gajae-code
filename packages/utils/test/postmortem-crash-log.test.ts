@@ -57,6 +57,72 @@ describe("crash redaction classification", () => {
 		expect(redacted).toBe("bearer\n«redacted-auth»");
 		expect(redacted).not.toContain(value);
 	});
+
+	it("masks a basic-auth continuation whose token68 value ends in base64 padding", () => {
+		const token = "Zml4dHVyZTpwYXNzd29yZA==";
+
+		const redacted = redactCrashSecrets(`Basic\n${token}`);
+
+		expect(redacted).toBe("Basic\n«redacted-auth»");
+		expect(redacted).not.toContain(token);
+	});
+
+	it("still preserves a genuine key=value diagnostic after an auth cue", () => {
+		// The padding rule must not turn every assignment into a credential, nor every
+		// credential into a diagnostic.
+		expect(redactCrashSecrets("Token\ndiagnostic=keep-me")).toBe("Token\ndiagnostic=keep-me");
+		expect(redactCrashSecrets("Basic\nZml4dHVyZTpwYXNzd29yZA==\nnote: keep-me")).toContain("note: keep-me");
+	});
+
+	it("masks only the credential of a wrapped URI after an auth cue", () => {
+		const text = "Token\n_https://app:synthetic@db.example.com/db_";
+
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).toBe("Token\n_https://«redacted-url-credential»@db.example.com/db_");
+		expect(redacted).not.toContain("synthetic");
+		for (const kept of ["_https://", "«redacted-url-credential»@", "db.example.com/db_"])
+			expect(redacted).toContain(kept);
+	});
+
+	it("keeps an apostrophe in a plain scalar from ending the container early", () => {
+		const fixture = `wrapper: [don't, "ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(fixture);
+		expect(redacted).toContain("# keep-me");
+		expect(Bun.YAML.parse(redacted)).toEqual({
+			wrapper: ["don't", "ordinary secret: | continuation"],
+			public: "visible",
+		});
+	});
+
+	it("does not let a comment line open a container that hides a real block scalar", () => {
+		const fixture = `# wrapper: ["ignored\nsecret: |\n  SYNTHETIC_PASSWORD\npublic: 'text"]`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(`# wrapper: ["ignored\nsecret: |\n  «redacted»\npublic: 'text"]`);
+		expect(redacted).not.toContain("SYNTHETIC_PASSWORD");
+		expect(redacted).toContain(`public: 'text"]`);
+	});
+
+	it("accepts a quoted mapping key as a container bound", () => {
+		const fixture = `"wrapper": ["ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(fixture);
+		expect(redacted).toContain("# keep-me");
+	});
+
+	it("keeps a trailing diagnostic after a lower-case Authorization scheme", () => {
+		const redacted = redactCrashSecrets("Authorization: bearer opaquecredential123 diagnostic=keep");
+
+		expect(redacted).toBe("Authorization: «redacted-auth» diagnostic=keep");
+		expect(redacted).not.toContain("opaquecredential123");
+	});
 });
 
 describe("recordFatalCrash", () => {
@@ -257,6 +323,109 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('"phase":"startup"');
 		expect(contents).toContain('"reason":"pending"');
 		expect(contents).toContain("SDK startup did not complete before readiness cutoff.");
+	});
+
+	it("masks a PEM body in an oversized object that serves as the message", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = {
+			code: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}\n-----END RSA PRIVATE KEY-----`,
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).toContain('Error: {"code":"«redacted-private-key»"}');
+	});
+
+	it("masks a URL credential beyond the captured preview bound", () => {
+		const target = tempCrashLog();
+		const password = "SYNTHETIC_PASSWORD";
+		const reason = {
+			message: "fixture",
+			code: `${"x".repeat(4030)} https://app:${password}${"a".repeat(40)}@db.example.com/db`,
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(password);
+		// The non-secret context around the credential is still printed.
+		expect(contents).toContain(`{"code":"${"x".repeat(64)}`);
+		expect(contents).toContain("https://«redacted-url-credential»");
+		expect(contents).toContain("db.example.com/db");
+	});
+
+	it("masks a PEM body inside an oversized captured object", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = {
+			message: "fixture",
+			code: {
+				detail: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}\n-----END RSA PRIVATE KEY-----`,
+			},
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).not.toContain("BEGIN RSA PRIVATE KEY");
+		expect(contents).toContain('{"code":{"detail":"«redacted-private-key»"}}');
+	});
+
+	it("masks an oversized captured string whose PEM footer falls outside the preview", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = {
+			message: "fixture",
+			code: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}\n-----END RSA PRIVATE KEY-----`,
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).toContain('{"code":"«redacted-private-key»"}');
+	});
+
+	it("masks a captured field whose private-key banner has no footer at all", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = { message: "fixture", code: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}` };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).toContain('{"code":"«redacted-private-key»"}');
+	});
+
+	it("masks an auth continuation inside a captured string field", () => {
+		const target = tempCrashLog();
+		const value = "opaquecredential123";
+
+		expect(
+			recordFatalCrash("Uncaught Exception", { message: "fixture", code: `bearer\n${value}` }, { path: target }),
+		).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(value);
+		expect(contents).toContain('{"code":"bearer\\n«redacted-auth»"}');
+	});
+
+	it("masks a token68 continuation inside a captured string field", () => {
+		const target = tempCrashLog();
+		const value = "YWJjZGVmZw==";
+
+		expect(
+			recordFatalCrash("Uncaught Exception", { message: "fixture", code: `bearer\n${value}` }, { path: target }),
+		).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(value);
+		expect(contents).toContain('{"code":"bearer\\n«redacted-auth»"}');
 	});
 
 	it("still records a throwable that cannot be serialized", () => {
