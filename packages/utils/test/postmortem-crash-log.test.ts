@@ -662,6 +662,24 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets(hiddenOpener)).not.toContain("BODY");
 	});
 
+	it("redacts a key body whose footer the container give-up removed", () => {
+		// The container scan runs out of lookahead among unclosed assignments and masks the rest,
+		// which also removes the footer the block needs. The block body must not survive that.
+		const text = `-----BEGIN PRIVATE KEY-----\nSYNTHETIC_PEM_BODY\n${"password={\n".repeat(100)}-----END PRIVATE KEY-----\nordinary tail`;
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).not.toContain("SYNTHETIC_PEM_BODY");
+		expect(redacted).toBe("«redacted»");
+	});
+
+	it("redacts URL userinfo whose authority delimiter the container give-up removed", () => {
+		const text = `${"secret={\n".repeat(9)}https://fixture-user:OPAQUE_USERINFO:secret={${"A".repeat(1024)}}@example.test`;
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).not.toContain("OPAQUE_USERINFO");
+		expect(redacted).toBe("«redacted»");
+	});
+
 	it("preserves later diagnostics after an unterminated credential container", () => {
 		const input = "safe=keep credentials={secret=abc\nstack frame\nafter=keep";
 		expect(redactCrashSecrets(input)).toBe("safe=keep credentials=«redacted»\nstack frame\nafter=keep");

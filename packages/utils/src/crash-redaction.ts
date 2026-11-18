@@ -700,11 +700,16 @@ function createContainerScanBudget(length: number, bounded: boolean): ContainerS
 function redactCredentialContainers(text: string, rules: CredentialRedactionRules, bounded: boolean): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
 	const { assignment, camel } = containerAssignmentPatterns(rules);
-	return redactCredentialContainersWithPattern(
-		redactCredentialContainersWithPattern(text, assignment, bounded),
-		camel,
-		bounded,
-	);
+	const state: ContainerScanState = { exhausted: false };
+	const generic = redactCredentialContainersWithPattern(text, assignment, bounded, state);
+	if (state.exhausted) {
+		// The cutoff cannot prove that what it kept is safe for the rules that read this text next:
+		// it removes the footer a block pairs with and the `@` that ends a URL's userinfo. One
+		// marker for the whole text is the only cut that holds for every later rule.
+		return "«redacted»";
+	}
+	const camelMasked = redactCredentialContainersWithPattern(generic, camel, bounded, state);
+	return state.exhausted ? "«redacted»" : camelMasked;
 }
 
 function containerAssignmentPatterns(rules: CredentialRedactionRules): { assignment: RegExp; camel: RegExp } {
@@ -714,7 +719,12 @@ function containerAssignmentPatterns(rules: CredentialRedactionRules): { assignm
 	};
 }
 
-function redactCredentialContainersWithPattern(text: string, assignment: RegExp, bounded: boolean): string {
+function redactCredentialContainersWithPattern(
+	text: string,
+	assignment: RegExp,
+	bounded: boolean,
+	state: ContainerScanState,
+): string {
 	const budget = createContainerScanBudget(text.length, bounded);
 	const lineScan = createLineEndScan();
 	let output = "";
@@ -729,6 +739,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp,
 			// guessing.
 			output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
 			copiedUntil = text.length;
+			state.exhausted = true;
 			break;
 		}
 		const scan = findCredentialContainerEnd(text, containerStart, suffixLength, lineScan);
@@ -750,6 +761,11 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp,
 		assignment.lastIndex = containerEnd;
 	}
 	return copiedUntil === 0 ? text : output + text.slice(copiedUntil);
+}
+
+/** Whether a container pass gave up and masked a suffix it could not delimit. */
+interface ContainerScanState {
+	exhausted: boolean;
 }
 
 type EscapedQuoteDelimiter = { delimiter: "'" | '"' | "`"; backslashCount: number };
