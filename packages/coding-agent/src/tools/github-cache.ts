@@ -17,14 +17,11 @@
 
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
-import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getGithubCacheDbPath, logger, redactCrashSecrets } from "@gajae-code/utils";
+import { getGithubCacheDbPath, isCredentialKey, logger, redactCrashSecrets } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
-import type { PrDiffPayload } from "./gh";
-
-const requireGh = createRequire(import.meta.url);
+import { parsePrUnifiedDiff, scrubPrDiffText } from "./gh";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -292,6 +289,162 @@ export interface PutCachedInput<T = unknown> {
 	fetchedAt?: number;
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Assignment-style credentials, bounded to the value token. The shared crash
+ * redactor deliberately redacts through end-of-line; on a cached issue body
+ * that eats the rest of a Markdown table row or the command after a
+ * `TOKEN=…` example. These spans are redacted here and masked while the crash
+ * redactor runs, so it cannot consume the tail a second time.
+ *
+ * `authorization`/`bearer`/`cookies` are deliberately left to the shared
+ * redactor: their grammars are not a single value token.
+ */
+const BOUNDED_CREDENTIAL_ASSIGNMENT =
+	/(?<![A-Za-z0-9_-])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?\s*[:=]\s*)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s"'`|;&,<>]+))/gi;
+
+const BOUNDED_CREDENTIAL_MASK = "\u0000gjc-credential-";
+
+/**
+ * Authorization headers are redacted through the scheme word and the value, but
+ * not through the rest of the line, so a table cell or shell command after the
+ * header survives. `cookies` stays with the shared redactor: cookie pairs are
+ * not a single value token.
+ */
+const BOUNDED_AUTHORIZATION_HEADER =
+	/(?<![A-Za-z0-9_-])((?:authorization|auth)(?:\s*["']?\s*[:=]\s*["']?))(Bearer|Basic|Token)(\s+)[^\s|]+/gi;
+
+const BOUNDED_AUTHORIZATION_MASK = "\u0000gjc-auth-";
+
+function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
+	const sanitized: string[] = [];
+	const masked = text.replace(
+		BOUNDED_AUTHORIZATION_HEADER,
+		(_match: string, label: string, scheme: string, spacing: string) => {
+			const sentinel = `${BOUNDED_AUTHORIZATION_MASK}${sanitized.length}\u0000`;
+			sanitized.push(`${label}${scheme}${spacing}«redacted»`);
+			return sentinel;
+		},
+	);
+	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
+	return {
+		text: masked,
+		restore: scrubbed =>
+			scrubbed.replace(/\u0000gjc-auth-(\d+)\u0000/g, (_match, index: string) => sanitized[Number(index)] ?? ""),
+	};
+}
+
+function maskBoundedCredentialAssignments(text: string): { text: string; restore: (scrubbed: string) => string } {
+	const sanitized: string[] = [];
+	const masked = text.replace(
+		BOUNDED_CREDENTIAL_ASSIGNMENT,
+		(
+			_match: string,
+			label: string,
+			separator: string,
+			doubleQuoted: string | undefined,
+			singleQuoted: string | undefined,
+		) => {
+			const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
+			const sentinel = `${BOUNDED_CREDENTIAL_MASK}${sanitized.length}\u0000`;
+			sanitized.push(`${label}${separator}${quote}«redacted»${quote}`);
+			return sentinel;
+		},
+	);
+	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
+	return {
+		text: masked,
+		restore: scrubbed =>
+			scrubbed.replace(
+				/\u0000gjc-credential-(\d+)\u0000/g,
+				(_match, index: string) => sanitized[Number(index)] ?? "",
+			),
+	};
+}
+
+/**
+ * Remove URL userinfo. Authentication is what makes a URL sensitive; the host,
+ * path, query and surrounding markup stay readable. Handles `scheme://`,
+ * JSON-escaped `scheme:\/\/`, and protocol-relative `//user:pass@host` forms.
+ * Tabs inside the userinfo are matched too, because URL parsers drop them.
+ */
+function stripUrlUserinfo(text: string): string {
+	const withoutAuthorityUserinfo = text.replace(
+		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#@"'`<>]*@/gi,
+		"$1",
+	);
+	return withoutAuthorityUserinfo.replace(/(^|[\s"'`([{<])(\/\/)[^\r\n /?#@"'`<>]*@/g, "$1$2");
+}
+
+/**
+ * Vendor token shapes re-checked with only alphanumerics as the left boundary.
+ * The crash redactor anchors on a word boundary, so a token glued to an
+ * identifier (`build_ghp_…`) survives there; cached bodies are arbitrary user
+ * text, so the cache cannot inherit that assumption.
+ */
+const CACHE_VENDOR_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+	[/(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
+	[/(?<![A-Za-z0-9])gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
+	[/(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
+	[/(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}/g, "«redacted-api-key»"],
+	[/(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{8,}/g, "«redacted-slack-token»"],
+	[/(?<![A-Za-z0-9])npm_[A-Za-z0-9]{20,}/g, "«redacted-npm-token»"],
+	[/(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
+	[/(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
+	[/(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
+];
+
+function scrubCacheVendorTokens(text: string): string {
+	let scrubbed = text;
+	for (const [pattern, marker] of CACHE_VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, marker);
+	return scrubbed;
+}
+
+/**
+ * Strip the local home directory from cached text. `/home/<user>/x`,
+ * `/Users/<user>/x`, `/root/x` and `C:\Users\<user>\x` all become `~/x`: the
+ * path stays useful but no longer names this machine's account. Relative forms
+ * (`~/x`, `$HOME/x`) and non-home roots such as `/srv/app` are untouched, and
+ * a URL's own path is never rewritten.
+ */
+function scrubHostPaths(text: string): string {
+	const home = os.homedir();
+	const homePattern =
+		home.length > 1 ? new RegExp(`(?<![A-Za-z0-9._#-])${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
+	const scrubLocal = (chunk: string): string => {
+		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
+		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#-])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#-])\/root(?![A-Za-z0-9._-])/g, "~");
+		return scrubbed.replace(/(?<![A-Za-z0-9._#-])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
+	};
+	// A URL's path is content, not a local path, so only scrub outside URL spans.
+	// `file:` URLs are local by definition and still get scrubbed.
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(/(?:[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)|\/\/)[^\s"'`<>(){}]*/gi)) {
+		const index = match.index ?? 0;
+		const url = match[0];
+		out += scrubLocal(text.slice(last, index));
+		out += /^file:/i.test(url) ? scrubLocal(url) : url;
+		last = index + url.length;
+	}
+	return out + scrubLocal(text.slice(last));
+}
+
+/** Text-level scrub for everything the view cache persists or serves back. */
+function scrubCacheText(text: string): string {
+	const authHeaders = maskBoundedAuthorizationHeaders(text);
+	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
+	let scrubbed = stripUrlUserinfo(assignments.text);
+	scrubbed = redactCrashSecrets(scrubbed);
+	scrubbed = scrubCacheVendorTokens(scrubbed);
+	scrubbed = scrubHostPaths(scrubbed);
+	return authHeaders.restore(assignments.restore(scrubbed));
+}
+
 /** Scrub credential-shaped text and host paths inside a value before it is JSON-encoded or served back. */
 function scrubPersistedValue(value: unknown): unknown {
 	if (typeof value === "string") return scrubCacheText(value);
@@ -300,38 +453,28 @@ function scrubPersistedValue(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(scrubPersistedValue);
 	const proto = Object.getPrototypeOf(value);
 	if (proto !== Object.prototype && proto !== null) return value;
+	// An opaque value under a credential-named field is credential material even
+	// when it has no recognizable token shape.
 	const out: Record<string, unknown> = {};
+	const seenKeys = new Set<string>();
 	for (const [key, child] of Object.entries(value)) {
-		out[scrubCacheText(key)] = scrubPersistedValue(child);
+		const baseKey = scrubCacheText(key);
+		let outKey = baseKey;
+		let disambiguator = 2;
+		while (seenKeys.has(outKey)) outKey = `${baseKey}#${disambiguator++}`;
+		seenKeys.add(outKey);
+		const scrubbedChild =
+			isCredentialKey(key) && child !== null && child !== undefined ? "«redacted»" : scrubPersistedValue(child);
+		// `defineProperty` keeps an own `__proto__` key an ordinary entry instead of
+		// assigning through the prototype setter.
+		Object.defineProperty(out, outKey, {
+			value: scrubbedChild,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
 	}
 	return out;
-}
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * Strip the local home directory from cached text. `/home/<user>/x`,
- * `/Users/<user>/x`, `/root/x` and `C:\\Users\\<user>\\x` all become `~/x`: the
- * path stays useful but no longer names this machine's account. Relative forms
- * (`~/x`, `$HOME/x`) and non-home roots such as `/srv/app` are untouched.
- */
-function scrubHostPaths(text: string): string {
-	let scrubbed = text;
-	const home = os.homedir();
-	if (home.length > 1) {
-		scrubbed = scrubbed.replace(new RegExp(`(?<![A-Za-z0-9._-])${escapeRegExp(home)}(?=[/\\\\]|$)`, "g"), "~");
-	}
-	return scrubbed
-		.replace(/(?<![A-Za-z0-9._-])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;]+(?=\/|$)/g, "~")
-		.replace(/(?<![A-Za-z0-9._-])\/root(?=\/|$)/g, "~")
-		.replace(/(?<![A-Za-z0-9._-])[A-Za-z]:\\Users\\[^\\\s"'`<>()[\]{},;]+(?=\\|$)/g, "~");
-}
-
-/** Text-level scrub for everything the view cache persists or serves back. */
-function scrubCacheText(text: string): string {
-	return scrubHostPaths(redactCrashSecrets(text));
 }
 
 interface ScrubbedView {
@@ -370,19 +513,13 @@ function scrubStoredView(
 	}
 	let scrubbedUnified = unified;
 	let files: unknown = isRecordValue(scrubbedPayload) ? scrubbedPayload.files : undefined;
-	try {
-		const { parsePrUnifiedDiff, rewritePrDiffPathTokens } = requireGh("./gh") as {
-			parsePrUnifiedDiff: (text: string) => PrDiffPayload;
-			rewritePrDiffPathTokens: (text: string, transform: (decodedPath: string) => string) => string;
-		};
-		scrubbedUnified = rewritePrDiffPathTokens(unified, scrubCacheText);
-		const reparsed = parsePrUnifiedDiff(scrubbedUnified);
-		files = scrubPersistedValue(reparsed.files);
-	} catch (err) {
-		// Compiled binaries may not resolve the lazy diff parser. Serve the
-		// scrubbed text anyway; offsets come from the stored index in that case.
-		logger.debug("github cache: diff reindex unavailable", { err: String(err) });
-	}
+	// Path tokens are decoded, scrubbed and re-quoted before the text pass, so an
+	// escape-encoded credential cannot survive and the text pass cannot chew
+	// through diff framing. The index is then rebuilt from the exact text that is
+	// persisted, keeping slice offsets valid after scrubbing changed lengths.
+	scrubbedUnified = scrubPrDiffText(unified, scrubCacheText);
+	const reparsed = parsePrUnifiedDiff(scrubbedUnified);
+	files = scrubPersistedValue(reparsed.files);
 	const base = isRecordValue(scrubbedPayload) ? scrubbedPayload : {};
 	return {
 		payload: { ...base, unified: scrubbedUnified, files },

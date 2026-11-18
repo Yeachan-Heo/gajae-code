@@ -2925,61 +2925,116 @@ function quotePrDiffPath(value: string): string {
 	return `${quoted}"`;
 }
 
+interface PrDiffPathToken {
+	start: number;
+	end: number;
+	value: string;
+	/** Set when the token kept its C-style escaped source form. */
+	escaped?: boolean;
+}
+
+function pushPrDiffPathToken(line: string, from: number, tokens: PrDiffPathToken[]): number {
+	const start = skipDiffHeaderSpaces(line, from);
+	if (start >= line.length) return start;
+	const token = parseDiffHeaderToken(line, start);
+	if (!token) return start;
+	tokens.push({ start, end: token.nextIndex, value: token.value, escaped: token.escaped });
+	return token.nextIndex;
+}
+
 /**
- * Rewrite the Git-quoted path tokens of a unified diff whose decoded form
- * changes under `transform`.
- *
- * Escape decoding is what hides some credential shapes: a path holding
- * `\141ccess_token=…` has no recognizable label until `\141` becomes `a`. A
- * text-level scrub therefore has to run on the decoded path, and the encoded
- * token must be rewritten too, otherwise the stored diff still carries the
- * secret. Only diff header lines are touched; hunk bodies are left verbatim.
- * Tokens that keep their escaped source form (malformed escapes or invalid
- * UTF-8) are skipped because their raw text is the representation that was
- * already scrubbed as text.
+ * Path tokens on one diff header line. Git quotes each operand independently,
+ * so `diff --git "a/x" b/y` is valid and both sides have to be visited.
+ * Quoted tokens are decoded, unquoted ones are the literal span.
  */
-export function rewritePrDiffPathTokens(text: string, transform: (decodedPath: string) => string): string {
-	if (!text.includes('"')) return text;
-	const lines = text.split("\n");
-	let changed = false;
-	// Header window: from `diff --git` until the first `@@`. Hunk bodies can
-	// legitimately start with `--- `, so the window is what keeps them out.
-	let headerLinesLeft = 0;
-	const rewrite = (line: string, quoteIndex: number): string => {
-		const token = parseDiffQuotedToken(line, quoteIndex);
-		if (!token || token.escaped) return line;
-		const rewritten = transform(token.value);
-		if (rewritten === token.value) return line;
-		changed = true;
-		return line.slice(0, quoteIndex) + quotePrDiffPath(rewritten) + line.slice(token.nextIndex);
-	};
-	for (let i = 0; i < lines.length; i += 1) {
-		const original = lines[i] as string;
-		let line = original;
-		if (line.startsWith("diff --git ")) {
-			headerLinesLeft = 8;
-			const firstQuoteIndex = skipDiffHeaderSpaces(line, "diff --git ".length);
-			const first = line.charAt(firstQuoteIndex) === '"' ? parseDiffQuotedToken(line, firstQuoteIndex) : undefined;
-			if (first) {
-				// Rightmost token first: rewriting the second token leaves the first
-				// token's offsets untouched.
-				const secondQuoteIndex = skipDiffHeaderSpaces(line, first.nextIndex);
-				if (line.charAt(secondQuoteIndex) === '"') line = rewrite(line, secondQuoteIndex);
-				line = rewrite(line, firstQuoteIndex);
-			}
-		} else if (line.startsWith("@@ ")) {
-			headerLinesLeft = 0;
-		} else if (headerLinesLeft > 0) {
-			headerLinesLeft -= 1;
-			if (line.startsWith('--- "') || line.startsWith('+++ "')) {
-				line = rewrite(line, 4);
-			} else if (line.startsWith('rename from "') || line.startsWith('rename to "')) {
-				line = rewrite(line, line.indexOf('"'));
-			}
-		}
-		if (line !== original) lines[i] = line;
+function prDiffPathTokens(line: string): PrDiffPathToken[] {
+	const tokens: PrDiffPathToken[] = [];
+	if (line.startsWith("diff --git ")) {
+		const afterFirst = pushPrDiffPathToken(line, "diff --git ".length, tokens);
+		if (line.slice(afterFirst).trim().length > 0) pushPrDiffPathToken(line, afterFirst, tokens);
+		return tokens;
 	}
-	return changed ? lines.join("\n") : text;
+	for (const prefix of ["--- ", "+++ ", "rename from ", "rename to ", "copy from ", "copy to "]) {
+		if (!line.startsWith(prefix)) continue;
+		pushPrDiffPathToken(line, prefix.length, tokens);
+		return tokens;
+	}
+	if (line.startsWith("Binary files ")) {
+		const afterFirst = pushPrDiffPathToken(line, "Binary files ".length, tokens);
+		if (line.slice(afterFirst).startsWith(" and ")) {
+			pushPrDiffPathToken(line, afterFirst + " and ".length, tokens);
+		}
+	}
+	return tokens;
+}
+
+const PR_DIFF_PATH_MASK = "\u0000gjc-diff-path-";
+
+/**
+ * Mask the path tokens of diff header lines whose decoded form changes under
+ * `transform`, holding their sanitized re-quoted form aside.
+ *
+ * A unified diff is Git's grammar, not prose: a text-level scrub over
+ * `diff --git a/token=…` consumes the rest of the header line, and a scrub over
+ * a quoted token can eat through its closing quote. Masking first keeps the
+ * line shape intact while every path is still decoded, scrubbed and re-quoted.
+ * Tokens that keep a malformed escaped source form are left to the text pass,
+ * because re-encoding their source form would change the bytes they denote.
+ */
+export function maskPrDiffPathTokens(
+	text: string,
+	transform: (decodedPath: string) => string,
+): { text: string; restore: (scrubbed: string) => string } {
+	if (!text.includes("diff --git ")) return { text, restore: scrubbed => scrubbed };
+	const lines = text.split("\n");
+	const sanitizedTokens: string[] = [];
+	let inSection = false;
+	let inHunk = false;
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i] as string;
+		if (line.startsWith("diff --git ")) {
+			inSection = true;
+			inHunk = false;
+		} else if (line.startsWith("@@ ")) {
+			inHunk = true;
+			continue;
+		} else if (inHunk || !inSection) {
+			continue;
+		}
+		const tokens = prDiffPathTokens(line);
+		if (tokens.length === 0) continue;
+		let masked = line;
+		// Right to left keeps the earlier token offsets valid.
+		for (let index = tokens.length - 1; index >= 0; index -= 1) {
+			const token = tokens[index] as PrDiffPathToken;
+			if (token.escaped) continue;
+			const sanitized = transform(token.value);
+			if (sanitized === token.value) continue;
+			const sentinel = `${PR_DIFF_PATH_MASK}${sanitizedTokens.length}\u0000`;
+			sanitizedTokens.push(quotePrDiffPath(sanitized));
+			masked = masked.slice(0, token.start) + sentinel + masked.slice(token.end);
+		}
+		if (masked !== line) lines[i] = masked;
+	}
+	if (sanitizedTokens.length === 0) return { text, restore: scrubbed => scrubbed };
+	return {
+		text: lines.join("\n"),
+		restore: scrubbed =>
+			scrubbed.replace(
+				/\u0000gjc-diff-path-(\d+)\u0000/g,
+				(_match, index: string) => sanitizedTokens[Number(index)] ?? "",
+			),
+	};
+}
+
+/**
+ * Sanitize a unified diff. Path tokens are decoded, scrubbed and re-quoted so
+ * an escape-encoded credential cannot survive as encoded text, and the rest of
+ * the diff is scrubbed as text with the path tokens masked out of that pass.
+ */
+export function scrubPrDiffText(text: string, transform: (value: string) => string): string {
+	const masked = maskPrDiffPathTokens(text, transform);
+	return masked.restore(transform(masked.text));
 }
 
 function skipDiffHeaderSpaces(text: string, index: number): number {

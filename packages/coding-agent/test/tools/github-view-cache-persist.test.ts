@@ -13,7 +13,7 @@ import {
 	getOrFetchPrDiff,
 	type PrDiffPayload,
 	parsePrUnifiedDiff,
-	rewritePrDiffPathTokens,
+	scrubPrDiffText,
 } from "@gajae-code/coding-agent/tools/gh";
 import {
 	getCached,
@@ -407,8 +407,35 @@ describe("github view cache persistence", () => {
 		expect(cached?.sourceUrl).not.toContain(GITHUB_TOKEN);
 		expect(cached?.rendered).not.toContain(GITHUB_TOKEN);
 		expect(cached?.payload.body).not.toContain(GITHUB_TOKEN);
-		expect(cached?.sourceUrl).toContain("«redacted-url-credential»@github.com");
+		expect(cached?.sourceUrl).toBe(`https://github.com/${TEST_REPO}.git`);
+		expect(cached?.rendered).toContain(`https://github.com/${TEST_REPO}.git`);
 		expect(cacheFileBytes()).not.toContain(GITHUB_TOKEN);
+	});
+
+	it("cache write and read drop userinfo in escaped and protocol-relative URLs", () => {
+		const body = [
+			`json https:\\/\\/octocat:${GITHUB_TOKEN}@github.com/${TEST_REPO}.git`,
+			`schemeless //octocat:${GITHUB_TOKEN}@github.com/${TEST_REPO}.git`,
+		].join("\n");
+		const url = `https://github.com/${TEST_REPO}/issues/67`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 67,
+			includeComments: true,
+			payload: issuePayload(67, body, url),
+			rendered: body,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+
+		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 67, true, TEST_AUTH_KEY);
+		expect(cached).not.toBeNull();
+		expect(cached?.rendered).not.toContain(GITHUB_TOKEN);
+		expect(cached?.rendered).not.toContain("octocat");
+		expect(cached?.rendered).toContain("https:\\/\\/github.com");
+		expect(cached?.rendered).toContain("//github.com");
 	});
 
 	it("cache write and read drop an absolute host path", () => {
@@ -523,9 +550,10 @@ describe("github view cache persistence", () => {
 
 	it("scrubs a credential hidden by a Git-quoted diff path escape", () => {
 		const secret = "opaque-cache-value-1234567890";
-		// `\141` decodes to `a`, so the label only becomes recognizable after the
-		// parser decodes it; the stored unified text must not keep the secret.
-		const encodedPath = `\\141ccess_token=${secret}`;
+		// `\164` decodes to `t`; the raw text has no `token` label, so only a
+		// decode-then-scrub can remove the value. The second section proves the
+		// rebuilt offsets still bound each file after the first path shrinks.
+		const encodedPath = `\\164oken=${secret}`;
 		const diff = [
 			`diff --git "a/${encodedPath}" "b/${encodedPath}"`,
 			"new file mode 100644",
@@ -533,6 +561,12 @@ describe("github view cache persistence", () => {
 			`+++ "b/${encodedPath}"`,
 			"@@ -0,0 +1 @@",
 			"+content",
+			"diff --git a/second b/second",
+			"index 5555555..6666666 100644",
+			"--- a/second",
+			"+++ b/second",
+			"@@ -1 +1 @@",
+			"+tail",
 			"",
 		].join("\n");
 		putCached({
@@ -551,10 +585,155 @@ describe("github view cache persistence", () => {
 		expect(cached).not.toBeNull();
 		const packed = `${cached?.rendered}\n${JSON.stringify(cached?.payload)}`;
 		expect(packed).not.toContain(secret);
-		expect(cached?.payload.files).toHaveLength(1);
-		const [file] = cached?.payload.files ?? [];
-		expect(file?.path).not.toContain(secret);
-		expect(cached?.payload.unified.slice(file?.startOffset, file?.endOffset).startsWith("diff --git ")).toBe(true);
+		expect(cached?.payload.files).toHaveLength(2);
+		const [first, second] = cached?.payload.files ?? [];
+		expect(first?.path).not.toContain(secret);
+		expect(first?.path).toContain("token=«redacted»");
+		expect(cached?.payload.unified.slice(first?.startOffset, first?.endOffset).startsWith("diff --git ")).toBe(true);
+		expect(
+			cached?.payload.unified
+				.slice(second?.startOffset, second?.endOffset)
+				.startsWith("diff --git a/second b/second"),
+		).toBe(true);
+		expect(cached?.payload.unified.slice(second?.startOffset, second?.endOffset)).toContain("+tail");
+	});
+
+	it("keeps a mixed-quoting diff header and an unquoted path intact", () => {
+		const secret = "opaque-cache-value-1234567890";
+		const diff = [
+			`diff --git "a/token=${secret}" b/token-placeholder`,
+			"index 1111111..2222222 100644",
+			`--- "a/token=${secret}"`,
+			"+++ b/token-placeholder",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			`diff --git a/env/token=${secret} b/env/token=${secret}`,
+			"index 3333333..4444444 100644",
+			`--- a/env/token=${secret}`,
+			`+++ b/env/token=${secret}`,
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 68,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain(secret);
+		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 68, false, TEST_AUTH_KEY);
+		const files = cached?.payload.files ?? [];
+		expect(files).toHaveLength(2);
+		expect(files[0]?.path).toBe("token-placeholder");
+		expect(files[0]?.oldPath).toBe("token=«redacted»");
+		expect(files[1]?.path).toBe("env/token=«redacted»");
+		for (const file of files) {
+			expect(cached?.payload.unified.slice(file.startOffset, file.endOffset).startsWith("diff --git ")).toBe(true);
+		}
+	});
+
+	it("scans binary diff headers and keeps their shape", () => {
+		const secret = "opaque-cache-value-1234567890";
+		const diff = [
+			`diff --git "a/token=${secret}" "b/token=${secret}"`,
+			`Binary files "a/token=${secret}" and "b/token=${secret}" differ`,
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 69,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain(secret);
+		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 69, false, TEST_AUTH_KEY);
+		expect(cached?.payload.unified).not.toContain(secret);
+		expect(cached?.payload.unified).toContain("differ");
+	});
+
+	it("drops a vendor token glued to an identifier", () => {
+		const body = `build_${GITHUB_TOKEN}`;
+		const url = `https://github.com/${TEST_REPO}/issues/70`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 70,
+			includeComments: true,
+			payload: issuePayload(70, body, url),
+			rendered: body,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+
+		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 70, true, TEST_AUTH_KEY);
+		expect(cached?.payload.body).not.toContain(GITHUB_TOKEN);
+		expect(cached?.payload.body).toContain("build_«redacted-github-token»");
+	});
+
+	it("drops an opaque value stored under a credential field", () => {
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 71,
+			includeComments: true,
+			payload: { access_token: "opaque-cache-demo-0123456789", nested: { token: "another-opaque-demo-value" } },
+			rendered: "nested",
+			fetchedAt: 1,
+		});
+
+		const cached = getCached<{ access_token?: string; nested?: { token?: string } }>(
+			TEST_REPO,
+			"issue",
+			71,
+			true,
+			TEST_AUTH_KEY,
+		);
+		expect(cached?.payload.access_token).toBe("«redacted»");
+		expect(cached?.payload.nested?.token).toBe("«redacted»");
+		expect(cacheFileBytes()).not.toContain("opaque-cache-demo-0123456789");
+	});
+
+	it("scrubs a delimited home path and preserves a URL whose path starts with /home/", () => {
+		const hostPath = path.join(os.homedir(), "gjc-delimited");
+		const body = [
+			`| local | \`${hostPath}\` |`,
+			"",
+			"`" + hostPath + "` and https://docs.example/#/home/public/guide",
+			"ipv6 https://[::1]/home/public/guide still a URL",
+		].join("\n");
+		const url = `https://github.com/${TEST_REPO}/issues/72`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 72,
+			includeComments: true,
+			payload: issuePayload(72, body, url),
+			rendered: body,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+
+		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 72, true, TEST_AUTH_KEY);
+		expect(cached?.payload.body).not.toContain(hostPath);
+		expect(cached?.payload.body).toContain("https://docs.example/#/home/public/guide");
+		expect(cached?.payload.body).toContain("https://[::1]/home/public/guide");
+		expect(cached?.payload.body).toContain("| local | `~/gjc-delimited` |");
 	});
 
 	it("round-trips ordinary markdown, code, URLs and $HOME-relative examples", async () => {
@@ -564,9 +743,11 @@ describe("github view cache persistence", () => {
 			"| file | action |",
 			"|---|---|",
 			"| `src/app.ts` | edit |",
+			"| access_token=opaque-demo-value | keep |",
 			"",
 			"```sh",
 			"cd $HOME/src/app",
+			"export TOKEN=$HOME/example ; echo ready",
 			"curl -sS https://api.github.com/repos/o/r",
 			"```",
 			"",
@@ -575,7 +756,7 @@ describe("github view cache persistence", () => {
 		const url = `https://github.com/${TEST_REPO}/issues/66`;
 		const spy = vi.spyOn(git.github, "json").mockResolvedValue(issuePayload(66, body, url) as never);
 
-		const live = await getOrFetchIssue({
+		await getOrFetchIssue({
 			cwd: tempDir,
 			repo: TEST_REPO,
 			issue: "66",
@@ -590,12 +771,49 @@ describe("github view cache persistence", () => {
 			cacheAuthKey: TEST_AUTH_KEY,
 		});
 		expect(again.status).toBe("fresh");
-		expect(again.payload.body).toBe(body);
-		expect(again.rendered).toBe(live.rendered);
 		expect(again.rendered).toContain("| `src/app.ts` | edit |");
+		expect(again.rendered).toContain("| access_token=«redacted» | keep |");
 		expect(again.rendered).toContain("cd $HOME/src/app");
+		expect(again.rendered).toContain("export TOKEN=«redacted» ; echo ready");
 		expect(again.rendered).toContain("https://example.com/guide");
+		expect(again.rendered).toContain("`~/scratch/out.log`");
 		expect(spy).toHaveBeenCalledTimes(1);
+		spy.mockRestore();
+	});
+
+	it("scrubs a stale cache hit before returning it", async () => {
+		const url = `https://github.com/${TEST_REPO}/issues/73`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 73,
+			includeComments: true,
+			payload: issuePayload(73, `stale ${GITHUB_TOKEN}`, url),
+			rendered: `stale ${GITHUB_TOKEN}`,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+		const settings = {
+			get: (key: string) => {
+				if (key === "github.cache.softTtlSec") return 1;
+				if (key === "github.cache.hardTtlSec") return 10000000000;
+				return undefined;
+			},
+		};
+		const spy = vi.spyOn(git.github, "json").mockResolvedValue(issuePayload(73, "refreshed", url) as never);
+
+		const result = await getOrFetchIssue({
+			cwd: tempDir,
+			repo: TEST_REPO,
+			issue: "73",
+			includeComments: true,
+			cacheAuthKey: TEST_AUTH_KEY,
+			settings: settings as never,
+		});
+		expect(result.status).toBe("stale");
+		expect(result.rendered).not.toContain(GITHUB_TOKEN);
+		expect((result.payload as { body?: string }).body).not.toContain(GITHUB_TOKEN);
 		spy.mockRestore();
 	});
 
@@ -611,7 +829,7 @@ describe("github view cache persistence", () => {
 					"+content",
 					"",
 				].join("\n");
-				const rewritten = rewritePrDiffPathTokens(diff, value => value.replaceAll("secret", "«redacted»"));
+				const rewritten = scrubPrDiffText(diff, (value: string) => value.replaceAll("secret", "«redacted»"));
 				const parsed = parsePrUnifiedDiff(rewritten);
 				expect(parsed.files).toHaveLength(1);
 				const expected = diffPath.replaceAll("secret", "«redacted»");
