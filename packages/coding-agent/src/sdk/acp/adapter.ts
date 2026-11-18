@@ -462,11 +462,37 @@ export class AcpSdkAdapter {
 				: {}),
 		});
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
-		return await this.#requestSession({
-			type: "control_request",
-			operation: "turn.prompt",
-			input: { ...(typeof params === "object" ? params : {}), text },
-		});
+
+		// Auto-generate a clientRef for prompt recovery if one is not provided.
+		// This allows recovery of in-flight prompts after connection loss via turn.prompt_status query.
+		const clientRef =
+			typeof params === "object" && typeof params.clientRef === "string" ? params.clientRef : randomUUID();
+
+		const input = { ...(typeof params === "object" ? params : {}), text, clientRef };
+
+		try {
+			return await this.#requestSession({
+				type: "control_request",
+				operation: "turn.prompt",
+				input,
+			});
+		} catch (error) {
+			// Handle connection loss during prompt: attempt to recover the prompt status using clientRef.
+			// If the prompt was recorded before connection loss, we can retrieve its status.
+			// If not found, re-throw the original error.
+			if (
+				error instanceof SdkClientError &&
+				(error.code === "connection_closed" || error.code === "uncertain_after_send")
+			) {
+				try {
+					const recoveredStatus = await this.#recoverPromptStatus(clientRef, error);
+					if (recoveredStatus) return recoveredStatus;
+				} catch {
+					// Recovery attempt failed; re-throw the original prompt error.
+				}
+			}
+			throw error;
+		}
 	}
 	/**
 	 * Upload one prompt image through the host-owned `turn.image.*` staging controls in
@@ -604,6 +630,33 @@ export class AcpSdkAdapter {
 			throw adapterError;
 		}
 		return envelope?.result ?? response;
+	}
+
+	async #recoverPromptStatus(clientRef: string, _originalError: SdkClientError): Promise<unknown | undefined> {
+		// After connection loss, query the prompt status to see if it was recorded.
+		// Use turn.prompt_status if available, otherwise fall back to turn.result.
+		try {
+			const statusResult = await this.query("turn.prompt_status", { clientRef });
+			const status = object(statusResult);
+			if (status?.status === "unknown" || status?.status === "acknowledged" || status?.status === "completed") {
+				// Prompt was recorded before connection loss; return its status.
+				return statusResult;
+			}
+		} catch (statusError) {
+			// If prompt_status is not available or not found, try turn.result as fallback.
+			if (statusError instanceof AcpSdkAdapterError && statusError.code === "unknown_query") {
+				try {
+					const turnResult = await this.query("turn.result", {
+						kind: "prompt",
+						clientRef,
+					});
+					return turnResult;
+				} catch {
+					// Fallback also failed; original error will be thrown.
+				}
+			}
+		}
+		return undefined;
 	}
 
 	async #requestSession(

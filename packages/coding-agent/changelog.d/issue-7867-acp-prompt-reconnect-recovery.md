@@ -1,0 +1,3 @@
+### Fixed
+
+- **ACP**: When an ACP client loses its connection to the session host (connection:2) while a prompt is in-flight, the prompt is no longer dropped. Instead, the adapter auto-generates a unique `clientRef` for the prompt if one is not provided, and after connection loss, it attempts to recover the prompt's status using that `clientRef`. If the prompt was recorded before the connection dropped, its status is recovered and returned; otherwise, the original error is re-thrown. This ensures prompts sent via ACP are resilient to mid-flight connection loss and can be recovered via `turn.prompt_status` or `turn.result` queries. (#7867)
