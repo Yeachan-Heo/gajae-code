@@ -81,11 +81,14 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
  * (https://developers.openai.com/api/docs/pricing). Generated policies apply the
  * public API pricing and freeform tool metadata.
  *
- * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
- * so the flagship remains the first Codex suggestion.
+ * Only the current flagship (GPT-6.2 Astra) carries `priority: 1`; every other
+ * row stays in default catalog order so the flagship remains the first Codex
+ * suggestion.
  */
 const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number }[] = [
-	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
+	{ id: "gpt-6.2-astra", name: "GPT-6.2 Astra", priority: 1 },
+	{ id: "gpt-6.2-sol", name: "GPT-6.2 Sol" },
+	{ id: "gpt-6-astra", name: "GPT-6 Astra" },
 	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
 	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
 	{ id: "gpt-6.1-terra", name: "GPT-6.1 Terra" },
@@ -120,12 +123,18 @@ export function injectCodexGpt6Models(models: Model[]): void {
 const ULTRAFAST_TIER_MODEL_KEYS = new Set([
 	"openai/gpt-6-astra",
 	"openai/gpt-6.1-sol",
+	"openai/gpt-6.2-astra",
+	"openai/gpt-6.2-sol",
 	"openai-codex/gpt-6-astra",
 	"openai-codex/gpt-6.1-sol",
+	"openai-codex/gpt-6.2-astra",
+	"openai-codex/gpt-6.2-sol",
 	"github-copilot/gpt-6-astra",
 	"github-copilot/gpt-6.1-sol",
 	"opencode-zen/gpt-6-astra",
 	"opencode-zen/gpt-6.1-sol",
+	"opencode-zen/gpt-6.2-astra",
+	"opencode-zen/gpt-6.2-sol",
 ]);
 
 const ULTRAFAST_ONLY_PROVIDERS = new Set(["github-copilot", "opencode-zen"]);
