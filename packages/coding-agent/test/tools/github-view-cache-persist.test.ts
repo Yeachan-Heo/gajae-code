@@ -1489,6 +1489,12 @@ describe("github view cache persistence", () => {
 			'{"auth":["token=left\\"tail",\n"fixture-retained-auth-52"]}',
 			'Cookie: ["first",\n  "cookie-array-private-canary",\n-Cookie: sid=display]',
 			'-Cookie: [first,\n-  "fixture-second-opaque",\n-Cookie: sid=display]',
+			"Auth: [']',\n  'fixture-retained-auth-53'\n]",
+			"Cookie: [\n  'first\n-Cookie: mode=display',\n  'fixture-private-opaque-54'\n]",
+			"curl -H 'Authorization: Token token=\"fixture-param-auth-54\"' https://example.test",
+			'Authorization: Token token="fixture-param-auth-54"\nrest',
+			'echo "Authorization=NTLM TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA="',
+			String.raw`trace "Authorization=Token token='prefix\' fixture-param-tail-55'"`,
 		];
 		for (const [index, body] of bodies.entries()) {
 			putCached({
@@ -1520,6 +1526,7 @@ describe("github view cache persistence", () => {
 				"fixture-private-opaque-54",
 				"fixture-param-auth-54",
 				"TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA=",
+				"fixture-param-tail-55",
 				"fixture-opaque-session",
 				"cookie-array-private-canary",
 				"fixture-second-opaque",
