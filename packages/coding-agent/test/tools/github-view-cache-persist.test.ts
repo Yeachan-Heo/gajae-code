@@ -929,6 +929,8 @@ describe("github view cache persistence", () => {
 			"-Authorization: Basic Zm9vOmJhcg==",
 			"-Cookie: {\n-  sid: fixture-opaque-Q8m4\n-}",
 			"-Cookie: \n  sid=fixture-opaque-Q8m4",
+			"-Cookie: \n-  sid=review33-opaque-session",
+			"-Cookie:\u00A0sid=fixture-nbsp-cookie-Q8m4",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
@@ -994,6 +996,8 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("cache-only-canary-X2m8");
 		expect(cacheFileBytes()).not.toContain("Zm9vOmJhcg==");
 		expect(cacheFileBytes()).not.toContain("fixture-opaque-Q8m4");
+		expect(cacheFileBytes()).not.toContain("review33-opaque-session");
+		expect(cacheFileBytes()).not.toContain("fixture-nbsp-cookie-Q8m4");
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");
 		expect(cacheFileBytes()).not.toContain("/root#top");
