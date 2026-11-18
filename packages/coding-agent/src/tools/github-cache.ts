@@ -644,6 +644,10 @@ function scrubHostPaths(text: string): string {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#])\/root(?![A-Za-z0-9._-])/g, "~");
+		// JSON text can escape path separators; mask the same local paths in
+		// that spelling without changing the surrounding text.
+		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
+		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|$)/g, "~");
 		return scrubbed.replace(/(?<![A-Za-z0-9._#])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
 	};
 	// A `file:` URL's path is local, so scrub it without turning the marker into
@@ -666,11 +670,15 @@ function scrubHostPaths(text: string): string {
 	const scrubHomeSegmentInUrl = (url: string): string => {
 		// A valid URL path is content. Only a malformed local authority (empty
 		// port on localhost) is treated as carrying a local path.
-		const localAuthority = /^(?:[a-z][a-z0-9+.-]*:)?\/\/(?:localhost:(?=\/)|\/)/i.test(url);
+		const localAuthority =
+			/^(?:[a-z][a-z0-9+.-]*:)?\/\/(?:localhost:(?=\/)|\/)/i.test(url) ||
+			/^(?:[a-z][a-z0-9+.-]*:)?\\\/\\\/(?:localhost:(?=\\\/)|\\\/)/i.test(url);
 		if (!localAuthority) return url;
 		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
 		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|]+/g, "$1~");
 		scrubbed = scrubbed.replace(/\/root(?=\/|$)/g, "~");
+		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
+		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|$)/g, "~");
 		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\s"'`<>()[\]{},;|]+/gi, "$1~");
 	};
 	// A URL's path is content, not a local path, so only scrub outside URL spans.

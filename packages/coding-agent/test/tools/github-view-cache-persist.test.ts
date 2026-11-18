@@ -884,6 +884,7 @@ describe("github view cache persistence", () => {
 			"left | right\n--- | ---\n# https://docs.example|user@localhost:/home/cache-fixture/config",
 			`left | right\n--- | ---\n# https://docs.example|@${os.homedir()}/cache-canary`,
 			"//fixture-user@/home/cache-fixture/config\nhttps://fixture-user@/root/config",
+			"json \\/\\/fixture-user@\\/home\\/cache-fixture\\/config",
 			"```text",
 			"https://alice:opaque|part@example.test/x",
 			"---|---",
