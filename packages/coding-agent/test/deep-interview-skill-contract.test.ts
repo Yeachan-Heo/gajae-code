@@ -174,13 +174,16 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 		expect(continuation).toMatch(/Bounded continuation safety recovery/);
 		// The resume choice is invocation-boundary-only and never re-asked mid-interview.
 		expect(continuation).toMatch(/never re-asked inside an active interview/);
-		// Hard cancellations are never delayed by the pre-round-3 early-proceed guard.
+		// Hard cancellation and early proceed stay distinct exit-intent classes.
 		expect(continuation).toMatch(/Hard cancellation/);
 		expect(continuation).toMatch(/stops immediately at any round/);
 		expect(continuation).toMatch(/Never turn a hard cancellation into a clarifying question/);
 		expect(continuation).toMatch(/Early proceed/);
-		expect(continuation).toMatch(/Before round 3, ask one targeted clarifying question/);
+		expect(continuation).toMatch(/ends the interview at any round \(no minimum round\)/);
 		expect(continuation).toMatch(/do not treat that early-proceed intent as a hard cancellation/);
+		// The retired pre-round-3 guard must not come back.
+		expect(skill).not.toMatch(/Before round 3, ask one targeted clarifying question/);
+		expect(skill).not.toMatch(/round[- ]3\+/i);
 		// Passive exit control is preserved with the two intent classes kept distinct.
 		expect(continuation).toMatch(/any answer, option, or free-text reply can carry an exit intent/);
 		expect(continuation).toMatch(/Hard cancellations are honored immediately/);
@@ -189,9 +192,52 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 	it("keeps the hard cap and explicit early-exit controls after retiring the tiered cadence (issue #4589)", () => {
 		expect(skill).toContain("Round 100");
 		expect(skill).toMatch(/Hard cap at 100 rounds/i);
-		expect(skill).toMatch(/Early exit \(round 3\+\)/i);
+		expect(skill).toMatch(/Early exit \(any round, standing option\)/i);
 		expect(skill).toMatch(/User says "stop", "cancel", "abort"/i);
-		expect(skill).toMatch(/stop immediately, save state for resume/i);
+		expect(skill).toMatch(
+			/stop immediately, save state for resume \(no spec; distinct from the early-exit option\)/i,
+		);
+	});
+
+	it("offers a standing 'enough' option on every interview-round ask from round 1, regardless of ambiguity", () => {
+		const steps = extractSection(skill, "Steps");
+		const askStep = steps.slice(
+			steps.indexOf("### Step 2b: Ask the Question"),
+			steps.indexOf("### Step 2b′: Auto-Answer Opted-Out Questions"),
+		);
+		expect(askStep).toContain("**Standing early-exit option (every interview round, from round 1).**");
+		expect(askStep).toContain(
+			"MUST list, as its final option, `This is enough — stop at current ambiguity ({score}%)`",
+		);
+		expect(askStep).toMatch(/regardless of the ambiguity score or round number/);
+		expect(askStep).toMatch(/never mark it as the recommended option/);
+		// Gates that are not interview rounds keep their own fixed option sets.
+		expect(askStep).toMatch(
+			/not offered on the Round 0 topology gate, the Phase 4b Restate gate, the auto-answer threshold-crossing confirmation, or the Phase 5 execution gate/,
+		);
+		// Selecting it is an early proceed: recorded, warned, then crystallized.
+		expect(askStep).toMatch(/not a round answer and not a hard cancellation/);
+		expect(askStep).toContain('"exit_reason":"user_enough"');
+		expect(askStep).toContain('"exit_ambiguity":<current_ambiguity>');
+		expect(askStep).toContain("Current ambiguity is {score}% (threshold: <resolvedThresholdPercent>)");
+		expect(askStep).toMatch(/Do not follow it with a generic "continue anyway\?" ask/);
+		expect(askStep).toMatch(/Continue to Phase 4 crystallization as usual/);
+		expect(askStep).toMatch(/never rewrites `threshold`, `current_ambiguity`, or round scores/);
+	});
+
+	it("crystallizes a user early exit with residual risks instead of closure follow-up questions", () => {
+		const steps = extractSection(skill, "Steps");
+		const phase4 = steps.slice(
+			steps.indexOf("## Phase 4: Crystallize Spec"),
+			steps.indexOf("## Phase 5: Execution Bridge"),
+		);
+		expect(phase4).toContain('**User early exit (`exit_reason: "user_enough"`).**');
+		expect(phase4).toMatch(/recorded as a residual risk for the spec instead of becoming another follow-up question/);
+		expect(phase4).toMatch(/The 4b Restate gate still runs/);
+		expect(phase4).toContain('"exit_reason":null');
+		expect(phase4).toContain("- Exit Reason: {threshold_met | user_enough | hard_cap}");
+		expect(phase4).toContain("- Ambiguity at Exit:");
+		expect(phase4).toContain("## Residual Risks");
 	});
 
 	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
