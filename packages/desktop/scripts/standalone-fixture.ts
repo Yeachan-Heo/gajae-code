@@ -86,17 +86,20 @@ export function startStandaloneFixture(): StandaloneFixture {
 				const url = new URL(request.url);
 				assert(
 					url.origin === `http://127.0.0.1:${server.port}` &&
-						url.pathname === "/v1/chat/completions" &&
-						!url.search,
-					"unexpected endpoint",
+						!url.search &&
+						((request.method === "POST" && url.pathname === "/v1/chat/completions") ||
+							(request.method === "GET" && url.pathname === "/v1/models")),
+					`unexpected endpoint (${request.method} ${url.pathname})`,
 				);
 				assert(
-					request.method === "POST" &&
-						request.headers.get("Authorization") === `Bearer ${FIXTURE_KEY}` &&
+					request.headers.get("Authorization") === `Bearer ${FIXTURE_KEY}` &&
 						request.headers.get("X-Standalone-Fixture") === token &&
 						!request.headers.has("Origin"),
 					"unexpected client",
 				);
+				if (request.method === "GET") {
+					return Response.json({ object: "list", data: [{ id: "offline", object: "model" }] });
+				}
 				const body = (await request.json()) as {
 					model?: string;
 					stream?: boolean;

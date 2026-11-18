@@ -218,6 +218,30 @@ function completion(baseUrl: string, token: string, messages: unknown[], tools: 
 	});
 }
 
+test("standalone provider serves only authenticated loopback model discovery without consuming the turn", async () => {
+	const fixture = startStandaloneFixture();
+	try {
+		fixture.arm({ prompt: "prompt after discovery", answer: "answer after discovery" });
+		const catalog = await fetch(`${fixture.baseUrl}/models`, {
+			headers: { Authorization: `Bearer ${FIXTURE_KEY}`, "X-Standalone-Fixture": fixture.token },
+		});
+		expect(catalog.status).toBe(200);
+		expect(await catalog.json()).toEqual({ object: "list", data: [{ id: "offline", object: "model" }] });
+		expect(fixture.snapshot().evidence).toEqual([]);
+		const response = await completion(fixture.baseUrl, fixture.token, [{ role: "user", content: "prompt after discovery" }]);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toContain("answer after discovery");
+		fixture.assertComplete();
+		const unauthorized = await fetch(`${fixture.baseUrl}/models`, {
+			headers: { Authorization: `Bearer ${FIXTURE_KEY}` },
+		});
+		expect(unauthorized.status).toBe(400);
+		expect(await unauthorized.text()).toBe("Fixture protocol: unexpected client");
+	} finally {
+		await fixture.close();
+	}
+});
+
 test("standalone provider verifies actual tool results with order-independent arguments", async () => {
 	const fixture = startStandaloneFixture();
 	try {
