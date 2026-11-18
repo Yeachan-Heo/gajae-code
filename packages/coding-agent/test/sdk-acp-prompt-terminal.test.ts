@@ -3530,7 +3530,7 @@ test("ACP activity idle alone does not settle a prompt", async () => {
 async function createRecoveryFixture(
 	acknowledgement: "held" | "rejected" | "accepted",
 	blockedAgentMessageText?: string,
-	options: { controlledRetryBackoff?: boolean } = {},
+	options: { controlledRetryBackoff?: boolean; virtualPromptWatchdog?: boolean } = {},
 ): Promise<Fixture & { notify(code?: string): void }> {
 	let notify: ((error: SdkClientError) => void) | undefined;
 	const original = AcpSdkAdapter.prototype.onReconnectFailed;
@@ -3549,6 +3549,7 @@ async function createRecoveryFixture(
 			blockedAgentMessageText,
 			cancelSettlementGraceMs: 25,
 			controlledRetryBackoff: options.controlledRetryBackoff,
+			virtualPromptWatchdog: options.virtualPromptWatchdog,
 		});
 		const callback = notify;
 		if (!callback) throw new Error("Expected session reconnect failure subscription");
@@ -3560,6 +3561,18 @@ async function createRecoveryFixture(
 	} finally {
 		registration.mockRestore();
 	}
+}
+
+/**
+ * After an uncertain outcome the session stays usable under the same id: ACP reattaches it to
+ * the host, and the next prompt is a fresh submission rather than a replay or `not_found` (#7867).
+ */
+async function expectReattachedSuccessor(fixture: Fixture, text: string): Promise<void> {
+	const successor = prompt(fixture, text);
+	void successor.catch(() => undefined);
+	await waitFor(() => fixture.promptDeliveryCount() === 2, "successor delivery through the reattached session");
+	expect(fixture.mutationInputs).toHaveLength(2);
+	expect(fixture.mutationInputs[1]?.clientRef).not.toBe(fixture.mutationInputs[0]?.clientRef);
 }
 
 function retainedTerminal(fixture: Fixture, kind: "prompt" | "skill" = "prompt"): Record<string, unknown> {
@@ -3823,8 +3836,6 @@ const unusableRecoveryPages: Array<[string, Record<string, unknown>]> = [
 	["empty correlation", { commandId: " " }],
 	["conflicting command alias", { command_id: "other-command" }],
 	["conflicting turn alias", { turn_id: "other-turn" }],
-	["accepted", { status: "accepted" }],
-	["in flight", { status: "in_flight" }],
 	["unknown", { status: "unknown" }],
 	["missing successful receipt", { receiptState: "missing" }],
 	["unknown successful receipt", { receiptState: "unknown" }],
@@ -3844,7 +3855,7 @@ const unusableRecoveryPages: Array<[string, Record<string, unknown>]> = [
 	],
 ];
 for (const [label, page] of unusableRecoveryPages) {
-	test(`ACP rejects ${label} retained evidence without replay or reattachment`, async () => {
+	test(`ACP rejects ${label} retained evidence without replay and reattaches the session`, async () => {
 		const fixture = await createRecoveryFixture("rejected");
 		try {
 			const pending = prompt(fixture, label);
@@ -3856,12 +3867,103 @@ for (const [label, page] of unusableRecoveryPages) {
 			});
 			expect(fixture.promptDeliveryCount()).toBe(1);
 			expect(fixture.recoveryInputs).toHaveLength(1);
-			await expect(prompt(fixture, "must not automatically reattach")).rejects.toMatchObject({ code: "not_found" });
+			await expectReattachedSuccessor(fixture, "successor after uncertain recovery");
 		} finally {
 			fixture.dispose();
 		}
 	});
 }
+
+/** The host still owns an unacknowledged submission (e.g. preflight compaction) or its run. */
+function liveSubmissionPage(fixture: Fixture, status: "admitted" | "accepted" | "in_flight"): Record<string, unknown> {
+	return { ...retainedTerminal(fixture), status, outcome: undefined, content: undefined, receiptState: "absent" };
+}
+
+for (const status of ["admitted", "accepted", "in_flight"] as const) {
+	test(`ACP keeps an unacknowledged ${status} prompt alive until its terminal (#7867)`, async () => {
+		const fixture = await createRecoveryFixture("rejected");
+		try {
+			let settled = false;
+			const pending = prompt(fixture, `${status} submission`).finally(() => {
+				settled = true;
+			});
+			await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+			fixture.releaseRecoveryResult(liveSubmissionPage(fixture, status));
+			await Bun.sleep(50);
+			// Failing the session here closed the requester connection, which cancels an admitted
+			// preflight: the prompt was silently lost and the session became `not_found`.
+			expect(settled).toBe(false);
+			fixture.sendStopped("end_turn");
+			expect(await bounded(pending, "live submission terminal")).toEqual({ stopReason: "end_turn" });
+			expect(fixture.promptDeliveryCount()).toBe(1);
+			expect(fixture.recoveryInputs).toHaveLength(1);
+		} finally {
+			fixture.dispose();
+		}
+	});
+}
+
+test("ACP reports a typed session_closed error when the session cannot be reattached (#7867)", async () => {
+	const fixture = await createRecoveryFixture("rejected");
+	// The session is already attached; only the reattachment after uncertainty starts an adapter.
+	const start = vi
+		.spyOn(AcpSdkAdapter.prototype, "start")
+		.mockRejectedValue(new SdkClientError("unavailable", "fixture session host is gone"));
+	try {
+		const pending = prompt(fixture, "host lost during recovery");
+		void pending.catch(() => undefined);
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+		const clientRef = fixture.mutationInputs[0]?.clientRef;
+		fixture.releaseRecoveryResult({ status: "unknown", receiptState: "unknown" });
+		// With no commandId/turnId the guidance names the clientRef selector that resolves it.
+		await expect(bounded(pending, "uncertain recovery")).rejects.toMatchObject({
+			code: "terminal_uncertain",
+			message: expect.stringContaining(
+				`--query turn.result --json-input '{"kind":"prompt","clientRef":"${clientRef}"}'`,
+			),
+		});
+		await expect(bounded(prompt(fixture, "after failed reattachment"), "successor")).rejects.toMatchObject({
+			code: "session_closed",
+			message: expect.stringContaining("fixture session host is gone"),
+		});
+		expect(start).toHaveBeenCalled();
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		start.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("ACP re-reads an admitted prompt on inactivity and settles its preflight rejection definitely (#7867)", async () => {
+	const fixture = await createRecoveryFixture("rejected", undefined, { virtualPromptWatchdog: true });
+	try {
+		const pending = prompt(fixture, "admitted during a long compaction");
+		void pending.catch(() => undefined);
+		await waitFor(() => fixture.recoveryInputs.length === 1, "admission recovery query");
+		fixture.releaseRecoveryResult(liveSubmissionPage(fixture, "admitted"));
+		await Bun.sleep(50);
+		// A preflight emits no frames; silence must re-read turn.result rather than abandon.
+		fixture.advancePromptWatchdog(24 * 60 * 60 * 1_000);
+		await waitFor(() => fixture.recoveryInputs.length === 2, "inactivity recovery query");
+		expect(fixture.recoveryInputs[1]).toMatchObject({
+			kind: "prompt",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.releaseRecoveryResult({
+			...retainedTerminal(fixture),
+			status: "failed",
+			outcome: undefined,
+			content: undefined,
+			receiptState: "missing",
+			error: { code: "cancelled", message: "The submission was rejected before it was accepted." },
+		});
+		await expect(bounded(pending, "definite preflight rejection")).rejects.toMatchObject({ code: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
 
 for (const page of [
 	{
@@ -4010,7 +4112,7 @@ for (const failure of ["unavailable", "timeout"] as const) {
 			expect(fixture.updates.some(update => update.update.sessionUpdate === "agent_message_chunk")).toBe(false);
 			expect(queries).toBe(1);
 			expect(fixture.promptDeliveryCount()).toBe(1);
-			await expect(prompt(fixture, "no automatic reattach")).rejects.toMatchObject({ code: "not_found" });
+			await expectReattachedSuccessor(fixture, "successor after bounded uncertainty");
 		} finally {
 			timerSpy.mockRestore();
 			querySpy.mockRestore();
@@ -4331,7 +4433,7 @@ for (const ref of ["missing", "wrong"] as const) {
 	});
 }
 
-test("ACP changed connection during recovery fails uncertain without reattachment", async () => {
+test("ACP changed connection during recovery fails uncertain and reattaches the session", async () => {
 	const fixture = await createRecoveryFixture("held");
 	try {
 		const pending = prompt(fixture, "connection replacement during lookup");
@@ -4345,7 +4447,7 @@ test("ACP changed connection during recovery fails uncertain without reattachmen
 		});
 		expect(fixture.promptDeliveryCount()).toBe(1);
 		expect(fixture.recoveryInputs).toHaveLength(1);
-		await expect(prompt(fixture, "must explicitly reconcile ownership")).rejects.toMatchObject({ code: "not_found" });
+		await expectReattachedSuccessor(fixture, "successor after owner connection change");
 	} finally {
 		fixture.dispose();
 	}

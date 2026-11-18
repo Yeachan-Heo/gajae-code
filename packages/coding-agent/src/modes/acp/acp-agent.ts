@@ -201,6 +201,12 @@ interface PromptWaiter {
 	dispatched: boolean;
 	/** True only while the dispatched control request can still reveal its correlation. */
 	acknowledgementPending: boolean;
+	/**
+	 * Recovery learned the correlation from an `admitted` turn.result: the host still runs
+	 * the submission's preflight and may yet reject it. Its first correlated frame proves
+	 * acceptance; until then an inactivity expiry re-reads turn.result instead of abandoning.
+	 */
+	awaitingAdmission?: boolean;
 
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
@@ -599,6 +605,29 @@ function clearPromptWatchdog(waiter: PromptWaiter): void {
 
 function describeCorrelation(correlation: PromptCorrelation): string {
 	return `commandId=${correlation.commandId ?? "none"} turnId=${correlation.turnId ?? "none"}`;
+}
+
+/**
+ * Names the selector that can still resolve an uncertain submission. Before the host
+ * acknowledges a submission the ACP-generated clientRef is the only identity it shares
+ * with the host, so the guidance must not point at correlation ids nobody knows.
+ */
+function uncertainPromptMessage(sessionId: string, detail: string, waiter: PromptWaiter): string {
+	const { commandId, turnId } = waiter.correlation;
+	const selector = JSON.stringify(
+		commandId !== undefined && turnId !== undefined
+			? { kind: waiter.invocationKind, commandId, turnId }
+			: { kind: waiter.invocationKind, clientRef: waiter.clientRef },
+	);
+	const identity =
+		commandId !== undefined && turnId !== undefined
+			? `commandId=${commandId}, turnId=${turnId}`
+			: "the host never acknowledged it, so it has no commandId/turnId yet";
+	return (
+		`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed (${identity}). ` +
+		`Run \`gjc sdk session raw query ${sessionId} --query turn.result --json-input '${selector}'\` to learn whether it ran ` +
+		"before submitting it again; the session reattaches to its host automatically."
+	);
 }
 
 function correlationsExactlyMatch(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
@@ -1816,8 +1845,14 @@ export class AcpAgent implements Agent {
 	readonly #ownedSessionIds = new Set<string>();
 	/** Temporary intent survives attachment replacement and uncertain lifecycle cleanup. */
 	readonly #ephemeralSessionIds = new Set<string>();
-	/** Track ephemeral sessions that failed with unrecoverable transport errors. Maps to the error delivered. */
-	readonly #failedEphemeralSessions = new Map<string, AcpSdkAdapterError>();
+	/**
+	 * Sessions whose host attachment failed and could not be restored, mapped to the typed error
+	 * every later request receives instead of `not_found`. Cleared once the session attaches
+	 * again (session/load, session/resume) or is closed.
+	 */
+	readonly #unrecoverableSessions = new Map<string, AcpSdkAdapterError>();
+	/** Reattachments in progress; requests for the session wait for them instead of racing `not_found`. */
+	readonly #reattachingSessions = new Map<string, Promise<void>>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #sessionListCursors = new AcpSessionListCursors();
@@ -2195,7 +2230,7 @@ export class AcpAgent implements Agent {
 				);
 				this.#uncertainAbortOwners.delete(params.sessionId);
 				this.#ephemeralSessionIds.delete(params.sessionId);
-				this.#failedEphemeralSessions.delete(params.sessionId);
+				this.#unrecoverableSessions.delete(params.sessionId);
 				return {};
 			}
 			this.#beginTeardown(params.sessionId);
@@ -2224,7 +2259,7 @@ export class AcpAgent implements Agent {
 							this.#knownSessionCwds.delete(params.sessionId);
 							this.#ownedSessionIds.delete(params.sessionId);
 							this.#ephemeralSessionIds.delete(params.sessionId);
-							this.#failedEphemeralSessions.delete(params.sessionId);
+							this.#unrecoverableSessions.delete(params.sessionId);
 							this.#knownSessionMcpServers.delete(params.sessionId);
 							this.#knownSessionMetadata.delete(params.sessionId);
 							this.#retiredPromptCorrelations.delete(params.sessionId);
@@ -2245,7 +2280,7 @@ export class AcpAgent implements Agent {
 				this.#knownSessionCwds.delete(params.sessionId);
 				this.#ownedSessionIds.delete(params.sessionId);
 				this.#ephemeralSessionIds.delete(params.sessionId);
-				this.#failedEphemeralSessions.delete(params.sessionId);
+				this.#unrecoverableSessions.delete(params.sessionId);
 				this.#knownSessionMcpServers.delete(params.sessionId);
 				this.#knownSessionMetadata.delete(params.sessionId);
 				this.#pendingDeleteLocators.delete(params.sessionId);
@@ -2328,9 +2363,14 @@ export class AcpAgent implements Agent {
 		// An unknown session must still report not_found; the retry loop only guards a
 		// live session's first turn against a startup readiness race (issue #5574).
 		if (!record) {
-			// Deliver the typed error for ephemeral sessions that failed with transport loss
-			const failedEphemeralError = this.#failedEphemeralSessions.get(params.sessionId);
-			if (failedEphemeralError) throw failedEphemeralError;
+			const reattaching = this.#reattachingSessions.get(params.sessionId);
+			if (reattaching) {
+				await reattaching;
+				return await this.prompt(params);
+			}
+			// A session whose host attachment could not be restored reports its typed failure.
+			const unrecoverable = this.#unrecoverableSessions.get(params.sessionId);
+			if (unrecoverable) throw unrecoverable;
 			return await this.#submitPrompt(params, true);
 		}
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
@@ -3847,6 +3887,7 @@ export class AcpAgent implements Agent {
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
 			);
 			this.#sessions.set(id, record);
+			this.#unrecoverableSessions.delete(id);
 			unsubscribePendingFrames();
 			for (const frame of bufferedFrames) adapter.acceptFrame(frame);
 			for (const frame of pendingAdapterFrames) this.#enqueueSdkFrame(id, adapter, frame);
@@ -4228,7 +4269,7 @@ export class AcpAgent implements Agent {
 				return;
 			record.attachment = attachment;
 			record.connectionId = attachment.connectionId;
-			this.#failedEphemeralSessions.delete(id);
+			this.#unrecoverableSessions.delete(id);
 			void this.#publishPromptPhase(id, adapter, this.#promptPhaseOwner(record));
 		} catch {
 			if (this.#sessions.get(id) === record && record.adapter === adapter)
@@ -4464,9 +4505,19 @@ export class AcpAgent implements Agent {
 						return { kind: "terminal" };
 					}
 				}
-				if (this.#ephemeralSessionIds.has(id) && (status.status === "accepted" || status.status === "in_flight")) {
-					// The exact Router host proved the accepted turn is still running.
-					// Keep its waiter and correlation; only terminal evidence may settle it.
+				if (
+					(status.status === "admitted" || status.status === "accepted" || status.status === "in_flight") &&
+					(this.#ephemeralSessionIds.has(id) ||
+						// An uncertain abort keeps its own fenced settlement below; the session is
+						// retained as background-busy either way.
+						((!acknowledgedAtLookup || waiter.awaitingAdmission) && !this.#ownsUncertainAbort(record, waiter)))
+				) {
+					// The exact Router host proved it still owns the submission. Keep its
+					// waiter, correlation, and connection: only terminal evidence may settle
+					// it. Tearing the session down here closed the requester connection,
+					// which cancels an admitted preflight (a long pre-prompt compaction, for
+					// example) so the prompt was never run or recorded (#7867).
+					waiter.awaitingAdmission = status.status === "admitted";
 					return { kind: "in_flight" };
 				}
 				detail = "status has no usable retained terminal outcome and receipt";
@@ -4477,10 +4528,7 @@ export class AcpAgent implements Agent {
 			if (timer !== undefined) clearTimeout(timer);
 		}
 		if (!ownsRecovery()) return { kind: "ownership_lost" };
-		const uncertain = new AcpSdkAdapterError(
-			"terminal_uncertain",
-			`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, clientRef=${waiter.clientRef}, commandId=${waiter.correlation.commandId ?? "unknown"}, turnId=${waiter.correlation.turnId ?? "unknown"} before submitting more work.`,
-		);
+		const uncertain = new AcpSdkAdapterError("terminal_uncertain", uncertainPromptMessage(id, detail, waiter));
 		if (this.#ephemeralSessionIds.has(id)) {
 			const unrecoverable = new AcpSdkAdapterError(
 				"ephemeral_session_unrecoverable",
@@ -4506,7 +4554,10 @@ export class AcpAgent implements Agent {
 			await this.#rejectPrompt(record, id, waiter, uncertain);
 			return { kind: "uncertain", error: uncertain };
 		}
-		await this.#failSession(id, adapter, uncertain);
+		// The prompt's own attachment cannot be trusted any more, but the session can: reattach
+		// the same session id to its live host (or report it closed) instead of forgetting it,
+		// which turned every later request into `not_found` (#7867).
+		await this.#failAndReattachSession(id, adapter, record.cwd, uncertain);
 		return { kind: "uncertain", error: uncertain };
 	}
 
@@ -4516,7 +4567,42 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		error: AcpSdkAdapterError,
 	): Promise<void> {
-		await this.#failSession(id, adapter, error);
+		await this.#failAndReattachSession(id, adapter, cwd, error);
+	}
+
+	/**
+	 * Fails the session's current attachment, then re-establishes it under the same session id.
+	 * Resolves once the attachment has failed; reattachment continues in the background. The
+	 * reattachment is registered before the failure is published, so a request the client sends
+	 * in reaction to that failure waits for the outcome instead of racing into `not_found`; when
+	 * reattachment is impossible the request receives a typed `session_closed` error.
+	 */
+	async #failAndReattachSession(
+		id: string,
+		adapter: AcpSdkAdapter,
+		cwd: string,
+		error: AcpSdkAdapterError,
+	): Promise<void> {
+		const record = this.#sessions.get(id);
+		if (!record || record.adapter !== adapter) return;
+		if (this.#disposed || this.#knownSessionCwds.get(id) !== cwd || this.#reattachingSessions.has(id)) {
+			await this.#failSession(id, adapter, error);
+			return;
+		}
+		const reattached = Promise.withResolvers<void>();
+		this.#reattachingSessions.set(id, reattached.promise);
+		const failed = this.#failSession(id, adapter, error);
+		void failed
+			.then(() => this.#reattachSession(id, cwd))
+			.catch(() => undefined)
+			.finally(() => {
+				if (this.#reattachingSessions.get(id) === reattached.promise) this.#reattachingSessions.delete(id);
+				reattached.resolve();
+			});
+		await failed;
+	}
+
+	async #reattachSession(id: string, cwd: string): Promise<void> {
 		if (this.#disposed || this.#knownSessionCwds.get(id) !== cwd) return;
 		const mcpServers = this.#knownSessionMcpServers.get(id) ?? [];
 		try {
@@ -4526,6 +4612,15 @@ export class AcpAgent implements Agent {
 		} catch (attachError) {
 			const detail = attachError instanceof Error ? attachError.message : String(attachError);
 			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
+			if (!this.#sessions.has(id) && this.#knownSessionCwds.get(id) === cwd)
+				this.#unrecoverableSessions.set(
+					id,
+					new AcpSdkAdapterError(
+						"session_closed",
+						`ACP session ${id} lost its SDK session host and could not be reattached (${detail}). ` +
+							"Load it again with session/load or start a new session.",
+					),
+				);
 			try {
 				await this.#connection.sessionUpdate({
 					sessionId: id,
@@ -4543,7 +4638,7 @@ export class AcpAgent implements Agent {
 		this.#knownSessionCwds.delete(id);
 		this.#ownedSessionIds.delete(id);
 		this.#ephemeralSessionIds.delete(id);
-		this.#failedEphemeralSessions.delete(id);
+		this.#unrecoverableSessions.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 		this.#retiredPromptCorrelations.delete(id);
@@ -4564,7 +4659,7 @@ export class AcpAgent implements Agent {
 			this.#knownSessionCwds.delete(id);
 			this.#ownedSessionIds.delete(id);
 			this.#ephemeralSessionIds.delete(id);
-			this.#failedEphemeralSessions.delete(id);
+			this.#unrecoverableSessions.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			this.#retiredPromptCorrelations.delete(id);
@@ -4686,7 +4781,7 @@ export class AcpAgent implements Agent {
 		record.reconnectUnsubscribe();
 		// Track failed ephemeral sessions so idle prompts get the correct error
 		if (this.#ephemeralSessionIds.has(id) && error.code === "ephemeral_session_unrecoverable") {
-			this.#failedEphemeralSessions.set(id, error);
+			this.#unrecoverableSessions.set(id, error);
 		}
 		const waiter = record.activePrompt;
 		record.activePrompt = undefined;
@@ -4774,7 +4869,11 @@ export class AcpAgent implements Agent {
 
 	#adapter(id: string): AcpSdkAdapter {
 		const record = this.#sessions.get(id);
-		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`);
+		if (!record)
+			throw (
+				this.#unrecoverableSessions.get(id) ??
+				new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`)
+			);
 		return record.adapter;
 	}
 
@@ -4910,6 +5009,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 		if (!correlationsExactlyMatch(waiter.correlation, correlation)) return;
+		waiter.awaitingAdmission = false;
 		this.#observePromptActivity(waiter, frame);
 		if (waiter.observedTurnActivity) record.promptObservedActivity = true;
 		if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
@@ -4995,6 +5095,14 @@ export class AcpAgent implements Agent {
 			waiter.settled ||
 			waiter.terminalReserved ||
 			record.statusRecovery === waiter
+		)
+			return;
+		// An admitted submission produces no frames while its preflight (e.g. a pre-prompt
+		// compaction) runs; the host's turn.result, not frame silence, decides its fate.
+		if (
+			waiter.awaitingAdmission &&
+			!this.#promptTransportGone(id, record) &&
+			this.#startUncertainPromptRecovery(id, record, waiter)
 		)
 			return;
 		const silenceMs = Math.max(0, this.#promptWatchdogClock.now() - waiter.lastFrameAt);
@@ -5131,12 +5239,17 @@ export class AcpAgent implements Agent {
 						return;
 					}
 					if (record.statusRecovery === waiter || (waiter.dispatched && !waiter.acknowledged)) {
-						await this.#failSession(
+						await this.#failAndReattachSession(
 							id,
 							adapter,
+							record.cwd,
 							new AcpSdkAdapterError(
 								"terminal_uncertain",
-								`Prompt owner connection changed before retained evidence was resolved. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, clientRef=${waiter.clientRef}.`,
+								uncertainPromptMessage(
+									id,
+									"the prompt owner connection changed before retained evidence was resolved",
+									waiter,
+								),
 							),
 						);
 						return;
@@ -6670,7 +6783,8 @@ export class AcpAgent implements Agent {
 		this.#knownSessionCwds.clear();
 		this.#ownedSessionIds.clear();
 		this.#ephemeralSessionIds.clear();
-		this.#failedEphemeralSessions.clear();
+		this.#unrecoverableSessions.clear();
+		this.#reattachingSessions.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#sessionListCursors.clear();
