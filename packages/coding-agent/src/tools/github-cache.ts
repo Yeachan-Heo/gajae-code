@@ -469,12 +469,12 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
  * also has a single pipe. The line is classified once and the matching pattern
  * set is used, so a compact table cannot be merged into one URL.
  */
-const SCHEME_USERINFO = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
+const SCHEME_USERINFO = /(?<![A-Za-z0-9.])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
 const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:\\\||[^\r\n /?#"`<>|])*@/gi;
-const RELATIVE_USERINFO = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>]*@/g;
-const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\/\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
-const ESCAPED_USERINFO = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
-const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\\\/\\\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
+const RELATIVE_USERINFO = /(?<![A-Za-z0-9.:])\/\/[^\r\n /?#"`<>]*@/g;
+const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\/\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
+const ESCAPED_USERINFO = /(?<![A-Za-z0-9.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
+const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\\\/\\\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
 const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
 
 function tableRowFlags(lines: string[]): boolean[] {
@@ -561,6 +561,8 @@ function tableRowFlags(lines: string[]): boolean[] {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
 		if (isIndentedCode(i) || isIndentedCode(i - 1)) continue;
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
+		// A heading, list item, or blockquote is a block, not a table header.
+		if (/^ {0,3}(?:#{1,6}(?:\s|$)|[-+*]\s|\d+[.)]\s|>)/.test(rows[i - 1] ?? "")) continue;
 		// GFM requires the header and delimiter to declare the same cell count;
 		// a prose line that happens to contain a pipe is not a header.
 		const cellsOf = (row: string): number => {
