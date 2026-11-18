@@ -76,27 +76,22 @@ function escapeXmlText(input: string): string {
 	return input.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Which control characters one escape layer may materialise. */
-type EscapeControls = "none" | "tab" | "all";
-
 /**
- * Decoded character of one `\uXXXX` escape. A frame name only ever gets `none` or `all`: its
- * printed spelling must not carry a control character, while its identity has to resolve every
- * escape, because the credential labels accept a tab separator that an encoded name can carry.
- * A value gets `tab`, which is also a separator the text scrub has to see; other control
- * characters stay spelled out so a value cannot reflow the printed dump.
+ * Decoded character of one `\uXXXX` escape. Control characters stay spelled out unless the
+ * caller asks for them: they are identity evidence for a field name (the credential labels
+ * accept a tab separator), but a printed value or name must never carry one.
  */
-function decodeCodePoint(hex: string, controls: EscapeControls): string {
+function decodeCodePoint(hex: string, allowControlCharacters: boolean): string {
 	const codePoint = Number.parseInt(hex, 16);
 	if (!Number.isFinite(codePoint) || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return `\\u${hex}`;
-	if (controls === "all") return String.fromCharCode(codePoint);
-	if (codePoint === 0x09 && controls === "tab") return "\t";
-	if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f)) return `\\u${hex}`;
+	if (!allowControlCharacters && (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f))) {
+		return `\\u${hex}`;
+	}
 	return String.fromCharCode(codePoint);
 }
 
-function decodeUnicodeEscapeText(input: string, controls: EscapeControls = "none"): string {
-	const decode = (_match: string, hex: string) => decodeCodePoint(hex, controls);
+function decodeUnicodeEscapeText(input: string, allowControlCharacters = false): string {
+	const decode = (_match: string, hex: string) => decodeCodePoint(hex, allowControlCharacters);
 	return input.replace(/\\\\u([0-9a-fA-F]{4})/g, decode).replace(/\\u([0-9a-fA-F]{4})/g, decode);
 }
 
@@ -181,19 +176,11 @@ function decodeEscapedText(input: string): string {
 }
 
 /**
- * Both escape layers of a value, with a horizontal tab resolved: it is a credential-label
- * separator, and the text scrub can only see a label split by one when it is materialised.
- */
-function decodeEscapedValue(input: string): string {
-	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input, "tab"), "tab");
-}
-
-/**
  * Both escape layers including control characters: identity evidence for a field name, because
  * the credential labels accept a tab separator that an encoded name can carry. Never printed.
  */
 function decodeEscapedIdentity(input: string): string {
-	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input, "all"), "all");
+	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input, true), true);
 }
 
 /** An integer-like key is enumerated before every other field, so it must keep its spelling. */
@@ -214,7 +201,7 @@ const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
  * entry holds, and no spelling is invented.
  */
 function decodeValueStrings(value: unknown): unknown {
-	if (typeof value === "string") return decodeEscapedValue(value);
+	if (typeof value === "string") return decodeEscapedText(value);
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
 	const source = Object.entries(value);

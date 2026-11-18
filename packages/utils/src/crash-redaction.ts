@@ -85,6 +85,45 @@ function redactPemPrivateKeys(text: string): string {
 	return parts.join("");
 }
 
+interface TextRange {
+	start: number;
+	end: number;
+}
+
+/**
+ * Mask private-key blocks and credential containers of one text in a single pass.
+ * Removing a block first erases the `key={` a container starts at, and masking a container
+ * first removes a footer the block still has to pair, so when the two overlap neither pass can
+ * read the other's output. Both are located on the original text and merged here; a merged
+ * range carries the container marker because the whole value was a credential.
+ */
+function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[]): string {
+	const containers: TextRange[] = [];
+	collectCredentialContainerRanges(text, CURRENT_CREDENTIAL_REDACTION_RULES, containers);
+	const merged: { start: number; end: number; container: boolean }[] = [];
+	const ranges = [
+		...spans.map(span => ({ start: span.start, end: span.end, container: false })),
+		...containers.map(range => ({ start: range.start, end: range.end, container: true })),
+	].sort((a, b) => a.start - b.start || a.end - b.end);
+	for (const range of ranges) {
+		const last = merged.at(-1);
+		if (last !== undefined && range.start <= last.end) {
+			last.end = Math.max(last.end, range.end);
+			last.container ||= range.container;
+			continue;
+		}
+		merged.push({ ...range });
+	}
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const range of merged) {
+		parts.push(text.slice(cursor, range.start), range.container ? "«redacted»" : PRIVATE_KEY_REDACTION_MARKER);
+		cursor = range.end;
+	}
+	parts.push(text.slice(cursor));
+	return parts.join("");
+}
+
 const CREDENTIAL_KEY_SEPARATOR = "[._\\t -]*";
 const CREDENTIAL_KEY_LABELS = `api${CREDENTIAL_KEY_SEPARATOR}key|apikey|account${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|shared${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}signature|access${CREDENTIAL_KEY_SEPARATOR}token|refresh${CREDENTIAL_KEY_SEPARATOR}token|id${CREDENTIAL_KEY_SEPARATOR}token|session${CREDENTIAL_KEY_SEPARATOR}key|session${CREDENTIAL_KEY_SEPARATOR}token|client${CREDENTIAL_KEY_SEPARATOR}secret|aws${CREDENTIAL_KEY_SEPARATOR}secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}key${CREDENTIAL_KEY_SEPARATOR}base|secret${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|encryption${CREDENTIAL_KEY_SEPARATOR}key|signing${CREDENTIAL_KEY_SEPARATOR}key|password${CREDENTIAL_KEY_SEPARATOR}(?:confirmation|confirm)|password|passwd|pwd|pw|passphrase|auth|authorization|bearer|private${CREDENTIAL_KEY_SEPARATOR}token|token|secrets?|credentials?|private${CREDENTIAL_KEY_SEPARATOR}key|cookies?`;
 const CREDENTIAL_KEY_LABELS_V1 = CREDENTIAL_KEY_LABELS.replace("|pw|", "|");
@@ -461,9 +500,12 @@ function uniqueStructuredKey(
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	// A complete block wins over the container rule: `private_key={footer: "…END…"}`
-	// would otherwise mask the footer first and leave an opener and body unpaired.
-	return redactCrashSecretsWithRules(redactPemPrivateKeys(text), CURRENT_CREDENTIAL_REDACTION_RULES);
+	// A block and a container that hold each other have to be located on the same text: removing
+	// the block first erases the assignment the container starts at, and masking the container
+	// first erases a footer the block still has to pair.
+	const spans = findPrivateKeySpans(text);
+	const masked = spans.length === 0 ? text : maskBlocksAndContainers(text, spans);
+	return redactCrashSecretsWithRules(masked, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
 /** Historical redaction rules used only to validate v1 crash fingerprints. */
@@ -701,16 +743,36 @@ function createContainerScanBudget(length: number, bounded: boolean): ContainerS
 
 function redactCredentialContainers(text: string, rules: CredentialRedactionRules, bounded: boolean): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
-	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
-	const camelAssignment = new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g");
+	const { assignment, camel } = containerAssignmentPatterns(rules);
 	return redactCredentialContainersWithPattern(
 		redactCredentialContainersWithPattern(text, assignment, bounded),
-		camelAssignment,
+		camel,
 		bounded,
 	);
 }
 
-function redactCredentialContainersWithPattern(text: string, assignment: RegExp, bounded: boolean): string {
+function containerAssignmentPatterns(rules: CredentialRedactionRules): { assignment: RegExp; camel: RegExp } {
+	return {
+		assignment: new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi"),
+		camel: new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g"),
+	};
+}
+
+/** Collect the ranges a container pass masks, in the coordinates of the text it reads. */
+function collectCredentialContainerRanges(text: string, rules: CredentialRedactionRules, ranges: TextRange[]): void {
+	if (!rules.containerCandidatePattern.test(text)) return;
+	const { assignment, camel } = containerAssignmentPatterns(rules);
+	// Each pattern reads the original text so every recorded range is in original coordinates.
+	redactCredentialContainersWithPattern(text, assignment, true, ranges);
+	redactCredentialContainersWithPattern(text, camel, true, ranges);
+}
+
+function redactCredentialContainersWithPattern(
+	text: string,
+	assignment: RegExp,
+	bounded: boolean,
+	ranges?: TextRange[],
+): string {
 	const budget = createContainerScanBudget(text.length, bounded);
 	const lineScan = createLineEndScan();
 	let output = "";
@@ -724,6 +786,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp,
 			// could leave a later closed container's contents behind. Redact the rest instead of
 			// guessing.
 			output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+			ranges?.push({ start: containerStart, end: text.length });
 			copiedUntil = text.length;
 			break;
 		}
@@ -742,6 +805,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp,
 			continue;
 		}
 		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+		ranges?.push({ start: containerStart, end: containerEnd });
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}

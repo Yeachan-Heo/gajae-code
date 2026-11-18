@@ -632,6 +632,18 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('metadata=["public"]');
 	});
 
+	it("masks a credential container that holds the footer of a private-key block", () => {
+		// The block and the container overlap: removing the block first erases `secret={`, and
+		// masking the container first erases the footer. Both are located on the original text.
+		const blockFirst = `-----BEGIN PRIVATE KEY-----\nsecret={"footer":"-----END PRIVATE KEY-----","payload":"OPAQUE_TAIL"}`;
+		const footerHolder = `body=-----BEGIN PRIVATE KEY-----\nBODY_TEXT\nholder={"footer":"-----END PRIVATE KEY-----"}`;
+
+		expect(redactCrashSecrets(blockFirst)).not.toContain("OPAQUE_TAIL");
+		expect(redactCrashSecrets(blockFirst)).not.toContain("BEGIN PRIVATE KEY");
+		expect(redactCrashSecrets(footerHolder)).not.toContain("BODY_TEXT");
+		expect(redactCrashSecrets(footerHolder)).not.toContain("END PRIVATE KEY");
+	});
+
 	it("preserves later diagnostics after an unterminated credential container", () => {
 		const input = "safe=keep credentials={secret=abc\nstack frame\nafter=keep";
 		expect(redactCrashSecrets(input)).toBe("safe=keep credentials=«redacted»\nstack frame\nafter=keep");

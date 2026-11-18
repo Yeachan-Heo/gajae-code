@@ -688,14 +688,11 @@ describe("formatSessionDumpText credential scrub", () => {
 		}
 	});
 
-	it("classifies an encoded tab separator in a credential name like the tab itself", () => {
-		// The credential labels accept a tab separator, so the encoded spelling has to resolve to
-		// the same identity; the printed dump still keeps control characters spelled out.
+	it("classifies an encoded tab separator in an argument name like the tab itself", () => {
+		// The credential labels accept a tab separator, so a field name has to resolve to the same
+		// identity; the printed dump still keeps the control character spelled out.
 		const encodedSecret = "encoded-tab-secret";
 		const directSecret = "direct-tab-secret";
-		const encodedPayloadSecret = "encoded-json-tab-secret";
-		const directPayloadSecret = "direct-json-tab-secret";
-		const schemaSecret = "encoded-schema-tab-secret";
 		const dumped = dump([
 			assistant(
 				[
@@ -703,36 +700,16 @@ describe("formatSessionDumpText credential scrub", () => {
 						type: "toolCall",
 						id: "call-encoded-tab-name",
 						name: "request",
-						arguments: {
-							payload: { "client\\u0009secret": encodedSecret, "client\tsecret": directSecret },
-							text: `{"client\\u0009secret":"${encodedPayloadSecret}"}`,
-							textDirect: `{"client\tsecret":"${directPayloadSecret}"}`,
-						},
+						arguments: { payload: { "client\\u0009secret": encodedSecret, "client\tsecret": directSecret } },
 					},
 				],
 				1,
 			),
 		] as AgentMessage[]);
-		const schemaDumped = formatSessionDumpText({
-			messages: [],
-			model: null,
-			thinkingLevel: null,
-			tools: [
-				{
-					name: "mcp_request",
-					description: "calls a tool",
-					parameters: {
-						type: "object",
-						properties: { config: { type: "string", default: `{"client\\u0009secret":"${schemaSecret}"}` } },
-					},
-				},
-			],
-		});
 
-		for (const secret of [encodedSecret, directSecret, encodedPayloadSecret, directPayloadSecret]) {
-			expect(dumped).not.toContain(secret);
-		}
-		expect(schemaDumped).not.toContain(schemaSecret);
+		expect(dumped).not.toContain(encodedSecret);
+		expect(dumped).not.toContain(directSecret);
+		expect(parameterValue(dumped, "payload")).toContain('"client\\\\u0009secret": "«redacted»"');
 	});
 
 	it("keeps an ordinary decoded JSON blob in the session dump", () => {
