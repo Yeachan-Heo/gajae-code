@@ -374,8 +374,14 @@ function createCredentialRedactionRules(keyLabels: string, camelSimpleSuffixes: 
 		camelKeySuffix: new RegExp(`^${camelKeyPattern}$`),
 		assignmentPrefix,
 		camelAssignmentPrefix,
-		assignmentCandidatePattern: new RegExp(String.raw`(?:${keyLabels})(?:\\*["'\x60]?\s*[=:]\s*)`, "i"),
-		containerCandidatePattern: new RegExp(String.raw`(?:${keyLabels})(?:\\*["'\x60]?\s*[=:]\s*[\[{])`, "i"),
+		assignmentCandidatePattern: new RegExp(
+			String.raw`(?<![A-Za-z0-9_.-])(?:${keyLabels})(?:\\*["'\x60]?\s*[=:]\s*)`,
+			"i",
+		),
+		containerCandidatePattern: new RegExp(
+			String.raw`(?<![A-Za-z0-9_.-])(?:${keyLabels})(?:\\*["'\x60]?\s*[=:]\s*[\[{])`,
+			"i",
+		),
 		camelAssignmentCandidatePattern: new RegExp(
 			String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${camelSimpleSuffixes})(?:\\*["'\x60]?\s*[=:]\s*)`,
 		),
