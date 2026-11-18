@@ -419,7 +419,7 @@ function maskCredentialJsonContainers(
 function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
 	const sanitized: string[] = [];
 	const masked = text.replace(
-		/(?<![A-Za-z0-9_-])((?:authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
+		/(?<![A-Za-z0-9_-])((?:authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
 		(
 			_match: string,
 			label: string,
@@ -722,15 +722,16 @@ function scrubCacheText(text: string, diff = false): string {
 	// The shared URL rule does not know about Markdown cell separators and can
 	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
 	// (userinfo was already removed) so only our authority pass sees them.
-	const withoutAtSigns = containers.text.replaceAll("@", AT_SIGN_MASK);
 	// Credential labels are masked before paths so a path scrub cannot consume
-	// a label and orphan its value; paths run before the shared redactor so a
-	// token cannot consume a following `file` scheme word.
-	const authHeaders = maskBoundedAuthorizationHeaders(withoutAtSigns);
+	// a label and orphan its value; paths run before `@` masking so a home path
+	// that itself contains `@` still matches; and paths run before the shared
+	// redactor so a token cannot consume a following `file` scheme word.
+	const authHeaders = maskBoundedAuthorizationHeaders(containers.text);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
-	let scrubbed = scrubHostPaths(withoutBearer);
-	scrubbed = redactCrashSecrets(scrubbed);
+	const withoutCookies = withoutBearer.replace(/(?<![A-Za-z0-9_-])(cookie[ \t]*:[ \t]*)[^\r\n]+/gi, "$1«redacted»");
+	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);
+	let scrubbed = redactCrashSecrets(withoutAtSigns);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
 	scrubbed = scrubbed.replaceAll(AT_SIGN_MASK, "@");
 	return containers.restore(authHeaders.restore(assignments.restore(scrubbed)));
