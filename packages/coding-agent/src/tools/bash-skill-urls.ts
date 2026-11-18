@@ -846,9 +846,14 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		const url = normalizeLocalScheme(rawUrl);
 		const delimiter = token === rawUrl ? undefined : token[0];
 		const urlStart = index + (delimiter === undefined ? 0 : 1);
-		// A character the consumer reads as an escape starts no URL: the token's own
-		// opening quote or the scheme's first letter behind a backslash.
-		if (!shellContext && (escapedAt(command, index) || escapedAt(command, urlStart))) continue;
+		// The same bytes mean different things in JSON (an escape) and in a YAML
+		// literal block (data), and an env value does not say which it is, so the
+		// ambiguity is reported instead of guessed at or silently left unresolved.
+		if (!shellContext && (escapedAt(command, index) || escapedAt(command, urlStart))) {
+			throw new ToolError(
+				"Refusing to expand this URL in an env value: it follows a backslash, which the value's format may read as an escape. Remove the backslash or make the URL the whole value.",
+			);
+		}
 		if (nestedRuleContext && extractScheme(url) === "rule") {
 			throw new ToolError(
 				"rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets.",

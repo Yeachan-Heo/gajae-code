@@ -2166,11 +2166,17 @@ describe("bash session agent directory", () => {
 				expect(textOf(bareTab)).toContain(await realpath(tabRule));
 				await expect(run("call-env-whole-quoted-tab", '"rule://tabbed"')).rejects.toThrow(/cannot carry/);
 
-				// A candidate the consumer reads as an escape is not a URL at all.
-				const escaped = await run("call-env-escaped", '{"message":"prefix \\rule://tabbed"}');
-				expect(textOf(escaped)).toContain("\\rule://tabbed");
-				const escapedOpener = await run("call-env-escaped-opener", '{"message":"prefix \\"rule://tabbed"}');
-				expect(textOf(escapedOpener)).toContain('\\"rule://tabbed');
+				// A backslash before the URL is ambiguous: JSON reads it as an escape, a
+				// YAML literal block as data. The tool reports that instead of guessing.
+				await expect(run("call-env-escaped", '{"message":"prefix \\rule://tabbed"}')).rejects.toThrow(
+					/may read as an escape/,
+				);
+				await expect(run("call-env-escaped-opener", '{"message":"prefix \\"rule://tabbed"}')).rejects.toThrow(
+					/may read as an escape/,
+				);
+				await expect(run("call-env-yaml-literal", "note: |\n  Rule marker: \\rule://tabbed")).rejects.toThrow(
+					/may read as an escape/,
+				);
 			} finally {
 				resetActiveRulesForTests();
 				await rm(parent, { recursive: true, force: true });
