@@ -437,11 +437,16 @@ function maskParameterizedAuthValues(text: string): string {
 					break;
 				}
 			}
-		} else if (first === "\\" && (text[valueStart + 1] === '"' || text[valueStart + 1] === "'")) {
-			const lineEnd = text.indexOf("\n", valueStart);
-			end = lineEnd === -1 ? text.length : lineEnd;
 		} else {
-			while (end < text.length && !/[\s,;]/.test(text[end])) end++;
+			let slashes = 0;
+			while (text[valueStart + slashes] === "\\") slashes++;
+			const quote = slashes > 0 && slashes % 2 === 1 ? text[valueStart + slashes] : "";
+			if (quote === '"' || quote === "'") {
+				const lineEnd = text.indexOf("\n", valueStart);
+				end = lineEnd === -1 ? text.length : lineEnd;
+			} else {
+				while (end < text.length && !/[\s,;]/.test(text[end])) end++;
+			}
 		}
 		out += text.slice(last, index) + match[1] + match[2] + match[3] + match[4] + "«redacted»";
 		last = end;

@@ -1505,6 +1505,7 @@ describe("github view cache persistence", () => {
 			JSON.stringify({ Authorization: 'Token token="prefix,fixture-round59-opaque"\\t' }),
 			String.raw`Authorization: Token token=\"display\"|Cookie: mode=\"light\"; sid=review59-cookie-opaque`,
 			String.raw`Authorization: Token proof=\"prefix Authorization: Basic eHl6, fixture-auth-tail\"`,
+			String.raw`Authorization: Token proof=\\\"prefix, fixture-auth-tail\\\"`,
 		];
 		for (const [index, body] of bodies.entries()) {
 			putCached({
