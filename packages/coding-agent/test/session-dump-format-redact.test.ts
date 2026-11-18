@@ -1542,6 +1542,25 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parsed.wrapper).toEqual(["ordinary secret: | continuation"]);
 	});
 
+	it("accepts a quoted container key as the quoted-data bound", () => {
+		const fixture = `"wrapper": ["ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible`;
+		const dumped = dump([{ role: "user", content: fixture, timestamp: 1 }] as AgentMessage[]);
+		const document = dumped.slice(dumped.indexOf('"wrapper":'));
+
+		expect(document).toContain("# keep-me");
+		expect(document).toContain('continuation"]');
+		expect(document).toContain("public: visible");
+	});
+
+	it("ignores a comment line that is shaped like a container", () => {
+		const fixture = `# wrapper: ["ignored\nsecret: |\n  SYNTHETIC_PASSWORD\npublic: 'text"]`;
+		const dumped = dump([{ role: "user", content: fixture, timestamp: 1 }] as AgentMessage[]);
+		const document = dumped.slice(dumped.indexOf("# wrapper:"));
+
+		expect(document).not.toContain("SYNTHETIC_PASSWORD");
+		expect(document).toContain(`public: 'text"]`);
+	});
+
 	it("keeps the newline and key after a bare Token line", () => {
 		const dumped = dump([{ role: "user", content: "Token\ndiagnostics: keep-me", timestamp: 1 }] as AgentMessage[]);
 
