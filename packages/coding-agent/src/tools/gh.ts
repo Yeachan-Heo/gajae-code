@@ -2902,6 +2902,86 @@ interface ParsedDiffHeaderToken {
 	escaped?: boolean;
 }
 
+/**
+ * Re-quote a decoded path the way Git quotes one: named escapes for the usual
+ * control characters and exactly three octal digits per other non-printable or
+ * non-ASCII byte.
+ */
+function quotePrDiffPath(value: string): string {
+	let quoted = '"';
+	for (const byte of DIFF_PATH_ENCODER.encode(value)) {
+		if (byte === 0x5c) quoted += "\\\\";
+		else if (byte === 0x22) quoted += '\\"';
+		else if (byte === 0x07) quoted += "\\a";
+		else if (byte === 0x08) quoted += "\\b";
+		else if (byte === 0x09) quoted += "\\t";
+		else if (byte === 0x0a) quoted += "\\n";
+		else if (byte === 0x0b) quoted += "\\v";
+		else if (byte === 0x0c) quoted += "\\f";
+		else if (byte === 0x0d) quoted += "\\r";
+		else if (byte < 0x20 || byte >= 0x7f) quoted += `\\${byte.toString(8).padStart(3, "0")}`;
+		else quoted += String.fromCharCode(byte);
+	}
+	return `${quoted}"`;
+}
+
+/**
+ * Rewrite the Git-quoted path tokens of a unified diff whose decoded form
+ * changes under `transform`.
+ *
+ * Escape decoding is what hides some credential shapes: a path holding
+ * `\141ccess_token=…` has no recognizable label until `\141` becomes `a`. A
+ * text-level scrub therefore has to run on the decoded path, and the encoded
+ * token must be rewritten too, otherwise the stored diff still carries the
+ * secret. Only diff header lines are touched; hunk bodies are left verbatim.
+ * Tokens that keep their escaped source form (malformed escapes or invalid
+ * UTF-8) are skipped because their raw text is the representation that was
+ * already scrubbed as text.
+ */
+export function rewritePrDiffPathTokens(text: string, transform: (decodedPath: string) => string): string {
+	if (!text.includes('"')) return text;
+	const lines = text.split("\n");
+	let changed = false;
+	// Header window: from `diff --git` until the first `@@`. Hunk bodies can
+	// legitimately start with `--- `, so the window is what keeps them out.
+	let headerLinesLeft = 0;
+	const rewrite = (line: string, quoteIndex: number): string => {
+		const token = parseDiffQuotedToken(line, quoteIndex);
+		if (!token || token.escaped) return line;
+		const rewritten = transform(token.value);
+		if (rewritten === token.value) return line;
+		changed = true;
+		return line.slice(0, quoteIndex) + quotePrDiffPath(rewritten) + line.slice(token.nextIndex);
+	};
+	for (let i = 0; i < lines.length; i += 1) {
+		const original = lines[i] as string;
+		let line = original;
+		if (line.startsWith("diff --git ")) {
+			headerLinesLeft = 8;
+			const firstQuoteIndex = skipDiffHeaderSpaces(line, "diff --git ".length);
+			const first = line.charAt(firstQuoteIndex) === '"' ? parseDiffQuotedToken(line, firstQuoteIndex) : undefined;
+			if (first) {
+				// Rightmost token first: rewriting the second token leaves the first
+				// token's offsets untouched.
+				const secondQuoteIndex = skipDiffHeaderSpaces(line, first.nextIndex);
+				if (line.charAt(secondQuoteIndex) === '"') line = rewrite(line, secondQuoteIndex);
+				line = rewrite(line, firstQuoteIndex);
+			}
+		} else if (line.startsWith("@@ ")) {
+			headerLinesLeft = 0;
+		} else if (headerLinesLeft > 0) {
+			headerLinesLeft -= 1;
+			if (line.startsWith('--- "') || line.startsWith('+++ "')) {
+				line = rewrite(line, 4);
+			} else if (line.startsWith('rename from "') || line.startsWith('rename to "')) {
+				line = rewrite(line, line.indexOf('"'));
+			}
+		}
+		if (line !== original) lines[i] = line;
+	}
+	return changed ? lines.join("\n") : text;
+}
+
 function skipDiffHeaderSpaces(text: string, index: number): number {
 	let i = index;
 	while (text.charAt(i) === " ") i += 1;

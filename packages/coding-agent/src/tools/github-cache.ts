@@ -258,6 +258,11 @@ export function getCached<T = unknown>(
 			logger.debug("github cache: corrupt payload row, ignoring", { err: String(err), repo, kind, number });
 			return null;
 		}
+		// Scrub on read too: rows written before the write-path scrub (or by an
+		// older binary) are still on disk, and a hit renders them back to the
+		// model. Reindexing uses the stored kind, so legacy diff offsets are
+		// rebuilt against the scrubbed text instead of the original.
+		const scrubbed = scrubStoredView(row.kind, payload, row.rendered, row.source_url ?? undefined);
 		return {
 			authKey: row.auth_key,
 			repo: row.repo,
@@ -265,9 +270,9 @@ export function getCached<T = unknown>(
 			number: row.number,
 			includeComments: row.include_comments === 1,
 			fetchedAt: row.fetched_at,
-			payload,
-			rendered: row.rendered,
-			sourceUrl: row.source_url ?? undefined,
+			payload: scrubbed.payload as T,
+			rendered: scrubbed.rendered,
+			sourceUrl: scrubbed.sourceUrl,
 		};
 	} catch (err) {
 		logger.debug("github cache: read failed", { err: String(err) });
@@ -287,9 +292,9 @@ export interface PutCachedInput<T = unknown> {
 	fetchedAt?: number;
 }
 
-/** Scrub credential-shaped text inside a value before it is JSON-encoded. */
+/** Scrub credential-shaped text and host paths inside a value before it is JSON-encoded or served back. */
 function scrubPersistedValue(value: unknown): unknown {
-	if (typeof value === "string") return redactCrashSecrets(value);
+	if (typeof value === "string") return scrubCacheText(value);
 	if (typeof value !== "object" || value === null) return value;
 	if (value instanceof Date) return value;
 	if (Array.isArray(value)) return value.map(scrubPersistedValue);
@@ -297,24 +302,93 @@ function scrubPersistedValue(value: unknown): unknown {
 	if (proto !== Object.prototype && proto !== null) return value;
 	const out: Record<string, unknown> = {};
 	for (const [key, child] of Object.entries(value)) {
-		out[redactCrashSecrets(key)] = scrubPersistedValue(child);
+		out[scrubCacheText(key)] = scrubPersistedValue(child);
 	}
 	return out;
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Rebuild a pull-request diff index from the scrubbed unified text.
- * Loaded lazily: `gh.ts` imports this module.
+ * Strip the local home directory from cached text. `/home/<user>/x`,
+ * `/Users/<user>/x`, `/root/x` and `C:\\Users\\<user>\\x` all become `~/x`: the
+ * path stays useful but no longer names this machine's account. Relative forms
+ * (`~/x`, `$HOME/x`) and non-home roots such as `/srv/app` are untouched.
  */
-function persistedPrDiffPayload(payload: unknown): unknown {
-	const scrubbed = scrubPersistedValue(payload);
-	if (typeof scrubbed !== "object" || scrubbed === null || Array.isArray(scrubbed)) return scrubbed;
-	const unified = (scrubbed as { unified?: unknown }).unified;
-	if (typeof unified !== "string") return scrubbed;
-	const { parsePrUnifiedDiff } = requireGh("./gh") as {
-		parsePrUnifiedDiff: (text: string) => PrDiffPayload;
+function scrubHostPaths(text: string): string {
+	let scrubbed = text;
+	const home = os.homedir();
+	if (home.length > 1) {
+		scrubbed = scrubbed.replace(new RegExp(`(?<![A-Za-z0-9._-])${escapeRegExp(home)}(?=[/\\\\]|$)`, "g"), "~");
+	}
+	return scrubbed
+		.replace(/(?<![A-Za-z0-9._-])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;]+(?=\/|$)/g, "~")
+		.replace(/(?<![A-Za-z0-9._-])\/root(?=\/|$)/g, "~")
+		.replace(/(?<![A-Za-z0-9._-])[A-Za-z]:\\Users\\[^\\\s"'`<>()[\]{},;]+(?=\\|$)/g, "~");
+}
+
+/** Text-level scrub for everything the view cache persists or serves back. */
+function scrubCacheText(text: string): string {
+	return scrubHostPaths(redactCrashSecrets(text));
+}
+
+interface ScrubbedView {
+	payload: unknown;
+	rendered: string;
+	sourceUrl: string | undefined;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Sanitize one stored representation. Runs on write and again on read, so a row
+ * written before this scrub existed is never served verbatim.
+ *
+ * A `pr-diff` row needs more than a text pass: its index holds byte offsets
+ * into the unified text, so a scrub (which changes byte lengths) requires
+ * rebuilding the index from the scrubbed text. Git path tokens are escape-
+ * decoded by the parser, and decoding can turn `\141ccess_token=…` into a
+ * recognizable credential, so the encoded header tokens are rewritten from
+ * their scrubbed decoded form before the index is rebuilt. The recursive value
+ * scrub then covers decoded paths and every other string field.
+ */
+function scrubStoredView(
+	kind: CacheKind,
+	payload: unknown,
+	rendered: string,
+	sourceUrl: string | undefined,
+): ScrubbedView {
+	const scrubbedPayload = scrubPersistedValue(payload);
+	const scrubbedSourceUrl = sourceUrl === undefined ? undefined : scrubCacheText(sourceUrl);
+	const unified = isRecordValue(scrubbedPayload) ? scrubbedPayload.unified : undefined;
+	if (kind !== "pr-diff" || typeof unified !== "string") {
+		return { payload: scrubbedPayload, rendered: scrubCacheText(rendered), sourceUrl: scrubbedSourceUrl };
+	}
+	let scrubbedUnified = unified;
+	let files: unknown = isRecordValue(scrubbedPayload) ? scrubbedPayload.files : undefined;
+	try {
+		const { parsePrUnifiedDiff, rewritePrDiffPathTokens } = requireGh("./gh") as {
+			parsePrUnifiedDiff: (text: string) => PrDiffPayload;
+			rewritePrDiffPathTokens: (text: string, transform: (decodedPath: string) => string) => string;
+		};
+		scrubbedUnified = rewritePrDiffPathTokens(unified, scrubCacheText);
+		const reparsed = parsePrUnifiedDiff(scrubbedUnified);
+		files = scrubPersistedValue(reparsed.files);
+	} catch (err) {
+		// Compiled binaries may not resolve the lazy diff parser. Serve the
+		// scrubbed text anyway; offsets come from the stored index in that case.
+		logger.debug("github cache: diff reindex unavailable", { err: String(err) });
+	}
+	const base = isRecordValue(scrubbedPayload) ? scrubbedPayload : {};
+	return {
+		payload: { ...base, unified: scrubbedUnified, files },
+		rendered: scrubbedUnified,
+		sourceUrl: scrubbedSourceUrl,
 	};
-	return parsePrUnifiedDiff(unified);
 }
 
 export function putCached<T = unknown>(input: PutCachedInput<T>): void {
@@ -322,21 +396,11 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 	if (!db) return;
 	try {
 		const fetchedAt = input.fetchedAt ?? Date.now();
-		// String values are scrubbed before JSON encoding. Encoding first glues
-		// a token to the escaped newline and the scrubber misses it. The live
-		// fetch result is not rewritten; a later hit reads this row.
-		const storedValue =
-			input.kind === "pr-diff" ? persistedPrDiffPayload(input.payload) : scrubPersistedValue(input.payload);
-		const payloadJson = JSON.stringify(storedValue);
-		const reindexedUnified =
-			input.kind === "pr-diff" &&
-			typeof storedValue === "object" &&
-			storedValue !== null &&
-			!Array.isArray(storedValue) &&
-			typeof (storedValue as { unified?: unknown }).unified === "string"
-				? (storedValue as { unified: string }).unified
-				: null;
-		const sourceUrl = input.sourceUrl ?? null;
+		// Sanitize before JSON encoding. Encoding first glues a token to an
+		// escaped newline and the scrubber misses it. The live fetch result is not
+		// rewritten; a later hit reads this scrubbed row.
+		const scrubbed = scrubStoredView(input.kind, input.payload, input.rendered, input.sourceUrl);
+		const payloadJson = JSON.stringify(scrubbed.payload);
 		db.prepare(
 			"INSERT OR REPLACE INTO github_view_cache (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(
@@ -347,8 +411,8 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 			input.includeComments ? 1 : 0,
 			fetchedAt,
 			payloadJson,
-			reindexedUnified ?? redactCrashSecrets(input.rendered),
-			sourceUrl === null ? null : redactCrashSecrets(sourceUrl),
+			scrubbed.rendered,
+			scrubbed.sourceUrl ?? null,
 		);
 		protectDbFiles(getGithubCacheDbPath());
 	} catch (err) {
