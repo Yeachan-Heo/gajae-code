@@ -19190,6 +19190,11 @@ export class AgentSession {
 				this.#deferredFollowUpForceOneAtATime.add(message);
 			}
 			this.#deferredSdkFollowUps.push(message);
+			// Notify follow-up waiters that a message has been admitted to the deferred
+			// queue. This lets job poll and other callers to waitForFollowUpQueued interrupt
+			// immediately without waiting for the deferred message to enter the agent's live
+			// queue (which happens when streaming ends or the queue drains).
+			this.agent.notifyFollowUpWaiters();
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		}

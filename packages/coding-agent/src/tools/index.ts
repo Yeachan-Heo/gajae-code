@@ -276,6 +276,8 @@ export interface ToolSession {
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Resolves on a steer admitted after the wait starts, or when `signal` aborts, without consuming the steer. */
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
+	/** Resolves on a follow-up message queued after the wait starts, or when `signal` aborts, without consuming the message. */
+	waitForFollowUpQueued?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/**
