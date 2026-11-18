@@ -277,7 +277,12 @@ function redactAccumulatedContentWithState(
 	// If we're in an active credential state from a previous hunk,
 	// or if accumulated redaction found changes, apply state-based redaction
 	if (inputState.inCredentialValue || redactedAccumulated !== originalContent) {
-		const redactedLines = applyStateBasedRedactionWithState(lineInfos, originalContent, redactedAccumulated, inputState);
+		const redactedLines = applyStateBasedRedactionWithState(
+			lineInfos,
+			originalContent,
+			redactedAccumulated,
+			inputState,
+		);
 		return redactedLines;
 	}
 
@@ -310,12 +315,12 @@ function applyStateBasedRedactionWithState(
 		// Check if this line contains a credential field opening in JSON/object notation
 		// Match common credential field names
 		const credentialFieldMatch = line.match(
-			/['"]?(token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization)['"]?\s*:\s*[\[{]/i,
+			/['"]?(token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization)['"]?\s*:\s*[[{]/i,
 		);
 
 		// Also check for headers/lines with credential keywords followed by bracket on same line
 		const credentialWithBracket = line.match(
-			/^\s*(Auth(?:orization)?|Cookie|Token|Secret|Password|Pass|Key)\s*:\s*[\[{]/i,
+			/^\s*(Auth(?:orization)?|Cookie|Token|Secret|Password|Pass|Key)\s*:\s*[[{]/i,
 		);
 
 		const hasCredentialOpening = credentialFieldMatch || credentialWithBracket || isCredentialHeader;
@@ -340,10 +345,10 @@ function applyStateBasedRedactionWithState(
 
 			// Redact this line as part of the value
 			// But preserve pure structure lines like standalone brackets
-			if (line.trim().match(/^[\[\]{},:]*$/)) {
+			if (line.trim().match(/^[[\]{},:]*$/)) {
 				// This is a pure structure line - keep it
 				result.push(info);
-			} else if (line.trim().match(/^[\[\]{},]$/)) {
+			} else if (line.trim().match(/^[[\]{},]$/)) {
 				// Single structural character - keep it
 				result.push(info);
 			} else {
@@ -352,7 +357,7 @@ function applyStateBasedRedactionWithState(
 			}
 
 			// Exit credential value if we've closed all brackets
-			if (bracketDepth <= 0 && !line.match(/[\[{]/)) {
+			if (bracketDepth <= 0 && !line.match(/[[{]/)) {
 				inCredentialValue = false;
 			}
 		} else {
