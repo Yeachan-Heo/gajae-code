@@ -561,6 +561,15 @@ function tableRowFlags(lines: string[]): boolean[] {
 		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
 		if (isIndentedCode(i) || isIndentedCode(i - 1)) continue;
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
+		// GFM requires the header and delimiter to declare the same cell count;
+		// a prose line that happens to contain a pipe is not a header.
+		const cellsOf = (row: string): number => {
+			let trimmed = row.trim().replace(/\\\|/g, "");
+			if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+			if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+			return trimmed.split("|").length;
+		};
+		if (cellsOf(rows[i] ?? "") !== cellsOf(rows[i - 1] ?? "")) continue;
 		flags[i - 1] = true;
 		flags[i] = true;
 		let j = i + 1;
