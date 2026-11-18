@@ -2388,18 +2388,22 @@ function ruleFor(name: string, rulePath: string, level: "project" | "user" = "pr
 }
 
 /**
- * `eval` re-parses its arguments as command text, and `source`/`.` execute a
- * file's text. A single-quoted substitution protects a path from the shell that
- * reads the command, but not from that second parse: a canonical path carrying
- * a glob or tilde metacharacter can then select a matching sibling directory's
- * file outside the authorized root. The refusal is value-located, so the same
- * characters stay usable in a command the shell parses once.
+ * `eval` re-parses its argument list as command text, so a single-quoted
+ * substitution protects a path from the shell that reads the command but not
+ * from that second parse: a canonical path carrying a glob, brace, tilde, or
+ * whitespace metacharacter can then select a matching sibling directory's file
+ * outside the authorized root. `source`/`.` take an already-parsed filename
+ * operand and are refused only as a conservative margin. The refusal is
+ * value-located, so the same characters stay usable in a command the shell
+ * parses once.
  */
 describe("rule:// paths a second shell parse would expand", () => {
-	it("refuses a glob-bearing rule path through eval, source, and the dot builtin", async () => {
+	it("refuses a metacharacter-bearing rule path through eval, source, and the dot builtin", async () => {
 		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-reparse-"));
 		try {
-			const authorized = path.join(parent, "proj*");
+			// A space is portable across hosts; the pure-string test below covers
+			// `*`, `?`, brackets, and braces for every platform.
+			const authorized = path.join(parent, "proj name");
 			const rulePath = path.join(authorized, ".agent", "rules", "deploy.md");
 			const cwd = authorized;
 			await mkdir(path.dirname(rulePath), { recursive: true });
@@ -2410,7 +2414,8 @@ describe("rule:// paths a second shell parse would expand", () => {
 				sessionCwd: cwd,
 			};
 			for (const command of ["eval cat rule://deploy", "source rule://deploy", ". rule://deploy"]) {
-				await expect(expandInternalUrls(command, options)).rejects.toThrow(/re-parses/);
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/re-read the substituted text/);
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/read <rule-url>/);
 			}
 		} finally {
 			await rm(parent, { recursive: true, force: true });
@@ -2420,7 +2425,8 @@ describe("rule:// paths a second shell parse would expand", () => {
 	it("refuses every metacharacter a second parse expands, and only in that context", () => {
 		for (const name of ["*", "?", "[", "]", "{", "}", "~", " "]) {
 			const resolved = `/work/proj${name}/.agent/rules/deploy.md`;
-			expect(() => refuseShellBearingRulePath(resolved, true)).toThrow(/re-parses/);
+			expect(() => refuseShellBearingRulePath(resolved, true)).toThrow(/re-read the substituted text/);
+			expect(() => refuseShellBearingRulePath(resolved, true)).toThrow(/read <rule-url>/);
 			// A command parsed once keeps them literal, so a legitimate project
 			// directory spelling must keep working there.
 			expect(refuseShellBearingRulePath(resolved)).toBe(resolved);
@@ -2465,6 +2471,9 @@ describe("rule:// paths a second shell parse would expand", () => {
 			for (const command of ["eval cat rule://plain", "source rule://plain", ". rule://plain"]) {
 				await expect(expandInternalUrls(command, options)).resolves.toContain(expected);
 			}
+			// The refusal needs both clauses: the builtin match AND a metacharacter in
+			// the path. Naming eval as data next to a benign path must stay usable.
+			await expect(expandInternalUrls("printf '%s' eval; cat rule://plain", options)).resolves.toContain(expected);
 		} finally {
 			await rm(parent, { recursive: true, force: true });
 		}
@@ -2491,6 +2500,231 @@ describe("rule:// paths a second shell parse would expand", () => {
 			}
 		},
 	);
+});
+
+/**
+ * A string this module emits can change meaning under a second parse. The
+ * product keeps the cheap emission rule -- the substituted operand is always
+ * single-quoted, and substitution is refused when that word sits in a context
+ * a second parse re-reads -- because spawning a shell per expansion is too
+ * expensive for the hot path (a `bash -n` spawn measures in milliseconds).
+ * These tests are the remaining defence: a new interpreter form must fail CI
+ * rather than the product.
+ */
+describe("rule:// emitted command keeps its operand under a second parse", () => {
+	const SPECIAL_ROOTS = ["proj[e]po", "proj{a,b}", "proj name", "proj~x"] as const;
+	const SECOND_PARSE_COMMANDS = [
+		"eval cat <url>",
+		"eval>out cat <url>",
+		"eval>x cat <url>",
+		"command eval cat <url>",
+		"builtin eval cat <url>",
+		"source <url>",
+		". <url>",
+		"x=eval; $x cat <url>",
+		"x='eval'; command $x cat <url>",
+		"bash -c 'eval cat <url>'",
+		"sh -c 'eval cat <url>'",
+		"sh -c 'cat <url>'",
+		'sh -c "cat "<url>',
+		'bash -c "cat "<url>',
+		'/bin/sh -c "cat "<url>',
+		'dash -c "cat "<url>',
+		'busybox sh -c "cat "<url>',
+		'sh -ec "cat "<url>',
+		"sh -c'cat '<url>",
+		'bash -c"cat "<url>',
+		"f(){ eval $1; }; f cat <url>",
+		"cat <url> >out",
+		"cat <> <url>",
+	] as const;
+
+	async function runShell(command: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
+		const subprocess = Bun.spawn(["bash", "-c", command], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(subprocess.stdout).text(),
+			new Response(subprocess.stderr).text(),
+			subprocess.exited,
+		]);
+		return { stdout, stderr, code };
+	}
+
+	async function writeFixture(
+		parent: string,
+		rootName: string,
+	): Promise<{
+		authorized: string;
+		rulePath: string;
+		canonical: string;
+		sibling: string;
+	}> {
+		const authorized = path.join(parent, rootName);
+		const rulePath = path.join(authorized, ".agent", "rules", "deploy.md");
+		await mkdir(path.dirname(rulePath), { recursive: true });
+		await writeFile(rulePath, "echo AUTHORIZED-RULE\n");
+		// The glob/brace target a second parse would select. Its content is a
+		// sentinel: observing it means the operand left the authorized root.
+		const sibling = path.join(
+			parent,
+			rootName === "proj[e]po"
+				? "projepo"
+				: rootName === "proj{a,b}"
+					? "proja"
+					: rootName === "proj name"
+						? "projname"
+						: "projx",
+		);
+		const secret = path.join(sibling, ".agent", "rules", "deploy.md");
+		await mkdir(path.dirname(secret), { recursive: true });
+		await writeFile(secret, "echo SECRET-OUTSIDE\n");
+		// Split-path decoys inside the run cwd: a whitespace re-parse reads these.
+		await writeFile(path.join(authorized, "rules"), "echo DECOY-RULES\n");
+		await writeFile(path.join(authorized, "deploy.md"), "echo DECOY-DEPLOY\n");
+		return { authorized, rulePath, canonical: await realpath(rulePath), sibling };
+	}
+
+	it("refuses every second-parse form, in every special root", async () => {
+		let cases = 0;
+		for (const rootName of SPECIAL_ROOTS) {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-emit-"));
+			try {
+				const fixture = await writeFixture(parent, rootName);
+				const options = {
+					skills: [],
+					internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+					sessionCwd: fixture.authorized,
+					sessionAgentDir: path.join(parent, "agent"),
+				};
+				for (const template of SECOND_PARSE_COMMANDS) {
+					cases++;
+					const command = template.replaceAll("<url>", "rule://deploy");
+					let emitted: string;
+					try {
+						emitted = await expandInternalUrls(command, options);
+					} catch (error) {
+						// A refusal has to name the way forward.
+						expect((error as Error).message).toContain("read <rule-url>");
+						continue;
+					}
+					// Clause (a): the emitted operand is the single-quoted canonical path.
+					expect(emitted).toContain(`'${fixture.canonical}'`);
+					// The emitted command must be syntactically valid for the shell.
+					const syntax = await runShell(`bash -n -c ${shellEscape(emitted)}`, fixture.authorized);
+					expect(syntax.stderr).toBe("");
+					// Clause (b): executing it may not reach a sibling or decoy path, so
+					// the operand canonicalizes to exactly the authorized rule file.
+					const result = await runShell(emitted, fixture.authorized);
+					const redirected = await Bun.file(path.join(fixture.authorized, "out"))
+						.text()
+						.catch(() => "");
+					const observed = `${result.stdout}${result.stderr}${redirected}`;
+					expect(observed).not.toContain("SECRET-OUTSIDE");
+					expect(observed).not.toContain("DECOY-");
+				}
+			} finally {
+				await rm(parent, { recursive: true, force: true });
+			}
+		}
+		expect(cases).toBe(SPECIAL_ROOTS.length * SECOND_PARSE_COMMANDS.length);
+	});
+
+	it("refuses a rule URL joined into a -c script word", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-cscript-"));
+		try {
+			const fixture = await writeFixture(parent, "proj[e]po");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+				sessionCwd: fixture.authorized,
+			};
+			for (const command of [
+				'sh -c "cat "rule://deploy',
+				'bash -c "cat "rule://deploy',
+				'/bin/sh -c "cat "rule://deploy',
+				'dash -c "cat "rule://deploy',
+				'busybox sh -c "cat "rule://deploy',
+				'sh -ec "cat "rule://deploy',
+			]) {
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/-c script word/);
+				await expect(expandInternalUrls(command, options)).rejects.toThrow(/read <rule-url>/);
+			}
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps legitimate -c scripts, eval mentions, and reader paths working", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-emit-ok-"));
+		try {
+			// A project root whose name carries `[` must keep expanding: the refusal
+			// is value- and context-located, not a ban on glob characters.
+			const fixture = await writeFixture(parent, "proj[1]");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+				sessionCwd: fixture.authorized,
+			};
+			// No rule URL: a `-c` script passes through untouched and runs.
+			const plainScript = "sh -c 'cat plain-rules.md'";
+			await writeFile(path.join(fixture.authorized, "plain-rules.md"), "PLAIN-RULES\n");
+			expect(await expandInternalUrls(plainScript, options)).toBe(plainScript);
+			expect((await runShell(plainScript, fixture.authorized)).stdout).toContain("PLAIN-RULES");
+			// `eval` as data plus a path with no metacharacter still expands; refusal
+			// needs both the builtin match and the metacharacter match.
+			const benign = await mkdtemp(path.join(tmpdir(), "bash-rule-emit-benign-"));
+			try {
+				const benignFixture = await writeFixture(benign, "project");
+				const benignOptions = {
+					skills: [],
+					internalRouter: createInternalRouter({
+						"rule://deploy": { sourcePath: benignFixture.rulePath },
+					}),
+					sessionCwd: benignFixture.authorized,
+				};
+				const evalMentions = [
+					"printf '%s' eval; cat rule://deploy",
+					"x=eval; $x cat rule://deploy",
+					"x='eval'; command $x cat rule://deploy",
+				];
+				for (const command of evalMentions) {
+					expect(await expandInternalUrls(command, benignOptions)).toContain(`'${benignFixture.canonical}'`);
+					// The same spellings with a metacharacter-bearing path are refused.
+					await expect(expandInternalUrls(command, options)).rejects.toThrow(/read <rule-url>/);
+				}
+			} finally {
+				await rm(benign, { recursive: true, force: true });
+			}
+			// The reader path for an authorized rule survives: the emitted command
+			// reads the intended file, proving canonical equality, not just quoting.
+			const emitted = await expandInternalUrls("cat rule://deploy", options);
+			expect((await runShell(emitted, fixture.authorized)).stdout).toContain("AUTHORIZED-RULE");
+			// A URL in a separate word after the -c script is not inside the script.
+			expect(await expandInternalUrls('sh -c "cat " rule://deploy', options)).toContain(`'${fixture.canonical}'`);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an authorized root containing glob characters expandable through the reader", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-rule-emit-glob-root-"));
+		try {
+			const fixture = await writeFixture(parent, "proj[1]{x}");
+			const options = {
+				skills: [],
+				internalRouter: createInternalRouter({ "rule://deploy": { sourcePath: fixture.rulePath } }),
+				sessionCwd: fixture.authorized,
+			};
+			const emitted = await expandInternalUrls("cat rule://deploy", options);
+			expect(emitted).toContain(`'${fixture.canonical}'`);
+			expect((await runShell(emitted, fixture.authorized)).stdout).toContain("AUTHORIZED-RULE");
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
 });
 
 /**

@@ -338,18 +338,134 @@ function hasNestedExpansionContext(command: string): boolean {
 }
 
 /**
- * Shell builtins whose own parse reads the substituted text again: `eval`
- * re-parses its arguments as command text, and `source`/`.` execute a file's
- * text. The single quotes this module adds survive the command's first parse
- * but not that second one, so a path they protected can be re-split or
- * re-expanded there.
+ * Shell builtins that read the substituted text again: `eval` re-parses its
+ * argument list as command text, so the single quotes this module adds survive
+ * the command's first parse but not that second one. `source`/`.` take an
+ * already-parsed filename operand -- the shell resolves it once and the builtin
+ * parses the file's *contents*, not the operand -- so refusing them here is a
+ * conservative policy margin, not a claim that the operand is re-parsed.
  * Quote and escape characters are removed before matching so `e'val'` reads as
  * the builtin it becomes. A match anywhere is deliberate: `command eval`,
  * `builtin eval`, a later pipeline segment, and `xargs eval` all reach the same
  * builtin, and refusing a command that merely mentions the word is the
- * fail-closed direction.
+ * fail-closed direction. A literal assignment such as `x=eval` is included:
+ * `$x` reaches the builtin, and refusing the spelling is cheaper than proving
+ * the indirection safe.
+ * The trailing boundary includes the redirection operators: bash also ends a
+ * command word at `<`/`>`, so `eval>out cat path` still passes `path` to
+ * `eval`, which re-parses it.
  */
-const REPARSING_SHELL_BUILTIN = /(?:^|[\s;&|()`])(?:eval|source|\.)(?=\s|$)/;
+const REPARSING_SHELL_BUILTIN = /(?:^|[\s;&|()`=])(?:eval|source|\.)(?=[\s;&|()<>]|$)/;
+
+/**
+ * Shell words whose `-c` argument is parsed as a script by a child shell. A
+ * substitution inside that word is unquoted by the outer shell and re-read by
+ * the child, so the single quotes this module adds do not protect it.
+ */
+const SCRIPT_SHELL_NAMES = new Set(["sh", "bash", "dash", "ksh", "zsh", "ash", "mksh", "pdksh"]);
+
+interface ShellWordSpan {
+	start: number;
+	end: number;
+	value: string;
+}
+
+/**
+ * Split command text into shell words with their source spans. Quotes and
+ * escapes are resolved into `value`; operators and whitespace end a word.
+ * This is a locator, not a shell parser: it only has to find which source word
+ * holds a substitution, so ambiguous syntax falls back to the wider span.
+ */
+function shellWordSpans(command: string): ShellWordSpan[] {
+	const words: ShellWordSpan[] = [];
+	let value = "";
+	let start = -1;
+	let i = 0;
+	const flush = (end: number) => {
+		if (start >= 0) words.push({ start, end, value });
+		start = -1;
+		value = "";
+	};
+	while (i < command.length) {
+		const character = command[i];
+		if (character === "'") {
+			if (start < 0) start = i;
+			let j = i + 1;
+			while (j < command.length && command[j] !== "'") j++;
+			value += command.slice(i + 1, j);
+			i = Math.min(j + 1, command.length);
+			continue;
+		}
+		if (character === '"') {
+			if (start < 0) start = i;
+			let j = i + 1;
+			while (j < command.length && command[j] !== '"') {
+				if (command[j] === "\\") j++;
+				j++;
+			}
+			value += command.slice(i + 1, Math.min(j, command.length));
+			i = Math.min(j + 1, command.length);
+			continue;
+		}
+		if (character === "\\") {
+			if (start < 0) start = i;
+			value += command[i + 1] ?? "";
+			i += 2;
+			continue;
+		}
+		if (/\s/.test(character) || ";&|()<>".includes(character)) {
+			flush(i);
+			i++;
+			continue;
+		}
+		if (start < 0) start = i;
+		value += character;
+		i++;
+	}
+	flush(command.length);
+	return words;
+}
+
+/**
+ * Source span of every command word a child shell will parse as its `-c`
+ * script, e.g. `sh -ec '...'`, `/bin/bash --norc -c ...`, `busybox sh -c ...`.
+ * The script is the first operand after the flag cluster that contains `c`;
+ * `-o NAME` consumes its operand before that scan continues.
+ */
+function shellScriptWordSpans(command: string): Array<[number, number]> {
+	const words = shellWordSpans(command);
+	const spans: Array<[number, number]> = [];
+	for (let i = 0; i < words.length; i++) {
+		const name = words[i].value.split(/[\\/]/).pop() ?? "";
+		if (!SCRIPT_SHELL_NAMES.has(name)) continue;
+		let scripted = false;
+		let j = i + 1;
+		while (j < words.length) {
+			const word = words[j].value;
+			if (word.startsWith("--")) {
+				j++;
+				continue;
+			}
+			if (!word.startsWith("-") || word === "-") break;
+			const flags = word.slice(1);
+			const scriptFlag = flags.indexOf("c");
+			if (scriptFlag >= 0) {
+				if (scriptFlag < flags.length - 1) {
+					// `-c'cat 'path`: the script is attached to the same argument,
+					// so its span starts after the `c` and ends with the word.
+					spans.push([words[j].start + 1 + scriptFlag + 1, words[j].end]);
+				} else {
+					scripted = true;
+					j++;
+				}
+				break;
+			}
+			j += flags.endsWith("o") ? 2 : 1;
+		}
+		if (scripted && j < words.length) spans.push([words[j].start, words[j].end]);
+	}
+	return spans;
+}
 
 function hasReparsingShellCommand(command: string): boolean {
 	return REPARSING_SHELL_BUILTIN.test(command.replace(/['"\\]/g, ""));
@@ -368,6 +484,12 @@ function shellEscape(p: string): string {
 }
 
 const SESSION_URL_ESCAPE = "URL is outside this session and cannot be expanded in a bash command";
+
+/**
+ * Named in every rule-URL refusal so a model retries with the reader instead of
+ * guessing more shell spellings.
+ */
+const RULE_READ_ALTERNATIVE = "Read the rule directly instead: read <rule-url>.";
 
 /**
  * Case-exact prefix rule for Windows spellings. `path.relative` answers `""` for a
@@ -704,12 +826,12 @@ export function refuseShellBearingRulePath(resolvedPath: string, reparsedByShell
 	const shellPath = WINDOWS_DRIVE_PATH.test(resolvedPath) ? resolvedPath.replaceAll("\\", "/") : resolvedPath;
 	if (RULE_PATH_SHELL_SYNTAX.test(shellPath)) {
 		throw new ToolError(
-			"rule:// URL resolved to a path containing shell syntax and cannot be expanded in a bash command.",
+			`rule:// URL resolved to a path containing shell syntax and cannot be expanded in a bash command. ${RULE_READ_ALTERNATIVE}`,
 		);
 	}
 	if (reparsedByShell && RULE_PATH_REPARSED_SYNTAX.test(shellPath)) {
 		throw new ToolError(
-			"rule:// URL resolved to a path containing a glob, tilde, or whitespace metacharacter and cannot be expanded in a command that re-parses its arguments (eval, source, or .).",
+			`rule:// URL resolved to a path containing a glob, tilde, or whitespace metacharacter and cannot be expanded in a command that may re-read the substituted text (eval, source, or .). ${RULE_READ_ALTERNATIVE}`,
 		);
 	}
 	return shellPath;
@@ -775,7 +897,9 @@ async function resolveInternalUrlToPath(
 
 	const sessionDirectoryMissing = sessionCwd === undefined || sessionCwd.trim() === "";
 	if (scheme === "rule" && sessionDirectoryMissing) {
-		throw new ToolError("rule:// URLs cannot be expanded in bash commands without a session directory.");
+		throw new ToolError(
+			`rule:// URLs cannot be expanded in bash commands without a session directory. ${RULE_READ_ALTERNATIVE}`,
+		);
 	}
 
 	if (!internalRouter?.canHandle(url)) {
@@ -805,7 +929,7 @@ async function resolveInternalUrlToPath(
 	if (scheme === "rule" && sessionCwd !== undefined) {
 		if (enclosedInQuote) {
 			throw new ToolError(
-				"rule:// URLs must be a standalone shell argument in bash commands; a rule:// URL inside a quoted argument cannot be expanded safely.",
+				`rule:// URLs must be a standalone shell argument in bash commands; a rule:// URL inside a quoted argument cannot be expanded safely. ${RULE_READ_ALTERNATIVE}`,
 			);
 		}
 		return sessionScopedRulePath(
@@ -881,8 +1005,9 @@ function assertPathFitsDataValue(resolvedPath: string): void {
  * `.agent/rules`, `.agents/rules`, or the agent directory. Lookup uses
  * `options.rules` only; a missing list is an empty scope, never the
  * process-global snapshot. A resolved rule path carrying a glob, tilde, or
- * whitespace character is refused in a command whose `eval`, `source`, or `.`
- * builtin would parse the substituted text again.
+ * whitespace character is refused in a command whose `eval` re-parses the
+ * substituted text; `source`/`.` are refused the same way as a conservative
+ * margin. A rule URL inside a shell's `-c` script word is always refused.
  * Passing `context: "data"` expands a value the shell never parses (an env
  * value) instead of command text: the same authorization applies, but the
  * quoting and nested-expansion guards, which only describe shell reading, do
@@ -898,10 +1023,15 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 	let expanded = command;
 	const hasRuleUrl = matches.some(match => extractScheme(normalizeLocalScheme(unquoteToken(match[0]))) === "rule");
 	const nestedRuleContext = shellContext && hasRuleUrl && hasNestedExpansionContext(command);
-	// `eval`, `source`, and `.` remove the quoting this module adds and read the
-	// substituted path again, so a glob, tilde, or whitespace-bearing rule path is
-	// refused only there.
+	// `eval` re-parses the substituted text; `source`/`.` are refused the same
+	// way as a conservative margin. A glob, tilde, or whitespace-bearing rule
+	// path is refused only in that context.
 	const reparsedRuleContext = shellContext && hasRuleUrl && hasReparsingShellCommand(command);
+	// A shell's `-c` argument is a word the child parses again. The outer shell
+	// joins adjacent quoted segments and strips the substitution's quotes, so a
+	// rule URL anywhere inside that word must be refused outright, whatever the
+	// canonical path contains.
+	const shellScriptSpans = shellContext && hasRuleUrl ? shellScriptWordSpans(command) : [];
 	for (let i = matches.length - 1; i >= 0; i--) {
 		const match = matches[i];
 		const token = match[0];
@@ -923,9 +1053,14 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			);
 		}
 		const delimiter = quotedToken && !escapedAt(command, index) ? token[0] : undefined;
+		if (extractScheme(url) === "rule" && shellScriptSpans.some(([start, end]) => index >= start && index < end)) {
+			throw new ToolError(
+				`rule:// URLs cannot be expanded inside a shell's -c script word, because that child shell parses the substituted text again. ${RULE_READ_ALTERNATIVE}`,
+			);
+		}
 		if (nestedRuleContext && extractScheme(url) === "rule") {
 			throw new ToolError(
-				"rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets.",
+				`rule:// URLs must be a standalone shell argument in bash commands; they cannot be expanded in a multi-line command or one that uses command substitution, backticks, heredocs, parameter or arithmetic expansion, or brackets. ${RULE_READ_ALTERNATIVE}`,
 			);
 		}
 		const resolvedPath = await resolveInternalUrlToPath(
