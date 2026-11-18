@@ -19,7 +19,7 @@ import {
 	type SubmittedUserInput,
 	stopInteractiveActivityIndicator,
 } from "../../modes/types";
-import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
@@ -336,10 +336,12 @@ export class InputController {
 	#lastBackgroundFoldKeyTime = 0;
 	#slashCommands: SlashCommand[] = [];
 
-	/** Set after a first Esc silently consumes a queued steer. Kept until the
-	 *  queued steer is either cancelled by a second Esc or drained by continuation,
-	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
-	#steerConsumePending = false;
+	/** Set after a first Esc silently consumes a queued steer, bound to the session
+	 *  it interrupted. Kept until a second Esc cancels the queued steer or the
+	 *  steer-on-interrupt continuation starts (that session's next `agent_start`),
+	 *  so abort cleanup going idle cannot turn the second Esc into an idle action,
+	 *  while a steer still queued behind the delivered one gets a fresh first Esc. */
+	#steerConsume: { session: AgentSession; unsubscribe: () => void } | undefined;
 	#commandPaletteActions = new Map<AppKeybinding, CommandPaletteAction>();
 	/** Opt-in subset of `#commandPaletteActions` whose listing is filtered by the
 	 *  action registry's availability predicate. Deliberately a sibling set rather
@@ -424,15 +426,35 @@ export class InputController {
 		);
 	}
 
-	#handlePendingSteerInterrupt(): boolean {
-		if (!this.#steerConsumePending) return false;
-		this.#resetEscapeGestures();
-		if (!this.ctx.session.hasQueuedSteering) {
-			this.#steerConsumePending = false;
-			return false;
-		}
+	#isSteerConsumePending(): boolean {
+		return this.#steerConsume?.session === this.ctx.session;
+	}
 
-		this.#steerConsumePending = false;
+	/** First Esc on a queued steer: silently abort so steer-on-interrupt resumes
+	 *  into it, and latch the gesture until that continuation starts. */
+	#consumeQueuedSteer(): void {
+		this.#endSteerConsume();
+		const session = this.ctx.session;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start" && this.#steerConsume?.unsubscribe === unsubscribe) this.#endSteerConsume();
+		});
+		this.#steerConsume = { session, unsubscribe };
+		void this.#abortInteractive({ silent: true });
+	}
+
+	#endSteerConsume(): void {
+		const consume = this.#steerConsume;
+		this.#steerConsume = undefined;
+		consume?.unsubscribe();
+	}
+
+	#handlePendingSteerInterrupt(): boolean {
+		if (!this.#steerConsume) return false;
+		const pending = this.#isSteerConsumePending();
+		this.#endSteerConsume();
+		if (!pending) return false;
+		this.#resetEscapeGestures();
+		if (!this.ctx.session.hasQueuedSteering) return false;
 		this.restoreQueuedMessagesToEditor({ abort: true });
 		return true;
 	}
@@ -471,10 +493,9 @@ export class InputController {
 				this.ctx.session.hasQueuedSteering &&
 				!this.ctx.session.isBashRunning &&
 				!this.ctx.session.isEvalRunning &&
-				!this.#steerConsumePending
+				!this.#isSteerConsumePending()
 			) {
-				this.#steerConsumePending = true;
-				void this.#abortInteractive({ silent: true });
+				this.#consumeQueuedSteer();
 				return true;
 			}
 			// Only count queues this handler can actually drain. The aggregate
@@ -546,12 +567,11 @@ export class InputController {
 			this.ctx.retryEscapePrimed = false;
 		}
 		if (options.streaming && this.ctx.session.isStreaming) {
-			if (this.ctx.session.hasQueuedSteering && !this.#steerConsumePending) {
+			if (this.ctx.session.hasQueuedSteering && !this.#isSteerConsumePending()) {
 				// First Esc with a queued steer: silently consume it and
 				// auto-continue via steer-on-interrupt instead of stalling on
 				// "Operation aborted".
-				this.#steerConsumePending = true;
-				void this.#abortInteractive({ silent: true });
+				this.#consumeQueuedSteer();
 			} else {
 				void this.#abortInteractive();
 			}
@@ -656,7 +676,7 @@ export class InputController {
 			const bypassAutocomplete = Boolean(
 				this.ctx.loadingAnimation ||
 					this.ctx.hasActiveBtw() ||
-					(this.#steerConsumePending && this.ctx.session.hasQueuedSteering) ||
+					(this.#isSteerConsumePending() && this.ctx.session.hasQueuedSteering) ||
 					this.ctx.session.isStreaming ||
 					this.ctx.session.isCompacting ||
 					this.ctx.session.isGeneratingHandoff ||

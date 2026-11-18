@@ -1,7 +1,11 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
-import type { AgentMessage } from "@gajae-code/agent-core";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
+import * as path from "node:path";
+import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { KEYBINDINGS } from "@gajae-code/coding-agent/config/keybindings";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	AVAILABILITY_GATED_NAV_PALETTE_ACTIONS,
@@ -14,10 +18,16 @@ import type {
 	InteractiveModeContext,
 	SubmittedUserInput,
 } from "@gajae-code/coding-agent/modes/types";
-import { associateSessionMessageViewportAnchorId } from "@gajae-code/coding-agent/session/session-manager";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import {
+	associateSessionMessageViewportAnchorId,
+	SessionManager,
+} from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/implementations";
 import type { SlashCommand } from "@gajae-code/tui";
+import { TempDir } from "@gajae-code/utils";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -105,6 +115,7 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 	ctx: InteractiveModeContext;
 	editor: FakeEditor;
 	inputListeners: FakeInputListener[];
+	emitSessionEvent: (event: AgentSessionEvent) => void;
 	spies: {
 		abort: ReturnType<typeof vi.fn>;
 		abortBash: ReturnType<typeof vi.fn>;
@@ -152,6 +163,16 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 	const handleBtwEscape = vi.fn(() => true);
 	const hasActiveBtw = vi.fn(() => false);
 	const inputListeners: FakeInputListener[] = [];
+	const sessionListeners = new Set<(event: AgentSessionEvent) => void>();
+	const subscribe = (listener: (event: AgentSessionEvent) => void) => {
+		sessionListeners.add(listener);
+		return () => {
+			sessionListeners.delete(listener);
+		};
+	};
+	const emitSessionEvent = (event: AgentSessionEvent) => {
+		for (const listener of [...sessionListeners]) listener(event);
+	};
 	const addInputListener = vi.fn((listener: FakeInputListener) => {
 		inputListeners.push(listener);
 		return () => {
@@ -234,6 +255,7 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 			retryNow,
 			clearQueue,
 			prompt,
+			subscribe,
 		} as unknown as InteractiveModeContext["session"],
 		sessionManager: {
 			getSessionName: () => "existing session",
@@ -285,6 +307,7 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 		ctx,
 		editor,
 		inputListeners,
+		emitSessionEvent,
 		spies: {
 			abort,
 			abortBash,
@@ -1112,6 +1135,50 @@ describe("InputController escape behavior", () => {
 		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
 		expect(editor.getText()).toBe("stop after this");
 		expect(editor.shouldBypassAutocompleteOnEscape?.()).toBe(false);
+	});
+
+	it("treats Esc as a fresh steer consume once the continuation has started", () => {
+		const { ctx, editor, emitSessionEvent, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		setQueueCounts(ctx, { followUp: 1 });
+		spies.clearQueue.mockReturnValue({ steering: [], followUp: ["second steer"] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.(); // consumes the first steer
+		emitSessionEvent({ type: "agent_start" } as AgentSessionEvent); // continuation delivering it
+		editor.onEscape?.(); // the second steer is still queued: consume it too
+
+		expect(spies.abort).toHaveBeenCalledTimes(2);
+		expect(spies.abort.mock.calls[0]?.[0]).toMatchObject({ cause: "user_interrupt", silent: true });
+		expect(spies.abort.mock.calls[1]?.[0]).toMatchObject({ cause: "user_interrupt", silent: true });
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+
+		// The re-armed gesture keeps its own second-Esc cancel.
+		editor.onEscape?.();
+		expect(spies.abort).toHaveBeenCalledTimes(3);
+		expect(spies.abort.mock.calls[2]?.[0]?.silent).toBeUndefined();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("second steer");
+	});
+
+	it("re-arms the first-Ctrl+C steer consume once the continuation has started", () => {
+		const { ctx, inputListeners, emitSessionEvent, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		expect(inputListeners[0]?.("\x03")).toEqual({ consume: true });
+		emitSessionEvent({ type: "agent_start" } as AgentSessionEvent);
+		expect(inputListeners[0]?.("\x03")).toEqual({ consume: true });
+
+		expect(spies.abort).toHaveBeenCalledTimes(2);
+		expect(spies.abort.mock.calls[1]?.[0]).toMatchObject({ silent: true });
+		expect(spies.clearQueue).not.toHaveBeenCalled();
 	});
 	it("interrupts an active stream even when the composer contains a draft", () => {
 		const { ctx, editor, spies } = createContext();
@@ -2215,5 +2282,129 @@ describe("InputController availability-gated navigation palette entries", () => 
 			expect(editor.getText()).toBe("  the draft  ");
 			expect(ctx.showSessionsDashboard).toHaveBeenCalledTimes(1);
 		});
+	});
+});
+
+/**
+ * Esc-on-steer against a live AgentSession: the queue handoff that matters
+ * (an interrupted run re-routing its unconsumed steers onto the follow-up
+ * queue, then the continuation draining them) only exists in the real session.
+ */
+describe("InputController Esc-on-steer with a live AgentSession", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let session: AgentSession | undefined;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@gjc-esc-steer-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+	});
+
+	afterEach(async () => {
+		if (session) {
+			await session.abort({ cause: "internal" });
+			await session.dispose();
+			session = undefined;
+		}
+		authStorage.close();
+		tempDir.removeSync();
+	});
+
+	async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (predicate()) return;
+			await Bun.sleep(1);
+		}
+		throw new Error("Timed out waiting for condition");
+	}
+
+	/** Every model call streams until aborted, so each turn stays live for the next Esc. */
+	async function startWithQueuedSteers(steeringMode: "all" | "one-at-a-time") {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({
+			responses: Array.from({ length: 4 }, () => ({ content: ["working"], delayMs: 60_000 })),
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			steeringMode,
+			streamFn: mock.stream,
+		});
+		const sessionSettings = Settings.isolated({ "compaction.enabled": false });
+		sessionSettings.setModelRole("default", `${model.provider}/${model.id}`);
+		const live = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: sessionSettings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		session = live;
+		const { ctx, editor } = createContext();
+		ctx.session = live;
+		// A streaming turn always has the busy indicator mounted.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		new InputController(ctx).setupKeyHandlers();
+
+		void live.prompt("first task");
+		await waitUntil(() => live.isStreaming && mock.calls.length === 1);
+		await live.prompt("steer one", { streamingBehavior: "steer" });
+		await live.prompt("steer two", { streamingBehavior: "steer" });
+		expect(live.getQueuedMessages()).toEqual({ steering: ["steer one", "steer two"], followUp: [] });
+		return { live, mock, editor };
+	}
+
+	function lastUserTexts(call: { context: { messages: readonly AgentMessage[] } } | undefined): string[] {
+		return (call?.context.messages ?? [])
+			.filter(message => message.role === "user")
+			.map(message => JSON.stringify(message.content));
+	}
+
+	it("injects one queued steer per Esc, including the one still queued during the continuation", async () => {
+		const { live, mock, editor } = await startWithQueuedSteers("one-at-a-time");
+
+		editor.onEscape?.();
+		await waitUntil(() => live.isStreaming && mock.calls.length === 2);
+		const continuation = lastUserTexts(mock.calls[1]);
+		expect(continuation.some(text => text.includes("steer one"))).toBe(true);
+		expect(continuation.some(text => text.includes("steer two"))).toBe(false);
+		expect(live.getQueuedMessages()).toEqual({ steering: [], followUp: ["steer two"] });
+
+		// Esc during the continuation is a fresh first Esc: it injects the next
+		// steer instead of hard-aborting and dumping it into the composer.
+		editor.onEscape?.();
+		await waitUntil(() => live.isStreaming && mock.calls.length === 3);
+		expect(lastUserTexts(mock.calls[2]).some(text => text.includes("steer two"))).toBe(true);
+		expect(live.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(editor.getText()).toBe("");
+	});
+
+	it("restores both queued steers to the composer on a double Esc before delivery", async () => {
+		const { live, mock, editor } = await startWithQueuedSteers("one-at-a-time");
+
+		editor.onEscape?.();
+		editor.onEscape?.();
+		await live.waitForIdle();
+		await Bun.sleep(20);
+
+		expect(editor.getText()).toBe("steer one\n\nsteer two");
+		expect(live.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(live.isStreaming).toBe(false);
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("injects every queued steer at once on the first Esc under steeringMode 'all'", async () => {
+		const { live, mock, editor } = await startWithQueuedSteers("all");
+
+		editor.onEscape?.();
+		await waitUntil(() => live.isStreaming && mock.calls.length === 2);
+		const continuation = lastUserTexts(mock.calls[1]);
+		expect(continuation.some(text => text.includes("steer one"))).toBe(true);
+		expect(continuation.some(text => text.includes("steer two"))).toBe(true);
+		expect(live.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(live.hasQueuedSteering).toBe(false);
+		expect(editor.getText()).toBe("");
 	});
 });

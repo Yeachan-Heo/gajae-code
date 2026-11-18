@@ -3946,6 +3946,13 @@ export class AgentSession {
 		| { kind: "held" }
 		| undefined;
 
+	/**
+	 * Steers a run left unconsumed and `#settleDisownedSteering` re-routed onto the
+	 * follow-up queue. They are still steering for the Esc-on-steer gesture: a
+	 * user interrupt resumes into them exactly as it would into the steering queue.
+	 */
+	readonly #rearmedSteerMessages = new WeakSet<AgentMessage>();
+
 	/** Remove run-bound steers from every queue mirror and terminalize them as removed. */
 	#discardRunBoundSteers(messages: readonly AgentMessage[]): void {
 		if (messages.length === 0) return;
@@ -4031,6 +4038,7 @@ export class AgentSession {
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
 		this.#markSteeringAsFollowUpPolicy(rearmed);
+		for (const message of rearmed) this.#rearmedSteerMessages.add(message);
 		const deferredAlreadyPresent = this.#deferredSdkFollowUps.length > 0;
 		if (deferredAlreadyPresent) {
 			// Deferred follow-ups are an older cross-store FIFO head. Keep rearmed
@@ -20071,9 +20079,13 @@ export class AgentSession {
 
 	/** Whether the agent has queued steering messages that a `user_interrupt`
 	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
-	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts.
+	 *  Steers an interrupted run left unconsumed are re-routed onto the follow-up
+	 *  queue and still count: with two queued steers, the continuation that
+	 *  delivers the first leaves the second waiting there. */
 	get hasQueuedSteering(): boolean {
-		return this.agent.hasQueuedSteering();
+		if (this.agent.hasQueuedSteering()) return true;
+		return this.agent.snapshotFollowUp().some(message => this.#rearmedSteerMessages.has(message));
 	}
 
 	/** Get pending messages (read-only). Returns the public text-only view;
