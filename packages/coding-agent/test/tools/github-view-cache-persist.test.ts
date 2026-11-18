@@ -1720,6 +1720,28 @@ describe("github view cache persistence", () => {
 			expect(cacheFileBytes()).not.toContain("escaped-opaque-10");
 		});
 
+		it("redacts a container whose item holds URL userinfo", () => {
+			// Userinfo stripping runs after container masking; before that order
+			// existed, its quote-tolerant userinfo rule could eat an item closer and
+			// strand the next item.
+			const body = "Cookie: [\n  'https://example.test',user@host,']',\n  \"userinfo-opaque-12\"\n]\nafter=keep";
+			storeBody(1312, body);
+			const stored = readBody(1312);
+			expect(stored).not.toContain("userinfo-opaque-12");
+			expect(stored).toContain("after=keep");
+			expect(stored).not.toContain("\u0000");
+			expect(cacheFileBytes()).not.toContain("userinfo-opaque-12");
+		});
+
+		it("redacts an unterminated inline Auth container without throwing", () => {
+			const body = 'trace Authorization: [\n  "inline-auth-opaque-13"';
+			expect(() => storeBody(1313, body)).not.toThrow();
+			const stored = readBody(1313);
+			expect(stored).not.toContain("inline-auth-opaque-13");
+			expect(stored).not.toContain("\u0000");
+			expect(cacheFileBytes()).not.toContain("inline-auth-opaque-13");
+		});
+
 		it("keeps a well-formed diff container's line accounting", () => {
 			const diff = [
 				"diff --git a/a b/a",
