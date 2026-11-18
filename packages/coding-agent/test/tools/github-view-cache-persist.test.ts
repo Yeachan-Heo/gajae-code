@@ -938,6 +938,7 @@ describe("github view cache persistence", () => {
 			'+Cookie:\n+ [\n+  { "EncryptionKey": [\n+"synthetic-opaque-marked-Q8m4"\n+  ] }\n+ ]',
 			'Cookie:\n[\n  [\n    "ordinary"\n  ],\n  "opaque-cookie-tail-Q8m4"\n]',
 			"Set-Cookie: \r\n  sid=cache-review-folded-38; Secure",
+			'Cookie:\n[\n"Cookie: sid=first",\n"sid=fixture-cookie-tail-round39"\n]',
 			'Cookie:\u00A0\r\n [\r\n   "sid=fixture-cookie-Q8m4"\r\n ]',
 			"Cookie: \u00A0\nEncryptionKey:\n  synthetic-opaque-Q8m4",
 			"-/home/demo-user/config",
@@ -1014,6 +1015,7 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("synthetic-opaque-marked-Q8m4");
 		expect(cacheFileBytes()).not.toContain("opaque-cookie-tail-Q8m4");
 		expect(cacheFileBytes()).not.toContain("cache-review-folded-38");
+		expect(cacheFileBytes()).not.toContain("fixture-cookie-tail-round39");
 		expect(cacheFileBytes()).not.toContain("synthetic-opaque-Q8m4");
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");

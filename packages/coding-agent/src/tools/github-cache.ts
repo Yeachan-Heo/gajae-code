@@ -711,6 +711,17 @@ function scrubHostPaths(text: string): string {
 }
 
 /** Text-level scrub for everything the view cache persists or serves back. */
+/** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
+function containerDepthAt(text: string, end: number): number {
+	let depth = 0;
+	for (let i = 0; i < end; i++) {
+		const ch = text[i];
+		if (ch === "{" || ch === "[") depth++;
+		else if (ch === "}" || ch === "]") depth = Math.max(0, depth - 1);
+	}
+	return depth;
+}
+
 function scrubCacheText(text: string, diff = false): string {
 	// Userinfo comes off the raw text first: container masking can collapse a
 	// blank line that ended a Markdown table, and a later table classification
@@ -761,11 +772,13 @@ function scrubCacheText(text: string, diff = false): string {
 		)
 		.replace(
 			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
-			"$1$2$3«redacted»",
+			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) =>
+				containerDepthAt(text, offset) > 0 ? match : `${lineStart}${marker}${label}«redacted»`,
 		)
 		.replace(
 			/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
-			"$1«redacted»",
+			(match: string, label: string, offset: number, text: string) =>
+				containerDepthAt(text, offset) > 0 ? match : `${label}«redacted»`,
 		);
 	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);
 	let scrubbed = redactCrashSecrets(withoutAtSigns);
