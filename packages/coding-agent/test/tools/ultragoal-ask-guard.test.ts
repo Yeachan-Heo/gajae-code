@@ -480,7 +480,6 @@ describe("ultragoal ask guard", () => {
 	});
 });
 
-
 describe("ultragoal ask guard cancellation", () => {
 	it("does not invoke ask when the call is aborted during the guard", async () => {
 		const calls: number[] = [];
@@ -496,6 +495,31 @@ describe("ultragoal ask guard cancellation", () => {
 		controller.abort();
 
 		await expect(guarded.execute("ask-1", {} as never, controller.signal)).rejects.toBeInstanceOf(ToolAbortError);
+		expect(calls).toEqual([]);
+	});
+
+	it("keeps the cancellation fence when the same tool is guarded twice", async () => {
+		const calls: number[] = [];
+		const raw = stubAskTool(async () => {
+			calls.push(1);
+		});
+		const once = guardToolForUltragoalAsk(
+			raw,
+			() => process.cwd(),
+			() => ({}),
+			() => undefined,
+		);
+		const twice = guardToolForUltragoalAsk(
+			once,
+			() => process.cwd(),
+			() => ({}),
+			() => undefined,
+		);
+		const controller = new AbortController();
+		controller.abort();
+
+		expect(twice).toBe(once);
+		await expect(twice.execute("ask-1", {} as never, controller.signal)).rejects.toBeInstanceOf(ToolAbortError);
 		expect(calls).toEqual([]);
 	});
 

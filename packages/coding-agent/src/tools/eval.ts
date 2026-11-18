@@ -285,6 +285,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				: undefined,
 		};
 		const sessionAbortController = new AbortController();
+		// abortEval() aborts this controller, and detached nested calls must stop with
+		// it even when the bridge no longer forwards the eval-local signal.
+		const abortNestedScope = (): void => nestedToolScope.abortController.abort();
+		if (sessionAbortController.signal.aborted) abortNestedScope();
+		else sessionAbortController.signal.addEventListener("abort", abortNestedScope, { once: true });
 		const abortFromCaller = (): void => sessionAbortController.abort(signal?.reason);
 		if (signal?.aborted) abortFromCaller();
 		else signal?.addEventListener("abort", abortFromCaller, { once: true });

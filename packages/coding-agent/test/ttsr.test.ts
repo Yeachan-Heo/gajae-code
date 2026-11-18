@@ -2032,6 +2032,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			const tool = new EvalTool({
 				...createToolSession(),
 				getToolForExecution: (name, options) => getSession().getToolForExecution(name, options),
+				trackEvalExecution: (execution, controller) => getSession().trackEvalExecution(execution, controller),
 			} as ToolSession);
 			// EvalTool's execute is typed against its own schema; the session dispatches it generically.
 			return tool as unknown as AgentTool;
@@ -2047,6 +2048,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 					onScope(options?.nestedToolScope);
 					return getSession().getToolForExecution(name, options);
 				},
+				trackEvalExecution: (execution, controller) => getSession().trackEvalExecution(execution, controller),
 			} as ToolSession);
 			return tool as unknown as AgentTool;
 		}
@@ -2456,6 +2458,50 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			lazyGate.resolve();
 			await Bun.sleep(10);
 			expect(lazyCalls).toEqual([]);
+		});
+
+		it("aborts a parked nested call when the eval execution is aborted", async () => {
+			const bashCalls: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const approval = Promise.withResolvers<ClientBridgePermissionOutcome>();
+			const bashAsked = Promise.withResolvers<void>();
+			const { session } = createSession(
+				[evalToolFor(() => session), bashTool],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"tool.bash({ command: 'echo X' }).catch(() => {}); await new Promise(resolve => setTimeout(resolve, 1000));",
+						),
+					],
+				],
+				[],
+				{
+					sdkPermissionProvider: toolCall => {
+						if (toolCall.toolName !== "bash") {
+							return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+						}
+						bashAsked.resolve();
+						return approval.promise;
+					},
+				},
+			);
+			const runPromise = run(session, "start bash");
+			await bashAsked.promise;
+			session.abortEval();
+			approval.resolve({ outcome: "selected", optionId: "allow_once" });
+			await runPromise;
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
 		});
 
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
