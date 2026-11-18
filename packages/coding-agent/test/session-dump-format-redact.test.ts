@@ -494,6 +494,30 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(payload).toContain('"application/json"');
 	});
 
+	it("keeps ordinary data under a literal hash-suffixed name", () => {
+		// Only a name the prepass decoded is classified by its resolved spelling; a name that
+		// literally ends in `#2` is ordinary data, not a header collection or a credential field.
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-literal-hash-name",
+						name: "request",
+						arguments: {
+							payload: { "api_key#2": "public-value", "headers#2": ["Authorization", "public-note"] },
+						},
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		const payload = parameterValue(dumped, "payload") ?? "";
+		expect(payload).toContain("public-value");
+		expect(payload).toContain("public-note");
+	});
+
 	it("keeps both schema definitions when an escaped credential name collides with a plain one", () => {
 		const dumped = formatSessionDumpText({
 			messages: [],
@@ -518,6 +542,34 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"type": "string"');
 		expect(dumped).toContain('"minLength": 10');
 		expect(dumped).toContain('"type": "number"');
+	});
+
+	it("masks both spellings of a data keyword under a credential-named property", () => {
+		const escapedDefault = "ESCAPED_DEFAULT_SECRET";
+		const canonicalDefault = "CANONICAL_DEFAULT_SECRET";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						properties: {
+							api_key: { "def\\u0061ult": escapedDefault, default: canonicalDefault },
+							publicFlag: { type: "boolean", default: true },
+						},
+					},
+				},
+			],
+		});
+
+		expect(dumped).not.toContain(escapedDefault);
+		expect(dumped).not.toContain(canonicalDefault);
+		expect(dumped).toContain('"default": "«redacted»"');
+		expect(dumped).toContain('"default": true');
 	});
 
 	it("keeps an ordinary decoded JSON blob in the session dump", () => {

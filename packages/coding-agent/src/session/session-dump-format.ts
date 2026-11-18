@@ -175,9 +175,6 @@ function decodeEscapedText(input: string): string {
 	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input));
 }
 
-/** Suffix that keeps a field name distinct when two spellings decode to the same name. */
-const DUPLICATE_NAME_SUFFIX = /#\d+$/;
-
 /** An integer-like key is enumerated before every other field, so it must keep its spelling. */
 const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
 
@@ -190,45 +187,37 @@ const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
  * Field names are part of that decoded representation: a name spelled with an escape is only
  * credential-shaped once resolved, and it is this prepass — not a later pass over the
  * serialized text — that has to recognize it.
- * The spelling every entry is stored under keeps the pairing stream in its original order and
- * keeps every entry: a name that would reorder the enumeration or that a sibling already holds
- * keeps the spelling it arrived with, and only a name that cannot stay distinct gets `#n`.
+ * The spelling each entry is stored under keeps the pairing stream in its original order and
+ * keeps every entry: a name two spellings claim, or one that would move an integer-like key,
+ * stays as it arrived. No entry is ever renamed to a spelling the payload did not contain.
  */
 function decodeValueStrings(value: unknown): unknown {
 	if (typeof value === "string") return decodeEscapedText(value);
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
-	const decoded = Object.create(null) as Record<string, unknown>;
-	const nextSuffix = new Map<string, number>();
-	for (const [key, nested] of Object.entries(value)) {
+	const source = Object.entries(value);
+	const claims = new Map<string, number>();
+	for (const [key] of source) {
 		const name = decodeEscapedText(key);
-		const storage = name === key || ARRAY_INDEX_NAME.test(name) || Object.hasOwn(decoded, name) ? key : name;
-		const field = Object.hasOwn(decoded, storage) ? uniqueDecodedFieldName(decoded, storage, nextSuffix) : storage;
+		claims.set(name, (claims.get(name) ?? 0) + 1);
+	}
+	const decoded = Object.create(null) as Record<string, unknown>;
+	for (const [key, nested] of source) {
+		const name = decodeEscapedText(key);
+		// Only a name one entry claims and that keeps the enumeration order is printed decoded; the
+		// entry that already spells it that way would keep it anyway, and every other spelling stays.
+		const field = name === key || (claims.get(name) === 1 && !ARRAY_INDEX_NAME.test(name)) ? name : key;
 		decoded[field] = decodeValueStrings(nested);
 	}
 	return decoded;
 }
 
-/** Next free `name#n` for a field name two entries claim; the map keeps the scan linear. */
-function uniqueDecodedFieldName(
-	target: Record<string, unknown>,
-	name: string,
-	nextSuffix: Map<string, number>,
-): string {
-	let suffix = nextSuffix.get(name) ?? 2;
-	while (Object.hasOwn(target, `${name}#${suffix}`)) suffix += 1;
-	nextSuffix.set(name, suffix + 1);
-	return `${name}#${suffix}`;
-}
-
 /**
- * The name a stored field stands for: escapes resolved, and the `#n` a duplicate needed removed.
- * Recognition reads this instead of the stored spelling, because a name that only becomes
- * credential- or header-shaped after decoding keeps the spelling it arrived with when a sibling
- * already holds the decoded form.
+ * The name a stored field stands for, so recognition reads the resolved spelling even when a
+ * sibling forced this entry to keep the one it arrived with.
  */
 function fieldIdentity(key: string): string {
-	return decodeEscapedText(key).replace(DUPLICATE_NAME_SUFFIX, "");
+	return decodeEscapedText(key);
 }
 
 /**
