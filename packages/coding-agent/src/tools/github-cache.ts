@@ -418,10 +418,54 @@ function maskCredentialJsonContainers(
  */
 /** Redact parameterized inline auth values such as `Token token="..."`. */
 function maskParameterizedAuthValues(text: string): string {
-	return text.replace(
-		/((?:"(?:(?:[A-Za-z0-9]+-)*authorization|auth)"|(?:(?:[A-Za-z0-9]+-)*authorization|auth))[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)([A-Za-z0-9_.-]+[ \t]*=[ \t]*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\\"(?:\\.|[^"\\\r\n])*?(?<!\\)\\"(?=[\s,;"|\\]|$)|\\'(?:\\.|[^'\\\r\n])*?(?<!\\)\\'(?=[\s,;'|\\]|$)|[^\s,;]+)/gi,
-		"$1$2$3$4«redacted»",
-	);
+	const prefix =
+		/((?:"?(?:(?:[A-Za-z0-9]+-)*authorization|auth)"?)[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)([A-Za-z0-9_.-]+[ \t]*=[ \t]*)/gi;
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(prefix)) {
+		const index = match.index ?? 0;
+		if (index < last) continue;
+		const valueStart = index + match[0].length;
+		let end = valueStart;
+		const first = text[valueStart];
+		if (first === '"' || first === "'") {
+			end = valueStart + 1;
+			for (; end < text.length; end++) {
+				if (text[end] === "\n") break;
+				if (text[end] === first && text[end - 1] !== "\\") {
+					end++;
+					break;
+				}
+			}
+		} else if (first === "\\" && (text[valueStart + 1] === '"' || text[valueStart + 1] === "'")) {
+			const quote = text[valueStart + 1];
+			const lineEnd = text.indexOf("\n", valueStart);
+			const limit = lineEnd === -1 ? text.length : lineEnd;
+			const field = /\s+(?:cookie|authorization|auth)\s*:/i.exec(text.slice(valueStart, limit));
+			const segmentEnd = field ? valueStart + field.index : limit;
+			const close = `\\${quote}`;
+			let closeAt = -1;
+			for (
+				let at = text.indexOf(close, valueStart + 2);
+				at !== -1 && at < segmentEnd;
+				at = text.indexOf(close, at + 1)
+			) {
+				const after = text[at + 2] ?? "";
+				if (after === "|") {
+					closeAt = at;
+					break;
+				}
+				if (after === "" || /[\s,;"'\\]/.test(after)) closeAt = at;
+			}
+			end = closeAt >= 0 ? closeAt + 2 : segmentEnd;
+			if (closeAt >= 0 && text[end] === "|") end = limit;
+		} else {
+			while (end < text.length && !/[\s,;]/.test(text[end])) end++;
+		}
+		out += text.slice(last, index) + match[1] + match[2] + match[3] + match[4] + "«redacted»";
+		last = end;
+	}
+	return out + text.slice(last);
 }
 
 function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
