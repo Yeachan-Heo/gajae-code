@@ -404,6 +404,11 @@ const PROJECT_RULE_DIR_NAMES = [".agent", ".agents"] as const;
  * On-disk spelling of `target` when every component below `base` is a real
  * directory, or `undefined` when one is missing or is a link (junction).
  *
+ * `base` must already be the canonical directory the caller authorized: it is
+ * not resolved again, so the walk cannot start from a different root than the
+ * one the caller checked. A caller whose base may be a link (the trusted home
+ * often is) resolves it once before calling.
+ *
  * The configured spelling decides which directory is meant. On a
  * case-insensitive volume `lstat` resolves `.agent` to the `.AGENT` entry the
  * user created and `realpath` then reports that on-disk case, so a real
@@ -419,14 +424,7 @@ async function unlinkedDirectorySpelling(base: string, target: string): Promise<
 	if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
 		return undefined;
 	}
-	let current: string;
-	try {
-		// The base may itself be a link (the trusted home often is), so it is
-		// resolved once; every recovered name then has to hang off that directory.
-		current = await fs.realpath(resolvedBase);
-	} catch {
-		return undefined;
-	}
+	let current = resolvedBase;
 	for (const part of relative.split(path.sep)) {
 		const requested = path.join(current, part);
 		let entry: fsTypes.Stats;
@@ -533,7 +531,10 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 			// An unlinked rules directory is its own on-disk spelling, so a real
 			// directory the user created with other casing still matches without
 			// promoting a case-variant sibling that discovery never loaded.
-			const unlinkedRoot = await unlinkedDirectorySpelling(home, ruleRoot);
+			const unlinkedRoot = await unlinkedDirectorySpelling(
+				canonicalHome,
+				path.join(canonicalHome, dirName, "rules"),
+			);
 			if (unlinkedRoot !== undefined) {
 				// Provenance accepts either spelling discovery may have stored: the
 				// configured home, or the canonical home a caller supplied. The
@@ -786,19 +787,36 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
  */
 const QUOTED_VALUE_UNSAFE = /['"\\\u0000-\u001f]/;
 
-const WORD_CHARACTER = /[\p{L}\p{N}_]/u;
+const WORD_CHARACTER = /[\p{L}\p{N}\p{M}_]/u;
+
+/**
+ * The character next to `index` as a whole code point, so an astral letter is one
+ * neighbour instead of two surrogate halves.
+ */
+function neighbourAt(value: string, index: number, step: -1 | 1): string | undefined {
+	if (step === -1) {
+		if (index === 0) return undefined;
+		const unit = value.charCodeAt(index - 1);
+		if (unit >= 0xdc00 && unit <= 0xdfff && index >= 2) return value.slice(index - 2, index);
+		return value[index - 1];
+	}
+	if (index + 1 >= value.length) return undefined;
+	const unit = value.charCodeAt(index + 1);
+	if (unit >= 0xd800 && unit <= 0xdbff) return value.slice(index + 1, index + 3);
+	return value[index + 1];
+}
 
 /**
  * True when the character at `index` delimits a quoted run in a data value. A
- * double quote always does. An apostrophe inside a word (`it's`, `owners'`) is
- * prose: it opens a run only at a word start and closes it only at a word end,
- * which is how a contraction or a possessive is written.
+ * double quote always does. An apostrophe inside a word (`it's`, `owners'`,
+ * `cafe\u0301's`) is prose: it opens a run only at a word start and closes it
+ * only at a word end, which is how a contraction or a possessive is written.
  */
 function isDataQuote(value: string, index: number, opening: boolean): boolean {
 	const character = value[index];
 	if (character === '"') return true;
 	if (character !== "'") return false;
-	const neighbour = opening ? value[index - 1] : value[index + 1];
+	const neighbour = neighbourAt(value, index, opening ? -1 : 1);
 	return !(neighbour !== undefined && WORD_CHARACTER.test(neighbour));
 }
 

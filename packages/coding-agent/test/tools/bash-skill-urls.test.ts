@@ -2151,6 +2151,18 @@ describe("bash session agent directory", () => {
 					env: { PAYLOAD: "owners' rule://tabbed and reviewers' notes" },
 				});
 				expect(textOf(possessive)).toContain(await realpath(tabRule));
+				// A decomposed accent and an astral letter are word characters too, so
+				// their apostrophes stay prose.
+				for (const [label, value] of [
+					["decomposed", "cafe\u0301's rule://tabbed and owners' notes"],
+					["astral", "\u03b1\u{1d6fc} rule://tabbed don't"],
+				] as const) {
+					const proseValue = await tool.execute(`call-env-${label}-tab`, {
+						command: 'printf "%s" "$PAYLOAD"',
+						env: { PAYLOAD: value },
+					});
+					expect(textOf(proseValue)).toContain(await realpath(tabRule));
+				}
 				// A lone apostrophe in prose is not a quoted run, so the same path is
 				// accepted there instead of being refused as quoted data.
 				const prose = await tool.execute("call-env-prose-tab", {
