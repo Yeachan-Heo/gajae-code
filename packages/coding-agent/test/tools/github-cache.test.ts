@@ -226,7 +226,7 @@ for (const kind of ["issue", "pr", "pr-diff"] as const) {
 			kind,
 			number: 83,
 			includeComments: false,
-			payload: {},
+			payload: kind === "pr-diff" ? { unified: "", files: [] } : {},
 			rendered: "old",
 			fetchedAt: Date.now() - 2_000,
 		});

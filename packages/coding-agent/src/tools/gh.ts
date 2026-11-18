@@ -2968,7 +2968,7 @@ function prDiffPathTokens(line: string): PrDiffPathToken[] {
 	return tokens;
 }
 
-const PR_DIFF_PATH_MASK = "\u0000gjc-diff-path-";
+const PR_DIFF_PATH_MASK = `\u0000gjc-${Math.random().toString(36).slice(2)}-diff-path-`;
 
 /**
  * Mask the path tokens of diff header lines whose decoded form changes under
@@ -3019,11 +3019,13 @@ export function maskPrDiffPathTokens(
 	if (sanitizedTokens.length === 0) return { text, restore: scrubbed => scrubbed };
 	return {
 		text: lines.join("\n"),
-		restore: scrubbed =>
-			scrubbed.replace(
-				/\u0000gjc-diff-path-(\d+)\u0000/g,
-				(_match, index: string) => sanitizedTokens[Number(index)] ?? "",
-			),
+		restore: scrubbed => {
+			let restored = scrubbed;
+			for (let index = 0; index < sanitizedTokens.length; index += 1) {
+				restored = restored.replaceAll(`${PR_DIFF_PATH_MASK}${index}\u0000`, sanitizedTokens[index] ?? "");
+			}
+			return restored;
+		},
 	};
 }
 
@@ -3147,27 +3149,19 @@ interface PrDiffHeaderPaths {
 
 function parsePrDiffHeaderPaths(header: string): PrDiffHeaderPaths {
 	const trail = header.slice("diff --git ".length);
-	if (trail.startsWith('"')) {
-		const oldToken = parseDiffQuotedToken(trail, 0);
-		if (!oldToken) return {};
-		const newToken = parseDiffHeaderToken(trail, oldToken.nextIndex);
-		if (!newToken) return {};
-		return {
-			oldPath: stripPrDiffPathPrefix(oldToken.value, "a/"),
-			newPath: stripPrDiffPathPrefix(newToken.value, "b/"),
-			oldPathEscaped: oldToken.escaped,
-			newPathEscaped: newToken.escaped,
-		};
-	}
-
-	const bIdx = trail.indexOf(" b/");
-	if (trail.startsWith("a/") && bIdx > 0) {
-		return {
-			oldPath: trail.slice(2, bIdx),
-			newPath: trail.slice(bIdx + 3),
-		};
-	}
-	return {};
+	// Git quotes each operand independently, so both tokens must be parsed the
+	// same way whether or not either side is quoted. A mix like
+	// `a/plain "b/name with space"` is valid.
+	const oldToken = parseDiffHeaderToken(trail, 0);
+	if (!oldToken) return {};
+	const newToken = parseDiffHeaderToken(trail, oldToken.nextIndex);
+	if (!newToken) return {};
+	return {
+		oldPath: stripPrDiffPathPrefix(oldToken.value, "a/"),
+		newPath: stripPrDiffPathPrefix(newToken.value, "b/"),
+		oldPathEscaped: oldToken.escaped,
+		newPathEscaped: newToken.escaped,
+	};
 }
 
 function isPrDiffFileHeaderLine(line: string): boolean {

@@ -304,9 +304,23 @@ function escapeRegExp(value: string): string {
  * redactor: their grammars are not a single value token.
  */
 const BOUNDED_CREDENTIAL_ASSIGNMENT =
-	/(?<![A-Za-z0-9_-])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?\s*[:=]\s*)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s"'`|;&,<>]+))/gi;
+	/(?<![A-Za-z0-9])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s"'`|;&,<>#]+)|(?=[\r\n]|$))/gi;
 
-const BOUNDED_CREDENTIAL_MASK = "\u0000gjc-credential-";
+/**
+ * Sentinels are nonce-prefixed so a literal NUL sequence in user text cannot
+ * alias a mask slot and be replaced or deleted by restoration.
+ */
+const CACHE_MASK_NONCE = Math.random().toString(36).slice(2);
+const BOUNDED_CREDENTIAL_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-credential-`;
+const BOUNDED_AUTHORIZATION_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-auth-`;
+
+function restoreMasked(scrubbed: string, prefix: string, values: readonly string[]): string {
+	let restored = scrubbed;
+	for (let index = 0; index < values.length; index += 1) {
+		restored = restored.replaceAll(`${prefix}${index}\u0000`, values[index] ?? "");
+	}
+	return restored;
+}
 
 /**
  * Authorization headers are redacted through the scheme word and the value, but
@@ -314,27 +328,26 @@ const BOUNDED_CREDENTIAL_MASK = "\u0000gjc-credential-";
  * header survives. `cookies` stays with the shared redactor: cookie pairs are
  * not a single value token.
  */
-const BOUNDED_AUTHORIZATION_HEADER =
-	/(?<![A-Za-z0-9_-])((?:authorization|auth)(?:\s*["']?\s*[:=]\s*["']?))(Bearer|Basic|Token)(\s+)[^\s|]+/gi;
-
-const BOUNDED_AUTHORIZATION_MASK = "\u0000gjc-auth-";
-
 function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
 	const sanitized: string[] = [];
 	const masked = text.replace(
-		BOUNDED_AUTHORIZATION_HEADER,
-		(_match: string, label: string, scheme: string, spacing: string) => {
+		/(?<![A-Za-z0-9_-])((?:authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
+		(
+			_match: string,
+			label: string,
+			scheme: string,
+			spacing: string,
+			doubleQuoted: string | undefined,
+			singleQuoted: string | undefined,
+		) => {
+			const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
 			const sentinel = `${BOUNDED_AUTHORIZATION_MASK}${sanitized.length}\u0000`;
-			sanitized.push(`${label}${scheme}${spacing}«redacted»`);
+			sanitized.push(`${label}${scheme}${spacing}${quote}«redacted»${quote}`);
 			return sentinel;
 		},
 	);
 	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
-	return {
-		text: masked,
-		restore: scrubbed =>
-			scrubbed.replace(/\u0000gjc-auth-(\d+)\u0000/g, (_match, index: string) => sanitized[Number(index)] ?? ""),
-	};
+	return { text: masked, restore: scrubbed => restoreMasked(scrubbed, BOUNDED_AUTHORIZATION_MASK, sanitized) };
 }
 
 function maskBoundedCredentialAssignments(text: string): { text: string; restore: (scrubbed: string) => string } {
@@ -355,28 +368,23 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
 		},
 	);
 	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
-	return {
-		text: masked,
-		restore: scrubbed =>
-			scrubbed.replace(
-				/\u0000gjc-credential-(\d+)\u0000/g,
-				(_match, index: string) => sanitized[Number(index)] ?? "",
-			),
-	};
+	return { text: masked, restore: scrubbed => restoreMasked(scrubbed, BOUNDED_CREDENTIAL_MASK, sanitized) };
 }
 
 /**
  * Remove URL userinfo. Authentication is what makes a URL sensitive; the host,
  * path, query and surrounding markup stay readable. Handles `scheme://`,
- * JSON-escaped `scheme:\/\/`, and protocol-relative `//user:pass@host` forms.
- * Tabs inside the userinfo are matched too, because URL parsers drop them.
+ * JSON-escaped `scheme:\/\/`, and protocol-relative `//user:pass@host` forms,
+ * including a raw `@` or an apostrophe inside the userinfo. Userinfo removal
+ * runs before the assignment masks so a URL shaped like
+ * `scheme://user:token=value@host` keeps its host.
  */
 function stripUrlUserinfo(text: string): string {
-	const withoutAuthorityUserinfo = text.replace(
-		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#@"'`<>]*@/gi,
+	const withoutSchemeUserinfo = text.replace(
+		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi,
 		"$1",
 	);
-	return withoutAuthorityUserinfo.replace(/(^|[\s"'`([{<])(\/\/)[^\r\n /?#@"'`<>]*@/g, "$1$2");
+	return withoutSchemeUserinfo.replace(/(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>]*@/g, "//");
 }
 
 /**
@@ -395,6 +403,7 @@ const CACHE_VENDOR_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
 	[/(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
 	[/(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
 	[/(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
+	[/(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}/g, "«redacted-google-api-key»"],
 ];
 
 function scrubCacheVendorTokens(text: string): string {
@@ -420,15 +429,30 @@ function scrubHostPaths(text: string): string {
 		scrubbed = scrubbed.replace(/(?<![A-Za-z0-9._#-])\/root(?![A-Za-z0-9._-])/g, "~");
 		return scrubbed.replace(/(?<![A-Za-z0-9._#-])[A-Za-z]:[\\/]Users[\\/][^\\/\s"'`<>()[\]{},;|]+/gi, "~");
 	};
+	// A `file:` URL's path is local, so scrub it without turning the marker into
+	// an authority: `file:///home/u/x` -> `file:///~/x`,
+	// `file://localhost/home/u/x` -> `file://localhost/~/x`.
+	const scrubFileUrl = (url: string): string => {
+		const match = /^(file:(?:\/\/|\\\/\\\/))([^/\\]*)([\s\S]*)$/i.exec(url);
+		if (!match) return scrubLocal(url);
+		const [, scheme, authority, rawPath] = match as unknown as [string, string, string, string];
+		if (!rawPath) return url;
+		const scrubbedPath = scrubLocal(rawPath);
+		if (scrubbedPath === rawPath) return url;
+		return scrubbedPath.startsWith("/")
+			? `${scheme}${authority}${scrubbedPath}`
+			: `${scheme}${authority}/${scrubbedPath}`;
+	};
 	// A URL's path is content, not a local path, so only scrub outside URL spans.
-	// `file:` URLs are local by definition and still get scrubbed.
+	// `|` ends a span so a compact Markdown table row does not shield the next
+	// cell's home path.
 	let out = "";
 	let last = 0;
-	for (const match of text.matchAll(/(?:[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)|\/\/)[^\s"'`<>(){}]*/gi)) {
+	for (const match of text.matchAll(/(?:[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)|\/\/)[^\s"'`<>(){}|]*/gi)) {
 		const index = match.index ?? 0;
 		const url = match[0];
 		out += scrubLocal(text.slice(last, index));
-		out += /^file:/i.test(url) ? scrubLocal(url) : url;
+		out += /^file:/i.test(url) ? scrubFileUrl(url) : url;
 		last = index + url.length;
 	}
 	return out + scrubLocal(text.slice(last));
@@ -436,10 +460,12 @@ function scrubHostPaths(text: string): string {
 
 /** Text-level scrub for everything the view cache persists or serves back. */
 function scrubCacheText(text: string): string {
-	const authHeaders = maskBoundedAuthorizationHeaders(text);
+	// Userinfo is removed from the raw text first: an assignment mask inside a
+	// URL's userinfo would hide the `@` delimiter the authority pass needs.
+	const withoutUserinfo = stripUrlUserinfo(text);
+	const authHeaders = maskBoundedAuthorizationHeaders(withoutUserinfo);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
-	let scrubbed = stripUrlUserinfo(assignments.text);
-	scrubbed = redactCrashSecrets(scrubbed);
+	let scrubbed = redactCrashSecrets(assignments.text);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
 	scrubbed = scrubHostPaths(scrubbed);
 	return authHeaders.restore(assignments.restore(scrubbed));
@@ -505,24 +531,38 @@ function scrubStoredView(
 	rendered: string,
 	sourceUrl: string | undefined,
 ): ScrubbedView {
-	const scrubbedPayload = scrubPersistedValue(payload);
 	const scrubbedSourceUrl = sourceUrl === undefined ? undefined : scrubCacheText(sourceUrl);
-	const unified = isRecordValue(scrubbedPayload) ? scrubbedPayload.unified : undefined;
-	if (kind !== "pr-diff" || typeof unified !== "string") {
-		return { payload: scrubbedPayload, rendered: scrubCacheText(rendered), sourceUrl: scrubbedSourceUrl };
+	if (kind !== "pr-diff") {
+		return {
+			payload: scrubPersistedValue(payload),
+			rendered: scrubCacheText(rendered),
+			sourceUrl: scrubbedSourceUrl,
+		};
 	}
-	let scrubbedUnified = unified;
-	let files: unknown = isRecordValue(scrubbedPayload) ? scrubbedPayload.files : undefined;
-	// Path tokens are decoded, scrubbed and re-quoted before the text pass, so an
-	// escape-encoded credential cannot survive and the text pass cannot chew
-	// through diff framing. The index is then rebuilt from the exact text that is
-	// persisted, keeping slice offsets valid after scrubbing changed lengths.
-	scrubbedUnified = scrubPrDiffText(unified, scrubCacheText);
+	const unified = isRecordValue(payload) ? payload.unified : undefined;
+	if (typeof unified !== "string") {
+		// A diff row without unified text cannot be reindexed consistently. Fail
+		// closed: the read becomes a miss and the write is skipped.
+		throw new Error("github cache: pr-diff payload without unified text");
+	}
+	// The raw unified text goes straight into the diff-aware scrub. Scrubbing
+	// it as prose first could consume a header operand (`Authorization:`), and
+	// the damaged text would be indexed as the persisted one. Sibling fields are
+	// scrubbed generically; the rebuilt `unified` and `files` come from the
+	// exact text that is stored so slice offsets stay valid.
+	const scrubbedUnified = scrubPrDiffText(unified, scrubCacheText);
 	const reparsed = parsePrUnifiedDiff(scrubbedUnified);
-	files = scrubPersistedValue(reparsed.files);
-	const base = isRecordValue(scrubbedPayload) ? scrubbedPayload : {};
+	const extras = isRecordValue(payload)
+		? scrubPersistedValue(
+				Object.fromEntries(Object.entries(payload).filter(([key]) => key !== "unified" && key !== "files")),
+			)
+		: {};
 	return {
-		payload: { ...base, unified: scrubbedUnified, files },
+		payload: {
+			...(isRecordValue(extras) ? extras : {}),
+			unified: scrubbedUnified,
+			files: scrubPersistedValue(reparsed.files),
+		},
 		rendered: scrubbedUnified,
 		sourceUrl: scrubbedSourceUrl,
 	};
