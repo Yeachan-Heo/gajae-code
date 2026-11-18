@@ -926,6 +926,7 @@ describe("github view cache persistence", () => {
 			String.raw`C:\Users\Jane Doe. X-Authorization: Negotiate dGVzdC1jYW5hcnk=`,
 			String.raw`C:\Users\Jane Doe. X-Cookie: sid=x-cookie-canary-Q3`,
 			"-Cookie: color=red; sid=cache-only-canary-X2m8",
+			"-Authorization: Basic Zm9vOmJhcg==",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
@@ -989,6 +990,7 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("dGVzdC1jYW5hcnk");
 		expect(cacheFileBytes()).not.toContain("x-cookie-canary");
 		expect(cacheFileBytes()).not.toContain("cache-only-canary-X2m8");
+		expect(cacheFileBytes()).not.toContain("Zm9vOmJhcg==");
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");
 		expect(cacheFileBytes()).not.toContain("/root#top");

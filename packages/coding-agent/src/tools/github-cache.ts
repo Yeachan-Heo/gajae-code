@@ -738,7 +738,16 @@ function scrubCacheText(text: string, diff = false): string {
 		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
 		"$1 «redacted»",
 	);
-	const authHeaders = maskBoundedAuthorizationHeaders(withoutParameterizedAuth);
+	const withoutLineAuth = withoutParameterizedAuth
+		.replace(
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
+			"$1$2$3 «redacted»",
+		)
+		.replace(
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s|;"'`&,]+)/gi,
+			"$1$2$3$4$5«redacted»",
+		);
+	const authHeaders = maskBoundedAuthorizationHeaders(withoutLineAuth);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
 	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
 	const withoutCookies = withoutBearer
