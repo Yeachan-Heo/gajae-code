@@ -1348,6 +1348,169 @@ describe("workflow mutation guard", () => {
 		).rejects.toBeInstanceOf(ToolError);
 	});
 
+	it("allows write/edit/ast_edit under .gjc/skills/<name>/ when no planning skill is active", async () => {
+		const cwd = await makeTempRoot();
+		const allowedCases: Array<[AgentTool, unknown]> = [
+			[tool("write"), { path: ".gjc/skills/foo/SKILL.md", content: "---\ndescription: x\n---\n" }],
+			[tool("write"), { path: path.join(cwd, ".gjc/skills/foo/references/notes.md"), content: "x" }],
+			[tool("edit"), { path: ".gjc/skills/foo/SKILL.md", edits: [{ old_text: "a", new_text: "b" }] }],
+			[
+				tool("edit", { mode: "apply_patch", customWireName: "apply_patch" }),
+				{ input: "*** Begin Patch\n*** Add File: .gjc/skills/foo/SKILL.md\n+x\n*** End Patch\n" },
+			],
+			[tool("ast_edit"), { paths: [".gjc/skills/foo/scripts/run.ts"], ops: [{ pat: "foo", out: "bar" }] }],
+		];
+		for (const [targetTool, args] of allowedCases) {
+			const decision = await getWorkflowMutationDecision({ cwd, sessionId: "session-a", tool: targetTool, args });
+			expect(decision.blocked).toBe(false);
+		}
+		await assertWorkflowMutationRawPathsAllowed({ cwd, rawPaths: [".gjc/skills/foo/SKILL.md"] });
+	});
+
+	it("keeps the .gjc/skills directory itself, other .gjc paths, and .. escapes blocked", async () => {
+		const cwd = await makeTempRoot();
+		for (const rawPath of [
+			".gjc/skills",
+			".gjc/skills/",
+			".gjc/skills/.",
+			".gjc/skills/foo/..",
+			".gjc/skills/../state/skill-active-state.json",
+			".gjc/skills/foo/../../state/sessions/session-a/ralplan-state.json",
+			".gjc/skills/../plans/plan.md",
+			".gjc/skills/../x",
+			".gjc/skills-evil/foo/SKILL.md",
+			".gjc/state/skill-active-state.json",
+			".gjc/plans/plan.md",
+			".gjc/specs/spec.md",
+			".gjc/_session-session-a/skills/foo/SKILL.md",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: rawPath, content: "x" },
+			});
+			expect({ rawPath, blocked: decision.blocked }).toEqual({ rawPath, blocked: true });
+			expect(decision.message).toContain("runtime-owned");
+			await expect(
+				assertWorkflowMutationRawPathsAllowed({ cwd, rawPaths: [rawPath], forceOverride: true }),
+			).rejects.toBeInstanceOf(ToolError);
+		}
+		const mixed = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("ast_edit"),
+			args: { paths: [".gjc/skills/foo/SKILL.md", ".gjc/state/ralplan-state.json"], ops: [{ pat: "a", out: "b" }] },
+		});
+		expect(mixed.blocked).toBe(true);
+		expect(mixed.reason).toBe("workflow-state-target");
+	});
+
+	it("blocks .gjc/skills symlinks and hardlinks whose real target is other .gjc state", async () => {
+		const cwd = await makeTempRoot();
+		const stateDir = path.join(cwd, ".gjc", "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		const stateFile = path.join(stateDir, "skill-active-state.json");
+		await Bun.write(stateFile, "{}\n");
+		const skillsDir = path.join(cwd, ".gjc", "skills");
+		await fs.mkdir(path.join(skillsDir, "real"), { recursive: true });
+		await fs.symlink(stateDir, path.join(skillsDir, "link"));
+		await fs.symlink(stateFile, path.join(skillsDir, "real", "file-link.json"));
+		await fs.symlink(path.join(cwd, ".gjc"), path.join(skillsDir, "gjc-root"));
+		await fs.link(stateFile, path.join(skillsDir, "real", "hard.json"));
+
+		for (const rawPath of [
+			".gjc/skills/link/skill-active-state.json",
+			".gjc/skills/link/new-file.json",
+			".gjc/skills/real/file-link.json",
+			".gjc/skills/gjc-root/plans/plan.md",
+			".gjc/skills/gjc-root/skills",
+			".gjc/skills/real/hard.json",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: rawPath, content: "x" },
+			});
+			expect({ rawPath, blocked: decision.blocked }).toEqual({ rawPath, blocked: true });
+			expect(decision.message).toContain("runtime-owned");
+			await expect(assertWorkflowMutationRawPathsAllowed({ cwd, rawPaths: [rawPath] })).rejects.toBeInstanceOf(
+				ToolError,
+			);
+		}
+
+		// A real skill directory beside the links stays writable.
+		const allowed = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("write"),
+			args: { path: ".gjc/skills/real/SKILL.md", content: "x" },
+		});
+		expect(allowed.blocked).toBe(false);
+	});
+
+	it("follows a .gjc/skills root symlink only when its real target stays outside other .gjc state", async () => {
+		const shared = await makeTempRoot();
+		await fs.mkdir(path.join(shared, ".agents", "skills"), { recursive: true });
+		await fs.mkdir(path.join(shared, ".gjc"), { recursive: true });
+		await fs.symlink("../.agents/skills", path.join(shared, ".gjc", "skills"));
+		const sharedDecision = await getWorkflowMutationDecision({
+			cwd: shared,
+			sessionId: "session-a",
+			tool: tool("write"),
+			args: { path: ".gjc/skills/foo/SKILL.md", content: "x" },
+		});
+		expect(sharedDecision.blocked).toBe(false);
+
+		const hostile = await makeTempRoot();
+		await fs.mkdir(path.join(hostile, ".gjc", "state"), { recursive: true });
+		await fs.symlink("state", path.join(hostile, ".gjc", "skills"));
+		const hostileDecision = await getWorkflowMutationDecision({
+			cwd: hostile,
+			sessionId: "session-a",
+			tool: tool("write"),
+			args: { path: ".gjc/skills/skill-active-state.json", content: "x" },
+		});
+		expect(hostileDecision.blocked).toBe(true);
+		expect(hostileDecision.message).toContain("runtime-owned");
+	});
+
+	it("keeps .gjc/skills writes blocked by the planning phase boundary", async () => {
+		for (const [skill, phase, message] of [
+			["deep-interview", "interviewing", DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE],
+			["ralplan", "planner", RALPLAN_MUTATION_BLOCK_MESSAGE],
+		] as const) {
+			const cwd = await makeTempRoot();
+			await writeActiveSkill(cwd, skill, phase);
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: ".gjc/skills/foo/SKILL.md", content: "x" },
+			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.reason).toBe("phase-boundary");
+			expect(decision.message).toBe(message);
+			await expect(
+				assertWorkflowMutationRawPathsAllowed({
+					cwd,
+					sessionId: "session-a",
+					rawPaths: [".gjc/skills/foo/SKILL.md"],
+				}),
+			).rejects.toThrow(message);
+			// forceOverride lifts only the planning boundary; the skill path then follows the always-on rule.
+			const forced = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: ".gjc/skills/foo/SKILL.md", content: "x" },
+				forceOverride: true,
+			});
+			expect(forced.blocked).toBe(false);
+		}
+	});
+
 	it("BashTool-shaped product mutation throws ToolError and leaves files byte-identical (#2698 / #2665)", async () => {
 		// Mirrors the agent-session bash wrapper: assertWorkflowMutationAllowed runs
 		// before BashTool.execute. A blocked mutation must not touch product or
@@ -2042,6 +2205,23 @@ describe("bash scanner quoting model", () => {
 		expect(decision.blocked).toBe(true);
 		expect(decision.reason).toBe("workflow-state-target");
 		expect(decision.message).toContain("runtime-owned");
+
+		const skillWrite = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'open(".gjc/skills/foo/SKILL.md", "w").write("x")\n' },
+		});
+		expect(skillWrite.blocked).toBe(false);
+		// The same write form is extracted: aimed through `..` at state, it is refused.
+		const escapedWrite = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'open(".gjc/skills/../state/skill-active-state.json", "w").write("x")\n' },
+		});
+		expect(escapedWrite.blocked).toBe(true);
+		expect(escapedWrite.reason).toBe("workflow-state-target");
 	});
 
 	it("blocks a qualified copy or rename destination when a gap precedes the attribute", async () => {
