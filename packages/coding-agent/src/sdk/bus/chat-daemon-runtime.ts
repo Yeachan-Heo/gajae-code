@@ -774,8 +774,11 @@ export class ChatDaemonRuntime {
 				: undefined;
 		if (typeof content !== "string") return;
 		// Use stable publication ID for notifications so replays are idempotent
-		const stableNotificationPublicationId = publicationId ?? 
-			(correlated.seq !== undefined ? `seq:${correlated.seq}:${sessionId}` : undefined);
+		const stableNotificationPublicationId =
+			publicationId ??
+			(correlated.seq !== undefined
+				? `${sessionId}:${correlated.generation ?? attachment.generation}:${correlated.seq}`
+				: undefined);
 		if (this.#discord)
 			await this.#trackOutbound(
 				this.#discord.notify({
@@ -783,7 +786,9 @@ export class ChatDaemonRuntime {
 					endpointGeneration: attachment.generation,
 					attachmentAuthorityId: attachment.authorityId,
 					content,
-					...(stableNotificationPublicationId === undefined ? {} : { publicationId: stableNotificationPublicationId }),
+					...(stableNotificationPublicationId === undefined
+						? {}
+						: { publicationId: stableNotificationPublicationId }),
 					...(notification.type === "action_needed"
 						? { actionId: notification.id, options: notification.options }
 						: {}),

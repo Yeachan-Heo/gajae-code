@@ -2531,7 +2531,9 @@ export class SessionRouter {
 					}
 				}
 				const publicationId =
-					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
+					seq !== undefined && outerGeneration !== undefined
+						? `${attached.sessionId}:${outerGeneration}:${seq}`
+						: undefined;
 				const coordinateFree = coordinateFreeRouterFrame(correlated);
 				const notificationFrame: SessionRouterFrame =
 					publicationId === undefined
