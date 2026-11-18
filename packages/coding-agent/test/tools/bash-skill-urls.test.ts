@@ -19,6 +19,7 @@ import {
 	expandSkillUrls,
 	refuseShellBearingRulePath,
 	resolveSkillUrl,
+	windowsPathIsInside,
 } from "../../src/tools/bash-skill-urls";
 import { ToolError } from "../../src/tools/tool-errors";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
@@ -1530,6 +1531,31 @@ describe("refuseShellBearingRulePath", () => {
 		]) {
 			expect(() => refuseShellBearingRulePath(resolvedPath)).toThrow(/shell syntax/);
 		}
+	});
+});
+
+/**
+ * The platform branch a POSIX host cannot reach. `path.win32.relative` folds
+ * case, so it reports a case-variant spelling of the root as the root itself;
+ * this comparison is what keeps a case-variant sibling directory out.
+ */
+describe("windowsPathIsInside", () => {
+	it("accepts the root and its descendants", () => {
+		expect(windowsPathIsInside("C:\\work\\Repo", "C:\\work\\Repo")).toBe(true);
+		expect(windowsPathIsInside("C:\\work\\Repo", "C:\\work\\Repo\\.agent\\rules\\x.md")).toBe(true);
+		expect(windowsPathIsInside("C:\\", "C:\\work\\x")).toBe(true);
+	});
+
+	it("rejects a case-variant spelling of the root or of a parent", () => {
+		// `path.win32.relative` answers "" for all three of these.
+		expect(windowsPathIsInside("C:\\work\\Repo", "C:\\work\\repo")).toBe(false);
+		expect(windowsPathIsInside("C:\\work\\Repo", "C:\\work\\repo\\rule.md")).toBe(false);
+		expect(windowsPathIsInside("C:\\work\\Repo", "c:\\work\\Repo\\rule.md")).toBe(false);
+	});
+
+	it("rejects a path outside the root", () => {
+		expect(windowsPathIsInside("C:\\work\\Repo", "C:\\work\\Repo2\\rule.md")).toBe(false);
+		expect(windowsPathIsInside("C:\\work\\Repo", "D:\\work\\Repo\\rule.md")).toBe(false);
 	});
 });
 

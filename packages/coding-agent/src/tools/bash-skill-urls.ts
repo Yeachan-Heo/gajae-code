@@ -346,11 +346,23 @@ function shellEscape(p: string): string {
 const SESSION_URL_ESCAPE = "URL is outside this session and cannot be expanded in a bash command";
 
 /**
+ * Case-exact prefix rule for Windows spellings. `path.relative` answers `""` for a
+ * case-variant spelling of the root as well, so the comparison is made on the
+ * resolved spellings directly. Both arguments must be absolute and resolved.
+ * Exported because a POSIX host cannot exercise the platform branch of
+ * {@link pathStaysInside} that depends on it.
+ */
+export function windowsPathIsInside(root: string, candidate: string): boolean {
+	return candidate === root || candidate.startsWith(root.endsWith("\\") ? root : `${root}\\`);
+}
+
+/**
  * True when `candidate` is `root` or below it. Windows resolves `path.relative`
  * without regard to case, so a case-variant sibling directory such as
- * `C:\work\proj` counts as inside `C:\work\Proj` even on a volume or directory
- * that is case-sensitive. Every caller here compares two canonical paths or two
- * paths derived from one spelling, so on Windows the shared prefix has to match
+ * `C:\work\proj` counts as inside `C:\work\Proj` — and answers `""` for a
+ * case-variant spelling of the root itself — even on a volume or directory that
+ * is case-sensitive. Every caller here compares two canonical paths or two paths
+ * derived from one spelling, so on Windows the shared prefix has to match
  * exactly as well: a case-insensitive volume canonicalizes both sides to one
  * spelling, and a case-sensitive one keeps their real spellings apart.
  */
@@ -358,10 +370,10 @@ function pathStaysInside(root: string, candidate: string): boolean {
 	const resolvedRoot = path.resolve(root);
 	const resolvedCandidate = path.resolve(candidate);
 	const relative = path.relative(resolvedRoot, resolvedCandidate);
-	if (relative === "") return true;
-	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
-	if (process.platform !== "win32") return true;
-	return resolvedCandidate.slice(0, resolvedRoot.length) === resolvedRoot;
+	if (relative !== "" && (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) {
+		return false;
+	}
+	return process.platform !== "win32" || windowsPathIsInside(resolvedRoot, resolvedCandidate);
 }
 
 function isStrictlyInside(root: string, candidate: string): boolean {
@@ -405,9 +417,16 @@ async function discoveredAncestorRulePath(sessionCwd: string, sourcePath: string
 		for (const dirName of PROJECT_RULE_DIR_NAMES) {
 			const lexicalRuleDir = path.join(ancestor.lexical, dirName, "rules");
 			const canonicalRuleDir = path.join(ancestor.canonical, dirName, "rules");
-			const sourceIsInRuleDir =
-				pathStaysInside(lexicalRuleDir, lexical) || pathStaysInside(canonicalRuleDir, lexical);
-			if (sourceIsInRuleDir && pathStaysInside(canonicalRuleDir, realTarget)) return realTarget;
+			if (!pathStaysInside(lexicalRuleDir, lexical) && !pathStaysInside(canonicalRuleDir, lexical)) continue;
+			// The names above are synthesized, so on a case-insensitive volume an
+			// on-disk `.AGENT` would not match the synthesized `.agent`. Take the
+			// resolved spelling only when it names the same path with different
+			// casing: realpath also follows a link at the rules directory itself,
+			// and a linked rules directory must not widen the boundary to its target.
+			const resolvedRuleDir = await canonicalPathOrAncestor(canonicalRuleDir, SESSION_URL_ESCAPE);
+			const ruleDirSpelling =
+				resolvedRuleDir.toLowerCase() === canonicalRuleDir.toLowerCase() ? resolvedRuleDir : canonicalRuleDir;
+			if (pathStaysInside(ruleDirSpelling, realTarget)) return realTarget;
 		}
 	}
 	return undefined;
@@ -434,13 +453,18 @@ async function discoveredUserRulePath(sourcePath: string): Promise<string | unde
 		if (realRule !== realTarget) continue;
 		for (const dirName of PROJECT_RULE_DIR_NAMES) {
 			const ruleRoot = path.join(home, dirName, "rules");
-			if (!pathStaysInside(ruleRoot, lexical) || !pathStaysInside(ruleRoot, ruleLexical)) continue;
-			let realRoot = ruleRoot;
+			let realRoot: string;
 			try {
 				realRoot = await fs.realpath(ruleRoot);
 			} catch {
 				continue;
 			}
+			// The physical rules directory is the trust anchor. Accepting either
+			// spelling keeps an on-disk `.AGENT` or a differently cased home from
+			// rejecting a rule that really does live in the trusted rules directory.
+			const sourceIsInRuleDir = pathStaysInside(ruleRoot, lexical) || pathStaysInside(realRoot, lexical);
+			const ruleIsInRuleDir = pathStaysInside(ruleRoot, ruleLexical) || pathStaysInside(realRoot, ruleLexical);
+			if (!sourceIsInRuleDir || !ruleIsInRuleDir) continue;
 			if (pathStaysInside(realRoot, realTarget)) return realTarget;
 		}
 	}
