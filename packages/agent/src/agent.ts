@@ -534,6 +534,7 @@ export class Agent {
 		error: undefined,
 	};
 	#contextRevision = 0;
+	#historyRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
@@ -957,6 +958,15 @@ export class Agent {
 		return this.#contextRevision;
 	}
 
+	/**
+	 * Revision of the committed message history alone. Unlike `contextRevision`,
+	 * prompt, tool and model publications do not advance it, so callers that need
+	 * to fence message ownership independently can compare only this counter.
+	 */
+	get historyRevision(): number {
+		return this.#historyRevision;
+	}
+
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
 		return this.#appendOnlyContext;
 	}
@@ -1305,6 +1315,7 @@ export class Agent {
 		}
 		this.#state.messages = ms.slice();
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	appendMessage(m: AgentMessage) {
@@ -1313,6 +1324,7 @@ export class Agent {
 		// via slice() at the API boundary, so no caller relies on per-append array identity.
 		this.#state.messages.push(m);
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	popMessage(): AgentMessage | undefined {
@@ -1320,6 +1332,7 @@ export class Agent {
 		const removed = this.#state.messages.at(-1);
 		this.#state.messages = messages;
 		this.#contextRevision++;
+		this.#historyRevision++;
 
 		if (removed && this.#state.streamMessage === removed) {
 			this.#state.streamMessage = null;
@@ -1329,11 +1342,13 @@ export class Agent {
 	}
 
 	/**
-	 * For callers that mutate committed messages or the system prompt in place
-	 * outside Agent-owned mutators.
+	 * For callers that mutate committed messages in place outside Agent-owned
+	 * mutators. Prompt mutations must use `setSystemPrompt` so they stay out of the
+	 * history revision.
 	 */
 	touchContext(): void {
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	/**
@@ -1658,6 +1673,7 @@ export class Agent {
 	clearMessages() {
 		this.#state.messages = [];
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	abort() {
@@ -1779,6 +1795,7 @@ export class Agent {
 	reset() {
 		this.#state.messages = [];
 		this.#contextRevision++;
+		this.#historyRevision++;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls = new Set<string>();

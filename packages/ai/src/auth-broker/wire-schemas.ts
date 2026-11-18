@@ -11,11 +11,21 @@
  * `hasOnlyFields` allowlist for the same effect.
  */
 import * as z from "zod/v4";
-import { isCanonicalMCPOAuthBinding, REMOTE_REFRESH_SENTINEL } from "../auth-storage";
+import {
+	isCanonicalMCPOAuthBinding,
+	isMCPOAuthBindingTransportAdmitted,
+	REMOTE_REFRESH_SENTINEL,
+} from "../auth-storage";
 import { usageReportSchema } from "../usage";
 
 // ─── Credential payloads ───────────────────────────────────────────────────
 
+/**
+ * Persisted wire shape of an MCP OAuth binding. This accepts a legacy
+ * non-loopback HTTP token endpoint so a single stale row cannot fail the whole
+ * snapshot; transport admission (`isMCPOAuthBindingTransportAdmitted`) is
+ * enforced where the binding is written and where its credentials are used.
+ */
 export const mcpOAuthBindingSchema = z
 	.object({
 		resourceOrigin: z.string().min(1),
@@ -63,11 +73,22 @@ export const apiKeyCredentialSchema = z
 	})
 	.strict();
 
-/** Discriminated union accepted on POST /v1/credential (writes). */
-export const writableAuthCredentialSchema = z.discriminatedUnion("type", [
-	oauthCredentialSchema,
-	apiKeyCredentialSchema,
-]);
+/**
+ * Discriminated union accepted on POST /v1/credential (writes). Writes are an
+ * admission boundary: a new binding must carry the cleartext policy, so only
+ * rows persisted before the policy existed can be insecure on read.
+ */
+export const writableAuthCredentialSchema = z
+	.discriminatedUnion("type", [oauthCredentialSchema, apiKeyCredentialSchema])
+	.refine(
+		credential =>
+			credential.type !== "oauth" ||
+			!credential.mcpBinding ||
+			isMCPOAuthBindingTransportAdmitted(credential.mcpBinding),
+		{
+			message: "MCP OAuth token endpoint must use HTTPS unless the host is loopback",
+		},
+	);
 
 /** Discriminated union returned in snapshots (refresh is sentinel for OAuth). */
 export const snapshotCredentialSchema = z.discriminatedUnion("type", [
