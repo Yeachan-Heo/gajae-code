@@ -139,6 +139,29 @@ describe("native runtime view transitions", () => {
 		await session.waitForIdle();
 	});
 
+	it("refuses raw new-session ingress before switching the native transcript", async () => {
+		const opened = await fixture();
+		const session = opened.result.session;
+		expect((await opened.runtime.prompt.prompt("before refused rotation")).kind).toBe("applied");
+		await session.waitForIdle();
+		const file = session.sessionFile;
+		if (!file) throw new Error("Missing native transcript");
+		const bytes = await Bun.file(file).text();
+		const lifecycle = { ...session.sessionLifecycle };
+		const identity = session.sessionId;
+		const operation = currentEmbeddedResumeOperation(opened.handle);
+
+		await expect(session.newSession()).rejects.toBeInstanceOf(NativeRuntimeRefusal);
+		expect(session.sessionLifecycle).toEqual(lifecycle);
+		expect(session.sessionId).toBe(identity);
+		expect(session.sessionFile).toBe(file);
+		expect(currentEmbeddedResumeOperation(opened.handle)).toBe(operation);
+		expect(await Bun.file(file).text()).toBe(bytes);
+		expect((await opened.runtime.prompt.prompt("after refused rotation")).kind).toBe("applied");
+		await session.waitForIdle();
+		expect(userEntries(session)).toHaveLength(2);
+	});
+
 	it("refuses a view transition attempted outside its own admitted dispatch", async () => {
 		const opened = await fixture();
 		const session = opened.result.session;

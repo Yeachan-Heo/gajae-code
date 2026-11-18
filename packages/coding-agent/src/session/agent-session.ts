@@ -21833,6 +21833,11 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
+		try {
+			assertNativeRuntimeInvocation(this);
+		} catch (error) {
+			return Promise.reject(error);
+		}
 		if (this.#newSessionTransition) return this.#newSessionTransition;
 		// /drop deletes the predecessor after the successor is live. A shared session's
 		// transcript cannot be deleted by this opener (#7824): refuse before switching
