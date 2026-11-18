@@ -746,6 +746,8 @@ describe("github view cache persistence", () => {
 			`Binary files /dev/null and "b/${encoded}" differ`,
 			`Binary files a/report and notes and "b/${encoded}" differ`,
 			`Binary files a/plain and b/token='left and ${secret}' differ`,
+			`Binary files a/plain and "b/name\\ntoken=${secret} and b/suffix" differ`,
+			`Binary files a/token='left and b/right' and /dev/null differ`,
 			"",
 		].join("\n");
 		putCached({
@@ -848,6 +850,11 @@ describe("github view cache persistence", () => {
 			"first|second",
 			"---|---",
 			"https://docs.example|'person@example.test'",
+			"|https://alice:pa\\|ss@example.test/z|keep|",
+			"```text",
+			"https://alice:opaque|part@example.test/x",
+			"---|---",
+			"```",
 		].join("\n");
 		const url = `https://github.com/${TEST_REPO}/issues/92`;
 		putCached({
@@ -868,6 +875,8 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.body).toContain("https://example.test/x");
 		expect(cached?.payload.body).toContain("https://example.test/y");
 		expect(cached?.payload.body).toContain("first|second\n---|---\nhttps://docs.example|'person@example.test'");
+		expect(cached?.payload.body).toContain("```text\nhttps://example.test/x\n---|---\n```");
+		expect(cached?.payload.body).toContain("|https://example.test/z|keep|");
 		expect(cached?.payload.body).not.toContain("opaque");
 		expect(cached?.payload.body).not.toContain("alice:demo");
 	});

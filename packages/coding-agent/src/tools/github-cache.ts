@@ -467,27 +467,41 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
  * set is used, so a compact table cannot be merged into one URL.
  */
 const SCHEME_USERINFO = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
-const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>|]*@/gi;
+const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:\\\||[^\r\n /?#"`<>|])*@/gi;
 const RELATIVE_USERINFO = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>]*@/g;
-const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g;
+const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\/\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
 const ESCAPED_USERINFO = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
-const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\\\/\\\/[^\r\n /?#"`<>|]*@/g;
+const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9+.:])\\\/\\\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
 const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
 
 function tableRowFlags(lines: string[]): boolean[] {
-	const flags = lines.map(line => {
-		const trimmed = line.trim();
-		return trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"));
-	});
+	const flags = new Array<boolean>(lines.length).fill(false);
+	const fenced = new Array<boolean>(lines.length).fill(false);
+	let inFence = false;
+	for (let i = 0; i < lines.length; i++) {
+		const isFence = /^(?:```|~~~)/.test((lines[i] ?? "").trim());
+		fenced[i] = inFence || isFence;
+		if (isFence) inFence = !inFence;
+	}
+	for (let i = 0; i < lines.length; i++) {
+		if (fenced[i] === true) continue;
+		const trimmed = (lines[i] ?? "").trim();
+		if (trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"))) flags[i] = true;
+	}
+	let covered = -1;
 	for (let i = 1; i < lines.length; i++) {
+		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
 		if (!TABLE_DELIMITER_ROW.test(lines[i] ?? "") || !(lines[i - 1] ?? "").includes("|")) continue;
 		flags[i - 1] = true;
 		flags[i] = true;
-		for (let j = i + 1; j < lines.length; j++) {
+		let j = i + 1;
+		for (; j < lines.length; j++) {
+			if (fenced[j] === true) break;
 			const row = lines[j] ?? "";
 			if (row.trim() === "" || !row.includes("|")) break;
 			flags[j] = true;
 		}
+		covered = j - 1;
 	}
 	return flags;
 }
