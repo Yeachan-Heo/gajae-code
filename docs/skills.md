@@ -100,6 +100,12 @@ cp my-skill/SKILL.md ~/.gjc/agent/skills/my-skill/SKILL.md
 Start a new session and invoke the skill with `/skill:my-skill`, or let the
 model discover it with the `skill_discovery` tool.
 
+The agent's file tools (`write`, `edit`, `ast_edit`, `python`/`eval`) may create
+and edit files under `.gjc/skills/<name>/` outside planning phases; the rest of
+`.gjc/**` (and the `.gjc/skills` directory itself) stays runtime-owned. A path
+whose real target (after symlinks or hardlinks) leaves the skills root for other
+`.gjc` state is still refused.
+
 ## Trust and disable
 
 Skill discovery is controlled by three settings, all on by default:
