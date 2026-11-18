@@ -76,23 +76,23 @@ function escapeXmlText(input: string): string {
 	return input.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function decodeCodePoint(hex: string): string {
+/**
+ * Decoded character of one `\uXXXX` escape. Control characters stay spelled out unless the
+ * caller asks for them: they are identity evidence for a field name (the credential labels
+ * accept a tab separator), but they must never reach the printed dump.
+ */
+function decodeCodePoint(hex: string, allowControlCharacters: boolean): string {
 	const codePoint = Number.parseInt(hex, 16);
-	if (
-		!Number.isFinite(codePoint) ||
-		codePoint < 0x20 ||
-		(codePoint >= 0x7f && codePoint <= 0x9f) ||
-		(codePoint >= 0xd800 && codePoint <= 0xdfff)
-	) {
+	if (!Number.isFinite(codePoint) || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return `\\u${hex}`;
+	if (!allowControlCharacters && (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f))) {
 		return `\\u${hex}`;
 	}
 	return String.fromCharCode(codePoint);
 }
 
-function decodeUnicodeEscapeText(input: string): string {
-	return input
-		.replace(/\\\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => decodeCodePoint(hex))
-		.replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => decodeCodePoint(hex));
+function decodeUnicodeEscapeText(input: string, allowControlCharacters = false): string {
+	const decode = (_match: string, hex: string) => decodeCodePoint(hex, allowControlCharacters);
+	return input.replace(/\\\\u([0-9a-fA-F]{4})/g, decode).replace(/\\u([0-9a-fA-F]{4})/g, decode);
 }
 
 /** Redact the private-key blocks that a caller located in a wider source string. */
@@ -175,6 +175,14 @@ function decodeEscapedText(input: string): string {
 	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input));
 }
 
+/**
+ * Both escape layers including control characters: identity evidence for a field name, because
+ * the credential labels accept a tab separator that an encoded name can carry. Never printed.
+ */
+function decodeEscapedIdentity(input: string): string {
+	return decodeUnicodeEscapeText(decodeUnicodeEscapeText(input, true), true);
+}
+
 /** An integer-like key is enumerated before every other field, so it must keep its spelling. */
 const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
 
@@ -188,14 +196,16 @@ const ARRAY_INDEX_NAME = /^(?:0|[1-9]\d*)$/;
  * credential-shaped once resolved, and it is this prepass — not a later pass over the
  * serialized text — that has to recognize it.
  * The spelling each entry is stored under keeps the pairing stream in its original order and
- * keeps every entry: a name two spellings claim, or one that would move an integer-like key,
- * stays as it arrived. No entry is ever renamed to a spelling the payload did not contain.
+ * keeps every entry: a name another entry also claims or already authored, or one that would
+ * move an integer-like key, stays as it arrived. No entry is renamed into a spelling another
+ * entry holds, and no spelling is invented.
  */
 function decodeValueStrings(value: unknown): unknown {
 	if (typeof value === "string") return decodeEscapedText(value);
 	if (Array.isArray(value)) return value.map(decodeValueStrings);
 	if (value === null || typeof value !== "object") return value;
 	const source = Object.entries(value);
+	const authored = new Set(Object.keys(value));
 	const claims = new Map<string, number>();
 	for (const [key] of source) {
 		const name = decodeEscapedText(key);
@@ -204,20 +214,23 @@ function decodeValueStrings(value: unknown): unknown {
 	const decoded = Object.create(null) as Record<string, unknown>;
 	for (const [key, nested] of source) {
 		const name = decodeEscapedText(key);
-		// Only a name one entry claims and that keeps the enumeration order is printed decoded; the
-		// entry that already spells it that way would keep it anyway, and every other spelling stays.
-		const field = name === key || (claims.get(name) === 1 && !ARRAY_INDEX_NAME.test(name)) ? name : key;
-		decoded[field] = decodeValueStrings(nested);
+		// A decoded spelling is printed only when this entry is its only claimant, it keeps the
+		// enumeration order, and no sibling already authored that exact spelling. A sibling keeps
+		// its own key when it cannot be renamed, so decoding into an authored spelling would
+		// overwrite one of the two entries — a chained escape can decode to exactly that text.
+		const printed = name === key || (claims.get(name) === 1 && !authored.has(name) && !ARRAY_INDEX_NAME.test(name));
+		decoded[printed ? name : key] = decodeValueStrings(nested);
 	}
 	return decoded;
 }
 
 /**
  * The name a stored field stands for, so recognition reads the resolved spelling even when a
- * sibling forced this entry to keep the one it arrived with.
+ * sibling forced this entry to keep the one it arrived with. Control characters are resolved
+ * too: an encoded tab between label parts has to classify like the tab itself.
  */
 function fieldIdentity(key: string): string {
-	return decodeEscapedText(key);
+	return decodeEscapedIdentity(key);
 }
 
 /**
@@ -256,7 +269,7 @@ function serializeParameterValue(value: unknown): string {
  * header collection.
  */
 const STRUCTURED_REDACTION = {
-	headerPairs: (key: string | undefined) => isHeaderCollectionKey(key === undefined ? undefined : fieldIdentity(key)),
+	headerPairs: isHeaderCollectionKey,
 	resolveKey: fieldIdentity,
 } as const;
 

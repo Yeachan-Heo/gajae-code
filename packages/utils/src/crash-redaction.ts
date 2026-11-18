@@ -369,7 +369,9 @@ export interface StructuredRedactionOptions {
 }
 
 function allowsHeaderPairs(options: StructuredRedactionOptions | undefined, key: string | undefined): boolean {
-	return typeof options?.headerPairs === "function" ? options.headerPairs(key) : options?.headerPairs === true;
+	const headerPairs = options?.headerPairs;
+	if (typeof headerPairs !== "function") return headerPairs === true;
+	return headerPairs(key === undefined ? undefined : resolvedField(options, key));
 }
 
 function resolvedField(options: StructuredRedactionOptions | undefined, key: string): string {

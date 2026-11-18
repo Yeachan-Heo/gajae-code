@@ -667,6 +667,50 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parameterValue(dumped, "payload")).toBe('{"api_key":"«redacted»"}');
 	});
 
+	it("keeps both entries when a chained escape decodes to an authored sibling name", () => {
+		// `n\u005cu005cu006fte` decodes twice to `n\u006fte`, which is an authored sibling key that
+		// keeps its own spelling, so decoding into it would overwrite one of the two entries.
+		const authored = "n\\u006fte";
+		const chained = "n\\u005cu005cu006fte";
+		const orders: Record<string, unknown>[] = [
+			{ note: "VALUE_C", [authored]: "VALUE_U", [chained]: "VALUE_T" },
+			{ [chained]: "VALUE_T", [authored]: "VALUE_U", note: "VALUE_C" },
+		];
+
+		for (const args of orders) {
+			const dumped = dump([
+				assistant([{ type: "toolCall", id: "call-chained-escape-name", name: "request", arguments: args }], 1),
+			] as AgentMessage[]);
+
+			for (const value of ["VALUE_C", "VALUE_U", "VALUE_T"]) {
+				expect(dumped).toContain(value);
+			}
+		}
+	});
+
+	it("classifies an encoded tab separator in a credential name like the tab itself", () => {
+		// The credential labels accept a tab separator, so the encoded spelling has to resolve to
+		// the same identity; the printed dump still keeps control characters spelled out.
+		const encodedSecret = "encoded-tab-secret";
+		const directSecret = "direct-tab-secret";
+		const dumped = dump([
+			assistant(
+				[
+					{
+						type: "toolCall",
+						id: "call-encoded-tab-name",
+						name: "request",
+						arguments: { payload: { "client\\u0009secret": encodedSecret, "client\tsecret": directSecret } },
+					},
+				],
+				1,
+			),
+		] as AgentMessage[]);
+
+		expect(dumped).not.toContain(encodedSecret);
+		expect(dumped).not.toContain(directSecret);
+	});
+
 	it("keeps an ordinary decoded JSON blob in the session dump", () => {
 		const payload = '{"path": "src/auth", "note": "ok"}';
 		const dumped = dump([
