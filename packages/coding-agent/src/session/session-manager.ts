@@ -12473,6 +12473,7 @@ export class SessionManager {
 	}
 
 	#moveRelocationRewrite = false;
+	#hadSessionFileOnMoveRewrite = false;
 
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
 		// assertLegacyMutationAllowed now allows moves within exclusive transitions (#7856)
@@ -12920,9 +12921,11 @@ export class SessionManager {
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
+				this.#hadSessionFileOnMoveRewrite = hadSessionFile;
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 				await this.#rewriteFileForMove();
 			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
+				this.#hadSessionFileOnMoveRewrite = hadSessionFile;
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 				await this.#rewriteFileForMove();
 			} else {
@@ -17321,31 +17324,84 @@ export class SessionManager {
 	async #rewriteFileForMove(): Promise<void> {
 		this.#moveRelocationRewrite = true;
 		try {
-			// For shared/append-only sessions, only patch the header (cwd update) without full rewrite.
-			// This preserves entries appended by other openers and follows the append-only protocol.
-			// Skip the rewrite for sessions marked as shared via admission or during shared append.
-			// Also skip if the destination file has entries not in memory (concurrent openers).
-			// However, always do a full rewrite if the file doesn't exist yet (need to create it from memory).
-			const isSharedSession = this.#sharedAppendOnly || this.#publishedSharedSession(this.#sessionId ?? "");
-			let hasOtherOwnersEntries = false;
-			const fileExists = this.#sessionFile && this.#storage.existsSync(this.#sessionFile);
-			if (fileExists && !isSharedSession && this.#sessionFile) {
-				// Check if destination has entries not in memory (from concurrent openers)
-				try {
-					const destinationEntries = await loadEntriesFromFile(this.#sessionFile, this.#storage);
-					if (destinationEntries.length > this.#fileEntries.length) {
-						hasOtherOwnersEntries = true;
-					}
-				} catch {
-					// If we can't read the destination file, proceed with rewrite
-				}
-			}
-			if (!isSharedSession && (!fileExists || !hasOtherOwnersEntries)) {
+			// When the session file was moved (hadSessionFileOnMoveRewrite=true), we do a header-only
+			// patch to preserve peer-appended entries and header patches.
+			// When the file didn't exist (hadSessionFileOnMoveRewrite=false), we do a full rewrite from memory.
+			if (this.#hadSessionFileOnMoveRewrite && this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
+				// File was moved: patch header line only, preserve everything else byte-for-byte
+				await this.#patchHeaderOnlyInFile();
+			} else {
+				// File didn't exist or no longer exists: full rewrite from memory
 				await this.#rewriteFile();
 			}
 		} finally {
 			this.#moveRelocationRewrite = false;
+			this.#hadSessionFileOnMoveRewrite = false;
 		}
+	}
+
+	/**
+	 * Patch only the header line in an existing file, preserving all other content byte-for-byte.
+	 * This is used when a session file is moved: we update the cwd in the header but keep all
+	 * peer-appended entries and header patches intact.
+	 */
+	async #patchHeaderOnlyInFile(): Promise<void> {
+		if (!this.#sessionFile) return;
+		const sessionFile = this.#sessionFile;
+		let fileContent: string;
+		try {
+			fileContent = await this.#storage.readText(sessionFile);
+		} catch (err) {
+			if (isEnoent(err)) {
+				// File was deleted; fall back to full rewrite
+				await this.#rewriteFile();
+				return;
+			}
+			throw err;
+		}
+
+		// Get the in-memory header with updated cwd
+		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (!header) {
+			// No header in memory; shouldn't happen, but fall back to full rewrite
+			await this.#rewriteFile();
+			return;
+		}
+
+		// Split content into lines preserving empty lines at the end
+		const lines = fileContent.endsWith("\n") ? fileContent.slice(0, -1).split("\n") : fileContent.split("\n");
+
+		if (lines.length === 0 || !lines[0]) {
+			// Empty file or no first line; fall back to full rewrite
+			await this.#rewriteFile();
+			return;
+		}
+
+		// Replace the header line (first line) with the updated header
+		const newHeaderLine = JSON.stringify(header);
+		lines[0] = newHeaderLine;
+
+		// Reconstruct the file content, preserving the final newline
+		const newContent = lines.join("\n") + (fileContent.endsWith("\n") ? "\n" : "");
+
+		// Write atomically to a temp file, then replace
+		await this.#queuePersistTask(async () => {
+			this.#withSessionPersistenceFenceSync(() => {
+				const dir = path.resolve(sessionFile, "..");
+				const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.tmp`);
+				try {
+					// Write the new content to the temp file synchronously
+					this.#storage.writeTextSync(tempPath, newContent);
+					const replacement = this.#replaceSessionFileSync(tempPath, sessionFile);
+					if (replacement.kind === "restored_previous") throw replacement.error;
+				} catch (err) {
+					void this.#storage.unlink(tempPath).catch(() => {});
+					throw toError(err);
+				}
+			});
+		});
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
 	}
 
 	async #rewriteFile(): Promise<void> {
