@@ -4894,6 +4894,11 @@ describe("ModelRegistry", () => {
 				`http://127.0.0.1:${rapidMlxServer.port}/v1`,
 			);
 			try {
+				// Credential resolution pins a value inherited at process start, so an
+				// ambient RAPID_MLX_BASE_URL would silently win over the test endpoint.
+				// Fail loudly here, inside the cleanup scope, instead of leaving the
+				// positive control to fail for an unexplained reason.
+				expect($credentialEnv("RAPID_MLX_BASE_URL")).toBe(`http://127.0.0.1:${rapidMlxServer.port}/v1`);
 				await Settings.init({
 					inMemory: true,
 					overrides: {

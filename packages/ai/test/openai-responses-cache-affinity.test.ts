@@ -85,9 +85,6 @@ async function captureOpenAIResponseHeaders(
 	const stream = streamOpenAIResponses(modelOverride, context, {
 		apiKey: "test-key",
 		...(modelOverride.baseUrl === model.baseUrl ? { authCredentialType: "oauth" as const } : {}),
-		// A loopback base URL uses the proxy-bypassing transport instead of the
-		// ambient `fetch`, so inject the stub explicitly.
-		fetch: global.fetch,
 		...options,
 	});
 
