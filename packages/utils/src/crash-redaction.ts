@@ -121,7 +121,7 @@ function maskBlocksAndContainers(text: string, spans: readonly PrivateKeySpan[])
 		...scalars.map(range => ({ ...range, container: true })),
 	]);
 	const containerMasked = applyMaskRanges(text, containerApplied);
-	const survivors = findPrivateKeySpans(containerMasked).map(span => mapMaskedRange(span, containerApplied));
+	const survivors = mapMaskedRanges(findPrivateKeySpans(containerMasked), containerApplied);
 	return applyMaskRanges(
 		text,
 		mergeMaskRanges([
@@ -164,22 +164,27 @@ function applyMaskRanges(text: string, ranges: readonly AppliedRange[]): string 
 }
 
 /**
- * Map one range of the masked text back to the original. A marker carries no block text, so a
- * block can only start and end in copied text; a position inside one is clamped to its end.
+ * Map ranges of the masked text back to the original in one forward pass.
+ * Both lists ascend and the markers never overlap, so a cursor shared across the batch keeps
+ * the mapping linear. A marker carries no block text, so a block cannot begin inside one; an
+ * endpoint that lands inside is clamped to that marker's end instead of dropping the range.
  */
-function mapMaskedRange(range: TextRange, applied: readonly AppliedRange[]): TextRange {
+function mapMaskedRanges(ranges: readonly TextRange[], applied: readonly AppliedRange[]): TextRange[] {
+	let cursor = 0;
+	let delta = 0;
 	const map = (maskedIndex: number): number => {
-		let delta = 0;
-		for (const appliedRange of applied) {
+		while (cursor < applied.length) {
+			const appliedRange = applied[cursor] as AppliedRange;
 			const maskedStart = appliedRange.start - delta;
 			const maskedEnd = maskedStart + appliedRange.marker.length;
 			if (maskedIndex < maskedStart) break;
 			if (maskedIndex < maskedEnd) return appliedRange.end;
 			delta += appliedRange.end - appliedRange.start - appliedRange.marker.length;
+			cursor += 1;
 		}
 		return maskedIndex + delta;
 	};
-	return { start: map(range.start), end: map(range.end) };
+	return ranges.map(range => ({ start: map(range.start), end: map(range.end) }));
 }
 
 const CREDENTIAL_KEY_SEPARATOR = "[._\\t -]*";
