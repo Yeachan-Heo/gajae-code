@@ -2933,39 +2933,121 @@ interface PrDiffPathToken {
 	escaped?: boolean;
 }
 
-function pushPrDiffPathToken(line: string, from: number, tokens: PrDiffPathToken[]): number {
-	const start = skipDiffHeaderSpaces(line, from);
-	if (start >= line.length) return start;
-	const token = parseDiffHeaderToken(line, start);
-	if (!token) return start;
-	tokens.push({ start, end: token.nextIndex, value: token.value, escaped: token.escaped });
-	return token.nextIndex;
+function diffGitPathTokens(line: string): PrDiffPathToken[] {
+	const trailStart = "diff --git ".length;
+	const trail = line.slice(trailStart);
+	const tokens: PrDiffPathToken[] = [];
+	if (trail.startsWith('"')) {
+		const oldToken = parseDiffQuotedToken(trail, 0);
+		if (!oldToken) return tokens;
+		tokens.push({
+			start: trailStart,
+			end: trailStart + oldToken.nextIndex,
+			value: oldToken.value,
+			escaped: oldToken.escaped,
+		});
+		const newStart = skipDiffHeaderSpaces(trail, oldToken.nextIndex);
+		if (newStart >= trail.length) return tokens;
+		const quotedNew = trail.charAt(newStart) === '"' ? parseDiffQuotedToken(trail, newStart) : undefined;
+		tokens.push({
+			start: trailStart + newStart,
+			end: quotedNew ? trailStart + quotedNew.nextIndex : line.length,
+			value: quotedNew ? quotedNew.value : trail.slice(newStart),
+			escaped: quotedNew?.escaped,
+		});
+		return tokens;
+	}
+	// An unquoted operand may contain spaces; the right-hand operand starts at
+	// the last ` b/` (or ` "b/` when only the new side is quoted).
+	const quotedSeparator = trail.indexOf(' "b/');
+	if (quotedSeparator > 0) {
+		const newToken = parseDiffQuotedToken(trail, quotedSeparator + 1);
+		if (!newToken) return tokens;
+		tokens.push({ start: trailStart, end: trailStart + quotedSeparator, value: trail.slice(0, quotedSeparator) });
+		tokens.push({
+			start: trailStart + quotedSeparator + 1,
+			end: trailStart + newToken.nextIndex,
+			value: newToken.value,
+			escaped: newToken.escaped,
+		});
+		return tokens;
+	}
+	const separator = trail.lastIndexOf(" b/");
+	if (separator <= 0) return tokens;
+	tokens.push({ start: trailStart, end: trailStart + separator, value: trail.slice(0, separator) });
+	tokens.push({ start: trailStart + separator + 1, end: line.length, value: trail.slice(separator + 1) });
+	return tokens;
+}
+
+function singlePathToken(line: string, prefix: string): PrDiffPathToken[] {
+	const start = prefix.length;
+	if (start >= line.length) return [];
+	const quoted = line.charAt(start) === '"' ? parseDiffQuotedToken(line, start) : undefined;
+	return [
+		{
+			start,
+			end: quoted ? quoted.nextIndex : line.length,
+			value: quoted ? quoted.value : line.slice(start),
+			escaped: quoted?.escaped,
+		},
+	];
+}
+
+function binaryFileTokens(line: string): PrDiffPathToken[] {
+	const prefix = "Binary files ";
+	const rest = line.slice(prefix.length);
+	const tokens: PrDiffPathToken[] = [];
+	const first = rest.startsWith('"') ? parseDiffQuotedToken(rest, 0) : undefined;
+	if (first) {
+		tokens.push({
+			start: prefix.length,
+			end: prefix.length + first.nextIndex,
+			value: first.value,
+			escaped: first.escaped,
+		});
+		const afterAnd = rest.indexOf(" and ", first.nextIndex);
+		if (afterAnd === -1) return tokens;
+		const secondStart = afterAnd + " and ".length;
+		const quotedSecond = rest.charAt(secondStart) === '"' ? parseDiffQuotedToken(rest, secondStart) : undefined;
+		const end = quotedSecond
+			? quotedSecond.nextIndex
+			: rest.endsWith(" differ")
+				? rest.length - " differ".length
+				: rest.length;
+		tokens.push({
+			start: prefix.length + secondStart,
+			end: prefix.length + end,
+			value: quotedSecond ? quotedSecond.value : rest.slice(secondStart, end),
+			escaped: quotedSecond?.escaped,
+		});
+		return tokens;
+	}
+	const andIndex = rest.indexOf(" and ");
+	if (andIndex <= 0) return tokens;
+	const secondStart = andIndex + " and ".length;
+	const end = rest.endsWith(" differ") ? rest.length - " differ".length : rest.length;
+	tokens.push({ start: prefix.length, end: prefix.length + andIndex, value: rest.slice(0, andIndex) });
+	tokens.push({
+		start: prefix.length + secondStart,
+		end: prefix.length + end,
+		value: rest.slice(secondStart, end),
+	});
+	return tokens;
 }
 
 /**
  * Path tokens on one diff header line. Git quotes each operand independently,
- * so `diff --git "a/x" b/y` is valid and both sides have to be visited.
- * Quoted tokens are decoded, unquoted ones are the literal span.
+ * so `diff --git "a/x" b/y` is valid and both sides have to be visited. A
+ * single-path header (`---`, `+++`, rename, copy) runs to end of line, and an
+ * unquoted operand may itself contain spaces.
  */
 function prDiffPathTokens(line: string): PrDiffPathToken[] {
-	const tokens: PrDiffPathToken[] = [];
-	if (line.startsWith("diff --git ")) {
-		const afterFirst = pushPrDiffPathToken(line, "diff --git ".length, tokens);
-		if (line.slice(afterFirst).trim().length > 0) pushPrDiffPathToken(line, afterFirst, tokens);
-		return tokens;
-	}
+	if (line.startsWith("diff --git ")) return diffGitPathTokens(line);
 	for (const prefix of ["--- ", "+++ ", "rename from ", "rename to ", "copy from ", "copy to "]) {
-		if (!line.startsWith(prefix)) continue;
-		pushPrDiffPathToken(line, prefix.length, tokens);
-		return tokens;
+		if (line.startsWith(prefix)) return singlePathToken(line, prefix);
 	}
-	if (line.startsWith("Binary files ")) {
-		const afterFirst = pushPrDiffPathToken(line, "Binary files ".length, tokens);
-		if (line.slice(afterFirst).startsWith(" and ")) {
-			pushPrDiffPathToken(line, afterFirst + " and ".length, tokens);
-		}
-	}
-	return tokens;
+	if (line.startsWith("Binary files ")) return binaryFileTokens(line);
+	return [];
 }
 
 const PR_DIFF_PATH_MASK = `\u0000gjc-${Math.random().toString(36).slice(2)}-diff-path-`;
@@ -3022,7 +3104,7 @@ export function maskPrDiffPathTokens(
 		restore: scrubbed => {
 			let restored = scrubbed;
 			for (let index = 0; index < sanitizedTokens.length; index += 1) {
-				restored = restored.replaceAll(`${PR_DIFF_PATH_MASK}${index}\u0000`, sanitizedTokens[index] ?? "");
+				restored = restored.replaceAll(`${PR_DIFF_PATH_MASK}${index}\u0000`, () => sanitizedTokens[index] ?? "");
 			}
 			return restored;
 		},
@@ -3126,16 +3208,6 @@ function parseDiffPathLine(line: string, prefix: string): { value: string; escap
 	return token ? { value: token.value, escaped: token.escaped } : { value: rest };
 }
 
-function parseDiffHeaderToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
-	const start = skipDiffHeaderSpaces(text, startIndex);
-	if (start >= text.length) return undefined;
-	const quoted = parseDiffQuotedToken(text, start);
-	if (quoted) return quoted;
-	const end = text.indexOf(" ", start);
-	if (end === -1) return { value: text.slice(start), nextIndex: text.length };
-	return { value: text.slice(start, end), nextIndex: end };
-}
-
 function stripPrDiffPathPrefix(value: string, prefix: "a/" | "b/"): string | undefined {
 	return value.startsWith(prefix) ? value.slice(prefix.length) : undefined;
 }
@@ -3148,14 +3220,10 @@ interface PrDiffHeaderPaths {
 }
 
 function parsePrDiffHeaderPaths(header: string): PrDiffHeaderPaths {
-	const trail = header.slice("diff --git ".length);
-	// Git quotes each operand independently, so both tokens must be parsed the
-	// same way whether or not either side is quoted. A mix like
-	// `a/plain "b/name with space"` is valid.
-	const oldToken = parseDiffHeaderToken(trail, 0);
-	if (!oldToken) return {};
-	const newToken = parseDiffHeaderToken(trail, oldToken.nextIndex);
-	if (!newToken) return {};
+	// One grammar for masking and indexing: each operand may be quoted or not,
+	// independently, and an unquoted operand may contain spaces.
+	const [oldToken, newToken] = diffGitPathTokens(header);
+	if (!oldToken || !newToken) return {};
 	return {
 		oldPath: stripPrDiffPathPrefix(oldToken.value, "a/"),
 		newPath: stripPrDiffPathPrefix(newToken.value, "b/"),

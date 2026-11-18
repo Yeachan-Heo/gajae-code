@@ -317,7 +317,8 @@ const BOUNDED_AUTHORIZATION_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-auth-`;
 function restoreMasked(scrubbed: string, prefix: string, values: readonly string[]): string {
 	let restored = scrubbed;
 	for (let index = 0; index < values.length; index += 1) {
-		restored = restored.replaceAll(`${prefix}${index}\u0000`, values[index] ?? "");
+		// Function replacer: a `$&`/`$'` sequence in sanitized text must stay literal.
+		restored = restored.replaceAll(`${prefix}${index}\u0000`, () => values[index] ?? "");
 	}
 	return restored;
 }
@@ -381,10 +382,10 @@ function maskBoundedCredentialAssignments(text: string): { text: string; restore
  */
 function stripUrlUserinfo(text: string): string {
 	const withoutSchemeUserinfo = text.replace(
-		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi,
+		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>|]*@/gi,
 		"$1",
 	);
-	return withoutSchemeUserinfo.replace(/(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>]*@/g, "//");
+	return withoutSchemeUserinfo.replace(/(?<![A-Za-z0-9+.:])\/\/[^\r\n /?#"`<>|]*@/g, "//");
 }
 
 /**

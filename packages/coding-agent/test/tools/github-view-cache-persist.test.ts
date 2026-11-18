@@ -761,6 +761,64 @@ describe("github view cache persistence", () => {
 		expect(cached?.payload.unified).toContain("differ");
 	});
 
+	it("keeps unquoted operand spaces and replacement metacharacters", () => {
+		const secret = "opaque-cache-value-1234567890";
+		const diff = [
+			"diff --git a/file with spaces b/file with spaces",
+			"index 1111111..2222222 100644",
+			"--- a/file with spaces",
+			"+++ b/file with spaces",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			`diff --git "a/$&-token=${secret}" "b/$&-token=${secret}"`,
+			"index 3333333..4444444 100644",
+			`--- "a/$&-token=${secret}"`,
+			`+++ "b/$&-token=${secret}"`,
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"",
+		].join("\n");
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "pr-diff",
+			number: 77,
+			includeComments: false,
+			payload: parsePrUnifiedDiff(diff),
+			rendered: diff,
+			fetchedAt: 1,
+		});
+
+		expect(cacheFileBytes()).not.toContain(secret);
+		const cached = getCached<PrDiffPayload>(TEST_REPO, "pr-diff", 77, false, TEST_AUTH_KEY);
+		const files = cached?.payload.files ?? [];
+		expect(files).toHaveLength(2);
+		expect(files[0]?.path).toBe("file with spaces");
+		expect(files[1]?.path).toBe("$&-token=«redacted»");
+		expect(cached?.payload.unified).not.toContain("gjc-");
+	});
+
+	it("does not merge two compact table cells into one URL", () => {
+		const body = "|//example.test|dev@else.test|";
+		const url = `https://github.com/${TEST_REPO}/issues/78`;
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind: "issue",
+			number: 78,
+			includeComments: true,
+			payload: issuePayload(78, body, url),
+			rendered: body,
+			sourceUrl: url,
+			fetchedAt: 1,
+		});
+
+		const cached = getCached<{ body?: string }>(TEST_REPO, "issue", 78, true, TEST_AUTH_KEY);
+		expect(cached?.payload.body).toBe("|//example.test|dev@else.test|");
+	});
+
 	it("drops a vendor token glued to an identifier", () => {
 		const body = `build_${GITHUB_TOKEN}`;
 		const url = `https://github.com/${TEST_REPO}/issues/70`;
