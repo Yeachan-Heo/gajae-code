@@ -475,6 +475,7 @@ const RELATIVE_USERINFO = /(?<![A-Za-z0-9.:])\/\/[^\r\n /?#"`<>]*@/g;
 const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\/\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
 const ESCAPED_USERINFO = /(?<![A-Za-z0-9.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
 const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\\\/\\\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
+const BLOCK_START = /^(?:#{1,6}(?:\s|$)|[-+*]\s|\d+[.)]\s|>)/;
 const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
 
 function tableRowFlags(lines: string[]): boolean[] {
@@ -563,7 +564,7 @@ function tableRowFlags(lines: string[]): boolean[] {
 		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
 		// A heading, list item, or blockquote is a block, not a table header,
 		// including when nested at a list content baseline.
-		if (/^(?:#{1,6}(?:\s|$)|[-+*]\s|\d+[.)]\s|>)/.test((rows[i - 1] ?? "").trimStart())) continue;
+		if (BLOCK_START.test((rows[i - 1] ?? "").trimStart())) continue;
 		// GFM requires the header and delimiter to declare the same cell count;
 		// a prose line that happens to contain a pipe is not a header.
 		const cellsOf = (row: string): number => {
@@ -580,6 +581,8 @@ function tableRowFlags(lines: string[]): boolean[] {
 			if (fenced[j] === true) break;
 			const row = rows[j] ?? "";
 			if (row.trim() === "" || !row.includes("|") || isIndentedCode(j)) break;
+			// A block start ends the table even without a blank line.
+			if (BLOCK_START.test(row.trimStart())) break;
 			flags[j] = true;
 		}
 		covered = j - 1;
