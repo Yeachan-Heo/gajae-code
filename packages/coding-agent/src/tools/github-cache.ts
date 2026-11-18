@@ -427,6 +427,7 @@ function maskBoundedAuthorizationHeaders(text: string): { text: string; restore:
 			spacing: string,
 			doubleQuoted: string | undefined,
 			singleQuoted: string | undefined,
+			_unquoted: string | undefined,
 			offset: number,
 			text: string,
 		) => {
@@ -743,6 +744,13 @@ function isWordApostrophe(text: string, index: number): boolean {
 	return /[A-Za-z0-9]/.test(text[index - 1] ?? "") && /[A-Za-z0-9]/.test(text[index + 1] ?? "");
 }
 
+/** True when the current line starts a credential header. */
+function lineStartsCredentialHeader(text: string, index: number): boolean {
+	const start = text.lastIndexOf("\n", index) + 1;
+	const end = text.indexOf("\n", index);
+	return startsCredentialHeader(text.slice(start, end === -1 ? text.length : end));
+}
+
 /** Quote-aware bracket scan up to `end`. */
 function scanStructure(text: string, end: number): { stack: { ch: string; index: number }[]; quoted: boolean } {
 	const stack: { ch: string; index: number }[] = [];
@@ -758,7 +766,7 @@ function scanStructure(text: string, end: number): { stack: { ch: string; index:
 			if (ch === quote && !isEscapedAt(text, i)) quote = null;
 			continue;
 		}
-		if (ch === '"' || (ch === "'" && !isWordApostrophe(text, i))) {
+		if (ch === '"' || (ch === "'" && !isWordApostrophe(text, i) && lineStartsCredentialHeader(text, i))) {
 			quote = ch;
 			continue;
 		}
