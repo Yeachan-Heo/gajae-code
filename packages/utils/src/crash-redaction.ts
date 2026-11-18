@@ -349,6 +349,7 @@ interface CredentialRedactionRules {
 	readonly assignmentCandidatePattern: RegExp;
 	readonly containerCandidatePattern: RegExp;
 	readonly camelAssignmentCandidatePattern: RegExp;
+	readonly camelContainerCandidatePattern: RegExp;
 	readonly authValuePattern: RegExp;
 	/** Current policy: one line, and never the scheme word of the URL that follows it. */
 	readonly authValueLinePattern: RegExp;
@@ -384,6 +385,9 @@ function createCredentialRedactionRules(keyLabels: string, camelSimpleSuffixes: 
 		),
 		camelAssignmentCandidatePattern: new RegExp(
 			String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${camelSimpleSuffixes})(?:\\*["'\x60]?\s*[=:]\s*)`,
+		),
+		camelContainerCandidatePattern: new RegExp(
+			String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${camelSimpleSuffixes})(?:\\*["'\x60]?\s*[=:]\s*[\[{])`,
 		),
 		authValuePattern: new RegExp(
 			String.raw`${assignmentPrefix}(?:Bearer|Basic|Token)\s+${unquotedValuePatternBody}`,
@@ -1664,7 +1668,7 @@ function createContainerScanBudget(length: number, bounded: boolean): ContainerS
 }
 
 function redactCredentialContainers(text: string, rules: CredentialRedactionRules, bounded: boolean): string {
-	if (!rules.containerCandidatePattern.test(text)) return text;
+	if (!rules.containerCandidatePattern.test(text) && !rules.camelContainerCandidatePattern.test(text)) return text;
 	const { assignment, camel } = containerAssignmentPatterns(rules);
 	const state: ContainerScanState = { exhausted: false };
 	const generic = redactCredentialContainersWithPattern(text, assignment, bounded, state);
@@ -1715,7 +1719,7 @@ export function findCredentialContainerSpans(text: OriginalText): PrivateKeySpan
 }
 
 function findCredentialContainerSpansIn(text: string, rules: CredentialRedactionRules): PrivateKeySpan[] {
-	if (!rules.containerCandidatePattern.test(text)) return [];
+	if (!rules.containerCandidatePattern.test(text) && !rules.camelContainerCandidatePattern.test(text)) return [];
 	const { assignment, camel } = containerAssignmentPatterns(rules);
 	const spans: PrivateKeySpan[] = [];
 	const state: ContainerScanState = { exhausted: false };
@@ -1723,7 +1727,7 @@ function findCredentialContainerSpansIn(text: string, rules: CredentialRedaction
 	// The camel pass scans the same original text instead of the generic pass's output. Its key
 	// pattern is expensive on a long run of one letter, so it only runs when a camel-shaped key is
 	// actually followed by an assignment; without one the container pattern cannot match.
-	if (!state.exhausted && rules.camelAssignmentCandidatePattern.test(text)) {
+	if (!state.exhausted && rules.camelContainerCandidatePattern.test(text)) {
 		collectCredentialContainerSpans(text, camel, true, state, spans);
 	}
 	if (state.exhausted) return [{ start: 0, end: text.length }];
