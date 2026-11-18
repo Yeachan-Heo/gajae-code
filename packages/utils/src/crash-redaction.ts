@@ -168,15 +168,33 @@ function lineBreakLengthAt(text: string, at: number): number {
 	return serialized < 0 ? 0 : serialized - at;
 }
 
+/** Characters that can close a serialized value holding a PEM body. */
+function isSerializedValueEnd(character: string | undefined): boolean {
+	return (
+		character === '"' ||
+		character === "'" ||
+		character === "," ||
+		character === "}" ||
+		character === "]" ||
+		character === ")"
+	);
+}
+
 /**
- * End of the body an unpaired opener still owns. The body starts on the next printed line and
- * consists of base64-shaped lines only; text on the banner's own line (prose, a nested sibling)
- * is not part of the block, so a replacement bounded here never deletes it.
+ * End of the body an unpaired opener still owns. The banner's own line is never body: the body
+ * starts after the first break, and trailing spaces before that break belong to the banner, so a
+ * banner padded with any run of spaces still owns the base64 line under it. The body is then the
+ * maximal run of key-shaped lines: each line holds only base64 characters (plus optional padding
+ * and indentation) and ends at a line break or at the delimiter that closes the serialized value.
+ * Anything else ends the body, so a sibling field (`Note: keep`) or a prose suffix is not body and
+ * a replacement bounded here never deletes it.
  */
 function unpairedPrivateKeyBodyEnd(text: string, headerEnd: number): number {
-	const firstBreak = lineBreakLengthAt(text, headerEnd);
+	let bannerEnd = headerEnd;
+	while (text[bannerEnd] === " " || text[bannerEnd] === "\t") bannerEnd++;
+	const firstBreak = lineBreakLengthAt(text, bannerEnd);
 	if (firstBreak === 0) return headerEnd;
-	let cursor = headerEnd + firstBreak;
+	let cursor = bannerEnd + firstBreak;
 	let end = headerEnd;
 	while (cursor < text.length) {
 		let bodyStart = cursor;
@@ -193,14 +211,11 @@ function unpairedPrivateKeyBodyEnd(text: string, headerEnd: number): number {
 		}
 		let trailing = bodyEnd;
 		while (text[trailing] === " " || text[trailing] === "\t") trailing++;
-		if (trailing < text.length && lineBreakLengthAt(text, trailing) === 0) {
-			// Punctuation is where a serialized value ends; a word means the line is not a body.
-			if (isPemBodyCharacter(text[trailing])) break;
-			end = bodyEnd;
-			break;
-		}
-		end = bodyEnd;
 		const nextBreak = lineBreakLengthAt(text, trailing);
+		// A break or the serialized value's closing delimiter ends the body line; any other text
+		// after the base64 run (a colon, another word) means this line is not body at all.
+		if (nextBreak === 0 && trailing < text.length && !isSerializedValueEnd(text[trailing])) break;
+		end = bodyEnd;
 		if (nextBreak === 0) break;
 		cursor = trailing + nextBreak;
 	}
@@ -1045,9 +1060,25 @@ const URI_AT_LINE_START = /^[ \t]*[^A-Za-z0-9+.-]*[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
 /** token68/base64: the trailing `=` is padding, not an assignment separator. */
 const BASE64_CONTINUATION_LINE = /^[ \t]*[A-Za-z0-9+/]{8,}={0,2}[ \t]*$/;
-/** A padded token at the start of a line; whatever follows the padding is a separate field. */
-const PADDED_TOKEN_AT_LINE_START = /^[ \t]*[A-Za-z0-9+/]{8,}={1,2}(?=[ \t]|$)/;
+/**
+ * A padded token at the start of a line: base64 characters, then one or two `=` and the field
+ * separator. The padding must complete a group of four, and the payload must not be a plain
+ * lower-case word: `diagnostic=` and `diagnostics=` are field assignments, while a printed base64
+ * payload carries upper-case letters, digits or `+/`. Without this, every `<word>= value` line
+ * after a bare `Basic` loses its key.
+ */
+const PADDED_TOKEN_AT_LINE_START = /^[ \t]*([A-Za-z0-9+/]{8,})(={1,2})(?=[ \t]|$)/;
 const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
+
+/** Whether `line` starts with a base64 token whose `=` padding completes its final group. */
+function startsWithPaddedToken(line: string): boolean {
+	const match = PADDED_TOKEN_AT_LINE_START.exec(line);
+	if (match === null) return false;
+	const payload = match[1] as string;
+	const padding = match[2] as string;
+	if ((payload.length + padding.length) % 4 !== 0) return false;
+	return /[A-Z0-9+/]/.test(payload);
+}
 
 /**
  * Whether a continuation line names a diagnostic field. Base64 is the exception: its padding is
@@ -1057,7 +1088,7 @@ const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
 function startsDiagnosticAssignment(line: string): boolean {
 	return (
 		!BASE64_CONTINUATION_LINE.test(line) &&
-		!PADDED_TOKEN_AT_LINE_START.test(line) &&
+		!startsWithPaddedToken(line) &&
 		DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(line)
 	);
 }
