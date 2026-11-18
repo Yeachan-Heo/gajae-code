@@ -919,6 +919,7 @@ describe("github view cache persistence", () => {
 			String.raw`C:\Users\Jane Doe. Cookie: sid=persist-cookie-canary-X2m8`,
 			String.raw`C:\Users\Jane Doe. Authorization: Negotiate Y2FjaGU6Y2FuYXJ5`,
 			'Authorization: Digest username="fixture", realm="example.test", nonce="fixture-nonce", uri="/resource", response="6629fae49393a05397450978507c4ef1"',
+			"Authorization: Digest fixture; -----BEGIN PRIVATE KEY-----\nMIIQ2FjaGVPbmx5U3ludGhldGljRml4dHVyZQ==\n-----END PRIVATE KEY-----",
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
@@ -976,6 +977,7 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("persist-cookie-canary");
 		expect(cacheFileBytes()).not.toContain("Y2FjaGU6Y2FuYXJ5");
 		expect(cacheFileBytes()).not.toContain("6629fae49393a05397450978507c4ef1");
+		expect(cacheFileBytes()).not.toContain("MIIQ2FjaGVPbmx5U3ludGhldGljRml4dHVyZQ==");
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");
 		expect(cacheFileBytes()).not.toContain("/root#top");

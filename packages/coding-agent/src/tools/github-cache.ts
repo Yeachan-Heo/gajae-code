@@ -726,9 +726,15 @@ function scrubCacheText(text: string, diff = false): string {
 	// a label and orphan its value; paths run before `@` masking so a home path
 	// that itself contains `@` still matches; and paths run before the shared
 	// redactor so a token cannot consume a following `file` scheme word.
+	// PEM blocks are masked before any line-truncating header rule can delete
+	// their BEGIN marker and orphan the key body.
+	const withoutPem = containers.text.replace(
+		/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+		"«redacted-private-key»",
+	);
 	// Digest/Negotiate headers carry parameters after the scheme; mask the rest
 	// of the header line so a `response=` parameter cannot survive.
-	const withoutParameterizedAuth = containers.text.replace(
+	const withoutParameterizedAuth = withoutPem.replace(
 		/(?<![A-Za-z0-9_-])((?:authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
 		"$1 «redacted»",
 	);
