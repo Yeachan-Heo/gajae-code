@@ -633,21 +633,32 @@ describe("recordFatalCrash", () => {
 	});
 
 	it("masks a credential container whose only private-key footer cannot complete a block", () => {
-		// The container owns the bytes between its braces, so masking it removes the footer the
-		// block would otherwise pair with. The unmatched opener and body stay readable exactly as
-		// origin/dev leaves them; this asserts the container's own contents never survive.
-		const blockFirst = `-----BEGIN PRIVATE KEY-----\nBODY\nsecret={"footer":"-----END PRIVATE KEY-----","payload":"OPAQUE_TAIL"}`;
+		// The block and the container are both detected on the original text, so the footer inside
+		// the container still closes the block instead of the container hiding it from a later pass.
+		// Both masks are absent, and the lines around them keep their text and line structure.
+		const blockFirst = `safe-before=keep\n-----BEGIN PRIVATE KEY-----\nBODY\nsecret={"footer":"-----END PRIVATE KEY-----","payload":"OPAQUE_TAIL"}\nsafe-after=keep\nline4=still-here`;
 		const footerHolder = `body=-----BEGIN PRIVATE KEY-----\nBODY_TEXT\nholder={"footer":"-----END PRIVATE KEY-----"}`;
 
-		expect(redactCrashSecrets(blockFirst)).toContain("secret=«redacted»");
-		expect(redactCrashSecrets(blockFirst)).not.toContain("OPAQUE_TAIL");
+		const blockRedacted = redactCrashSecrets(blockFirst);
+		expect(blockRedacted).not.toContain("BODY");
+		expect(blockRedacted).not.toContain("OPAQUE_TAIL");
+		expect(blockRedacted).not.toContain("footer");
+		expect(blockRedacted.split("\n")).toEqual([
+			"safe-before=keep",
+			"«redacted-private-key»",
+			"safe-after=keep",
+			"line4=still-here",
+		]);
 		expect(redactCrashSecrets(footerHolder)).not.toContain("BODY_TEXT");
 		expect(redactCrashSecrets(footerHolder)).not.toContain("END PRIVATE KEY");
 
-		// A footer that survives masking still pairs the block through the second banner, so the
-		// line between the two is removed.
+		// One detection pass pairs the opener with the first footer it can see. That block and the
+		// container it contains are masked; the unrelated line after them is left verbatim, and the
+		// orphan footer carries no key material.
 		const secondFooter = `-----BEGIN PRIVATE KEY-----\nsecret={"footer":"-----END PRIVATE KEY-----"}\nOPAQUE_LINE\n-----END PRIVATE KEY-----`;
-		expect(redactCrashSecrets(secondFooter)).not.toContain("OPAQUE_LINE");
+		const secondRedacted = redactCrashSecrets(secondFooter);
+		expect(secondRedacted).not.toContain("BEGIN PRIVATE KEY");
+		expect(secondRedacted).toContain("OPAQUE_LINE");
 
 		// A YAML block scalar under a credential name holds the footer, so its body is part of the
 		// same removal even though the scalar sits between the opener and the footer.
@@ -1268,12 +1279,13 @@ after=keep`;
 		expect(contents).not.toContain(pemBody);
 		expect(contents).toContain("«redacted-google-api-key»");
 		expect(contents).toContain("«redacted-private-key»");
-		// Scheme and host stay readable so the record still says which remote failed.
+		// Scheme and host stay readable so the record still says which remote failed. The `Token`
+		// label itself is context, not a credential value, and must not consume the scheme word.
 		expect(contents).toContain("https://«redacted-url-credential»@git.example.com");
 		expect(contents).toContain("_https://«redacted-url-credential»@git.example.com/x.git_");
 		expect(contents).toContain("raw-at: https://«redacted-url-credential»@example.com/repo.git?keep=1");
 		expect(contents).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
-		expect(contents).toContain("token-url: «redacted-auth»://«redacted-url-credential»@example.com/db");
+		expect(contents).toContain("token-url: Token postgres://«redacted-url-credential»@example.com/db");
 	});
 
 	it("scans a large credential-free crash body in linear time", () => {

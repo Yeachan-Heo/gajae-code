@@ -88,6 +88,7 @@
 	},
 	"devDependencies": {
 		"@babel/traverse": "catalog:",
+		"ajv": "catalog:",
 		"@babel/types": "catalog:",
 		"@types/babel__traverse": "catalog:",
 		"@types/bun": "catalog:",

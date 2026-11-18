@@ -12,9 +12,16 @@
 - A private-key block that starts before a credential container and ends inside it now masks the container's remaining members too, on both the single-block and the adjacent-run pairing paths. The block and the container are detected on the original text and applied in one pass, so replacing the block can no longer delete the assignment that let the container pass find the rest.
 - A header collection is classified from the original slot types, so a private-key block that covers a numeric slot can no longer turn a mixed array into a name/value list and print a credential header record's value.
 - A sparse array counts a hole as the `null` it prints in both the detection and the application walk, so a block split past a hole no longer shifts the masks onto the surrounding values.
-- A URL password after a Bearer/Basic/Token prefix is removed from the dump. The auth-token rule used to consume the scheme word, leaving `://user:password@host` without an authority the URL rule recognized; the userinfo is now detected on the original text and masked in the same pass, while the scheme and host stay readable.
+- A URL password after a Bearer/Basic/Token prefix is removed from the dump. The auth-token rule used to consume the scheme word, leaving `://user:password@host` without an authority the URL rule recognized; the userinfo is now detected on the original text and masked in the same pass, while the scheme and host stay readable. A trailing diagnostic on the same line (`Token postgres://… diagnostic=keep`) is not consumed either.
 - A tool-argument name is scrubbed through the same original-text detection as its value, so a name shaped like a credential container whose footer sits inside a private-key block can no longer print the banner and body inside `<parameter name="...">`.
-- A credential-container mask that removes the unindented lines of a YAML block scalar no longer causes the remaining indented lines to be re-read as the scalar. The credential-named YAML body is detected on the original text and masked in the same pass, so a line outside every detected range (for example the `keep-me` line after a container) survives, and the output is still parseable YAML.
+- A credential-container mask that removes the unindented lines of a YAML block scalar no longer causes the remaining indented lines to be re-read as the scalar. The credential-named YAML body is detected on the original text and masked in the same pass, and a scalar discovered inside a container cannot extend past the container's closing bracket, so a line outside every detected range (for example the `keep-me` line after a container) survives and the output is still parseable YAML.
+- Session dump metadata, tool names, invoke names, custom types, branch ids and file paths now go through the same original-text detection pass as body content. The single-boundary rule covers the whole dump, not just structured body content.
+- Every mask in a rendered schema carries a `#<path>` suffix, so a value covered in several locations (a `required` list, `enum`, `examples`, `default`, or several `anyOf` elements) prints distinct placeholders and the emitted schema stays unique-item valid. A marker is only ever longer than its base form; masking strength is never traded for uniqueness.
+
+### Limitations
+
+- Covered identifier-list entries (for example `required`) print a location-unique placeholder rather than the original name: the document remains valid JSON Schema, but the identifiers are not preserved.
+- `dependentRequired` has no dedicated handling; its covered values rely on the same marker-per-location rule.
 
 ### Changed
 

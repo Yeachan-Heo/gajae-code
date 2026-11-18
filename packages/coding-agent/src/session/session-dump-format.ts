@@ -5,16 +5,15 @@ import type { AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import {
-	findCredentialContainerSpans,
+	applyRedactions,
+	asOriginalText,
+	collectCrashRedactionRanges,
 	findPrivateKeySpans,
-	findUrlCredentialSpans,
-	findYamlBlockScalarSpans,
 	isCredentialKey,
 	isHeaderCollectionKey,
 	PRIVATE_KEY_REDACTION_MARKER,
 	type PrivateKeySpan,
-	redactCrashSecrets,
-	redactResidualCrashSecrets,
+	type RedactionRanges,
 } from "@gajae-code/utils";
 import { buildCacheEconomicsWarning, type CacheWarningBuildState } from "./cache-economics";
 import {
@@ -69,22 +68,19 @@ function takeRedactedTextRun(parts: string[]): string | undefined {
 	} else {
 		// Blocks are rendered with a newline between them, which would split a banner that straddles
 		// two blocks, so the pairing is detected while the parts are still adjacent. Detection reads
-		// the original parts; the ranges are then mapped into the joined text so one application pass
-		// covers the paired blocks and the credential containers found in that same original text.
+		// the original parts; the mapped private-key ranges join one application pass over the
+		// original text, which also finds the containers, URLs and YAML bodies in it.
 		const spansByPart = crossFieldPrivateKeySpans(parts);
 		const joined = parts.join("\n");
-		const ranges: RedactionRange[] = [];
+		const privateKeys: PrivateKeySpan[] = [];
 		let offset = 0;
 		for (let index = 0; index < parts.length; index++) {
 			for (const span of spansByPart[index]) {
-				ranges.push({ start: offset + span.start, end: offset + span.end, marker: PRIVATE_KEY_REDACTION_MARKER });
+				privateKeys.push({ start: offset + span.start, end: offset + span.end });
 			}
 			offset += parts[index].length + 1;
 		}
-		ranges.push(...containerRanges(joined));
-		ranges.push(...urlRanges(joined));
-		ranges.push(...yamlBlockScalarRanges(joined));
-		redacted = redactResidualCrashSecrets(applyRedactionRanges(joined, ranges));
+		redacted = scrubText(joined, privateKeys);
 	}
 	parts.length = 0;
 	return redacted;
@@ -117,104 +113,42 @@ function decodeUnicodeEscapeText(input: string, allowControlCharacters = false):
 	return input.replace(/\\\\u([0-9a-fA-F]{4})/g, decode).replace(/\\u([0-9a-fA-F]{4})/g, decode);
 }
 
-/** One range of printed text replaced by a marker; overlapping ranges are merged before application. */
-interface RedactionRange extends PrivateKeySpan {
-	readonly marker: string;
+function markerWithPath(marker: string, markerPath: string | undefined): string {
+	return markerPath === undefined || markerPath.length === 0 ? marker : `${marker}#${markerPath}`;
 }
-
-const CONTAINER_REDACTION_MARKER = "«redacted»";
 
 /**
- * Apply every range to the original text once. Detection always reads that original text, so the
- * only way two ranges meet is as two masks that both have to hold: the merged region starts where
- * the first one starts, ends where the furthest one ends, and prints the first one's marker.
- * A private-key block that starts before a container and ends inside it therefore masks the
- * container's remaining members instead of leaving them behind a destroyed assignment.
+ * Give every emitted marker a suffix for its location in a rendered schema. A covered value that
+ * lands in several array slots would otherwise print the same placeholder each time and violate
+ * `uniqueItems`; longer markers are always safe, and this never shortens a marker.
  */
-function applyRedactionRanges(text: string, ranges: readonly RedactionRange[]): string {
-	if (ranges.length === 0) return text;
-	const sorted = [...ranges].sort((left, right) => left.start - right.start || right.end - left.end);
-	const merged: RedactionRange[] = [];
-	for (const range of sorted) {
-		const last = merged[merged.length - 1];
-		if (last !== undefined && range.start < last.end) {
-			if (range.end > last.end) {
-				merged[merged.length - 1] = { start: last.start, end: range.end, marker: last.marker };
-			}
-			continue;
-		}
-		merged.push(range);
-	}
-	const parts: string[] = [];
-	let cursor = 0;
-	for (const range of merged) {
-		parts.push(text.slice(cursor, range.start), range.marker);
-		cursor = range.end;
-	}
-	parts.push(text.slice(cursor));
-	return parts.join("");
-}
-
-/** Private-key ranges that a caller located in a wider source string. */
-function privateKeyRanges(spans: readonly PrivateKeySpan[]): RedactionRange[] {
-	return spans.map(span => ({ start: span.start, end: span.end, marker: PRIVATE_KEY_REDACTION_MARKER }));
-}
-
-/** Credential-container ranges of one original text. */
-function containerRanges(text: string): RedactionRange[] {
-	return findCredentialContainerSpans(text).map(span => ({
-		start: span.start,
-		end: span.end,
-		marker: CONTAINER_REDACTION_MARKER,
-	}));
-}
-
-const URL_CREDENTIAL_REDACTION_MARKER = "«redacted-url-credential»";
-
-/** URL-userinfo ranges of one original text; the scheme and host stay printed. */
-function urlRanges(text: string): RedactionRange[] {
-	return findUrlCredentialSpans(text).map(span => ({
-		start: span.start,
-		end: span.end,
-		marker: URL_CREDENTIAL_REDACTION_MARKER,
-	}));
-}
-
-/** Printed body ranges of the credential-named YAML block scalars of one original text. */
-function yamlBlockScalarRanges(text: string): RedactionRange[] {
-	return findYamlBlockScalarSpans(text).map(span => ({
-		start: span.start,
-		end: span.end,
-		marker: CONTAINER_REDACTION_MARKER,
+function withMarkerPath(ranges: RedactionRanges, markerPath: string | undefined): RedactionRanges {
+	if (markerPath === undefined || markerPath.length === 0) return ranges;
+	return ranges.map(range => ({
+		...range,
+		label: range.label.length === 0 ? range.label : markerWithPath(range.label, markerPath),
 	}));
 }
 
 /**
- * Structural masks of one piece of text, applied in one pass over the text the caller detected
- * them on, then the line-bounded rules that need no structural evidence.
- * URL userinfo and YAML scalar bodies are detected here too: by the time the line-bounded rules
- * run, the auth-token rule has consumed the URL scheme word and a structural mask has removed the
- * lines that delimited the YAML scalar, so neither can be classified from the output.
+ * One detection pass over the original text, one application. `privateKeys` are ranges a caller
+ * mapped from a wider original source; everything else is detected in `text` itself.
  */
-function scrubText(text: string, privateKeys: readonly PrivateKeySpan[]): string {
-	return redactResidualCrashSecrets(
-		applyRedactionRanges(text, [
-			...privateKeyRanges(privateKeys),
-			...containerRanges(text),
-			...urlRanges(text),
-			...yamlBlockScalarRanges(text),
-		]),
-	);
+function scrubText(text: string, privateKeys: readonly PrivateKeySpan[], markerPath?: string): string {
+	const original = asOriginalText(text);
+	return applyRedactions(original, withMarkerPath(collectCrashRedactionRanges(original, privateKeys), markerPath));
 }
 
 /** A field name is scrubbed through the same original-text detection as a value. */
 function scrubName(name: string): string {
-	return scrubText(name, findPrivateKeySpans(name));
+	const original = asOriginalText(name);
+	return applyRedactions(original, collectCrashRedactionRanges(original));
 }
 
-/** Scrub one block of dump text, detecting its private-key blocks in that same text. */
+/** Scrub one block of dump text, detecting its masks in that same text. */
 function redactDumpText(text: string): string {
-	return scrubText(text, findPrivateKeySpans(text));
+	const original = asOriginalText(text);
+	return applyRedactions(original, collectCrashRedactionRanges(original));
 }
 
 /**
@@ -235,7 +169,7 @@ function crossFieldPrivateKeySpans(values: readonly string[]): PrivateKeySpan[][
 	// Spans and leaves are both ordered, so the walk advances one leaf pointer instead of
 	// visiting every leaf for every span.
 	let leaf = 0;
-	for (const span of findPrivateKeySpans(joined)) {
+	for (const span of findPrivateKeySpans(asOriginalText(joined))) {
 		while (leaf < values.length && offsets[leaf] + values[leaf].length <= span.start) leaf++;
 		for (let index = leaf; index < values.length; index++) {
 			const valueStart = offsets[index];
@@ -375,16 +309,27 @@ function serializeParameterValue(value: unknown): string {
  * original: a replaced leaf never feeds back into the classification of a header collection, a
  * header record, or a credential name.
  */
-function sanitizeDataValue(value: unknown, fieldName: string | undefined, plan: ValueRedactionPlan): unknown {
+function nestedMarkerPath(markerPath: string | undefined, segment: string | number): string | undefined {
+	if (markerPath === undefined) return undefined;
+	if (typeof segment === "number") return `${markerPath}[${segment}]`;
+	return markerPath.length === 0 ? segment : `${markerPath}.${segment}`;
+}
+
+function sanitizeDataValue(
+	value: unknown,
+	fieldName: string | undefined,
+	plan: ValueRedactionPlan,
+	markerPath?: string,
+): unknown {
 	if (fieldName !== undefined && isCredentialKey(fieldIdentity(fieldName))) {
 		skipValueLeaves(plan, value);
-		return "«redacted»";
+		return markerWithPath("«redacted»", markerPath);
 	}
-	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan));
+	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan), markerPath);
 	if (value === null || typeof value !== "object") {
 		// A number, boolean or null has no textual form that can keep part of a block, so a covered
 		// one is replaced whole instead of keeping a fragment of the key.
-		return takeLeafSpans(plan).length > 0 ? PRIVATE_KEY_REDACTION_MARKER : value;
+		return takeLeafSpans(plan).length > 0 ? markerWithPath(PRIVATE_KEY_REDACTION_MARKER, markerPath) : value;
 	}
 	if (Array.isArray(value)) {
 		// A header collection is a flat name/value list only when the original slots say so: a slot a
@@ -399,15 +344,16 @@ function sanitizeDataValue(value: unknown, fieldName: string | undefined, plan: 
 		const sanitized: unknown[] = [];
 		for (let index = 0; index < value.length; index++) {
 			const item = value[index];
+			const itemPath = nestedMarkerPath(markerPath, index);
 			if (flatPairs && index % 2 === 1) {
 				const headerName = value[index - 1];
 				if (typeof headerName === "string" && isCredentialKey(fieldIdentity(headerName))) {
 					skipValueLeaves(plan, item);
-					sanitized.push("«redacted»");
+					sanitized.push(markerWithPath("«redacted»", itemPath));
 					continue;
 				}
 			}
-			sanitized.push(sanitizeDataValue(item, flatPairs ? undefined : fieldName, plan));
+			sanitized.push(sanitizeDataValue(item, flatPairs ? undefined : fieldName, plan, itemPath));
 		}
 		return sanitized;
 	}
@@ -435,13 +381,16 @@ function sanitizeDataValue(value: unknown, fieldName: string | undefined, plan: 
 		const redactedKey = uniqueScrubbedKey(redacted, field, scrubbedKeys);
 		const normalized = fieldIdentity(field).toLowerCase();
 		const member = source[field];
+		const memberPath = nestedMarkerPath(markerPath, redactedKey);
 		if (maskHeaderValue && (normalized === "value" || normalized === "values")) {
 			skipValueLeaves(plan, member);
 			redacted[redactedKey] =
-				normalized === "values" && Array.isArray(member) ? member.map(() => "«redacted»") : "«redacted»";
+				normalized === "values" && Array.isArray(member)
+					? member.map((_item, index) => markerWithPath("«redacted»", nestedMarkerPath(memberPath, index)))
+					: markerWithPath("«redacted»", memberPath);
 			continue;
 		}
-		redacted[redactedKey] = sanitizeDataValue(member, field, plan);
+		redacted[redactedKey] = sanitizeDataValue(member, field, plan, memberPath);
 	}
 	return redacted;
 }
@@ -494,15 +443,18 @@ const OMIT_SCHEMA_VALUE = Symbol("omit-schema-value");
  * no longer equals what the caller declared, because keeping the covered value's type would mean
  * printing the covered value.
  */
-function maskSchemaData(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(maskSchemaData);
-	if (value === null || typeof value !== "object") return "«redacted»";
+function maskSchemaData(value: unknown, markerPath = ""): unknown {
+	if (Array.isArray(value)) {
+		return value.map((item, index) => maskSchemaData(item, nestedMarkerPath(markerPath, index)));
+	}
+	if (value === null || typeof value !== "object") return markerWithPath("«redacted»", markerPath);
 	const masked = Object.create(null) as Record<string, unknown>;
 	const scrubbedKeys = new Map<string, number>();
 	for (const [key, nested] of Object.entries(value)) {
 		// Two token-shaped keys scrub to one marker, so the marker alone would let the second
 		// property replace the first; the suffix keeps both definitions in the dump.
-		masked[uniqueScrubbedKey(masked, key, scrubbedKeys)] = maskSchemaData(nested);
+		const redactedKey = uniqueScrubbedKey(masked, key, scrubbedKeys);
+		masked[redactedKey] = maskSchemaData(nested, nestedMarkerPath(markerPath, redactedKey));
 	}
 	return masked;
 }
@@ -538,15 +490,17 @@ function sanitizeSchemaValue(
 	propertyName: string | undefined,
 	plan: ValueRedactionPlan,
 	schemaPosition: boolean,
+	markerPath = "",
 ): unknown {
-	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan));
+	if (typeof value === "string") return scrubText(value, takeLeafSpans(plan), markerPath);
 	if (Array.isArray(value)) {
-		return value.map(item => {
-			const sanitized = sanitizeSchemaValue(item, propertyName, plan, schemaPosition);
+		return value.map((item, index) => {
+			const itemPath = nestedMarkerPath(markerPath, index);
+			const sanitized = sanitizeSchemaValue(item, propertyName, plan, schemaPosition, itemPath);
 			// An array slot cannot be omitted without shifting later slots, so a covered scalar keeps
 			// its marker form here; the arrays that reach this branch hold literal data (`enum`,
 			// `examples`) or schemas, and a string is valid in both.
-			return sanitized === OMIT_SCHEMA_VALUE ? PRIVATE_KEY_REDACTION_MARKER : sanitized;
+			return sanitized === OMIT_SCHEMA_VALUE ? markerWithPath(PRIVATE_KEY_REDACTION_MARKER, itemPath) : sanitized;
 		});
 	}
 	if (value === null || typeof value !== "object") {
@@ -561,20 +515,26 @@ function sanitizeSchemaValue(
 		// Keywords are recognized by the name they stand for, so an escaped keyword a sibling forced
 		// to keep its spelling is still a map or a data keyword rather than an ordinary field.
 		const keyword = decodeEscapedText(field);
+		const redactedKey = uniqueScrubbedKey(redacted, field, scrubbedKeys);
+		// The path uses the scrubbed key, never the stored spelling: a token-shaped name is a
+		// credential and must not reappear inside a marker suffix.
+		const fieldPath = nestedMarkerPath(markerPath, redactedKey);
 		if (SCHEMA_MAP_KEYWORDS.has(keyword) && nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 			const schemas = Object.create(null) as Record<string, unknown>;
 			const nameSuffixes = new Map<string, number>();
 			for (const [name, schema] of Object.entries(nested as Record<string, unknown>)) {
 				// The definition keeps the name it was stored under; the credential test reads the name
 				// the definition stands for, so a collided spelling still masks its literal data.
-				schemas[uniqueScrubbedKey(schemas, name, nameSuffixes)] = sanitizeSchemaValue(
+				const redactedName = uniqueScrubbedKey(schemas, name, nameSuffixes);
+				schemas[redactedName] = sanitizeSchemaValue(
 					schema,
 					fieldIdentity(name),
 					plan,
 					true,
+					nestedMarkerPath(fieldPath, redactedName),
 				);
 			}
-			redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = schemas;
+			redacted[redactedKey] = schemas;
 			continue;
 		}
 		if (SCHEMA_VALUE_KEYWORDS.has(keyword)) {
@@ -582,9 +542,9 @@ function sanitizeSchemaValue(
 				// The literal is data under a credential-named property, so nothing of it may print;
 				// its leaves still take their plan entries even though the masked copy replaces them.
 				skipValueLeaves(plan, nested);
-				redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = maskSchemaData(nested);
+				redacted[redactedKey] = maskSchemaData(nested, fieldPath);
 			} else {
-				redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitizeDataValue(nested, propertyName, plan);
+				redacted[redactedKey] = sanitizeDataValue(nested, propertyName, plan, fieldPath);
 			}
 			continue;
 		}
@@ -598,7 +558,7 @@ function sanitizeSchemaValue(
 				takeLeafSpans(plan);
 				if (!covered) kept.push(scrubText(item, []));
 			}
-			if (kept.length > 0) redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = kept;
+			if (kept.length > 0) redacted[redactedKey] = kept;
 			continue;
 		}
 		if (typeof nested === "string" && !childIsSchema) {
@@ -611,11 +571,11 @@ function sanitizeSchemaValue(
 				continue;
 			}
 		}
-		const sanitized = sanitizeSchemaValue(nested, propertyName, plan, childIsSchema);
+		const sanitized = sanitizeSchemaValue(nested, propertyName, plan, childIsSchema, fieldPath);
 		// A covered scalar under an ordinary keyword is dropped: the keyword is optional, and the
 		// covered value would otherwise have to print as something it is not.
 		if (sanitized === OMIT_SCHEMA_VALUE) continue;
-		redacted[uniqueScrubbedKey(redacted, field, scrubbedKeys)] = sanitized;
+		redacted[redactedKey] = sanitized;
 	}
 	return redacted;
 }
@@ -706,17 +666,15 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 	const model = options.model;
 	const thinkingLevel = options.thinkingLevel;
 	lines.push("## Configuration\n");
-	lines.push(
-		`Model: ${model ? `${redactCrashSecrets(model.provider)}/${redactCrashSecrets(model.id)}` : "(not selected)"}`,
-	);
-	lines.push(`Thinking Level: ${redactCrashSecrets(String(thinkingLevel ?? ""))}`);
+	lines.push(`Model: ${model ? `${redactDumpText(model.provider)}/${redactDumpText(model.id)}` : "(not selected)"}`);
+	lines.push(`Thinking Level: ${redactDumpText(String(thinkingLevel ?? ""))}`);
 	lines.push("\n");
 
 	const tools = options.tools ?? [];
 	if (tools.length > 0) {
 		lines.push("## Available Tools\n");
 		for (const tool of tools) {
-			lines.push(`<tool name="${redactCrashSecrets(tool.name)}">`);
+			lines.push(`<tool name="${redactDumpText(tool.name)}">`);
 			lines.push(redactDumpText(tool.description));
 			const parametersClean = stripTypeBoxFields(tool.parameters);
 			lines.push(`\nParameters:\n${formatArgsAsXml(parametersClean as Record<string, unknown>, "schema")}`);
@@ -764,7 +722,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 				} else if (c.type === "toolCall") {
 					const redactedText = takeRedactedTextRun(textRun);
 					if (redactedText !== undefined) lines.push(redactedText);
-					lines.push(`<invoke name="${redactCrashSecrets(c.name)}">`);
+					lines.push(`<invoke name="${redactDumpText(c.name)}">`);
 					if (c.arguments && typeof c.arguments === "object") {
 						lines.push(formatArgsAsXml(c.arguments as Record<string, unknown>, "arguments"));
 					}
@@ -775,11 +733,11 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			if (redactedText !== undefined) lines.push(redactedText);
 			const cacheWarning = buildCacheEconomicsWarning(assistantMsg.usage, model, cacheWarningState);
 			if (cacheWarning) {
-				lines.push(redactCrashSecrets(cacheWarning));
+				lines.push(redactDumpText(cacheWarning));
 			}
 			lines.push("");
 		} else if (msg.role === "toolResult") {
-			lines.push(`### Tool Result: ${redactCrashSecrets(msg.toolName)}`);
+			lines.push(`### Tool Result: ${redactDumpText(msg.toolName)}`);
 			if (msg.isError) {
 				lines.push("(error)");
 			}
@@ -814,7 +772,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			}
 		} else if (msg.role === "custom" || msg.role === "hookMessage") {
 			const customMsg = msg as CustomMessage | HookMessage;
-			lines.push(`## ${redactCrashSecrets(customMsg.customType)}\n`);
+			lines.push(`## ${redactDumpText(customMsg.customType)}\n`);
 			if (typeof customMsg.content === "string") {
 				lines.push(redactDumpText(customMsg.content));
 			} else {
@@ -835,7 +793,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 		} else if (msg.role === "branchSummary") {
 			const branchMsg = msg as BranchSummaryMessage;
 			lines.push("## Branch Summary\n");
-			lines.push(`(from branch: ${redactCrashSecrets(branchMsg.fromId)})\n`);
+			lines.push(`(from branch: ${redactDumpText(branchMsg.fromId)})\n`);
 			lines.push(redactDumpText(branchMsg.summary));
 			lines.push("\n");
 		} else if (msg.role === "compactionSummary") {
@@ -848,7 +806,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 			const fileMsg = msg as FileMentionMessage;
 			lines.push("## File Mention\n");
 			for (const file of fileMsg.files) {
-				lines.push(`<file path="${redactCrashSecrets(file.path)}">`);
+				lines.push(`<file path="${redactDumpText(file.path)}">`);
 				if (file.content) {
 					lines.push(redactDumpText(file.content));
 				}

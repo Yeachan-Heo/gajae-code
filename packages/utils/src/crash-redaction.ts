@@ -7,6 +7,63 @@
  * text goes through `sanitizeExternalCrashV1` instead.
  */
 
+declare const originalTextBrand: unique symbol;
+declare const redactedTextBrand: unique symbol;
+
+/**
+ * Text no detection rule has edited yet. Every rule reads only this type, so output of a previous
+ * redaction cannot be fed back into detection: `RedactedText` is a different brand.
+ */
+export type OriginalText = string & { readonly [originalTextBrand]: "original" };
+
+/** Text produced by the single application pass; never accepted by a detector. */
+export type RedactedText = string & { readonly [redactedTextBrand]: "redacted" };
+
+/** One range of original text replaced by `label`; an empty label deletes the range. */
+export interface RedactionRange {
+	readonly start: number;
+	readonly end: number;
+	readonly label: string;
+}
+
+export type RedactionRanges = readonly RedactionRange[];
+
+/** The only conversion from caller input to text a detector may read. */
+export function asOriginalText(value: string): OriginalText {
+	return value as OriginalText;
+}
+
+/**
+ * Replace every detection range in one pass over the original text. This is the only function that
+ * turns `OriginalText` into `RedactedText`; overlapping ranges merge, and the range that starts
+ * first (the longer one on a tie) keeps its label. A label may be a marker or empty to delete.
+ */
+export function applyRedactions(original: OriginalText, ranges: RedactionRanges): RedactedText {
+	if (ranges.length === 0) return original as unknown as RedactedText;
+	const sorted = [...ranges].sort((left, right) => left.start - right.start || right.end - left.end);
+	const merged: RedactionRange[] = [];
+	for (const range of sorted) {
+		if (range.end <= range.start) continue;
+		const last = merged[merged.length - 1];
+		if (last !== undefined && range.start < last.end) {
+			if (range.end > last.end) {
+				merged[merged.length - 1] = { start: last.start, end: range.end, label: last.label };
+			}
+			continue;
+		}
+		merged.push(range);
+	}
+	if (merged.length === 0) return original as unknown as RedactedText;
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const range of merged) {
+		parts.push(original.slice(cursor, range.start), range.label);
+		cursor = range.end;
+	}
+	parts.push(original.slice(cursor));
+	return parts.join("") as RedactedText;
+}
+
 const PEM_BEGIN = "-----BEGIN ";
 const PEM_END = "-----END ";
 const PEM_LABEL = "PRIVATE KEY-----";
@@ -41,7 +98,46 @@ function privateKeyMarkerEnd(text: string, at: number, token: string): number {
  * An opening banner with no footer later in the text is left unmatched, and the
  * scan stops: nothing after it can close the same block.
  */
-export function findPrivateKeySpans(text: string): PrivateKeySpan[] {
+function findPrivateKeySpansIn(text: string): PrivateKeySpan[] {
+	// Without any footer nothing can pair, so a long run of unclosed banners stays linear.
+	if (!text.includes(PEM_END)) return [];
+	const spans: PrivateKeySpan[] = [];
+	// Openers pair with the nearest opener before a footer (LIFO). An opener that is itself inside
+	// a YAML scalar or a credential container is therefore left unmatched when a real block opens
+	// after it, instead of pairing forward and swallowing the diagnostics in between.
+	const openers: number[] = [];
+	let i = 0;
+	while (i < text.length) {
+		const begin = text.indexOf(PEM_BEGIN, i);
+		const end = text.indexOf(PEM_END, i);
+		if (begin < 0 && end < 0) break;
+		if (begin >= 0 && (end < 0 || begin < end)) {
+			const headerEnd = privateKeyMarkerEnd(text, begin, PEM_BEGIN);
+			if (headerEnd >= 0) {
+				openers.push(begin);
+				i = headerEnd;
+			} else {
+				i = begin + PEM_BEGIN.length;
+			}
+			continue;
+		}
+		const footerEnd = privateKeyMarkerEnd(text, end, PEM_END);
+		if (footerEnd >= 0 && openers.length > 0) {
+			spans.push({ start: openers.pop() as number, end: footerEnd });
+		}
+		i = end + PEM_END.length;
+	}
+	spans.sort((left, right) => left.start - right.start);
+	return spans;
+}
+
+/** Locate the private-key blocks of one original text. */
+export function findPrivateKeySpans(text: OriginalText): PrivateKeySpan[] {
+	return findPrivateKeySpansIn(text);
+}
+
+/** Historical v1 pairing: first opener with the first footer after it, stopping when unmatched. */
+function findPrivateKeySpansLegacy(text: string): PrivateKeySpan[] {
 	const spans: PrivateKeySpan[] = [];
 	let i = 0;
 	while (i < text.length) {
@@ -71,9 +167,9 @@ export function findPrivateKeySpans(text: string): PrivateKeySpan[] {
 	return spans;
 }
 
-/** Replace each complete private-key block in one forward pass. */
+/** Replace each complete private-key block in one forward pass (v1 rules only). */
 function redactPemPrivateKeys(text: string): string {
-	const spans = findPrivateKeySpans(text);
+	const spans = findPrivateKeySpansLegacy(text);
 	if (spans.length === 0) return text;
 	const parts: string[] = [];
 	let cursor = 0;
@@ -96,6 +192,7 @@ const CREDENTIAL_KEY_LABELS_V1 = CREDENTIAL_KEY_LABELS.replace("|pw|", "|");
  */
 const REDACTION_PLACEHOLDER_PATTERN = /^(?:«redacted(?:-[a-z]+(?:-[a-z]+)*)?»|\[REDACTED_[A-Z]+(?:_[A-Z]+)*\]?)$/;
 const REDACTION_PLACEHOLDER_BOUNDARY_PATTERN = /^(?:$|[\s,;})"'`\\])/;
+const UNQUOTED_VALUE_DELIMITER_PATTERN = /[\s,;"'`}\]]/;
 const CREDENTIAL_CAMEL_COMPOUND_SUFFIXES =
 	"AccessToken|RefreshToken|IdToken|SessionToken|ClientSecret|EncryptionKey|SigningKey";
 const CREDENTIAL_CAMEL_SIMPLE_SUFFIXES =
@@ -125,6 +222,8 @@ interface CredentialRedactionRules {
 	readonly containerCandidatePattern: RegExp;
 	readonly camelAssignmentCandidatePattern: RegExp;
 	readonly authValuePattern: RegExp;
+	/** Current policy: one line, and never the scheme word of the URL that follows it. */
+	readonly authValueLinePattern: RegExp;
 	readonly valuePattern: RegExp;
 	readonly camelValuePattern: RegExp;
 	readonly escapedBacktickValuePattern: RegExp;
@@ -154,6 +253,10 @@ function createCredentialRedactionRules(keyLabels: string, camelSimpleSuffixes: 
 		),
 		authValuePattern: new RegExp(
 			String.raw`${assignmentPrefix}(?:Bearer|Basic|Token)\s+${unquotedValuePatternBody}`,
+			"gi",
+		),
+		authValueLinePattern: new RegExp(
+			String.raw`${assignmentPrefix}(?:Bearer|Basic|Token)[ \t]+(?![A-Za-z0-9._~+/=-]*:\/\/)${unquotedValuePatternBody}`,
 			"gi",
 		),
 		valuePattern: new RegExp(String.raw`${assignmentPrefix}(?!\\+\x60)${valuePatternBody}`, "gi"),
@@ -230,6 +333,10 @@ function lineBounds(text: string, start: number): { contentEnd: number; nextLine
  */
 function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedactionRules): PrivateKeySpan[] {
 	const spans: PrivateKeySpan[] = [];
+	// A header line inside a credential container is data the container owns, not YAML structure:
+	// the container's close bounds the scalar, so the body scan cannot walk past it into unrelated
+	// text that merely looks indented.
+	const containers = findCredentialContainerSpansIn(text, rules);
 	let lineStart = 0;
 
 	while (lineStart < text.length) {
@@ -240,24 +347,26 @@ function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedact
 			continue;
 		}
 
+		const bodyLimit = containingContainerEnd(containers, lineStart) ?? text.length;
 		let bodyLineStart = nextLineStart;
-		while (bodyLineStart < text.length) {
+		while (bodyLineStart < bodyLimit) {
 			const bodyLine = lineBounds(text, bodyLineStart);
+			const bodyContentEnd = Math.min(bodyLine.contentEnd, bodyLimit);
 			let indentation = 0;
 			while (
-				bodyLineStart + indentation < bodyLine.contentEnd &&
+				bodyLineStart + indentation < bodyContentEnd &&
 				(text[bodyLineStart + indentation] === " " || text[bodyLineStart + indentation] === "\t")
 			) {
 				indentation++;
 			}
 
-			if (bodyLineStart + indentation === bodyLine.contentEnd) {
+			if (bodyLineStart + indentation === bodyContentEnd) {
 				bodyLineStart = bodyLine.nextLineStart;
 				continue;
 			}
 			if (indentation <= header.indentation) break;
 
-			let bodyTextEnd = bodyLine.contentEnd;
+			let bodyTextEnd = bodyContentEnd;
 			while (
 				bodyTextEnd > bodyLineStart + indentation &&
 				(text[bodyTextEnd - 1] === " " || text[bodyTextEnd - 1] === "\t")
@@ -274,8 +383,22 @@ function findYamlBlockScalarSpansWithRules(text: string, rules: CredentialRedact
 	return spans;
 }
 
-/** Locate the credential-named YAML block-scalar bodies of `text` without mutating it. */
-export function findYamlBlockScalarSpans(text: string): PrivateKeySpan[] {
+/** End of the innermost container that contains `position`, or undefined. */
+function containingContainerEnd(containers: readonly PrivateKeySpan[], position: number): number | undefined {
+	let low = 0;
+	let high = containers.length - 1;
+	while (low <= high) {
+		const middle = (low + high) >> 1;
+		const container = containers[middle];
+		if (position < container.start) high = middle - 1;
+		else if (position >= container.end) low = middle + 1;
+		else return container.end;
+	}
+	return undefined;
+}
+
+/** Locate the credential-named YAML block-scalar bodies of one original text. */
+export function findYamlBlockScalarSpans(text: OriginalText): PrivateKeySpan[] {
 	return findYamlBlockScalarSpansWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
 }
 
@@ -463,6 +586,329 @@ function uniqueStructuredKey(
 	return candidate;
 }
 
+interface ValueOffsets {
+	readonly markerStart: number;
+	readonly markerEnd: number;
+	readonly deleteStart?: number;
+	readonly deleteEnd?: number;
+}
+
+/** Offsets of the secret inside one `valuePattern` match, mirroring the old replacement exactly. */
+function credentialValueOffsets(match: RegExpExecArray): ValueOffsets | undefined {
+	const whole = match[0];
+	if (parseCredentialYamlBlockScalarHeader(whole) !== undefined) return undefined;
+	const prefix = match[1] ?? "";
+	const escapedDoubleQuoted = match[3];
+	const doubleQuoted = match[6];
+	const escapedSingleQuoted = match[9];
+	const singleQuoted = match[12];
+	const backtickQuoted = match[15];
+	const unclosedEscapedDoubleQuoted = match[18];
+	const unclosedDoubleQuoted = match[20];
+	const unclosedEscapedSingleQuoted = match[22];
+	const unclosedSingleQuoted = match[24];
+	const unclosedBacktickQuoted = match[26];
+	const value =
+		escapedDoubleQuoted ??
+		doubleQuoted ??
+		escapedSingleQuoted ??
+		singleQuoted ??
+		backtickQuoted ??
+		unclosedEscapedDoubleQuoted ??
+		unclosedDoubleQuoted ??
+		unclosedEscapedSingleQuoted ??
+		unclosedSingleQuoted ??
+		unclosedBacktickQuoted ??
+		whole.slice(prefix.length);
+	const open =
+		match[2] ??
+		match[5] ??
+		match[8] ??
+		match[11] ??
+		match[14] ??
+		match[17] ??
+		match[19] ??
+		match[21] ??
+		match[23] ??
+		match[25] ??
+		"";
+	const close = match[4] ?? match[7] ?? match[10] ?? match[13] ?? match[16] ?? "";
+	const suffix = whole.slice(prefix.length + open.length + value.length + close.length);
+	if (REDACTION_PLACEHOLDER_PATTERN.test(value.trim()) && /^(?:[):.]|\/?>)*$/.test(suffix)) return undefined;
+	const markerStart = prefix.length + open.length;
+	const markerEnd = markerStart + value.length;
+	if (close.length > 0) {
+		return { markerStart, markerEnd, deleteStart: markerEnd + close.length, deleteEnd: whole.length };
+	}
+	if (open.length > 0) return { markerStart, markerEnd: whole.length };
+	return { markerStart: prefix.length, markerEnd: whole.length };
+}
+
+function collectValueRanges(pattern: RegExp, line: string, base: number, out: RedactionRange[]): void {
+	pattern.lastIndex = 0;
+	for (let match = pattern.exec(line); match !== null; match = pattern.exec(line)) {
+		if (match[0].length === 0) {
+			pattern.lastIndex += 1;
+			continue;
+		}
+		const offsets = credentialValueOffsets(match);
+		if (offsets === undefined) continue;
+		if (offsets.markerEnd > offsets.markerStart) {
+			out.push({
+				start: base + match.index + offsets.markerStart,
+				end: base + match.index + offsets.markerEnd,
+				label: "«redacted»",
+			});
+		}
+		if (offsets.deleteEnd !== undefined && offsets.deleteEnd > offsets.deleteStart!) {
+			out.push({
+				start: base + match.index + offsets.deleteStart!,
+				end: base + match.index + offsets.deleteEnd,
+				label: "",
+			});
+		}
+	}
+}
+
+function collectWholeMatchRanges(
+	pattern: RegExp,
+	line: string,
+	base: number,
+	label: string,
+	out: RedactionRange[],
+): void {
+	pattern.lastIndex = 0;
+	for (let match = pattern.exec(line); match !== null; match = pattern.exec(line)) {
+		if (match[0].length === 0) {
+			pattern.lastIndex += 1;
+			continue;
+		}
+		out.push({ start: base + match.index, end: base + match.index + match[0].length, label });
+	}
+}
+
+function collectPrefixedRanges(
+	pattern: RegExp,
+	line: string,
+	base: number,
+	label: string,
+	out: RedactionRange[],
+	skipYamlHeader: boolean,
+): void {
+	pattern.lastIndex = 0;
+	for (let match = pattern.exec(line); match !== null; match = pattern.exec(line)) {
+		if (match[0].length === 0) {
+			pattern.lastIndex += 1;
+			continue;
+		}
+		if (skipYamlHeader && parseCredentialYamlBlockScalarHeader(match[0]) !== undefined) continue;
+		const start = match.index + (match[1]?.length ?? 0);
+		if (match.index + match[0].length > start) {
+			out.push({ start: base + start, end: base + match.index + match[0].length, label });
+		}
+	}
+}
+
+function collectCookieRanges(line: string, base: number, out: RedactionRange[]): void {
+	COOKIE_VALUE_PATTERN.lastIndex = 0;
+	for (let match = COOKIE_VALUE_PATTERN.exec(line); match !== null; match = COOKIE_VALUE_PATTERN.exec(line)) {
+		if (match[0].length === 0) {
+			COOKIE_VALUE_PATTERN.lastIndex += 1;
+			continue;
+		}
+		if (parseCredentialYamlBlockScalarHeader(match[0]) !== undefined) continue;
+		const [, prefix, value] = match;
+		const start = match.index + prefix.length;
+		const end = match.index + match[0].length - cookieDiagnosticSuffix(value).length;
+		if (end > start) out.push({ start: base + start, end: base + end, label: "«redacted»" });
+	}
+}
+
+function collectClosedEscapedBacktickRanges(pattern: RegExp, line: string, base: number, out: RedactionRange[]): void {
+	pattern.lastIndex = 0;
+	for (let match = pattern.exec(line); match !== null; match = pattern.exec(line)) {
+		if (match[0].length === 0) {
+			pattern.lastIndex += 1;
+			continue;
+		}
+		const [, prefix, open, value, close] = match;
+		const markerStart = match.index + prefix.length + open.length;
+		const markerEnd = markerStart + value.length;
+		if (markerEnd > markerStart) out.push({ start: base + markerStart, end: base + markerEnd, label: "«redacted»" });
+		const deleteStart = markerEnd + close.length;
+		const deleteEnd = match.index + match[0].length;
+		if (deleteEnd > deleteStart) out.push({ start: base + deleteStart, end: base + deleteEnd, label: "" });
+	}
+}
+
+function collectUnclosedEscapedBacktickRanges(
+	pattern: RegExp,
+	line: string,
+	base: number,
+	out: RedactionRange[],
+): void {
+	pattern.lastIndex = 0;
+	for (let match = pattern.exec(line); match !== null; match = pattern.exec(line)) {
+		if (match[0].length === 0) {
+			pattern.lastIndex += 1;
+			continue;
+		}
+		const start = match.index + match[1].length + match[2].length;
+		if (match.index + match[0].length > start) {
+			out.push({ start: base + start, end: base + match.index + match[0].length, label: "«redacted»" });
+		}
+	}
+}
+
+const AUTH_TOKEN_PATTERN =
+	/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]+(?![A-Za-z0-9._~+/=-]*:\/\/)[A-Za-z0-9._~+/=-]{8,}/gi;
+
+const RESIDUAL_WHOLE_MATCH_RULES: readonly { readonly pattern: RegExp; readonly label: string }[] = [
+	{ pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, label: "«redacted-jwt»" },
+	{ pattern: /\bsk-[A-Za-z0-9_-]{8,}\b/g, label: "«redacted-api-key»" },
+	{ pattern: /\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, label: "«redacted-github-token»" },
+	{ pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, label: "«redacted-github-token»" },
+	{ pattern: /\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, label: "«redacted-slack-token»" },
+	{ pattern: /\bnpm_[A-Za-z0-9]{20,}\b/g, label: "«redacted-npm-token»" },
+	{ pattern: /\bglpat-[A-Za-z0-9_-]{20,}\b/g, label: "«redacted-gitlab-token»" },
+	{ pattern: /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, label: "«redacted-api-key»" },
+	{ pattern: /\bhf_[A-Za-z0-9]{20,}\b/g, label: "«redacted-api-key»" },
+	{ pattern: /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g, label: "«redacted-google-api-key»" },
+	{ pattern: /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, label: "«redacted-aws-key»" },
+];
+
+const RESIDUAL_TRAILING_PREFIX_RULES: readonly { readonly pattern: RegExp; readonly label: string }[] = [
+	{
+		pattern: /(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		label: "«redacted»",
+	},
+	{
+		pattern: /(?<![A-Za-z0-9_%])(session(?:id|[_-]id)%3[Dd])[A-Za-z0-9._~%-]{8,}/gi,
+		label: "«redacted»",
+	},
+];
+
+const RESIDUAL_TRAILING_WHOLE_MATCH_RULES: readonly { readonly pattern: RegExp; readonly label: string }[] = [
+	{
+		pattern: /(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{0,39}[/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g,
+		label: "«redacted-aws-key»",
+	},
+];
+
+/**
+ * Line-bounded rules of one original text. Every pattern is attempted on one physical line only,
+ * so no rule can consume a line terminator or reinterpret text produced by another rule.
+ */
+const AUTH_SCHEME_AT_LINE_END = /(?:^|[^A-Za-z0-9_-])(?:Bearer|Basic|Token)[ \t]*$/;
+const DIAGNOSTIC_ASSIGNMENT_AT_LINE_START = /^[ \t]*[A-Za-z][A-Za-z0-9_.-]{0,127}[ \t]*[=:]/;
+const CONTINUATION_DELIMITER = /[\s,;"'`}\]]/;
+
+function collectResidualRanges(text: OriginalText): RedactionRange[] {
+	const ranges: RedactionRange[] = [];
+	let lineStart = 0;
+	while (lineStart <= text.length) {
+		let lineEnd = text.indexOf("\n", lineStart);
+		if (lineEnd < 0) lineEnd = text.length;
+		const contentEnd = lineEnd > lineStart && text[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
+		const line = text.slice(lineStart, contentEnd);
+		collectLineRanges(line, CURRENT_CREDENTIAL_REDACTION_RULES, lineStart, ranges);
+		// A scheme marker alone at the end of a line carries its value on the next physical line.
+		// The continuation is explicit and bounded: it is skipped when the next line is a field
+		// assignment, so `Token\ndiagnostics: keep-me` keeps its newline and its key.
+		if (AUTH_SCHEME_AT_LINE_END.test(line) && lineEnd < text.length) {
+			const nextStart = lineEnd + 1;
+			let nextEnd = text.indexOf("\n", nextStart);
+			if (nextEnd < 0) nextEnd = text.length;
+			const nextContentEnd = nextEnd > nextStart && text[nextEnd - 1] === "\r" ? nextEnd - 1 : nextEnd;
+			const nextLine = text.slice(nextStart, nextContentEnd);
+			if (!DIAGNOSTIC_ASSIGNMENT_AT_LINE_START.test(nextLine)) {
+				let start = 0;
+				while (start < nextLine.length && (nextLine[start] === " " || nextLine[start] === "\t")) start++;
+				let end = start;
+				while (end < nextLine.length && !CONTINUATION_DELIMITER.test(nextLine[end])) end++;
+				if (end - start >= 8)
+					ranges.push({ start: nextStart + start, end: nextStart + end, label: "«redacted-auth»" });
+			}
+		}
+		if (lineEnd === text.length) break;
+		lineStart = lineEnd + 1;
+	}
+	return ranges;
+}
+
+function collectLineRanges(line: string, rules: CredentialRedactionRules, base: number, out: RedactionRange[]): void {
+	collectWholeMatchRanges(AUTH_TOKEN_PATTERN, line, base, "«redacted-auth»", out);
+	for (const rule of RESIDUAL_WHOLE_MATCH_RULES) collectWholeMatchRanges(rule.pattern, line, base, rule.label, out);
+	collectCookieRanges(line, base, out);
+	collectPrefixedRanges(rules.authValueLinePattern, line, base, "«redacted»", out, false);
+	collectAuthorizationRanges(line, base, out);
+	if (rules.assignmentCandidatePattern.test(line)) {
+		collectClosedEscapedBacktickRanges(rules.escapedBacktickValuePattern, line, base, out);
+		collectUnclosedEscapedBacktickRanges(rules.escapedBacktickUnclosedPattern, line, base, out);
+		collectValueRanges(rules.valuePattern, line, base, out);
+	}
+	if (rules.camelAssignmentCandidatePattern.test(line)) {
+		collectClosedEscapedBacktickRanges(rules.camelEscapedBacktickValuePattern, line, base, out);
+		collectUnclosedEscapedBacktickRanges(rules.camelEscapedBacktickUnclosedPattern, line, base, out);
+		collectValueRanges(rules.camelValuePattern, line, base, out);
+	}
+	for (const rule of RESIDUAL_TRAILING_PREFIX_RULES) {
+		collectPrefixedRanges(rule.pattern, line, base, rule.label, out, false);
+	}
+	for (const rule of RESIDUAL_TRAILING_WHOLE_MATCH_RULES) {
+		collectWholeMatchRanges(rule.pattern, line, base, rule.label, out);
+	}
+}
+
+/** `Authorization: Bearer …` is owned by the auth-token rule so a later diagnostic survives. */
+function collectAuthorizationRanges(line: string, base: number, out: RedactionRange[]): void {
+	CREDENTIAL_AUTHORIZATION_VALUE_PATTERN.lastIndex = 0;
+	for (let match = CREDENTIAL_AUTHORIZATION_VALUE_PATTERN.exec(line); match !== null; ) {
+		if (match[0].length === 0) {
+			CREDENTIAL_AUTHORIZATION_VALUE_PATTERN.lastIndex += 1;
+			match = CREDENTIAL_AUTHORIZATION_VALUE_PATTERN.exec(line);
+			continue;
+		}
+		const prefix = match[1] ?? "";
+		const valueStart = match.index + prefix.length;
+		const value = line.slice(valueStart, match.index + match[0].length);
+		if (
+			!/^(?:Bearer|Basic|Token)[ \t]/.test(value) &&
+			parseCredentialYamlBlockScalarHeader(match[0]) === undefined &&
+			match[0].length > prefix.length
+		) {
+			out.push({ start: base + valueStart, end: base + match.index + match[0].length, label: "«redacted»" });
+		}
+		match = CREDENTIAL_AUTHORIZATION_VALUE_PATTERN.exec(line);
+	}
+}
+
+/**
+ * Collect every structural mask of one original text: caller-supplied private-key ranges, then
+ * credential containers, URL userinfo and YAML block-scalar bodies. Detection reads only
+ * `original`; no range here is derived from another range's output.
+ */
+function collectStructuralRanges(original: OriginalText, privateKeySpans: readonly PrivateKeySpan[]): RedactionRange[] {
+	return [
+		...privateKeySpans.map(span => ({ start: span.start, end: span.end, label: PRIVATE_KEY_REDACTION_MARKER })),
+		...findCredentialContainerSpans(original).map(span => ({ ...span, label: "«redacted»" })),
+		...findUrlCredentialSpans(original).map(span => ({ ...span, label: "«redacted-url-credential»" })),
+		...findYamlBlockScalarSpans(original).map(span => ({ ...span, label: "«redacted»" })),
+	];
+}
+
+/**
+ * Every mask of one original text, in one classification pass: the structural ranges above plus
+ * the line-bounded rules, which return their own ranges instead of editing text. Callers pass
+ * private-key ranges they mapped from a wider original source; otherwise the text itself is read.
+ */
+export function collectCrashRedactionRanges(
+	original: OriginalText,
+	privateKeySpans: readonly PrivateKeySpan[] = findPrivateKeySpans(original),
+): RedactionRanges {
+	return [...collectStructuralRanges(original, privateKeySpans), ...collectResidualRanges(original)];
+}
+
 /**
  * Scrub credential material from crash text before it is persisted.
  * Covers bearer/basic-style headers, key=value or JSON key forms of common
@@ -471,28 +917,18 @@ function uniqueStructuredKey(
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES);
-}
-
-/**
- * Scrub the line-bounded rules only, for a caller that already replaced the structural masks
- * (credential containers, private-key blocks, URL userinfo and YAML block-scalar bodies) from one
- * detection pass over its original text.
- * Every rule left here reads one physical line: none of them re-parses indentation or pairs a
- * banner with a footer, so this pass cannot reinterpret structure outside the range it edits.
- * Re-running the structural passes would classify output a previous stage produced, which is
- * exactly the evidence loss a single detection pass exists to avoid.
- */
-export function redactResidualCrashSecrets(text: string): string {
-	return redactCrashSecretsWithRules(text, CURRENT_CREDENTIAL_REDACTION_RULES, false);
+	const original = asOriginalText(text);
+	return applyRedactions(original, collectCrashRedactionRanges(original));
 }
 
 /** Historical redaction rules used only to validate v1 crash fingerprints. */
 export function redactCrashSecretsV1(text: string): string {
-	return redactCrashSecretsWithRules(text, V1_CREDENTIAL_REDACTION_RULES);
+	return redactHistoricalCrashSecrets(asOriginalText(text), V1_CREDENTIAL_REDACTION_RULES);
 }
 
-function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules, structures = true): string {
+/** Sequential v1 rules, frozen for fingerprint validation only; current output never uses them. */
+function redactHistoricalCrashSecrets(text: OriginalText, rules: CredentialRedactionRules): string {
+	const structures = true;
 	let redacted = structures ? redactCredentialContainers(text, rules, rules !== V1_CREDENTIAL_REDACTION_RULES) : text;
 	if (structures) {
 		// Block scalar bodies span lines and must be masked before line-bounded rules handle the
@@ -739,7 +1175,11 @@ function redactCredentialContainers(text: string, rules: CredentialRedactionRule
  * consume the scheme word and leave `://user:secret@host` without an authority the URL rule
  * recognizes.
  */
-export function findUrlCredentialSpans(text: string): PrivateKeySpan[] {
+export function findUrlCredentialSpans(text: OriginalText): PrivateKeySpan[] {
+	return findUrlCredentialSpansIn(text);
+}
+
+function findUrlCredentialSpansIn(text: string): PrivateKeySpan[] {
 	if (!text.includes("://")) return [];
 	const spans: PrivateKeySpan[] = [];
 	const pattern = new RegExp(URL_CREDENTIAL_SOURCE, "gi");
@@ -760,8 +1200,11 @@ export function findUrlCredentialSpans(text: string): PrivateKeySpan[] {
  * previous replacement produced. A scan that runs out of lookahead reports the whole text,
  * because a cutoff cannot prove what it kept is safe for a later rule.
  */
-export function findCredentialContainerSpans(text: string): PrivateKeySpan[] {
-	const rules = CURRENT_CREDENTIAL_REDACTION_RULES;
+export function findCredentialContainerSpans(text: OriginalText): PrivateKeySpan[] {
+	return findCredentialContainerSpansIn(text, CURRENT_CREDENTIAL_REDACTION_RULES);
+}
+
+function findCredentialContainerSpansIn(text: string, rules: CredentialRedactionRules): PrivateKeySpan[] {
 	if (!rules.containerCandidatePattern.test(text)) return [];
 	const { assignment, camel } = containerAssignmentPatterns(rules);
 	const spans: PrivateKeySpan[] = [];
@@ -836,12 +1279,19 @@ function collectCredentialContainerSpans(
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
 		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
 		const container = text.slice(containerStart, containerEnd);
-		if (
-			container.endsWith("]") &&
-			REDACTION_PLACEHOLDER_PATTERN.test(container) &&
-			REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))
-		) {
-			assignment.lastIndex = containerEnd;
+		if (container.endsWith("]") && REDACTION_PLACEHOLDER_PATTERN.test(container)) {
+			if (REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))) {
+				assignment.lastIndex = containerEnd;
+				continue;
+			}
+			// A placeholder followed immediately by more value text is only the first fragment of
+			// the assigned value. Mask the whole value up to the same delimiter the unquoted rule
+			// uses, so the fragment after `]` cannot survive the one application pass.
+			let end = containerEnd;
+			while (end < text.length && !UNQUOTED_VALUE_DELIMITER_PATTERN.test(text[end])) end++;
+			spans.push({ start: containerStart, end });
+			maskedUntil = end;
+			assignment.lastIndex = end;
 			continue;
 		}
 		spans.push({ start: containerStart, end: containerEnd });

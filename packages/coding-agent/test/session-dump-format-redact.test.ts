@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, Usage } from "@gajae-code/ai";
 import { formatSessionDumpText } from "@gajae-code/coding-agent/session/session-dump-format";
+import Ajv2020 from "ajv/dist/2020";
 import fc from "fast-check";
 import { XMLValidator } from "fast-xml-parser";
 
@@ -119,18 +120,24 @@ describe("formatSessionDumpText credential scrub", () => {
 
 	it("removes a URL password that an auth-token prefix would otherwise hide", () => {
 		const password = "SYNTHETIC_PG_PASSWORD";
+		const bearerPassword = "SYNTHETIC_BEARER_USERINFO";
 		const dumped = dump([
 			{
 				role: "user",
-				content: `connect with Token postgres://app:${password}@db.example.com:5432/prod`,
+				content: [
+					`connect with Token postgres://app:${password}@db.example.com:5432/prod`,
+					`and postgres://Bearer-something:${bearerPassword}@host.example.com/db`,
+				].join("\n"),
 				timestamp: 1,
 			},
 		] as AgentMessage[]);
 
-		// The auth-token rule matches the scheme word, so the URL has to be classified from the
-		// original text before that rule consumes the authority delimiter it needs.
+		// The literal `Token` is context, not the credential: the URL rule masks only the userinfo,
+		// so the scheme and host stay recognizable as a URL after the auth-token rule has run.
 		expect(dumped).not.toContain(password);
-		expect(dumped).toContain("db.example.com");
+		expect(dumped).not.toContain(bearerPassword);
+		expect(dumped).toContain("Token postgres://«redacted-url-credential»@db.example.com:5432/prod");
+		expect(dumped).toContain("postgres://«redacted-url-credential»@host.example.com/db");
 		expect(dumped).toContain("connect with");
 	});
 
@@ -266,7 +273,7 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).toContain('"token"');
 		expect(dumped).toContain('"type": "string"');
 		expect(dumped).toContain('"minLength": 10');
-		expect(dumped).toContain('"default": "«redacted»"');
+		expect(dumped).toContain('"default": "«redacted»#properties.token.default"');
 		expect(dumped).toContain('"publicFlag"');
 		expect(dumped).toContain('"type": "boolean"');
 		expect(dumped).not.toContain(defaultValue);
@@ -672,8 +679,12 @@ describe("formatSessionDumpText credential scrub", () => {
 
 		expect(dumped).not.toContain(first);
 		expect(dumped).not.toContain(second);
-		// Both members survive: the marker plus one suffix for the second key.
-		expect(dumped.match(/«redacted-github-token»/g) ?? []).toHaveLength(2);
+		// Both members survive with distinct keys and distinct value-marker paths; the second key
+		// keeps the scrubbed-key suffix so one definition cannot replace the other.
+		expect(dumped).toContain('"«redacted-github-token»":');
+		expect(dumped).toContain('"«redacted-github-token»#2":');
+		expect(dumped).toContain('"«redacted»#properties.api_key.default.«redacted-github-token»"');
+		expect(dumped).toContain('"«redacted»#properties.api_key.default.«redacted-github-token»#2"');
 	});
 
 	it("masks both spellings of a data keyword under a credential-named property", () => {
@@ -700,7 +711,7 @@ describe("formatSessionDumpText credential scrub", () => {
 
 		expect(dumped).not.toContain(escapedDefault);
 		expect(dumped).not.toContain(canonicalDefault);
-		expect(dumped).toContain('"default": "«redacted»"');
+		expect(dumped).toContain('"default": "«redacted»#properties.api_key.default"');
 		expect(dumped).toContain('"default": true');
 	});
 
@@ -855,7 +866,7 @@ describe("formatSessionDumpText credential scrub", () => {
 
 		expect(dumped).not.toContain(tokenDefault);
 		expect(dumped).not.toContain(nestedDefault);
-		expect(dumped).toContain('"token": "«redacted»"');
+		expect(dumped).toContain('"token": "«redacted»#properties.config.default.token"');
 		expect(dumped).toContain('"host": "example.com"');
 	});
 
@@ -875,7 +886,7 @@ describe("formatSessionDumpText credential scrub", () => {
 		});
 
 		expect(dumped).not.toContain("sk-abcdefghijklmnop");
-		expect(dumped).toContain('"default": "«redacted-api-key»"');
+		expect(dumped).toContain('"default": "«redacted-api-key»#properties.value.default"');
 	});
 
 	it("keeps a long container that closes after several unclosed containers", () => {
@@ -1503,6 +1514,41 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(parsed.public).toBe("visible");
 	});
 
+	it("bounds a YAML block scalar discovered inside a credential container", () => {
+		// The fake header sits inside the container's string value; its body scan must stop at `]`
+		// instead of consuming the `# keep-me` line that belongs to the surrounding document.
+		const fixture = 'private_key: ["ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible';
+		const dumped = dump([{ role: "user", content: fixture, timestamp: 1 }] as AgentMessage[]);
+		const document = dumped.slice(dumped.indexOf("private_key:"));
+
+		expect(document).toContain("# keep-me");
+		expect(document).not.toContain("continuation");
+		const parsed = Bun.YAML.parse(document) as { private_key?: unknown; public?: unknown };
+		expect(parsed.public).toBe("visible");
+		expect(typeof parsed.private_key).toBe("string");
+	});
+
+	it("keeps the newline and key after a bare Token line", () => {
+		const dumped = dump([{ role: "user", content: "Token\ndiagnostics: keep-me", timestamp: 1 }] as AgentMessage[]);
+
+		expect(dumped).toContain("Token\ndiagnostics: keep-me");
+		expect(dumped).not.toContain("«redacted-auth»");
+	});
+
+	it("does not reclassify a host after a private-key block is masked", () => {
+		const body = "POST_UNION_URL_PEM_BODY";
+		const fixture = `https://db.example.com(${pem("RSA", "BEGIN")}\n${body}\n${pem("RSA", "END")})@note`;
+		const dumped = dump([{ role: "user", content: fixture, timestamp: 1 }] as AgentMessage[]);
+
+		// The original URL scan stops at the banner's space before any `@`; the residual pass must
+		// never re-read the masked block and treat the host as userinfo.
+		expect(dumped).toContain("db.example.com");
+		expect(dumped).toContain("@note");
+		expect(dumped).not.toContain(body);
+		expect(dumped).not.toContain(pem("RSA", "BEGIN"));
+		expect(dumped).not.toContain(pem("RSA", "END"));
+	});
+
 	it("keeps a covered typed constraint out of the rendered schema", () => {
 		const body = "SCHEMA_TYPED_PEM_BODY";
 		const dumped = formatSessionDumpText({
@@ -1532,7 +1578,7 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(dumped).not.toContain(pem("RSA", "END"));
 		// Incidental label check for one covered default; the assertions below do not depend on which
 		// marker wins a merged range.
-		expect((properties.first as { default: string }).default).toBe("«redacted-private-key»");
+		expect((properties.first as { default: string }).default).toBe("«redacted-private-key»#properties.first.default");
 		// A covered keyword is omitted rather than printed as a string, and a covered boolean
 		// subschema becomes the neutral schema. What survives is still a JSON Schema document:
 		// `{}` constrains nothing, and every remaining value has the shape its keyword requires.
@@ -1544,6 +1590,46 @@ describe("formatSessionDumpText credential scrub", () => {
 		expect(Object.hasOwn(properties.second as object, "type")).toBe(false);
 		expect(properties.flag).toEqual({});
 		expect((properties.first as { type: string }).type).toBe("string");
+	});
+
+	it("keeps a covered identifier list valid against the draft 2020-12 meta-schema", () => {
+		const body = "SCHEMA_IDENTIFIER_PEM_BODY";
+		const dumped = formatSessionDumpText({
+			messages: [],
+			model: null,
+			thinkingLevel: null,
+			tools: [
+				{
+					name: "mcp_request",
+					description: "calls a tool",
+					parameters: {
+						type: "object",
+						description: `${pem("RSA", "BEGIN")}\n${body}`,
+						required: ["alpha", "beta"],
+						title: pem("RSA", "END"),
+						properties: { alpha: { type: "string" }, beta: { type: "string" } },
+						anyOf: [{ title: pem("RSA", "BEGIN") }, { title: pem("RSA", "END") }],
+						enum: [pem("RSA", "BEGIN"), pem("RSA", "END")],
+					},
+				},
+			],
+		});
+
+		const names = ["type", "description", "required", "title", "properties", "anyOf", "enum"];
+		const schema: Record<string, unknown> = {};
+		for (const name of names) {
+			const text = parameterValue(dumped, name);
+			if (text === undefined) continue;
+			try {
+				schema[name] = JSON.parse(text);
+			} catch {
+				// A schema string is printed as its raw text (`object`, not `"object"`).
+				schema[name] = text;
+			}
+		}
+		const ajv = new Ajv2020({ strict: false });
+		expect(ajv.validateSchema(schema)).toBe(true);
+		expect(dumped).not.toContain(body);
 	});
 
 	it("bounds unclosed credential containers in the session dump", () => {
