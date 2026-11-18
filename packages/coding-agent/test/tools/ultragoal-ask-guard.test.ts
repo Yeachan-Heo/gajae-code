@@ -509,8 +509,10 @@ describe("ultragoal ask guard cancellation", () => {
 			() => ({}),
 			() => undefined,
 		);
-		const twice = guardToolForUltragoalAsk(
-			once,
+		// SDK startup can guard one wrapper while a later nested lookup starts from
+		// the raw registry object; the marker must not leak to that target.
+		const fromRaw = guardToolForUltragoalAsk(
+			raw,
 			() => process.cwd(),
 			() => ({}),
 			() => undefined,
@@ -518,8 +520,9 @@ describe("ultragoal ask guard cancellation", () => {
 		const controller = new AbortController();
 		controller.abort();
 
-		expect(twice).toBe(once);
-		await expect(twice.execute("ask-1", {} as never, controller.signal)).rejects.toBeInstanceOf(ToolAbortError);
+		expect(fromRaw).not.toBe(raw);
+		expect(fromRaw).not.toBe(once);
+		await expect(fromRaw.execute("ask-1", {} as never, controller.signal)).rejects.toBeInstanceOf(ToolAbortError);
 		expect(calls).toEqual([]);
 	});
 

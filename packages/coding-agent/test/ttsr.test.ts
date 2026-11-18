@@ -2504,6 +2504,49 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			expect(bashCalls).toEqual([]);
 		});
 
+		it("aborts a detached call from an earlier cell when eval is cancelled", async () => {
+			const bashCalls: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const approval = Promise.withResolvers<ClientBridgePermissionOutcome>();
+			const bashAsked = Promise.withResolvers<void>();
+			const toolCall: ToolCall = {
+				type: "toolCall",
+				id: "eval-1",
+				name: "eval",
+				arguments: {
+					cells: [
+						{ language: "js", code: "tool.bash({ command: 'echo X' }).catch(() => {});" },
+						{ language: "js", code: "await new Promise(resolve => setTimeout(resolve, 1000));" },
+					],
+				},
+			};
+			const { session } = createSession([evalToolFor(() => session), bashTool], [[toolCall]], [], {
+				sdkPermissionProvider: toolCall => {
+					if (toolCall.toolName !== "bash") {
+						return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+					}
+					bashAsked.resolve();
+					return approval.promise;
+				},
+			});
+			const runPromise = run(session, "two cells");
+			await bashAsked.promise;
+			session.abortEval();
+			approval.resolve({ outcome: "selected", optionId: "allow_once" });
+			await runPromise;
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
+		});
+
 		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
 			const { session, triggered } = createSession(
 				[evalToolFor(() => session), new WriteTool(createToolSession())],
