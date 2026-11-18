@@ -20085,7 +20085,8 @@ export class AgentSession {
 	 *  delivers the first leaves the second waiting there. */
 	get hasQueuedSteering(): boolean {
 		if (this.agent.hasQueuedSteering()) return true;
-		return this.agent.snapshotFollowUp().some(message => this.#rearmedSteerMessages.has(message));
+		if (this.agent.snapshotFollowUp().some(message => this.#rearmedSteerMessages.has(message))) return true;
+		return this.#deferredSdkFollowUps.some(message => this.#rearmedSteerMessages.has(message));
 	}
 
 	/** Get pending messages (read-only). Returns the public text-only view;
