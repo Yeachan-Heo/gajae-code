@@ -644,8 +644,7 @@ function scrubCacheVendorTokens(text: string): string {
  */
 function scrubHostPaths(text: string): string {
 	const home = os.homedir();
-	const homePattern =
-		home.length > 1 ? new RegExp(`(?<![A-Za-z0-9._#])${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
+	const homePattern = home.length > 1 ? new RegExp(`${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
 	const escapedHome = home.length > 1 ? home.replaceAll("/", "\\/") : "";
 	// JSON text escapes quotes and backslashes as well as slashes.
 	const jsonHome = home.length > 1 ? JSON.stringify(home).slice(1, -1) : "";
@@ -653,14 +652,14 @@ function scrubHostPaths(text: string): string {
 		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
 		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
-		scrubbed = scrubbed.replace(/\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|]+/g, "~");
-		scrubbed = scrubbed.replace(/\/root(?![A-Za-z0-9._-])/g, "~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|:=]+/g, "~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z])\/root(?![A-Za-z0-9._-])/g, "~");
 		// JSON text can escape path separators; mask the same local paths in
 		// that spelling without changing the surrounding text.
-		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
-		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|]+/gi, "$1~");
+		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|:=]+/g, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|:=]+/gi, "$1~");
 		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
-		return scrubbed.replace(/(?<![A-Za-z0-9._#])[A-Za-z]:[\\/]Users[\\/][^\\/\r\n"`<>()[\]{},;|]+/gi, "~");
+		return scrubbed.replace(/[A-Za-z]:[\\/]Users[\\/][^\\/\r\n"`<>()[\]{},;|:=]+/gi, "~");
 	};
 	// A `file:` URL's path is local, so scrub it without turning the marker into
 	// an authority: `file:///home/u/x` -> `file:///~/x`,
@@ -689,12 +688,12 @@ function scrubHostPaths(text: string): string {
 		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
 		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
 		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
-		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|]+/g, "$1~");
+		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|:=]+/g, "$1~");
 		scrubbed = scrubbed.replace(/\/root(?=\/|[?#]|$)/g, "~");
-		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|]+/g, "$1~");
-		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|]+/gi, "$1~");
+		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|:=]+/g, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|:=]+/gi, "$1~");
 		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
-		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\r\n"`<>()[\]{},;|]+/gi, "$1~");
+		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\r\n"`<>()[\]{},;|:=]+/gi, "$1~");
 	};
 	// A URL's path is content, not a local path, so only scrub outside URL spans.
 	// `|` ends a span so a compact Markdown table row does not shield the next
@@ -723,12 +722,15 @@ function scrubCacheText(text: string, diff = false): string {
 	// The shared URL rule does not know about Markdown cell separators and can
 	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
 	// (userinfo was already removed) so only our authority pass sees them.
-	// Host paths come off before any token/assignment redactor can consume a
-	// following scheme word and turn a local path into a remote-looking span.
-	const withoutAtSigns = scrubHostPaths(containers.text).replaceAll("@", AT_SIGN_MASK);
+	const withoutAtSigns = containers.text.replaceAll("@", AT_SIGN_MASK);
+	// Credential labels are masked before paths so a path scrub cannot consume
+	// a label and orphan its value; paths run before the shared redactor so a
+	// token cannot consume a following `file` scheme word.
 	const authHeaders = maskBoundedAuthorizationHeaders(withoutAtSigns);
 	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
-	let scrubbed = redactCrashSecrets(assignments.text);
+	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
+	let scrubbed = scrubHostPaths(withoutBearer);
+	scrubbed = redactCrashSecrets(scrubbed);
 	scrubbed = scrubCacheVendorTokens(scrubbed);
 	scrubbed = scrubbed.replaceAll(AT_SIGN_MASK, "@");
 	return containers.restore(authHeaders.restore(assignments.restore(scrubbed)));

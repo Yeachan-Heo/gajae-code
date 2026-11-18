@@ -914,6 +914,8 @@ describe("github view cache persistence", () => {
 			"xghp_0123456789012345file://localhost/home/cache-fixture/private.txt",
 			"xghp_012345678901234Afile://localhost/home/cache-fixture/private.txt",
 			"ghp_0123456789012345file://localhost/home/cache-fixture/private.txt",
+			`ghp_0123456789012345${os.homedir()}/private.txt`,
+			String.raw`C:\Users\Jane Doe. Bearer /dGVzdC1maXh0dXJl`,
 			"-/home/demo-user/config",
 			"10. item\n\n    # Release | Notes\n    ---|---\n    https://fixture-user:alpha|beta@example.test/x",
 			"left | right\n--- | ---\n# https://fixture-user:cache|canary@example.test/x",
@@ -966,6 +968,8 @@ describe("github view cache persistence", () => {
 		expect(cacheFileBytes()).not.toContain("'cache-fixture");
 		expect(cacheFileBytes()).not.toContain("Jane Doe");
 		expect(cacheFileBytes()).not.toContain(os.homedir());
+		expect(cached?.payload.body).not.toContain(os.homedir());
+		expect(cacheFileBytes()).not.toContain("dGVzdC1t");
 		expect(cacheFileBytes()).not.toContain("/root/config");
 		expect(cacheFileBytes()).not.toContain("/root?view=1");
 		expect(cacheFileBytes()).not.toContain("/root#top");
