@@ -910,6 +910,7 @@ interface AcceptedQueueCancellation {
 	disposition: AcceptedQueueDisposition;
 	dispositionPromise: Promise<AcceptedQueueDisposition>;
 	resolveDisposition: (disposition: AcceptedQueueDisposition) => void;
+	ExecutionStarted: boolean;
 	removalTerminalization?: Promise<boolean>;
 	removalFailure?: unknown;
 }
@@ -3450,18 +3451,31 @@ function createControlSurface(
 			disposition: "preflight",
 			dispositionPromise: queueDisposition.promise,
 			resolveDisposition: queueDisposition.resolve,
+			ExecutionStarted: false,
 		};
 		let accepted = false;
 		let settled = false;
 		let submission: Promise<unknown> | undefined;
+		let unregisteredOnExecutionStart = false;
 		const cancelPreflight = (): boolean => {
 			preflightController.abort();
-			// Issue #7853: an abort that lands after preflight acceptance but before
-			// execution completion should cancel it. Even if the preflight was already
-			// settled (accepted), aborting the signal is still a successful cancellation.
+			// Issue #7853: Check if execution has started. Only return true if the submission
+			// is still in the preflight phase (accepted but NOT started). Once execution starts
+			// (at agent_start), we cannot cancel the preflight anymore.
+			const cancellationRecord = acceptedQueueCancellations.get(`${correlation.commandId}:${correlation.turnId}`);
+			if (cancellationRecord?.ExecutionStarted === true) {
+				// Execution has started; cannot cancel preflight after agent_start has fired.
+				// Unregister this callback so it won't be called again.
+				if (!unregisteredOnExecutionStart) {
+					unregisteredOnExecutionStart = true;
+					const requesterPreflights = currentRequesterPreflights();
+					requesterPreflights.delete(cancelPreflight);
+				}
+				return false; // Cannot cancel; execution has already started
+			}
 			if (accepted) {
-				// The preflight was accepted (durable write succeeded). The signal is now
-				// aborted, which interrupts any execution. This is a successful cancellation.
+				// The preflight was accepted (durable write succeeded) and execution has NOT started yet.
+				// The signal is now aborted, which interrupts the preflight. This is a successful cancellation.
 				return true;
 			}
 			if (settled) return false; // Already settled and not accepted, didn't cancel
@@ -6052,6 +6066,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				else current.deadlineManager.onRunStarted(entry.correlation);
 			}
 			transitions = drained.map(({ kind, correlation }) => ({ kind, correlation }));
+			// Mark submissions as having started execution so cancelPreflight can distinguish
+			// preflight cancellations (which succeed) from aborts after agent_start (which don't).
+			for (const { correlation } of transitions) {
+				const cancellationRecord = acceptedQueueCancellations.get(`${correlation.commandId}:${correlation.turnId}`);
+				if (cancellationRecord) {
+					cancellationRecord.ExecutionStarted = true;
+				}
+			}
 		} else {
 			// Pair this agent_end with the oldest unmatched start. A delayed
 			// aborted-turn end that lands after a successor agent_start must

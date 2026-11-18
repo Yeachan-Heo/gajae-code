@@ -11884,7 +11884,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				},
 			});
 			// Start the prompt (this triggers sendUserMessage which accepts the preflight)
-			const promptPromise = harness.control("turn.prompt", { text: "original" });
+			void harness.control("turn.prompt", { text: "original" });
 			// Give the preflight time to be accepted and row persisted
 			await Bun.sleep(50);
 			// Abort while the preflight is accepted but execution hasn't started.
@@ -11915,6 +11915,83 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// Unblock the execution so the prompt completes
 			executionBlocked?.resolve();
 			await Bun.sleep(50);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort-after-agent_start-does-not-report-preflight-cancelled", async () => {
+		// Issue #7853: aborting after agent_start has fired should NOT cancel the preflight,
+		// because execution has already started. The abort should report turn=uncertain,
+		// not turn=stopped. The fix ensures cancelPreflight only returns true when execution
+		// has NOT started (before agent_start), and unregisters the callback at that point.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-after-agent-start-"));
+		try {
+			const transport = memoryTransport();
+			const reconciliationStore = createReconciliationStore({
+				sessionFile: path.join(cwd, "session.json"),
+				sessionId: transport.sessionId,
+			});
+			let agentStartEmitted = false;
+			const harness = await invocationHarness("abort-after-agent-start", cwd, {
+				sendUserMessage: async (_content, options) => {
+					// Accept the preflight (triggering durable write)
+					await options?.onPreflightAcceptCommit?.();
+					// Wait for agent_start to be emitted
+					await new Promise<void>(resolve => {
+						const checkInterval = setInterval(() => {
+							if (agentStartEmitted) {
+								clearInterval(checkInterval);
+								resolve();
+							}
+						}, 5);
+					});
+					// Never complete, so the turn stays in_flight
+					await neverSettlingPromise();
+				},
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => 1,
+					getActivePromptHandle: () => "abort-after-agent-start",
+					getActivePromptOwnerConnectionId: () => "client",
+					cancelPendingPreflightForTerminalAbort: () => {},
+					pendingToolExecutions: () => [],
+					// Return unfenced so the abort can't succeed via other means
+					abortPromptAndWaitWithTerminal: async () => ({ status: "unfenced" }),
+					getReconciliationStore: () => reconciliationStore,
+				},
+			});
+			// Start the prompt (this triggers sendUserMessage which accepts the preflight)
+			void harness.control("turn.prompt", { text: "original" });
+			// Give the preflight time to be accepted
+			await Bun.sleep(50);
+			// Emit agent_start to simulate execution starting
+			agentStartEmitted = true;
+			await harness.emit("agent_start");
+			await Bun.sleep(10);
+			// Abort after agent_start has fired. Since execution has started,
+			// the abort should NOT report turn=stopped (preflight cancelled),
+			// but instead turn=uncertain (execution may still be running).
+			const abort = await harness.controlAs(
+				"client",
+				"turn.abort",
+				{ mode: "terminal" },
+				"abort-after-agent-start-key",
+			);
+			expect(abort).toMatchObject({
+				ok: true,
+				result: { turn: "uncertain" }, // Fix ensures uncertain, not stopped
+			});
+			// Wait for durable row to settle (may take a moment due to async operations)
+			const deadline = Date.now() + 5000;
+			while (reconciliationStore.snapshotTerminalScopes().length === 0) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for durable row to persist");
+				await Bun.sleep(20);
+			}
+			const row = reconciliationStore.snapshotTerminalScopes()[0]!;
+			// The fix ensures the row settles as uncertain (execution was started, not cancelled)
+			expect(row.turnDisposition).toBe("uncertain");
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
