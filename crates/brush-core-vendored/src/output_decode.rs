@@ -169,122 +169,110 @@ impl OutputDecoder {
 	}
 
 	fn drain(&mut self, eof: bool) -> String {
-		match self.state.mode {
-			Mode::Utf8 => self.drain_utf8(eof),
-			#[cfg(windows)]
-			Mode::Acp => self.drain_acp(eof),
-		}
-	}
-
-	fn drain_utf8(&mut self, eof: bool) -> String {
-		let mut out = String::new();
-		if self.pending.is_empty() {
-			return out;
-		}
-
-		loop {
-			match str::from_utf8(&self.pending) {
-				Ok(text) => {
-					out.push_str(text);
-					self.pending.clear();
-					return out;
-				},
-				Err(error) => {
-					let valid_up_to = error.valid_up_to();
-					let error_len = error.error_len();
-					if valid_up_to > 0 {
-						// SAFETY: [..valid_up_to] is valid UTF-8 by valid_up_to().
-						out.push_str(unsafe { str::from_utf8_unchecked(&self.pending[..valid_up_to]) });
-					}
-
-					if error_len.is_none() && !eof {
-						self.pending.drain(..valid_up_to);
-						return out;
-					}
-
-					#[cfg(windows)]
-					if self.state.select_acp_fallback() {
-						// One encoding per command. Do not resume UTF-8 after
-						// a bad byte: later UTF-8 would be ACP-mojibake, but
-						// cmd/chcp emit ACP for the whole stream.
-						self.pending.drain(..valid_up_to);
-						out.push_str(&self.drain_acp(eof));
-						return out;
-					}
-
-					// Decode only the error bytes themselves as lossy; keep trailing incomplete
-					// UTF-8 for the next chunk (unless EOF).
-					let error_end = valid_up_to + error_len.unwrap_or(0);
-					if error_end > valid_up_to {
-						out.push_str(&String::from_utf8_lossy(&self.pending[valid_up_to..error_end]));
-					}
-					if eof {
-						// At EOF, lossy-decode any remaining incomplete sequence.
-						if error_end < self.pending.len() {
-							out.push_str(&String::from_utf8_lossy(&self.pending[error_end..]));
-						}
-						self.pending.clear();
-						return out;
-					} else {
-						// Not EOF: keep incomplete sequence for next chunk.
-						self.pending.drain(..error_end);
-						// Loop to process any remaining malformed bytes in pending.
-						if self.pending.is_empty() {
-							return out;
-						}
-					}
-				},
-			}
-		}
-	}
-
-	#[cfg(windows)]
-	fn drain_acp(&mut self, eof: bool) -> String {
 		let mut out = String::new();
 
+		// Single iterative loop that switches mode as needed, avoiding mutual recursion.
+		// Mode switching happens at line boundaries when in ACP mode (switch to UTF-8),
+		// or when invalid UTF-8 is encountered (switch to ACP on Windows).
 		loop {
 			if self.pending.is_empty() {
 				return out;
 			}
 
-			// Look for a newline in the ACP-encoded data to determine where this line ends.
-			// Once we find a newline, reset back to UTF-8 mode for the next line.
-			let mut line_end = None;
-			let mut index = 0;
-			while index < self.pending.len() {
-				if self.pending[index] == b'\n' {
-					line_end = Some(index + 1);
-					break;
-				}
-				let Some(char_len) = acp_character_len(self.state.fallback_codepage, &self.pending[index..], eof) else {
-					break;
-				};
-				index += char_len;
+			match self.state.mode {
+				Mode::Utf8 => {
+					match str::from_utf8(&self.pending) {
+						Ok(text) => {
+							out.push_str(text);
+							self.pending.clear();
+							return out;
+						},
+						Err(error) => {
+							let valid_up_to = error.valid_up_to();
+							let error_len = error.error_len();
+							if valid_up_to > 0 {
+								// SAFETY: [..valid_up_to] is valid UTF-8 by valid_up_to().
+								out.push_str(unsafe { str::from_utf8_unchecked(&self.pending[..valid_up_to]) });
+							}
+
+							if error_len.is_none() && !eof {
+								self.pending.drain(..valid_up_to);
+								return out;
+							}
+
+							#[cfg(windows)]
+							if self.state.select_acp_fallback() {
+								// One encoding per command. Do not resume UTF-8 after
+								// a bad byte: later UTF-8 would be ACP-mojibake, but
+								// cmd/chcp emit ACP for the whole stream.
+								self.pending.drain(..valid_up_to);
+								// Loop continues in ACP mode; do not return.
+								continue;
+							}
+
+							// Decode only the error bytes themselves as lossy; keep trailing incomplete
+							// UTF-8 for the next chunk (unless EOF).
+							let error_end = valid_up_to + error_len.unwrap_or(0);
+							if error_end > valid_up_to {
+								out.push_str(&String::from_utf8_lossy(&self.pending[valid_up_to..error_end]));
+							}
+							if eof {
+								// At EOF, lossy-decode any remaining incomplete sequence.
+								if error_end < self.pending.len() {
+									out.push_str(&String::from_utf8_lossy(&self.pending[error_end..]));
+								}
+								self.pending.clear();
+								return out;
+							} else {
+								// Not EOF: keep incomplete sequence for next chunk.
+								self.pending.drain(..error_end);
+								// Continue looping to process any remaining malformed bytes in pending.
+								if self.pending.is_empty() {
+									return out;
+								}
+							}
+						},
+					}
+				},
+				#[cfg(windows)]
+				Mode::Acp => {
+					// Look for a newline in the ACP-encoded data to determine where this line ends.
+					// Once we find a newline, reset back to UTF-8 mode for the next line.
+					let mut line_end = None;
+					let mut index = 0;
+					while index < self.pending.len() {
+						if self.pending[index] == b'\n' {
+							line_end = Some(index + 1);
+							break;
+						}
+						let Some(char_len) = acp_character_len(self.state.fallback_codepage, &self.pending[index..], eof) else {
+							break;
+						};
+						index += char_len;
+					}
+
+					let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, &self.pending, eof));
+					if len == 0 {
+						return out;
+					}
+
+					let decoded = decode_codepage(self.state.fallback_codepage, &self.pending[..len])
+						.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
+					self.pending.drain(..len);
+					out.push_str(&decoded);
+
+					// If we found a line ending (newline), reset back to UTF-8 mode for the next line.
+					if line_end.is_some() {
+						self.state.mode = Mode::Utf8;
+						// Continue looping to process remaining data in UTF-8 mode.
+						continue;
+					}
+
+					// No newline found and we've processed all complete ACP sequences.
+					// Return and wait for more data or EOF.
+					return out;
+				},
 			}
-
-			let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, &self.pending, eof));
-			if len == 0 {
-				return out;
-			}
-
-			let decoded = decode_codepage(self.state.fallback_codepage, &self.pending[..len])
-				.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
-			self.pending.drain(..len);
-			out.push_str(&decoded);
-
-			// If we found a line ending (newline), reset back to UTF-8 mode for the next line.
-			if line_end.is_some() {
-				self.state.mode = Mode::Utf8;
-				// Continue processing remaining data in UTF-8 mode.
-				if !self.pending.is_empty() {
-					out.push_str(&self.drain_utf8(eof));
-				}
-				return out;
-			}
-
-			// No newline found and we've processed all complete ACP sequences.
-			// Return and wait for more data or EOF.
-			return out;
 		}
 	}
 }
@@ -674,5 +662,64 @@ mod tests {
 		// Expected: both lines decoded and returned
 		assert_eq!(result, "中\n文\n", "Both GBK lines should decode in one call");
 		assert_eq!(decoder.finish(), "");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn many_alternating_invalid_and_valid_lines_does_not_overflow() {
+		// Regression test for stack overflow caused by mutual recursion between
+		// drain_utf8 and drain_acp. When the buffer contains many alternating lines of
+		// invalid UTF-8 (triggering ACP mode) and valid UTF-8 (resetting to UTF-8),
+		// the old code would create a stack frame for each line transition,
+		// causing stack overflow around 100k+ lines.
+		//
+		// This test creates 100k alternating lines:
+		// - Invalid line: [0xFF, \n] - invalid UTF-8, falls back to ACP, decodes as lossy
+		// - Valid line: [0x41, \n] (ASCII 'A', valid UTF-8)
+		//
+		// Expected: all 100k lines decode successfully without stack overflow.
+		// All 100k+ lines should be fully decoded and returned.
+		let mut decoder = OutputDecoder::with_fallback_codepage(936); // Use GBK to trigger ACP fallback
+
+		let mut buffer = Vec::new();
+		const NUM_LINES: usize = 100_000;
+		for i in 0..NUM_LINES {
+			if i % 2 == 0 {
+				// Invalid UTF-8 line: will trigger ACP fallback
+				buffer.push(0xFF);
+			} else {
+				// Valid UTF-8 line: ASCII 'A'
+				buffer.push(0x41);
+			}
+			buffer.push(b'\n');
+		}
+
+		let result = decoder.push(&buffer);
+		let finish = decoder.finish();
+
+		// Verify all lines are decoded
+		let total_output = result + &finish;
+		let line_count = total_output.lines().count();
+		assert_eq!(
+			line_count, NUM_LINES,
+			"Expected {} lines, got {}",
+			NUM_LINES, line_count
+		);
+
+		// Verify no data is lost (each line should end with \n, except possibly the last if no newline)
+		// and contains either U+FFFD (replacement for 0xFF) or 'A'
+		for (i, line) in total_output.lines().enumerate() {
+			if i % 2 == 0 {
+				// Invalid line should be replacement character
+				assert_eq!(
+					line, "\u{FFFD}",
+					"Line {} should be replacement char (0xFF decoded as lossy)",
+					i
+				);
+			} else {
+				// Valid line should be 'A'
+				assert_eq!(line, "A", "Line {} should be 'A'", i);
+			}
+		}
 	}
 }
