@@ -11,14 +11,15 @@
 //! them with U+FFFD (乱码).
 //!
 //! Policy: decode as UTF-8 until a complete invalid sequence; on Windows,
-//! switch the remainder of that stream to the process ANSI code page
-//! (`GetACP`) unless that page is already UTF-8.
+//! switch to the process ANSI code page (`GetACP`) unless that page is
+//! already UTF-8. Reset to UTF-8 at line boundaries (after `\n`) so each
+//! line's encoding is independently determined.
 //!
 //! Valid UTF-8 always wins, including bytes that are also valid ACP (GBK 一 is
 //! `D2 BB`, which is U+04BB in UTF-8). Overlap is ambiguous; this prefers the
-//! modern-tool default over guessing language. The ACP switch is permanent
-//! for the stream: command output is one encoding, not mixed. A single
-//! invalid byte therefore ACP-decodes everything after it.
+//! modern-tool default over guessing language. The ACP switch is per-line,
+//! not permanent: a single invalid byte ACP-decodes only that line. The next
+//! line starts with UTF-8 preference again.
 
 use std::str;
 
@@ -242,13 +243,36 @@ impl OutputDecoder {
 		if self.pending.is_empty() {
 			return String::new();
 		}
-		let len = complete_acp_len(self.state.fallback_codepage, &self.pending, eof);
+
+		// Look for a newline in the ACP-encoded data to determine where this line ends.
+		// Once we find a newline, reset back to UTF-8 mode for the next line.
+		let mut line_end = None;
+		let mut index = 0;
+		while index < self.pending.len() {
+			if self.pending[index] == b'\n' {
+				line_end = Some(index + 1);
+				break;
+			}
+			let Some(char_len) = acp_character_len(self.state.fallback_codepage, &self.pending[index..], eof) else {
+				break;
+			};
+			index += char_len;
+		}
+
+		let len = line_end.unwrap_or_else(|| complete_acp_len(self.state.fallback_codepage, &self.pending, eof));
 		if len == 0 {
 			return String::new();
 		}
+
 		let decoded = decode_codepage(self.state.fallback_codepage, &self.pending[..len])
 			.unwrap_or_else(|| String::from_utf8_lossy(&self.pending[..len]).into_owned());
 		self.pending.drain(..len);
+
+		// If we found a line ending (newline), reset back to UTF-8 mode for the next line.
+		if line_end.is_some() {
+			self.state.mode = Mode::Utf8;
+		}
+
 		decoded
 	}
 }
@@ -588,6 +612,37 @@ mod tests {
 		assert_eq!(decoder.push(&[0xff, 0xe2]), "\u{FFFD}");
 		// Next chunk completes the € character (0xE2 0x82 0xAC).
 		assert_eq!(decoder.push(&[0x82, 0xac]), "€");
+		assert_eq!(decoder.finish(), "");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn utf8_resumes_after_invalid_byte_at_line_boundary() {
+		// When an invalid byte appears in the middle of a stream, the current
+		// implementation permanently switches to ACP decoding for the rest of the stream.
+		// This test verifies the fix: decoding should return to UTF-8 after a line
+		// boundary (newline). This prevents one line's encoding problem from corrupting
+		// subsequent lines.
+		//
+		// Scenario: UTF-8 line, then a line with an invalid byte, then UTF-8 again.
+		// Before fix: last line decoded incorrectly as ACP.
+		// After fix: last line decoded correctly as UTF-8.
+		let mut decoder = OutputDecoder::with_fallback_codepage(936);
+
+		// First line: valid UTF-8
+		assert_eq!(decoder.push(b"line1\n"), "line1\n");
+
+		// Second line: invalid byte followed by newline
+		// 0xff is not valid in UTF-8 or GBK, so it becomes replacement; newline ends the line
+		assert_eq!(decoder.push(&[0xff, b'\n']), "\u{FFFD}\n");
+
+		// Third line: valid UTF-8 (中文 in UTF-8)
+		// Before fix: this would be decoded as GBK and become mojibake.
+		// After fix: this should be decoded as UTF-8 and display correctly.
+		let utf8_line = "中文\n".as_bytes();
+		let result = decoder.push(utf8_line);
+		assert_eq!(result, "中文\n", "UTF-8 line after invalid byte should decode as UTF-8, not ACP");
+
 		assert_eq!(decoder.finish(), "");
 	}
 }
