@@ -257,6 +257,76 @@ fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
 	state.acks.lock().begin_dispatch(request.request_id())
 }
 
+/// Rewrite every unpaired UTF-16 surrogate escape (`\uD800`–`\uDFFF`) inside
+/// JSON string literals to `\uFFFD`.
+///
+/// Host frames are produced by JavaScript, whose strings are UTF-16 and may
+/// legitimately hold an unpaired surrogate, for example a streamed tool-call
+/// argument cut between the two halves of an astral character. `JSON.stringify`
+/// emits such a code unit as a `\uDxxx` escape. That is valid RFC 8259 JSON,
+/// but a Rust `String` cannot represent it, so `serde_json` rejects the whole
+/// frame and a single emoji fragment used to turn an ordinary progress frame
+/// into `invalid_frame`. The substitution is the one
+/// `String.prototype.toWellFormed` performs, so every client receives
+/// well-formed text, and it replaces four ASCII hex digits with four ASCII hex
+/// digits: the byte length is unchanged and the frame ceiling verdict is the
+/// one the producer computed.
+///
+/// Input that is not otherwise valid JSON is returned with the same rewrite
+/// applied and still fails the subsequent parse.
+#[must_use]
+pub fn replace_lone_surrogate_escapes(json: String) -> String {
+	fn hex_escape(bytes: &[u8], at: usize) -> Option<u16> {
+		bytes.get(at..at + 4)?.iter().try_fold(0u16, |unit, digit| {
+			let value = char::from(*digit).to_digit(16)?;
+			Some(unit << 4 | value as u16)
+		})
+	}
+	let bytes = json.as_bytes();
+	let mut lone = Vec::new();
+	let mut in_string = false;
+	let mut index = 0;
+	while index < bytes.len() {
+		match bytes[index] {
+			b'"' => {
+				in_string = !in_string;
+				index += 1;
+			},
+			b'\\' if in_string => {
+				if bytes.get(index + 1) != Some(&b'u') {
+					index += 2;
+					continue;
+				}
+				let Some(unit) = hex_escape(bytes, index + 2) else {
+					index += 2;
+					continue;
+				};
+				if (0xd800..=0xdbff).contains(&unit)
+					&& bytes.get(index + 6..index + 8) == Some(b"\\u".as_slice())
+					&& hex_escape(bytes, index + 8).is_some_and(|low| (0xdc00..=0xdfff).contains(&low))
+				{
+					index += 12;
+					continue;
+				}
+				if (0xd800..=0xdfff).contains(&unit) {
+					lone.push(index + 2);
+				}
+				index += 6;
+			},
+			_ => index += 1,
+		}
+	}
+	if lone.is_empty() {
+		return json;
+	}
+	let mut bytes = json.into_bytes();
+	for at in lone {
+		bytes[at..at + 4].copy_from_slice(b"fffd");
+	}
+	String::from_utf8(bytes)
+		.expect("replacing ASCII hex digits with ASCII hex digits preserves UTF-8")
+}
+
 /// Extract a safe protocol kind for diagnostics without retaining payload data.
 fn directed_frame_kind(json: &str) -> String {
 	let Some(value) = serde_json::from_str::<serde_json::Value>(json).ok() else {
@@ -1193,7 +1263,9 @@ impl ServerHandle {
 	/// or formatting the payload, so a caller can identify the dropped delivery
 	/// without exposing secrets.
 	pub fn send_to(&self, connection_id: &str, json: String) -> Result<(), DirectedDeliveryError> {
-		self.enqueue_directed_frame(connection_id, json).map(|_| ())
+		self
+			.enqueue_directed_frame(connection_id, replace_lone_surrogate_escapes(json))
+			.map(|_| ())
 	}
 
 	/// Send one directed frame and return an opaque, server-authenticated
@@ -1215,6 +1287,7 @@ impl ServerHandle {
 				None,
 			));
 		}
+		let json = replace_lone_surrogate_escapes(json);
 		let frame_kind = directed_frame_kind(&json);
 		let prerequisite_digest = directed_prerequisite_digest(&json).ok_or_else(|| {
 			self.directed_delivery_error(
@@ -1360,6 +1433,7 @@ impl ServerHandle {
 		positioned_receipts: &[String],
 		needed: ActionNeeded,
 	) -> Result<DependentIdleDeliveryOutcome, PushFrameError> {
+		let prerequisite_json = replace_lone_surrogate_escapes(prerequisite_json);
 		let prerequisite: ServerMessage = serde_json::from_str(&prerequisite_json)
 			.map_err(|_| PushFrameError::DependentPrerequisiteInvalid)?;
 		let ServerMessage::IdentityHeader(identity) = &prerequisite else {
@@ -3133,6 +3207,62 @@ mod tests {
 			unavailable_json.len(),
 		);
 
+		handle.stop();
+	}
+
+	#[test]
+	fn lone_surrogate_escapes_become_replacement_characters_without_changing_length() {
+		// `JSON.stringify("한글 \uD83E")` keeps the Korean text raw and escapes the
+		// unpaired high surrogate; a valid pair stays an escaped pair.
+		let json = r#"{"type":"event","text":"한글 \ud83e","low":"\uDD9E!","pair":"\ud83e\udd9e","literal":"\\ud83e","key\ud800":1}"#;
+		let normalized = replace_lone_surrogate_escapes(json.to_owned());
+		assert_eq!(normalized.len(), json.len());
+		assert_eq!(
+			normalized,
+			r#"{"type":"event","text":"한글 \ufffd","low":"\ufffd!","pair":"\ud83e\udd9e","literal":"\\ud83e","key\ufffd":1}"#
+		);
+		let value: serde_json::Value = serde_json::from_str(&normalized).expect("well-formed JSON");
+		assert_eq!(value["text"], "한글 \u{fffd}");
+		assert_eq!(value["pair"], "\u{1f99e}");
+		assert_eq!(value["literal"], "\\ud83e");
+		let clean = r#"{"type":"event","text":"한글 \ud83e\udd9e"}"#;
+		assert_eq!(replace_lone_surrogate_escapes(clean.to_owned()), clean);
+	}
+
+	#[tokio::test]
+	async fn directed_send_delivers_multibyte_frames_with_lone_surrogates() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut ws = connect(&handle, "secret").await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
+		wait_for_clients(&handle, 1).await;
+		// The #7867 frame: ~6 KB of Korean progress text whose streamed snapshot
+		// ends in half of an astral character.
+		let text = "한국어 응답 ".repeat(500);
+		let json = format!(
+			r#"{{"type":"event","kind":"message_update","payload":{{"text":"{text}\ud83e"}}}}"#
+		);
+		assert!(json.len() > 6_000);
+		handle
+			.send_to(&connection_id, json.clone())
+			.expect("a frame with a lone surrogate escape is deliverable");
+		let delivered = loop {
+			let Ok(Some(Ok(Message::Text(frame)))) =
+				tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+			else {
+				panic!("directed frame was not delivered");
+			};
+			if frame.contains("message_update") {
+				break frame;
+			}
+		};
+		assert_eq!(delivered.len(), json.len());
+		let value: serde_json::Value = serde_json::from_str(&delivered).expect("well-formed frame");
+		assert_eq!(value["payload"]["text"], format!("{text}\u{fffd}"));
+		let receipt = handle.send_to_with_receipt(&connection_id, json);
+		assert!(receipt.is_ok(), "receipt delivery must accept the same frame");
 		handle.stop();
 	}
 
