@@ -858,7 +858,7 @@ function collectCredentialContainerRanges(text: string, rules: CredentialRedacti
 	const { assignment, camel } = containerAssignmentPatterns(rules);
 	const generic: TextRange[] = [];
 	redactCredentialContainersWithPattern(text, assignment, true, generic);
-	ranges.push(...generic);
+	for (const range of generic) ranges.push(range);
 	if (generic.length === 0) {
 		redactCredentialContainersWithPattern(text, camel, true, ranges);
 		return;
@@ -866,7 +866,7 @@ function collectCredentialContainerRanges(text: string, rules: CredentialRedacti
 	const applied = mergeMaskRanges(generic.map(range => ({ ...range, container: true })));
 	const camelRanges: TextRange[] = [];
 	redactCredentialContainersWithPattern(applyMaskRanges(text, applied), camel, true, camelRanges);
-	ranges.push(...mapMaskedRanges(camelRanges, applied));
+	for (const range of mapMaskedRanges(camelRanges, applied)) ranges.push(range);
 }
 
 function redactCredentialContainersWithPattern(
