@@ -435,4 +435,62 @@ describe("SessionManager.moveTo", () => {
 		const newArtifactDir = newFile.slice(0, -6); // strip .jsonl
 		expect(fs.existsSync(newArtifactDir)).toBe(true);
 	});
+
+	it("preserves shared opener entries when moving in shadow mode", async () => {
+		// Create session A and initialize with content
+		const sessionA = SessionManager.create(cwdA);
+		sessionA.appendMessage({ role: "user", content: "from A", timestamp: 1 });
+		sessionA.appendMessage(makeAssistantMessage());
+		await sessionA.flush();
+
+		const sourceFile = sessionA.getSessionFile()!;
+		expect(fs.existsSync(sourceFile)).toBe(true);
+
+		// Open the same session as B in shadow mode (shared append-only)
+		const sessionB = await SessionManager.open(sourceFile, cwdA, undefined, "copy-retain", "shadow");
+
+		try {
+			// Manually simulate a concurrent append by writing directly to the source file
+			// This simulates what would happen if another opener appended while the move was happening
+			const currentContent = await Bun.file(sourceFile).text();
+			const additionalEntry = JSON.stringify({
+				type: "message",
+				id: "test-id-from-b",
+				message: { role: "user", content: "from B during move", timestamp: 2 },
+			});
+			await Bun.write(sourceFile, `${currentContent}\n${additionalEntry}\n`);
+
+			// Move session A to cwdB
+			await sessionA.moveTo(cwdB);
+
+			// Verify the destination file exists
+			const destinationFile = sessionA.getSessionFile()!;
+			expect(fs.existsSync(destinationFile)).toBe(true);
+			expect(fs.existsSync(sourceFile)).toBe(false);
+
+			// Load and verify entries from the destination
+			const entries = await loadEntriesFromFile(destinationFile);
+
+			// Should have:
+			// 1. Session header with new cwd
+			// 2. User message "from A"
+			// 3. Assistant message from A
+			// 4. User message "from B during move" (this should be preserved, not lost)
+			const userMessages = entries.filter(
+				(e): e is any =>
+					typeof e === "object" &&
+					e !== null &&
+					(e as any).type === "message" &&
+					(e as any).message?.role === "user",
+			);
+
+			const fromBMessage = userMessages.find((e: any) => e.message?.content === "from B during move");
+			expect(fromBMessage).not.toBeUndefined();
+			// Also verify the header was updated
+			const header = getHeader(entries);
+			expect(header?.cwd).toBe(path.resolve(cwdB));
+		} finally {
+			await sessionB.close();
+		}
+	});
 });
