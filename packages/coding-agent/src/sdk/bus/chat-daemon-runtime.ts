@@ -601,6 +601,7 @@ export class ChatDaemonRuntime {
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
 		const currentAttachment = this.#attachments.get(attachment.sessionId);
 		const revivedTransport = currentAttachment === attachment;
+		this.#attachments.set(attachment.sessionId, attachment);
 		if (revivedTransport) {
 			this.#presentation?.connectSession(attachment.sessionId, {
 				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
@@ -671,15 +672,6 @@ export class ChatDaemonRuntime {
 			const retirement = this.#trackRetirement(attachment);
 			this.#attachments.delete(attachment.sessionId);
 			await retirement;
-			return;
-		}
-		if (reason === "replaced") {
-			// Generation changed: defer cleanup to avoid interfering with the new attachment adoption
-			const retirement = this.#trackRetirement(attachment);
-			this.#attachments.delete(attachment.sessionId);
-			// Do not await here: let retirement proceed in the background while new attachment is adopted.
-			// The successor barrier will observe the retirement promise and wait for it to complete.
-			void retirement;
 			return;
 		}
 		this.#attachments.delete(attachment.sessionId);
