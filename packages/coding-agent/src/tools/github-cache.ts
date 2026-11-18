@@ -867,7 +867,8 @@ function scrubCacheText(text: string, diff = false): string {
 				if (insideContainerQuote(text, offset)) return match;
 				if (closesMatchingContainer(text, offset, match)) {
 					if (!match.includes("'")) return match;
-					const closer = match.trimEnd().slice(-1);
+					const closerIndex = Math.max(match.lastIndexOf("]"), match.lastIndexOf("}"));
+					const closer = closerIndex >= 0 ? match.slice(closerIndex) : "";
 					return `${lineStart}${marker}${label}«redacted»${closer}`;
 				}
 				if (match.includes('"') && !hasLocalDoubleQuotePair(match)) return match;
