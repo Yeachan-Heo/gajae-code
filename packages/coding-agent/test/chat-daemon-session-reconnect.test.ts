@@ -1966,3 +1966,43 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 		});
 	});
 }, 20_000);
+
+test("an initial attachment quickly superseded re-registers with the new generation", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
+		await withSerializedFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			// Emit a frame on the initial generation to establish the attachment.
+			host.emit("on initial generation");
+			await awaitCompletedPosts(provider, 1);
+
+			// Supersede the generation, simulating a broker generation change.
+			// The old attachment should be retired and the new one should be adopted.
+			host.drop();
+			await supersede();
+			host.roll();
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+
+			// Emit a frame on the new generation and verify it's published.
+			host.emit("on new generation");
+			await awaitCompletedPosts(provider, 2);
+
+			// Verify that replay requests are for the new generation, not the old one.
+			// If the runtime failed to re-register with the new generation, it would try
+			// to replay from the old generation instead.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+			]);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\non initial generation",
+				"GJC notice\non new generation",
+			]);
+		});
+	});
+}, 20_000);

@@ -508,6 +508,14 @@ class PreparedResidentStoreTransition {
 		return this.#index;
 	}
 
+	preserveSelectedLeaf(leafId: string | null): void {
+		if (leafId !== null && !this.index.byId.has(leafId)) {
+			this.dispose();
+			throw new Error("cold_transcript_selected_leaf_missing");
+		}
+		this.#index = { ...this.index, leafId };
+	}
+
 	releaseReferences(): void {
 		if (this.#active) throw new Error("resident_transition_still_active");
 		this.#entries = undefined;
@@ -16370,6 +16378,7 @@ export class SessionManager {
 	}
 
 	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
+		const leafId = this.#leafId;
 		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
 		const transcriptSize = this.#storage.statSync(this.#sessionFile).size;
 		if (transcriptSize > eagerHydrationMaxBytes())
@@ -16405,6 +16414,7 @@ export class SessionManager {
 			},
 			"memory-fallback",
 		);
+		transition.preserveSelectedLeaf(leafId);
 		this.#commitResidentTextStoreTransition(transition, false);
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
@@ -16417,6 +16427,7 @@ export class SessionManager {
 	#ensureFullHotView(): void {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return;
+		const leafId = this.#leafId;
 		if (this.#sessionFile && this.#storage.statSync(this.#sessionFile).size > eagerHydrationMaxBytes())
 			throw new Error("cold_sidecar_rebuild_required_for_bounded_transcript");
 		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
@@ -16469,6 +16480,7 @@ export class SessionManager {
 				},
 				"memory-fallback",
 			);
+			transition.preserveSelectedLeaf(leafId);
 			this.#commitResidentTextStoreTransition(transition, false);
 			this.#clearColdRuntimeAfterHydration(runtime);
 		} catch {

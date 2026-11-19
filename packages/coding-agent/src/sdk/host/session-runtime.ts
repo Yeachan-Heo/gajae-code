@@ -8501,7 +8501,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// a failed startup attempt holds the backoff like a failed recovery registration.
 			const armBrokerRecovery = (): void => {
 				if (brokerRecoveryStopped) return;
-				if (!brokerRegistered) brokerRecoveryBackoff.recordFailure(options.agentDir);
 				startBrokerRecovery();
 			};
 			if (options.brokerRegistrationRequired) armBrokerRecovery();
