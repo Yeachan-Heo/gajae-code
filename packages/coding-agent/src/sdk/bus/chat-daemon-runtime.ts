@@ -599,7 +599,8 @@ export class ChatDaemonRuntime {
 	}
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
-		const revivedTransport = this.#attachments.get(attachment.sessionId) === attachment;
+		const currentAttachment = this.#attachments.get(attachment.sessionId);
+		const revivedTransport = currentAttachment === attachment;
 		this.#attachments.set(attachment.sessionId, attachment);
 		if (revivedTransport) {
 			this.#presentation?.connectSession(attachment.sessionId, {
@@ -607,6 +608,7 @@ export class ChatDaemonRuntime {
 			});
 			return;
 		}
+
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const barrier = (async () => {
@@ -639,7 +641,9 @@ export class ChatDaemonRuntime {
 			)
 				this.#retirementWork.delete(attachment.sessionId);
 		})();
+		// Set barrier BEFORE attachment to ensure frames wait for retirement
 		this.#attachmentBarriers.set(attachment.sessionId, barrier);
+		this.#attachments.set(attachment.sessionId, attachment);
 		try {
 			await barrier;
 			if (this.#attachments.get(attachment.sessionId) !== attachment) return;
@@ -656,7 +660,14 @@ export class ChatDaemonRuntime {
 		attachment: SessionAttachment,
 		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
 	): Promise<void> {
-		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+		const currentAttachment = this.#attachments.get(attachment.sessionId);
+		// Only remove if it's the exact attachment being reported as removed.
+		// If the attachment has already been replaced with a new generation,
+		// do not interfere with the transition to the successor.
+		if (currentAttachment !== attachment) {
+			// Generation changed: a newer attachment has already taken over
+			return;
+		}
 		if (reason === "replaced_same_generation") {
 			const retirement = this.#trackRetirement(attachment);
 			this.#attachments.delete(attachment.sessionId);
@@ -697,7 +708,8 @@ export class ChatDaemonRuntime {
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
-		await this.#attachmentBarriers.get(attachment.sessionId);
+		const barrier = this.#attachmentBarriers.get(attachment.sessionId);
+		if (barrier) await barrier;
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		const normalizedFrame = correlated.body;
 		const publicationId =
@@ -718,12 +730,15 @@ export class ChatDaemonRuntime {
 			// unpositioned session_ready frame deliberately carries no ring
 			// generation; reject only an explicit, conflicting Router-owned value.
 			if (correlated.generation !== undefined && correlated.generation !== attachment.generation) return;
+			// Use stable publication ID for session_ready so replays use the same nonce.
+			// Include generation to avoid collisions when broker registration changes the generation.
+			const stablePublicationId = publicationId ?? `session-ready:${sessionId}:${attachment.generation}`;
 			await this.#resume(
 				sessionId,
 				attachment.generation,
 				attachment.authorityId,
 				"GJC session ready.",
-				publicationId,
+				stablePublicationId,
 			);
 			return;
 		}
@@ -751,6 +766,12 @@ export class ChatDaemonRuntime {
 					: (body as Record<string, unknown>).text
 				: undefined;
 		if (typeof content !== "string") return;
+		// Use stable publication ID for notifications so replays are idempotent
+		const stableNotificationPublicationId =
+			publicationId ??
+			(correlated.seq !== undefined
+				? `${sessionId}:${correlated.generation ?? attachment.generation}:${correlated.seq}`
+				: undefined);
 		if (this.#discord)
 			await this.#trackOutbound(
 				this.#discord.notify({
@@ -758,7 +779,9 @@ export class ChatDaemonRuntime {
 					endpointGeneration: attachment.generation,
 					attachmentAuthorityId: attachment.authorityId,
 					content,
-					...(publicationId === undefined ? {} : { publicationId }),
+					...(stableNotificationPublicationId === undefined
+						? {}
+						: { publicationId: stableNotificationPublicationId }),
 					...(notification.type === "action_needed"
 						? { actionId: notification.id, options: notification.options }
 						: {}),
@@ -772,7 +795,7 @@ export class ChatDaemonRuntime {
 					content,
 					notification.type === "action_needed" && notification.kind === "ask" ? notification.id : undefined,
 					attachment.generation,
-					publicationId,
+					stableNotificationPublicationId,
 					keepLiteral,
 				),
 			);

@@ -31,7 +31,7 @@ import type {
 	ClientBridgePermissionToolCall,
 } from "../src/session/client-bridge";
 import { convertToLlm } from "../src/session/messages";
-import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
+import { SessionManager } from "../src/session/session-manager";
 import type { NestedToolScope, ToolSession } from "../src/tools";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "../src/tools/descriptors";
 import { EvalTool } from "../src/tools/eval";
@@ -1009,6 +1009,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			contextMode?: "keep" | "discard";
 			sessionManager?: SessionManager;
 			streamToolArgs?: boolean;
+			retryToolCalls?: ToolCall[];
 			streamText?: string;
 			toolInterruptPolicy?: "abort_tools" | "finish_tools";
 			sdkPermissionProvider?: (
@@ -1036,7 +1037,12 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 				const turn = streamCalls++;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					const calls = turn % 2 === 0 ? toolCallTurns[turn / 2] : undefined;
+					const calls =
+						turn === 1 && options.retryToolCalls
+							? options.retryToolCalls
+							: turn % 2 === 0
+								? toolCallTurns[turn / 2]
+								: undefined;
 					// Prose is streamed only alongside the first scripted tool-call turn.
 					const streamText = turn === 0 ? options.streamText : undefined;
 					const message: AssistantMessage = {
@@ -1154,15 +1160,181 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 	it.each([
 		"keep",
 		"discard",
-	] as const)("refuses shared TTSR retry without live or committed mutation (%s)", async contextMode => {
-		await exerciseManagedRetry(contextMode, true);
+	] as const)("continues a shared TTSR retry and publishes its reminder through shared admission (%s)", async contextMode => {
+		await exerciseManagedRetry(contextMode, "shared");
+	});
+
+	// Fault injection: only the reminder publication is refused; the manager stays healthy.
+	// Stale and unknown require session close per #7838; rejected can retry in memory.
+	it("continues a shared TTSR retry in memory after a rejected reminder refusal", async () =>
+		exerciseManagedRetry("discard", "shared-rejected"));
+
+	it("closes a shared TTSR session after a typed stale reminder refusal without retrying in memory", async () =>
+		exerciseManagedRetry("discard", "shared-stale"));
+
+	it.each([
+		["unknown", "once"],
+		["unknown", "after-gap"],
+		["throw", "once"],
+	] as const)("closes shared TTSR session on uncertain publication (%s, %s)", async (failureMode, repeatMode) => {
+		const agentDir = path.join(tempDir, "managed-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const manager = SessionManager.create(tempDir, SessionManager.managedDestination(tempDir, agentDir));
+		const writeTool = new WriteTool(createToolSession());
+		const writeExecution = spyOn(writeTool, "execute");
+		const streamSibling = makeRule({
+			name: "stream-sibling",
+			content: "TTSR-STREAM-REMINDER: marker seen.",
+			condition: ["TTSR-STREAM-MARKER"],
+			interruptMode: "never",
+			repeatMode: "once",
+		});
+		const target = createSession(
+			[writeTool],
+			[[writeCall("managed-write", "managed.ts", "// TTSR-STREAM-MARKER\nexport default 1;\n")]],
+			[
+				streamSibling,
+				defaultExportRule({
+					repeatMode,
+					...(repeatMode === "after-gap" ? { repeatGap: 1 } : {}),
+				}),
+			],
+			{ interruptMode: "always", contextMode: "discard", sessionManager: manager, streamToolArgs: true },
+		);
+		const notices: { level: string; message: string }[] = [];
+		const unsubscribe = target.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "ttsr")
+				notices.push({ level: event.level, message: event.message });
+		});
+		const barrier = holdTtsrRetry(target.session);
+		const publishing = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const publish = manager.appendCustomMessageEntrySharingSession.bind(manager);
+		let committedReminderId: string | undefined;
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession").mockImplementation(
+			async (...args: Parameters<typeof publish>) => {
+				if (args[0] !== "ttsr-injection") return publish(...args);
+				publishing.resolve();
+				await releasePublication.promise;
+				const outcome = await publish(...args);
+				if (outcome.kind !== "committed") return outcome;
+				committedReminderId = outcome.id;
+				if (failureMode === "unknown")
+					return { kind: "unknown", id: outcome.id, error: new Error("durability_unproven") };
+				throw new Error("persistence failed after commit");
+			},
+		);
+		const append = spyOn(target.session.agent, "appendMessage");
+		const replace = spyOn(target.session.agent, "replaceMessages");
+		let prompt: Promise<void> | undefined;
+		try {
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			prompt = target.session.prompt("write it");
+			void prompt.catch(() => {});
+			await barrier.entered;
+			await target.session.agent.waitForIdle();
+			await target.session.waitForAgentEndHandlingForTests();
+			await manager.flush();
+			const sharedAdmission = await manager.appendMessageSharingSession({
+				role: "user",
+				content: "intentional shared append",
+				timestamp: Date.now(),
+			});
+			expect(sharedAdmission.kind).toBe("committed");
+			// Streaming non-interrupting matches may hold provisional per-tool claims
+			// while the AST match interrupts and routes both rules through one append.
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["stream-sibling"]);
+			append.mockClear();
+			replace.mockClear();
+			barrier.release();
+			await publishing.promise;
+			const settledBeforePublication = await Promise.race([
+				prompt.then(() => true),
+				Bun.sleep(25).then(() => false),
+			]);
+			expect(settledBeforePublication).toBe(false);
+			const sessionFile = manager.getSessionFile()!;
+			releasePublication.resolve();
+			const settledAfterFailure = await Promise.race([prompt.then(() => true), Bun.sleep(1_000).then(() => false)]);
+			expect(settledAfterFailure).toBe(true);
+			await target.session.waitForIdle();
+			expect(target.session.isDisposed).toBe(true);
+			await target.session.awaitDisposeCompletion();
+			expect(target.modelMessages).toHaveLength(1);
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual([]);
+			// Disposal clears resident entries, so inspect the durable transcript instead.
+			const persistedEntries = (await Bun.file(sessionFile).text())
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(persistedEntries.some(entry => entry.type === "ttsr_injection")).toBe(false);
+			expect(
+				target.session.agent.state.messages.some(
+					message => message.role === "custom" && message.customType === "ttsr-injection",
+				),
+			).toBe(false);
+			if (!committedReminderId) throw new Error("The injected reminder was not committed by the shared append");
+			expect(
+				persistedEntries.some(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "ttsr-injection" &&
+						entry.id === committedReminderId,
+				),
+			).toBe(true);
+			expect(append).not.toHaveBeenCalled();
+			expect(replace).not.toHaveBeenCalled();
+			expect(writeExecution).not.toHaveBeenCalled();
+			const laterPrompt = target.session.prompt("write the same content again");
+			await expect(laterPrompt).rejects.toMatchObject({ code: "busy" });
+			await target.session.waitForIdle();
+			expect(target.modelMessages).toHaveLength(1);
+			expect(writeExecution).not.toHaveBeenCalled();
+			expect(sharedAppend.mock.calls.filter(([customType]) => customType === "ttsr-injection")).toHaveLength(1);
+			expect(notices).toHaveLength(1);
+			expect(notices[0].level).toBe("warning");
+			expect(notices[0].message).not.toContain("memory only");
+			if (failureMode === "unknown") {
+				expect(notices[0].message).toContain("outcome is unknown");
+				expect(notices[0].message).toContain(`attempted id: ${committedReminderId}`);
+			} else {
+				expect(notices[0].message).toContain("without confirming it was not committed");
+			}
+			expect(notices[0].message).toContain("session was closed");
+			expect(target.session.isTtsrAbortPending).toBe(false);
+			expect(target.session.isStreaming).toBe(false);
+		} finally {
+			barrier.release();
+			releasePublication.resolve();
+			try {
+				await target.session.abort();
+			} finally {
+				try {
+					await target.session.dispose();
+				} finally {
+					if (prompt) await Promise.allSettled([prompt]);
+					barrier.restore();
+					unsubscribe();
+					append.mockRestore();
+					replace.mockRestore();
+					writeExecution.mockRestore();
+					sharedAppend.mockRestore();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					session = undefined;
+				}
+			}
+		}
 	});
 
 	it("continues ordinary managed TTSR discard retry and persists its reminder", async () => {
-		await exerciseManagedRetry("discard", false);
+		await exerciseManagedRetry("discard", "legacy");
 	});
 
-	async function exerciseManagedRetry(contextMode: "keep" | "discard", share: boolean): Promise<void> {
+	it("drops a shared TTSR retry whose reminder publication outlives an abort", async () => {
 		const agentDir = path.join(tempDir, "managed-agent");
 		await fsPromises.mkdir(agentDir, { mode: 0o700 });
 		const manager = SessionManager.create(tempDir, SessionManager.managedDestination(tempDir, agentDir));
@@ -1170,7 +1342,624 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			[new WriteTool(createToolSession())],
 			[[writeCall("managed-write", "managed.ts", "export default 1;\n")]],
 			[defaultExportRule()],
-			{ interruptMode: "always", contextMode, sessionManager: manager },
+			{ interruptMode: "always", contextMode: "discard", sessionManager: manager },
+		);
+		const barrier = holdTtsrRetry(target.session);
+		const publishing = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const published = Promise.withResolvers<void>();
+		const publish = manager.appendCustomMessageEntrySharingSession.bind(manager);
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession").mockImplementation(
+			async (...args: Parameters<typeof publish>) => {
+				if (args[0] !== "ttsr-injection") return publish(...args);
+				publishing.resolve();
+				await releasePublication.promise;
+				try {
+					return await publish(...args);
+				} finally {
+					published.resolve();
+				}
+			},
+		);
+		let prompt: Promise<void> | undefined;
+		try {
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			prompt = target.session.prompt("write it");
+			void prompt.catch(() => {});
+			await barrier.entered;
+			await target.session.agent.waitForIdle();
+			await target.session.waitForAgentEndHandlingForTests();
+			const outcome = await manager.appendMessageSharingSession({
+				role: "user",
+				content: "intentional shared append",
+				timestamp: Date.now(),
+			});
+			expect(outcome.kind).toBe("committed");
+			barrier.release();
+			await publishing.promise;
+			// The retry is parked inside the shared publication; abort lands in that window.
+			await target.session.abort({ timeoutMs: 0 });
+			releasePublication.resolve();
+			await Promise.allSettled([prompt]);
+			// The held writer settled; let the retry task finish its post-await fence.
+			await published.promise;
+			await Bun.sleep(0);
+			await target.session.waitForIdle();
+			// The retry does not run, but the committed reminder is added to the live session
+			// history to maintain consistency with the shared store. This ensures the reminder
+			// is visible in the session and prevents duplicate interrupts while the rule remains
+			// in the transcript (#7838).
+			const injectionMessage = target.session.agent.state.messages.find(
+				message => message.role === "custom" && message.customType === "ttsr-injection",
+			) as any;
+			expect(injectionMessage).toBeDefined();
+			expect(injectionMessage?.details?.rules).toContain("named-exports");
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
+			expect(target.modelMessages).toHaveLength(1);
+			expect(target.session.isTtsrAbortPending).toBe(false);
+			expect(target.session.isStreaming).toBe(false);
+		} finally {
+			barrier.release();
+			releasePublication.resolve();
+			try {
+				await target.session.abort();
+			} finally {
+				try {
+					await target.session.dispose();
+				} finally {
+					if (prompt) await Promise.allSettled([prompt]);
+					barrier.restore();
+					sharedAppend.mockRestore();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					session = undefined;
+				}
+			}
+		}
+	});
+
+	it("restores the published after-gap checkpoint when reconciling reminder entries", async () => {
+		const rule = defaultExportRule({ repeatMode: "after-gap", repeatGap: 3 });
+		const reminder = (messageCount?: number) => ({
+			role: "custom" as const,
+			customType: "ttsr-injection",
+			content: RULE_CONTENT,
+			display: false,
+			details: messageCount === undefined ? { rules: [rule.name] } : { rules: [rule.name], messageCount },
+			attribution: "agent" as const,
+			timestamp: Date.now(),
+		});
+		const reconcile = async (
+			messages: ReturnType<typeof reminder>[],
+			records: { name: string; lastInjectedAt: number }[],
+			restoredCount = 5,
+		): Promise<{ checkpoint: number | undefined; count: number }> => {
+			const ttsrManager = new TtsrManager({ interruptMode: "always", contextMode: "discard" });
+			ttsrManager.addRule(rule);
+			ttsrManager.restoreMessageCount(restoredCount);
+			ttsrManager.restoreInjected(records);
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages },
+				convertToLlm,
+			});
+			const restored = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(tempDir),
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				ttsrManager,
+				modelRegistry,
+				toolRegistry: new Map(),
+			});
+			try {
+				return {
+					checkpoint: ttsrManager.getInjectedRecords().find(record => record.name === rule.name)?.lastInjectedAt,
+					count: ttsrManager.getMessageCount(),
+				};
+			} finally {
+				await restored.dispose();
+			}
+		};
+		// Missing marker: the published checkpoint wins over the restored current count (5).
+		expect(await reconcile([reminder(2)], [])).toEqual({ checkpoint: 2, count: 5 });
+		// An older record of the same rule does not hide a newer published occurrence.
+		expect(await reconcile([reminder(0), reminder(4)], [{ name: rule.name, lastInjectedAt: 0 }])).toEqual({
+			checkpoint: 4,
+			count: 5,
+		});
+		// The counter restored from an older marker lags the newer checkpoint: it advances to it, so
+		// the gap is measured from the checkpoint rather than from the stale count.
+		expect(await reconcile([reminder(0), reminder(4)], [{ name: rule.name, lastInjectedAt: 0 }], 0)).toEqual({
+			checkpoint: 4,
+			count: 4,
+		});
+		// A newer restored record is kept.
+		expect(await reconcile([reminder(2)], [{ name: rule.name, lastInjectedAt: 4 }])).toEqual({
+			checkpoint: 4,
+			count: 5,
+		});
+		// A legacy entry without a checkpoint only fills a missing record.
+		expect(await reconcile([reminder()], [])).toEqual({ checkpoint: 5, count: 5 });
+		expect(await reconcile([reminder()], [{ name: rule.name, lastInjectedAt: 1 }])).toEqual({
+			checkpoint: 1,
+			count: 5,
+		});
+	});
+
+	function restoreTtsrSession(manager: SessionManager, rules: Rule[]) {
+		const resumeState = manager.buildSessionContext();
+		const ttsrManager = new TtsrManager({ interruptMode: "always", contextMode: "keep" });
+		for (const rule of rules) ttsrManager.addRule(rule);
+		ttsrManager.restoreMessageCount(resumeState.ttsrMessageCount ?? 0);
+		ttsrManager.restoreInjected(
+			resumeState.injectedTtsrRuleRecords?.length
+				? resumeState.injectedTtsrRuleRecords
+				: resumeState.injectedTtsrRules,
+		);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const restored = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: resumeState.messages },
+				convertToLlm,
+			}),
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			ttsrManager,
+			modelRegistry,
+			toolRegistry: new Map(),
+		});
+		return { session: restored, ttsrManager, resumeState };
+	}
+
+	it.each([
+		"once",
+		"after-gap",
+	] as const)("recovers a cooperative-abort reminder's consumption after compaction and reopen (%s)", async repeatMode => {
+		const rule = defaultExportRule({ repeatMode, repeatGap: 3 });
+		let publishedCount: number | undefined;
+		const result = await abortDuringSharedPublication({
+			cooperativeAbort: true,
+			rule,
+			afterPublication: async (target, manager) => {
+				const reminder = manager
+					.getBranch()
+					.find(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+				if (reminder?.type !== "custom_message") throw new Error("Reminder was not published");
+				publishedCount = (reminder.details as { messageCount: number }).messageCount;
+				expect(publishedCount).toBeGreaterThan(0);
+				expect(manager.getBranch().some(entry => entry.type === "ttsr_injection")).toBe(false);
+				expect(target.agent.state.messages.some(message => message.role === "custom")).toBe(true);
+				const kept = await manager.appendMessageSharingSession({
+					role: "user",
+					content: "kept after reminder",
+					timestamp: Date.now(),
+				});
+				expect(kept.kind).toBe("committed");
+				if (kept.kind !== "committed") throw new Error(`kept message: ${kept.kind}`);
+				const compacted = await manager.appendCompactionSharingSession(
+					{ summary: "Earlier turn compacted", firstKeptEntryId: kept.id, tokensBefore: 1 },
+					() => true,
+				);
+				expect(compacted.kind).toBe("committed");
+			},
+		});
+		expect(result.disposed).toBe(false);
+		expect(result.committedId).toBeDefined();
+		expect(result.modelCalls).toBe(1);
+		const reopened = await SessionManager.open(result.sessionFile, result.destination);
+		let restored: ReturnType<typeof restoreTtsrSession> | undefined;
+		try {
+			expect(reopened.getBranch().some(entry => entry.id === result.committedId)).toBe(true);
+			restored = restoreTtsrSession(reopened, [rule]);
+			const { session: resumed, ttsrManager, resumeState } = restored;
+			expect(resumeState.injectedTtsrRuleRecords).toEqual([]);
+			expect(resumeState.injectedTtsrRules).toEqual([]);
+			expect(resumeState.ttsrMessageCount ?? 0).toBe(0);
+			expect(ttsrManager.getMessageCount()).toBe(publishedCount!);
+			expect(ttsrManager.getInjectedRecords()).toEqual([
+				expect.objectContaining({ name: rule.name, lastInjectedAt: publishedCount }),
+			]);
+			expect(
+				resumed.agent.state.messages.some(
+					message => message.role === "custom" && message.customType === "ttsr-injection",
+				),
+			).toBe(false);
+			expect(JSON.stringify(resumed.agent.state.messages)).not.toContain(RULE_CONTENT);
+			const match = () =>
+				ttsrManager.checkAstSnapshot("export default 1;\n", {
+					source: "tool",
+					toolName: "write",
+					filePaths: [path.join(tempDir, "resumed.ts")],
+				});
+			expect(await match()).toEqual([]);
+			for (let count = 1; count < 3; count++) {
+				ttsrManager.incrementMessageCount();
+				expect(await match()).toEqual([]);
+			}
+			ttsrManager.incrementMessageCount();
+			expect(await match()).toEqual(repeatMode === "after-gap" ? [rule] : []);
+		} finally {
+			await restored?.session.dispose();
+			expect((await reopened.closeStrict()).kind).toBe("closed");
+		}
+	});
+
+	it("reconciles compacted reminders only on the active branch with missing or partial metadata", async () => {
+		const agentDir = path.join(tempDir, "branch-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const destination = SessionManager.managedDestination(tempDir, agentDir);
+		const manager = SessionManager.create(tempDir, destination);
+		const root = manager.appendMessage({ role: "user", content: "branch point", timestamp: 1 });
+		const sibling = manager.appendCustomMessageEntry("ttsr-injection", "INACTIVE-REMINDER", false, {
+			rules: ["active", "inactive"],
+			messageCount: 99,
+		});
+		manager.branch(root);
+		manager.appendCustomMessageEntry("ttsr-injection", "ACTIVE-REMINDER", false, {
+			rules: ["active", null, 7],
+			messageCount: 4,
+		});
+		manager.appendCustomMessageEntry("ttsr-injection", "LEGACY-REMINDER", false, {
+			rules: ["legacy", null],
+			messageCount: "not a checkpoint",
+		});
+		manager.appendCustomMessageEntry("ttsr-injection", "MISSING-METADATA", false);
+		manager.appendCustomMessageEntry("ttsr-injection", "MISSING-RULES", false, { messageCount: 500 });
+		const kept = manager.appendMessage({ role: "user", content: "retained context", timestamp: 2 });
+		const sessionFile = manager.getSessionFile()!;
+		try {
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const outcome = await manager.appendCompactionSharingSession(
+				{ summary: "Earlier reminders compacted", firstKeptEntryId: kept, tokensBefore: 1 },
+				() => true,
+			);
+			expect(outcome.kind).toBe("committed");
+		} finally {
+			expect((await manager.closeStrict()).kind).toBe("closed");
+		}
+		const reopened = await SessionManager.open(sessionFile, destination);
+		let restored: ReturnType<typeof restoreTtsrSession> | undefined;
+		try {
+			expect(reopened.getEntries().some(entry => entry.id === sibling)).toBe(true);
+			expect(reopened.getBranch().some(entry => entry.id === sibling)).toBe(false);
+			const rules = ["active", "legacy", "inactive"].map(name =>
+				makeRule({ name, condition: [name], repeatMode: "once" }),
+			);
+			restored = restoreTtsrSession(reopened, rules);
+			expect(restored.resumeState.injectedTtsrRules).toEqual([]);
+			expect(restored.resumeState.injectedTtsrRuleRecords).toEqual([]);
+			expect(restored.ttsrManager.getMessageCount()).toBe(4);
+			expect(restored.ttsrManager.getInjectedRecords()).toEqual([
+				expect.objectContaining({ name: "active", lastInjectedAt: 4 }),
+				expect.objectContaining({ name: "legacy", lastInjectedAt: 4 }),
+			]);
+			expect(JSON.stringify(restored.session.agent.state.messages)).not.toContain("REMINDER");
+			expect(JSON.stringify(restored.session.agent.state.messages)).not.toContain("MISSING-");
+			expect(
+				restored.ttsrManager.checkDelta("active legacy inactive", { source: "text" }).map(rule => rule.name),
+			).toEqual(["inactive"]);
+		} finally {
+			await restored?.session.dispose();
+			expect((await reopened.closeStrict()).kind).toBe("closed");
+		}
+	});
+
+	async function abortDuringSharedPublication(options: {
+		unknownOutcome?: boolean;
+		cooperativeAbort?: boolean;
+		rule?: Rule;
+		beforeRelease?: (target: AgentSession) => void;
+		afterPublication?: (target: AgentSession, manager: SessionManager) => Promise<void>;
+	}) {
+		const agentDir = path.join(tempDir, "managed-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const destination = SessionManager.managedDestination(tempDir, agentDir);
+		const manager = SessionManager.create(tempDir, destination);
+		const target = createSession(
+			[new WriteTool(createToolSession())],
+			[[writeCall("managed-write", "managed.ts", "export default 1;\n")]],
+			[options.rule ?? defaultExportRule()],
+			{ interruptMode: "always", contextMode: "discard", sessionManager: manager },
+		);
+		const notices: string[] = [];
+		const unsubscribe = target.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "ttsr") notices.push(event.message);
+		});
+		const barrier = holdTtsrRetry(target.session);
+		const publishing = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const published = Promise.withResolvers<void>();
+		const publish = manager.appendCustomMessageEntrySharingSession.bind(manager);
+		let committedId: string | undefined;
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession").mockImplementation(
+			async (...args: Parameters<typeof publish>) => {
+				if (args[0] !== "ttsr-injection") return publish(...args);
+				publishing.resolve();
+				await releasePublication.promise;
+				try {
+					const outcome = await publish(...args);
+					if (outcome.kind === "committed") committedId = outcome.id;
+					if (options.unknownOutcome && outcome.kind === "committed")
+						return { kind: "unknown", id: outcome.id, error: new Error("durability_unproven") } as const;
+					return outcome;
+				} finally {
+					published.resolve();
+				}
+			},
+		);
+		let prompt: Promise<void> | undefined;
+		try {
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			prompt = target.session.prompt("write it");
+			void prompt.catch(() => {});
+			await barrier.entered;
+			await target.session.agent.waitForIdle();
+			await target.session.waitForAgentEndHandlingForTests();
+			const outcome = await manager.appendMessageSharingSession({
+				role: "user",
+				content: "intentional shared append",
+				timestamp: Date.now(),
+			});
+			expect(outcome.kind).toBe("committed");
+			barrier.release();
+			await publishing.promise;
+			if (options.cooperativeAbort) {
+				// The abort waits for post-prompt recovery, which waits for the held publication.
+				const aborting = target.session.abort();
+				await Bun.sleep(0);
+				expect(target.session.isStreaming).toBe(true);
+				releasePublication.resolve();
+				await aborting;
+			} else {
+				await target.session.abort({ timeoutMs: 0 });
+				options.beforeRelease?.(target.session);
+				releasePublication.resolve();
+			}
+			await Promise.allSettled([prompt]);
+			await published.promise;
+			await Bun.sleep(0);
+			await target.session.waitForIdle();
+			await options.afterPublication?.(target.session, manager);
+			const liveReminders = target.session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "ttsr-injection",
+			);
+			return {
+				sessionFile: manager.getSessionFile()!,
+				destination,
+				disposed: target.session.isDisposed,
+				liveReminders,
+				injected: target.ttsrManager.getInjectedRuleNames(),
+				notices: [...notices],
+				committedId,
+				modelCalls: target.modelMessages.length,
+			};
+		} finally {
+			barrier.release();
+			releasePublication.resolve();
+			try {
+				await target.session.abort();
+			} finally {
+				try {
+					await target.session.dispose();
+				} finally {
+					if (prompt) await Promise.allSettled([prompt]);
+					barrier.restore();
+					unsubscribe();
+					sharedAppend.mockRestore();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					session = undefined;
+				}
+			}
+		}
+	}
+
+	it("fails closed when an aborted retry's reminder publication outcome is unknown", async () => {
+		const result = await abortDuringSharedPublication({ unknownOutcome: true });
+		expect(result.committedId).toBeDefined();
+		expect(result.disposed).toBe(true);
+		expect(result.liveReminders).toHaveLength(0);
+		expect(result.injected).toEqual([]);
+		expect(result.notices).toHaveLength(1);
+		expect(result.notices[0]).toContain(`attempted id: ${result.committedId}`);
+		expect(result.notices[0]).toContain("session was closed");
+		expect(result.modelCalls).toBe(1);
+	});
+
+	it("delivers a committed reminder after a cooperative abort while the prompt is still in flight", async () => {
+		const result = await abortDuringSharedPublication({ cooperativeAbort: true });
+		expect(result.committedId).toBeDefined();
+		expect(result.disposed).toBe(false);
+		expect(result.liveReminders).toHaveLength(1);
+		expect(result.injected).toEqual(["named-exports"]);
+		expect(result.notices).toEqual([]);
+		expect(result.modelCalls).toBe(1);
+	});
+
+	it("closes the session instead of delivering an aborted retry's reminder into changed live history", async () => {
+		// Another writer appends to live history while the cancelled retry's publication is held.
+		const result = await abortDuringSharedPublication({
+			beforeRelease: target =>
+				target.agent.appendMessage({ role: "user", content: "successor prompt", timestamp: Date.now() }),
+		});
+		expect(result.committedId).toBeDefined();
+		expect(result.liveReminders).toHaveLength(0);
+		expect(result.injected).toEqual([]);
+		expect(result.disposed).toBe(true);
+		expect(result.notices).toHaveLength(1);
+		expect(result.notices[0]).toContain("must be reopened");
+	});
+
+	it("does not leak settled reminders across turns to a later discard retry", async () => {
+		// Regression test for #7838: a reminder settled in an earlier turn of the same session
+		// must not be carried into a later turn's discard retry.
+		const siblingContent = "TTSR-SIBLING-REMINDER: settled in turn one.";
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: new WriteTool(createToolSession()).parameters,
+			concurrency: "shared",
+			matcherDigest: args => (args as { content?: string }).content,
+			async execute() {
+				return { content: [{ type: "text", text: `${name} done` }] };
+			},
+		});
+		const call = (id: string, name: string, file: string, content: string): ToolCall => ({
+			type: "toolCall",
+			id,
+			name,
+			arguments: { path: path.join(tempDir, file), content },
+		});
+		const { session, modelMessages } = createSession(
+			[makeTool("slow"), makeTool("fast")],
+			[[call("slow-1", "slow", "a.txt", "SIBLING-MARKER")], [call("fast-2", "fast", "b.ts", "export default 1;\n")]],
+			[
+				makeRule({
+					name: "sibling",
+					content: siblingContent,
+					condition: ["SIBLING-MARKER"],
+					interruptMode: "never",
+					repeatMode: "once",
+				}),
+				defaultExportRule({ interruptMode: "always", repeatMode: "once" }),
+			],
+			{ streamToolArgs: true, contextMode: "discard" },
+		);
+		await run(session, "turn one");
+		// Turn one settled the sibling reminder into its delivered tool result.
+		expect(toolResultText(session, "slow-1")).toContain(siblingContent);
+		const turnOneCalls = modelMessages.length;
+		await run(session, "turn two");
+		// Turn two interrupted and retried. Its retry input keeps turn one's tool result, so the
+		// sibling reminder appears exactly once; a leaked settled reminder would add a second copy.
+		expect(modelMessages.length).toBe(turnOneCalls + 2);
+		const retry = JSON.stringify(modelMessages[modelMessages.length - 1]);
+		expect(retry.split(RULE_CONTENT)).toHaveLength(2);
+		expect(retry.split(siblingContent)).toHaveLength(2);
+	});
+
+	it.each([
+		["a distinct", "fast-2"],
+		["a reused", "slow-1"],
+	])("does not re-carry a reminder settled in an earlier assistant turn of the same prompt (%s tool call id)", async (_label, interruptingId) => {
+		// #7838: discard only drops the interrupted assistant turn. A reminder folded into an
+		// earlier turn's result stays in history, so the retry must not carry or re-mark it, even
+		// when the interrupted turn reuses that result's tool call id.
+		const siblingContent = "TTSR-SIBLING-REMINDER: settled in assistant turn one.";
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: new WriteTool(createToolSession()).parameters,
+			concurrency: "shared",
+			matcherDigest: args => (args as { content?: string }).content,
+			async execute() {
+				return { content: [{ type: "text", text: `${name} done` }] };
+			},
+		});
+		const call = (id: string, name: string, file: string, content: string): ToolCall => ({
+			type: "toolCall",
+			id,
+			name,
+			arguments: { path: path.join(tempDir, file), content },
+		});
+		const { session, modelMessages, ttsrManager } = createSession(
+			[makeTool("slow"), makeTool("fast")],
+			[[call("slow-1", "slow", "a.txt", "SIBLING-MARKER")]],
+			[
+				makeRule({
+					name: "sibling",
+					content: siblingContent,
+					condition: ["SIBLING-MARKER"],
+					interruptMode: "never",
+					repeatMode: "once",
+				}),
+				defaultExportRule({ interruptMode: "always", repeatMode: "once" }),
+			],
+			// The second assistant turn of the same prompt interrupts on the fast call.
+			{
+				streamToolArgs: true,
+				contextMode: "discard",
+				retryToolCalls: [call(interruptingId, "fast", "b.ts", "export default 1;\n")],
+			},
+		);
+		let settledCheckpoint: number | undefined;
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId === "slow-1"
+			)
+				settledCheckpoint ??= ttsrManager
+					.getInjectedRecords()
+					.find(record => record.name === "sibling")?.lastInjectedAt;
+		});
+		await run(session, "one prompt");
+
+		expect(toolResultText(session, "slow-1")).toContain(siblingContent);
+		// Turn one, the interrupted turn two, and the retry, all inside one prompt.
+		expect(modelMessages).toHaveLength(3);
+		const retry = JSON.stringify(modelMessages[2]);
+		expect(retry.split(RULE_CONTENT)).toHaveLength(2);
+		expect(retry.split(siblingContent)).toHaveLength(2);
+		const durable = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+		expect(durable).toHaveLength(1);
+		expect((durable[0] as { details?: { rules?: string[] } }).details?.rules).toEqual(["named-exports"]);
+		expect(settledCheckpoint).toBeDefined();
+		expect(ttsrManager.getInjectedRecords().find(record => record.name === "sibling")?.lastInjectedAt).toBe(
+			settledCheckpoint,
+		);
+	});
+
+	async function exerciseManagedRetry(
+		contextMode: "keep" | "discard",
+		mode: "legacy" | "shared" | "shared-stale" | "shared-rejected",
+	): Promise<void> {
+		const share = mode !== "legacy";
+		const refused = mode === "shared-stale" || mode === "shared-rejected";
+		const siblingContent = "TTSR-SIBLING-REMINDER: carry the interrupted tool rule.";
+		const rules = [defaultExportRule({ repeatMode: "once" })];
+		if (refused) {
+			rules.push(
+				makeRule({
+					name: "carried-sibling",
+					content: siblingContent,
+					condition: ["SIBLING-MARKER"],
+					scope: ["tool:write(*.ts)"],
+					interruptMode: "never",
+					repeatMode: "once",
+				}),
+			);
+		}
+		const callContent = refused ? "export default 1; // SIBLING-MARKER\n" : "export default 1;\n";
+		const retryCall = writeCall("managed-write-retry", "managed.ts", callContent);
+		const agentDir = path.join(tempDir, "managed-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const destination = SessionManager.managedDestination(tempDir, agentDir);
+		const manager = SessionManager.create(tempDir, destination);
+		const target = createSession(
+			[new WriteTool(createToolSession())],
+			[[writeCall("managed-write", "managed.ts", callContent)]],
+			rules,
+			{
+				interruptMode: "always",
+				contextMode,
+				sessionManager: manager,
+				streamToolArgs: refused,
+				retryToolCalls: refused ? [retryCall] : undefined,
+			},
 		);
 		const notices: { level: string; message: string }[] = [];
 		const unsubscribe = target.session.subscribe(event => {
@@ -1181,16 +1970,17 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		const barrier = holdTtsrRetry(target.session);
 		const replace = spyOn(target.session.agent, "replaceMessages");
 		const append = spyOn(target.session.agent, "appendMessage");
-		const refused = Promise.withResolvers<unknown>();
-		const assertAllowed = manager.assertLegacyMutationAllowed.bind(manager);
-		const guard = spyOn(manager, "assertLegacyMutationAllowed").mockImplementation(operation => {
-			try {
-				return assertAllowed(operation);
-			} catch (error) {
-				refused.resolve(error);
-				throw error;
-			}
-		});
+		const legacyAppend = spyOn(manager, "appendCustomMessageEntry");
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession");
+		let resumedSession: AgentSession | undefined;
+		let reopenedManager: SessionManager | undefined;
+		if (mode === "shared-stale") {
+			sharedAppend.mockImplementation(async () => ({ kind: "stale", reason: "transcript_moved" }) as const);
+		} else if (mode === "shared-rejected") {
+			sharedAppend.mockImplementation(
+				async () => ({ kind: "rejected", error: new Error("not_committed") }) as const,
+			);
+		}
 		let prompt: Promise<void> | undefined;
 		try {
 			await initializeLocalRoot({
@@ -1210,7 +2000,9 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			await target.session.agent.waitForIdle();
 			await target.session.waitForAgentEndHandlingForTests();
 			await manager.flush();
-			expect(target.triggered).toEqual([["named-exports"]]);
+			expect(target.triggered.flat().sort()).toEqual(
+				refused ? ["carried-sibling", "named-exports"] : ["named-exports"],
+			);
 			expect(target.session.isTtsrAbortPending).toBe(true);
 			expect(
 				manager
@@ -1223,8 +2015,8 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 					),
 			).toBe(true);
 			expect(await Bun.file(path.join(tempDir, "managed.ts")).exists()).toBe(false);
-			const history = structuredClone(target.session.agent.state.messages);
 			const injected = target.ttsrManager.getInjectedRuleNames();
+			expect(injected).toEqual(refused ? ["carried-sibling"] : []);
 			const records = injectedNames(target.session);
 			const calls = target.modelMessages.length;
 			expect(calls).toBe(1);
@@ -1239,58 +2031,133 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 				if (outcome.kind !== "committed") throw new Error(`shared append: ${outcome.kind}`);
 			}
 			const file = manager.getSessionFile()!;
-			const bytes = await Bun.file(file).text();
-			const entries = structuredClone(manager.getEntries());
-			const cursor = manager.getLeafId();
-			const revisions = manager.revisionSnapshot();
 			replace.mockClear();
 			append.mockClear();
 			barrier.release();
-			if (share) {
-				expect(
-					await Promise.race([
-						refused.promise,
-						prompt.then(() => {
-							throw new Error("TTSR retry completed without shared-mutation refusal");
-						}),
-					]),
-				).toBeInstanceOf(SharedSessionMutationUnsupportedError);
-				// Assert before joining prompt: the unfixed retry mutates live history,
-				// then throws from appendCustomMessageEntry and strands its resume gate.
-				expect(replace).not.toHaveBeenCalled();
-				expect(append).not.toHaveBeenCalled();
-				expect(target.session.agent.state.messages).toEqual(history);
+			await prompt;
+			await target.session.waitForIdle();
+			if (mode === "shared-stale") {
+				expect(target.session.isDisposed).toBe(true);
+				await target.session.awaitDisposeCompletion();
 				expect(target.modelMessages).toHaveLength(calls);
-				expect(target.ttsrManager.getInjectedRuleNames()).toEqual(injected);
-				expect(injectedNames(target.session)).toEqual(records);
-				expect(manager.getEntries()).toEqual(entries);
-				expect(manager.getLeafId()).toBe(cursor);
-				expect(manager.revisionSnapshot()).toEqual(revisions);
-				expect(await Bun.file(file).text()).toBe(bytes);
+				expect(target.ttsrManager.getInjectedRuleNames()).toEqual([]);
+				expect(append).not.toHaveBeenCalled();
+				expect(replace).not.toHaveBeenCalled();
+				expect(legacyAppend).not.toHaveBeenCalled();
+				expect(sharedAppend.mock.calls.filter(([customType]) => customType === "ttsr-injection")).toHaveLength(1);
+				expect(await Bun.file(path.join(tempDir, "managed.ts")).exists()).toBe(false);
+				const persisted = await Bun.file(file).text();
+				expect(persisted).not.toContain('"ttsr_injection"');
+				expect(persisted).not.toContain('"ttsr-injection"');
 				expect(notices).toHaveLength(1);
 				expect(notices[0].level).toBe("warning");
-				expect(notices[0].message).toContain("The interrupted turn remains aborted; no retry was started.");
-			} else {
-				await prompt;
-				await target.session.waitForIdle();
-				await manager.flush();
+				expect(notices[0].message).toContain("transcript_moved");
+				expect(notices[0].message).toContain("requires reopening");
+				expect(notices[0].message).not.toContain("memory only");
+				await expect(target.session.prompt("try again")).rejects.toMatchObject({ code: "busy" });
+				expect(target.session.isTtsrAbortPending).toBe(false);
+				return;
+			}
+			await manager.flush();
+			if (contextMode === "discard") {
 				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(true);
-				expect(target.modelMessages).toHaveLength(2);
-				expect(JSON.stringify(target.modelMessages[1])).toContain(RULE_CONTENT);
-				expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
-				expect(injectedNames(target.session)).toEqual(["named-exports"]);
+			}
+			// The retry ran: a second model call that carries the reminder.
+			expect(target.modelMessages).toHaveLength(calls + (refused ? 2 : 1));
+			expect(JSON.stringify(target.modelMessages[1])).toContain(RULE_CONTENT);
+			if (refused) expect(JSON.stringify(target.modelMessages[1])).toContain(siblingContent);
+			expect(target.triggered.flat().sort()).toEqual(
+				refused ? ["carried-sibling", "named-exports"] : ["named-exports"],
+			);
+			expect(target.ttsrManager.getInjectedRuleNames().sort()).toEqual(
+				refused ? ["carried-sibling", "named-exports"] : ["named-exports"],
+			);
+			expect(injected).toEqual(refused ? ["carried-sibling"] : []);
+			if (share) {
+				expect(legacyAppend).not.toHaveBeenCalled();
+				expect(sharedAppend.mock.calls.some(([customType]) => customType === "ttsr-injection")).toBe(true);
+				// The shared append that armed shared admission survives the retry.
 				expect(
 					manager
 						.getEntries()
-						.some(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection"),
+						.some(
+							entry =>
+								entry.type === "message" &&
+								entry.message.role === "user" &&
+								entry.message.content === "intentional shared append",
+						),
 				).toBe(true);
-				const persisted = await Bun.file(file).text();
+			}
+			const persistedInjection = manager
+				.getEntries()
+				.some(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+			const persisted = await Bun.file(file).text();
+			if (refused) {
+				expect(persistedInjection).toBe(false);
+				expect(injectedNames(target.session)).toEqual([]);
+				expect(persisted).not.toContain('"ttsr_injection"');
+				expect(notices).toHaveLength(1);
+				expect(notices[0].level).toBe("warning");
+				expect(notices[0].message).toContain("retrying with it in memory only");
+				const reopened = await SessionManager.open(file, destination);
+				reopenedManager = reopened;
+				const resumeState = reopened.buildSessionContext();
+				expect(resumeState.injectedTtsrRules).toEqual([]);
+				expect(resumeState.injectedTtsrRuleRecords).toEqual([]);
+				await initializeLocalRoot({
+					getArtifactsDir: () => reopened.getArtifactsDir(),
+					isManagedDestination: () => true,
+					getSessionId: () => reopened.getSessionId(),
+				});
+				const resumed = createSession(
+					[new WriteTool(createToolSession())],
+					[[writeCall("resumed-write", "managed.ts", callContent)]],
+					rules,
+					{
+						interruptMode: "always",
+						contextMode,
+						sessionManager: reopened,
+						streamToolArgs: true,
+						retryToolCalls: [writeCall("resumed-retry-write", "managed.ts", callContent)],
+					},
+				);
+				resumedSession = resumed.session;
+				if ((resumeState.ttsrMessageCount ?? 0) > 0)
+					resumed.ttsrManager.restoreMessageCount(resumeState.ttsrMessageCount!);
+				resumed.ttsrManager.restoreInjected(
+					resumeState.injectedTtsrRuleRecords?.length
+						? resumeState.injectedTtsrRuleRecords
+						: resumeState.injectedTtsrRules,
+				);
+				await run(resumed.session, "write after reopen");
+				await resumed.session.awaitSessionSettlement();
+				await reopened.flush();
+				expect(resumed.triggered.flat().sort()).toEqual(["carried-sibling", "named-exports"]);
+				expect(resumed.modelMessages).toHaveLength(3);
+				expect(JSON.stringify(resumed.modelMessages[1])).toContain(RULE_CONTENT);
+				expect(JSON.stringify(resumed.modelMessages[1])).toContain(siblingContent);
+				expect(injectedNames(resumed.session).sort()).toEqual(["carried-sibling", "named-exports"]);
+			} else {
+				expect(persistedInjection).toBe(true);
+				expect(injectedNames(target.session)).toEqual(["named-exports"]);
 				expect(persisted).toContain(RULE_CONTENT);
 				expect(persisted).toContain('"ttsr_injection"');
 				expect(notices).toEqual([]);
+				// The durable entry and the live message carry one identical payload and checkpoint.
+				const durable = manager
+					.getEntries()
+					.filter(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+				const live = target.session.agent.state.messages.filter(
+					message => message.role === "custom" && message.customType === "ttsr-injection",
+				);
+				expect(durable).toHaveLength(1);
+				expect(live).toHaveLength(1);
+				const durableEntry = durable[0] as { content: unknown; details?: { messageCount?: unknown } };
+				const liveMessage = live[0] as { content: unknown; details?: { messageCount?: unknown } };
+				expect(liveMessage.content).toEqual(durableEntry.content);
+				expect(liveMessage.details).toEqual(durableEntry.details);
+				expect(typeof durableEntry.details?.messageCount).toBe("number");
 			}
-			await prompt;
-			await target.session.waitForIdle();
 			expect(target.session.isTtsrAbortPending).toBe(false);
 			expect(target.session.isStreaming).toBe(false);
 		} finally {
@@ -1302,11 +2169,14 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 					await target.session.dispose();
 				} finally {
 					if (prompt) await Promise.allSettled([prompt]);
+					if (resumedSession) await resumedSession.dispose();
+					if (reopenedManager) expect((await reopenedManager.closeStrict()).kind).toBe("closed");
 					barrier.restore();
 					unsubscribe();
 					replace.mockRestore();
 					append.mockRestore();
-					guard.mockRestore();
+					legacyAppend.mockRestore();
+					sharedAppend.mockRestore();
 					expect((await manager.closeStrict()).kind).toBe("closed");
 					session = undefined;
 				}
@@ -1995,6 +2865,403 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(retry).toContain(RULE_CONTENT);
 		expect(retry).toContain(siblingContent);
 		expect(injectedNames(session).sort()).toEqual(["named-exports", "sibling"]);
+	});
+
+	it("carries a settled sibling reminder into a discard retry once, matching the persisted entry", async () => {
+		const siblingContent = "TTSR-SIBLING-REMINDER: marker seen.";
+		const slowSettled = Promise.withResolvers<void>();
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: new WriteTool(createToolSession()).parameters,
+			concurrency: "shared",
+			nonAbortable: true,
+			matcherDigest: args => (args as { content?: string }).content,
+			async execute() {
+				return { content: [{ type: "text", text: `${name} done` }] };
+			},
+		});
+		const call = (id: string, name: string, file: string, content: string): ToolCall => ({
+			type: "toolCall",
+			id,
+			name,
+			arguments: { path: path.join(tempDir, file), content },
+		});
+		const { session, modelMessages } = createSession(
+			[makeTool("slow"), makeTool("fast")],
+			[[call("slow-1", "slow", "a.txt", "SIBLING-MARKER"), call("fast-1", "fast", "b.ts", "export default 1;\n")]],
+			[
+				makeRule({
+					name: "sibling",
+					content: siblingContent,
+					condition: ["SIBLING-MARKER"],
+					interruptMode: "never",
+					repeatMode: "once",
+				}),
+				defaultExportRule({ interruptMode: "always", repeatMode: "once" }),
+			],
+			{ streamToolArgs: true, contextMode: "discard" },
+		);
+		let slowWasSettled = false;
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId === "slow-1"
+			)
+				slowSettled.resolve();
+		});
+		// fast's AST interrupt lands only after slow's decorated result was published.
+		const before = session.agent.beforeToolCall!;
+		session.agent.beforeToolCall = async (ctx, signal) => {
+			if (ctx.toolCall.id === "fast-1") {
+				slowWasSettled = await Promise.race([
+					slowSettled.promise.then(() => true),
+					Bun.sleep(500).then(() => false),
+				]);
+			}
+			return before(ctx, signal);
+		};
+		await run(session, "go");
+
+		expect(slowWasSettled).toBe(true);
+		const retry = JSON.stringify(modelMessages[1]);
+		expect(retry.split(RULE_CONTENT)).toHaveLength(2);
+		expect(retry.split(siblingContent)).toHaveLength(2);
+		const durable = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+		const live = session.agent.state.messages.filter(
+			message => message.role === "custom" && message.customType === "ttsr-injection",
+		);
+		expect(durable).toHaveLength(1);
+		expect(live).toHaveLength(1);
+		expect((live[0] as { content: unknown }).content).toEqual((durable[0] as { content: unknown }).content);
+		expect(((durable[0] as { details?: { rules?: string[] } }).details?.rules ?? []).sort()).toEqual([
+			"named-exports",
+			"sibling",
+		]);
+	});
+
+	it("closes the session when a stale retry's reminder commits during a newer prompt, and reopen restores it once", async () => {
+		const siblingContent = "TTSR-SIBLING-REMINDER: marker seen.";
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: new WriteTool(createToolSession()).parameters,
+			concurrency: "shared",
+			matcherDigest: args => (args as { content?: string }).content,
+			async execute() {
+				return { content: [{ type: "text", text: `${name} done` }] };
+			},
+		});
+		const call = (id: string, name: string, file: string, content: string): ToolCall => ({
+			type: "toolCall",
+			id,
+			name,
+			arguments: { path: path.join(tempDir, file), content },
+		});
+		const agentDir = path.join(tempDir, "managed-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const destination = SessionManager.managedDestination(tempDir, agentDir);
+		const manager = SessionManager.create(tempDir, destination);
+		const rules = [
+			makeRule({
+				name: "sibling",
+				content: siblingContent,
+				condition: ["SIBLING-MARKER"],
+				interruptMode: "never",
+				repeatMode: "once",
+			}),
+			defaultExportRule({ interruptMode: "always", repeatMode: "once" }),
+		];
+		const target = createSession(
+			[makeTool("slow"), makeTool("fast")],
+			[[call("fast-1", "fast", "b.ts", "export default 1;\n")], [call("slow-2", "slow", "a.txt", "SIBLING-MARKER")]],
+			rules,
+			{ streamToolArgs: true, sessionManager: manager },
+		);
+		const notices: string[] = [];
+		const unsubscribe = target.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "ttsr") notices.push(event.message);
+		});
+		const claimed = Promise.withResolvers<void>();
+		const releaseTool = Promise.withResolvers<void>();
+		const before = target.session.agent.beforeToolCall!;
+		target.session.agent.beforeToolCall = async (ctx, signal) => {
+			const result = await before(ctx, signal);
+			if (ctx.toolCall.id === "slow-2") {
+				claimed.resolve();
+				await releaseTool.promise;
+			}
+			return result;
+		};
+		const barrier = holdTtsrRetry(target.session);
+		const publishing = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const published = Promise.withResolvers<void>();
+		const publish = manager.appendCustomMessageEntrySharingSession.bind(manager);
+		let committed: { id: string; messageCount: unknown } | undefined;
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession").mockImplementation(
+			async (...args: Parameters<typeof publish>) => {
+				if (args[0] !== "ttsr-injection") return publish(...args);
+				publishing.resolve();
+				await releasePublication.promise;
+				try {
+					const outcome = await publish(...args);
+					if (outcome.kind === "committed")
+						committed = { id: outcome.id, messageCount: (args[3] as { messageCount?: unknown }).messageCount };
+					return outcome;
+				} finally {
+					published.resolve();
+				}
+			},
+		);
+		let prompt: Promise<void> | undefined;
+		let next: Promise<void> | undefined;
+		let sessionFile: string | undefined;
+		try {
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			prompt = target.session.prompt("go");
+			void prompt.catch(() => {});
+			await barrier.entered;
+			await target.session.agent.waitForIdle();
+			await target.session.waitForAgentEndHandlingForTests();
+			sessionFile = manager.getSessionFile()!;
+			const outcome = await manager.appendMessageSharingSession({
+				role: "user",
+				content: "intentional shared append",
+				timestamp: Date.now(),
+			});
+			expect(outcome.kind).toBe("committed");
+			barrier.release();
+			await publishing.promise;
+			// Abort while the stale retry is parked inside its publication, then start newer prompts.
+			await target.session.abort({ timeoutMs: 0 });
+			await target.session.prompt("between");
+			await target.session.waitForIdle();
+			next = target.session.prompt("third");
+			void next.catch(() => {});
+			await claimed.promise;
+			expect(target.ttsrManager.getInjectedRuleNames()).toContain("sibling");
+			releasePublication.resolve();
+			// The held writer settled; let the retry task finish its post-await fence.
+			await published.promise;
+			await Bun.sleep(0);
+			releaseTool.resolve();
+			await Promise.allSettled([next]);
+			await target.session.waitForIdle();
+			// The committed reminder cannot reach the running successor's live history, so the session
+			// fails closed instead of running on without it or publishing it a second time.
+			expect(target.session.isDisposed).toBe(true);
+			await target.session.awaitDisposeCompletion();
+			expect(notices).toHaveLength(1);
+			expect(notices[0]).toContain("must be reopened");
+			expect(
+				target.session.agent.state.messages.some(
+					message => message.role === "custom" && message.customType === "ttsr-injection",
+				),
+			).toBe(false);
+		} finally {
+			barrier.release();
+			releasePublication.resolve();
+			releaseTool.resolve();
+			try {
+				await target.session.abort();
+			} finally {
+				try {
+					await target.session.dispose();
+				} finally {
+					await Promise.allSettled([prompt, next].filter(Boolean));
+					barrier.restore();
+					unsubscribe();
+					sharedAppend.mockRestore();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					session = undefined;
+				}
+			}
+		}
+
+		// Reopen: the committed entry is the only evidence (no marker was written), and reconciliation
+		// marks its rule once, at the published checkpoint.
+		if (!committed || !sessionFile) throw new Error("The cancelled retry's reminder was not committed");
+		const publishedCount = committed.messageCount;
+		expect(typeof publishedCount).toBe("number");
+		const reopened = await SessionManager.open(sessionFile, destination);
+		const reminderEntries = reopened
+			.getEntries()
+			.filter(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+		expect(reminderEntries.map(entry => entry.id)).toEqual([committed.id]);
+		const resumeState = reopened.buildSessionContext();
+		expect(resumeState.injectedTtsrRuleRecords?.some(record => record.name === "named-exports") ?? false).toBe(false);
+		const ttsrManager = new TtsrManager({ interruptMode: "always", contextMode: "keep" });
+		for (const rule of rules) ttsrManager.addRule(rule);
+		if ((resumeState.ttsrMessageCount ?? 0) > 0) ttsrManager.restoreMessageCount(resumeState.ttsrMessageCount!);
+		ttsrManager.restoreInjected(
+			resumeState.injectedTtsrRuleRecords?.length
+				? resumeState.injectedTtsrRuleRecords
+				: resumeState.injectedTtsrRules,
+		);
+		const markAt = spyOn(ttsrManager, "markInjectedByNamesAt");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const resumed = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: resumeState.messages },
+				convertToLlm,
+			}),
+			sessionManager: reopened,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			ttsrManager,
+			modelRegistry,
+			toolRegistry: new Map(),
+		});
+		try {
+			const markCalls = markAt.mock.calls.filter(([names]) => names.includes("named-exports"));
+			expect(markCalls).toHaveLength(1);
+			expect(markCalls[0][1]).toBe(publishedCount as number);
+			expect(ttsrManager.getInjectedRecords().find(record => record.name === "named-exports")?.lastInjectedAt).toBe(
+				publishedCount as number,
+			);
+		} finally {
+			markAt.mockRestore();
+			await resumed.dispose();
+			expect((await reopened.closeStrict()).kind).toBe("closed");
+		}
+	});
+
+	it("releases a carried sibling claim when a shared retry is aborted during reminder publication", async () => {
+		const siblingContent = "TTSR-SIBLING-REMINDER: marker seen.";
+		const slowFolded = Promise.withResolvers<void>();
+		const interrupted = Promise.withResolvers<void>();
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: new WriteTool(createToolSession()).parameters,
+			concurrency: "shared",
+			nonAbortable: true,
+			matcherDigest: args => (args as { content?: string }).content,
+			async execute() {
+				return { content: [{ type: "text", text: `${name} done` }] };
+			},
+		});
+		const call = (id: string, name: string, file: string, content: string): ToolCall => ({
+			type: "toolCall",
+			id,
+			name,
+			arguments: { path: path.join(tempDir, file), content },
+		});
+		const agentDir = path.join(tempDir, "managed-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const manager = SessionManager.create(tempDir, SessionManager.managedDestination(tempDir, agentDir));
+		const target = createSession(
+			[makeTool("slow"), makeTool("fast")],
+			[[call("slow-1", "slow", "a.txt", "SIBLING-MARKER"), call("fast-1", "fast", "b.ts", "export default 1;\n")]],
+			[
+				makeRule({
+					name: "sibling",
+					content: siblingContent,
+					condition: ["SIBLING-MARKER"],
+					interruptMode: "never",
+					repeatMode: "once",
+				}),
+				defaultExportRule({ interruptMode: "always", repeatMode: "once" }),
+			],
+			{ streamToolArgs: true, sessionManager: manager },
+		);
+		const fold = target.session.agent.afterToolCall!;
+		target.session.agent.afterToolCall = async (ctx, signal) => {
+			const result = await fold(ctx, signal);
+			if (ctx.toolCall.id === "slow-1") {
+				slowFolded.resolve();
+				await interrupted.promise;
+			}
+			return result;
+		};
+		const before = target.session.agent.beforeToolCall!;
+		target.session.agent.beforeToolCall = async (ctx, signal) => {
+			if (ctx.toolCall.id === "fast-1") await slowFolded.promise;
+			const result = await before(ctx, signal);
+			if (ctx.toolCall.id === "fast-1") setTimeout(() => interrupted.resolve(), 5);
+			return result;
+		};
+		const barrier = holdTtsrRetry(target.session);
+		const publishing = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const published = Promise.withResolvers<void>();
+		const publish = manager.appendCustomMessageEntrySharingSession.bind(manager);
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession").mockImplementation(
+			async (...args: Parameters<typeof publish>) => {
+				if (args[0] !== "ttsr-injection") return publish(...args);
+				publishing.resolve();
+				await releasePublication.promise;
+				try {
+					return await publish(...args);
+				} finally {
+					published.resolve();
+				}
+			},
+		);
+		let prompt: Promise<void> | undefined;
+		try {
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			prompt = target.session.prompt("go");
+			void prompt.catch(() => {});
+			await barrier.entered;
+			await target.session.agent.waitForIdle();
+			await target.session.waitForAgentEndHandlingForTests();
+			// The sibling is provisionally claimed by its per-tool bucket; the interrupting rule is only pending.
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["sibling"]);
+			const outcome = await manager.appendMessageSharingSession({
+				role: "user",
+				content: "intentional shared append",
+				timestamp: Date.now(),
+			});
+			expect(outcome.kind).toBe("committed");
+			barrier.release();
+			await publishing.promise;
+			await target.session.abort({ timeoutMs: 0 });
+			releasePublication.resolve();
+			await Promise.allSettled([prompt]);
+			// The held writer settled; let the retry task finish its post-await fence.
+			await published.promise;
+			await Bun.sleep(0);
+			await target.session.waitForIdle();
+			// No retry ran, but the committed reminder is reconciled to prevent duplicate interrupts (#7838).
+			// Both carried rules (main and sibling) are marked in memory to suppress repeat-gap intervals,
+			// but neither is persisted since the full retry setup was aborted before in-memory append.
+			expect(target.modelMessages).toHaveLength(1);
+			expect(target.ttsrManager.getInjectedRuleNames().sort()).toEqual(["named-exports", "sibling"]);
+			expect(injectedNames(target.session)).not.toContain("sibling");
+			expect(target.session.isTtsrAbortPending).toBe(false);
+		} finally {
+			barrier.release();
+			releasePublication.resolve();
+			try {
+				await target.session.abort();
+			} finally {
+				try {
+					await target.session.dispose();
+				} finally {
+					if (prompt) await Promise.allSettled([prompt]);
+					barrier.restore();
+					sharedAppend.mockRestore();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					session = undefined;
+				}
+			}
+		}
 	});
 
 	describe("nested eval tool.<name>() calls", () => {
