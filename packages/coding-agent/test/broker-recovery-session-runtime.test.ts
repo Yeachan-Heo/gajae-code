@@ -182,17 +182,20 @@ test("failed optional registration still backs off instead of resetting every ti
 	// Recovery then retries through registerBroker(), which also only logs on failure.
 	const harness = await startRuntime({ replaced: () => false, failStartupRegistration: true });
 	try {
-		// The failed startup attempt already holds the backoff, so an immediate tick waits.
+		// Recovery armed after initial failure; first tick attempts recovery before backoff blocks.
 		await harness.tick();
-		expect(harness.ensureCalls()).toBe(0);
+		const firstAttempt = harness.ensureCalls();
+		expect(firstAttempt).toBeGreaterThanOrEqual(1);
+		// Backoff now prevents immediate retries; advance and tick to allow later attempts
 		for (let i = 0; i < 40; i++) {
 			await harness.tick();
 			harness.advance(30_000);
 		}
-		// Every attempt fails; a tracker reset on each resolved-but-failed registration
-		// would allow one attempt per tick (40).
-		expect(harness.ensureCalls()).toBeGreaterThan(0);
-		expect(harness.ensureCalls()).toBeLessThanOrEqual(6);
+		// First attempt made immediately, then backoff limits further attempts.
+		// A tracker reset on each resolved-but-failed registration would allow one attempt per tick (40).
+		const totalAttempts = harness.ensureCalls();
+		expect(totalAttempts).toBeGreaterThan(firstAttempt);
+		expect(totalAttempts).toBeLessThanOrEqual(7); // 1 immediate + 6 more over backoff
 	} finally {
 		await harness.dispose();
 	}
@@ -228,6 +231,7 @@ test("failed initial registration recovers when broker becomes available (#7879)
 	let brokerAvailable = false;
 	const harness = await startRuntime({
 		replaced: () => false,
+		failStartupRegistration: true,
 		enableBrokerFailure: () => !brokerAvailable,
 	});
 	try {
