@@ -25714,6 +25714,12 @@ export class SessionManager {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
 		const openSelectedStrictly = async (selectedPath: string): Promise<SessionManager | undefined> => {
+			// Skip an opposite-scope transcript from its bounded header prefix before any
+			// full inspection. Opening it first can throw on size or context limits, which
+			// would stop the scan before an older matching-scope transcript is reached.
+			// The post-open checks below stay authoritative.
+			const [listed] = await readSessionMetadata([selectedPath], storage).catch(() => []);
+			if (listed && !sessionMatchesConfinement(listed, confined)) return undefined;
 			let selectedSize: number | undefined;
 			try {
 				selectedSize = storage.statSync(selectedPath).size;
