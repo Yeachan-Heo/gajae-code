@@ -111,6 +111,7 @@ const allowed = new Set<DesktopMethod>([
 	"shutdown",
 ]);
 if (fixtureMode) {
+	allowed.add("project.close");
 	allowed.add("thinking.set");
 	allowed.add("auth.setKey");
 }
