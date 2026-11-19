@@ -295,6 +295,7 @@ interface HunkState {
 	bracketDepth: number;
 	bracketStack: string[]; // Track opening bracket types to validate matching
 	inPemBlock: boolean; // Track if we're inside a PEM block
+	inYamlBlockScalar?: boolean; // Track if we're in a YAML block scalar (terminated by dedent or end of hunk)
 }
 
 interface HunkResult {
@@ -720,25 +721,37 @@ function applyStateBasedRedactionWithIndependentProjections(
 
 		// Check if this line starts a credential header with value on later line
 		const isCredentialHeader =
-			line.match(/:(\s*)$/) && // Ends with colon (possibly followed by space)
+			line.match(/:(	*)$/) && // Ends with colon (possibly followed by space)
 			(line.match(/cookie|auth|token|pass|secret|key|credential/i) || false);
 
 		// Check if this line contains a credential field opening in JSON/object notation
 		const credentialFieldMatch = line.match(
-			/['"$]?(token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization)['"]?\s*:\s*[[{]/i,
+			/['"$]?(token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization)['"]?\s*:\s*[\[{]/i,
 		);
 
 		// Also check for headers/lines with credential keywords followed by bracket on same line
 		const credentialWithBracket = line.match(
-			/^\s*(Auth(?:orization)?|Cookie|Token|Secret|Password|Pass|Key)\s*:\s*[[{]/i,
+			/^\s*(Auth(?:orization)?|Cookie|Token|Secret|Password|Pass|Key)\s*:\s*[\[{]/i,
+		);
+
+		// Check for YAML block scalars with credential keywords (e.g., "api_token: |")
+		// YAML block scalars can have credential values on subsequent lines
+		const yamlBlockScalarWithCredential = line.match(
+			/(?:token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization).*?:\s*[|>]/i,
 		);
 
 		const hasCredentialOpening =
-			credentialFieldMatch || credentialWithBracket || isCredentialHeader || isPemBlockStart;
+			credentialFieldMatch ||
+			credentialWithBracket ||
+			isCredentialHeader ||
+			yamlBlockScalarWithCredential ||
+			isPemBlockStart;
 
 		if (hasCredentialOpening) {
 			// This line starts a credential header or field
 			fileState.inCredentialValue = true;
+			// For YAML block scalars (ending with | or >), mark as YAML mode to handle indentation-based termination
+			fileState.inYamlBlockScalar = yamlBlockScalarWithCredential ? true : false;
 			fileState.bracketDepth = 0;
 			fileState.bracketStack = [];
 			// Count brackets in this line using quote-aware matching
@@ -752,19 +765,35 @@ function applyStateBasedRedactionWithIndependentProjections(
 			fileState.bracketDepth += depthDelta;
 			fileState.bracketStack = newStack;
 
-			// Redact this line as part of the credential value
-			// But preserve pure structure lines like standalone brackets
-			if (line.trim().match(/^[[\]{},:]*$/)) {
-				// This is a pure structure line - keep it as-is
-				result.push(info);
+			// For YAML block scalars, redact all indented lines and exit on non-indented line
+			if (fileState.inYamlBlockScalar) {
+				// Check if this line is indented (starts with space after the diff prefix)
+				const isIndented = line.match(/^\s+/);
+				if (isIndented) {
+					// Part of the YAML block - redact it
+					result.push({ ...info, content: "«redacted»" });
+				} else {
+					// Not indented - end of YAML block
+					fileState.inCredentialValue = false;
+					fileState.inYamlBlockScalar = false;
+					result.push({ ...info, content: redactedContent });
+				}
 			} else {
-				// Actual content - redact it
-				result.push({ ...info, content: "«redacted»" });
-			}
+				// Regular bracket-based credential value
+				// Redact this line as part of the credential value
+				// But preserve pure structure lines like standalone brackets
+				if (line.trim().match(/^[\[\]{},:]*$/)) {
+					// This is a pure structure line - keep it as-is
+					result.push(info);
+				} else {
+					// Actual content - redact it
+					result.push({ ...info, content: "«redacted»" });
+				}
 
-			// Exit credential value when all brackets are closed
-			if (fileState.bracketDepth <= 0 && !line.match(/[[{]/)) {
-				fileState.inCredentialValue = false;
+				// Exit credential value when all brackets are closed
+				if (fileState.bracketDepth <= 0 && !line.match(/[\[{]/)) {
+					fileState.inCredentialValue = false;
+				}
 			}
 		} else {
 			// Not in credential value - do normal per-line redaction
