@@ -3108,6 +3108,14 @@ interface StagedTreeViewToolSelection {
 	selectedDiscoveredBuiltinToolNames: string[];
 }
 
+interface McpToolCatalogCandidate {
+	registry: Map<string, AgentTool>;
+	discoverable: Map<string, DiscoverableTool>;
+	mandatory: Set<string>;
+	selected: string[];
+	isCurrent: () => boolean;
+}
+
 /**
  * An entry states its transport with `type`, or implies it: a `command` entry is
  * stdio and a `url` entry is http. Only the discriminator is read — the command
@@ -4926,6 +4934,7 @@ export class AgentSession {
 	#committedExplicitMCPToolSelectionPersistsForContext = true;
 	#stagedTreeViewToolSelection: StagedTreeViewToolSelection | undefined;
 	#mcpCatalogGeneration = 0;
+	#mcpCatalogRefreshGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
 	#gjcSubskillToolNames = new Set<string>();
@@ -7569,14 +7578,14 @@ export class AgentSession {
 	}
 
 	/** A mandatory MCP name counts only while an MCP tool is the registered object for it. */
-	#isRegisteredMcpTool(name: string): boolean {
-		const tool = this.#toolRegistry.get(name);
+	#isRegisteredMcpTool(name: string, registry = this.#toolRegistry): boolean {
+		const tool = registry.get(name);
 		return tool !== undefined && isMCPBridgeTool(tool);
 	}
 
 	/** True when a non-MCP tool owns `name`; a mandatory MCP name must never activate it. */
-	#isNameHeldByNonMcpTool(name: string): boolean {
-		const tool = this.#toolRegistry.get(name);
+	#isNameHeldByNonMcpTool(name: string, registry = this.#toolRegistry): boolean {
+		const tool = registry.get(name);
 		return tool !== undefined && !isMCPBridgeTool(tool);
 	}
 
@@ -7586,9 +7595,13 @@ export class AgentSession {
 	 * later calls are never redirected to an MCP endpoint; the conflict is logged.
 	 * A registry object in `retiring` is being removed by its owner, so the MCP tool replaces it.
 	 */
-	#isMcpToolNameHeldByOtherTool(tool: CustomTool, retiring?: ReadonlyMap<string, AgentTool>): boolean {
+	#isMcpToolNameHeldByOtherTool(
+		tool: CustomTool,
+		retiring?: ReadonlyMap<string, AgentTool>,
+		registry = this.#toolRegistry,
+	): boolean {
 		if (!isMCPBridgeTool(tool)) return false;
-		const existing = this.#toolRegistry.get(tool.name);
+		const existing = registry.get(tool.name);
 		if (!existing || isMCPBridgeTool(existing)) return false;
 		if (retiring?.get(tool.name) === existing) return false;
 		logger.warn("Skipping MCP tool whose name is already registered by another tool", {
@@ -13593,9 +13606,9 @@ export class AgentSession {
 		return this.#retryAttempt;
 	}
 
-	#collectDiscoverableMCPToolsFromRegistry(): Map<string, DiscoverableTool> {
+	#collectDiscoverableMCPToolsFromRegistry(registry = this.#toolRegistry): Map<string, DiscoverableTool> {
 		return new Map(
-			collectDiscoverableTools(Array.from(this.#toolRegistry.values()).filter(isMCPBridgeTool)).map(
+			collectDiscoverableTools(Array.from(registry.values()).filter(isMCPBridgeTool)).map(
 				tool => [tool.name, tool] as const,
 			),
 		);
@@ -13614,22 +13627,26 @@ export class AgentSession {
 		this.#discoverableToolSearchIndex = null;
 	}
 
-	#filterSelectableMCPToolNames(toolNames: Iterable<string>): string[] {
-		return Array.from(toolNames).filter(name => this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name));
+	#filterSelectableMCPToolNames(
+		toolNames: Iterable<string>,
+		registry = this.#toolRegistry,
+		discoverable = this.#discoverableMCPTools,
+	): string[] {
+		return Array.from(toolNames).filter(name => discoverable.has(name) && registry.has(name));
 	}
 
-	#getConfiguredDefaultSelectedMCPToolNames(): string[] {
+	#getConfiguredDefaultSelectedMCPToolNames(
+		registry = this.#toolRegistry,
+		discoverable = this.#discoverableMCPTools,
+	): string[] {
 		const defaultToolNames = new Set([
 			...this.#defaultSelectedMCPToolNames,
-			...selectDiscoverableToolNamesByServer(
-				this.#discoverableMCPTools.values(),
-				this.#defaultSelectedMCPServerNames,
-			),
+			...selectDiscoverableToolNamesByServer(discoverable.values(), this.#defaultSelectedMCPServerNames),
 		]);
 		if (this.#mcpDiscoveryEnabled && !this.settings.get("mcp.discoveryDeferAutoload")) {
 			for (const name of this.#defaultSelectedConventionalMCPToolNames) defaultToolNames.add(name);
 		}
-		return this.#filterSelectableMCPToolNames(defaultToolNames);
+		return this.#filterSelectableMCPToolNames(defaultToolNames, registry, discoverable);
 	}
 
 	#pruneSelectedMCPToolNames(): void {
@@ -13751,10 +13768,12 @@ export class AgentSession {
 		}
 	}
 
-	#getActiveNonMCPToolNames(activeToolNames = this.getActiveToolNames()): string[] {
-		return activeToolNames.filter(
-			name => !this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name),
-		);
+	#getActiveNonMCPToolNames(
+		activeToolNames = this.getActiveToolNames(),
+		registry = this.#toolRegistry,
+		discoverable = this.#discoverableMCPTools,
+	): string[] {
+		return activeToolNames.filter(name => !discoverable.has(name) && registry.has(name));
 	}
 
 	/**
@@ -15239,6 +15258,8 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
+			mcpCatalog?: McpToolCatalogCandidate;
+			onToolsPublished?: () => void;
 			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
@@ -15258,40 +15279,54 @@ export class AgentSession {
 			(options?.explicitActiveToolSelectionGeneration === undefined ||
 				options.explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration);
 		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
-		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
+		const catalog = options?.mcpCatalog;
+		const registry = catalog?.registry ?? this.#toolRegistry;
+		const discoverable = catalog?.discoverable ?? this.#discoverableMCPTools;
+		const mandatory = catalog?.mandatory ?? this.#mandatoryMCPToolNames;
+		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...mandatory])];
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
 			options?.previousSelectedDiscoveredBuiltinToolNames ?? this.#getSelectedDiscoveredBuiltinToolNames();
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
-			const tool = this.#toolRegistry.get(name);
+			const tool = registry.get(name);
 			if (tool) {
 				tools.push(tool);
 				validToolNames.push(name);
 			}
 		}
 		const nextSelectedMCPToolNames = this.#mcpDiscoveryEnabled
-			? new Set(
-					validToolNames.filter(
-						name =>
-							isMCPToolName(name) &&
-							!this.#mandatoryMCPToolNames.has(name) &&
-							this.#discoverableMCPTools.has(name) &&
-							this.#toolRegistry.has(name),
-					),
-				)
-			: this.#selectedMCPToolNames;
+			? new Set(validToolNames.filter(name => isMCPToolName(name) && !mandatory.has(name) && discoverable.has(name)))
+			: (catalog ? new Set(catalog.selected) : this.#selectedMCPToolNames);
 		const activeNameSet = new Set(validToolNames);
 		const nextSelectedDiscoveredBuiltinToolNames = new Set(
 			options?.nextSelectedDiscoveredBuiltinToolNames ?? this.#selectedDiscoveredToolNames,
 		);
 		for (const name of nextSelectedDiscoveredBuiltinToolNames) {
-			if (!activeNameSet.has(name) || this.#discoverableMCPTools.has(name) || !this.#toolRegistry.has(name)) {
+			if (!activeNameSet.has(name) || discoverable.has(name) || !registry.has(name)) {
 				nextSelectedDiscoveredBuiltinToolNames.delete(name);
 			}
 		}
-		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
+		const catalogIsCurrent = () =>
+			mcpCatalogGeneration === this.#mcpCatalogGeneration &&
+			(catalog
+				? catalog.isCurrent()
+				: validToolNames.every((name, index) => this.#toolRegistry.get(name) === tools[index]));
+		const promoteCatalog = () => {
+			if (!catalog) return;
+			// Keep the live map identity shared with the SDK's tool contexts.
+			this.#toolRegistry.clear();
+			for (const [name, tool] of registry) this.#toolRegistry.set(name, tool);
+			this.#mandatoryMCPToolNames = mandatory;
+			this.#setDiscoverableMCPTools(discoverable);
+			this.#reserveBaseSystemPromptGeneration();
+		};
+		const onToolsPublished = () => {
+			options?.fence?.onToolsApplied();
+			options?.onToolsPublished?.();
+		};
+		const signature = this.#computeAppliedToolSignature(validToolNames, tools, registry);
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
 		if (sharedDiscovery) {
@@ -15312,14 +15347,13 @@ export class AgentSession {
 				manager.getSessionFile() === file &&
 				manager.getSessionIdentityGeneration() === identityGeneration &&
 				selectionIsCurrent() &&
-				mcpCatalogGeneration === this.#mcpCatalogGeneration &&
-				validToolNames.every((name, index) => this.#toolRegistry.get(name) === tools[index]) &&
+				catalogIsCurrent() &&
 				(promptGeneration === undefined || promptGeneration === this.#baseSystemPromptGeneration);
 			let builtPrompt: string[] | undefined;
 			if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 				promptGeneration = this.#reserveBaseSystemPromptGeneration();
 				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+					this.#rebuildSystemPrompt!(validToolNames, registry),
 				);
 				builtPrompt = built.systemPrompt;
 			}
@@ -15335,6 +15369,7 @@ export class AgentSession {
 				this.#resolveEffectiveDiscoveryMode() === "all" &&
 				!this.#selectedMCPToolNamesMatch(previousSelectedDiscoveredBuiltinToolNames, selectedBuiltinNames);
 			const promote = () => {
+				promoteCatalog();
 				if (builtPrompt) {
 					this.#baseSystemPrompt = builtPrompt;
 					this.agent.setSystemPrompt(builtPrompt);
@@ -15347,7 +15382,7 @@ export class AgentSession {
 				}
 				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools, options?.fence?.onToolsApplied);
+				this.#setGuardedAgentTools(tools, onToolsPublished);
 				this.#invalidateDiscoveryCaches();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
@@ -15391,24 +15426,27 @@ export class AgentSession {
 			}
 			return this.#activeToolSelectionRevision;
 		}
+		let builtPrompt: string[] | undefined;
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			while (true) {
-				const generation = this.#reserveBaseSystemPromptGeneration();
+				// A catalog candidate does not invalidate independent prompt builds until it publishes.
+				const generation = catalog ? this.#baseSystemPromptGeneration : this.#reserveBaseSystemPromptGeneration();
+				const clearPendingSignature = () => {
+					if (!catalog && generation === this.#baseSystemPromptGeneration) {
+						this.#pendingAppliedToolSignature = undefined;
+					}
+				};
 				let built: { systemPrompt: string[] };
 				try {
 					built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-						this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+						this.#rebuildSystemPrompt!(validToolNames, registry),
 					);
 				} catch (error) {
-					if (generation === this.#baseSystemPromptGeneration) {
-						this.#pendingAppliedToolSignature = undefined;
-					}
+					clearPendingSignature();
 					throw error;
 				}
 				if (this.#isDisposed || !selectionIsCurrent()) {
-					if (generation === this.#baseSystemPromptGeneration) {
-						this.#pendingAppliedToolSignature = undefined;
-					}
+					clearPendingSignature();
 					return undefined;
 				}
 				if (options?.sessionTransitionGeneration !== undefined) {
@@ -15416,53 +15454,41 @@ export class AgentSession {
 						await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
 					}
 					if (options.sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
-						if (generation === this.#baseSystemPromptGeneration) {
-							this.#pendingAppliedToolSignature = undefined;
-						}
+						clearPendingSignature();
 						return undefined;
 					}
 				}
-				if (this.#isDisposed || !selectionIsCurrent()) {
-					if (generation === this.#baseSystemPromptGeneration) {
-						this.#pendingAppliedToolSignature = undefined;
-					}
-					return undefined;
-				}
-				if (
-					mcpCatalogGeneration !== this.#mcpCatalogGeneration ||
-					validToolNames.some((name, index) => this.#toolRegistry.get(name) !== tools[index])
-				) {
-					if (generation === this.#baseSystemPromptGeneration) {
-						this.#pendingAppliedToolSignature = undefined;
-					}
+				if (this.#isDisposed || !selectionIsCurrent() || !catalogIsCurrent()) {
+					clearPendingSignature();
 					return undefined;
 				}
 				if (generation !== this.#baseSystemPromptGeneration) continue;
 				assertControlMutationAllowed();
-				this.#baseSystemPrompt = built.systemPrompt;
-				this.agent.setSystemPrompt(this.#baseSystemPrompt);
-				this.#lastAppliedToolSignature = signature;
-				this.#pendingAppliedToolSignature = undefined;
-				options?.fence?.onPromptApplied();
+				builtPrompt = built.systemPrompt;
 				break;
 			}
-		} else if (promptRelevantToolsChanged) {
-			if (!selectionIsCurrent()) return undefined;
-			this.#lastAppliedToolSignature = signature;
-			this.#pendingAppliedToolSignature = undefined;
 		}
 		if (
 			!selectionIsCurrent() ||
 			(options?.sessionTransitionGeneration !== undefined &&
 				options.sessionTransitionGeneration !== this.#sessionTransitionGeneration) ||
-			mcpCatalogGeneration !== this.#mcpCatalogGeneration ||
-			validToolNames.some((name, index) => this.#toolRegistry.get(name) !== tools[index])
+			!catalogIsCurrent()
 		)
 			return undefined;
-		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
+		promoteCatalog();
+		if (builtPrompt) {
+			this.#baseSystemPrompt = builtPrompt;
+			this.agent.setSystemPrompt(builtPrompt);
+			options?.fence?.onPromptApplied();
+		}
+		if (promptRelevantToolsChanged) {
+			this.#lastAppliedToolSignature = signature;
+			this.#pendingAppliedToolSignature = undefined;
+			this.#defaultModelSelectionMutationRevision++;
+		}
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-		this.#setGuardedAgentTools(tools, options?.fence?.onToolsApplied);
+		this.#setGuardedAgentTools(tools, onToolsPublished);
 		this.#invalidateDiscoveryCaches();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
@@ -15553,12 +15579,15 @@ export class AgentSession {
 			this.#explicitMCPToolSelectionForContext = explicitMCPToolNames;
 			this.#explicitMCPToolSelectionPersistsForContext = options?.persistMCPSelection !== false;
 		}
+		// Commit only the accepted selection, before its observer can reconcile a catalog.
+		const onToolsPublished = isExplicit ? () => this.#commitExplicitMCPToolSelectionAuthority() : undefined;
 		try {
 			let appliedRevision = await this.#applyActiveToolsByName(toolNames, {
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
 				sharedPublication,
+				onToolsPublished,
 			});
 			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
 				if (sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
@@ -15589,6 +15618,7 @@ export class AgentSession {
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
 							sharedPublication,
+							onToolsPublished,
 						},
 					);
 					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {
@@ -15611,9 +15641,12 @@ export class AgentSession {
 					}
 				}
 			}
-			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
-				if (appliedRevision !== undefined) this.#commitExplicitMCPToolSelectionAuthority();
-				else this.#restoreCommittedExplicitMCPToolSelectionAuthority();
+			if (
+				isExplicit &&
+				appliedRevision === undefined &&
+				explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration
+			) {
+				this.#restoreCommittedExplicitMCPToolSelectionAuthority();
 			}
 		} catch (error) {
 			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
@@ -15750,7 +15783,7 @@ export class AgentSession {
 	 * intended instruction change, and name-sorting means touched files do not
 	 * perturb it.
 	 */
-	#computeAppliedToolSignature(toolNames: string[], tools: AgentTool[]): string {
+	#computeAppliedToolSignature(toolNames: string[], tools: AgentTool[], registry = this.#toolRegistry): string {
 		// Order-preserving join: any reorder must produce a different signature so
 		// the rebuild fires and the new tool list reaches the API.
 		const nameSegment = toolNames.join("\u0001");
@@ -15762,7 +15795,7 @@ export class AgentSession {
 			// Registry iteration order is not load-bearing for the prompt content, so we
 			// sort to keep the signature insensitive to incidental insertion order.
 			const entries: string[] = [];
-			for (const tool of this.#toolRegistry.values()) {
+			for (const tool of registry.values()) {
 				entries.push(describeTool(tool));
 			}
 			entries.sort();
@@ -15789,16 +15822,16 @@ export class AgentSession {
 			retiringTools?: ReadonlyMap<string, AgentTool>;
 		} = {},
 	): Promise<void> {
-		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
-		const retiring = options.retiringTools;
-		const existingNames = Array.from(this.#toolRegistry.keys());
-		for (const name of existingNames) {
-			const tool = this.#toolRegistry.get(name);
-			if (this.#discoverableMCPTools.has(name) || (tool && isMCPBridgeTool(tool))) {
-				this.#toolRegistry.delete(name);
-			}
-		}
-
+		const refreshGeneration = ++this.#mcpCatalogRefreshGeneration;
+		const catalogGeneration = this.#mcpCatalogGeneration;
+		const manager = this.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
+		const refreshIsCurrent = () =>
+			!this.#isDisposed &&
+			this.sessionManager === manager &&
+			manager.getSessionIdentityGeneration() === identity &&
+			this.#mcpCatalogRefreshGeneration === refreshGeneration &&
+			this.#mcpCatalogGeneration === catalogGeneration;
 		const getCustomToolContext = (): CustomToolContext => ({
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
@@ -15812,60 +15845,93 @@ export class AgentSession {
 			},
 		});
 
-		for (const customTool of omitPluginMcpNameShadows(mcpTools)) {
-			if (this.#isMcpToolNameHeldByOtherTool(customTool, retiring)) continue;
-			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
-			const finalTool = (
-				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
-			) as AgentTool;
-			this.#toolRegistry.set(finalTool.name, finalTool);
-		}
+		let sawProvisionalCursor = false;
+		while (refreshIsCurrent()) {
+			const previousRegistry = [...this.#toolRegistry];
+			const registry = new Map(previousRegistry);
+			for (const [name, tool] of previousRegistry) {
+				if (this.#discoverableMCPTools.has(name) || isMCPBridgeTool(tool)) registry.delete(name);
+			}
+			for (const customTool of omitPluginMcpNameShadows(mcpTools)) {
+				if (this.#isMcpToolNameHeldByOtherTool(customTool, options.retiringTools, registry)) continue;
+				const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
+				const finalTool = this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped;
+				registry.set(finalTool.name, finalTool);
+			}
 
-		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
-		const requestedMandatory = options.mandatoryMCPToolNames ?? [...this.#mandatoryMCPToolNames];
-		const retainedMandatory = retainPluginMcpMandatoryNames(mcpTools, requestedMandatory).map(name =>
-			name.toLowerCase(),
-		);
-		this.#mandatoryMCPToolNames = new Set(
-			options.mandatoryMCPToolNames !== undefined
-				? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name))
-				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
-		);
-		this.#pruneSelectedMCPToolNames();
-		const staged = this.#stagedTreeViewToolSelection;
-		const provisionalCursor = staged?.isProvisional() === true;
-		const provisionalTools = provisionalCursor && staged?.ownsActiveTools() ? staged : undefined;
-		const persistedMCPToolNames = this.#getPersistedMCPToolSelection();
-		const hasPersistedMCPToolSelection = persistedMCPToolNames !== undefined;
-		const hasLiveMCPToolSelectionAuthority =
-			this.#mcpDiscoveryEnabled &&
-			(this.#constructorMCPToolSelection !== undefined || this.#committedHasExplicitActiveToolSelectionForContext);
-		if (options.selectedMCPToolNames) {
-			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(options.selectedMCPToolNames));
-		} else if (hasPersistedMCPToolSelection || hasLiveMCPToolSelectionAuthority) {
-			const authoritativeMCPToolNames = this.#getMCPToolSelectionAuthorityNames(persistedMCPToolNames);
-			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(authoritativeMCPToolNames ?? []));
-		} else {
-			this.#selectedMCPToolNames = new Set(
-				this.#resolveConstructorMCPToolSelection() ?? this.#getConfiguredDefaultSelectedMCPToolNames(),
+			const discoverable = this.#collectDiscoverableMCPToolsFromRegistry(registry);
+			const requestedMandatory = options.mandatoryMCPToolNames ?? [...this.#mandatoryMCPToolNames];
+			const retainedMandatory = retainPluginMcpMandatoryNames(mcpTools, requestedMandatory).map(name =>
+				name.toLowerCase(),
 			);
+			const mandatory = new Set(
+				options.mandatoryMCPToolNames !== undefined
+					? retainedMandatory.filter(name => this.#isRegisteredMcpTool(name, registry))
+					: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name, registry)),
+			);
+			const staged = this.#stagedTreeViewToolSelection;
+			const provisionalCursor = staged?.isProvisional() === true;
+			sawProvisionalCursor ||= provisionalCursor;
+			const provisionalTools = provisionalCursor && staged?.ownsActiveTools() ? staged : undefined;
+			const toolRevision = this.agent.toolRevision;
+			const leaf = manager.getLeafId();
+			const transitionGeneration = this.#sessionTransitionGeneration;
+			const committedExplicitNames = this.#committedExplicitMCPToolSelectionForContext;
+			const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+			const persistedMCPToolNames = this.#getPersistedMCPToolSelection();
+			const hasLiveMCPToolSelectionAuthority =
+				this.#mcpDiscoveryEnabled &&
+				(this.#constructorMCPToolSelection !== undefined || this.#committedHasExplicitActiveToolSelectionForContext);
+			const authoritativeNames =
+				persistedMCPToolNames !== undefined || hasLiveMCPToolSelectionAuthority
+					? this.#getMCPToolSelectionAuthorityNames(persistedMCPToolNames)
+					: this.#constructorMCPToolSelection;
+			const selected = this.#filterSelectableMCPToolNames(
+				options.selectedMCPToolNames ??
+					authoritativeNames ??
+					this.#getConfiguredDefaultSelectedMCPToolNames(registry, discoverable),
+				registry,
+				discoverable,
+			);
+			const activeMCPToolNames = this.#mcpDiscoveryEnabled
+				? selected.filter(name => !mandatory.has(name))
+				: this.getActiveToolNames().filter(name => isMCPToolName(name) && registry.has(name) && !mandatory.has(name));
+			const applied = await this.#applyActiveToolsByName(
+				[
+					...this.#getActiveNonMCPToolNames(provisionalTools?.activeToolNames, registry, discoverable),
+					...(options.activeMCPToolNames ?? activeMCPToolNames),
+				],
+				{
+					previousSelectedMCPToolNames,
+					nextSelectedDiscoveredBuiltinToolNames: provisionalTools?.selectedDiscoveredBuiltinToolNames,
+					mcpCatalog: {
+						registry,
+						discoverable,
+						mandatory,
+						selected,
+						isCurrent: () =>
+							refreshIsCurrent() &&
+							this.#sessionTransitionGeneration === transitionGeneration &&
+							manager.getLeafId() === leaf &&
+							(this.#stagedTreeViewToolSelection?.isProvisional() === true) === provisionalCursor &&
+							this.agent.toolRevision === toolRevision &&
+							this.#committedExplicitMCPToolSelectionForContext === committedExplicitNames &&
+this.#toolRegistry.size === previousRegistry.length &&
+								previousRegistry.every(([name, tool]) => this.#toolRegistry.get(name) === tool),
+					},
+					// A retry after restore rollback must not persist a selection observed on its staged branch.
+					persistMCPSelection:
+						!sawProvisionalCursor &&
+						(options.persistMCPSelection ??
+							(this.#committedHasExplicitActiveToolSelectionForContext
+								? this.#committedExplicitMCPToolSelectionPersistsForContext
+								: persistedMCPToolNames !== undefined)),
+				},
+			);
+			if (applied !== undefined) return;
+			// A live change (including rollback) can invalidate the selection snapshot
+			// without superseding this catalog. Reconcile against the new live state.
 		}
-		const nextActive = [
-			...this.#getActiveNonMCPToolNames(provisionalTools?.activeToolNames),
-			...(options.activeMCPToolNames ?? this.getSelectedMCPToolNames()),
-		];
-		await this.#applyActiveToolsByName(nextActive, {
-			previousSelectedMCPToolNames,
-			nextSelectedDiscoveredBuiltinToolNames: provisionalTools?.selectedDiscoveredBuiltinToolNames,
-			expectedActiveToolSelectionRevision: provisionalCursor ? this.#activeToolSelectionRevision : undefined,
-			// Reconcile runtime tools immediately, but never append a selection to a staged branch.
-			persistMCPSelection:
-				!provisionalCursor &&
-				(options.persistMCPSelection ??
-					(this.#committedHasExplicitActiveToolSelectionForContext
-						? this.#committedExplicitMCPToolSelectionPersistsForContext
-						: hasPersistedMCPToolSelection)),
-		});
 	}
 
 	async #hasActiveGjcSubskillTools(parent: string, sessionId: string | undefined): Promise<boolean> {
@@ -36058,6 +36124,7 @@ export class AgentSession {
 		const identity = manager.getSessionIdentityGeneration();
 		const generation = this.#sessionTransitionGeneration;
 		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
+		const mcpCatalogRefreshGeneration = this.#mcpCatalogRefreshGeneration;
 		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
 		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
@@ -36110,12 +36177,16 @@ export class AgentSession {
 				!busy()
 			);
 		};
-		const selectionOurs = () =>
+		const toolRequestsAreCurrent = () =>
+			this.#mcpCatalogRefreshGeneration === mcpCatalogRefreshGeneration &&
 			this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
-		const toolAuthorityOurs = () => this.#mcpCatalogGeneration === mcpCatalogGeneration && selectionOurs();
-		const toolsAreOurs = () => toolAuthorityOurs() && agent.toolRevision === ownedToolRevision;
-		const liveContextOurs = () => toolsAreOurs() && agent.contextRevision === ownedContextRevision;
-		const current = () => historyIsOurs() && liveContextOurs();
+		const catalogIsOurs = () => this.#mcpCatalogGeneration === mcpCatalogGeneration;
+		// A newer request supersedes forward progress, but only an actual catalog or
+		// tool publication takes ownership away from rollback.
+		const toolsAreOurs = () => catalogIsOurs() && agent.toolRevision === ownedToolRevision;
+		const rollbackContextOurs = () =>
+			historyIsOurs() && toolsAreOurs() && agent.contextRevision === ownedContextRevision;
+		const current = () => toolRequestsAreCurrent() && rollbackContextOurs();
 		// Only an identified prompt publication relaxes the tool rollback fence.
 		// Model changes and unclassified touchContext() calls still fail closed.
 		const nonPromptContextOurs = () =>
@@ -36185,14 +36256,14 @@ export class AgentSession {
 					}
 					// Prompt before tools: the tool observer may publish prompt state of
 					// its own, and that later publication must win over this revert.
-					if (current()) {
+					if (rollbackContextOurs()) {
 						this.#baseSystemPrompt = previousBaseSystemPrompt;
 						agent.setSystemPrompt(previousSystemPrompt);
 						fence.onPromptApplied();
 						// Invalidate rebuilds authorized for the abandoned target tools.
 						this.#reserveBaseSystemPromptGeneration();
 					}
-					const sourcePromptRestored = current();
+					const sourcePromptRestored = rollbackContextOurs();
 					const canRestoreTools =
 						sourcePromptRestored || (publishedTools && historyIsOurs() && toolsAreOurs() && nonPromptContextOurs());
 					if (canRestoreTools) {
@@ -36226,7 +36297,7 @@ export class AgentSession {
 						rollbackFailed: true,
 					});
 				}
-				if (!historyIsOurs() || !toolAuthorityOurs()) throw gone();
+				if (!historyIsOurs() || !catalogIsOurs() || !toolRequestsAreCurrent()) throw gone();
 			} else if (moved) {
 				throw gone();
 			}

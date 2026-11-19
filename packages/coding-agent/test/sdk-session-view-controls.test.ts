@@ -1213,6 +1213,85 @@ describe("SDK exact session view", () => {
 		});
 	}
 
+	it("rolls back published target tools when a reentrant MCP refresh fails to rebuild", async () => {
+		let observe = false;
+		let refresh: Promise<void> | undefined;
+		const { old, previous } = await seedMcpBranches(names => {
+			if (!observe) return;
+			observe = false;
+			expect(names).toEqual([MCP_TOOL]);
+			expect(session.systemPrompt).toEqual([`tools:${MCP_TOOL}`]);
+			refresh = session.refreshMCPTools([{ ...lookupTool }]);
+			void refresh.catch(() => {});
+		});
+		const manager = session.sessionManager;
+		const entries = manager.getEntries();
+		const messages = session.agent.state.messages.slice();
+		const tools = session.agent.state.tools.slice();
+		const systemPrompt = session.systemPrompt.slice();
+		const originalTool = session.getToolByName(MCP_TOOL);
+		rebuild = async names => {
+			if (names.length === 0) throw new Error("catalog prompt rebuild failed");
+			return { systemPrompt: [`tools:${names.join(",")}`] };
+		};
+		observe = true;
+		await expect(restoreSessionView(session, target(old))).rejects.toMatchObject({
+			code: "resource_gone",
+			rollbackFailed: false,
+		});
+		if (!refresh) throw new Error("Expected the forward observer to start an MCP refresh");
+		await expect(refresh).rejects.toThrow("catalog prompt rebuild failed");
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(manager.getEntries()).toEqual(entries);
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.agent.state.tools).toEqual(tools);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getToolByName(MCP_TOOL)).toBe(originalTool);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+	});
+
+	it("reconciles a reentrant MCP refresh against the just-published explicit selection", async () => {
+		let observe = false;
+		let selection: Promise<void> | undefined;
+		let refresh: Promise<void> | undefined;
+		let targetTool: AgentTool | undefined;
+		const replacement = { ...lookupTool, description: "Replacement lookup" };
+		const { old, previous } = await seedMcpBranches(names => {
+			if (!observe) return;
+			observe = false;
+			expect(names).toEqual([MCP_TOOL]);
+			targetTool = session.agent.state.tools[0];
+			selection = session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+			void selection.catch(() => {});
+			// Do not await the explicit call: its matching signature lets it publish synchronously.
+			refresh = session.refreshMCPTools([replacement]);
+			void refresh.catch(() => {});
+		});
+		const manager = session.sessionManager;
+		const entries = manager.getEntries();
+		const messages = session.agent.state.messages.slice();
+		observe = true;
+		await expect(restoreSessionView(session, target(old))).rejects.toMatchObject({
+			code: "resource_gone",
+			rollbackFailed: false,
+		});
+		if (!selection || !refresh || !targetTool) throw new Error("Expected the forward observer to publish tools");
+		await Promise.all([selection, refresh]);
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(manager.getEntries()).toEqual(entries);
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getToolByName(MCP_TOOL)?.description).toBe(replacement.description);
+		expect(session.agent.state.tools[0]?.description).toBe(replacement.description);
+		expect(session.agent.state.tools[0]).not.toBe(targetTool);
+		expect(session.systemPrompt).toEqual([`tools:${MCP_TOOL}`]);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+	});
+
 	it("restores the cursor without resurrecting removed MCP tools or persisting to a staged branch", async () => {
 		const { old, previous } = await seedMcpBranches();
 		await restoreSessionView(session, target(old));
