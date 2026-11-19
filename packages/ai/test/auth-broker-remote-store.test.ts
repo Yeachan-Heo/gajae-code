@@ -167,6 +167,53 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		for (const row of remote.listCredentialInventory()) expect(row).not.toHaveProperty("credential");
 	});
 
+	test("active inventory rows carry the identity fields a portable preference needs", async () => {
+		for (const organizationId of ["org-kb", "org-personal"]) {
+			storage!.upsertCredential("anthropic", {
+				...mintOAuthCredential("team", Date.now() + 60_000),
+				access: `access-${organizationId}`,
+				refresh: `refresh-${organizationId}`,
+				organizationId,
+				organizationName: `${organizationId} name`,
+				projectId: `project-${organizationId}`,
+			});
+		}
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+
+		const team = remote.listCredentialInventory("anthropic").filter(row => row.email === "team@example.com");
+		expect(
+			team.map(({ accountId, organizationId, organizationName, projectId }) => ({
+				accountId,
+				organizationId,
+				organizationName,
+				projectId,
+			})),
+		).toEqual(
+			expect.arrayContaining([
+				{
+					accountId: "account-team",
+					organizationId: "org-kb",
+					organizationName: "org-kb name",
+					projectId: "project-org-kb",
+				},
+				{
+					accountId: "account-team",
+					organizationId: "org-personal",
+					organizationName: "org-personal name",
+					projectId: "project-org-personal",
+				},
+			]),
+		);
+		expect(team).toHaveLength(2);
+		for (const row of remote.listCredentialInventory()) {
+			expect(row).not.toHaveProperty("credential");
+			expect(row).not.toHaveProperty("access");
+			expect(row).not.toHaveProperty("refresh");
+		}
+	});
+
 	test("404 metadata is cached as unsupported and list is zero-network", async () => {
 		const fetchMock = vi.fn(async (input: string | URL | Request) => {
 			const url = String(input);

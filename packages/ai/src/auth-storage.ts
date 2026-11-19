@@ -3434,12 +3434,31 @@ export class AuthStorage {
 	): number | undefined {
 		const designatedIds = new Set<number>();
 		for (const { selector } of preferences) {
-			const credentialId = this.#findCredentialBySelector(provider, selector)?.id;
+			const credentialId = this.#findPreferredCredential(provider, selector)?.id;
 			if (credentialId === undefined) continue;
 			if (designatedIds.has(credentialId)) return credentialId;
 			designatedIds.add(credentialId);
 		}
 		return undefined;
+	}
+
+	/**
+	 * Row a configured preference designates. An `org:` preference names an organization id only, never a display name,
+	 * so removing one row cannot retarget it to another organization whose name equals that id. It designates the one
+	 * OAuth row of that organization; when a later login adds a second row of the same organization it designates
+	 * nothing, because a soft preference must never fail credential selection.
+	 */
+	#findPreferredCredential(provider: string, selector: AuthCredentialSelector): IndexedStoredCredential | undefined {
+		if (selector.kind !== "org") return this.#findCredentialBySelector(provider, selector);
+		const wanted = selector.value.trim().toLowerCase();
+		if (!wanted) return undefined;
+		const stored = this.#getStoredCredentials(provider);
+		const designated = stored.filter(
+			entry => entry.credential.type === "oauth" && entry.credential.organizationId?.trim().toLowerCase() === wanted,
+		);
+		if (designated.length !== 1) return undefined;
+		const [entry] = designated;
+		return { ...entry!, index: stored.indexOf(entry!) };
 	}
 
 	/**
@@ -3478,11 +3497,13 @@ export class AuthStorage {
 		const matched: Array<{ candidate: Candidate; maxUsedFraction: number | undefined }> = [];
 		const claimed = new Set<Candidate>();
 		for (const preference of preferences) {
+			const designated = this.#findPreferredCredential(provider, preference.selector);
+			if (!designated) continue;
 			const position = this.#findUsableOAuthCandidate(
 				provider,
 				providerKey,
 				candidates,
-				preference.selector,
+				{ kind: "id", value: String(designated.id) },
 				options?.modelId,
 			);
 			if (position < 0) continue;
