@@ -4805,8 +4805,10 @@ describe("SessionSdkSessionRuntime", () => {
 			// The settled startup attempt armed recovery, and its failure holds the next tick.
 			expect(harness.recoveryActive()).toBe(true);
 			harness.recover();
+			await Bun.sleep(0); // Yield to allow async registerBroker to settle attempts
 			await harness.emit("turn_start");
 			harness.recover();
+			await Bun.sleep(0); // Ensure second recover doesn't trigger due to pending promises
 			expect(attempts).toBe(2);
 			expect(harness.turnStarts()).toBe(1);
 			expect(harness.stops()).toBe(0);
