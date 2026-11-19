@@ -784,5 +784,127 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 			});
 		});
+
+		describe("required failing tests for redesign", () => {
+			it("[MUST FAIL] replacement hunk with different multi-line secrets on old and new sides", () => {
+				// A replacement hunk where old side has multi-line credential with different secret than new side
+				// Both should be redacted independently - no cross-side contamination
+				const diff = [
+					...HEADER,
+					"@@ -1,5 +1,5 @@ ",
+					' {"secret": [',
+					'-  "old-side-secret-canary-123"',
+					'+  "new-side-secret-canary-456"',
+					" ]",
+					" }",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Both old and new canaries should be redacted
+				expect(scrubbed).not.toContain("old-side-secret-canary-123");
+				expect(scrubbed).not.toContain("new-side-secret-canary-456");
+
+				// Context lines should be preserved
+				expect(scrubbed).toContain(' {"secret": [');
+				expect(scrubbed).toContain(" ]");
+				expect(scrubbed).toContain(" }");
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[MUST FAIL] folded Authorization header with ordinary space continuation", () => {
+				// Authorization header followed by indented continuation on next line with space-prefix
+				// The continuation should be redacted as part of the header value
+				const diff = [
+					...HEADER,
+					"@@ -0,0 +1,3 @@ ",
+					"+Authorization: Bearer",
+					"+  folded-token-canary-xyz",
+					"+next-line",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// The folded continuation token should be redacted
+				expect(scrubbed).not.toContain("folded-token-canary-xyz");
+
+				// Authorization header structure should be preserved
+				expect(scrubbed).toContain("+Authorization:");
+
+				// Next-line should be preserved (credential state ended)
+				expect(scrubbed).toContain("+next-line");
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[MUST FAIL] asymmetric open container spanning two hunks", () => {
+				// A container opened on old side in hunk 1 with a secret inside
+				// Should persist as "open" state across hunk boundary
+				// Second hunk should maintain credential redaction on that side
+				const diff = [
+					...HEADER,
+					"@@ -1,2 +1,2 @@ ",
+					"-secret_key: [",
+					"+secret_key: simple",
+					" context",
+					"@@ -40,2 +40,2 @@ ",
+					'-  "hunk-two-old-canary"',
+					'+  "hunk-two-new-canary"',
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Both canaries should be redacted
+				expect(scrubbed).not.toContain("hunk-two-old-canary");
+				expect(scrubbed).not.toContain("hunk-two-new-canary");
+
+				// Context line should be preserved
+				expect(scrubbed).toContain(" context");
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[MUST FAIL] deep nesting perf test: 10k-deep structure under 200ms", () => {
+				// Test that bracket tracking is O(n) and not O(n²) with deep nesting
+				// Build a diff with 10k nested brackets
+				const lines = [HEADER[0], ...HEADER.slice(1)];
+				lines.push("@@ -1,10002 +1,10002 @@ ");
+
+				lines.push(' {"secret": {');
+				// Add 5000 nested levels
+				for (let i = 0; i < 5000; i += 1) {
+					lines.push(` "level_${i}": {`);
+				}
+				lines.push(' "deep": "deep-nesting-canary-9999"');
+				// Close all levels
+				for (let i = 0; i < 5000; i += 1) {
+					lines.push(" }");
+				}
+				lines.push(" }");
+				lines.push("");
+
+				const diff = lines.join("\n");
+				const startTime = Date.now();
+				const scrubbed = scrubUnifiedDiff(diff);
+				const elapsed = Date.now() - startTime;
+
+				// Canary should be redacted
+				expect(scrubbed).not.toContain("deep-nesting-canary-9999");
+
+				// Should complete in reasonable time (< 200ms for 10k deep nesting)
+				// This catches quadratic behavior and stack cloning issues
+				expect(elapsed).toBeLessThan(200);
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+		});
 	});
 });
