@@ -30,6 +30,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { OWNER_ENROLL_CUSTOM_TYPE } from "@gajae-code/coding-agent/session/resume-cursor";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
@@ -38,6 +39,7 @@ import {
 	captureExecutionApprovalPresentation,
 	captureExecutionApprovalTranscriptBoundary,
 	deepInterviewExecutionApprovalRecordPath,
+	type ExecutionApprovalTranscriptBoundary,
 	reconcileWorkflowSkillState,
 	recordDeepInterviewExecutionApproval,
 	runNativeStateCommand,
@@ -614,6 +616,105 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("authenticates enrollment bytes without granting enrollment branch or Ask authority", async () => {
+		await withTempCwd(async cwd => {
+			// These boundary-only fixtures never open a SessionManager, so corrupt records cannot affect a live writer.
+			const transcriptPath = path.join(cwd, "approval-boundary.jsonl");
+			const sessionId = TEST_SESSION_ID;
+			const timestamp = "2026-01-01T00:00:00.000Z";
+			const toolCallId = "approval-call";
+			const header = { type: "session", version: CURRENT_SESSION_VERSION, id: sessionId, timestamp, cwd };
+			const ask = {
+				type: "message",
+				id: "ask-entry",
+				parentId: null,
+				timestamp,
+				message: persistedApprovalAssistant([{ type: "toolCall", id: toolCallId, name: "ask", arguments: {} }]),
+			};
+			const enrollment = {
+				type: "custom",
+				customType: OWNER_ENROLL_CUSTOM_TYPE,
+				id: "prefix-enrollment",
+				parentId: ask.id,
+				timestamp,
+				data: {
+					v: 1,
+					bind: sessionId,
+					member: "member",
+					runtime: "cooperative_tui",
+					pid: 1,
+					processIncarnation: "incarnation",
+					hostId: "host",
+					epoch: "epoch",
+				},
+			};
+			const continuationEnrollment = { ...enrollment, id: "continuation-enrollment" };
+			const askResult = {
+				type: "message",
+				id: "result-entry",
+				parentId: ask.id,
+				timestamp,
+				message: {
+					role: "toolResult",
+					toolName: "ask",
+					toolCallId,
+					content: [{ type: "text", text: "Approve execution via ultragoal" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			};
+			const jsonl = (...records: Record<string, unknown>[]) =>
+				records.map(record => `${JSON.stringify(record)}\n`).join("");
+			const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+			const prefix = jsonl(header, ask, enrollment);
+			const capture = (text: string) =>
+				captureExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, sha256(text), toolCallId);
+			await Bun.write(transcriptPath, prefix);
+			const boundary = await capture(prefix);
+			expect(boundary.leaf_id).toBe(ask.id);
+			expect(boundary.byte_length).toBe(Buffer.byteLength(prefix));
+			const prefixSha256 = sha256(prefix);
+			const validate = () =>
+				assertExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, prefixSha256, boundary);
+
+			await Bun.write(transcriptPath, prefix + jsonl(continuationEnrollment, askResult));
+			await validate();
+			await Bun.write(transcriptPath, prefix + jsonl(continuationEnrollment));
+			await expect(validate()).rejects.toThrow("lacks the recorded Ask result");
+			for (const invalidResult of [
+				{ ...askResult, parentId: continuationEnrollment.id },
+				{ ...askResult, id: continuationEnrollment.id },
+			]) {
+				await Bun.write(transcriptPath, prefix + jsonl(continuationEnrollment, invalidResult));
+				await expect(validate()).rejects.toThrow("user-bearing Ask result");
+			}
+
+			const foreign = { ...continuationEnrollment, data: { ...enrollment.data, bind: "other-session" } };
+			for (const [extra, reason] of [
+				[foreign, "owner enrollment is invalid"],
+				[{ ...continuationEnrollment, timestamp: undefined }, "owner enrollment is invalid"],
+				[{ ...continuationEnrollment, data: { ...enrollment.data, pid: "1" } }, "owner enrollment is invalid"],
+				[{ ...continuationEnrollment, parentId: null }, "changed user evidence or branch"],
+				[{ ...continuationEnrollment, id: enrollment.id }, "changed user evidence or branch"],
+				[{ ...continuationEnrollment, id: sessionId }, "changed user evidence or branch"],
+				[{ ...continuationEnrollment, customType: "other.custom" }, "changed user evidence or branch"],
+			] as const) {
+				await Bun.write(transcriptPath, prefix + jsonl(extra, askResult));
+				await expect(validate()).rejects.toThrow(reason);
+			}
+			const foreignPrefix = jsonl(header, ask, foreign);
+			await Bun.write(transcriptPath, foreignPrefix);
+			await expect(capture(foreignPrefix)).rejects.toThrow("owner enrollment is invalid");
+			const invalidParent = jsonl(header, { ...enrollment, parentId: null }, { ...ask, parentId: enrollment.id });
+			await Bun.write(transcriptPath, invalidParent);
+			await expect(capture(invalidParent)).rejects.toThrow("transcript branch is invalid");
+
+			const editedEnrollment = { ...enrollment, data: { ...enrollment.data, epoch: "edited" } };
+			await Bun.write(transcriptPath, jsonl(header, ask, editedEnrollment, continuationEnrollment, askResult));
+			await expect(validate()).rejects.toThrow("transcript prefix changed after user approval");
+		});
+	});
+
 	it("rejects legacy pending approval records without a tool-call identity", async () => {
 		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
 			await askAndPersistExecutionApproval(cwd, manager, "legacy-boundary");
@@ -814,6 +915,7 @@ describe("gjc state handoff", () => {
 		for (const afterApproval of [false, true]) {
 			it(`rejects persisted Ask consent after ${mutation} ${afterApproval ? "at handoff" : "before approval"}`, async () => {
 				await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+					const rewindTarget = manager.getLeafId()!;
 					await askAndPersistExecutionApproval(cwd, manager, "negative-approval");
 					const pending = (await readJson(deepInterviewExecutionApprovalRecordPath(cwd, sessionId)))!;
 					if (afterApproval) {
@@ -835,21 +937,25 @@ describe("gjc state handoff", () => {
 						manager.appendMessage({ role: "user", content: "Also delete backups.", timestamp: Date.now() });
 						await manager.flush();
 					} else if (mutation === "branch-rewind") {
-						await fs.appendFile(
-							transcriptPath,
-							`${JSON.stringify({
-								type: "message",
-								id: "rewound-assistant",
-								parentId: null,
-								message: persistedApprovalAssistant([{ type: "text", text: "Continue on an earlier branch." }]),
-							})}\n`,
+						manager.branch(rewindTarget);
+						manager.appendMessage(
+							persistedApprovalAssistant([{ type: "text", text: "Continue on an earlier branch." }]),
 						);
+						await manager.flush();
 					} else {
 						await fs.appendFile(pending.spec_path as string, "\nChanged requirement.\n");
 					}
 					const approved = await approvePersistedCrystal(cwd, sessionId);
 					expect(approved.status, approved.stderr).toBe(2);
-					expect((await handoffPersistedCrystal(cwd, sessionId)).status).toBe(2);
+					const handoff = await handoffPersistedCrystal(cwd, sessionId);
+					expect(handoff.status, handoff.stderr).toBe(2);
+					if (mutation === "branch-rewind") {
+						const refusedBranch = "execution approval transcript continuation changed user evidence or branch";
+						expect(approved.stderr).toContain(refusedBranch);
+						expect(handoff.stderr).toContain(
+							afterApproval ? refusedBranch : "crystallization never grants execution approval",
+						);
+					}
 					expect((await readJson(deepInterviewExecutionApprovalRecordPath(cwd, sessionId)))?.status).toBe(
 						afterApproval ? "consumed" : "pending",
 					);
@@ -919,7 +1025,28 @@ describe("gjc state handoff", () => {
 				"utf8",
 			);
 			expect(approvalRecord).not.toContain("Approve execution via ultragoal");
-			expect(JSON.parse(approvalRecord).answer_hash).toMatch(/^[a-f0-9]{64}$/);
+			const { answer_hash, transcript_path, transcript_boundary } = JSON.parse(approvalRecord) as {
+				answer_hash: string;
+				transcript_path: string;
+				transcript_boundary: ExecutionApprovalTranscriptBoundary;
+			};
+			expect(answer_hash).toMatch(/^[a-f0-9]{64}$/);
+			// The manager reopened by recordExecutionApproval writes an enrollment before its Ask result.
+			const transcript = await fs.readFile(transcript_path);
+			const [enrollment, result] = Bun.JSONL.parse(
+				transcript.subarray(transcript_boundary.byte_length).toString("utf8"),
+			);
+			expect(enrollment).toMatchObject({
+				type: "custom",
+				customType: OWNER_ENROLL_CUSTOM_TYPE,
+				parentId: transcript_boundary.leaf_id,
+				data: { bind: TEST_SESSION_ID },
+			});
+			expect(result).toMatchObject({
+				type: "message",
+				parentId: transcript_boundary.leaf_id,
+				message: { role: "toolResult", toolName: "ask", toolCallId: transcript_boundary.approval_tool_call_id },
+			});
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status, approval.stderr).toBe(0);
 			const after = (await readJson(callerPath)) as Record<string, unknown>;

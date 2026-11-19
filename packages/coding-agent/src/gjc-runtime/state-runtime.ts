@@ -5,6 +5,7 @@ import * as path from "node:path";
 // Subpath import keeps this module native-free for the gjc-state-gates shards:
 // the package barrel pulls procmgr/ptree → @gajae-code/natives.
 import * as logger from "@gajae-code/utils/logger";
+import { isOwnerEnrollData, OWNER_ENROLL_CUSTOM_TYPE } from "../session/resume-cursor";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import {
 	applyHandoffToActiveState,
@@ -1939,6 +1940,13 @@ function approvalTranscriptRecords(text: string): Record<string, unknown>[] {
 	}
 }
 
+function isApprovalTranscriptOwnerEnrollment(record: Record<string, unknown>, sessionId: string): boolean {
+	if (record.type !== "custom" || record.customType !== OWNER_ENROLL_CUSTOM_TYPE) return false;
+	if (typeof record.timestamp !== "string" || !isOwnerEnrollData(record.data, sessionId))
+		throw new StateCommandError(2, "execution approval transcript owner enrollment is invalid");
+	return true;
+}
+
 /** `cwd` must already be canonical; the recorded session cwd may spell an alias of it (#7562). */
 async function approvalTranscriptPrefix(
 	cwd: string,
@@ -1946,7 +1954,7 @@ async function approvalTranscriptPrefix(
 	text: string,
 ): Promise<{
 	leaf: string | null;
-	ids: Set<string>;
+	physicalIds: Set<string>;
 	askToolCallCounts: Map<string, number>;
 	leafAskToolCallIds: Set<string>;
 }> {
@@ -1958,7 +1966,8 @@ async function approvalTranscriptPrefix(
 		(await physicalPathIdentity(header.cwd)) !== cwd
 	)
 		throw new StateCommandError(2, "execution approval transcript identity mismatch");
-	const ids = new Set<string>();
+	const physicalIds = new Set<string>([sessionId]);
+	const nonBranchIds = new Set<string>([sessionId]);
 	const askToolCallCounts = new Map<string, number>();
 	let leafAskToolCallIds = new Set<string>();
 	let leaf: string | null = null;
@@ -1974,7 +1983,8 @@ async function approvalTranscriptPrefix(
 			if (
 				!isPlainObject(patch) ||
 				typeof record.entryId !== "string" ||
-				!ids.has(record.entryId) ||
+				!physicalIds.has(record.entryId) ||
+				nonBranchIds.has(record.entryId) ||
 				["id", "parentId", "type"].some(key => key in patch)
 			)
 				throw new StateCommandError(2, "execution approval transcript branch patch is invalid");
@@ -1982,10 +1992,19 @@ async function approvalTranscriptPrefix(
 		}
 		if (
 			!isExecutionApprovalId(record.id) ||
-			ids.has(record.id) ||
-			(record.parentId !== null && (typeof record.parentId !== "string" || !ids.has(record.parentId)))
+			physicalIds.has(record.id) ||
+			(record.parentId !== null &&
+				(typeof record.parentId !== "string" ||
+					!physicalIds.has(record.parentId) ||
+					nonBranchIds.has(record.parentId)))
 		)
 			throw new StateCommandError(2, "execution approval transcript branch is invalid");
+		physicalIds.add(record.id);
+		// Enrollment is authenticated as part of the physical prefix, but is not a branch vertex.
+		if (isApprovalTranscriptOwnerEnrollment(record, sessionId)) {
+			nonBranchIds.add(record.id);
+			continue;
+		}
 		const recordAskToolCallIds = new Set<string>();
 		if (
 			record.type === "message" &&
@@ -2013,10 +2032,9 @@ async function approvalTranscriptPrefix(
 			}
 		}
 		leafAskToolCallIds = recordAskToolCallIds;
-		ids.add(record.id);
 		leaf = record.id;
 	}
-	return { leaf, ids, askToolCallCounts, leafAskToolCallIds };
+	return { leaf, physicalIds, askToolCallCounts, leafAskToolCallIds };
 }
 
 export async function captureExecutionApprovalTranscriptBoundary(
@@ -2093,6 +2111,15 @@ export async function assertExecutionApprovalTranscriptBoundary(
 		throw new StateCommandError(2, "execution approval transcript continuation is incomplete");
 	let approvalAskResultSeen = false;
 	for (const record of approvalTranscriptRecords(suffix)) {
+		if (isApprovalTranscriptOwnerEnrollment(record, sessionId)) {
+			if (!isExecutionApprovalId(record.id) || branch.physicalIds.has(record.id) || record.parentId !== branch.leaf)
+				throw new StateCommandError(
+					2,
+					"execution approval transcript continuation changed user evidence or branch",
+				);
+			branch.physicalIds.add(record.id);
+			continue;
+		}
 		const message = record.message;
 		const isUserBearingAskCall =
 			record.type === "message" &&
@@ -2124,7 +2151,7 @@ export async function assertExecutionApprovalTranscriptBoundary(
 		if (
 			record.type !== "message" ||
 			!isExecutionApprovalId(record.id) ||
-			branch.ids.has(record.id) ||
+			branch.physicalIds.has(record.id) ||
 			record.parentId !== branch.leaf ||
 			!isPlainObject(record.message) ||
 			!["assistant", "toolResult"].includes(String(record.message.role)) ||
@@ -2137,7 +2164,7 @@ export async function assertExecutionApprovalTranscriptBoundary(
 					: "execution approval transcript continuation changed user evidence or branch",
 			);
 		if (isRecordedApprovalAskResult) approvalAskResultSeen = true;
-		branch.ids.add(record.id);
+		branch.physicalIds.add(record.id);
 		branch.leaf = record.id;
 	}
 	if (!approvalAskResultSeen)
