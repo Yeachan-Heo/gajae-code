@@ -304,9 +304,73 @@ function Resolve-ReleaseTag {
 function Get-WebExceptionStatus {
     param($ErrorRecord)
     try {
+        if ($ErrorRecord.Exception.Data.Contains("HttpStatus")) { return [int]$ErrorRecord.Exception.Data["HttpStatus"] }
         return [int]$ErrorRecord.Exception.Response.StatusCode
     } catch {
         return 0
+    }
+}
+
+function Get-DefaultProxyUri {
+    param([string]$Uri)
+    # The proxy Invoke-WebRequest would use for $Uri ([WebRequest]::DefaultWebProxy: the system setting
+    # plus any session override), or $null for a direct connection. It is resolved once for the first
+    # URL, so a PAC with different rules for the redirect host is not honoured by curl.exe.
+    $target = [System.Uri]$Uri
+    $proxy = [System.Net.WebRequest]::DefaultWebProxy
+    if (-not $proxy -or $proxy.IsBypassed($target)) { return $null }
+    $proxyUri = $proxy.GetProxy($target)
+    if ($proxyUri -and $proxyUri.AbsoluteUri -ne $target.AbsoluteUri) { return $proxyUri.AbsoluteUri }
+    return $null
+}
+
+function Save-ReleaseAsset {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [switch]$ShowProgress
+    )
+    # curl.exe, not powershell.exe, downloads: on one machine (AhnLab V3 installed; link unproven) every
+    # download from the powershell.exe process was 0.3-0.55 MB/s while curl.exe ran at 46-84 MB/s.
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if (Test-Path -LiteralPath $curl) {
+        $arguments = @("--location", "--show-error", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "120", "--user-agent", $UserAgent, "--output", $OutFile, "--write-out", "%{http_code}")
+        $arguments += if ($ShowProgress) { "--progress-bar" } else { "--silent" }
+        $proxyUri = Get-DefaultProxyUri -Uri $Uri
+        $arguments += if ($proxyUri) { @("--proxy", $proxyUri, "--proxy-anyauth", "--proxy-user", ":") } else { @("--noproxy", "*") }
+        # curl writes progress and errors to stderr. Hosts that turn native stderr into error records
+        # (ISE, remoting, PSNativeCommandUseErrorActionPreference) would throw under the script's Stop
+        # preference before the exit code is read, so both preferences are relaxed around the call only.
+        $previousErrorAction = $ErrorActionPreference
+        $previousNativeErrorAction = $PSNativeCommandUseErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandUseErrorActionPreference = $false
+        try {
+            $statusText = & $curl @arguments $Uri
+            $curlExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorAction
+            $PSNativeCommandUseErrorActionPreference = $previousNativeErrorAction
+        }
+        $status = 0
+        [void][int]::TryParse([string]($statusText | Where-Object { $_ -is [string] } | Select-Object -Last 1), [ref]$status)
+        if ($curlExit -eq 0 -and $status -ge 200 -and $status -lt 300) { return }
+        Remove-Item -Force -LiteralPath $OutFile -ErrorAction SilentlyContinue
+        $reason = "HTTP $status, curl exit $curlExit"
+        if ($status -ge 400) {
+            $failure = New-Object System.Exception "Download failed ($reason): $Uri"
+            $failure.Data["HttpStatus"] = $status
+            throw $failure
+        }
+        Write-Warning "curl.exe could not download $Uri ($reason); retrying with Invoke-WebRequest."
+    }
+    if ($ShowProgress) { Write-Host "Downloading with Invoke-WebRequest, which shows no progress; this can take several minutes." }
+    $previousProgress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -Headers @{ "User-Agent" = $UserAgent }
+    } finally {
+        $ProgressPreference = $previousProgress
     }
 }
 
@@ -428,7 +492,7 @@ function Assert-Checksum {
     try {
         $sumsMissing = $false
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $sumsUrl -OutFile $sumsTmp -Headers @{ "User-Agent" = $UserAgent }
+            Save-ReleaseAsset -Uri $sumsUrl -OutFile $sumsTmp
             $expected = Get-ChecksumForAsset -SumsPath $sumsTmp -AssetName $AssetName
             if (-not $expected -or $expected -notmatch '^[0-9a-f]{64}$') {
                 throw "Release checksum file $BinarySha256Asset did not list $AssetName"
@@ -447,7 +511,7 @@ function Assert-Checksum {
         }
 
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $manifestUrl -OutFile $manifestTmp -Headers @{ "User-Agent" = $UserAgent }
+            Save-ReleaseAsset -Uri $manifestUrl -OutFile $manifestTmp
             $manifest = Get-Content $manifestTmp -Raw | ConvertFrom-Json
             foreach ($entry in $manifest.binaries) {
                 if ($entry.name -eq $AssetName) {
@@ -684,10 +748,10 @@ function Install-Binary {
         $BinaryUrl = "$GithubReleases/$Latest/$BinaryName"
         Write-Host "Downloading $BinaryName..."
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $BinaryUrl -OutFile $DownloadTmp -Headers @{ "User-Agent" = $UserAgent }
+            Save-ReleaseAsset -Uri $BinaryUrl -OutFile $DownloadTmp -ShowProgress
         } catch {
             Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
-            throw "No prebuilt GJC binary was found for windows-x64 in $Latest.`nExpected asset URL: $BinaryUrl`nRe-run with -Source only if you are developing GJC and already have Bun."
+            throw "Could not download the prebuilt GJC binary for windows-x64 in $Latest.`nExpected asset URL: $BinaryUrl`nCause: $($_.Exception.Message)`nRe-run with -Source only if you are developing GJC and already have Bun."
         }
 
         if (-not (Test-Path $DownloadTmp) -or ((Get-Item $DownloadTmp).Length -le 0)) {
