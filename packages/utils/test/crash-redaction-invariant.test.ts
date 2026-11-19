@@ -89,6 +89,25 @@ export const REDACTION_CORPUS: readonly CorpusEntry[] = [
 		survives: ["Token", "_https://", "db.example.com/db_"],
 	},
 	{
+		name: "auth continuation after assignment without space",
+		text: "Authorization=Bearer\nopaquecredential123",
+		secrets: ["opaquecredential123", "Bearer"],
+		survives: ["Authorization="],
+	},
+	{
+		name: "auth continuation after assignment with spaces",
+		text: "authorization = Bearer\nopaquecredential123",
+		secrets: ["opaquecredential123", "Bearer"],
+		survives: ["authorization ="],
+	},
+	{
+		name: "auth continuation after JSON field with quoted value",
+		text: `"Authorization": "Bearer
+opaquecredential123"`,
+		secrets: ["opaquecredential123", "Bearer"],
+		survives: ["Authorization"],
+	},
+	{
 		name: "plain-scalar apostrophe inside a container",
 		text: `wrapper: [don't, "ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible`,
 		secrets: [],
