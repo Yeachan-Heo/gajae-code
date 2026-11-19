@@ -26,7 +26,13 @@ import {
 	invalidateFsScanAfterWrite,
 } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
-import { assertRealpathInsideActiveWorkspace, resolveToCwd } from "../../tools/path-utils";
+import {
+	assertRealpathInsideActiveWorkspace,
+	mkdirInsideActiveWorkspace,
+	readFileBytesInsideActiveWorkspace,
+	resolveToCwd,
+	unlinkInsideActiveWorkspace,
+} from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { ToolError } from "../../tools/tool-errors";
 import { ApplyPatchError, generateUnifiedDiffString, normalizeCreateContent } from "../diff";
@@ -582,8 +588,7 @@ class LspFileSystem implements FileSystem {
 	}
 
 	async readBinary(path: string): Promise<Uint8Array> {
-		const bytes = await fs.promises.readFile(path);
-		return bytes;
+		return readFileBytesInsideActiveWorkspace(path);
 	}
 
 	async write(path: string, content: string): Promise<void> {
@@ -604,11 +609,11 @@ class LspFileSystem implements FileSystem {
 	}
 
 	async delete(path: string): Promise<void> {
-		await this.#getFile(path).unlink();
+		await unlinkInsideActiveWorkspace(path);
 	}
 
 	async mkdir(path: string): Promise<void> {
-		await fs.promises.mkdir(path, { recursive: true });
+		await mkdirInsideActiveWorkspace(path);
 	}
 
 	getDiagnostics(): FileDiagnosticsResult | undefined {

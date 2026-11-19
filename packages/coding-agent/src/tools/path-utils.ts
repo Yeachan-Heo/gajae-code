@@ -8,10 +8,12 @@ import { InternalUrlRouter } from "../internal-urls";
 import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
 import {
-	openFileInsideWorkspace,
+	mkdirInsideWorkspace,
 	pathEscapesWorkspace,
 	readFileInsideWorkspace,
 	realpathEscapesWorkspace,
+	unlinkInsideWorkspace,
+	writeFileInsideWorkspace,
 } from "./workspace-confine";
 
 const workspaceConfineRoot = new AsyncLocalStorage<string>();
@@ -43,45 +45,48 @@ export async function assertRealpathInsideActiveWorkspace(resolved: string): Pro
 		);
 	}
 }
-/** Read a confined file without following a final symlink. Ordinary sessions use Bun.file. */
+/** Read a confined file through a descriptor-pinned walk. Ordinary sessions use Bun.file. */
 export async function readFileTextInsideActiveWorkspace(absolutePath: string): Promise<string> {
 	const root = workspaceConfineRoot.getStore();
 	if (!root) return Bun.file(absolutePath).text();
 	return (await readFileInsideWorkspace(root, absolutePath)).toString("utf8");
 }
 
-/** Replace a confined file without following a final symlink. */
+/** Read confined bytes through a descriptor-pinned walk. Ordinary sessions use fs.readFile. */
+export async function readFileBytesInsideActiveWorkspace(absolutePath: string): Promise<Uint8Array> {
+	const root = workspaceConfineRoot.getStore();
+	if (!root) return fs.promises.readFile(absolutePath);
+	return readFileInsideWorkspace(root, absolutePath);
+}
+
+/** Atomically replace a confined file through a descriptor-pinned walk. Ordinary sessions use Bun.write. */
 export async function writeFileTextInsideActiveWorkspace(absolutePath: string, content: string): Promise<void> {
 	const root = workspaceConfineRoot.getStore();
 	if (!root) {
 		await Bun.write(absolutePath, content);
 		return;
 	}
-	if (await realpathEscapesWorkspace(root, absolutePath)) {
-		throw new ToolError(
-			`Path resolves outside the confined session root (${root}): ${absolutePath}. This session can only use its cwd and descendants.`,
-		);
-	}
-	let opened: fs.Stats;
-	try {
-		opened = fs.lstatSync(absolutePath);
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-		await Bun.write(absolutePath, content);
+	await writeFileInsideWorkspace(root, absolutePath, content);
+}
+
+/** Remove a confined file through a descriptor-pinned walk. Ordinary sessions use fs.unlink. */
+export async function unlinkInsideActiveWorkspace(absolutePath: string): Promise<void> {
+	const root = workspaceConfineRoot.getStore();
+	if (!root) {
+		await fs.promises.unlink(absolutePath);
 		return;
 	}
-	if (opened.isSymbolicLink()) {
-		throw new ToolError(
-			`Path resolves outside the confined session root (${root}): ${absolutePath}. This session can only use its cwd and descendants.`,
-		);
+	await unlinkInsideWorkspace(root, absolutePath);
+}
+
+/** Create a confined directory tree through a descriptor-pinned walk. Ordinary sessions use fs.mkdir. */
+export async function mkdirInsideActiveWorkspace(absolutePath: string): Promise<void> {
+	const root = workspaceConfineRoot.getStore();
+	if (!root) {
+		await fs.promises.mkdir(absolutePath, { recursive: true });
+		return;
 	}
-	const handle = await openFileInsideWorkspace(root, absolutePath);
-	try {
-		await handle.truncate(0);
-		await handle.writeFile(content);
-	} finally {
-		await handle.close();
-	}
+	await mkdirInsideWorkspace(root, absolutePath);
 }
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;

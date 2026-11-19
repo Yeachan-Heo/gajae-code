@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { confinedMkdirAll, confinedOpenRead, confinedUnlink, confinedWriteFileAtomic } from "@gajae-code/natives";
 import fc from "fast-check";
 import { confineSandboxProfile, sandboxedShellCommand } from "../src/tools/confine-sandbox";
 import {
@@ -10,6 +11,7 @@ import {
 	pathEscapesWorkspace,
 	readFileInsideWorkspace,
 	realpathEscapesWorkspace,
+	writeFileInsideWorkspace,
 } from "../src/tools/workspace-confine";
 
 describe("--confine path boundary", () => {
@@ -197,5 +199,88 @@ describe("--confine path boundary", () => {
 		await expect(readFileInsideWorkspace(root, linked)).rejects.toThrow(/outside/);
 		expect(await readFileInsideWorkspace(root, path.join(root, "visible.txt"))).toEqual(Buffer.from("visible"));
 		await fs.rm(parent, { recursive: true, force: true });
+	});
+	it("replaces an existing in-root file, keeps its mode, and creates a nested new file", async () => {
+		if (process.platform === "win32") return;
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-write-"));
+		const root = path.join(parent, "repo");
+		const existing = path.join(root, "existing.txt");
+		await fs.mkdir(root);
+		await fs.writeFile(existing, "before\n");
+		await fs.chmod(existing, 0o640);
+		try {
+			await writeFileInsideWorkspace(root, existing, "after\n");
+			expect(await fs.readFile(existing, "utf8")).toBe("after\n");
+			expect((await fs.stat(existing)).mode & 0o777).toBe(0o640);
+			const nested = path.join(root, "a", "b", "new.txt");
+			await writeFileInsideWorkspace(root, nested, "new\n");
+			expect(await fs.readFile(nested, "utf8")).toBe("new\n");
+			expect((await fs.readdir(root)).sort()).toEqual(["a", "existing.txt"]);
+		} finally {
+			await fs.rm(parent, { recursive: true, force: true });
+		}
+	});
+	it("follows an in-root symlink whose target stays inside the root", async () => {
+		if (process.platform === "win32") return;
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-inroot-link-"));
+		const root = path.join(parent, "repo");
+		await fs.mkdir(path.join(root, "real"), { recursive: true });
+		await fs.writeFile(path.join(root, "real", "file.txt"), "inside\n");
+		await fs.symlink(path.join(root, "real"), path.join(root, "alias"));
+		try {
+			const read = await readFileInsideWorkspace(root, path.join(root, "alias", "file.txt"));
+			expect(read.toString()).toBe("inside\n");
+			await writeFileInsideWorkspace(root, path.join(root, "alias", "file.txt"), "changed\n");
+			expect(await fs.readFile(path.join(root, "real", "file.txt"), "utf8")).toBe("changed\n");
+			expect((await fs.lstat(path.join(root, "alias"))).isSymbolicLink()).toBe(true);
+		} finally {
+			await fs.rm(parent, { recursive: true, force: true });
+		}
+	});
+	it("refuses a parent that became an outside symlink after the path check", async () => {
+		if (process.platform === "win32") return;
+		// The JS realpath check ran against a real directory; the native walk then
+		// meets the swapped symlink. Calling the native helper with the
+		// already-checked relative path reproduces that window deterministically.
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-race-"));
+		const root = path.join(parent, "repo");
+		const outside = path.join(parent, "outside");
+		await fs.mkdir(root);
+		await fs.mkdir(outside);
+		await fs.writeFile(path.join(outside, "secret.txt"), "hidden\n");
+		await fs.symlink(outside, path.join(root, "sub"));
+		const realRoot = await fs.realpath(root);
+		try {
+			expect(() => confinedOpenRead(realRoot, "sub/secret.txt")).toThrow(/confine:escape/);
+			expect(() => confinedWriteFileAtomic(realRoot, "sub/secret.txt", Buffer.from("overwritten\n"), true)).toThrow(
+				/confine:escape/,
+			);
+			expect(() => confinedWriteFileAtomic(realRoot, "sub/new.txt", Buffer.from("new\n"), true)).toThrow(
+				/confine:escape/,
+			);
+			expect(() => confinedUnlink(realRoot, "sub/secret.txt")).toThrow(/confine:escape/);
+			expect(() => confinedMkdirAll(realRoot, "sub/created")).toThrow(/confine:escape/);
+			expect(() => confinedOpenRead(realRoot, "../outside/secret.txt")).toThrow(/confine:escape/);
+			expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("hidden\n");
+			expect((await fs.readdir(outside)).sort()).toEqual(["secret.txt"]);
+		} finally {
+			await fs.rm(parent, { recursive: true, force: true });
+		}
+	});
+	it("refuses a final symlink even when it points inside the root", async () => {
+		if (process.platform === "win32") return;
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-final-link-"));
+		const root = path.join(parent, "repo");
+		await fs.mkdir(root);
+		const realRoot = await fs.realpath(root);
+		await fs.writeFile(path.join(root, "target.txt"), "inside\n");
+		await fs.symlink(path.join(root, "target.txt"), path.join(root, "link.txt"));
+		try {
+			expect(() => confinedOpenRead(realRoot, "link.txt")).toThrow(/confine:escape/);
+			expect(() => confinedWriteFileAtomic(realRoot, "link.txt", Buffer.from("x"), false)).toThrow(/confine:escape/);
+			expect(await fs.readFile(path.join(root, "target.txt"), "utf8")).toBe("inside\n");
+		} finally {
+			await fs.rm(parent, { recursive: true, force: true });
+		}
 	});
 });
