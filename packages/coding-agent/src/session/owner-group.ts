@@ -1600,6 +1600,47 @@ export function withOwnerPublicationSync<T>(token: OwnerMembership, body: () => 
 export async function withOwnerPublication<T>(token: OwnerMembership, body: () => Promise<T>): Promise<T> {
 	return withOwnerPublicationMode(token, body, false);
 }
+/** Hold both exact native authorities before B's managed transaction; only B can publish. @internal */
+export async function withNativeForkSuccessorPublication<T>(
+	sourceToken: OwnerMembership,
+	destinationToken: OwnerMembership,
+	body: (assertOwners: () => void) => Promise<T>,
+): Promise<T> {
+	const source = membership(sourceToken);
+	const destination = membership(destinationToken);
+	const sourceTarget = source.target;
+	const destinationTarget = destination.target;
+	const sourceRev = source.rev;
+	const destinationRev = destination.rev;
+	if (source.policy.kind !== "exclusive_native" || destination.policy.kind !== "exclusive_native")
+		refuse("policy_mismatch");
+	if (sourceTarget.authorityKey === destinationTarget.authorityKey || source.publishing || destination.publishing)
+		refuse("participation_lost");
+	return withLocksAsync([sourceTarget, destinationTarget], async () => {
+		let active = true;
+		const assertOwners = (): void => {
+			if (
+				!active ||
+				source.target !== sourceTarget ||
+				source.rev !== sourceRev ||
+				source.pendingTransfer ||
+				destination.target !== destinationTarget ||
+				destination.rev !== destinationRev ||
+				destination.pendingTransfer
+			)
+				refuse("participation_lost");
+			// The manager separately verifies the captured transcript name, identity and bytes.
+			currentMember(source, true, "unchecked");
+			currentMember(destination, true, "unchecked");
+		};
+		try {
+			assertOwners();
+			return await publishUnderOwnerLock(destination, destinationTarget, () => body(assertOwners), "unchecked");
+		} finally {
+			active = false;
+		}
+	});
+}
 /** Cooperative refresh and publication are one authority transaction, never an unlocked revision refresh. */
 export async function withCooperativeOwnerPublication<T>(token: OwnerMembership, body: () => Promise<T>): Promise<T> {
 	if (membership(token).policy.kind !== "cooperative") refuse("policy_mismatch");
@@ -1629,27 +1670,35 @@ async function withOwnerPublicationMode<T>(
 			observe(currentTarget, data.inspectors, false);
 			data.rev = currentMember(data, false).record!.rev;
 		} else currentMember(data, true, "unchecked");
-		data.publishing = true;
-		const failures: unknown[] = [];
-		let result!: T;
-		try {
-			try {
-				result = await body();
-			} catch (error) {
-				failures.push(error);
-			}
-			try {
-				if (data.target !== target) refuse("participation_lost");
-				currentMember(data, true, cooperativeRefresh ? "required" : "unchecked");
-			} catch (error) {
-				failures.push(error);
-			}
-			throwFailures(failures);
-			return result;
-		} finally {
-			data.publishing = false;
-		}
+		return publishUnderOwnerLock(data, target, body, cooperativeRefresh ? "required" : "unchecked");
 	});
+}
+async function publishUnderOwnerLock<T>(
+	data: MembershipData,
+	target: OwnerTarget,
+	body: () => Promise<T>,
+	transcript: "required" | "unchecked",
+): Promise<T> {
+	data.publishing = true;
+	const failures: unknown[] = [];
+	let result!: T;
+	try {
+		try {
+			result = await body();
+		} catch (error) {
+			failures.push(error);
+		}
+		try {
+			if (data.target !== target) refuse("participation_lost");
+			currentMember(data, true, transcript);
+		} catch (error) {
+			failures.push(error);
+		}
+		throwFailures(failures);
+		return result;
+	} finally {
+		data.publishing = false;
+	}
 }
 /**
  * Publish one freshly admitted private fork directory, not an arbitrary owner-root move.

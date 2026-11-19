@@ -166,6 +166,7 @@ import {
 	settleOwnerTransfer,
 	validateCooperativeOwnerRecordSync,
 	withCooperativeOwnerPublication,
+	withNativeForkSuccessorPublication,
 	withOwnerPublication,
 	withOwnerPublicationSync,
 	withOwnerTransferPublication,
@@ -673,6 +674,7 @@ type SelectedForkSuccessorReservation = (identity: {
 
 type NativeSelectedBranchSource = {
 	readonly selectedEntryId: string;
+	readonly membership: OwnerMembership;
 	assertCurrent(): void;
 	assertOwner(): void;
 };
@@ -698,6 +700,7 @@ type NativeCapturedForkSelection = CapturedForkSelection & {
 type NativeCapturedForkPublication = {
 	pending?: PendingResumeOp;
 	dispatched?: boolean;
+	receipt?: SessionNoReplacePublicationReceipt;
 	proven?: boolean;
 };
 
@@ -758,6 +761,11 @@ function nativeForkAdmissionDiagnostic(error: unknown): NativeForkAdmissionDiagn
 	return Object.freeze({ name: "Error", message: typeof error === "string" ? error : "Unknown error" });
 }
 
+function nativeForkRetainedError(error: unknown): Error {
+	const { name, message, code } = nativeForkAdmissionDiagnostic(error);
+	return Object.assign(new Error(message, { cause: error }), { name, ...(code === undefined ? {} : { code }) });
+}
+
 type NativeCapturedForkResult =
 	| {
 			kind: "native_forked";
@@ -772,6 +780,8 @@ type NativeCapturedForkResult =
 			manager: SessionManager;
 			membership: OwnerMembership;
 			pending: PendingResumeOp;
+			/** Historical no-replace receipt, not authority to continue or adopt the fork. */
+			receipt?: SessionNoReplacePublicationReceipt;
 			proven: boolean;
 			error: Error;
 	  }
@@ -14106,9 +14116,20 @@ export class SessionManager {
 		});
 	}
 
-	async #withOwnerPublication<T>(body: () => Promise<T>): Promise<T> {
+	async #withOwnerPublication<T>(
+		body:
+			| (() => Promise<T>)
+			| {
+					readonly source: OwnerMembership;
+					publish(assertOwners: () => void): Promise<T>;
+			  },
+	): Promise<T> {
 		const execution = this.#ownerExecution.getStore();
-		if (execution?.active && execution.token === this.#ownerMembership) return body();
+		if (execution?.active && execution.token === this.#ownerMembership) {
+			// A successor must acquire both locks together, never nest A under B.
+			if (typeof body !== "function") throw new OwnerAuthorityError("participation_lost");
+			return body();
+		}
 		const predecessor = this.#ownerPublicationTail;
 		const completion = Promise.withResolvers<void>();
 		this.#ownerPublicationTail = completion.promise;
@@ -14116,21 +14137,31 @@ export class SessionManager {
 			await predecessor;
 			await this.#ensureOwnerMembership();
 			const token = this.#ownerMembership;
-			if (!token) return await body();
-			const publish = (run: () => Promise<T>): Promise<T> =>
-				this.#ownerTransfer
-					? withOwnerTransferPublication(this.#ownerTransfer, run)
-					: getOwnerMembershipEvidence(token).policy.kind === "cooperative"
-						? withCooperativeOwnerPublication(token, run)
-						: withOwnerPublication(token, run);
-			return await publish(async () => {
+			if (!token) {
+				if (typeof body !== "function") throw new OwnerAuthorityError("participation_lost");
+				return await body();
+			}
+			const run = async (effect: () => Promise<T>): Promise<T> => {
 				const context = { token, active: true };
 				try {
-					return await this.#ownerExecution.run(context, body);
+					return await this.#ownerExecution.run(context, effect);
 				} finally {
 					context.active = false;
 				}
-			});
+			};
+			if (typeof body !== "function") {
+				if (this.#ownerTransfer) throw new OwnerAuthorityError("participation_lost");
+				return await withNativeForkSuccessorPublication(body.source, token, assertOwners =>
+					run(() => body.publish(assertOwners)),
+				);
+			}
+			const publish = (effect: () => Promise<T>): Promise<T> =>
+				this.#ownerTransfer
+					? withOwnerTransferPublication(this.#ownerTransfer, effect)
+					: getOwnerMembershipEvidence(token).policy.kind === "cooperative"
+						? withCooperativeOwnerPublication(token, effect)
+						: withOwnerPublication(token, effect);
+			return await publish(() => run(body));
 		} finally {
 			completion.resolve();
 		}
@@ -26423,11 +26454,12 @@ export class SessionManager {
 		target: string | null,
 		nativeFork?: {
 			readonly publication: NativeCapturedForkPublication;
+			readonly sourceOwner?: OwnerMembership;
 			assertSource(): void;
 		},
 	): Promise<SessionNoReplacePublicationReceipt> {
 		const file = reservation.fresh.sessionFile;
-		const publish = () => this.#withSessionPersistenceFenceSync(() => {
+		const publish = (assertPublicationAuthority?: () => void) => this.#withSessionPersistenceFenceSync(() => {
 			nativeFork?.assertSource();
 			reservation.assertAvailable();
 			const managed = this.destination.kind === "managed" ? this.#managedTranscriptStore(file) : undefined;
@@ -26468,6 +26500,7 @@ export class SessionManager {
 				throw new Error("invalid_resume_target");
 			reservation.assertAvailable();
 			managed?.assertBound();
+			assertPublicationAuthority?.();
 			let staged: StagedStreamingWriter;
 			try {
 				staged = openStagedWriter.call(this.#storage, file, {
@@ -26475,7 +26508,7 @@ export class SessionManager {
 				});
 			} catch (error) {
 				// Construction may have acquired a descriptor without returning its writer.
-				if (nativeFork) this.#nativeForkStage = { kind: "open_unknown", error: toError(error) };
+				if (nativeFork) this.#nativeForkStage = { kind: "open_unknown", error: nativeForkRetainedError(error) };
 				throw error;
 			}
 			let writeFailure: { error: unknown } | undefined;
@@ -26489,11 +26522,13 @@ export class SessionManager {
 			try {
 				staged.closeSync();
 			} catch (error) {
-				const closeError = toError(error);
-				if (nativeFork) this.#nativeForkStage = { kind: "close_unknown", writer: staged, error: closeError };
-				if (writeFailure && writeFailure.error !== error && nativeFork) {
-					const writeError = toError(writeFailure.error);
-					throw new AggregateError([writeError, closeError], `${writeError.message}; ${closeError.message}`);
+				if (nativeFork) {
+					const closeError = nativeForkRetainedError(error);
+					this.#nativeForkStage = { kind: "close_unknown", writer: staged, error: closeError };
+					if (writeFailure && writeFailure.error !== error) {
+						const writeError = nativeForkRetainedError(writeFailure.error);
+						throw new AggregateError([writeError, closeError], `${writeError.message}; ${closeError.message}`);
+					}
 				}
 				throw writeFailure ? writeFailure.error : error;
 			}
@@ -26502,6 +26537,7 @@ export class SessionManager {
 			nativeFork?.assertSource();
 			reservation.assertAvailable();
 			managed?.assertBound();
+			assertPublicationAuthority?.();
 			marker.attempted = true;
 			if (nativeFork) nativeFork.publication.dispatched = true;
 			let receipt: SessionNoReplacePublicationReceipt;
@@ -26509,7 +26545,9 @@ export class SessionManager {
 				receipt = staged.publishNoReplace();
 			} catch (error) {
 				// Publication may own a second descriptor whose close was not acknowledged.
-				if (nativeFork) this.#nativeForkStage = { kind: "publish_unknown", writer: staged, error: toError(error) };
+				if (nativeFork) {
+					this.#nativeForkStage = { kind: "publish_unknown", writer: staged, error: nativeForkRetainedError(error) };
+				}
 				throw error;
 			}
 			if (
@@ -26520,6 +26558,19 @@ export class SessionManager {
 				receipt.stat.size !== bytes
 			)
 				throw new Error("durability_unproven");
+			if (nativeFork) {
+				// Save the writer's acknowledgment before later proof or lock release can fail.
+				const mtime = receipt.stat.mtime.getTime();
+				nativeFork.publication.receipt = Object.freeze({
+					...receipt,
+					stat: Object.freeze({
+						...receipt.stat,
+						get mtime() {
+							return new Date(mtime);
+						},
+					}),
+				});
+			}
 			const { capture, markers } = this.#verifyReservedForkInstallation(reservation, receipt);
 			if (capture.reducerView.leafEntryId !== parent) throw new Error("stale_snapshot");
 			if (pending) this.#proveReservedNativeFork(pending, receipt, capture);
@@ -26544,18 +26595,30 @@ export class SessionManager {
 			this.#ensuredOnDisk = true;
 			return receipt;
 		});
-		return this.#withOwnerPublication(async () => {
-			if (this.destination.kind !== "managed") return publish();
+		const publishWithTransaction = async (assertOwners?: () => void): Promise<SessionNoReplacePublicationReceipt> => {
+			if (this.destination.kind !== "managed") return publish(assertOwners);
 			return withManagedSessionTransaction(
 				{ locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(file)), sessionId: this.#sessionId },
 				async scope => {
 					scope.assertOwned();
-					const receipt = publish();
+					const receipt = publish(
+						assertOwners
+							? () => {
+									assertOwners();
+									scope.assertOwned();
+								}
+							: undefined,
+					);
 					scope.assertOwned();
 					return receipt;
 				},
 			);
-		});
+		};
+		return this.#withOwnerPublication(
+			nativeFork?.sourceOwner
+				? { source: nativeFork.sourceOwner, publish: publishWithTransaction }
+				: publishWithTransaction,
+		);
 	}
 
 	#proveReservedNativeFork(
@@ -28288,8 +28351,8 @@ export class SessionManager {
 				throw new Error("stale_snapshot");
 			sourceStore?.assertBound();
 		};
-		// Check A's owner outside B's owner-publication critical section; never
-		// acquire the predecessor's owner lock under the successor's lock.
+		// This standalone check is for preparation and result validation only.
+		// Publication acquires both owner locks together and uses its own assertion.
 		const assertOwner = (): void => withOwnerPublicationSync(membership, assertCurrent);
 		assertOwner();
 		const captured = SessionManager.captureTranscriptStrict(file, installation.storage);
@@ -28319,7 +28382,7 @@ export class SessionManager {
 					reserveSelectedForkTranscript: ({ sessionId, file }) =>
 						reserve(Object.freeze({ role: "successor", sessionId, file })),
 				},
-				{ selectedEntryId, assertCurrent, assertOwner },
+				{ selectedEntryId, membership, assertCurrent, assertOwner },
 			);
 			if (result.kind === "forked") throw new Error("unexpected_cooperative_fork");
 			return result;
@@ -28719,7 +28782,9 @@ export class SessionManager {
 					reservation,
 					reservedHistory,
 					forkTarget,
-					exclusive ? { publication: nativePublication, assertSource: assertNativeSource } : undefined,
+					exclusive
+						? { publication: nativePublication, sourceOwner: successor?.membership, assertSource: assertNativeSource }
+						: undefined,
 				);
 				if (exclusive) {
 					nativePublication.proven = true;
@@ -28909,8 +28974,9 @@ export class SessionManager {
 						manager,
 						membership,
 						pending,
+						receipt: nativePublication.receipt,
 						proven: nativePublication.proven === true,
-						error: toError(error),
+						error: nativeForkRetainedError(error),
 					};
 				// No transcript publication was dispatched and the manager never escaped.
 				// Close the private resident state before releasing only its exact admission.

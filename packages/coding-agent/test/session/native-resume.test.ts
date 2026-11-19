@@ -8,6 +8,7 @@ import {
 	admitOwnerMembershipSync,
 	captureLegacyTakeoverAttestationSync,
 	captureOwnerTargetSync,
+	type OwnerRecord,
 } from "../../src/session/owner-group";
 import { reduceResumeTranscript, resolveResumeCheckpoint } from "../../src/session/resume-cursor";
 import type { ResumeRouting } from "../../src/session/resume-operation";
@@ -354,6 +355,117 @@ describe("native selected branch successor preparation", () => {
 			expect(storage.readTextSync(`${aFile}.original`)).toBe(aBytes);
 			expect(storage.readTextSync(aFile)).toBe(aBytes);
 			expect(a.manager.getOwnerMembership()).toBe(a.membership);
+		},
+	);
+
+	for (const change of ["loss", "epoch", "revision", "member"] as const) {
+		it.skipIf(process.platform === "win32")(
+			`refuses B publication when A's owner record changes at staged close (${change})`,
+			async () => {
+				const { fork: a, aFile, aBytes, storage } = await selectedForkFixture(true);
+				const { authorityKey } = a.manager.getSessionOwnerEvidence()!;
+				const original = storage.readTextSync(authorityKey);
+				const record = JSON.parse(original) as OwnerRecord;
+				const differentId = (id: string) => `${id[0] === "0" ? "1" : "0"}${id.slice(1)}`;
+				const next = {
+					...record,
+					epoch: change === "epoch" ? differentId(record.epoch) : record.epoch,
+					rev: change === "revision" ? record.rev + 1 : record.rev,
+					members:
+						change === "member"
+							? record.members.map(member => ({ ...member, memberId: differentId(member.memberId) }))
+							: record.members,
+				};
+				const displaced = `${authorityKey}.displaced`;
+				const foreign = `${JSON.stringify(next)}\n`;
+				const open = storage.openStagedWriter.bind(storage);
+				const dispatch = vi.fn();
+				vi.spyOn(storage, "openStagedWriter").mockImplementation((file, options) => {
+					const writer = open(file, options);
+					const close = writer.closeSync.bind(writer);
+					writer.closeSync = () => {
+						close();
+						if (change === "loss") fs.renameSync(authorityKey, displaced);
+						else fs.writeFileSync(authorityKey, foreign);
+					};
+					const publish = writer.publishNoReplace.bind(writer);
+					writer.publishNoReplace = () => {
+						dispatch();
+						return publish();
+					};
+					return writer;
+				});
+				let candidate: string | undefined;
+				const retained = await a.manager.prepareNativeBranchSuccessor({
+					sourceOp: a.pending,
+					selectedEntryId: "selected",
+					reserve: async ({ file }) => {
+						candidate = file;
+					},
+				});
+				if (retained.kind !== "native_fork_retained") throw new Error(`B was not retained: ${retained.kind}`);
+				managers.push(retained.manager);
+				expect(retained.proven).toBe(false);
+				expect(retained.receipt).toBeUndefined();
+				expect(retained.error).toMatchObject({ code: "participation_lost", message: "participation_lost" });
+				expect(retained.manager.getOwnerMembership()).toBe(retained.membership);
+				expect(nativeResumeBinding(retained.pending).initialPublication).toBeUndefined();
+				expect(dispatch).not.toHaveBeenCalled();
+				if (!candidate) throw new Error("B was not reserved");
+				expect(fs.existsSync(candidate)).toBe(false);
+				expect(storage.readTextSync(aFile)).toBe(aBytes);
+				if (change === "loss") {
+					expect(fs.existsSync(authorityKey)).toBe(false);
+					expect(storage.readTextSync(displaced)).toBe(original);
+				} else {
+					expect(storage.readTextSync(authorityKey)).toBe(foreign);
+				}
+			},
+		);
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"retains the exact B operation and receipt after a hostile late abort",
+		async () => {
+			const { fork: a, aFile, aBytes, storage } = await selectedForkFixture(true);
+			const abort = new AbortController();
+			const reason: object = Object.create(null);
+			const open = storage.openStagedWriter.bind(storage);
+			let receipt: SessionNoReplacePublicationReceipt | undefined;
+			vi.spyOn(storage, "openStagedWriter").mockImplementation((file, options) => {
+				const writer = open(file, options);
+				const publish = writer.publishNoReplace.bind(writer);
+				writer.publishNoReplace = () => {
+					const published = publish();
+					receipt = published;
+					abort.abort(reason);
+					return published;
+				};
+				return writer;
+			});
+			let candidate: string | undefined;
+			const retained = await a.manager.prepareNativeBranchSuccessor({
+				sourceOp: a.pending,
+				selectedEntryId: "selected",
+				signal: abort.signal,
+				reserve: async ({ file }) => {
+					candidate = file;
+				},
+			});
+			if (retained.kind !== "native_fork_retained") throw new Error(`B was not retained: ${retained.kind}`);
+			managers.push(retained.manager);
+			if (!candidate || !receipt || !retained.receipt) throw new Error("B publication receipt was lost");
+			expect(retained.proven).toBe(true);
+			expect(retained.error).toMatchObject({ message: "Unknown error" });
+			expect(retained.error.cause).toBe(reason);
+			expect(retained.receipt).toEqual(receipt);
+			expect(Object.isFrozen(retained.receipt)).toBe(true);
+			expect(Object.isFrozen(retained.receipt.stat)).toBe(true);
+			expect(retained.manager.getSessionFile()).toBe(candidate);
+			expect(retained.manager.getOwnerMembership()).toBe(retained.membership);
+			expect(nativeResumeBinding(retained.pending).initialPublication?.publicationId).toBe(receipt.publicationId);
+			expect(resumeDigest(storage.readTextSync(candidate))).toBe(receipt.sha256);
+			expect(storage.readTextSync(aFile)).toBe(aBytes);
 		},
 	);
 
