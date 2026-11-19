@@ -182,6 +182,7 @@ describe("startup auth config", () => {
 				"      - shared@example.com: 75",
 				"      - email:prefixed@example.com: 40.5",
 				"      - account:acct-9: 100",
+				"      - org:org-kb: 90",
 				"    openai-codex: account:acct-1",
 				"    kimi-code: solo@example.com",
 			].join("\n"),
@@ -195,6 +196,7 @@ describe("startup auth config", () => {
 				{ selector: { kind: "email", value: "prefixed@example.com" }, maxUsedFraction: 0.405 },
 				// A 100 percent cap is the same as no cap: only blocking moves past the account.
 				{ selector: { kind: "account", value: "acct-9" } },
+				{ selector: { kind: "org", value: "org-kb" }, maxUsedFraction: 0.9 },
 			],
 			"openai-codex": [{ selector: { kind: "account", value: "acct-1" } }],
 			"kimi-code": [{ selector: { kind: "email", value: "solo@example.com" } }],
@@ -213,6 +215,9 @@ describe("startup auth config", () => {
 		["a cap over 100", "    anthropic:\n      - cheap@example.com: 101\n"],
 		["a string cap", '    anthropic:\n      - cheap@example.com: "75%"\n'],
 		["a nested list", "    anthropic:\n      - - cheap@example.com\n"],
+		["the same organization twice", "    anthropic:\n      - org:Org-KB\n      - org:org-kb: 50\n"],
+		["an organization display name with spaces", "    anthropic:\n      - org:KB Team\n"],
+		["an empty organization", '    anthropic:\n      - "org:"\n'],
 	])("fails closed for credential preferences with %s", async (_label, body) => {
 		clearAuthEnv();
 		const agentDir = await makeAgentDir(

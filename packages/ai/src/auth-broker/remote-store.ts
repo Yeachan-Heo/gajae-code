@@ -553,6 +553,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				provider: entry.provider,
 				credentialKind: metadata?.type ?? entry.credential.type,
 				identityLabel: metadata?.identity ?? snapshotIdentityLabel(entry),
+				...snapshotIdentityFields(entry),
 				disabled: false,
 				disabledCause: null,
 			});
@@ -1510,6 +1511,24 @@ function isErrorStatus(error: unknown, status: number): boolean {
 function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 	if (entry.credential.type !== "oauth") return null;
 	return formatOAuthIdentityLabel(entry.credential);
+}
+
+/**
+ * Payload-free identity fields of an active OAuth snapshot row, matching what the local SQLite inventory exposes, so
+ * inventory consumers (`gjc accounts prefer`) can find a unique email, account id, or organization id in broker mode.
+ */
+function snapshotIdentityFields(
+	entry: SnapshotEntry,
+): Pick<CredentialInventoryRecord, "accountId" | "email" | "projectId" | "organizationId" | "organizationName"> {
+	const credential = entry.credential;
+	if (credential.type !== "oauth") return {};
+	return {
+		...(credential.accountId ? { accountId: credential.accountId } : {}),
+		...(credential.email ? { email: credential.email } : {}),
+		...(credential.projectId ? { projectId: credential.projectId } : {}),
+		...(credential.organizationId ? { organizationId: credential.organizationId } : {}),
+		...(credential.organizationName ? { organizationName: credential.organizationName } : {}),
+	};
 }
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
