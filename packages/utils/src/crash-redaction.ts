@@ -270,8 +270,79 @@ export function redactCrashSecretsV1(text: string): string {
 	return redactCrashSecretsWithRules(text, V1_CREDENTIAL_REDACTION_RULES);
 }
 
+/**
+ * Redact indented continuation lines following credential headers.
+ * Handles folded headers like:
+ *   Authorization: Bearer
+ *     token-value-here
+ *   next-line
+ *
+ * Headers that end with a credential keyword followed by optional whitespace
+ * but no value should have their indented continuation lines redacted.
+ */
+function redactFoldedHeaders(text: string, rules: CredentialRedactionRules): string {
+	const output: string[] = [];
+	const lines = text.split("\n");
+	let i = 0;
+
+	while (i < lines.length) {
+		const line = lines[i];
+
+		// Check if this line is a credential header with no value on the same line
+		// Pattern: optional whitespace + credential key + optional whitespace + colon + optional whitespace + end of line
+		// Or with leading diff marker: +/- + optional whitespace + credential key + colon + optional whitespace + end
+		const prefixMatch = line.match(/^([+-]?\s*)(.+?)\s*:\s*$/);
+		if (prefixMatch) {
+			const [, , headerContent] = prefixMatch;
+			const trimmedHeader = headerContent.trim();
+
+			// Check if header content ends with a credential keyword
+			if (
+				isCredentialKeyWithRules(trimmedHeader, rules) ||
+				trimmedHeader.match(
+					/(?:auth|authorization|cookie|token|password|secret)(?:\s+(?:Bearer|Basic|Token))?\s*$/i,
+				)
+			) {
+				// This is a credential header with no value on the same line
+				// Emit the header line as-is
+				output.push(line);
+				i += 1;
+
+				// Redact all following indented lines until we hit a non-indented line
+				while (i < lines.length) {
+					const continuationLine = lines[i];
+
+					// Check if this line is significantly indented (at least 2 spaces after diff prefix)
+					// This distinguishes folded value continuations from structural elements
+					const continuationMatch = continuationLine.match(/^([+-]?)(\s{2,})(.*)$/);
+					if (continuationMatch) {
+						const [, diffPrefix, indent] = continuationMatch;
+						// Redact the continuation line content, preserving diff prefix and indent
+						output.push(`${diffPrefix}${indent}«redacted»`);
+						i += 1;
+					} else {
+						// Not sufficiently indented or end of input: stop folded header processing
+						break;
+					}
+				}
+				continue;
+			}
+		}
+
+		// Not a credential header with no value: pass through unchanged
+		output.push(line);
+		i += 1;
+	}
+
+	return output.join("\n");
+}
+
 function redactCrashSecretsWithRules(text: string, rules: CredentialRedactionRules): string {
-	let redacted = redactCredentialContainers(text, rules);
+	// Redact folded headers first: credential headers with value on indented continuation lines
+	// This must run before other rules that might partially redact header lines
+	let redacted = redactFoldedHeaders(text, rules);
+	// Then container redaction
+	redacted = redactCredentialContainers(redacted, rules);
 	// Block scalar bodies span lines and must be masked before line-bounded rules handle the header.
 	redacted = redactYamlBlockScalars(redacted, rules);
 	redacted = redacted.replace(
