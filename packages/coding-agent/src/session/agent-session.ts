@@ -19218,70 +19218,71 @@ this.#toolRegistry.size === previousRegistry.length &&
 		// prompt still in preflight, aborting) has no run to steer. Ordinary steers
 		// become a sequential follow-up owned by the next turn; SDK turn-bound
 		// steers fail closed rather than being delivered to a successor run.
-		if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
-			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 		const expectedPromptHandle = options?.expectedPromptHandle;
-		if (
-			expectedPromptHandle === null ||
-			(expectedPromptHandle !== undefined && this.activePromptHandle !== expectedPromptHandle)
-		)
-			throw Object.assign(new Error("The expected run is not active."), { code: "turn_not_active" });
-		const admission = await withNativeRuntimeEffect(this, "queue", () =>
-			this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined),
-		);
-		if (!admission.admitted) {
-			if (options?.expectedSdkRunToken !== undefined || expectedPromptHandle !== undefined)
+		const steering = await withNativeRuntimeEffect(this, "queue", (): QueuedFollowUpOwner | undefined => {
+			if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
 				throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
-			const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
-				forceOneAtATime: options?.forceOneAtATime,
-				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
-				onPromoted: options?.onPromoted,
-				onQueuedRunStartFailed: options?.onQueuedRunStartFailed,
-				sdkRunToken: options?.sdkRunToken,
-				scheduleNonAdmittedWake: false,
-				onQueued: message => {
-					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
-					options?.onQueued?.(message);
-				},
-				onQueuedAfterAdmission: options?.onQueuedAfterAdmission,
-				allowDuringSessionTransition: options?.allowDuringSessionTransition,
-				allowCancelAndSubmit: options?.allowCancelAndSubmit,
-			});
-			this.#scheduleNonAdmittedQueuedContinuation();
-			return queuedFollowUp;
-		}
-		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
-		if (options?.onQueuedRunStartFailed)
-			this.#queuedRunStartFailureHooks.set(message, options.onQueuedRunStartFailed);
-		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
-		if (options?.external) {
-			this.#externalSteerMessages.add(message);
-			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
-			this.#queuedAdmissionSeq.set(message, ++this.#queuedAdmissionSequence);
-			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
-		}
-		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
-		if (expectedPromptHandle !== undefined) this.#runBoundSteerTargets.set(message, expectedPromptHandle);
-		if (options?.claimsGenuineUserIntent) {
-			const epoch = this.#claimDeepInterviewUserIntent();
-			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
-		}
-		options?.onQueued?.(message);
-		const cancelQueuedSteer = (): boolean => {
-			const removedQueues = this.agent.removeQueuedMessages(candidate => candidate === message);
-			const removed = removedQueues.steering > 0 || removedQueues.followUp > 0;
-			if (!removed) return false;
-			this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
-			this.#followUpMessages = this.#followUpMessages.filter(entry => entry.message !== message);
-			this.#externalSteerMessages.delete(message);
-			this.#externalFollowUps.delete(message);
-			this.#sequentialSteerMessages.delete(message);
-			this.#fireQueuedRemovalHooks([message]);
-			this.#releaseDeferredSdkFollowUps();
-			return true;
-		};
-		options?.onQueuedAfterAdmission?.(message, cancelQueuedSteer);
-		return { cancel: cancelQueuedSteer };
+			if (
+				expectedPromptHandle === null ||
+				(expectedPromptHandle !== undefined && this.activePromptHandle !== expectedPromptHandle)
+			)
+				throw Object.assign(new Error("The expected run is not active."), { code: "turn_not_active" });
+			const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+			if (!admission.admitted) return undefined;
+			// Record the admitted input before yielding: the run may drain it on the next turn.
+			if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
+			if (options?.onQueuedRunStartFailed)
+				this.#queuedRunStartFailureHooks.set(message, options.onQueuedRunStartFailed);
+			this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
+			if (options?.external) {
+				this.#externalSteerMessages.add(message);
+				this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
+				this.#queuedAdmissionSeq.set(message, ++this.#queuedAdmissionSequence);
+				if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
+			}
+			if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+			if (expectedPromptHandle !== undefined) this.#runBoundSteerTargets.set(message, expectedPromptHandle);
+			if (options?.claimsGenuineUserIntent) {
+				const epoch = this.#claimDeepInterviewUserIntent();
+				this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
+			}
+			options?.onQueued?.(message);
+			const cancelQueuedSteer = (): boolean => {
+				const removedQueues = this.agent.removeQueuedMessages(candidate => candidate === message);
+				const removed = removedQueues.steering > 0 || removedQueues.followUp > 0;
+				if (!removed) return false;
+				this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
+				this.#followUpMessages = this.#followUpMessages.filter(entry => entry.message !== message);
+				this.#externalSteerMessages.delete(message);
+				this.#externalFollowUps.delete(message);
+				this.#sequentialSteerMessages.delete(message);
+				this.#fireQueuedRemovalHooks([message]);
+				this.#releaseDeferredSdkFollowUps();
+				return true;
+			};
+			options?.onQueuedAfterAdmission?.(message, cancelQueuedSteer);
+			return { cancel: cancelQueuedSteer };
+		});
+		if (steering) return steering;
+		if (options?.expectedSdkRunToken !== undefined || expectedPromptHandle !== undefined)
+			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
+		const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
+			forceOneAtATime: options?.forceOneAtATime,
+			claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
+			onPromoted: options?.onPromoted,
+			onQueuedRunStartFailed: options?.onQueuedRunStartFailed,
+			sdkRunToken: options?.sdkRunToken,
+			scheduleNonAdmittedWake: false,
+			onQueued: message => {
+				if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
+				options?.onQueued?.(message);
+			},
+			onQueuedAfterAdmission: options?.onQueuedAfterAdmission,
+			allowDuringSessionTransition: options?.allowDuringSessionTransition,
+			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+		});
+		this.#scheduleNonAdmittedQueuedContinuation();
+		return queuedFollowUp;
 	}
 
 	/**
