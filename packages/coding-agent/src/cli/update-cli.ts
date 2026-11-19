@@ -984,6 +984,41 @@ function isSupersedablePrePromotionRecord(
 }
 
 /**
+ * True for a `staged`/`pending_activation` record whose live target no longer
+ * matches its baseline even though the transaction never started its promotion:
+ * the target was replaced outside this transaction, e.g. by the installer
+ * reinstall recommended after a failed self-update.
+ *
+ * A retained replacement occupies `backupName` before it mutates the target or
+ * the stage (Windows: retire-rename of the old target; POSIX: hardlink pin of
+ * the candidate, then exchange), so an intact recorded stage with nothing at
+ * `backupName` proves no promotion step ran.
+ */
+async function isExternallyReplacedPrePromotionRecord(
+	record: ActivationRecordV1,
+	targetPath: string,
+	current: { readonly identity: FileIdentity } | undefined,
+): Promise<boolean> {
+	if (record.phase !== "staged" && record.phase !== "pending_activation") return false;
+	if (path.resolve(record.targetPath) !== targetPath) return false;
+	if (!record.baseline.exists || !record.targetIdentity || !record.stagingIdentity || !current) return false;
+	if (sameFileIdentity(record.targetIdentity, current.identity)) return false;
+	const stage = await snapshotRegularFile(record.stagingPath);
+	if (
+		!stage ||
+		!sameFileIdentity(record.stagingIdentity, stage.identity) ||
+		stage.identity.sha256 !== record.candidate.digest
+	)
+		return false;
+	try {
+		await fs.promises.lstat(path.join(path.dirname(targetPath), record.backupName));
+		return false;
+	} catch (error) {
+		return isEnoent(error);
+	}
+}
+
+/**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
@@ -1009,11 +1044,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	// A pre-promotion record for a different candidate never mutated the install:
 	// its live target is still the recorded baseline. Pinning it would refuse every
 	// later release with activation_transaction_requires_reconciliation (#6096), so
-	// let a fresh transaction supersede it. Anything past promotion stays pinned.
+	// let a fresh transaction supersede it. A record whose target was replaced from
+	// outside before any promotion step is equally inert. Anything past promotion
+	// stays pinned.
 	const supersedable =
 		existing.status === "valid" &&
-		!activationRecordMatchesCandidate(existing.record, options, undefined) &&
-		isSupersedablePrePromotionRecord(existing.record, targetPath, current);
+		((!activationRecordMatchesCandidate(existing.record, options, undefined) &&
+			isSupersedablePrePromotionRecord(existing.record, targetPath, current)) ||
+			(await isExternallyReplacedPrePromotionRecord(existing.record, targetPath, current)));
 	const resumePinned =
 		existing.status === "valid" &&
 		!supersedable &&
