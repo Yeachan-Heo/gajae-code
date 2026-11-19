@@ -1565,6 +1565,34 @@ describe("owner-checked native deletion", () => {
 		}
 	}
 
+	it("replays completed managed cleanup without publishing a scope binding", async () => {
+		const f = await preparedManagedFixture();
+		await artifacts(f);
+		const listing = listManagedCandidates(f.scope);
+		if (listing.kind !== "complete" || listing.owned.length !== 1)
+			throw new Error("Expected one prepared managed candidate");
+		const [candidate] = listing.owned;
+		await deleteEmbeddedSession(f.file, { ...f, managed: true });
+		const binding = path.join(f.directory, MANAGED_SESSION_BINDING_FILE);
+		const before = await fs.lstat(binding, { bigint: true });
+		const bytes = await Bun.file(binding).text();
+		const publish = vi.spyOn(native, "renameNoReplacePathAsync");
+		const publishSync = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		const replay = await deleteManagedSessionCandidate(f.scope, candidate);
+		expect(replay.kind).toBe("already_deleted");
+		expect(publish.mock.calls.map(([, destination]) => destination)).not.toContain(binding);
+		expect(publishSync.mock.calls.map(([relativePath]) => relativePath)).not.toContain(MANAGED_SESSION_BINDING_FILE);
+		const after = await fs.lstat(binding, { bigint: true });
+		expect([after.dev, after.ino, after.mtimeNs, after.ctimeNs]).toEqual([
+			before.dev,
+			before.ino,
+			before.mtimeNs,
+			before.ctimeNs,
+		]);
+		expect(await Bun.file(binding).text()).toBe(bytes);
+		expect(sync.existsSync(f.file)).toBe(false);
+	});
+
 	for (const empty of [false, true]) {
 		it(`refuses completed managed cleanup replay with a new ${empty ? "empty" : "nonempty"} canonical inode`, async () => {
 			const f = await preparedManagedFixture();
