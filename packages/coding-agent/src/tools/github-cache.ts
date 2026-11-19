@@ -104,10 +104,21 @@ export function openDb(): Database | null {
 		// than running an in-place ALTER dance.
 		// Schema v5: Structural diff scrubbing with quote-aware bracket tracking.
 		// Invalidate all pre-v5 rows as they may contain unscrubbed credentials.
+		// IMPORTANT: Set to a version that prevents legacy writers from using this cache.
+		// If an old process sees version > its max known version, it must not write.
 		const userVersion = (db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
 		if (userVersion !== undefined && userVersion < 5) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
+		}
+		// If a version higher than our current code sees this, we should also refuse
+		// to continue to prevent schema mismatches
+		const currentVersion = 50; // Update this when cache schema changes
+		if (userVersion !== undefined && userVersion > currentVersion) {
+			throw new Error(
+				`GitHub cache schema v${userVersion} is not supported by this version of gjc. ` +
+					"Please update gjc to work with the cache schema.",
+			);
 		}
 		db.run(`
 			CREATE TABLE IF NOT EXISTS github_view_cache (
@@ -123,7 +134,7 @@ export function openDb(): Database | null {
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
 			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
-			PRAGMA user_version = 5;
+			PRAGMA user_version = 50;
 		`);
 		protectDbFiles(dbPath);
 		cachedDb = db;
@@ -366,6 +377,20 @@ function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unk
 				// Also check for GitHub token patterns (ghp_, gho_, ghu_, ghs_, ghr_)
 				// These patterns are also redacted in diff headers
 				if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+
+				// Check for AWS access key patterns (AKIA followed by 16 uppercase alphanumeric)
+				if (/AKIA[0-9A-Z]{16}/i.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+
+				// Check for other token-shaped patterns (hex or base64 tokens)
+				// Only redact if it looks like a hex/base64 token, not a service name
+				const hexTokenMatch = component.match(/[a-f0-9]{20,}|[A-Z0-9]{30,}/i);
+				if (hexTokenMatch) {
 					hasCredentialComponent = true;
 					break;
 				}

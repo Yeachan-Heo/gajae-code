@@ -674,45 +674,74 @@ function applyStateBasedRedactionWithIndependentProjections(
 		return { redactedLines: result, state: inputState };
 	}
 
-	// Process each line using independent projection redactions
-	// Use separate indices for tracking position in oldSide and newSide projections
-	let oldSideLineIdx = 0;
-	let newSideLineIdx = 0;
+	// Maintain independent states for old and new projections to prevent
+	// state leakage. When a deleted line closes brackets, it shouldn't prevent
+	// an added line from proper credential tracking.
+	const oldState: HunkState = {
+		inCredentialValue: inputState.inCredentialValue,
+		bracketDepth: inputState.bracketDepth,
+		bracketStack: [...inputState.bracketStack],
+		inPemBlock: inputState.inPemBlock,
+		inYamlBlockScalar: inputState.inYamlBlockScalar,
+	};
+	const newState: HunkState = {
+		inCredentialValue: inputState.inCredentialValue,
+		bracketDepth: inputState.bracketDepth,
+		bracketStack: [...inputState.bracketStack],
+		inPemBlock: inputState.inPemBlock,
+		inYamlBlockScalar: inputState.inYamlBlockScalar,
+	};
+	let finalState: HunkState = inputState;
 
+	// Build a mapping from hunk line index to old/new side indices
+	const lineToOldIndex = new Map<number, number>();
+	const lineToNewIndex = new Map<number, number>();
+	let oldIdx = 0;
+	let newIdx = 0;
+	for (let lineIdx = 0; lineIdx < lineInfos.length; lineIdx += 1) {
+		const prefix = lineInfos[lineIdx].prefix;
+		if (prefix === "-" || prefix === " ") {
+			lineToOldIndex.set(lineIdx, oldIdx);
+			oldIdx += 1;
+		}
+		if (prefix === "+" || prefix === " ") {
+			lineToNewIndex.set(lineIdx, newIdx);
+			newIdx += 1;
+		}
+	}
+
+	// Process each line using independent projection redactions
 	for (let lineIdx = 0; lineIdx < lineInfos.length; lineIdx += 1) {
 		const info = lineInfos[lineIdx];
 		const line = info.content;
 		const prefix = info.prefix;
 
-		// If this line was identified as fully redacted by the accumulated redactor
-		if (fullyRedactedLines.has(lineIdx)) {
-			result.push({ ...info, content: "«redacted»" });
-			continue;
-		}
-
-		// Track indices for each side projection
-		if (prefix === "-") {
-			oldSideLineIdx += 1;
-		} else if (prefix === "+") {
-			newSideLineIdx += 1;
-		} else if (prefix === " ") {
-			oldSideLineIdx += 1;
-			newSideLineIdx += 1;
-		}
+		// Determine which states apply to this line
+		const isOldLine = prefix === "-" || prefix === " ";
+		const isNewLine = prefix === "+" || prefix === " ";
 
 		// Check if this line is a PEM block marker
 		const isPemBlockStart = line.match(/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/);
 		const isPemBlockEnd = line.match(/^-----END [A-Z0-9 ]*PRIVATE KEY-----/);
 
-		// Handle PEM block state
-		if (isPemBlockStart || fileState.inPemBlock) {
-			if (isPemBlockStart) {
-				fileState.inPemBlock = true;
-			}
+		// Handle PEM block state - track independently for old and new
+		let shouldRedactForPem = false;
+		if (isPemBlockStart) {
+			if (isOldLine) oldState.inPemBlock = true;
+			if (isNewLine) newState.inPemBlock = true;
+			shouldRedactForPem = true;
+		} else {
+			if (isOldLine && oldState.inPemBlock) shouldRedactForPem = true;
+			else if (isNewLine && newState.inPemBlock) shouldRedactForPem = true;
+		}
+
+		if (shouldRedactForPem) {
 			if (isPemBlockEnd) {
-				fileState.inPemBlock = false;
+				if (isOldLine) oldState.inPemBlock = false;
+				if (isNewLine) newState.inPemBlock = false;
 			}
 			result.push({ ...info, content: "«redacted»" });
+			if (prefix === " ") finalState = oldState; // Sync states for context
 			continue;
 		}
 
@@ -748,53 +777,87 @@ function applyStateBasedRedactionWithIndependentProjections(
 			isPemBlockStart;
 
 		if (hasCredentialOpening) {
-			// This line starts a credential header or field
-			fileState.inCredentialValue = true;
-			// For YAML block scalars (ending with | or >), mark as YAML mode to handle indentation-based termination
-			fileState.inYamlBlockScalar = yamlBlockScalarWithCredential ? true : false;
-			fileState.bracketDepth = 0;
-			fileState.bracketStack = [];
-			// Count brackets in this line using quote-aware matching
-			const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, fileState.bracketStack);
-			fileState.bracketDepth += depthDelta;
-			fileState.bracketStack = newStack;
+			// This line starts a credential header or field - set state for applicable sides
+			if (isOldLine) {
+				oldState.inCredentialValue = true;
+				oldState.inYamlBlockScalar = yamlBlockScalarWithCredential ? true : false;
+				oldState.bracketDepth = 0;
+				oldState.bracketStack = [];
+				const { depthDelta: oldDepth, newStack: oldStack } = countBracketsQuoteAwareWithStack(
+					line,
+					oldState.bracketStack,
+				);
+				oldState.bracketDepth += oldDepth;
+				oldState.bracketStack = oldStack;
+			}
+			if (isNewLine) {
+				newState.inCredentialValue = true;
+				newState.inYamlBlockScalar = yamlBlockScalarWithCredential ? true : false;
+				newState.bracketDepth = 0;
+				newState.bracketStack = [];
+				const { depthDelta: newDepth, newStack: newStack } = countBracketsQuoteAwareWithStack(
+					line,
+					newState.bracketStack,
+				);
+				newState.bracketDepth += newDepth;
+				newState.bracketStack = newStack;
+			}
 			result.push({ ...info, content: redactedContent });
-		} else if (fileState.inCredentialValue) {
-			// We're in a credential value - track brackets with quote awareness
-			const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, fileState.bracketStack);
-			fileState.bracketDepth += depthDelta;
-			fileState.bracketStack = newStack;
+		} else if ((isOldLine && oldState.inCredentialValue) || (isNewLine && newState.inCredentialValue)) {
+			// We're in a credential value - track brackets independently for each side
+			let shouldRedact = false;
 
-			// For YAML block scalars, redact all indented lines and exit on non-indented line
-			if (fileState.inYamlBlockScalar) {
-				// Check if this line is indented (starts with space after the diff prefix)
-				const isIndented = line.match(/^\s+/);
-				if (isIndented) {
-					// Part of the YAML block - redact it
-					result.push({ ...info, content: "«redacted»" });
-				} else {
-					// Not indented - end of YAML block
-					fileState.inCredentialValue = false;
-					fileState.inYamlBlockScalar = false;
-					result.push({ ...info, content: redactedContent });
-				}
-			} else {
-				// Regular bracket-based credential value
-				// Redact this line as part of the credential value
-				// But preserve pure structure lines like standalone brackets
-				if (line.trim().match(/^[\[\]{},:]*$/)) {
-					// This is a pure structure line - keep it as-is
-					result.push(info);
-				} else {
-					// Actual content - redact it
-					result.push({ ...info, content: "«redacted»" });
-				}
+			if (isOldLine && oldState.inCredentialValue) {
+				const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, oldState.bracketStack);
+				oldState.bracketDepth += depthDelta;
+				oldState.bracketStack = newStack;
 
-				// Exit credential value when all brackets are closed
-				if (fileState.bracketDepth <= 0 && !line.match(/[\[{]/)) {
-					fileState.inCredentialValue = false;
+				if (oldState.inYamlBlockScalar) {
+					const isIndented = line.match(/^\s+/);
+					if (isIndented) {
+						shouldRedact = true;
+					} else {
+						oldState.inCredentialValue = false;
+						oldState.inYamlBlockScalar = false;
+					}
+				} else if (oldState.bracketDepth <= 0 && !line.match(/[\[{]/)) {
+					oldState.inCredentialValue = false;
+				} else if (!line.trim().match(/^[\[\]{},:]*$/)) {
+					shouldRedact = true;
 				}
 			}
+
+			if (isNewLine && newState.inCredentialValue) {
+				const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, newState.bracketStack);
+				newState.bracketDepth += depthDelta;
+				newState.bracketStack = newStack;
+
+				if (newState.inYamlBlockScalar) {
+					const isIndented = line.match(/^\s+/);
+					if (isIndented) {
+						shouldRedact = true;
+					} else {
+						newState.inCredentialValue = false;
+						newState.inYamlBlockScalar = false;
+					}
+				} else if (newState.bracketDepth <= 0 && !line.match(/[\[{]/)) {
+					newState.inCredentialValue = false;
+				} else if (!line.trim().match(/^[\[\]{},:]*$/)) {
+					shouldRedact = true;
+				}
+			}
+
+			// Pure structure lines or no redaction needed
+			if (!shouldRedact && line.trim().match(/^[\[\]{},:]*$/)) {
+				result.push(info);
+			} else if (shouldRedact) {
+				result.push({ ...info, content: "«redacted»" });
+			} else {
+				result.push({ ...info, content: redactedContent });
+			}
+		} else if (fullyRedactedLines.has(lineIdx)) {
+			// Not in credential mode, but the accumulated redactor fully redacted this line
+			result.push({ ...info, content: "«redacted»" });
 		} else {
 			// Not in credential value - do normal per-line redaction
 			result.push({
@@ -802,7 +865,46 @@ function applyStateBasedRedactionWithIndependentProjections(
 				content: redactedContent,
 			});
 		}
+		// Update final state for context lines
+		if (prefix === " ") {
+			finalState = oldState; // Both should be in sync for context
+		}
 	}
 
-	return { redactedLines: result, state: fileState };
+	// For hunks with only old/new lines (no context lines), use the merged state
+	// Merge old and new states by using the state that is most likely to be correct
+	// If only one side is in a credential, that's the final state
+	// If both are in a credential, use a merged state (they should be in sync)
+	if (finalState === inputState) {
+		// No context lines were processed, need to merge old/new states
+		// Use the state from whichever side has the most recent activity
+		// In practice, both should be in sync for context-less hunks if they started in sync
+		if (oldState.inCredentialValue || newState.inCredentialValue) {
+			// At least one side is in a credential - use merged state
+			finalState = {
+				inCredentialValue: oldState.inCredentialValue || newState.inCredentialValue,
+				bracketDepth: Math.max(oldState.bracketDepth, newState.bracketDepth),
+				bracketStack:
+					oldState.bracketStack.length > newState.bracketStack.length
+						? oldState.bracketStack
+						: newState.bracketStack,
+				inPemBlock: oldState.inPemBlock || newState.inPemBlock,
+				inYamlBlockScalar: oldState.inYamlBlockScalar || newState.inYamlBlockScalar,
+			};
+		} else {
+			// Neither is in a credential - use merged state for consistency
+			finalState = {
+				inCredentialValue: false,
+				bracketDepth: Math.max(oldState.bracketDepth, newState.bracketDepth),
+				bracketStack:
+					oldState.bracketStack.length > newState.bracketStack.length
+						? oldState.bracketStack
+						: newState.bracketStack,
+				inPemBlock: oldState.inPemBlock || newState.inPemBlock,
+				inYamlBlockScalar: oldState.inYamlBlockScalar || newState.inYamlBlockScalar,
+			};
+		}
+	}
+
+	return { redactedLines: result, state: finalState };
 }
