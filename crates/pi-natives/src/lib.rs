@@ -27,6 +27,7 @@ pub mod ast;
 pub mod build_info;
 pub mod clipboard;
 pub mod computer;
+pub mod confine_fs;
 pub mod crash;
 pub mod diff;
 

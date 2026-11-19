@@ -1024,6 +1024,35 @@ export interface ComputerScreenshot {
   captureId: number
 }
 
+/**
+ * Create `relative` and any missing ancestors beneath `root` without following
+ * a symlink at any component.
+ */
+export declare function confinedMkdirAll(root: string, relative: string): void
+
+/**
+ * Open `relative` beneath `root` for reading and return an owned descriptor.
+ *
+ * `relative` must be a normalized relative path with no `..` component. A
+ * symlink at any component below `root` is rejected. The caller owns the
+ * returned descriptor and must close it.
+ */
+export declare function confinedOpenRead(root: string, relative: string): number
+
+/** Remove the file `relative` beneath `root` through the pinned parent descriptor. */
+export declare function confinedUnlink(root: string, relative: string): void
+
+/**
+ * Atomically replace or create `relative` beneath `root` with `data`.
+ *
+ * The bytes are staged in an exclusively created sibling temp file opened
+ * through the pinned parent descriptor, synced, and published with
+ * `renameat` against that same descriptor. An existing target keeps its
+ * mode. A symlinked, hard-linked, or non-regular target is rejected. Missing
+ * parent directories are created only when `create_parents` is set.
+ */
+export declare function confinedWriteFileAtomic(root: string, relative: string, data: Buffer, createParents: boolean): void
+
 /** A context line (before or after a match). */
 export interface ContextLine {
   /** 1-indexed line number in the source file. */
