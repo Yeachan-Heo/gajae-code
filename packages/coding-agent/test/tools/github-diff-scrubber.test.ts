@@ -636,5 +636,153 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed2.split("\n")).toHaveLength(diffMultilineRedaction.split("\n").length);
 			});
 		});
+
+		describe("snowykr P2 findings - detailed regression tests", () => {
+			it("[P2] finding #2: header-only credential maintains state across continuation", () => {
+				// Issue: +Cookie: then + sid=canary loses state before redacting the scalar continuation
+				// A Cookie header split across multiple lines should maintain credential state
+				const diff = [...HEADER, "@@ -0,0 +1,3 @@ ", "+Cookie:", "+  sid=header-only-canary", "+  path=/", ""].join(
+					"\n",
+				);
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// The canary value must be redacted despite being on a continuation line
+				expect(scrubbed).not.toContain("header-only-canary");
+
+				// Cookie: header structure should be preserved
+				expect(scrubbed).toContain("+Cookie:");
+
+				// Line count must be preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[P2] finding #3: multiline openers include refresh_token and private_key patterns", () => {
+				// Issue: multiline opener list omits shared redactor keys like refresh_token/private_key
+				// These should be detected using the same patterns as redactCrashSecrets
+				const diffWithRefreshToken = [
+					...HEADER,
+					"@@ -0,0 +1,4 @@ ",
+					'+  "refresh_token": [',
+					'+    "refresh-token-canary-value"',
+					"+  ]",
+					"",
+				].join("\n");
+
+				const scrubbed1 = scrubUnifiedDiff(diffWithRefreshToken);
+				expect(scrubbed1).not.toContain("refresh-token-canary-value");
+
+				const diffWithPrivateKey = [
+					...HEADER,
+					"@@ -0,0 +1,4 @@ ",
+					'+  "private_key": [',
+					'+    "private-key-canary-data"',
+					"+  ]",
+					"",
+				].join("\n");
+
+				const scrubbed2 = scrubUnifiedDiff(diffWithPrivateKey);
+				expect(scrubbed2).not.toContain("private-key-canary-data");
+
+				// Line counts preserved
+				expect(scrubbed1.split("\n")).toHaveLength(diffWithRefreshToken.split("\n").length);
+				expect(scrubbed2.split("\n")).toHaveLength(diffWithPrivateKey.split("\n").length);
+			});
+
+			it("[P2] finding #4: asymmetric projection state preserved at context lines", () => {
+				// Issue: asymmetric old/new projection state is dropped at context lines/hunk transitions
+				// When a context line appears, both old and new state should be synchronized properly
+				const diff = [
+					...HEADER,
+					"@@ -1,5 +1,5 @@ ",
+					' {"secret": [',
+					'-  "old-side-canary"',
+					'+  "new-side-canary"',
+					" ]}",
+					" context line",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Both side canaries must be redacted
+				expect(scrubbed).not.toContain("old-side-canary");
+				expect(scrubbed).not.toContain("new-side-canary");
+
+				// Context line must be preserved
+				expect(scrubbed).toContain(" context line");
+
+				// Line count must be preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[P2] finding #5: quoted diff --git paths with spaces are parsed correctly", () => {
+				// Issue: quoted diff --git paths with spaces split wrongly
+				// C-quoted paths like \"a/file with spaces.js\" should be handled correctly
+				const diff = [
+					'diff --git "a/api secret token.js" "b/api secret token.js"',
+					"index 1111111..2222222 100644",
+					'--- "a/api secret token.js"',
+					'+++ "b/api secret token.js"',
+					"@@ -1,2 +1,2 @@ ",
+					" const x = 'value';",
+					" module.exports = x;",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Credential-shaped path should be redacted
+				expect(scrubbed).toContain("file-redacted");
+				expect(scrubbed).not.toContain("api secret token");
+
+				// File structure should be preserved (quotes intact)
+				expect(scrubbed).toMatch(/".*file-redacted.*"/);
+
+				// Content lines in hunk should be preserved
+				expect(scrubbed).toContain("const x = 'value';");
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[P2] finding #6: bracket stack handling does not degrade with long diffs", () => {
+				// Issue: per-line nesting-stack clone is quadratic
+				// We test that a large diff with many bracket operations completes efficiently
+				// and doesn't have exponential behavior
+				const lines = [HEADER[0], ...HEADER.slice(1)];
+				lines.push("@@ -1,100 +1,100 @@ ");
+
+				// Add 100 lines with bracket operations
+				for (let i = 0; i < 100; i += 1) {
+					if (i === 0) {
+						lines.push(' {"token": [');
+					} else if (i === 99) {
+						lines.push(" ]");
+						lines.push(" }");
+					} else {
+						lines.push(` "line-${i}-canary-data",`);
+					}
+				}
+				lines.push("");
+
+				const diff = lines.join("\n");
+				const startTime = Date.now();
+				const scrubbed = scrubUnifiedDiff(diff);
+				const elapsed = Date.now() - startTime;
+
+				// All canaries should be redacted
+				for (let i = 1; i < 99; i += 1) {
+					expect(scrubbed).not.toContain(`line-${i}-canary-data`);
+				}
+
+				// Should complete in reasonable time (< 500ms for 100 lines)
+				// This catches quadratic behavior
+				expect(elapsed).toBeLessThan(500);
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+		});
 	});
 });

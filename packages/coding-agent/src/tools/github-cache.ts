@@ -110,6 +110,7 @@ export function openDb(): Database | null {
 			?.user_version;
 		if (userVersion !== undefined && userVersion < 5) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
+			db.run("DROP TABLE IF EXISTS github_view_cache_v50");
 		}
 		// If a version higher than our current code sees this, we should also refuse
 		// to continue to prevent schema mismatches
@@ -121,7 +122,7 @@ export function openDb(): Database | null {
 			);
 		}
 		db.run(`
-			CREATE TABLE IF NOT EXISTS github_view_cache (
+			CREATE TABLE IF NOT EXISTS github_view_cache_v50 (
 				auth_key        TEXT    NOT NULL,
 				repo             TEXT    NOT NULL,
 				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-diff')),
@@ -133,7 +134,7 @@ export function openDb(): Database | null {
 				source_url       TEXT,
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
-			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
+			CREATE INDEX IF NOT EXISTS idx_github_view_cache_v50_fetched ON github_view_cache_v50(fetched_at);
 			PRAGMA user_version = 50;
 		`);
 		protectDbFiles(dbPath);
@@ -153,7 +154,7 @@ export function openDb(): Database | null {
 function evictExpired(db: Database, hardTtlMs: number): void {
 	try {
 		const cutoff = Date.now() - hardTtlMs;
-		db.prepare("DELETE FROM github_view_cache WHERE fetched_at < ?").run(cutoff);
+		db.prepare("DELETE FROM github_view_cache_v50 WHERE fetched_at < ?").run(cutoff);
 	} catch (err) {
 		logger.debug("github cache: eviction failed", { err: String(err) });
 	}
@@ -257,7 +258,7 @@ export function getCached<T = unknown>(
 	try {
 		const row = db
 			.prepare(
-				"SELECT auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
+				"SELECT auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url FROM github_view_cache_v50 WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
 			)
 			.get(authKey, normalizeRepo(repo), kind, number, includeComments ? 1 : 0) as Row | undefined;
 		if (!row) return null;
@@ -469,7 +470,7 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 
 		const payloadJson = JSON.stringify(scrubbedPayload);
 		db.prepare(
-			"INSERT OR REPLACE INTO github_view_cache (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT OR REPLACE INTO github_view_cache_v50 (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(
 			input.authKey ?? DEFAULT_CACHE_AUTH_KEY,
 			normalizeRepo(input.repo),
@@ -505,15 +506,12 @@ export function invalidate(
 	if (!db) return;
 	try {
 		if (includeComments === undefined) {
-			db.prepare("DELETE FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ?").run(
-				authKey,
-				normalizeRepo(repo),
-				kind,
-				number,
-			);
+			db.prepare(
+				"DELETE FROM github_view_cache_v50 WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ?",
+			).run(authKey, normalizeRepo(repo), kind, number);
 		} else {
 			db.prepare(
-				"DELETE FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
+				"DELETE FROM github_view_cache_v50 WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
 			).run(authKey, normalizeRepo(repo), kind, number, includeComments ? 1 : 0);
 		}
 	} catch (err) {
@@ -526,7 +524,7 @@ export function clearAll(): void {
 	const db = openDb();
 	if (!db) return;
 	try {
-		db.prepare("DELETE FROM github_view_cache").run();
+		db.prepare("DELETE FROM github_view_cache_v50").run();
 	} catch (err) {
 		logger.debug("github cache: clear failed", { err: String(err) });
 	}
