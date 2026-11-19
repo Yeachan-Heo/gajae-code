@@ -887,7 +887,7 @@ describe("Credential scrubbing in cached data", () => {
 		it("DOES redact actual credential files in cache", async () => {
 			const diffPayload: Record<string, unknown> = {
 				unified:
-					'diff --git a/config/secret-api-key.json b/config/secret-api-key.json\nindex 1..2 100644\n--- a/config/secret-api-key.json\n+++ b/config/secret-api-key.json\n@@ -1,1 +1,1 @@\n {\\"api\\": \\"sensitive\\"}',
+					'diff --git a/config/secret-api-key.json b/config/secret-api-key.json\nindex 1..2 100644\n--- a/config/secret-api-key.json\n+++ b/config/secret-api-key.json\n@@ -1,1 +1,1 @@\n {\"api\": \"sensitive\"}',
 				files: [
 					{
 						path: "config/secret-api-key.json",
@@ -915,6 +915,50 @@ describe("Credential scrubbing in cached data", () => {
 			const payloadJson = JSON.stringify(cached.payload);
 			expect(payloadJson).not.toContain("secret-api-key");
 			expect(payloadJson).toContain("file-redacted");
+		});
+
+		it("[P2] redacts token-shaped paths in cached file metadata", async () => {
+			// GitHub token patterns in filenames should be redacted from both unified diff and file metadata
+			const tokenPath = "src/ghp_abcdefghijklmnopqrstuvwxyz123456789_config.json";
+			const normalPath = "src/main.ts";
+
+			const diffPayload: Record<string, unknown> = {
+				unified: `diff --git a/${tokenPath} b/${tokenPath}\nindex 1111111..2222222 100644\n--- a/${tokenPath}\n+++ b/${tokenPath}\n@@ -1 @@\n-secret\n+newsecret\n`,
+				files: [
+					{
+						path: tokenPath,
+						oldPath: tokenPath,
+						startOffset: 0,
+						endOffset: 100,
+					},
+					{
+						path: normalPath,
+						startOffset: 100,
+						endOffset: 200,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 103,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 103, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// Token-shaped path should NOT appear in cached payload (not in diff header or file metadata)
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).not.toContain("ghp_");
+			expect(payloadJson).not.toContain("abcdefghijklmnopqrstuvwxyz123456789");
+			// Normal paths should be visible
+			expect(payloadJson).toContain(normalPath);
 		});
 	});
 });

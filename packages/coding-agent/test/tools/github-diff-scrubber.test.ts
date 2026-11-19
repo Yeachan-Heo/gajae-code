@@ -503,6 +503,35 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed).toContain("file-redacted");
 			});
 
+			it("[P2] redacts YAML block scalars with multiline indented values", () => {
+				// YAML block scalar with pipe operator and indented values
+				// This tests that accumulated context is used instead of per-line redaction
+				const diff = [
+					...HEADER,
+					"@@ -1,5 +1,5 @@",
+					" config:",
+					" api_token: |",
+					"   yaml-block-canary-value",
+					"   more-secret-canary",
+					" database:",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// All canaries should be redacted despite being in block scalar context
+				expect(scrubbed).not.toContain("yaml-block-canary-value");
+				expect(scrubbed).not.toContain("more-secret-canary");
+
+				// YAML structure should be preserved
+				expect(scrubbed).toContain("api_token: |");
+
+				// Line count preserved
+				const lines = scrubbed.split("\n");
+				const originalLines = diff.split("\n");
+				expect(lines).toHaveLength(originalLines.length);
+			});
+
 			it("[P2] applies independent projections for replacement hunks", () => {
 				// Test: old and new sides with different structures
 				// Both sides have multi-line credentials that should be redacted independently
