@@ -419,5 +419,89 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 			});
 		});
+
+		describe("snowykr P2 findings - independent projections", () => {
+			it("[P2] keeps old and new diff projections independent", () => {
+				// Issue: A deleted line closes a bracket that was opened in an added line.
+				// The state must not leak between projections.
+				const diff = [
+					...HEADER,
+					"@@ -1,3 +1,3 @@ ",
+					' {"token": [',
+					'-  "old-side-secret"],',
+					'+  "new-side-secret"],',
+					'  "keep": 1}',
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Both projections should have credentials redacted independently
+				expect(scrubbed).not.toContain("old-side-secret");
+				expect(scrubbed).not.toContain("new-side-secret");
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+
+				// Hunk header still parseable
+				expect(scrubbed).toContain("@@ -1,3 +1,3 @@ ");
+			});
+
+			it("[P2] projects partial redactor matches back onto mixed hunks", () => {
+				// Issue: A split key/colon JSON credential loses context
+				const diff = [
+					...HEADER,
+					"@@ -0,0 +1,5 @@ ",
+					'+  "token": [',
+					'+    "split-secret-token"',
+					"+  ],",
+					'+  "other": "value"',
+					"+}",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Split credential should be redacted
+				expect(scrubbed).not.toContain("split-secret-token");
+
+				// Line count preserved
+				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+			});
+
+			it("[P2] scrubs parsed paths in all textual diff headers", () => {
+				// C-quoted path with credential-shaped filename
+				const diff = [
+					'diff --git "a/config/ghp_secret123.env" "b/config/ghp_secret123.env"',
+					"index 1111111..2222222 100644",
+					'--- "a/config/ghp_secret123.env"',
+					'+++ "b/config/ghp_secret123.env"',
+					"@@ -1,1 +1,1 @@ ",
+					" TOKEN=abc123",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Credential-shaped path should be redacted
+				expect(scrubbed).not.toContain("ghp_secret123");
+				expect(scrubbed).toContain("file-redacted");
+			});
+
+			it("[P3] redacts paths repeated in binary-diff summaries", () => {
+				// Binary files line with credential-shaped paths
+				const diff = [
+					"diff --git a/secret.bin b/secret.bin",
+					"Binary files a/secret.bin and b/secret.bin differ",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Paths in binary files line should be redacted
+				expect(scrubbed).not.toContain("secret.bin");
+				expect(scrubbed).toContain("file-redacted");
+			});
+		});
 	});
 });
