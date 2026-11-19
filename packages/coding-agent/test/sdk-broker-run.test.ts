@@ -205,3 +205,29 @@ it("exits 1 through the public failure boundary when startup throws", async () =
 	// Nothing was published: the blocking file is still the only thing at the state path.
 	expect(await fs.readFile(path.join(dir, "sdk"), "utf8")).toBe("not a directory");
 }, 90_000);
+
+it("exits 1 through the public failure boundary when an existing broker lock is refused", async () => {
+	const dir = await agentDir();
+	const lock = path.join(dir, "sdk", "broker.lock");
+	await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+	// A live pid with no host identity: the legacy shape the broker must refuse, never reclaim.
+	await Bun.write(
+		path.join(lock, "owner.json"),
+		JSON.stringify({
+			version: 1,
+			ownerId: "legacy-owner",
+			pid: process.pid,
+			incarnation: brokerProcessIncarnation(process.pid),
+		}),
+	);
+	const run = brokerRun(dir);
+	const [exitCode, stderr] = await Promise.all([run.exited, new Response(run.stderr).text()]);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("Code: host_unqualified");
+	expect(stderr).toContain('ERROR {"code":"broker_unavailable"');
+	expect(stderr).toContain('"outcomeCertainty":"not-applied"');
+	expect(stderr).toContain("lock_refused");
+	// The command is already `broker run`: it must not tell the operator to run itself.
+	expect(stderr).not.toContain("Run the broker in the foreground");
+	expect(await Bun.file(path.join(lock, "owner.json")).json()).toMatchObject({ ownerId: "legacy-owner" });
+}, 90_000);

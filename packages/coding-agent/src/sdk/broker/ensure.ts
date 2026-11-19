@@ -626,6 +626,8 @@ function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): s
 		return `SDK broker startup blocked by retained removal transition ${record.blockingLockPath}.`;
 	if (record.reason === "startup-lock-unavailable")
 		return `SDK broker startup could not acquire required lock ${record.blockingLockPath}.`;
+	if (record.reason === "startup-lock-refused")
+		return `SDK broker startup refused existing lock ${record.blockingLockPath} (${record.refusalCode}).`;
 	if (record.reason === "startup-deadline")
 		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
 	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
@@ -1865,6 +1867,7 @@ async function ensureBrokerOnce(
 						reason:
 							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
+						lockRefused: trustedStartupExitRecord?.reason === "startup-lock-refused",
 					})
 				: discoveryError
 					? discoveryError

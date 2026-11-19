@@ -122,6 +122,27 @@ describe("bash-shell-guardian", () => {
 			expect(authenticated?.processRef).toBeUndefined();
 		});
 
+		it("keeps a record pending while its live process cannot be referenced", () => {
+			// A live process can deny the authority Process.fromPid needs (so it returns null) while
+			// Process.observe still reads it: that proves liveness, not ownership, so it must not settle.
+			const line = JSON.stringify({ pid: 4321, incarnation: "live-inc", signature: sign(4321, "live-inc", "") });
+			const bindings = (observation: { status: string; incarnation?: string }) =>
+				({ fromPid: () => null, observe: () => observation }) as never;
+			const samePresent = authenticateOwnershipRecord(
+				line,
+				token,
+				bindings({ status: "present", incarnation: "live-inc" }),
+			);
+			expect(samePresent?.pending).toBe(true);
+			expect(samePresent?.processRef).toBeUndefined();
+			// A different incarnation or a confirmed absence proves the recorded process is gone.
+			expect(
+				authenticateOwnershipRecord(line, token, bindings({ status: "present", incarnation: "replacement" }))
+					?.pending,
+			).toBeUndefined();
+			expect(authenticateOwnershipRecord(line, token, bindings({ status: "absent" }))?.pending).toBeUndefined();
+		});
+
 		it("binds the Darwin unique id into the signature", () => {
 			const signature = sign(1234, "uuid-abc", "");
 			const forged = JSON.stringify({ pid: 1234, incarnation: "uuid-abc", darwinUniqueId: "42", signature });

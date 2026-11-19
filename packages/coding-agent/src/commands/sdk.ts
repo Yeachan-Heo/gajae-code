@@ -60,6 +60,7 @@ import {
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
+import { type BrokerLockRefusalCode, BrokerLockRefusedError } from "../sdk/broker/lock-refusal";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
@@ -1979,6 +1980,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		signal: "SIGTERM" | "SIGINT" | null,
 		timeoutMs?: number,
 		blockingLockPath?: string,
+		refusalCode?: BrokerLockRefusalCode,
 	): BrokerStartupExitRecord & Record<string, unknown> => ({
 		version: 1,
 		reason,
@@ -1992,6 +1994,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		timeoutMs: timeoutMs ?? null,
 		writtenAt: Date.now(),
 		...(blockingLockPath === undefined ? {} : { blockingLockPath }),
+		...(refusalCode === undefined ? {} : { refusalCode }),
 	});
 	const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
 		const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
@@ -2033,21 +2036,24 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		signal: "SIGTERM" | "SIGINT" | null,
 		timeoutMs?: number,
 		blockingLockPath?: string,
+		refusalCode?: BrokerLockRefusalCode,
 	): Promise<boolean> => {
 		// The first startup exit cause owns both the persisted reason and the process exit code.
 		if (startupExitTask) return startupExitReason === reason ? startupExitTask : Promise.resolve(false);
 		if (startupExitRequested) return Promise.resolve(false);
 		startupExitRequested = true;
 		startupExitReason = reason;
-		const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs, blockingLockPath);
+		const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs, blockingLockPath, refusalCode);
 		const message =
 			reason === "startup-lock-blocked" && blockingLockPath
 				? `SDK broker startup blocked by retained removal transition ${blockingLockPath}.`
-				: reason === "startup-lock-unavailable"
-					? `SDK broker startup could not acquire ${blockingLockPath ?? "a required lock"}.`
-					: reason === "startup-deadline"
-						? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
-						: `SDK broker startup interrupted by ${signal} before readiness.`;
+				: reason === "startup-lock-refused"
+					? `SDK broker startup refused existing lock ${blockingLockPath} (${refusalCode}).`
+					: reason === "startup-lock-unavailable"
+						? `SDK broker startup could not acquire ${blockingLockPath ?? "a required lock"}.`
+						: reason === "startup-deadline"
+							? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
+							: `SDK broker startup interrupted by ${signal} before readiness.`;
 		writeStartupExitLog(exitRecord, message);
 		startupExitTask = (async () => {
 			const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
@@ -2369,6 +2375,10 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		} else if (error instanceof FileLockAcquireError) {
 			// Nested lock failures or non-orphan-transition errors
 			await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.orphanPath ?? error.lockPath);
+		} else if (error instanceof BrokerLockRefusedError) {
+			// A live, foreign-host or host-unqualified broker.lock is never displaced; the
+			// typed record lets the spawning client report the refusal instead of a bare exit.
+			await exitDuringStartup("startup-lock-refused", 1, null, undefined, error.lockPath, error.code);
 		}
 		if (broker) {
 			try {
@@ -2395,6 +2405,19 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			markerWritten,
 		});
 		unregisterPostmortem();
+		if (error instanceof BrokerLockRefusedError) {
+			// An operator condition, not a crash: report the lock on stderr, with no uncaught-exception record.
+			process.stderr.write(brokerLockRefusalReport(error));
+			// `gjc sdk broker run` keeps failing through the public failure boundary like every other startup failure.
+			if (publicBrokerRun)
+				throw new PublicCommandFailure({
+					kind: "broker_unavailable",
+					proof: "pre-effect",
+					diagnostics: ["lock_refused"],
+				});
+			process.exitCode = 1;
+			return;
+		}
 		throw error;
 	}
 	if (!broker) {
@@ -2457,4 +2480,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 function failPublicBrokerRun(agentDir: string): void {
 	process.stderr.write(`gjc sdk broker run: another SDK broker already owns ${agentDir}.\n`);
 	process.exitCode = 1;
+}
+
+/** Operator report for a refused `broker.lock`: the lock, the refusal code, and a recovery step that never displaces the lock. */
+function brokerLockRefusalReport(error: BrokerLockRefusedError): string {
+	const recovery =
+		error.code === "host_unqualified"
+			? "follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks after every broker using this agent directory has stopped."
+			: error.code === "foreign_host"
+				? "stop the broker on the host that owns this lock; its liveness cannot be verified from this host."
+				: `wait for broker pid ${error.ownerPid} to publish discovery, or stop it, then retry.`;
+	return `SDK broker startup refused an existing lock.\nLock: ${error.lockPath}\nCode: ${error.code}\nRecovery: ${recovery}\n`;
 }

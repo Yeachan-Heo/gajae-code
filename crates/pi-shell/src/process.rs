@@ -37,8 +37,9 @@ pub enum ProcessObservation {
 		incarnation: String,
 	},
 	/// The operating system positively confirmed that no process currently
-	/// has this pid. This is proof of death, not merely an unread process
-	/// table.
+	/// has this pid, or (Windows) that the process has exited even though an
+	/// open handle still keeps its object queryable. This is proof of death,
+	/// not merely an unread process table.
 	Absent,
 	/// The query could not determine liveness: permission denial, a platform
 	/// limitation, an invalid (non-positive) pid, or a transient I/O
@@ -1389,6 +1390,7 @@ mod platform {
 	const PROCESS_REFERENCE_ACCESS: u32 =
 		PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
 	const WAIT_OBJECT_0: u32 = 0;
+	const WAIT_TIMEOUT: u32 = 258;
 
 	#[link(name = "kernel32")]
 	unsafe extern "system" {
@@ -1493,7 +1495,7 @@ mod platform {
 
 		/// Kernel-derived identity evidence for this exact process incarnation.
 		pub fn incarnation(&self) -> String {
-			format!("windows:{}", self.creation_time)
+			windows_incarnation(self.creation_time)
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -1917,28 +1919,48 @@ mod platform {
 	const ERROR_INVALID_PARAMETER: u32 = 87;
 
 	/// Read-only observation of whether `pid` currently names a verifiable
-	/// process incarnation. Never signals, kills, reaps, or waits.
+	/// process incarnation. Never signals, kills, reaps, or blocks on exit.
 	pub fn observe_pid(pid: i32) -> ProcessObservation {
 		if pid <= 0 {
 			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
 		}
-		if let Some(process) = Process::from_pid(pid) {
-			return ProcessObservation::Present { incarnation: process.incarnation() };
-		}
 		let Ok(pid_u32) = u32::try_from(pid) else {
 			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
 		};
-		// `Process::from_pid` failed above; probe again with the minimal query
-		// access right so a permission-restricted-but-alive process (which denies
-		// the fuller `PROCESS_REFERENCE_ACCESS` set) is not misreported as absent.
+		// Observation needs no termination authority. Open its own read-only
+		// reference rather than going through `from_pid`, which accepts an exited
+		// process whose object a handle still pins and would report it as present.
+		if let Some(handle) = open_process(pid_u32, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) {
+			// An open handle pins the process object, not its liveness: Windows
+			// keeps exited objects queryable while any handle remains open. Query
+			// the exit state on this same pinned identity without blocking. Do not
+			// use `status()`, which conservatively maps failed probes to Running.
+			// SAFETY: this owned handle has SYNCHRONIZE access and remains valid
+			// throughout the zero-timeout query; this does not wait for exit.
+			return match unsafe { WaitForSingleObject(handle.as_raw(), 0) } {
+				WAIT_OBJECT_0 => ProcessObservation::Absent,
+				WAIT_TIMEOUT => match process_creation_time(handle.as_raw()) {
+					Some(creation_time) => {
+						ProcessObservation::Present { incarnation: windows_incarnation(creation_time) }
+					},
+					None => {
+						ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() }
+					},
+				},
+				_ => ProcessObservation::Unknown { reason_code: "exit_state_unavailable".to_owned() },
+			};
+		}
+		// The query-plus-synchronize request failed above; probe again with
+		// query-only access so denial of SYNCHRONIZE is not treated as absence.
 		// SAFETY: `OpenProcess` takes the access mask and pid by value and does not
 		// dereference caller-owned memory. The handle, if any, is immediately
 		// wrapped for RAII closure.
 		let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_u32) };
 		if let Some(owned) = OwnedHandle::from_raw(handle) {
-			// The process exists (the OS handed back a valid handle) but identity
-			// (creation time) could not be pinned by `Process::from_pid`'s stricter
-			// access request — not proof of death.
+			// This process object may be live or exited. Query-only access does
+			// not permit the SYNCHRONIZE exit-state probe, and failure of the
+			// stricter reference request is not proof of death. Keep this unknown
+			// rather than broadening rights or inferring liveness from a handle.
 			drop(owned);
 			return ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() };
 		}
@@ -1950,6 +1972,11 @@ mod platform {
 		} else {
 			ProcessObservation::Unknown { reason_code: "permission_denied".to_owned() }
 		}
+	}
+
+	/// Incarnation string for a Windows process with this creation time.
+	fn windows_incarnation(creation_time: u64) -> String {
+		format!("windows:{creation_time}")
 	}
 
 	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
@@ -2023,9 +2050,9 @@ impl Process {
 	/// queried") or [`Self::status`] mapping an identity-check failure to
 	/// [`ProcessStatus::Exited`] on Darwin, `observe` keeps positive OS-reported
 	/// absence separate from every inconclusive outcome. It never signals,
-	/// kills, reaps, waits on, or spawns any process — it only reads existing
-	/// kernel state (pidfd status on Linux, `sysctl`/`kill(pid, 0)` on macOS,
-	/// `OpenProcess` on Windows).
+	/// kills, reaps, blocks waiting on, or spawns any process — it only reads
+	/// existing kernel state (pidfd status on Linux, `sysctl`/`kill(pid, 0)` on
+	/// macOS, `OpenProcess` and a zero-timeout exit-state query on Windows).
 	pub fn observe(pid: i32) -> ProcessObservation {
 		platform::observe_pid(pid)
 	}
@@ -3036,17 +3063,8 @@ mod tests {
 
 		child.kill().expect("kill owned child");
 		child.wait().expect("reap owned child");
-		// Release the child handle before asserting absence. `wait` reaps the
-		// child but `std::process::Child` closes the underlying handle only on
-		// drop, and Windows keeps a process object — with its creation-time
-		// identity, so `OpenProcess` and `from_pid` both still succeed — alive
-		// for as long as any handle to it is open. Holding `child` past the
-		// reap therefore pins the very incarnation this test waits to see
-		// disappear (observed in CI: `Present { incarnation:
-		// "windows:134341044275280593" }` for the whole 2s poll budget). The
-		// assertion below still demands a positive `Absent`, so dropping the
-		// handle removes a fixture artifact rather than weakening the contract.
-		drop(child);
+		// `child` stays alive here: on Windows its handle keeps the exited process
+		// object queryable, and `observe` must still report it as `Absent`.
 
 		// Process-table absence is not guaranteed to be visible to the very next
 		// observation on every platform; poll briefly for the confirmed-dead
@@ -3065,8 +3083,6 @@ mod tests {
 			ProcessObservation::Absent,
 			"owned exited child must observe as positively absent",
 		);
-		// observe() and from_pid() must never disagree about a confirmed-dead pid.
-		assert!(Process::from_pid(pid).is_none());
 	}
 
 	/// Non-positive pids can never name a single process (0 is reserved,

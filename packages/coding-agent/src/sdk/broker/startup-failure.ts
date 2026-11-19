@@ -217,8 +217,16 @@ export class BrokerStartupError extends Error {
 	readonly signal: string | null;
 	readonly reason: string;
 	readonly stderrExcerpt?: string;
+	/** The broker's trusted startup-exit record says it refused an existing `broker.lock`. */
+	readonly lockRefused: boolean;
 
-	constructor(fields: { exitCode: number | null; signal: string | null; reason: string; stderrExcerpt?: string }) {
+	constructor(fields: {
+		exitCode: number | null;
+		signal: string | null;
+		reason: string;
+		stderrExcerpt?: string;
+		lockRefused?: boolean;
+	}) {
 		super(
 			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${fields.stderrExcerpt ? ` Broker stderr: ${fields.stderrExcerpt}` : ""}`,
 		);
@@ -227,5 +235,6 @@ export class BrokerStartupError extends Error {
 		this.signal = fields.signal;
 		this.reason = fields.reason;
 		this.stderrExcerpt = fields.stderrExcerpt;
+		this.lockRefused = fields.lockRefused ?? false;
 	}
 }

@@ -25,6 +25,7 @@ import {
 	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { BrokerStartupError } from "../broker/startup-failure";
 import { bounded, readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
@@ -229,6 +230,24 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	});
 }
 
+/**
+ * `broker_unavailable` with the fixed `lock_refused` diagnostic when a detached
+ * broker refused an existing `broker.lock`; `undefined` for any other error.
+ * Neither the lock path nor the broker's message is exposed.
+ */
+export function brokerLockRefusalFailure(error: unknown, details?: unknown): PublicCommandFailure | undefined {
+	// `ensureBroker` reports a failed cleanup of the spawned broker as
+	// `AggregateError([startupFailure, cleanupError])`. The refusal stays the reported cause and
+	// the unverified cleanup is reported next to it, never dropped.
+	const cleanupUnverified = error instanceof AggregateError;
+	const primary = cleanupUnverified ? error.errors[0] : error;
+	if (!(primary instanceof BrokerStartupError) || !primary.lockRefused) return undefined;
+	return new PublicCommandFailure({
+		...sdkPublicFailure("broker_unavailable", details, "pre-send").input,
+		diagnostics: cleanupUnverified ? ["lock_refused", "broker_cleanup_unverified"] : ["lock_refused"],
+	});
+}
+
 function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): PublicCommandFailure {
 	if (error instanceof PublicCommandFailure)
 		return new PublicCommandFailure({
@@ -243,6 +262,8 @@ function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): Publi
 			],
 		});
 	const context = { sessionId: args.sessionId, operationRef: args.opRef, idempotencyKey: args.idempotencyKey };
+	const lockFailure = brokerLockRefusalFailure(error, context);
+	if (lockFailure) return lockFailure;
 	if (error instanceof SdkSessionCliError)
 		return sdkPublicFailure(
 			error.exitCode === 2 && error.code !== "invalid_json" ? "usage" : error.code,
