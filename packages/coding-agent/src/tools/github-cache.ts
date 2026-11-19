@@ -350,8 +350,7 @@ function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unk
 			let hasCredentialComponent = false;
 
 			for (const component of components) {
-				// Match only if the credential keyword is a clear part of the component name
-				// This includes patterns like:
+				// Match keyword-shaped credential patterns:
 				// - secret-key, secret_key, secret.key
 				// - api-key.json, apikey.env
 				// - password.conf, .env.password
@@ -360,6 +359,13 @@ function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unk
 					/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
 
 				if (credentialPattern.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+
+				// Also check for GitHub token patterns (ghp_, gho_, ghu_, ghs_, ghr_)
+				// These patterns are also redacted in diff headers
+				if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
 					hasCredentialComponent = true;
 					break;
 				}
