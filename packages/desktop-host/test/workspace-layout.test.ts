@@ -14,6 +14,7 @@ import {
 	captureSessionView,
 	createAgentSession,
 	type ExtensionContext,
+	type ExtensionFactory,
 	restoreSessionView,
 	type SdkSessionView,
 } from "@gajae-code/coding-agent/sdk";
@@ -141,9 +142,11 @@ async function launch(
 
 async function launchFinalView({
 	explicitResumeProviderScope = false,
+	extensions = [],
 	onSessionStart,
 }: {
 	explicitResumeProviderScope?: boolean;
+	extensions?: ExtensionFactory[];
 	onSessionStart?: (context: ExtensionContext) => Promise<void>;
 } = {}) {
 	process.env.GJC_NO_TITLE = "1";
@@ -168,8 +171,8 @@ async function launchFinalView({
 					: {}),
 				model,
 				extensions: onSessionStart
-					? [extension => extension.on("session_start", (_event, context) => onSessionStart(context))]
-					: [],
+					? [...extensions, extension => extension.on("session_start", (_event, context) => onSessionStart(context))]
+					: extensions,
 				systemPrompt: ["Test"],
 				toolNames: [],
 				skills: [],
@@ -695,10 +698,26 @@ describe("desktop workspace layout", () => {
 		"continued",
 		"root",
 		"superseded",
+		"handled",
 	] as const)("workspace close drains an exclusive %s view behind its pending terminal receipt", async selection => {
 		const contexts = [0, 1, 2].map(() => Promise.withResolvers<ExtensionContext>());
 		let starts = 0;
+		const finalInput = "final exclusive append";
+		const handledEntry = {
+			customType: "handled-input",
+			content: finalInput,
+			display: true,
+			attribution: "user",
+		} as const;
+		const handleInput: ExtensionFactory = extension => {
+			extension.on("input", event => {
+				if (event.text !== finalInput) return;
+				extension.sendMessage(handledEntry, { triggerTurn: false });
+				return { handled: true };
+			});
+		};
 		const { call, open, created, model, readCatalog, dataDir } = await launchFinalView({
+			extensions: selection === "handled" ? [handleInput] : [],
 			onSessionStart: async context => contexts[starts++]!.resolve(context),
 		});
 		const project = await open("first");
@@ -742,21 +761,25 @@ describe("desktop workspace layout", () => {
 			disposed.resolve();
 		});
 		let responded = false;
-		const prompting = call("prompt", { sessionId: session.id, text: "final exclusive append" }, requestId).then(
-			() => {
-				responded = true;
-			},
-		);
+		const prompting = call("prompt", { sessionId: session.id, text: finalInput }, requestId).then(() => {
+			responded = true;
+		});
 		let closing: Promise<unknown> | undefined;
 		try {
 			await entered.promise;
 			if (!final) throw new Error("Missing exclusive operation's final view");
 			expect(final).not.toEqual(initial);
 			if (selection === "root") expect(final.leafEntryId).toBeNull();
+			if (selection === "handled") {
+				expect(final.leafEntryId).not.toBeNull();
+				expect(sdk.sessionManager.getLeafEntry()).toMatchObject({ type: "custom_message", ...handledEntry });
+				expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(initial);
+			}
 			expect(sdk.isStreaming).toBe(false);
 			closing = call("project.close", { projectId: project.id });
 			await closing;
-			// Actual teardown takes the settled view without claiming the held receipt completed.
+			// Check persistence before joining disposal, so a missing handoff fails on the stale view.
+			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(final);
 			await disposed.promise;
 			expect(responded).toBe(false);
 			expect(disposal).toHaveBeenCalledTimes(1);
@@ -767,13 +790,15 @@ describe("desktop workspace layout", () => {
 				path.join(dataDir, "deliveries.json"),
 			).json();
 			expect(journal.receipts).toContainEqual(expect.objectContaining(pending));
-			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(final);
+			await expect(call("delivery.ack", { deliveryId: requestId })).rejects.toThrow("Delivery is not final");
 			await open("first");
 			await call("session.select", { sessionId: session.id });
 			expect(created).toHaveLength(2);
 			const successor = created[1]!.session;
 			expect(captureSessionView(successor)).toEqual(final);
 			if (selection === "root") expect(captureSessionView(successor).leafEntryId).toBeNull();
+			if (selection === "handled")
+				expect(successor.sessionManager.getLeafEntry()).toMatchObject({ type: "custom_message", ...handledEntry });
 			let expected = final;
 			if (selection === "superseded") {
 				await restoreSessionView(successor, { sessionId: successor.sessionId, leafEntryId: null });
@@ -825,7 +850,7 @@ describe("desktop workspace layout", () => {
 			const reopened = captureSessionView(created.at(-1)!.session);
 			expect(reopened).toEqual(expected);
 			if (selection === "root" || selection === "superseded") expect(reopened.leafEntryId).toBeNull();
-			expect(model.calls).toHaveLength(2);
+			expect(model.calls).toHaveLength(selection === "handled" ? 1 : 2);
 		} finally {
 			release.resolve();
 			await prompting;

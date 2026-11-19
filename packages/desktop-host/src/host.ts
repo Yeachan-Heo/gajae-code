@@ -1957,6 +1957,7 @@ export class DesktopHost {
 		text: string,
 		images: ImageContent[],
 		allowGateMutation = false,
+		beforeTerminal?: () => Promise<void>,
 	): Promise<{ handled: boolean; text: string; images: ImageContent[] }> {
 		const runner = live.sdk.extensionRunner;
 		if (!runner?.hasHandlers("input")) return { handled: false, text, images };
@@ -1966,6 +1967,7 @@ export class DesktopHost {
 		try {
 			result = await runner.emitInput(text, images.length ? images : undefined, "interactive");
 		} catch (error) {
+			if (beforeTerminal) await beforeTerminal();
 			await this.#delivery(id, { disposition: "unknown", error: "Extension input outcome unknown" });
 			throw error;
 		}
@@ -1975,10 +1977,12 @@ export class DesktopHost {
 			live.sdk.sessionLifecycle.generation !== generation ||
 			(live.gateMutation && !allowGateMutation)
 		) {
+			if (beforeTerminal) await beforeTerminal();
 			await this.#delivery(id, { disposition: "unknown", error: "Session changed during extension input" });
 			throw new Error("Session changed during extension input");
 		}
 		if (result.handled) {
+			if (beforeTerminal) await beforeTerminal();
 			await this.#delivery(id, { disposition: "completed" });
 			return { handled: true, text, images };
 		}
@@ -2044,6 +2048,7 @@ export class DesktopHost {
 		id: string,
 		text: string,
 		images: ImageContent[],
+		settleView: () => void,
 		alreadyBegun = false,
 		allowGateMutation = false,
 		editEntryId?: string,
@@ -2051,7 +2056,19 @@ export class DesktopHost {
 		let completeTask = this.#localTaskCompletion(live);
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
-		const input = await this.#extensionInput(live, id, text, images, allowGateMutation);
+		const settleTerminalView = async () => {
+			// An extension or a rejected invocation can leave SDK work running. Do not
+			// transfer the view until it settles, or replace the delivery's own error.
+			if (live.sdk.isAwaitingIdle) {
+				try {
+					await live.sdk.waitForIdle();
+				} catch {
+					return;
+				}
+			}
+			settleView();
+		};
+		const input = await this.#extensionInput(live, id, text, images, allowGateMutation, settleTerminalView);
 		if (input.handled) return;
 		accepted = this.#deliveries.list().some(receipt => receipt.id === id && receipt.disposition === "accepted");
 		text = input.text;
@@ -2095,6 +2112,7 @@ export class DesktopHost {
 			else await live.sdk.prompt(text, options);
 			await live.sdk.waitForIdle();
 		} catch (error) {
+			await settleTerminalView();
 			await this.#delivery(
 				id,
 				journalFailed
@@ -2112,7 +2130,7 @@ export class DesktopHost {
 		}
 		// SDK idle is distinct from durable terminal delivery. Retirement may now take
 		// the final view while this request continues to own its pending journal write.
-		live.exclusiveViewHandoff?.settle();
+		settleView();
 		const owned = run.started ? terminals.get(scopeKey(run.started.scope)) : undefined;
 		if (owned?.assistant === "error" || owned?.assistant === "aborted" || owned?.reason === "cancelled") {
 			await this.#delivery(id, {
@@ -2142,7 +2160,7 @@ export class DesktopHost {
 	}
 	async #exclusive<T>(
 		live: LiveSession,
-		operation: () => Promise<T>,
+		operation: (settleView: () => void) => Promise<T>,
 		retireGates = false,
 		persistSource = true,
 		// Only a prompt whose turn failed describes the conversation. The `prompt`
@@ -2173,7 +2191,7 @@ export class DesktopHost {
 		live.exclusiveViewHandoff = viewHandoff;
 		try {
 			if (retireGates) await live.gatePresenter?.withdrawAll();
-			return await operation();
+			return await operation(() => viewHandoff?.settle());
 		} catch (error) {
 			if (
 				recordFailure &&
@@ -2982,8 +3000,8 @@ export class DesktopHost {
 			}
 			return this.#exclusive(
 				live,
-				async () => {
-					await this.#promptDelivery(live, request.id, text, images, true, false, editEntryId);
+				async settleView => {
+					await this.#promptDelivery(live, request.id, text, images, settleView, true, false, editEntryId);
 					return null;
 				},
 				false,
@@ -3730,12 +3748,13 @@ export class DesktopHost {
 			// would report success and an unknown name would spend a provider turn.
 			return { consumed: false, refused: true, output: DESKTOP_UNAVAILABLE };
 		// Commands mutate the same session as prompts, so they take the same lock.
-		return this.#exclusive(live, () => this.#runCommand(live, text, requestId, alreadyBegun), true);
+		return this.#exclusive(live, settleView => this.#runCommand(live, text, requestId, settleView, alreadyBegun), true);
 	}
 	async #runCommand(
 		live: LiveSession,
 		text: string,
 		requestId: string,
+		settleView: () => void,
 		alreadyBegun = false,
 	): Promise<DesktopCommandResult> {
 		const chunks: string[] = [];
@@ -3798,7 +3817,7 @@ export class DesktopHost {
 				// A builtin that returns a prompt starts a real turn, so its failure is the
 				// conversation's failure even though command.run itself is administrative.
 				try {
-					await this.#promptDelivery(live, requestId, forwarded, [], alreadyBegun, true);
+					await this.#promptDelivery(live, requestId, forwarded, [], settleView, alreadyBegun, true);
 				} catch (error) {
 					if (
 						!live.errorOwner &&
