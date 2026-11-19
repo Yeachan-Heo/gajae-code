@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as publicOwnerGroup from "@gajae-code/coding-agent/session/owner-group";
 import { createCooperativeOwnerInspectors } from "../../src/sdk/native-ownership";
 import { captureNativeResumeTranscript, nativeResumeBinding, resumeDigest } from "../../src/session/native-resume";
 import {
@@ -14,6 +15,7 @@ import {
 import { reduceResumeTranscript, resolveResumeCheckpoint } from "../../src/session/resume-cursor";
 import type { ResumeRouting } from "../../src/session/resume-operation";
 import { BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, type FileEntry, SessionManager } from "../../src/session/session-manager";
+import { prepareNativeBranchSuccessor } from "../../src/session/session-manager-internal";
 import {
 	FileSessionStorage,
 	type SessionDurabilityRepairRange,
@@ -190,6 +192,16 @@ async function selectedForkFixture(managed: boolean) {
 }
 
 describe("native selected branch successor preparation", () => {
+	it("does not expose preparation or dual-owner publication as package APIs", () => {
+		expect("prepareNativeBranchSuccessor" in SessionManager.prototype).toBe(false);
+		expect("withNativeForkSuccessorPublication" in publicOwnerGroup).toBe(false);
+		expect(() =>
+			Bun.resolveSync("@gajae-code/coding-agent/session/session-manager-internal", import.meta.dir),
+		).toThrow();
+		expect(() =>
+			Bun.resolveSync("@gajae-code/coding-agent/session/internal/native-fork-owner-publication", import.meta.dir),
+		).toThrow();
+	});
 	for (const managed of [false, true]) {
 		for (const selectedEntryId of ["first", "selected"] as const) {
 			it.skipIf(process.platform === "win32")(
@@ -229,7 +241,7 @@ describe("native selected branch successor preparation", () => {
 						};
 						return writer;
 					});
-					const b = await a.manager.prepareNativeBranchSuccessor({
+					const b = await prepareNativeBranchSuccessor(a.manager, {
 						sourceOp: a.pending,
 						selectedEntryId,
 						reserve: async identity => {
@@ -330,7 +342,7 @@ describe("native selected branch successor preparation", () => {
 			const { fork: a, aFile, aBytes, storage } = await selectedForkFixture(false);
 			const reserve = vi.fn(async () => {});
 			await expect(
-				a.manager.prepareNativeBranchSuccessor({
+				prepareNativeBranchSuccessor(a.manager, {
 					sourceOp: { ...a.pending },
 					selectedEntryId: "selected",
 					reserve,
@@ -340,7 +352,7 @@ describe("native selected branch successor preparation", () => {
 			let candidate: string | undefined;
 			const open = vi.spyOn(storage, "openStagedWriter");
 			await expect(
-				a.manager.prepareNativeBranchSuccessor({
+				prepareNativeBranchSuccessor(a.manager, {
 					sourceOp: a.pending,
 					selectedEntryId: "selected",
 					reserve: async identity => {
@@ -369,7 +381,7 @@ describe("native selected branch successor preparation", () => {
 			const open = vi.spyOn(storage, "openStagedWriter");
 			let candidate: string | undefined;
 			await expect(
-				a.manager.prepareNativeBranchSuccessor({
+				prepareNativeBranchSuccessor(a.manager, {
 					sourceOp: a.pending,
 					selectedEntryId: "selected",
 					reserve: async ({ file }) => {
@@ -425,7 +437,7 @@ describe("native selected branch successor preparation", () => {
 					return writer;
 				});
 				let candidate: string | undefined;
-				const retained = await a.manager.prepareNativeBranchSuccessor({
+				const retained = await prepareNativeBranchSuccessor(a.manager, {
 					sourceOp: a.pending,
 					selectedEntryId: "selected",
 					reserve: async ({ file }) => {
@@ -453,6 +465,66 @@ describe("native selected branch successor preparation", () => {
 		);
 	}
 
+	for (const owner of ["A", "B"] as const) {
+		it.skipIf(process.platform === "win32")(
+			`refuses B publication when ${owner}'s acquired lock is replaced at staged close`,
+			async () => {
+				const { fork: a, aFile, aBytes, storage, sourceFile, sourceBytes } = await selectedForkFixture(true);
+				const aKey = a.manager.getSessionOwnerEvidence()!.authorityKey;
+				const aOwnerBytes = storage.readTextSync(aKey);
+				let candidate: { file: string; authorityKey: string } | undefined;
+				let replacement: { file: string; bytes: string; ino: bigint; bOwnerBytes: string } | undefined;
+				const open = storage.openStagedWriter.bind(storage);
+				const dispatch = vi.fn();
+				vi.spyOn(storage, "openStagedWriter").mockImplementation((file, options) => {
+					const writer = open(file, options);
+					const close = writer.closeSync.bind(writer);
+					writer.closeSync = () => {
+						close();
+						if (!candidate) throw new Error("B was not reserved");
+						const bOwnerBytes = storage.readTextSync(candidate.authorityKey);
+						const lock = `${owner === "A" ? aKey : candidate.authorityKey}.lock`;
+						const bytes = storage.readTextSync(lock);
+						fs.renameSync(lock, `${lock}.displaced`);
+						// Copy even the old token and digest: the acquired inode is still displaced.
+						fs.writeFileSync(lock, bytes, { mode: 0o600, flag: "wx" });
+						replacement = { file: lock, bytes, ino: fs.lstatSync(lock, { bigint: true }).ino, bOwnerBytes };
+					};
+					const publish = writer.publishNoReplace.bind(writer);
+					writer.publishNoReplace = () => {
+						dispatch();
+						return publish();
+					};
+					return writer;
+				});
+				const retained = await prepareNativeBranchSuccessor(a.manager, {
+					sourceOp: a.pending,
+					selectedEntryId: "selected",
+					reserve: async ({ file, sessionId }) => {
+						const { authorityKey } = captureOwnerTargetSync({ transcriptPath: file, headerId: sessionId });
+						candidate = { file, authorityKey };
+					},
+				});
+				if (retained.kind !== "native_fork_retained") throw new Error(`B was not retained: ${retained.kind}`);
+				managers.push(retained.manager);
+				if (!candidate || !replacement) throw new Error("B did not reach staged close");
+				expect(retained.proven).toBe(false);
+				expect(retained.receipt).toBeUndefined();
+				expect(retained.error).toMatchObject({ code: "authority_changed", message: "authority_changed" });
+				expect(nativeResumeBinding(retained.pending).initialPublication).toBeUndefined();
+				expect(dispatch).not.toHaveBeenCalled();
+				expect(fs.existsSync(candidate.file)).toBe(false);
+				expect(storage.readTextSync(aFile)).toBe(aBytes);
+				expect(storage.readTextSync(sourceFile)).toBe(sourceBytes);
+				expect(storage.readTextSync(aKey)).toBe(aOwnerBytes);
+				expect(storage.readTextSync(candidate.authorityKey)).toBe(replacement.bOwnerBytes);
+				expect(storage.readTextSync(replacement.file)).toBe(replacement.bytes);
+				expect(storage.readTextSync(`${replacement.file}.displaced`)).toBe(replacement.bytes);
+				expect(fs.lstatSync(replacement.file, { bigint: true }).ino).toBe(replacement.ino);
+			},
+		);
+	}
+
 	it.skipIf(process.platform === "win32")(
 		"retains the exact B operation and receipt after a hostile late abort",
 		async () => {
@@ -473,7 +545,7 @@ describe("native selected branch successor preparation", () => {
 				return writer;
 			});
 			let candidate: string | undefined;
-			const retained = await a.manager.prepareNativeBranchSuccessor({
+			const retained = await prepareNativeBranchSuccessor(a.manager, {
 				sourceOp: a.pending,
 				selectedEntryId: "selected",
 				signal: abort.signal,
@@ -532,7 +604,7 @@ describe("native selected branch successor preparation", () => {
 					};
 					return writer;
 				});
-				const result = a.manager.prepareNativeBranchSuccessor({
+				const result = prepareNativeBranchSuccessor(a.manager, {
 					sourceOp: a.pending,
 					selectedEntryId: "selected",
 					reserve: async identity => {

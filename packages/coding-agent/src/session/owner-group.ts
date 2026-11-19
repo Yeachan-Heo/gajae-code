@@ -7,6 +7,7 @@ import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { parseMacPlatformUuid, parseWindowsMachineGuid } from "../config/machine-identity";
 import { isProcessIncarnation } from "../sdk/broker/process-incarnation";
 import { statFromNode } from "../sdk/session-readonly/storage";
+import { bindNativeForkOwnerPublication } from "./internal/native-fork-owner-publication";
 import type { SdkResumeCheckpoint } from "./resume-cursor";
 import { FileSessionStorage, type SessionStorageExclusiveLock } from "./session-storage";
 
@@ -670,6 +671,18 @@ function exactIdentity(file: FileBytes, parent: OwnerRoot): NativeExactFileIdent
 		sha256: file.digest,
 	};
 }
+function sameExactIdentity(a: NativeExactFileIdentity, b: NativeExactFileIdentity): boolean {
+	return (
+		a.dev === b.dev &&
+		a.ino === b.ino &&
+		a.nlink === b.nlink &&
+		a.parentDev === b.parentDev &&
+		a.parentIno === b.parentIno &&
+		a.size === b.size &&
+		a.mtimeNs === b.mtimeNs &&
+		a.sha256 === b.sha256
+	);
+}
 function exactRemove(target: OwnerTarget, snapshot: RecordSnapshot): void {
 	if (!snapshot.file || !snapshot.ownerDirectory) return;
 	assertSnapshot(target, snapshot);
@@ -825,6 +838,21 @@ interface AuthorityLock {
 	root: OwnerRoot;
 	lock: SessionStorageExclusiveLock;
 }
+function assertAcquiredAuthorityLock({ target, root, lock }: AuthorityLock): void {
+	const acquired = lock.acquiredFile;
+	if (!acquired || lockedDirectories.get(target.authorityKey) !== root) refuse("authority_changed");
+	try {
+		const parent = directory(target, false);
+		if (!parent || !sameRoot(parent, root)) refuse("authority_changed");
+		// The acquisition digest binds the generation token, but equal bytes alone do not prove the inode.
+		const current = readExact(`${target.authorityKey}.lock`, MAX_RECORD_BYTES, true, true, 0);
+		if (!current || !sameExactIdentity(exactIdentity(current, parent), acquired.identity))
+			refuse("authority_changed");
+		assertRoot(parent);
+	} catch {
+		refuse("authority_changed");
+	}
+}
 function releaseLocks(locks: readonly AuthorityLock[], failures: unknown[]): void {
 	for (const { target, root, lock } of locks.toReversed()) {
 		try {
@@ -894,13 +922,13 @@ async function acquireLocksBounded(targets: readonly OwnerTarget[], timeoutMs = 
 }
 async function withLocksAsync<T>(
 	targets: readonly OwnerTarget[],
-	body: () => Promise<T>,
+	body: (locks: readonly AuthorityLock[]) => Promise<T>,
 	timeoutMs = 1000,
 ): Promise<T> {
 	const locks = await acquireLocksBounded(targets, timeoutMs);
 	const failures: unknown[] = [];
 	try {
-		return await body();
+		return await body(locks);
 	} catch (error) {
 		failures.push(error);
 		throw error;
@@ -1601,7 +1629,7 @@ export async function withOwnerPublication<T>(token: OwnerMembership, body: () =
 	return withOwnerPublicationMode(token, body, false);
 }
 /** Hold both exact native authorities before B's managed transaction; only B can publish. @internal */
-export async function withNativeForkSuccessorPublication<T>(
+async function withNativeForkSuccessorPublication<T>(
 	sourceToken: OwnerMembership,
 	destinationToken: OwnerMembership,
 	body: (assertOwners: () => void) => Promise<T>,
@@ -1616,7 +1644,7 @@ export async function withNativeForkSuccessorPublication<T>(
 		refuse("policy_mismatch");
 	if (sourceTarget.authorityKey === destinationTarget.authorityKey || source.publishing || destination.publishing)
 		refuse("participation_lost");
-	return withLocksAsync([sourceTarget, destinationTarget], async () => {
+	return withLocksAsync([sourceTarget, destinationTarget], async locks => {
 		let active = true;
 		const assertOwners = (): void => {
 			if (
@@ -1632,6 +1660,7 @@ export async function withNativeForkSuccessorPublication<T>(
 			// The manager separately verifies the captured transcript name, identity and bytes.
 			currentMember(source, true, "unchecked");
 			currentMember(destination, true, "unchecked");
+			for (const lock of locks) assertAcquiredAuthorityLock(lock);
 		};
 		try {
 			assertOwners();
@@ -1641,6 +1670,8 @@ export async function withNativeForkSuccessorPublication<T>(
 		}
 	});
 }
+bindNativeForkOwnerPublication(withNativeForkSuccessorPublication);
+
 /** Cooperative refresh and publication are one authority transaction, never an unlocked revision refresh. */
 export async function withCooperativeOwnerPublication<T>(token: OwnerMembership, body: () => Promise<T>): Promise<T> {
 	if (membership(token).policy.kind !== "cooperative") refuse("policy_mismatch");
@@ -1829,19 +1860,7 @@ export async function publishOwnerDirectory(
 		const lock = readExact(lockPath, MAX_RECORD_BYTES, true, true);
 		const acquired = locks[0].lock.acquiredFile;
 		if (!lock || !acquired) refuse("authority_changed");
-		const lockIdentity = exactIdentity(lock, ownerDirectory);
-		const expectedLock = acquired.identity;
-		if (
-			lockIdentity.dev !== expectedLock.dev ||
-			lockIdentity.ino !== expectedLock.ino ||
-			lockIdentity.nlink !== expectedLock.nlink ||
-			lockIdentity.parentDev !== expectedLock.parentDev ||
-			lockIdentity.parentIno !== expectedLock.parentIno ||
-			lockIdentity.size !== expectedLock.size ||
-			lockIdentity.mtimeNs !== expectedLock.mtimeNs ||
-			lockIdentity.sha256 !== expectedLock.sha256
-		)
-			refuse("authority_changed");
+		if (!sameExactIdentity(exactIdentity(lock, ownerDirectory), acquired.identity)) refuse("authority_changed");
 		let lockOwner: unknown;
 		try {
 			lockOwner = JSON.parse(lock.bytes.toString("utf8"));

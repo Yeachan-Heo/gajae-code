@@ -166,7 +166,6 @@ import {
 	settleOwnerTransfer,
 	validateCooperativeOwnerRecordSync,
 	withCooperativeOwnerPublication,
-	withNativeForkSuccessorPublication,
 	withOwnerPublication,
 	withOwnerPublicationSync,
 	withOwnerTransferPublication,
@@ -282,6 +281,7 @@ import {
 	type ManagedSessionTransactionScope,
 	withManagedSessionTransaction,
 } from "./internal/managed-session-transaction";
+import { withNativeForkSuccessorPublication } from "./internal/native-fork-owner-publication";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	applyReducerDelta,
@@ -382,7 +382,12 @@ import {
 	type SessionRecapInput,
 	toRecapLineageEntry,
 } from "./recap";
-import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
+import {
+	type NativeBranchSuccessorOptions,
+	nativeBranchSuccessorCapability,
+	type SessionManagerReadAccess,
+	sessionManagerReadCapability,
+} from "./session-manager-internal";
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
 	ManagedSessionSecurityContext,
@@ -661,13 +666,6 @@ interface FreshSessionState {
 /** Initial captured-copy identity only; no publication or cleanup rights. */
 export type SelectedForkTranscriptReservation = (identity: {
 	readonly role: "staging";
-	readonly sessionId: string;
-	readonly file: string;
-}) => Promise<void>;
-
-/** The actual absent branch successor identity; reservation grants no cleanup rights. @internal */
-type SelectedForkSuccessorReservation = (identity: {
-	readonly role: "successor";
 	readonly sessionId: string;
 	readonly file: string;
 }) => Promise<void>;
@@ -28294,12 +28292,7 @@ export class SessionManager {
 	 * native lifecycle rather than reopening B or treating a reserved name as proof.
 	 * @internal
 	 */
-	async prepareNativeBranchSuccessor(options: {
-		readonly sourceOp: PendingResumeOp;
-		readonly selectedEntryId: string;
-		readonly reserve: SelectedForkSuccessorReservation;
-		readonly signal?: AbortSignal;
-	}): Promise<NativeCapturedForkResult> {
+	async [nativeBranchSuccessorCapability](options: NativeBranchSuccessorOptions): Promise<NativeCapturedForkResult> {
 		const { sourceOp, selectedEntryId, reserve, signal } = options;
 		const file = this.#sessionFile;
 		const id = this.#sessionId;
