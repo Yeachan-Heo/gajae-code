@@ -1010,6 +1010,33 @@ describe("staged streaming writers (immutable destinations)", () => {
 		expect(file.readTextSync(destination)).toBe("one\n");
 	});
 
+	it("unregisters the staged descriptor before a dispatched close can fail", async () => {
+		const dir = await makeTempDir("gjc-staged-close-unknown-");
+		const destination = path.join(dir, "fork.jsonl");
+		const writer = new FileSessionStorage().openStagedWriter(destination);
+		writer.writeLine(Buffer.from("staged", "utf8"));
+		const unregister = vi.spyOn(FinalizationRegistry.prototype, "unregister");
+		const close = fs.closeSync;
+		const failure = new Error("staged close result lost");
+		let unregisteredAtDispatch = false;
+		const dispatch = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			unregisteredAtDispatch = unregister.mock.calls.some(([token]) => token === writer);
+			close(fd);
+			throw failure;
+		});
+		try {
+			expect(() => writer.closeSync()).toThrow(failure);
+			expect(() => writer.closeSync()).toThrow(failure);
+			expect(dispatch).toHaveBeenCalledTimes(1);
+			expect(unregisteredAtDispatch).toBe(true);
+		} finally {
+			dispatch.mockRestore();
+			unregister.mockRestore();
+		}
+		expect(() => writer.publishNoReplace()).toThrow();
+		expect(await Bun.file(destination).exists()).toBe(false);
+	});
+
 	it("memory backend mirrors the file contract (parity)", async () => {
 		const memory = new MemorySessionStorage();
 		const destination = "/sessions/fork.jsonl";

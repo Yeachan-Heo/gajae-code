@@ -2068,12 +2068,14 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			if (!closed.isFile || closed.dev !== this.#createdIdentity.dev || closed.ino !== this.#createdIdentity.ino)
 				throw new Error("staged_source_identity_changed");
 			this.#closedIdentity = closed;
+			// After dispatch the descriptor may already be closed even if close throws.
+			// Never let the finalizer close a numeric descriptor that may have been reused.
+			writerRegistry.unregister(this);
 			fs.closeSync(this.#fd);
 		} catch (err) {
 			throw this.#recordError(err);
 		}
 		this.#closed = true;
-		writerRegistry.unregister(this);
 	}
 
 	publishNoReplace(): SessionNoReplacePublicationReceipt {
