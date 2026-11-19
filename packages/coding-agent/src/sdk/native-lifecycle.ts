@@ -348,8 +348,11 @@ export async function withNativeRuntimeEffect<T>(
 		invocation.effectsStarted = true;
 		return start();
 	}
-	const admitted = await serialized(member, () =>
-		member.manager!.admitNativeRuntimeEffect(
+	const admitted = await serialized(member, async () => {
+		// A queued effect can outlive its admission. Do not enter durability repair
+		// after a TTSR publication fence, even though its callback would refuse.
+		if (member.ttsrPublicationFailed) throw new NativeRuntimeRefusal("context_mismatch");
+		return member.manager!.admitNativeRuntimeEffect(
 			invocation.op,
 			routing(member, "RECON", "RETAIN_LIVE"),
 			reconciliation => {
@@ -365,8 +368,8 @@ export async function withNativeRuntimeEffect<T>(
 				});
 			},
 			"repairDurability",
-		),
-	);
+		);
+	});
 	if (admitted.kind === "refused") throw new NativeRuntimeRefusal(admitted.reason, admitted.reconciliation);
 	return admitted.completion;
 }

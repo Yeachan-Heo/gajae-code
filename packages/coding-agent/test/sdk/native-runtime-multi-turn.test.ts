@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +11,12 @@ import {
 	prepareEmbeddedDisconnect,
 	terminateEmbeddedAgentSession,
 } from "../../src/sdk/native-embedding";
+import {
+	fenceNativeTtsrPublication,
+	invokeNativeRuntime,
+	reconcileNativeHandle,
+	withNativeRuntimeEffect,
+} from "../../src/sdk/native-lifecycle";
 import { AuthStorage } from "../../src/session/auth-storage";
 
 type Opened = Extract<NativeEmbeddedOpenResult, { kind: "opened" }>;
@@ -83,6 +89,51 @@ async function fixture() {
 }
 
 describe("native runtime multi-turn dispatch", () => {
+	it("does not start queued durability repair after a native publication fence", async () => {
+		const opened = await fixture();
+		const session = opened.result.session;
+		const manager = session.sessionManager;
+		const runtimeEntered = Promise.withResolvers<void>();
+		const runNested = Promise.withResolvers<void>();
+		const nestedQueued = Promise.withResolvers<void>();
+		const reconcileEntered = Promise.withResolvers<void>();
+		const releaseReconcile = Promise.withResolvers<void>();
+		const invocation = invokeNativeRuntime(opened.handle, "prompt", async () => {
+			runtimeEntered.resolve();
+			await runNested.promise;
+			const effect = withNativeRuntimeEffect(session, "prompt", () => {
+				throw new Error("Fenced effect must not run");
+			});
+			nestedQueued.resolve();
+			await expect(effect).rejects.toMatchObject({ reason: "context_mismatch" });
+		});
+		await runtimeEntered.promise;
+		const reconcile = manager.reconcileResumeOperation.bind(manager);
+		const hold = spyOn(manager, "reconcileResumeOperation").mockImplementation(async (...args) => {
+			reconcileEntered.resolve();
+			await releaseReconcile.promise;
+			return reconcile(...args);
+		});
+		const managerAdmission = spyOn(manager, "admitNativeRuntimeEffect");
+		const reading = reconcileNativeHandle(opened.handle, opened.op);
+		try {
+			await reconcileEntered.promise;
+			runNested.resolve();
+			await nestedQueued.promise;
+			expect(fenceNativeTtsrPublication(manager)).toBe(true);
+			releaseReconcile.resolve();
+			await reading;
+			expect((await invocation).kind).toBe("applied");
+			expect(managerAdmission).not.toHaveBeenCalled();
+		} finally {
+			runNested.resolve();
+			releaseReconcile.resolve();
+			await Promise.allSettled([invocation, reading]);
+			hold.mockRestore();
+			managerAdmission.mockRestore();
+		}
+	});
+
 	it("applies every turn although each turn leaves its own suffix unproven", async () => {
 		const opened = await fixture();
 		const session = opened.result.session;
