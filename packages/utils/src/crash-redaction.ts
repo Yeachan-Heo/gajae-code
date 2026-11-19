@@ -606,6 +606,7 @@ function positionOnCommentLine(text: string, position: number): boolean {
  */
 function findQuotedContainerDataSpansIn(text: string): PrivateKeySpan[] {
 	const spans: PrivateKeySpan[] = [];
+	const lineScan = createLineEndScan();
 	ANY_CONTAINER_ASSIGNMENT.lastIndex = 0;
 	for (let match = ANY_CONTAINER_ASSIGNMENT.exec(text); match !== null; ) {
 		// A comment line is not YAML structure, so it cannot open a container that would
@@ -620,7 +621,7 @@ function findQuotedContainerDataSpansIn(text: string): PrivateKeySpan[] {
 			text,
 			containerStart,
 			text.length - containerStart,
-			createLineEndScan(),
+			lineScan,
 		).value;
 		let quote: string | undefined;
 		let quoteStart = -1;
