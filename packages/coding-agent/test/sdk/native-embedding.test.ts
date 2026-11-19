@@ -911,7 +911,7 @@ describe("readonly-first native SDK embedding", () => {
 		expect(result.kind).toBe("selector");
 		expect(factories).toBe(0);
 		expect(await Bun.file(f.file).text()).toBe(before);
-		expect(await fs.readdir(f.root)).toEqual(["project", "selected.jsonl"]);
+		expect((await fs.readdir(f.root)).sort()).toEqual(["project", "selected.jsonl"]);
 	});
 
 	it("refuses changed raw bytes against the consented checkpoint before any factory or writer", async () => {
@@ -933,7 +933,7 @@ describe("readonly-first native SDK embedding", () => {
 		expect(result).toMatchObject({ kind: "refused", reason: "stale_snapshot" });
 		expect(factories).toBe(0);
 		expect(await Bun.file(f.file).text()).toBe(before);
-		expect(await fs.readdir(f.root)).toEqual(["project", "selected.jsonl"]);
+		expect((await fs.readdir(f.root)).sort()).toEqual(["project", "selected.jsonl"]);
 	});
 
 	it("owns an explicit null-root attempt before startup and never replays its IDs after startup failure", async () => {
