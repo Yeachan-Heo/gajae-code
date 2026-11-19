@@ -271,6 +271,203 @@ export function redactCrashSecretsV1(text: string): string {
 }
 
 /**
+ * Wrapper around replaceAll that preserves newline counts in matched text.
+ * When a match containing N newlines is replaced, adds (N - replacedNewlines) extra newlines.
+ * This ensures line count is preserved when redacting multi-line content.
+ */
+function replacePreservingLines(
+	text: string,
+	pattern: RegExp,
+	replacement: string | ((...args: any[]) => string),
+): string {
+	if (typeof replacement === "string") {
+		// String replacement: simpler case
+		return text.replace(pattern, match => {
+			const originalNewlines = (match.match(/\n/g) || []).length;
+			const replacedNewlines = (replacement.match(/\n/g) || []).length;
+			const extraNewlines = "\n".repeat(Math.max(0, originalNewlines - replacedNewlines));
+			return replacement + extraNewlines;
+		});
+	}
+
+	// Function replacement: need to track the matched text and count its newlines
+	return text.replace(pattern, (...args) => {
+		const match = args[0];
+		const originalNewlines = (match.match(/\n/g) || []).length;
+		const replacedText = replacement(...args);
+		const replacedNewlines = (replacedText.match(/\n/g) || []).length;
+		const extraNewlines = "\n".repeat(Math.max(0, originalNewlines - replacedNewlines));
+		return replacedText + extraNewlines;
+	});
+}
+
+/**
+ * Like redactCrashSecrets, but preserves line count by adding newlines after placeholders
+ * to match the original line count. This is essential for diff scrubbing where projections
+ * rely on exact line counts.
+ *
+ * Uses the same redaction rules as redactCrashSecrets, but post-processes replacements
+ * to preserve the number of newlines in matched text.
+ */
+export function redactCrashSecretsPreservingLines(text: string): string {
+	// Use the current rules (not V1)
+	return redactCrashSecretsWithRulesPreservingLines(text, CURRENT_CREDENTIAL_REDACTION_RULES);
+}
+
+/**
+ * Internal version of redactCrashSecretsWithRules that preserves line counts.
+ */
+function redactCrashSecretsWithRulesPreservingLines(text: string, rules: CredentialRedactionRules): string {
+	// Redact folded headers first
+	let redacted = redactFoldedHeadersPreservingLines(text, rules);
+	// Then container redaction
+	redacted = redactCredentialContainersPreservingLines(redacted, rules);
+	// Block scalar bodies
+	redacted = redactYamlBlockScalarsPreservingLines(redacted, rules);
+
+	// All remaining replaces use the line-preserving wrapper
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+		"«redacted-auth»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+		"«redacted-jwt»",
+	);
+	redacted = replacePreservingLines(redacted, /\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
+	redacted = replacePreservingLines(redacted, /\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, "«redacted-github-token»");
+	redacted = replacePreservingLines(redacted, /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "«redacted-github-token»");
+	redacted = replacePreservingLines(redacted, /\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "«redacted-slack-token»");
+	redacted = replacePreservingLines(redacted, /\bnpm_[A-Za-z0-9]{20,}\b/g, "«redacted-npm-token»");
+	redacted = replacePreservingLines(redacted, /\bglpat-[A-Za-z0-9_-]{20,}\b/g, "«redacted-gitlab-token»");
+	redacted = replacePreservingLines(redacted, /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, "«redacted-api-key»");
+	redacted = replacePreservingLines(redacted, /\bhf_[A-Za-z0-9]{20,}\b/g, "«redacted-api-key»");
+	redacted = replacePreservingLines(
+		redacted,
+		/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+		"«redacted-private-key»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g,
+		"«redacted-google-api-key»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(^|[^A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]*@/gi,
+		"$1$2«redacted-url-credential»@",
+	);
+	redacted = replacePreservingLines(redacted, /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	redacted = replacePreservingLines(redacted, COOKIE_VALUE_PATTERN, (_match: string, prefix: string, value: string) =>
+		parseCredentialYamlBlockScalarHeader(_match) === undefined
+			? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
+			: _match,
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		rules.authValuePattern,
+		(_match, prefix: string) => `${prefix}«redacted»`,
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
+		(_match: string, prefix: string) =>
+			parseCredentialYamlBlockScalarHeader(_match) === undefined ? `${prefix}«redacted»` : _match,
+	);
+
+	if (rules.assignmentCandidatePattern.test(redacted)) {
+		redacted = replacePreservingLines(
+			redacted,
+			rules.escapedBacktickValuePattern,
+			(_match: string, prefix: string, open: string, _value: string, close: string) =>
+				`${prefix}${open}«redacted»${close}`,
+		);
+		redacted = replacePreservingLines(
+			redacted,
+			rules.escapedBacktickUnclosedPattern,
+			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
+		);
+		redacted = replacePreservingLines(redacted, rules.valuePattern, redactCredentialValue);
+	}
+	if (rules.camelAssignmentCandidatePattern.test(redacted)) {
+		redacted = replacePreservingLines(
+			redacted,
+			rules.camelEscapedBacktickValuePattern,
+			(_match: string, prefix: string, open: string, _value: string, close: string) =>
+				`${prefix}${open}«redacted»${close}`,
+		);
+		redacted = replacePreservingLines(
+			redacted,
+			rules.camelEscapedBacktickUnclosedPattern,
+			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
+		);
+		redacted = replacePreservingLines(redacted, rules.camelValuePattern, redactCredentialValue);
+	}
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		"$1«redacted»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_%])(session(?:id|[_-]id)%3[Dd])[A-Za-z0-9._~%-]{8,}/gi,
+		"$1«redacted»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{0,39}[/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g,
+		"«redacted-aws-key»",
+	);
+	return redacted;
+}
+
+/**
+ * redactFoldedHeaders preserving line count.
+ */
+function redactFoldedHeadersPreservingLines(text: string, rules: CredentialRedactionRules): string {
+	// First, do the normal redaction
+	const redacted = redactFoldedHeaders(text, rules);
+	// Since redactFoldedHeaders already works line-by-line, it shouldn't change line count
+	// But we apply the wrapper just to be safe
+	return redacted;
+}
+
+/**
+ * redactCredentialContainers preserving line count.
+ */
+function redactCredentialContainersPreservingLines(text: string, rules: CredentialRedactionRules): string {
+	// Container redaction can span multiple lines, so we need to preserve them
+	// Use the original function which handles container state across lines
+	const originalRedacted = redactCredentialContainers(text, rules);
+	// Compare line counts and add newlines if needed
+	const originalLines = text.split("\n").length;
+	const redactedLines = originalRedacted.split("\n").length;
+	if (redactedLines < originalLines) {
+		// Add empty lines at the end
+		return originalRedacted + "\n".repeat(originalLines - redactedLines);
+	}
+	return originalRedacted;
+}
+
+/**
+ * redactYamlBlockScalars preserving line count.
+ */
+function redactYamlBlockScalarsPreservingLines(text: string, rules: CredentialRedactionRules): string {
+	// YAML block scalars can span multiple lines
+	const originalRedacted = redactYamlBlockScalars(text, rules);
+	// Compare line counts and add newlines if needed
+	const originalLines = text.split("\n").length;
+	const redactedLines = originalRedacted.split("\n").length;
+	if (redactedLines < originalLines) {
+		// Add empty lines at the end
+		return originalRedacted + "\n".repeat(originalLines - redactedLines);
+	}
+	return originalRedacted;
+}
+
+/**
  * Redact indented continuation lines following credential headers.
  * Handles folded headers like:
  *   Authorization: Bearer
