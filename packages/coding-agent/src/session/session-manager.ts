@@ -142,6 +142,7 @@ import {
 	confirmOwnerFirstWriteMarkerSync,
 	confirmOwnerTransferAppendSync,
 	confirmOwnerTransferPublicationSync,
+	freshCooperativeEnrollmentByteAllowance,
 	getOwnerMembershipEvidence,
 	getOwnerTransferPublicationSourceSync,
 	getPendingOwnerTransfer,
@@ -152,6 +153,8 @@ import {
 	type OwnerMembershipEvidence,
 	type OwnerTransfer,
 	type OwnerTransferTranscript,
+	OWNER_TRANSCRIPT_HEADER_MAX_BYTES,
+	OWNER_TRANSCRIPT_MAX_BYTES,
 	ownerFirstWriteMarkerSync,
 	publishOwnerDirectory,
 	recheckOwnerAdmissionWithAsyncEvidence,
@@ -172,6 +175,7 @@ import {
 	OWNER_ENROLL_CUSTOM_TYPE,
 	projectResumeGraphRecord,
 	RESUME_CURSOR_CUSTOM_TYPE,
+	RESUME_CURSOR_MAX_SUPERSEDES,
 	type ResumeGraphRecord,
 	reduceResumeTranscript,
 } from "./resume-cursor";
@@ -266,6 +270,7 @@ import {
 	mayCleanManagedTreeStaging,
 	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
+	shouldFsyncManagedDirectory,
 } from "./internal/managed-session-storage";
 import {
 	type ManagedSessionTransactionScope,
@@ -375,6 +380,7 @@ import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./s
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
 	ManagedSessionSecurityContext,
+	SessionNoReplacePublicationReceipt,
 	SessionStorage,
 	SessionStorageBufferedWriter,
 	SessionStorageExclusiveLock,
@@ -654,8 +660,17 @@ export type SelectedForkTranscriptReservation = (identity: {
 }) => Promise<void>;
 
 type ReservedCapturedFork = {
-	readonly fresh: FreshSessionState;
+	readonly fresh: FreshSessionState & { readonly sessionFile: string };
+	assertDestination(): void;
 	assertAvailable(): void;
+};
+
+type ReservedForkHistory = {
+	readonly bytes: number;
+	readonly maxBytes: number;
+	readonly sha256: string;
+	readonly graph: readonly ResumeGraphRecord[];
+	readonly candidates: readonly string[];
 };
 
 type ResidentCacheDegradedStore = BlobStore & { degradedReason?: string; degradedCauseCode?: string };
@@ -4064,19 +4079,19 @@ function inspectCapturedForkDestination(directory: string): fs.BigIntStats {
 	});
 }
 
-async function reserveInitialCapturedFork(
+function prepareInitialCapturedFork(
 	snapshot: CapturedSessionTranscriptSnapshot,
 	cwd: string,
 	directory: string,
 	managed: boolean,
-	reserve: SelectedForkTranscriptReservation,
-): Promise<ReservedCapturedFork> {
+): ReservedCapturedFork {
 	const directoryIdentity = inspectCapturedForkDestination(directory);
 	const bindingFile = path.join(directory, MANAGED_SESSION_BINDING_FILE);
 	const binding = managed ? captureManagedFileNoFollow(bindingFile) : undefined;
-	const fresh = buildFreshSessionState(cwd, createSessionId(), directory, snapshot.identity.sessionId);
-	const file = fresh.sessionFile!;
-	const assertAvailable = (): void => {
+	const state = buildFreshSessionState(cwd, createSessionId(), directory, snapshot.identity.sessionId);
+	const file = state.sessionFile!;
+	const fresh = { ...state, sessionFile: file };
+	const assertDestination = (): void => {
 		const current = inspectCapturedForkDestination(directory);
 		if (
 			current.dev !== directoryIdentity.dev ||
@@ -4084,6 +4099,9 @@ async function reserveInitialCapturedFork(
 			(binding && !managedFileSnapshotEquals(captureManagedFileNoFollow(bindingFile), binding))
 		)
 			throw Object.assign(new Error("Fork reservation destination changed"), { code: "destination_unavailable" });
+	};
+	const assertAvailable = (): void => {
+		assertDestination();
 		// lstat (not exists) also refuses a dangling symlink at either candidate name.
 		if (fs.lstatSync(file, { throwIfNoEntry: false }) || fs.lstatSync(file.slice(0, -6), { throwIfNoEntry: false }))
 			throw Object.assign(new Error("Fork reservation destination is occupied"), { code: "destination_unavailable" });
@@ -4103,12 +4121,94 @@ async function reserveInitialCapturedFork(
 			throw Object.assign(new Error("Captured fork source identity changed"), { code: "identity-mismatch" });
 	};
 	assertAvailable();
-	await reserve(Object.freeze({ role: "staging", sessionId: fresh.sessionId, file }));
-	assertAvailable();
-	const source = snapshot.revalidate();
-	if (source.kind !== "valid")
-		throw Object.assign(new Error("Captured fork source changed during reservation"), { code: source.reason });
-	return { fresh, assertAvailable };
+	return { fresh, assertDestination, assertAvailable };
+}
+
+function capturedForkCursor(
+	id: string,
+	parentId: string | null,
+	timestamp: string,
+	bind: string,
+	member: string,
+	op: string,
+	idx: number,
+	supersedes: readonly string[],
+): CustomEntry {
+	return {
+		type: "custom",
+		customType: RESUME_CURSOR_CUSTOM_TYPE,
+		id,
+		parentId,
+		timestamp,
+		data: { v: 1, bind, op, idx, member, reason: "fork_init", supersedes },
+	};
+}
+
+/** Use the actual persistence transforms without emitting blobs or opening the destination. */
+function measureReservedForkHistory(
+	entries: readonly FileEntry[],
+	target: string | null,
+	maxBytes: number,
+): ReservedForkHistory | StrictSessionOpenFailure {
+	const imageStore = new BlobStore(getBlobsDir());
+	const memory = new MemoryBlobStore();
+	const graph: ResumeGraphRecord[] = [];
+	const digest = crypto.createHash("sha256");
+	let bytes = 0;
+	for (const entry of entries) {
+		const materialized = materializeResidentEntryForPersistenceSync(
+			entry,
+			{ textStore: memory, imageStore },
+			new Map(),
+		);
+		const persisted = prepareEntryForPersistenceSync(materialized, memory);
+		const line = Buffer.from(JSON.stringify(persisted), "utf8");
+		bytes += line.byteLength + 1;
+		if (
+			bytes > maxBytes ||
+			line.byteLength + 1 > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES ||
+			(entry.type === "session" && line.byteLength > OWNER_TRANSCRIPT_HEADER_MAX_BYTES)
+		)
+			return { kind: "error", reason: "oversized", size: bytes };
+		digest.update(line).update(TRANSCRIPT_LINE_TERMINATOR);
+		graph.push(projectResumeGraphRecord(persisted));
+	}
+	const sha256 = digest.digest("hex");
+	const reduction = reduceResumeTranscript(graph, sha256);
+	if (
+		reduction.checkpoint.kind === "invalid" ||
+		reduction.markerEvidence.length !== 0 ||
+		(target !== null && !reduction.executableEntries.some(entry => entry.id === target))
+	)
+		return { kind: "error", reason: "malformed", message: "Invalid transformed fork graph or target." };
+	const candidates = (reduction.checkpoint.candidates ?? []).filter(id => id !== target);
+	const markerBytes = freshCooperativeEnrollmentByteAllowance() + Buffer.byteLength(JSON.stringify(target));
+	let upper = bytes + markerBytes;
+	if (markerBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES)
+		return { kind: "error", reason: "oversized", size: upper };
+	// Generated entry IDs are short hex or decimal snowflakes. Reserve 64 ASCII
+	// bytes for either form and 27 for a Date's longest ISO representation.
+	const generatedId = "0".repeat(64);
+	let parent = target;
+	for (let start = 0; start < candidates.length; start += RESUME_CURSOR_MAX_SUPERSEDES) {
+		const cursor = capturedForkCursor(
+			generatedId,
+			parent,
+			"0".repeat(27),
+			reduction.checkpoint.headerId,
+			"0".repeat(32),
+			"0".repeat(36),
+			start / RESUME_CURSOR_MAX_SUPERSEDES,
+			candidates.slice(start, start + RESUME_CURSOR_MAX_SUPERSEDES),
+		);
+		const lineBytes = Buffer.byteLength(JSON.stringify(cursor)) + 1;
+		upper += lineBytes;
+		if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES || upper > maxBytes)
+			return { kind: "error", reason: "oversized", size: upper };
+		parent = generatedId;
+	}
+	if (upper > maxBytes) return { kind: "error", reason: "oversized", size: upper };
+	return { bytes, maxBytes: upper, sha256, graph, candidates };
 }
 
 function destinationFor(
@@ -26103,6 +26203,166 @@ export class SessionManager {
 		}
 	}
 
+	#stageCapturedForkSelection(target: string | null, candidates: readonly string[]) {
+		this.#leafId = target;
+		this.#leafRevision++;
+		const marker = this.#stageOwnerMarker();
+		const planned: CustomEntry[] = marker ? [marker] : [];
+		let parent = target;
+		const op = crypto.randomUUID();
+		for (let start = 0; start < candidates.length; start += RESUME_CURSOR_MAX_SUPERSEDES) {
+			const entry = capturedForkCursor(
+				this.#generateEntryId(),
+				parent,
+				new Date().toISOString(),
+				this.#sessionId,
+				this.#resumeBinding().memberToken,
+				op,
+				start / RESUME_CURSOR_MAX_SUPERSEDES,
+				candidates.slice(start, start + RESUME_CURSOR_MAX_SUPERSEDES),
+			);
+			planned.push(entry);
+			parent = entry.id;
+			this.#fileEntries.push(entry);
+			this.#byId.set(entry.id, entry);
+			this.#bumpEntryRevision();
+			this.#heldPublicationEntries.add(entry.id);
+		}
+		return { planned, parent };
+	}
+
+	/** One installation: the captured history and its exact initialization suffix are never public separately. */
+	async #publishReservedCapturedFork(
+		reservation: ReservedCapturedFork,
+		history: ReservedForkHistory,
+		target: string | null,
+	): Promise<SessionNoReplacePublicationReceipt> {
+		const file = reservation.fresh.sessionFile;
+		const publish = () => this.#withSessionPersistenceFenceSync(() => {
+			reservation.assertAvailable();
+			const managed = this.destination.kind === "managed" ? this.#managedTranscriptStore(file) : undefined;
+			const openStagedWriter = this.#storage.openStagedWriter;
+			const owner = this.#ownerMembership;
+			if (!openStagedWriter || !owner) throw new Error("fork_reservation_unsupported");
+			const digest = crypto.createHash("sha256");
+			let bytes = 0;
+			const encode = (entry: FileEntry): Buffer => {
+				const line = Buffer.from(JSON.stringify(entry), "utf8");
+				bytes += line.byteLength + 1;
+				if (bytes > history.maxBytes || line.byteLength + 1 > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES)
+					throw new Error("fork_reservation_envelope_changed");
+				digest.update(line).update(TRANSCRIPT_LINE_TERMINATOR);
+				return line;
+			};
+			const lines = this.#fileEntries.map(entry =>
+				encode(prepareEntryForPersistenceSync(
+					materializeResidentEntryForPersistenceSync(entry, this.#residentBlobStores(), new Map()),
+					this.#blobStore,
+				)),
+			);
+			if (bytes !== history.bytes || digest.copy().digest("hex") !== history.sha256)
+				throw new Error("stale_snapshot");
+			const { planned, parent } = this.#stageCapturedForkSelection(target, history.candidates);
+			const marker = this.#ownerMarker;
+			if (!marker) throw new Error("participation_lost");
+			const suffix = planned.map(encode);
+			const sha256 = digest.digest("hex");
+			const { checkpoint } = reduceResumeTranscript([...history.graph, ...planned.map(projectResumeGraphRecord)], sha256);
+			if (checkpoint.kind === "invalid" || checkpoint.leafEntryId !== parent)
+				throw new Error("invalid_resume_target");
+			reservation.assertAvailable();
+			managed?.assertBound();
+			const staged = openStagedWriter.call(this.#storage, file, {
+				securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
+			});
+			let receipt: SessionNoReplacePublicationReceipt;
+			try {
+				for (const line of lines) staged.writeLine(line);
+				for (const line of suffix) staged.writeLine(line);
+				staged.fsync();
+				staged.closeSync();
+				reservation.assertAvailable();
+				managed?.assertBound();
+				marker.attempted = true;
+				receipt = staged.publishNoReplace();
+			} catch (error) {
+				try {
+					staged.closeSync();
+				} catch {
+					// Preserve the primary failure; the reserved pathname is not a cleanup capability.
+				}
+				throw error;
+			}
+			if (
+				receipt.kind !== "fsync" ||
+				receipt.namespaceSynced !== true ||
+				!receipt.publicationId ||
+				receipt.sha256 !== sha256 ||
+				receipt.stat.size !== bytes
+			)
+				throw new Error("durability_unproven");
+			const { capture, markers } = this.#verifyReservedForkInstallation(reservation, receipt);
+			if (capture.reducerView.leafEntryId !== parent) throw new Error("stale_snapshot");
+			const markerDigest = resumeDigest(suffix[0]!);
+			confirmOwnerFirstWriteMarkerSync(
+				owner,
+				marker.marker,
+				() =>
+					markers[0]?.entryId === marker.entry.id &&
+					capture.entries.some(
+						entry =>
+							entry.id === marker.entry.id &&
+							entry.range.start === history.bytes &&
+							entry.payloadDigest === markerDigest,
+					),
+			);
+			this.#ownerMarker = undefined;
+			for (const entry of planned) this.#heldPublicationEntries.delete(entry.id);
+			this.#leafId = parent;
+			this.#leafRevision++;
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			return receipt;
+		});
+		return this.#withOwnerPublication(async () => {
+			if (this.destination.kind !== "managed") return publish();
+			return withManagedSessionTransaction(
+				{ locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(file)), sessionId: this.#sessionId },
+				async scope => {
+					scope.assertOwned();
+					const receipt = publish();
+					scope.assertOwned();
+					return receipt;
+				},
+			);
+		});
+	}
+
+	#verifyReservedForkInstallation(reservation: ReservedCapturedFork, receipt: SessionNoReplacePublicationReceipt) {
+		reservation.assertDestination();
+		const file = reservation.fresh.sessionFile;
+		const managed = this.destination.kind === "managed" ? this.#managedTranscriptStore(file) : undefined;
+		managed?.assertBound();
+		const { capture, stat, identity, markers, invalidOwnerMarkers } = captureNativeResumeTranscript(file, this.#storage);
+		if (
+			capture.kind !== "captured" ||
+			!stat ||
+			!sameResumeStat(stat, receipt.stat) ||
+			stat.nlink !== 1n ||
+			identity?.canonicalPath !== file ||
+			capture.snapshotDigest !== receipt.sha256 ||
+			capture.reducerView.kind === "invalid" ||
+			capture.reducerView.headerId !== reservation.fresh.sessionId ||
+			invalidOwnerMarkers ||
+			!markers ||
+			markers.length !== 1
+		)
+			throw new Error("stale_snapshot");
+		managed?.assertBound();
+		reservation.assertDestination();
+		return { capture, markers };
+	}
+
 	/** Append only fresh destination authority and the selected execution checkpoint. */
 	async #initializeCapturedFork(target: string | null): Promise<void> {
 		if (!(this.#storage instanceof FileSessionStorage) || !this.#sessionFile) return;
@@ -26116,36 +26376,7 @@ export class SessionManager {
 					if (target !== null && !before.capture.entries.some(entry => entry.id === target))
 						throw new Error("invalid_resume_target");
 					const candidates = (before.capture.reducerView.candidates ?? []).filter(id => id !== target);
-					this.#leafId = target;
-					this.#leafRevision++;
-					const marker = this.#stageOwnerMarker();
-					const planned: CustomEntry[] = marker ? [marker] : [];
-					let parent = target;
-					const op = crypto.randomUUID();
-					for (let start = 0; start < candidates.length; start += 256) {
-						const entry: CustomEntry = {
-							type: "custom",
-							customType: RESUME_CURSOR_CUSTOM_TYPE,
-							id: this.#generateEntryId(),
-							parentId: parent,
-							timestamp: new Date().toISOString(),
-							data: {
-								v: 1,
-								bind: this.#sessionId,
-								op,
-								idx: planned.length - (marker ? 1 : 0),
-								member: this.#resumeBinding().memberToken,
-								reason: "fork_init",
-								supersedes: candidates.slice(start, start + 256),
-							},
-						};
-						planned.push(entry);
-						parent = entry.id;
-						this.#fileEntries.push(entry);
-						this.#byId.set(entry.id, entry);
-						this.#bumpEntryRevision();
-						this.#heldPublicationEntries.add(entry.id);
-					}
+					const { planned, parent } = this.#stageCapturedForkSelection(target, candidates);
 					if (this.#ownerMarker) this.#ownerMarker.attempted = true;
 					if (this.destination.kind === "managed") {
 						const store = this.#managedTranscriptStore(file);
@@ -26241,7 +26472,6 @@ export class SessionManager {
 	async #tryForkFromCapturedBounded(
 		snapshot: CapturedSessionTranscriptSnapshot,
 		executionTargetLeafId?: string | null,
-		reservation?: ReservedCapturedFork,
 	): Promise<StrictSessionForkResult | undefined> {
 		if (
 			this.#effectiveSessionMemoryMode(snapshot.identity.size) !== "enabled" ||
@@ -26365,15 +26595,10 @@ export class SessionManager {
 			forkTarget = entry.parentId;
 		}
 		applyHeaderPatch(sourceHeader, headerPatch);
-		const fresh = reservation?.fresh ?? this.#freshSessionState({ parentSession: sourceHeader.id });
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return undefined;
-		if (reservation) {
-			reservation.assertAvailable();
-			const revalidated = snapshot.revalidate();
-			if (revalidated.kind !== "valid") return revalidated;
-		}
 		this.#applyFreshSessionMetadata(fresh);
 		const withPublication = <T>(body: () => T): T =>
 			executionTargetLeafId === undefined ? body() : this.#withOwnerPublicationSync(body);
@@ -26428,15 +26653,13 @@ export class SessionManager {
 					? managedSourceStorage.statSync(snapshot.sourcePath)
 					: snapshot.storage.statSync(snapshot.sourcePath);
 				if (!sameDescriptor(copyDescriptor, current)) {
-					if (!reservation)
-						await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
+					await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 					return { kind: "error", reason: "identity-mismatch" };
 				}
 			} else {
 				const afterWrite = snapshot.revalidate();
 				if (afterWrite.kind !== "valid") {
-					if (!reservation)
-						await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
+					await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 					return afterWrite;
 				}
 			}
@@ -26450,10 +26673,7 @@ export class SessionManager {
 			} catch {
 				// Preserve the captured-fork failure.
 			}
-			// A reservation is not a rollback capability. Do not fall back to the
-			// legacy path-based transcript/artifact discard on this lane.
-			if (published && !reservation)
-				await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
+			if (published) await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 			throw error;
 		}
 	}
@@ -27740,8 +27960,25 @@ export class SessionManager {
 			if (revalidated.kind !== "valid") return revalidated;
 			return { kind: "error", reason: "oversized", size: snapshot.identity.size };
 		}
+		const boundedRequested =
+			sourceEntryId === undefined &&
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes()));
+		const reservedMaxBytes = Math.min(OWNER_TRANSCRIPT_MAX_BYTES, eagerHydrationMaxBytes());
+		if (reserve && (boundedRequested || snapshot.identity.size > reservedMaxBytes))
+			return { kind: "error", reason: "oversized", size: snapshot.identity.size };
+		if (
+			reserve &&
+			(!(snapshot.storage instanceof FileSessionStorage) ||
+				typeof snapshot.storage.openStagedWriter !== "function" ||
+				!shouldFsyncManagedDirectory())
+		)
+			throw Object.assign(new Error("Durable eager fork reservation is unavailable"), {
+				code: "destination_unavailable",
+			});
 		let reservation: ReservedCapturedFork | undefined;
-		let destination: SessionDestination;
+		let destination: SessionDestination | undefined;
+		let prepareReservedDestination: (() => SessionDestination) | undefined;
 		if (typeof destinationInput === "object" && "managed" in destinationInput) {
 			if (!reserve || !(snapshot.storage instanceof FileSessionStorage))
 				throw new Error("fork_reservation_unsupported");
@@ -27749,15 +27986,16 @@ export class SessionManager {
 			const scopeInput = { cwd, agentDir, sessionsRoot: getSessionsDir(agentDir) };
 			const resolved = resolveManagedScope(scopeInput);
 			if (resolved.kind === "error") throw managedScopeStartupError("resolve", resolved);
-			reservation = await reserveInitialCapturedFork(snapshot, cwd, resolved.scope.directoryPath, true, reserve);
-			const current = resolveManagedScope(scopeInput);
-			if (current.kind === "error") throw managedScopeStartupError("resolve", current);
-			if (current.scope.directoryPath !== resolved.scope.directoryPath)
-				throw Object.assign(new Error("Fork reservation managed scope changed"), {
-					code: "destination_unavailable",
-				});
-			reservation.assertAvailable();
-			destination = prepareManagedDestination(resolved.scope, agentDir);
+			reservation = prepareInitialCapturedFork(snapshot, cwd, resolved.scope.directoryPath, true);
+			prepareReservedDestination = () => {
+				const current = resolveManagedScope(scopeInput);
+				if (current.kind === "error") throw managedScopeStartupError("resolve", current);
+				if (current.scope.directoryPath !== resolved.scope.directoryPath)
+					throw Object.assign(new Error("Fork reservation managed scope changed"), {
+						code: "destination_unavailable",
+					});
+				return prepareManagedDestination(resolved.scope, agentDir);
+			};
 		} else {
 			if (reserve && (destinationInput === undefined || !(snapshot.storage instanceof FileSessionStorage)))
 				throw new Error("fork_reservation_unsupported");
@@ -27766,29 +28004,11 @@ export class SessionManager {
 				const directory = path.resolve(destination.directory);
 				if (destination.kind === "explicit" && destination.directory !== directory)
 					destination = explicitDestination(directory, explicitProfileAgentDirs.get(destination));
-				reservation = await reserveInitialCapturedFork(
-					snapshot,
-					cwd,
-					directory,
-					destination.kind === "managed",
-					reserve,
-				);
+				reservation = prepareInitialCapturedFork(snapshot, cwd, directory, destination.kind === "managed");
 			}
 		}
-		reservation?.assertAvailable();
-		if (
-			sourceEntryId === undefined &&
-			(sessionMemoryMode === "enabled" ||
-				(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes()))
-		) {
-			const boundedManager = new SessionManager(
-				cwd,
-				destination.directory,
-				true,
-				snapshot.storage,
-				destination,
-				reservation !== undefined,
-			);
+		if (!reserve && boundedRequested && destination) {
+			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			if (
 				destination.kind === "managed" &&
@@ -27822,7 +28042,7 @@ export class SessionManager {
 			}
 			let bounded: StrictSessionForkResult | undefined;
 			try {
-				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot, executionTargetLeafId, reservation);
+				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot, executionTargetLeafId);
 			} catch (error) {
 				boundedManager.#clearBoundedManagedSource();
 				await boundedManager.close().catch(() => {});
@@ -27830,7 +28050,6 @@ export class SessionManager {
 			}
 			if (bounded) {
 				boundedManager.#clearBoundedManagedSource();
-				if (reservation && bounded.kind === "error") await boundedManager.close();
 				return bounded;
 			}
 			await boundedManager.close();
@@ -27928,6 +28147,30 @@ export class SessionManager {
 		const revalidated = snapshot.revalidate();
 		if (revalidated.kind !== "valid") return revalidated;
 
+		let reservedHistory: ReservedForkHistory | undefined;
+		if (reserve && reservation) {
+			const { fresh } = reservation;
+			const sourceHeader = forkEntries[0] as SessionHeader;
+			fresh.header.title = sourceHeader.title;
+			fresh.header.titleSource = sourceHeader.titleSource;
+			forkEntries[0] = fresh.header;
+			for (const entry of forkEntries) {
+				if (entry.type === "session") continue;
+				residentizePersistedBlobRefs(entry);
+				if (entry.type === "message" && entry.message.role === "assistant")
+					entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+			}
+			const measured = measureReservedForkHistory(forkEntries, forkTarget, reservedMaxBytes);
+			if ("kind" in measured) return measured;
+			reservedHistory = measured;
+			reservation.assertAvailable();
+			await reserve(Object.freeze({ role: "staging", sessionId: fresh.sessionId, file: fresh.sessionFile }));
+			reservation.assertAvailable();
+			const afterReservation = snapshot.revalidate();
+			if (afterReservation.kind !== "valid") return afterReservation;
+			if (prepareReservedDestination) destination = prepareReservedDestination();
+		}
+		if (!destination) throw new Error("fork_destination_unavailable");
 		const dir = destination.directory;
 		const privateStagingDir =
 			!reservation &&
@@ -27958,15 +28201,7 @@ export class SessionManager {
 				reservation !== undefined,
 			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
-			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
-			if (reservation) {
-				reservation.assertAvailable();
-				const beforeWrite = snapshot.revalidate();
-				if (beforeWrite.kind !== "valid") {
-					authorityFailure = beforeWrite;
-					throw new Error("Captured fork source authority changed before destination initialization.");
-				}
-			}
+			if (!reservation) await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			const fresh = reservation?.fresh ?? manager.#freshSessionState({ parentSession: sourceHeader?.id });
 			fresh.header.title = sourceHeader?.title;
@@ -27984,11 +28219,11 @@ export class SessionManager {
 				"memory-fallback",
 			);
 			manager.#applyFreshSessionMetadata(fresh);
-			manager.#commitResidentTextStoreTransition(transition);
+			manager.#commitResidentTextStoreTransition(transition, !reservation);
 			manager.#retireEphemeralArtifacts();
 			reservation?.assertAvailable();
 			if (nativeResume) manager.#ensureOwnerMembershipSync();
-			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+			if (!reservation) manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 			const beforeWrite = snapshot.revalidate();
 			if (beforeWrite.kind !== "valid") {
 				authorityFailure = beforeWrite;
@@ -27996,6 +28231,24 @@ export class SessionManager {
 			}
 			const sessionFile = manager.#sessionFile;
 			if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
+			if (reservation) {
+				if (!reservedHistory) throw new Error("fork_reservation_envelope_unavailable");
+				const receipt = await manager.#publishReservedCapturedFork(reservation, reservedHistory, forkTarget);
+				const finalSource = snapshot.revalidate();
+				if (finalSource.kind !== "valid") {
+					authorityFailure = finalSource;
+					throw new Error("Captured fork source authority changed after destination publication.");
+				}
+				manager.#verifyReservedForkInstallation(reservation, receipt);
+				manager.#openCommittedDigest = receipt.sha256;
+				if (destination.kind === "managed")
+					manager.#managedPersistExpectedIdentity = {
+						...managedIdentityFromDescriptor(receipt.stat),
+						sha256: receipt.sha256,
+					};
+				writeTerminalBreadcrumb(manager.cwd, sessionFile);
+				return { kind: "forked", manager };
+			}
 			const activeManager = manager;
 			// Publish each already-parsed entry through the staged writer without joining
 			// another whole-file string/Buffer. The parse/resident graph is still the

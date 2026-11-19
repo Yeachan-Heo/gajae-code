@@ -718,8 +718,8 @@ export async function forkEmbeddedSession(
 		cwd: string;
 		selection?: { snapshotDigest: string; targetLeafId: string | null };
 		/**
-		 * Awaited before publication of the initial copy, for an existing canonical
-		 * explicit directory or existing bound managed scope. The frozen identity
+		 * Awaited for supported eager copies before publication, in an existing
+		 * canonical explicit directory or bound managed scope. The frozen identity
 		 * names an absent file; it does not confer ownership, cleanup authority, or admission.
 		 */
 		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation;
@@ -735,9 +735,14 @@ export async function forkEmbeddedSession(
 					(requireExisting && fs.realpathSync(directory) !== path.resolve(directory))
 				: requireExisting
 		)
-			throw Object.assign(new Error("Fork destination is not an available non-symlink directory"), {
-				code: "destination_unavailable",
-			});
+			throw Object.assign(
+				new Error(
+					requireExisting
+						? "Fork destination is not an available non-symlink directory"
+						: "Fork destination is not a non-symlink directory",
+				),
+				{ code: "destination_unavailable" },
+			);
 	};
 	// The legacy missing-directory fork publishes by directory rename. It has no
 	// existing final parent to bind an exact reservation to, so refuse before capture.

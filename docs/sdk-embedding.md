@@ -296,11 +296,20 @@ strict complete/incomplete inventory. `forkEmbeddedSession` copies captured hist
 to independent destination membership and durably pins the selected execution
 checkpoint, rather than inferring it from a physical metadata tail. With
 `reserveSelectedForkTranscript`, it awaits an initial `{ role: "staging", sessionId, file }`
-reservation before publishing the transcript. The destination must be an existing
-canonical directory or an already bound managed scope. After the callback, the SDK
-checks that the source and destination are unchanged and the target is still
-absent. The hook reserves only the first identity, not a later branch successor;
-it grants neither native writer authority nor permission to clean up by pathname.
+reservation before publishing the transcript. Only eager forks on platforms with
+file and directory sync are eligible. The source and the transformed output,
+including room for enrollment and checkpoint records, must fit the 64 MiB owner
+envelope and its header and line limits. Unsupported sizes are refused before
+calling the hook. The destination must be an existing canonical directory or an
+already bound managed scope.
+
+After the callback, the SDK checks that the source and destination are unchanged
+and the target is still absent. It publishes the copy, enrollment and checkpoint
+together without replacing an existing file, then verifies the installed file
+against the durable publication receipt. An accepted callback is not a successful
+fork. The hook reserves only the first identity, not a later branch successor;
+it grants neither native writer authority nor permission to remove a destination
+by pathname, including after a publication failure.
 
 Deletion checks all owner vetoes before cleanup and requires a verified positive
 deletion outcome.

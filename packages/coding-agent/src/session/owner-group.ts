@@ -223,8 +223,8 @@ const issuedAttestations = new WeakSet<LegacyTakeoverAttestation>();
 const storage = new FileSessionStorage();
 const lockedDirectories = new Map<string, OwnerRoot>();
 const MAX_RECORD_BYTES = 256 * 1024;
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
-const MAX_HEADER_BYTES = 64 * 1024;
+export const OWNER_TRANSCRIPT_MAX_BYTES = 64 * 1024 * 1024;
+export const OWNER_TRANSCRIPT_HEADER_MAX_BYTES = 64 * 1024;
 const MAX_READ_BYTES = 64 * 1024;
 const MAX_MEMBERS = 256;
 const HEX = /^[0-9a-f]{64}$/;
@@ -367,15 +367,15 @@ function transcriptSnapshot(
 	if (exclusive && named && named.nlink !== 1n) refuse("transcript_hardlinked");
 	const snap = readExact(
 		target.transcriptPath,
-		MAX_TRANSCRIPT_BYTES,
+		OWNER_TRANSCRIPT_MAX_BYTES,
 		false,
 		exclusive,
-		MAX_HEADER_BYTES + 1,
+		OWNER_TRANSCRIPT_HEADER_MAX_BYTES + 1,
 		prefixByteLimit,
 	);
 	if (snap) {
 		const end = snap.bytes.indexOf(10);
-		if ((end === -1 ? snap.bytes.length : end) > MAX_HEADER_BYTES) refuse("invalid_owner_target");
+		if ((end === -1 ? snap.bytes.length : end) > OWNER_TRANSCRIPT_HEADER_MAX_BYTES) refuse("invalid_owner_target");
 		let header: unknown;
 		try {
 			header = JSON.parse(snap.bytes.subarray(0, end === -1 ? snap.bytes.length : end).toString("utf8"));
@@ -800,6 +800,13 @@ function aggregate(members: readonly OwnerMember[]): OwnerLiveness {
 	const results = members.map(probeOwnerMemberSync);
 	return results.includes("unknown") ? "unknown" : results.includes("live") ? "live" : "dead";
 }
+/** Size allowance for a fresh cooperative enrollment line, excluding its parent ID. */
+export function freshCooperativeEnrollmentByteAllowance(): number {
+	// The remaining fields are fixed-width generated IDs, a date, pid, and
+	// the cooperative_tui runtime. Include their JSON keys and framing as well.
+	return 1024 + Buffer.byteLength(JSON.stringify(ownProcess().incarnation));
+}
+
 function newMember(runtime: string, capabilities: readonly string[]): OwnerMember {
 	const own = ownProcess();
 	const member = Object.freeze({
@@ -1738,7 +1745,7 @@ export async function publishOwnerDirectory(
 			assertCanonicalRoot(parent);
 		};
 		const assertFile = (name: string, expected: FileBytes): FileBytes => {
-			const actual = readExact(name, MAX_TRANSCRIPT_BYTES, true, true, expected.bytes.length);
+			const actual = readExact(name, OWNER_TRANSCRIPT_MAX_BYTES, true, true, expected.bytes.length);
 			if (!actual || !sameStat(actual.stat, expected.stat) || actual.digest !== expected.digest)
 				refuse("authority_changed");
 			return actual;
