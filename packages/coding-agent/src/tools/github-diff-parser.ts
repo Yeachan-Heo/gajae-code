@@ -74,12 +74,10 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 		if (line.startsWith("diff --git")) {
 			// Redact paths in diff --git headers if they contain credential-like filenames
 			// Handle both unquoted and C-quoted paths
-			const gitMatch = line.match(/^diff --git (.+) (.+)$/);
-			if (gitMatch) {
-				const oldPath = gitMatch[1];
-				const newPath = gitMatch[2];
-				const redactedOld = redactDiffHeaderPath(oldPath);
-				const redactedNew = redactDiffHeaderPath(newPath);
+			const paths = parseDiffGitPaths(line);
+			if (paths) {
+				const redactedOld = redactDiffHeaderPath(paths.oldPath);
+				const redactedNew = redactDiffHeaderPath(paths.newPath);
 				result.push(`diff --git ${redactedOld} ${redactedNew}`);
 			} else {
 				result.push(line);
@@ -176,6 +174,66 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 }
 
 /**
+ * Parse a "diff --git" line to extract old and new paths.
+ * Handles both unquoted paths (no spaces) and C-quoted paths (can contain spaces).
+ * Returns {oldPath, newPath} or null if parsing fails.
+ */
+function parseDiffGitPaths(line: string): { oldPath: string; newPath: string } | null {
+	if (!line.startsWith("diff --git ")) return null;
+
+	const rest = line.slice("diff --git ".length);
+	let oldPath: string | null = null;
+	let newPath: string | null = null;
+	let pos = 0;
+
+	// Parse first path (old path)
+	if (rest[pos] === '"') {
+		// C-quoted path: find the closing quote, handling escapes
+		pos += 1; // Skip opening quote
+		let endPos = pos;
+		while (endPos < rest.length) {
+			if (rest[endPos] === "\\" && endPos + 1 < rest.length) {
+				endPos += 2; // Skip escape sequence
+			} else if (rest[endPos] === '"') {
+				oldPath = rest.slice(0, endPos + 1); // Include quotes
+				pos = endPos + 1;
+				break;
+			} else {
+				endPos += 1;
+			}
+		}
+	} else {
+		// Unquoted path: read until space
+		const spaceIndex = rest.indexOf(" ", pos);
+		if (spaceIndex === -1) return null;
+		oldPath = rest.slice(pos, spaceIndex);
+		pos = spaceIndex;
+	}
+
+	if (!oldPath) return null;
+
+	// Skip spaces between paths
+	while (pos < rest.length && rest[pos] === " ") {
+		pos += 1;
+	}
+
+	// Parse second path (new path)
+	if (pos < rest.length) {
+		if (rest[pos] === '"') {
+			// C-quoted path: take everything from pos to end (including quotes)
+			newPath = rest.slice(pos);
+		} else {
+			// Unquoted path: take everything from pos to end
+			newPath = rest.slice(pos);
+		}
+	}
+
+	if (!newPath) return null;
+
+	return { oldPath, newPath };
+}
+
+/**
  * Parse and redact a diff header path, handling both unquoted and C-quoted formats.
  * C-quoted paths look like: "a/file name" or "a/file\nname"
  * Returns the original format with redacted path content.
@@ -223,9 +281,9 @@ function redactPathInDiffHeader(pathSection: string): string {
 	const components = pathSection.split("/");
 
 	for (const component of components) {
-		// Check for explicit credential keywords
+		// Check for explicit credential keywords (including when separated by spaces)
 		const credentialKeywordPattern =
-			/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
+			/(?:^|[-_. ])(?:secret|token|password|api[_-]?key|credential|private[_-]?key|refresh[_-]?token)(?:[-_. ]|$|\.[a-z]+$)/i;
 
 		if (credentialKeywordPattern.test(component)) {
 			return "file-redacted";
@@ -474,16 +532,12 @@ function redactAccumulatedContentWithState(
 	const newSideContent = newSideLines.map(info => info.content).join("\n");
 
 	const redactedAccumulated = redactCrashSecrets(originalContent);
-	const oldSideRedacted = redactCrashSecrets(oldSideContent);
-	const newSideRedacted = redactCrashSecrets(newSideContent);
 
 	// Apply state-based redaction with separate projection tracking
 	const redactedLines = applyStateBasedRedactionWithIndependentProjections(
 		lineInfos,
 		originalContent,
 		redactedAccumulated,
-		oldSideRedacted,
-		newSideRedacted,
 		inputState,
 	);
 
@@ -593,8 +647,6 @@ function applyStateBasedRedactionWithIndependentProjections(
 	lineInfos: LineInfo[],
 	originalContent: string,
 	redactedAccumulated: string,
-	oldSideRedacted: string,
-	newSideRedacted: string,
 	inputState: HunkState,
 ): { redactedLines: LineInfo[]; state: HunkState } {
 	const result: LineInfo[] = [];
@@ -666,7 +718,7 @@ function applyStateBasedRedactionWithIndependentProjections(
 
 		// Check if this line contains a credential field opening in JSON/object notation
 		const credentialFieldMatch = line.match(
-			/['"$]?(token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization)['"]?\s*:\s*[\[{]/i,
+			/['"}$]?(token|password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|auth|authorization)['" }]?\s*:\s*[\[{]/i,
 		);
 
 		// Also check for headers/lines with credential keywords followed by bracket on same line
@@ -677,7 +729,7 @@ function applyStateBasedRedactionWithIndependentProjections(
 		// Check for YAML block scalars with credential keywords (e.g., "api_token: |")
 		// YAML block scalars can have credential values on subsequent lines
 		const yamlBlockScalarWithCredential = line.match(
-			/(?:token|password|passwd|secret|api[_-]?key|access[_-]?token|auth|authorization).*?:\s*[|>]/i,
+			/(?:token|password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key|auth|authorization).*?:\s*[|>]/i,
 		);
 
 		const hasCredentialOpening =
@@ -691,7 +743,7 @@ function applyStateBasedRedactionWithIndependentProjections(
 			// This line starts a credential header or field - set state for applicable sides
 			if (isOldLine) {
 				oldState.inCredentialValue = true;
-				oldState.inYamlBlockScalar = yamlBlockScalarWithCredential ? true : false;
+				oldState.inYamlBlockScalar = !!yamlBlockScalarWithCredential;
 				oldState.bracketDepth = 0;
 				oldState.bracketStack = [];
 				const { depthDelta: oldDepth, newStack: oldStack } = countBracketsQuoteAwareWithStack(
@@ -703,7 +755,7 @@ function applyStateBasedRedactionWithIndependentProjections(
 			}
 			if (isNewLine) {
 				newState.inCredentialValue = true;
-				newState.inYamlBlockScalar = yamlBlockScalarWithCredential ? true : false;
+				newState.inYamlBlockScalar = !!yamlBlockScalarWithCredential;
 				newState.bracketDepth = 0;
 				newState.bracketStack = [];
 				const { depthDelta: newDepth, newStack: newStack } = countBracketsQuoteAwareWithStack(
@@ -732,7 +784,14 @@ function applyStateBasedRedactionWithIndependentProjections(
 						oldState.inYamlBlockScalar = false;
 					}
 				} else if (oldState.bracketDepth <= 0 && !line.match(/[\[{]/)) {
-					oldState.inCredentialValue = false;
+					// Header-only credential (no brackets): check if this line is an indented continuation
+					// Pure structure lines (only brackets/commas/colons) should not trigger redaction
+					if (line.match(/^\s+/) && !line.trim().match(/^[\[\]{},:]*$/)) {
+						// Indented line with non-structure content = continuation value to redact
+						shouldRedact = true;
+					} else {
+						oldState.inCredentialValue = false;
+					}
 				} else if (!line.trim().match(/^[\[\]{},:]*$/)) {
 					shouldRedact = true;
 				}
@@ -752,7 +811,14 @@ function applyStateBasedRedactionWithIndependentProjections(
 						newState.inYamlBlockScalar = false;
 					}
 				} else if (newState.bracketDepth <= 0 && !line.match(/[\[{]/)) {
-					newState.inCredentialValue = false;
+					// Header-only credential (no brackets): check if this line is an indented continuation
+					// Pure structure lines (only brackets/commas/colons) should not trigger redaction
+					if (line.match(/^\s+/) && !line.trim().match(/^[\[\]{},:]*$/)) {
+						// Indented line with non-structure content = continuation value to redact
+						shouldRedact = true;
+					} else {
+						newState.inCredentialValue = false;
+					}
 				} else if (!line.trim().match(/^[\[\]{},:]*$/)) {
 					shouldRedact = true;
 				}

@@ -336,7 +336,7 @@ describe("github-cache db layer", () => {
 		expect(got?.fetchedAt).toBe(2000);
 
 		const db = openDb();
-		const rows = db?.prepare("SELECT COUNT(*) AS c FROM github_view_cache").all() as Array<{ c: number }>;
+		const rows = db?.prepare("SELECT COUNT(*) AS c FROM github_view_cache_v50").all() as Array<{ c: number }>;
 		expect(rows[0].c).toBe(1);
 	});
 
@@ -959,6 +959,49 @@ describe("Credential scrubbing in cached data", () => {
 			expect(payloadJson).not.toContain("abcdefghijklmnopqrstuvwxyz123456789");
 			// Normal paths should be visible
 			expect(payloadJson).toContain(normalPath);
+		});
+
+		it("[P2] finding #1: legacy writers cannot contaminate new scrubbed cache table", async () => {
+			// Issue: When upgrading from legacy (v<5) to scrubbed (v50), the same table name
+			// is reused, allowing legacy processes to write unscrubbed rows.
+			// Solution: Use a NEW table name for the scrubbed version (github_view_cache_v50)
+			// Legacy code that knows only about github_view_cache cannot write to the new table.
+
+			const db = openDb();
+			if (!db) {
+				throw new Error("Failed to open cache database");
+			}
+
+			// Verify that the versioned table name is used
+			const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'github%'").all();
+			const tableNames = (tables as Array<{ name: string }>).map(t => t.name);
+
+			// Should have github_view_cache_v50 (the new versioned table)
+			expect(tableNames).toContain("github_view_cache_v50");
+
+			// Should NOT have github_view_cache (the old table that legacy code uses)
+			// This prevents legacy writers from accidentally writing to our new scrubbed table
+			expect(tableNames).not.toContain("github_view_cache");
+
+			// Verify schema version is 50
+			const version = db.query("PRAGMA user_version").get() as { user_version: number };
+			expect(version.user_version).toBe(50);
+
+			// Verify that caching works with the new table
+			const row = {
+				repo: TEST_REPO,
+				kind: "issue" as const,
+				number: 999,
+				includeComments: false,
+				payload: { title: "test" },
+				rendered: "test rendered",
+				authKey: TEST_AUTH_KEY,
+			};
+
+			putCached(row);
+			const cached = getCached(TEST_REPO, "issue", 999, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			expect(cached?.rendered).toBe("test rendered");
 		});
 	});
 });
