@@ -1438,6 +1438,10 @@
 				"circuitMaxCooldownMs": {
 					"type": "number",
 					"default": 1800000
+				},
+				"concurrencyWaitMs": {
+					"type": "number",
+					"default": 300000
 				}
 			},
 			"additionalProperties": false

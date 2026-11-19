@@ -1645,6 +1645,16 @@ export const SETTINGS_SCHEMA = {
 		default: 30 * 60 * 1000,
 		validate: (value: number) => Number.isFinite(value) && value >= 0,
 	},
+	// Concurrency saturation (a typed 429 such as `session_limit_reached`: the
+	// account already runs its maximum number of parallel requests) is a wait,
+	// not a failure. A managed chain retries the same entry for up to this long
+	// per request, without spending fallback attempts or opening the circuit,
+	// before treating it as an ordinary rate limit. 0 disables the wait.
+	"fallback.concurrencyWaitMs": {
+		type: "number",
+		default: 5 * 60 * 1000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
 
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
