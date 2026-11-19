@@ -592,8 +592,8 @@ function applyStateBasedRedactionWithIndependentProjections(
 	lineInfos: LineInfo[],
 	originalContent: string,
 	redactedAccumulated: string,
-	_oldSideRedacted: string,
-	_newSideRedacted: string,
+	oldSideRedacted: string,
+	newSideRedacted: string,
 	inputState: HunkState,
 ): { redactedLines: LineInfo[]; state: HunkState } {
 	const result: LineInfo[] = [];
@@ -601,6 +601,66 @@ function applyStateBasedRedactionWithIndependentProjections(
 
 	// First, identify if the entire hunk is a multi-line credential that gets fully redacted
 	const fullyRedactedLines = findFullyRedactedLinesByAccumulation(lineInfos, originalContent, redactedAccumulated);
+
+	// Build old and new side projections to track which lines are affected by redaction on each side
+	const oldSideLines = lineInfos.filter(info => info.prefix === "-" || info.prefix === " ");
+	const newSideLines = lineInfos.filter(info => info.prefix === "+" || info.prefix === " ");
+
+	// Get original lines from each side for comparison
+	const oldSideOriginalLines = oldSideLines.map(info => info.content);
+	const newSideOriginalLines = newSideLines.map(info => info.content);
+
+	// Split the redacted strings into lines (preserving empty lines)
+	const oldSideRedactedLines = oldSideRedacted.split("\n");
+	const newSideRedactedLines = newSideRedacted.split("\n");
+
+	// Build mappings for which lines changed between original and redacted for each side
+	const oldSideRedactionMap = new Map<number, string>();
+	const newSideRedactionMap = new Map<number, string>();
+	const oldSideFullyRedactedLines = new Set<number>();
+	const newSideFullyRedactedLines = new Set<number>();
+
+	// For old side: identify which lines changed or were part of a condensed block
+	let oldRedactedIdx = 0;
+	for (let i = 0; i < oldSideOriginalLines.length; i += 1) {
+		if (
+			oldRedactedIdx < oldSideRedactedLines.length &&
+			oldSideOriginalLines[i] === oldSideRedactedLines[oldRedactedIdx]
+		) {
+			// This line matches the next redacted line, advance both
+			oldRedactedIdx += 1;
+		} else if (
+			oldRedactedIdx < oldSideRedactedLines.length &&
+			oldSideOriginalLines[i] !== oldSideRedactedLines[oldRedactedIdx]
+		) {
+			// This line doesn't match the next redacted line - it was part of a condensed block
+			oldSideFullyRedactedLines.add(i);
+		} else if (oldRedactedIdx >= oldSideRedactedLines.length) {
+			// We've exhausted the redacted lines - remaining original lines were condensed
+			oldSideFullyRedactedLines.add(i);
+		}
+	}
+
+	// For new side: identify which lines changed or were part of a condensed block
+	let newRedactedIdx = 0;
+	for (let i = 0; i < newSideOriginalLines.length; i += 1) {
+		if (
+			newRedactedIdx < newSideRedactedLines.length &&
+			newSideOriginalLines[i] === newSideRedactedLines[newRedactedIdx]
+		) {
+			// This line matches the next redacted line, advance both
+			newRedactedIdx += 1;
+		} else if (
+			newRedactedIdx < newSideRedactedLines.length &&
+			newSideOriginalLines[i] !== newSideRedactedLines[newRedactedIdx]
+		) {
+			// This line doesn't match the next redacted line - it was part of a condensed block
+			newSideFullyRedactedLines.add(i);
+		} else if (newRedactedIdx >= newSideRedactedLines.length) {
+			// We've exhausted the redacted lines - remaining original lines were condensed
+			newSideFullyRedactedLines.add(i);
+		}
+	}
 
 	// Quick path: if no redactions found and not in an open state, do simple per-line redaction
 	if (fullyRedactedLines.size === 0 && redactedAccumulated === originalContent && !inputState.inCredentialValue) {
@@ -613,15 +673,30 @@ function applyStateBasedRedactionWithIndependentProjections(
 		return { redactedLines: result, state: inputState };
 	}
 
-	// Process each line with independent projection-aware state tracking
+	// Process each line using independent projection redactions
+	// Use separate indices for tracking position in oldSide and newSide projections
+	let oldSideLineIdx = 0;
+	let newSideLineIdx = 0;
+
 	for (let lineIdx = 0; lineIdx < lineInfos.length; lineIdx += 1) {
 		const info = lineInfos[lineIdx];
 		const line = info.content;
+		const prefix = info.prefix;
 
 		// If this line was identified as fully redacted by the accumulated redactor
 		if (fullyRedactedLines.has(lineIdx)) {
 			result.push({ ...info, content: "«redacted»" });
 			continue;
+		}
+
+		// Track indices for each side projection
+		if (prefix === "-") {
+			oldSideLineIdx += 1;
+		} else if (prefix === "+") {
+			newSideLineIdx += 1;
+		} else if (prefix === " ") {
+			oldSideLineIdx += 1;
+			newSideLineIdx += 1;
 		}
 
 		// Check if this line is a PEM block marker

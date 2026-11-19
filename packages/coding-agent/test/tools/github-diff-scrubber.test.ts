@@ -502,6 +502,63 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed).not.toContain("secret.bin");
 				expect(scrubbed).toContain("file-redacted");
 			});
+
+			it("[P2] applies independent projections for replacement hunks", () => {
+				// Test: old and new sides with different structures
+				// Both sides have multi-line credentials that should be redacted independently
+				const diffIndependentStates = [
+					...HEADER,
+					"@@ -1,3 +1,3 @@",
+					"-auth: [",
+					"+auth: {",
+					'-  "old-secret-canary"',
+					'+  "new-secret-canary"',
+					"-]",
+					"+}",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diffIndependentStates);
+
+				// Both secrets should be redacted
+				expect(scrubbed).not.toContain("old-secret-canary");
+				expect(scrubbed).not.toContain("new-secret-canary");
+
+				// Verify the structure shows the redaction occurred (prefix + redaction marker)
+				// All lines with credentials should show redaction
+				expect(scrubbed).toContain("-auth: «redacted»");
+				expect(scrubbed).toContain("+auth: «redacted»");
+
+				// Line count preserved (3 old lines + 3 new lines = 6 content lines)
+				const lines = scrubbed.split("\n");
+				const originalLines = diffIndependentStates.split("\n");
+				expect(lines).toHaveLength(originalLines.length);
+
+				// Test: multi-line credential condensing
+				// The old side has a multi-line structure that should be fully redacted
+				const diffMultilineRedaction = [
+					...HEADER,
+					"@@ -1,4 +1,2 @@",
+					"-Authorization: [",
+					"+Authorization: simple-value",
+					'-  "old-jwt-secret-canary"',
+					"-]",
+					" context",
+					"",
+				].join("\n");
+
+				const scrubbed2 = scrubUnifiedDiff(diffMultilineRedaction);
+
+				// All canaries should be redacted
+				expect(scrubbed2).not.toContain("old-jwt-secret-canary");
+
+				// Both old and new Authorization lines should be redacted
+				expect(scrubbed2).not.toContain("-Authorization: [");
+				expect(scrubbed2).not.toContain("+Authorization: simple-value");
+
+				// Line count preserved
+				expect(scrubbed2.split("\n")).toHaveLength(diffMultilineRedaction.split("\n").length);
+			});
 		});
 	});
 });
