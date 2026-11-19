@@ -79,6 +79,8 @@ describe("double-location owner transfer", () => {
 		const transcript = path.join(root, "old", "anything.jsonl");
 		header = { type: "session", version: 5, id: "transfer-header", timestamp: "2026-01-01T00:00:00.000Z", cwd: root };
 		await Bun.write(transcript, `${JSON.stringify(header)}\n`);
+		// Match the owner-only mode of managed publication, independent of umask.
+		await fs.chmod(transcript, 0o600);
 		old = captureOwnerTargetSync({ transcriptPath: transcript, headerId: "transfer-header" });
 		next = captureOwnerTargetSync({
 			transcriptPath: path.join(root, "next", "different.jsonl"),
