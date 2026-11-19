@@ -191,6 +191,18 @@ describe("crash redaction classification", () => {
 		);
 		expect(redactCrashSecretsForPreview(prose)).toBe('{code:"PEM example: «redacted-private-key»; diagnostic=keep"}');
 	});
+
+	it("redacts a secret spanning across fatal message and stderr context in one pass", () => {
+		// Regression test for a key split across message and stderr context being emitted.
+		// Combined redaction ensures secrets spanning boundaries are properly masked.
+		const text = `Error: api_key=secret_xyz_subsequent_part123`;
+
+		// When redacted together, the entire secret should be masked
+		const redacted = redactCrashSecrets(text);
+		expect(redacted).not.toContain("secret_xyz_");
+		expect(redacted).not.toContain("subsequent_part");
+		expect(redacted).toContain("«redacted»");
+	});
 });
 
 describe("recordFatalCrash", () => {

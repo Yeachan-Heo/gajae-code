@@ -474,14 +474,12 @@ let inspectorOpened = false;
 function formatFatalError(label: string, fatal: FatalDiagnostic): string {
 	const stackLines = fatal.stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
-	// The header and stack are classified together; the payload was classified per field at capture
-	// and is appended as-is, so no marker can be read back as source text. A payload used as the
-	// message is already masked for the same reason.
-	const header = fatal.messageIsMasked
-		? `${redactCrashSecrets(`\n[${label}] ${fatal.name}: `)}${fatal.message}${redactCrashSecrets(formattedStack)}\n`
-		: redactCrashSecrets(`\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}\n`);
-	const formattedPayload = fatal.payload ? `${fatal.payload}\n` : "";
-	return boundCrashRecord(`${header}${formattedPayload}`);
+	const formattedPayload = fatal.payload ? `\n${fatal.payload}` : "";
+	// Redact the entire combined diagnostic in one pass to ensure secrets spanning across
+	// message, stack, and payload boundaries are properly masked.
+	return boundCrashRecord(
+		redactCrashSecrets(`\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}${formattedPayload}\n`),
+	);
 }
 /** Cap for the durable crash log; it is reset past this so a crash loop cannot fill the disk. */
 export const CRASH_LOG_MAX_BYTES = 512 * 1024;
