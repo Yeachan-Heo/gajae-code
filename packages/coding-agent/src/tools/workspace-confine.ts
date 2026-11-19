@@ -5,6 +5,45 @@ import { confinedMkdirAll, confinedOpenRead, confinedUnlink, confinedWriteFileAt
 import { pathIsWithin } from "@gajae-code/utils";
 
 /**
+ * Cache for pinned root identities.
+ * Maps the input root path to its canonical realpath and inode/device pair.
+ * This prevents TOCTOU attacks where a concurrent process replaces the root
+ * path with a symlink after validation but before the operation.
+ */
+const pinnedRoots = new Map<string, { realPath: string; ino: bigint; dev: bigint }>();
+
+/**
+ * Get the canonical realpath of a root and validate it hasn't been replaced.
+ * On first call, caches the realpath and inode. On subsequent calls,
+ * verifies the inode hasn't changed (would indicate a path swap).
+ */
+async function getPinnedRootPath(root: string): Promise<string> {
+	const resolvedInput = path.resolve(root);
+	let pinned = pinnedRoots.get(resolvedInput);
+
+	if (!pinned) {
+		const realPath = await fs.realpath(root).catch(() => path.resolve(root));
+		const stat = await fs.stat(realPath);
+		pinned = { realPath, ino: BigInt(stat.ino), dev: BigInt(stat.dev) };
+		pinnedRoots.set(resolvedInput, pinned);
+	} else {
+		// Verify the pinned identity hasn't been replaced
+		try {
+			const currentStat = await fs.stat(pinned.realPath);
+			if (BigInt(currentStat.ino) !== pinned.ino || BigInt(currentStat.dev) !== pinned.dev) {
+				throw new Error(`Root identity changed: ${pinned.realPath}`);
+			}
+		} catch (err) {
+			// If we can't stat it, it's been deleted/replaced - clear the cache
+			pinnedRoots.delete(resolvedInput);
+			throw err;
+		}
+	}
+
+	return pinned.realPath;
+}
+
+/**
  * Confinement for a session opened with `--confine`.
  *
  * Existing paths are checked after symlink resolution. A path that does not
@@ -46,10 +85,7 @@ interface ConfinedTarget {
 }
 
 async function resolveConfinedTarget(root: string, candidate: string): Promise<ConfinedTarget> {
-	const [realRoot, existing] = await Promise.all([
-		fs.realpath(root).catch(() => path.resolve(root)),
-		nearestExistingPath(candidate),
-	]);
+	const [realRoot, existing] = await Promise.all([getPinnedRootPath(root), nearestExistingPath(candidate)]);
 	const stat = await fs.lstat(existing);
 	const realCandidate = stat.isSymbolicLink()
 		? await fs.realpath(existing).catch(() => undefined)
@@ -59,6 +95,50 @@ async function resolveConfinedTarget(root: string, candidate: string): Promise<C
 	const resolved = suffix ? path.resolve(realCandidate, suffix) : realCandidate;
 	if (resolved !== realRoot && !pathIsWithin(realRoot, resolved)) return { realRoot, relative: undefined };
 	return { realRoot, relative: path.relative(realRoot, resolved) };
+}
+
+/**
+ * Resolve a target for deletion, preserving final-symlink semantics.
+ * Unlike resolveConfinedTarget, this does not follow the final symlink component,
+ * so unlinking a symlink will remove the symlink itself, not its target.
+ */
+async function resolveConfinedTargetForDelete(root: string, candidate: string): Promise<ConfinedTarget> {
+	const realRoot = await getPinnedRootPath(root);
+	const resolvedCandidate = path.resolve(candidate);
+
+	// For deletion, we validate that the parent directory is inside the root
+	// and that the target (without following the final symlink) is inside the root.
+	const parent = path.dirname(resolvedCandidate);
+	const basename = path.basename(resolvedCandidate);
+
+	// Check if the parent directory exists and is inside the root
+	let existingParent = parent;
+	try {
+		await fs.lstat(existingParent);
+	} catch (err) {
+		// Parent doesn't exist - check the nearest existing parent
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+			const nearest = await nearestExistingPath(parent).catch(() => realRoot);
+			const nearestReal = await fs.realpath(nearest).catch(() => path.resolve(nearest));
+			if (!pathIsWithin(realRoot, nearestReal)) {
+				return { realRoot, relative: undefined };
+			}
+			existingParent = nearest;
+		} else {
+			throw err;
+		}
+	}
+
+	const parentReal = await fs.realpath(existingParent).catch(() => path.resolve(existingParent));
+	if (!pathIsWithin(realRoot, parentReal)) return { realRoot, relative: undefined };
+
+	// Construct the full resolved path without following the final symlink
+	const resolvedPath = path.join(parentReal, basename);
+	if (resolvedPath !== realRoot && !pathIsWithin(realRoot, resolvedPath)) {
+		return { realRoot, relative: undefined };
+	}
+
+	return { realRoot, relative: path.relative(realRoot, resolvedPath) };
 }
 
 /** True when `candidate` resolves, through symlinks, outside `root`. */
@@ -151,7 +231,8 @@ export async function writeFileInsideWorkspace(
 }
 
 export async function unlinkInsideWorkspace(root: string, candidate: string): Promise<void> {
-	const target = await requireConfinedTarget(root, candidate);
+	const target = await resolveConfinedTargetForDelete(root, candidate);
+	if (target.relative === undefined) throw escapeError(root, candidate);
 	try {
 		confinedUnlink(target.realRoot, target.relative);
 	} catch (error) {
