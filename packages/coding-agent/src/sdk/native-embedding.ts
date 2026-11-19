@@ -22,7 +22,11 @@ import type {
 	ResumeRetirementEvidence,
 	ResumeTerminationAuthorization,
 } from "../session/resume-operation";
-import { type SelectedForkTranscriptReservation, SessionManager } from "../session/session-manager";
+import {
+	type NativeForkAdmissionEvidence,
+	type SelectedForkTranscriptReservation,
+	SessionManager,
+} from "../session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
 import type {
 	ActivityControlOperation,
@@ -210,6 +214,8 @@ export type NativeEmbeddedOpenResult =
 			readonly reason: string;
 			readonly checkpoint?: SdkResumeCheckpoint;
 			readonly error?: string;
+			/** Observation only; present when an installed fork admission could not be settled. */
+			readonly forkAdmission?: NativeForkAdmissionEvidence;
 	  };
 
 /** Descriptor-bound read-only interpretation. No writer, registry, factory, or catalog effects. */
@@ -289,11 +295,6 @@ interface NativeOwner {
 }
 const nativeOwners = new WeakMap<SessionManager, NativeOwner>();
 const handles = new WeakMap<NativeLifecycleHandle, NativeOwner>();
-// A refusal can retain an installed admission, but cannot mint a lifecycle handle without an operation.
-const retainedForkAdmissions = new WeakMap<
-	NativeEmbeddedOpenResult,
-	{ readonly manager: SessionManager; readonly membership: OwnerMembership; readonly error: Error }
->();
 
 /** Internal baseline-factory hook: only a coordinator already owning this exact manager participates. */
 export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result: CreateAgentSessionResult): void {
@@ -507,15 +508,13 @@ async function createCapturedNativeFork(
 				signal,
 			});
 			if (produced.kind === "error") return { kind: "refused", reason: produced.reason };
-			if (produced.kind === "native_fork_admission_retained") {
-				const refusal: NativeEmbeddedOpenResult = {
+			if (produced.kind === "native_fork_admission_retained")
+				return {
 					kind: "refused",
 					reason: "fork_ownership_retained",
-					error: `${signal?.aborted ? "Fork cancelled; " : ""}${produced.error.message}`,
+					error: `${signal?.aborted ? "Fork cancelled; " : ""}Fresh fork admission could not be retired`,
+					forkAdmission: produced.evidence,
 				};
-				retainedForkAdmissions.set(refusal, produced);
-				return refusal;
-			}
 			const { manager, membership, pending } = produced;
 			// Register this exact operation with the existing coordinator, never reopen the child.
 			return beginNativeFactory(

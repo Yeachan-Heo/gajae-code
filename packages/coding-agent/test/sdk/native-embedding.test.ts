@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import * as sync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -306,11 +307,14 @@ describe("captured fresh native SDK fork", () => {
 			`never constructs or publishes after an admission lock release failure (${canRetire ? "settled" : "retained"})`,
 			async () => {
 				const f = await fixture([user("a", null)]);
+				const original = await Bun.file(f.file).text();
 				await fs.mkdir(f.agentDir, { mode: 0o700 });
 				let file: string | undefined;
 				let record: string | undefined;
 				let reportedReleaseFailure = false;
 				let factories = 0;
+				let stagedOpens = 0;
+				const stagedWriter = spyOn(FileSessionStorage.prototype, "openStagedWriter");
 				const acquireLock = FileSessionStorage.prototype.acquireExclusiveLockSync;
 				const acquire = spyOn(FileSessionStorage.prototype, "acquireExclusiveLockSync").mockImplementation(
 					function (this: FileSessionStorage, lockPath, options) {
@@ -322,7 +326,7 @@ describe("captured fresh native SDK fork", () => {
 							releaseSync: () => {
 								lock.releaseSync();
 								reportedReleaseFailure = true;
-								throw new Error("Injected admission lock release failure");
+								throw new Error("Injected admission lock release failure", { cause: { internal: true } });
 							},
 						};
 					},
@@ -346,18 +350,53 @@ describe("captured fresh native SDK fork", () => {
 						factories++;
 						throw new Error("Factory must not run");
 					},
-				}).finally(() => acquire.mockRestore());
+				}).finally(() => {
+					stagedOpens = stagedWriter.mock.calls.length;
+					acquire.mockRestore();
+					stagedWriter.mockRestore();
+				});
 				if (!file || !record) throw new Error("Expected exact fork reservation");
 				expect(reportedReleaseFailure).toBe(true);
-				expect(result).toMatchObject({
-					kind: "refused",
-					reason: canRetire ? "fork_refused" : "fork_ownership_retained",
-				});
 				const owner = await Bun.file(record).json();
 				expect(owner.state).toBe(canRetire ? "retired" : "live");
 				expect(owner.members).toHaveLength(canRetire ? 0 : 1);
+				if (canRetire) {
+					expect(result).toEqual({ kind: "refused", reason: "fork_refused" });
+				} else {
+					expect(result).toEqual({
+						kind: "refused",
+						reason: "fork_ownership_retained",
+						error: "Fresh fork admission could not be retired",
+						forkAdmission: {
+							kind: "admitted_unsettled",
+							identity: {
+								sessionId: owner.headerId,
+								file,
+								authorityKey: record,
+								memberId: owner.members[0].memberId,
+								epoch: owner.epoch,
+								rev: owner.rev,
+								snapshotDigest: createHash("sha256").digest("hex"),
+							},
+							admissionError: { name: "Error", message: "Injected admission lock release failure" },
+							settlementError: {
+								name: "OwnerAuthorityError",
+								message: "authority_busy",
+								code: "authority_busy",
+							},
+						},
+					});
+					if (result.kind !== "refused" || !result.forkAdmission) throw new Error("Expected admission receipt");
+					const receipt = result.forkAdmission;
+					expect(Object.isFrozen(receipt)).toBe(true);
+					expect(Object.isFrozen(receipt.identity)).toBe(true);
+					expect(Object.isFrozen(receipt.admissionError)).toBe(true);
+					expect(Object.isFrozen(receipt.settlementError)).toBe(true);
+				}
+				expect(stagedOpens).toBe(0);
 				expect(sync.existsSync(file)).toBe(false);
 				expect(factories).toBe(0);
+				expect(await Bun.file(f.file).text()).toBe(original);
 			},
 		);
 

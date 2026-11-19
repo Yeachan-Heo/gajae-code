@@ -697,9 +697,57 @@ type NativeForkStage =
 			readonly error: Error;
 	  };
 
+type NativeForkAdmissionDiagnostic = {
+	readonly name: string;
+	readonly message: string;
+	readonly code?: string;
+};
+
+/** Historical observation of an installed admission whose settlement was not proved. */
+export type NativeForkAdmissionEvidence = {
+	readonly kind: "admitted_unsettled";
+	readonly identity: {
+		readonly sessionId: string;
+		readonly file: string;
+		readonly authorityKey: string;
+		readonly memberId: string;
+		readonly epoch: string;
+		readonly rev: number;
+		readonly snapshotDigest: string;
+	};
+	readonly admissionError: NativeForkAdmissionDiagnostic;
+	readonly settlementError: NativeForkAdmissionDiagnostic;
+};
+
+// Quarantine the actual owner and original failures for the process lifetime, not the caller's receipt lifetime.
+const unsettledNativeForkOwners = new Set<{
+	readonly manager: SessionManager;
+	readonly membership: OwnerMembership;
+	readonly identity: NativeForkAdmissionEvidence["identity"];
+	readonly admissionError: unknown;
+	readonly settlementError: unknown;
+}>();
+
+function nativeForkAdmissionDiagnostic(error: unknown): NativeForkAdmissionDiagnostic {
+	try {
+		if (error instanceof Error) {
+			const { name, message } = error;
+			const code = "code" in error ? error.code : undefined;
+			return Object.freeze({
+				name: typeof name === "string" ? name : "Error",
+				message: typeof message === "string" ? message : "Unknown error",
+				...(typeof code === "string" ? { code } : {}),
+			});
+		}
+	} catch {
+		// A caller-controlled abort reason can throw when inspected; never lose the receipt.
+	}
+	return Object.freeze({ name: "Error", message: typeof error === "string" ? error : "Unknown error" });
+}
+
 type NativeCapturedForkResult =
 	| { kind: "native_forked"; manager: SessionManager; membership: OwnerMembership; pending: PendingResumeOp }
-	| { kind: "native_fork_admission_retained"; manager: SessionManager; membership: OwnerMembership; error: Error }
+	| { kind: "native_fork_admission_retained"; evidence: NativeForkAdmissionEvidence }
 	| {
 			kind: "native_fork_retained";
 			manager: SessionManager;
@@ -28388,6 +28436,7 @@ export class SessionManager {
 		let privateStagingPublished = false;
 		let directoryPublicationUncertain = false;
 		let membership: OwnerMembership | undefined;
+		let admittedIdentity: NativeForkAdmissionEvidence["identity"] | undefined;
 		const assertNativeSource = (): void => {
 			exclusive?.signal?.throwIfAborted();
 			reservation?.assertSourceName();
@@ -28452,6 +28501,17 @@ export class SessionManager {
 					},
 				);
 				membership = admission.membership;
+				// Settlement can mutate the record and then throw while releasing its lock. Capture the original identity now.
+				const { authorityKey, memberId, epoch, rev, snapshotDigest } = getOwnerMembershipEvidence(membership);
+				admittedIdentity = Object.freeze({
+					sessionId: target.headerId,
+					file: target.transcriptPath,
+					authorityKey,
+					memberId,
+					epoch,
+					rev,
+					snapshotDigest,
+				});
 				if (admission.kind === "retained") throw admission.error;
 				assertNativeSource();
 				reservation.assertAvailable();
@@ -28669,14 +28729,26 @@ export class SessionManager {
 					const closed = await manager.closeStrict();
 					if (closed.kind !== "closed") throw closed.error;
 					if (membership) retireOwnerMembershipSync(membership);
-				} catch (retirementError) {
-					const retainedError = new AggregateError(
-						[error, retirementError],
-						"Fresh fork admission could not be retired",
-					);
-					if (membership)
-						return { kind: "native_fork_admission_retained", manager, membership, error: retainedError };
-					throw retainedError;
+				} catch (settlementError) {
+					if (membership && admittedIdentity) {
+						unsettledNativeForkOwners.add({
+							manager,
+							membership,
+							identity: admittedIdentity,
+							admissionError: error,
+							settlementError,
+						});
+						return {
+							kind: "native_fork_admission_retained",
+							evidence: Object.freeze({
+								kind: "admitted_unsettled",
+								identity: admittedIdentity,
+								admissionError: nativeForkAdmissionDiagnostic(error),
+								settlementError: nativeForkAdmissionDiagnostic(settlementError),
+							}),
+						};
+					}
+					throw new AggregateError([error, settlementError], "Fresh fork admission could not be retired");
 				}
 				if (authorityFailure) return authorityFailure;
 				throw error;

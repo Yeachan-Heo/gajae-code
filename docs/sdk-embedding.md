@@ -215,6 +215,16 @@ The source is unchanged. This creates the first fork identity only; it does not
 reserve or publish a subsequent selected-entry branch. An uncertain publication
 may retain ownership and is not permission to delete the reserved path.
 
+When the SDK installs a fork admission but cannot prove it was settled before
+transcript publication, it returns `refused` with reason `fork_ownership_retained`.
+Its frozen `forkAdmission` receipt (`kind: "admitted_unsettled"`) identifies the
+reserved transcript and exact admitted owner generation. The receipt also reports
+separate `admissionError` and `settlementError` diagnostics. This is a historical
+observation, not a claim that the member is still live. The SDK retains the actual
+owner privately even if the result is discarded. The receipt contains no membership
+token, lifecycle handle or operation, and grants no permission to retry, retire or
+delete anything.
+
 The result is a discriminated union: `opened`, `selector`, `refused`,
 `uncertain_cursor`, `selection_incomplete`, or `startup_failed`. Only `opened`
 contains a published runtime and its registered `interaction` service/connection.
