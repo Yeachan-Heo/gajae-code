@@ -35293,6 +35293,40 @@ export class AgentSession {
 					: undefined;
 				if (conventionalRetirement && !conventionalRetirement.canCommit())
 					throw new Error("Session MCP reset ownership changed before session switch load");
+
+				// Validate filesystem scope matches between current and target sessions (finding 3)
+				if (switchingToDifferentSession) {
+					const currentConfined = this.sessionManager.isFilesystemConfined();
+					const captured = SessionManager.captureTranscriptStrict(sessionPath);
+					if (captured.kind === "captured") {
+						try {
+							let targetScope: string | undefined;
+							let firstLine = true;
+							captured.snapshot.forEachLine((line: Uint8Array) => {
+								if (firstLine) {
+									try {
+										const json = JSON.parse(new TextDecoder().decode(line)) as { filesystemScope?: string };
+										targetScope = json.filesystemScope;
+									} catch (e) {
+										// Ignore JSON parse errors, scope will be undefined
+									}
+									firstLine = false;
+									return false; // Stop after first line
+								}
+							});
+							const targetConfined = targetScope === "cwd";
+							if (currentConfined !== targetConfined) {
+								throw new Error(
+									`Cannot switch between confined and unconfined sessions: ` +
+										`current is ${currentConfined ? "confined" : "unconfined"}, target is ${targetConfined ? "confined" : "unconfined"}`,
+							);
+						}
+					} finally {
+						captured.snapshot.close();
+					}
+				}
+			}
+
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
