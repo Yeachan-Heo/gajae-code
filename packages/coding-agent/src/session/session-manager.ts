@@ -28331,6 +28331,15 @@ export class SessionManager {
 		if (destination.kind === "managed" && !sourceStore) throw new Error("context_mismatch");
 		const assertCurrent = (): void => {
 			signal?.throwIfAborted();
+			const owner = getOwnerMembershipEvidence(membership);
+			if (
+				owner.policy.kind !== "exclusive_native" ||
+				owner.memberKind !== sourceOp.policy.memberKind ||
+				owner.memberId !== sourceOp.memberToken ||
+				owner.authorityKey !== sourceOp.authorityKey ||
+				owner.epoch !== sourceOp.epoch ||
+				owner.rev !== sourceOp.policy.rev
+			) throw new OwnerAuthorityError("participation_lost");
 			if (
 				this.#sessionFile !== file ||
 				this.#sessionId !== id ||

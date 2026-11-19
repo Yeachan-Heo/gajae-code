@@ -9,6 +9,7 @@ import {
 	captureLegacyTakeoverAttestationSync,
 	captureOwnerTargetSync,
 	type OwnerRecord,
+	revalidateOwnerMembershipSync,
 } from "../../src/session/owner-group";
 import { reduceResumeTranscript, resolveResumeCheckpoint } from "../../src/session/resume-cursor";
 import type { ResumeRouting } from "../../src/session/resume-operation";
@@ -355,6 +356,34 @@ describe("native selected branch successor preparation", () => {
 			expect(storage.readTextSync(`${aFile}.original`)).toBe(aBytes);
 			expect(storage.readTextSync(aFile)).toBe(aBytes);
 			expect(a.manager.getOwnerMembership()).toBe(a.membership);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a predecessor revision refreshed after its fork operation",
+		async () => {
+			const { fork: a, aFile, aBytes, storage } = await selectedForkFixture(false);
+			const { authorityKey, rev } = a.manager.getSessionOwnerEvidence()!;
+			const row = JSON.parse(storage.readTextSync(authorityKey)) as OwnerRecord;
+			const refreshed = `${JSON.stringify({ ...row, rev: rev + 1 })}\n`;
+			const open = vi.spyOn(storage, "openStagedWriter");
+			let candidate: string | undefined;
+			await expect(
+				a.manager.prepareNativeBranchSuccessor({
+					sourceOp: a.pending,
+					selectedEntryId: "selected",
+					reserve: async ({ file }) => {
+						candidate = file;
+						fs.writeFileSync(authorityKey, refreshed);
+						expect(revalidateOwnerMembershipSync(a.membership).rev).toBe(rev + 1);
+					},
+				}),
+			).rejects.toThrow("participation_lost");
+			expect(open).not.toHaveBeenCalled();
+			if (!candidate) throw new Error("B was not reserved");
+			expect(fs.existsSync(candidate)).toBe(false);
+			expect(storage.readTextSync(aFile)).toBe(aBytes);
+			expect(storage.readTextSync(authorityKey)).toBe(refreshed);
 		},
 	);
 
