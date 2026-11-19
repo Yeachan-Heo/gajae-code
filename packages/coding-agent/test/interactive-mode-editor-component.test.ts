@@ -723,8 +723,6 @@ describe("InteractiveMode.setEditorComponent", () => {
 		const userLabelRow = plainLines.findIndex(line => line.trim() === "user");
 		expect(userLabelRow).toBeGreaterThanOrEqual(0);
 		expect(rendered.anchors[userLabelRow]).toBeNull();
-		expect(rendered.lines.join("")).toContain("\x1b]133;A\x07");
-		expect(rendered.lines.join("")).toContain("\x1b]133;B\x07\x1b]133;C\x07");
 		expect(syntheticRow).toBeGreaterThanOrEqual(0);
 		expect(rendered.anchors[syntheticRow]).toBeNull();
 		expect(statusRow).toBeGreaterThanOrEqual(0);

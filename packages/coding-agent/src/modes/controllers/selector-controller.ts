@@ -8,7 +8,6 @@ import {
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
-	OAuthCredentialSelectorError,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -2803,6 +2802,28 @@ export class SelectorController {
 				{ manualCode },
 			);
 			await this.ctx.session.modelRegistry.refresh("online-if-uncached", this.ctx.session.credentialSessionId);
+
+			// Remove any disabled credentials after successful login (kept during re-login flow)
+			if (options?.credentialsToRemoveAfterLogin?.length) {
+				const authStorage = this.ctx.session.modelRegistry.authStorage;
+				const removalResult = authStorage.removeAuthCredentialsHard(
+					providerId,
+					options.credentialsToRemoveAfterLogin,
+				);
+				// Treat both "removed" (successfully deleted) and "conflict" (already purged)
+				// as successful cleanup. A conflict result means the disabled credentials were
+				// already removed by upsertAuthCredentialForProvider's purgeSupersededDisabledRows
+				// when re-logging into the same account identity, which is the desired state.
+				if (removalResult.kind === "conflict") {
+					// Already purged during upsert (same-account re-login); this is expected
+				} else if (removalResult.kind !== "removed") {
+					// This should never happen, but log it if it does
+					this.ctx.showError(
+						"Warning: Failed to remove old disabled credential after login. You may see duplicate accounts.",
+					);
+				}
+			}
+
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			const successMessage =
 				providerId === "opencodex"
@@ -2903,12 +2924,15 @@ export class SelectorController {
 							},
 							{
 								accountProviderId: selectedProviderId,
+								// The selector fires these callbacks with `void`, so a rejection here is an
+								// unhandled rejection (a recorded GJC crash). Shared sessions refuse a
+								// credential write with SharedControlPublicationError (#7824); report every
+								// failure and keep the selector open so the user can retry or pick another row.
 								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
 									try {
 										await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
 									} catch (error: unknown) {
-										if (!(error instanceof OAuthCredentialSelectorError)) throw error;
-										this.ctx.showError(error.message);
+										this.ctx.showError(error instanceof Error ? error.message : String(error));
 										return;
 									}
 									selector.stopValidation();
@@ -2916,7 +2940,12 @@ export class SelectorController {
 									this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
 								},
 								onAutoSelect: async () => {
-									await this.ctx.session.setCredentialAuto(selectedProviderId);
+									try {
+										await this.ctx.session.setCredentialAuto(selectedProviderId);
+									} catch (error: unknown) {
+										this.ctx.showError(error instanceof Error ? error.message : String(error));
+										return;
+									}
 									selector.stopValidation();
 									done();
 									this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
@@ -2930,18 +2959,14 @@ export class SelectorController {
 									const authStorage = this.ctx.session.modelRegistry.authStorage;
 									const removalTargets = authStorage.listCredentialRemovalTargets(selectedProviderId);
 									const targetToRemove = removalTargets.find(target => target.id === credentialId);
-									if (targetToRemove) {
-										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [
-											targetToRemove,
-										]);
-										if (result.kind !== "removed") {
-											this.ctx.showError("Failed to clear disabled credential. Retry or re-login manually.");
-											return;
-										}
-									}
+									// Keep the disabled credential until new login succeeds; pass it to handleOAuthLogin
+									const reloginOptions = {
+										...options,
+										credentialsToRemoveAfterLogin: targetToRemove ? [targetToRemove] : undefined,
+									};
 									selector.stopValidation();
 									done();
-									await this.#handleOAuthLogin(selectedProviderId, options);
+									await this.#handleOAuthLogin(selectedProviderId, reloginOptions);
 								},
 								onAccountRemove: async targets => {
 									await this.#handleLogout(selectedProviderId, targets);

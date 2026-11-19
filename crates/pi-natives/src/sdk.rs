@@ -757,6 +757,7 @@ impl NotificationServer {
 		positioned_receipts: Vec<String>,
 		needed_json: String,
 	) -> Result<DependentIdleDeliveryResult> {
+		let prerequisite_json = gjc_sdk::server::replace_lone_surrogate_escapes(prerequisite_json);
 		let _: ServerMessage = serde_json::from_str(&prerequisite_json)
 			.map_err(|error| Error::from_reason(format!("invalid prerequisite json: {error}")))?;
 		let needed = parse_needed(&needed_json)?;

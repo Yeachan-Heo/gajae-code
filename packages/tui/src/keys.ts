@@ -486,11 +486,14 @@ const KOREAN_DUBEOLSIK_BASE_KEYS = new Map<number, BaseKey>(
 	].map(([character, key]) => [character.codePointAt(0)!, key as BaseKey]),
 );
 
-function matchesKoreanDubeolsikKittySequence(data: string, keyId: KeyId): boolean {
-	const event = parseKittySequence(data);
-	if (!event || event.eventType === 3 || event.baseLayoutKey !== undefined) return false;
+// Leading CSI-u codepoint, read without the native parser so that the common
+// case (any input that is not a mapped Hangul jamo) is rejected cheaply.
+const CSI_U_CODEPOINT_PREFIX = /^\x1b\[(\d+)[:;u]/;
 
-	const baseKey = KOREAN_DUBEOLSIK_BASE_KEYS.get(event.codepoint);
+function matchesKoreanDubeolsikKittySequence(data: string, keyId: KeyId): boolean {
+	if (!data.endsWith("u")) return false;
+	const prefix = CSI_U_CODEPOINT_PREFIX.exec(data);
+	const baseKey = prefix ? KOREAN_DUBEOLSIK_BASE_KEYS.get(Number(prefix[1])) : undefined;
 	if (!baseKey) return false;
 
 	const expected = parseKeyId(keyId);
@@ -499,6 +502,9 @@ function matchesKoreanDubeolsikKittySequence(data: string, keyId: KeyId): boolea
 		expected.baseKey !== baseKey
 	)
 		return false;
+
+	const event = parseKittySequence(data);
+	if (!event || event.eventType === 3 || event.baseLayoutKey !== undefined) return false;
 
 	let expectedModifier = 0;
 	for (const modifier of expected.modifiers) {
@@ -764,10 +770,10 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 		if (keyId === "ctrl+backspace") return matchesRawBackspace(data, RAW_BACKSPACE_CTRL_MODIFIER) === true;
 		if (keyId === "backspace") return matchesRawBackspace(data, 0) === true;
 	}
-	return (
-		nativeKeys().matchesKey(data, keyId, kittyProtocolActive) ||
-		(kittyProtocolActive && matchesKoreanDubeolsikKittySequence(data, keyId))
-	);
+	// Not gated on kittyProtocolActive: terminals can send CSI-u without the Kitty
+	// protocol (iTerm2's "Report modifiers using CSI u"), the native matcher already
+	// accepts Latin CSI-u in that mode, and a Hangul jamo codepoint is unambiguous.
+	return nativeKeys().matchesKey(data, keyId, kittyProtocolActive) || matchesKoreanDubeolsikKittySequence(data, keyId);
 }
 
 /**
