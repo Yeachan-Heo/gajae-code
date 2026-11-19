@@ -8,6 +8,7 @@ import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { getDefault } from "../src/config/settings-schema";
+import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { type CreateAgentSessionOptions, createAgentSession } from "../src/sdk/session";
 import { AgentSession, SharedControlPublicationError } from "../src/session/agent-session";
@@ -61,6 +62,7 @@ async function fixture(
 		cli: boolean;
 		options: Pick<CreateAgentSessionOptions, "hasUI" | "taskDepth" | "parentTaskPrefix" | "currentAgentType">;
 	},
+	defaultSelectedMCPToolNames?: string[],
 ) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-controls-"));
 	roots.push(root);
@@ -150,6 +152,7 @@ async function fixture(
 			]),
 			rebuildSystemPrompt: rebuild,
 			rootInteractiveSharedAppend,
+			...(defaultSelectedMCPToolNames && { mcpDiscoveryEnabled: true, defaultSelectedMCPToolNames }),
 		});
 	sessions.push(session);
 	await manager.flush();
@@ -329,6 +332,76 @@ describe("shared AgentSession control admission", () => {
 		]);
 		expect(f.manager.getLeafId()).toBe(appended[0]!.id);
 		expect(peer.getLeafId()).toBe(peerAppend.id);
+	});
+
+	for (const shared of [true, false]) {
+		it(`preserves configured MCP defaults after a rejected first selection (shared=${shared})`, async () => {
+			const defaultTool: CustomTool = {
+				name: "mcp__control_lookup",
+				label: "control/lookup",
+				description: "Configured MCP default fixture",
+				parameters: z.object({}),
+				mcpServerName: "control",
+				mcpToolName: "lookup",
+				execute: async () => ({ content: [] }),
+			};
+			const f = await fixture(false, shared, undefined, false, undefined, [defaultTool.name]);
+			expect(f.session.getSelectedMCPToolNames()).toEqual([]);
+			expect(f.session.hasMCPToolSelectionAuthority()).toBe(false);
+			const before = snapshot(f.session);
+			const toolRevision = f.agent.toolRevision;
+			const bytes = await Bun.file(f.file).text();
+			const rejection = new Error("first MCP selection rejected before append");
+
+			if (shared) {
+				const append = vi.spyOn(f.manager, "appendToolSelectionsSharingSession");
+				append.mockResolvedValueOnce({ kind: "rejected", error: rejection });
+				await expect(f.session.setActiveToolsByName([])).rejects.toMatchObject({
+					code: "rejected",
+					outcome: { kind: "rejected", error: rejection },
+				});
+				expect(append).toHaveBeenCalledWith([], undefined, expect.any(Function));
+			} else {
+				const append = vi.spyOn(f.manager, "appendMCPToolSelection");
+				append.mockImplementationOnce(() => {
+					throw rejection;
+				});
+				await expect(f.session.setActiveToolsByName([])).rejects.toBe(rejection);
+				expect(append).toHaveBeenCalledWith([]);
+			}
+
+			expect(snapshot(f.session)).toEqual(before);
+			expect(f.agent.toolRevision).toBe(toolRevision);
+			expect(f.session.hasMCPToolSelectionAuthority()).toBe(false);
+			await f.session.refreshMCPTools([defaultTool]);
+			expect(f.session.getSelectedMCPToolNames()).toEqual([defaultTool.name]);
+			expect(f.session.getActiveToolNames()).toEqual([...before.tools, defaultTool.name]);
+			expect(f.session.hasMCPToolSelectionAuthority()).toBe(false);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		});
+	}
+
+	it("publishes the first unchanged MCP selection with the discovered built-in change", async () => {
+		const f = await fixture(false, true, undefined, true);
+		await f.session.activateDiscoveredTools(["scheduled_fixture"]);
+		const parentId = f.manager.getLeafId();
+		const append = vi.spyOn(f.manager, "appendToolSelectionsSharingSession");
+
+		await f.session.setActiveToolsByName([]);
+
+		expect(append).toHaveBeenCalledTimes(1);
+		expect(append).toHaveBeenCalledWith([], [], expect.any(Function));
+		const [mcp, builtin] = f.manager.getBranch().slice(-2);
+		expect(mcp).toMatchObject({ type: "mcp_tool_selection", parentId, selectedToolNames: [] });
+		expect(builtin).toMatchObject({
+			type: "discovered_builtin_tool_selection",
+			parentId: mcp?.id,
+			selectedToolNames: [],
+		});
+		expect(f.session.getActiveToolNames()).toEqual([]);
+		expect(f.session.hasCommittedMCPToolSelectionAuthority()).toBe(true);
+		await f.session.setActiveToolsByName([]);
+		expect(append).toHaveBeenCalledTimes(1);
 	});
 
 	it("withholds discovered-tool promotion when shared publication cannot prove durability", async () => {

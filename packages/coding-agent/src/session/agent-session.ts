@@ -15250,6 +15250,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
+			persistMCPSelectionIfUnchanged?: boolean;
 			sharedPublication?: boolean;
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
@@ -15299,6 +15300,19 @@ export class AgentSession {
 		const nextSelectedMCPToolNames = this.#mcpDiscoveryEnabled
 			? new Set(validToolNames.filter(name => isMCPToolName(name) && !mandatory.has(name) && discoverable.has(name)))
 			: (catalog ? new Set(catalog.selected) : this.#selectedMCPToolNames);
+		const explicitMCPNamesToPersist = options?.persistMCPSelectionIfUnchanged
+			? this.#mcpDiscoveryEnabled
+				? [...nextSelectedMCPToolNames]
+				: validToolNames.filter(name => isMCPToolName(name) && !mandatory.has(name))
+			: undefined;
+		const needsExplicitMCPSelectionEntry = () => {
+			if (explicitMCPNamesToPersist === undefined) return false;
+			const context = this.sessionManager.buildSessionContext();
+			return (
+				!context.hasPersistedMCPToolSelection ||
+				!this.#selectedMCPToolNamesMatch(context.selectedMCPToolNames, explicitMCPNamesToPersist)
+			);
+		};
 		const activeNameSet = new Set(validToolNames);
 		const nextSelectedDiscoveredBuiltinToolNames = new Set(
 			options?.nextSelectedDiscoveredBuiltinToolNames ?? this.#selectedDiscoveredToolNames,
@@ -15343,6 +15357,7 @@ export class AgentSession {
 				this.#sessionTransitionKind === undefined &&
 				transitionGeneration === this.#sessionTransitionGeneration &&
 				this.sessionManager === manager &&
+				this.#usesSharedSessionPublication() &&
 				manager.getSessionId() === sessionId &&
 				manager.getSessionFile() === file &&
 				manager.getSessionIdentityGeneration() === identityGeneration &&
@@ -15358,13 +15373,16 @@ export class AgentSession {
 				builtPrompt = built.systemPrompt;
 			}
 			if (!current()) return undefined;
-			const persistedMCPNames = options?.persistedMCPToolNames ?? [...nextSelectedMCPToolNames];
+			const persistedMCPNames =
+				options?.persistedMCPToolNames ?? explicitMCPNamesToPersist ?? [...nextSelectedMCPToolNames];
 			const selectedBuiltinNames = this.#selectRestorableDiscoveredBuiltinToolNames(
 				nextSelectedDiscoveredBuiltinToolNames,
 			).filter(name => activeNameSet.has(name));
-			const mcpChanged =
+			// A first explicit MCP selection needs the same receipt even when its live names did not change.
+			const writeMCPSelection =
 				(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
-				!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, persistedMCPNames);
+				(!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, persistedMCPNames) ||
+					needsExplicitMCPSelectionEntry());
 			const builtinChanged =
 				this.#resolveEffectiveDiscoveryMode() === "all" &&
 				!this.#selectedMCPToolNamesMatch(previousSelectedDiscoveredBuiltinToolNames, selectedBuiltinNames);
@@ -15385,7 +15403,7 @@ export class AgentSession {
 				this.#setGuardedAgentTools(tools, onToolsPublished);
 				this.#invalidateDiscoveryCaches();
 			};
-			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
+			if (options?.persistMCPSelection === false || (!writeMCPSelection && !builtinChanged)) {
 				promote();
 			} else {
 				const operation = "select active tools";
@@ -15397,7 +15415,7 @@ export class AgentSession {
 					},
 					async () => {
 						const result = await manager.appendToolSelectionsSharingSession(
-							mcpChanged ? persistedMCPNames : undefined,
+							writeMCPSelection ? persistedMCPNames : undefined,
 							builtinChanged ? selectedBuiltinNames : undefined,
 							current,
 						);
@@ -15475,6 +15493,16 @@ export class AgentSession {
 			!catalogIsCurrent()
 		)
 			return undefined;
+		// Like its shared counterpart, the legacy durability-only append must be accepted
+		// before the new explicit authority becomes visible to tool observers.
+		if (
+			explicitMCPNamesToPersist !== undefined &&
+			this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, explicitMCPNamesToPersist) &&
+			needsExplicitMCPSelectionEntry()
+		) {
+			assertControlMutationAllowed();
+			this.sessionManager.appendMCPToolSelection(explicitMCPNamesToPersist);
+		}
 		promoteCatalog();
 		if (builtPrompt) {
 			this.#baseSystemPrompt = builtPrompt;
@@ -15560,11 +15588,11 @@ export class AgentSession {
 	): Promise<void> {
 		// Shared sessions publish the selection and promote prompt/tools together through the
 		// admitted tool-selection path; legacy sessions keep the legacy refusal.
-		const assertPublicationMode = this.#controlPublicationModeFence("select active tools");
 		const sharedPublication = this.#usesSharedSessionPublication();
+		if (!sharedPublication) this.sessionManager.assertLegacyMutationAllowed("select active tools");
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
-		const shouldPersistMCPSelectionIfUnchanged =
+		const persistMCPSelectionIfUnchanged =
 			isExplicit &&
 			options?.persistMCPSelection !== false &&
 			(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
@@ -15586,6 +15614,7 @@ export class AgentSession {
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
+				persistMCPSelectionIfUnchanged,
 				sharedPublication,
 				onToolsPublished,
 			});
@@ -15617,27 +15646,13 @@ export class AgentSession {
 							sessionTransitionGeneration,
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
+							persistMCPSelectionIfUnchanged,
 							sharedPublication,
 							onToolsPublished,
 						},
 					);
 					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {
 						throw new Error("Active tool selection was superseded while retrying after an MCP catalog change");
-					}
-				}
-			}
-			if (appliedRevision !== undefined && shouldPersistMCPSelectionIfUnchanged) {
-				const sessionContext = this.sessionManager.buildSessionContext();
-				const selectedMCPToolNames = this.getSelectedMCPToolNames();
-				if (
-					!sessionContext.hasPersistedMCPToolSelection ||
-					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
-				) {
-					if (sharedPublication)
-						await this.#publishSharedMCPToolSelection(selectedMCPToolNames, assertPublicationMode);
-					else {
-						assertPublicationMode();
-						this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
 					}
 				}
 			}
@@ -33333,35 +33348,6 @@ this.#toolRegistry.size === previousRegistry.length &&
 	 * exact receipt, never retry or compensate, and close the session so it cannot keep
 	 * running on state that diverges from its transcript.
 	 */
-	/** Make an already-live MCP selection durable in a shared session (no runtime change). */
-	async #publishSharedMCPToolSelection(selected: string[], assertMode: () => void): Promise<void> {
-		const operation = "select active tools";
-		const manager = this.sessionManager;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.#selectedMCPToolNamesMatch(this.getSelectedMCPToolNames(), selected)
-			);
-		};
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() => manager.appendToolSelectionsSharingSession(selected, undefined, current),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-	}
-
 	#failClosedSharedControl(
 		operation: string,
 		outcome: Extract<SharedEntriesAppendOutcome, { kind: "committed" | "unknown" }>,
