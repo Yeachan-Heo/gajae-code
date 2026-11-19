@@ -1,14 +1,20 @@
+import type { OwnerMembership } from "./owner-group";
 import type { PendingResumeOp } from "./resume-operation";
-import type { SessionContext, SessionEntry, SessionManager, SessionTreeNode } from "./session-manager";
+import type {
+	NativeForkAdmissionEvidence,
+	SessionContext,
+	SessionEntry,
+	SessionManager,
+	SessionTreeNode,
+	StrictSessionOpenFailure,
+} from "./session-manager";
+import type { SessionNoReplacePublicationReceipt } from "./session-storage";
 
 /**
  * Opaque capability for zero-copy session snapshots. This module is deliberately
  * excluded from package exports; only trusted in-package readers may use it.
  */
 export const sessionManagerReadCapability: unique symbol = Symbol("SessionManager internal read capability");
-
-/** Internal producer only: possession of the reservation does not grant ownership. */
-export const nativeBranchSuccessorCapability: unique symbol = Symbol("SessionManager internal native branch successor");
 
 export interface NativeBranchSuccessorOptions {
 	readonly sourceOp: PendingResumeOp;
@@ -21,8 +27,46 @@ export interface NativeBranchSuccessorOptions {
 	readonly signal?: AbortSignal;
 }
 
-export function prepareNativeBranchSuccessor(manager: SessionManager, options: NativeBranchSuccessorOptions) {
-	return manager[nativeBranchSuccessorCapability](options);
+export type NativeCapturedForkResult =
+	| {
+			kind: "native_forked";
+			manager: SessionManager;
+			membership: OwnerMembership;
+			pending: PendingResumeOp;
+			receipt: SessionNoReplacePublicationReceipt;
+	  }
+	| { kind: "native_fork_admission_retained"; evidence: NativeForkAdmissionEvidence }
+	| {
+			kind: "native_fork_retained";
+			manager: SessionManager;
+			membership: OwnerMembership;
+			pending: PendingResumeOp;
+			/** Historical no-replace receipt, not authority to continue or adopt the fork. */
+			receipt?: SessionNoReplacePublicationReceipt;
+			proven: boolean;
+			error: Error;
+	  }
+	| StrictSessionOpenFailure;
+
+type NativeBranchSuccessor = (
+	manager: SessionManager,
+	options: NativeBranchSuccessorOptions,
+) => Promise<NativeCapturedForkResult>;
+
+let prepareSuccessor: NativeBranchSuccessor | undefined;
+
+/** Register the private producer without putting a callable capability on the manager's prototype. */
+export function bindNativeBranchSuccessor(prepare: NativeBranchSuccessor): void {
+	if (prepareSuccessor) throw new Error("Native branch successor preparation is already bound");
+	prepareSuccessor = prepare;
+}
+
+export function prepareNativeBranchSuccessor(
+	manager: SessionManager,
+	options: NativeBranchSuccessorOptions,
+): Promise<NativeCapturedForkResult> {
+	if (!prepareSuccessor) throw new Error("Native branch successor preparation is unavailable");
+	return prepareSuccessor(manager, options);
 }
 
 export interface SessionManagerReadAccess {

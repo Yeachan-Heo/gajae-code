@@ -383,8 +383,9 @@ import {
 	toRecapLineageEntry,
 } from "./recap";
 import {
+	bindNativeBranchSuccessor,
 	type NativeBranchSuccessorOptions,
-	nativeBranchSuccessorCapability,
+	type NativeCapturedForkResult,
 	type SessionManagerReadAccess,
 	sessionManagerReadCapability,
 } from "./session-manager-internal";
@@ -763,27 +764,6 @@ function nativeForkRetainedError(error: unknown): Error {
 	const { name, message, code } = nativeForkAdmissionDiagnostic(error);
 	return Object.assign(new Error(message, { cause: error }), { name, ...(code === undefined ? {} : { code }) });
 }
-
-type NativeCapturedForkResult =
-	| {
-			kind: "native_forked";
-			manager: SessionManager;
-			membership: OwnerMembership;
-			pending: PendingResumeOp;
-			receipt: SessionNoReplacePublicationReceipt;
-	  }
-	| { kind: "native_fork_admission_retained"; evidence: NativeForkAdmissionEvidence }
-	| {
-			kind: "native_fork_retained";
-			manager: SessionManager;
-			membership: OwnerMembership;
-			pending: PendingResumeOp;
-			/** Historical no-replace receipt, not authority to continue or adopt the fork. */
-			receipt?: SessionNoReplacePublicationReceipt;
-			proven: boolean;
-			error: Error;
-	  }
-	| StrictSessionOpenFailure;
 
 type ReservedForkHistory = {
 	readonly bytes: number;
@@ -8472,6 +8452,10 @@ interface SessionCwdMoveOptions {
 }
 
 export class SessionManager {
+	static {
+		bindNativeBranchSuccessor((manager, options) => manager.#prepareNativeBranchSuccessor(options));
+	}
+
 	readonly #stateSnapshots = new WeakMap<
 		SessionManagerStateSnapshot,
 		Readonly<SessionManagerStateSnapshot> & { readonly explicitPersistIdentity?: ExplicitPersistIdentity }
@@ -28292,7 +28276,7 @@ export class SessionManager {
 	 * native lifecycle rather than reopening B or treating a reserved name as proof.
 	 * @internal
 	 */
-	async [nativeBranchSuccessorCapability](options: NativeBranchSuccessorOptions): Promise<NativeCapturedForkResult> {
+	async #prepareNativeBranchSuccessor(options: NativeBranchSuccessorOptions): Promise<NativeCapturedForkResult> {
 		const { sourceOp, selectedEntryId, reserve, signal } = options;
 		const file = this.#sessionFile;
 		const id = this.#sessionId;

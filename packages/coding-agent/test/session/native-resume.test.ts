@@ -15,7 +15,7 @@ import {
 import { reduceResumeTranscript, resolveResumeCheckpoint } from "../../src/session/resume-cursor";
 import type { ResumeRouting } from "../../src/session/resume-operation";
 import { BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, type FileEntry, SessionManager } from "../../src/session/session-manager";
-import { prepareNativeBranchSuccessor } from "../../src/session/session-manager-internal";
+import { prepareNativeBranchSuccessor, sessionManagerReadCapability } from "../../src/session/session-manager-internal";
 import {
 	FileSessionStorage,
 	type SessionDurabilityRepairRange,
@@ -194,6 +194,7 @@ async function selectedForkFixture(managed: boolean) {
 describe("native selected branch successor preparation", () => {
 	it("does not expose preparation or dual-owner publication as package APIs", () => {
 		expect("prepareNativeBranchSuccessor" in SessionManager.prototype).toBe(false);
+		expect(Object.getOwnPropertySymbols(SessionManager.prototype)).toEqual([sessionManagerReadCapability]);
 		expect("withNativeForkSuccessorPublication" in publicOwnerGroup).toBe(false);
 		expect(() =>
 			Bun.resolveSync("@gajae-code/coding-agent/session/session-manager-internal", import.meta.dir),
