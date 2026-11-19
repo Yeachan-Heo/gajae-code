@@ -3,7 +3,7 @@ import puppeteer from "puppeteer-core";
 import { browserPath } from "./component-fixture";
 
 test.skipIf(!browserPath)(
-	"app icon keeps macOS optical margins at source and Dock sizes",
+	"app icon preserves its optical margins at source and projected Dock sizes",
 	async () => {
 		const bytes = await Bun.file(`${import.meta.dir}/../icon.png`).arrayBuffer();
 		const browser = await puppeteer.launch({ executablePath: browserPath, headless: true });
@@ -14,12 +14,13 @@ test.skipIf(!browserPath)(
 					const image = new Image();
 					image.src = source;
 					await image.decode();
+					const canvas = new OffscreenCanvas(1024, 1024);
+					const context = canvas.getContext("2d");
+					if (!context) throw new Error("Cannot inspect icon pixels");
+					context.drawImage(image, 0, 0);
+					const { data } = context.getImageData(0, 0, 1024, 1024);
 					const bounds = [1024, 128, 64, 32].map(size => {
-						const canvas = new OffscreenCanvas(size, size);
-						const context = canvas.getContext("2d");
-						if (!context) throw new Error("Cannot inspect icon pixels");
-						context.drawImage(image, 0, 0, size, size);
-						const { data } = context.getImageData(0, 0, size, size);
+						const scale = 1024 / size;
 						let left = size,
 							top = size,
 							right = -1,
@@ -28,7 +29,13 @@ test.skipIf(!browserPath)(
 						let silhouettePixels = 0;
 						for (let y = 0; y < size; y++) {
 							for (let x = 0; x < size; x++) {
-								const alpha = data[(y * size + x) * 4 + 3];
+								// Use area coverage, not the renderer's platform-dependent downsampling.
+								let alpha = 0;
+								for (let row = y * scale; row < (y + 1) * scale; row++) {
+									for (let col = x * scale; col < (x + 1) * scale; col++) {
+										alpha += data[(row * 1024 + col) * 4 + 3];
+									}
+								}
 								if (size === 1024 && (x < 100 || x >= 924 || y < 100 || y >= 924)) {
 									if (alpha !== 0) paddingPixels++;
 								}
@@ -38,7 +45,7 @@ test.skipIf(!browserPath)(
 									const dy = Math.max(284 - y, 0, y - 739);
 									if (Math.hypot(dx, dy) > 185) silhouettePixels++;
 								}
-								if (alpha < 128) continue;
+								if (alpha * 2 < 255 * scale * scale) continue;
 								left = Math.min(left, x);
 								top = Math.min(top, y);
 								right = Math.max(right, x);
