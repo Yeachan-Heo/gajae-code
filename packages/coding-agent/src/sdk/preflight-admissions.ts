@@ -21,10 +21,10 @@ const REJECTED_ADMISSION_MESSAGE =
  * and preflight can include a pre-prompt compaction that runs for minutes. A
  * client whose acknowledgement budget expires meanwhile has nothing but its own
  * `clientRef` to reconcile with. Without this ledger `turn.result` answered
- * `unknown` for the whole preflight and again after a rejection, so a client
- * could not tell an in-progress submission from a lost one (#7867). The ledger
- * reports `admitted` (with the generated correlation) while preflight runs and a
- * definite `failed` after the host rejects the submission.
+ * `unknown` for the whole preflight, so a client could not tell an in-progress
+ * submission from a lost one (#7867). The ledger reports `admitted` (with the
+ * generated correlation) while preflight runs. Pre-acceptance rejections are not
+ * recorded; the clientRef is released so the client can retry (#7872).
  */
 export class PreflightAdmissionLedger {
 	readonly #pending = new Map<string, Admission>();
@@ -48,17 +48,33 @@ export class PreflightAdmissionLedger {
 		if (clientRef !== undefined) this.#pending.delete(admissionKey(kind, clientRef));
 	}
 
-	/** Converts an admitted submission into a definite rejection. */
+	/**
+	 * Records or discards a pre-acceptance rejection based on error semantics.
+	 *
+	 * Pre-acceptance validation errors (like model_not_selected) are released from
+	 * pending without recording. These "refusals" never entered meaningful preflight
+	 * and should allow the same clientRef to be re-submitted immediately.
+	 *
+	 * Other preflight errors are recorded as definite rejections so clients can
+	 * learn that the submission never ran (even if acknowledgement was lost).
+	 */
 	rejected(kind: AdmissionKind, clientRef: string | undefined, cause: unknown): void {
 		if (clientRef === undefined) return;
 		const key = admissionKey(kind, clientRef);
 		const admission = this.#pending.get(key);
 		if (!admission) return;
 		this.#pending.delete(key);
+
+		// Pre-acceptance validation refusals (model_not_selected, etc.) are not
+		// recorded, allowing clientRef reuse. Other preflight failures are recorded
+		// to satisfy clients who lost their acknowledgement.
+		const sanitized = sanitizePromptFailure(cause);
+		if (sanitized.code === "model_not_selected") return;
+
 		this.#rejected.set(key, {
 			...admission,
 			rejectedAt: this.#now(),
-			error: { code: sanitizePromptFailure(cause).code, message: REJECTED_ADMISSION_MESSAGE },
+			error: { code: sanitized.code, message: REJECTED_ADMISSION_MESSAGE },
 		});
 		while (this.#rejected.size > REJECTED_ADMISSION_CAPACITY)
 			this.#rejected.delete(this.#rejected.keys().next().value!);
