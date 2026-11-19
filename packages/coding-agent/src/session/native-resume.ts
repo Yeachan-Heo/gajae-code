@@ -10,8 +10,7 @@ import {
 import type { ResumeSessionIdentity, SessionStorageStat } from "../sdk/session-readonly/storage";
 import type { PublicationDebtSnapshot, PublicationPreparedEntry } from "./publication-freeze";
 import {
-	isOwnerEnrollData,
-	OWNER_ENROLL_CUSTOM_TYPE,
+	hasMalformedOwnerEnrollments,
 	projectResumeGraphRecord,
 	type ResumeGraphReduction,
 	reduceResumeTranscript,
@@ -210,24 +209,7 @@ export function captureNativeResumeTranscript(
 		const stat = snapshot.getLastReadStat() ?? storage.statSync(path);
 		const graph = buildStoredSessionEntries(records).map(projectResumeGraphRecord);
 		const reduction = reduceResumeTranscript(graph, snapshot.identity.sha256);
-		const foreignMarkers = new Set(
-			graph.flatMap(entry => {
-				if (
-					entry.type === "session" ||
-					entry.type !== "custom" ||
-					entry.customType !== OWNER_ENROLL_CUSTOM_TYPE ||
-					typeof entry.data !== "object" ||
-					entry.data === null ||
-					Array.isArray(entry.data) ||
-					!("bind" in entry.data) ||
-					typeof entry.data.bind !== "string" ||
-					entry.data.bind === reduction.checkpoint.headerId ||
-					!isOwnerEnrollData(entry.data, entry.data.bind)
-				)
-					return [];
-				return [entry.id];
-			}),
-		);
+
 		const rechecked = snapshot.revalidate();
 		if (rechecked.kind !== "valid")
 			return { failure: rechecked, capture: { kind: "read_failed", error: rechecked.reason } };
@@ -239,9 +221,7 @@ export function captureNativeResumeTranscript(
 					Object.freeze({ entryId: marker.entryId, data: Object.freeze({ ...marker.data }) }),
 				),
 			),
-			invalidOwnerMarkers: reduction.diagnostics.some(
-				diagnostic => diagnostic.reason === "invalid_owner_enroll" && !foreignMarkers.has(diagnostic.entryId),
-			),
+			invalidOwnerMarkers: hasMalformedOwnerEnrollments(graph, reduction),
 			executionTail: reduction.executableEntries.at(-1)?.id ?? null,
 			capture: {
 				kind: "captured",

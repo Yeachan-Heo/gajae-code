@@ -195,6 +195,28 @@ export function isOwnerEnrollData(value: unknown, headerId: string): value is Ow
 	);
 }
 
+/** Well-formed enrollment for a different transcript is inert copied history. */
+export function hasMalformedOwnerEnrollments(
+	graph: readonly ResumeGraphRecord[],
+	reduction: ResumeGraphReduction,
+): boolean {
+	const invalid = new Set(
+		reduction.diagnostics.filter(item => item.reason === "invalid_owner_enroll").map(item => item.entryId),
+	);
+	if (invalid.size === 0) return false;
+	for (const entry of graph) {
+		if (entry.type !== "custom" || entry.customType !== OWNER_ENROLL_CUSTOM_TYPE || !invalid.has(entry.id)) continue;
+		if (
+			isRecord(entry.data) &&
+			typeof entry.data.bind === "string" &&
+			entry.data.bind !== reduction.checkpoint.headerId &&
+			isOwnerEnrollData(entry.data, entry.data.bind)
+		)
+			invalid.delete(entry.id);
+	}
+	return invalid.size > 0;
+}
+
 /**
  * Reduces a resolved transcript without clocks, I/O, or ownership inference.
  * snapshotDigest must describe the caller's complete raw snapshot, including marker bytes;

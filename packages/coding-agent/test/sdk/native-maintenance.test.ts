@@ -626,7 +626,28 @@ describe("checkpoint-selected full-history native forks", () => {
 		it.skipIf(process.platform === "win32")(
 			`awaits the exact initial ${scope} reservation before publication`,
 			async () => {
-				const entries = [user("a", null), user("b", "a"), user("c", null)];
+				const entries = [
+					user("a", null),
+					user("b", "a"),
+					user("c", null),
+					{
+						type: "custom",
+						id: "prior-enrollment",
+						parentId: "b",
+						timestamp,
+						customType: "gjc.owner_enroll",
+						data: {
+							v: 1,
+							bind: "selected",
+							member: "prior-member",
+							runtime: "legacy",
+							pid: 2_147_483_647,
+							processIncarnation: "prior-process",
+							hostId: "prior-host",
+							epoch: "prior-epoch",
+						},
+					},
+				];
 				const f = managed ? await preparedManagedFixture(entries) : await fixture(entries);
 				// Use a normally secured managed source, not one requiring repair on open.
 				if (managed && process.platform !== "win32") await fs.chmod(f.file, 0o600);
@@ -874,6 +895,32 @@ describe("checkpoint-selected full-history native forks", () => {
 			expect(await Bun.file(`${reservedFile}.spill.tail`).text()).toBe("unrelated file");
 		},
 	);
+
+	it("refuses malformed enrollment history before reserving a fork", async () => {
+		const f = await fixture([
+			user("a", null),
+			{
+				type: "custom",
+				id: "marker",
+				parentId: "a",
+				timestamp,
+				customType: "gjc.owner_enroll",
+				data: { v: 1, bind: "selected" },
+			},
+		]);
+		const before = await tree(f.root);
+		const reserveSelectedForkTranscript = vi.fn(async () => {});
+		const error = await caught(
+			forkEmbeddedSession({
+				...f,
+				selection: { snapshotDigest: checkpoint(f.file).snapshotDigest, targetLeafId: "a" },
+				reserveSelectedForkTranscript,
+			}),
+		);
+		expect(reserveSelectedForkTranscript).not.toHaveBeenCalled();
+		expect(error.code).toBe("malformed");
+		expect(await tree(f.root)).toEqual(before);
+	});
 
 	it("refuses a bounded compacted fork before invoking the reservation or changing the destination", async () => {
 		const f = await fixture([

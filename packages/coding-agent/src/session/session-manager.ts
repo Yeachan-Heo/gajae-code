@@ -171,6 +171,7 @@ import {
 	withOwnerTransferPublicationSync,
 } from "./owner-group";
 import {
+	hasMalformedOwnerEnrollments,
 	isOwnerEnrollData,
 	OWNER_ENROLL_CUSTOM_TYPE,
 	projectResumeGraphRecord,
@@ -4178,6 +4179,7 @@ function measureReservedForkHistory(
 	if (
 		reduction.checkpoint.kind === "invalid" ||
 		reduction.markerEvidence.length !== 0 ||
+		hasMalformedOwnerEnrollments(graph, reduction) ||
 		(target !== null && !reduction.executableEntries.some(entry => entry.id === target))
 	)
 		return { kind: "error", reason: "malformed", message: "Invalid transformed fork graph or target." };
