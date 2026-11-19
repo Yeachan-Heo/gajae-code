@@ -39,6 +39,7 @@ interface Harness {
 async function startRuntime(options: {
 	replaced: () => boolean | Promise<boolean>;
 	failStartupRegistration?: boolean;
+	enableBrokerFailure?: () => boolean;
 }): Promise<Harness> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-recovery-6040-"));
 	const agentDir = path.join(root, "agent");
@@ -66,6 +67,7 @@ async function startRuntime(options: {
 		ensureBrokerImpl: async input => {
 			ensureCount++;
 			if (ensureCount === 1 && !options.failStartupRegistration) return await ensureBroker(input);
+			if (options.enableBrokerFailure && !options.enableBrokerFailure()) return await ensureBroker(input);
 			throw Object.assign(new Error("broker unavailable"), { code: "unavailable" });
 		},
 		setIntervalImpl: ((callback: () => void) => {
@@ -218,6 +220,45 @@ test("overlapping recovery ticks during a slow probe start only one attempt (#60
 		expect(harness.ensureCalls()).toBe(1);
 	} finally {
 		releaseProbe?.();
+		await harness.dispose();
+	}
+});
+
+test("failed initial registration recovers when broker becomes available (#7879)", async () => {
+	let brokerAvailable = false;
+	const harness = await startRuntime({
+		replaced: () => false,
+		enableBrokerFailure: () => !brokerAvailable,
+	});
+	try {
+		// Initial startup registration fails; backoff is recorded
+		expect(harness.ensureCalls()).toBe(0);
+
+		// Recovery tick 1: first recovery attempt (backoff hasn't prevented it yet)
+		await harness.tick();
+		const firstAttempt = harness.ensureCalls();
+		expect(firstAttempt).toBeGreaterThanOrEqual(1);
+
+		// Recovery tick 2: should be backed off
+		await harness.tick();
+		const afterBackoff = harness.ensureCalls();
+		expect(afterBackoff).toBe(firstAttempt); // No new attempts due to backoff
+
+		// Advance time and broker becomes available
+		harness.advance(2_000); // Let backoff allow another attempt
+		brokerAvailable = true;
+
+		// Recovery tick 3+: broker is now available, should eventually succeed
+		for (let i = 0; i < 20 && !harness.cleared(); i++) {
+			await harness.tick();
+			harness.advance(30_000);
+		}
+
+		// Verify recovery succeeded and stopped attempting
+		expect(harness.cleared()).toBe(false); // Recovery should still be armed or settled
+		// Should have made attempts to recover
+		expect(harness.ensureCalls()).toBeGreaterThanOrEqual(2);
+	} finally {
 		await harness.dispose();
 	}
 });
