@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -512,14 +513,14 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		await withFileLock(
 			lockedFile,
 			async () => {
-				const realOpen = fs.open;
-				vi.spyOn(fs, "open").mockImplementation((async (target, flags, mode) => {
+				const realOpenSync = fsSync.openSync;
+				vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
 					if (!deniedInfoRead && String(target) === lockInfoPath) {
 						deniedInfoRead = true;
 						throw Object.assign(new Error("metadata temporarily locked"), { code: "EPERM" });
 					}
-					return await realOpen(target, flags, mode);
-				}) as typeof fs.open);
+					return realOpenSync(target, flags, mode);
+				}) as typeof fsSync.openSync);
 				contender = withFileLock(
 					lockedFile,
 					async () => {
@@ -2486,7 +2487,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		const attempt = withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
 		await expect(attempt).rejects.toMatchObject({
 			code: "acquire_timeout",
-			removalFailure: { outcome: "error", code: "EACCES" },
+			removalFailure: { outcome: "error", code: "sharing_violation" },
 		});
 		await expect(attempt).rejects.toThrow(/Failed to remove file lock tree: sharing_violation/);
 	});
@@ -2598,5 +2599,43 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped");
+	});
+});
+
+describe("fileLocksGcAdapter.prune owner-record refusal", () => {
+	const hostPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+
+	afterEach(() => {
+		if (hostPlatform) Object.defineProperty(process, "platform", hostPlatform);
+	});
+
+	async function lockWithRefusedInfo(platform: NodeJS.Platform, code: string) {
+		const base = await makeTemp();
+		const spoolDir = path.join(base, "spool");
+		const lockDir = path.join(spoolDir, "refused.lock");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: 1000 });
+		const infoPath = path.join(lockDir, "info");
+		const realOpenSync = fsSync.openSync;
+		vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+			if (String(target) === infoPath) throw Object.assign(new Error(`${code}: open '${infoPath}'`), { code });
+			return realOpenSync(target, flags, mode);
+		}) as typeof fsSync.openSync);
+		Object.defineProperty(process, "platform", { ...hostPlatform, value: platform });
+		return { lockDir, ctx: ctxWith(spoolDir, () => ({ status: "dead" })) };
+	}
+
+	test("on Windows an owner record refused mid-removal keeps the lock for a later pass", async () => {
+		const { lockDir, ctx } = await lockWithRefusedInfo("win32", "EPERM");
+		const outcome = await fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx);
+
+		expect(outcome).toEqual({ removed: false, skipped: "file_lock_info_changing" });
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("on POSIX a refused owner record is a real permission failure, not a changing lock", async () => {
+		const { lockDir, ctx } = await lockWithRefusedInfo("linux", "EACCES");
+
+		await expect(fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx)).rejects.toMatchObject({ code: "EACCES" });
+		expect(await fs.exists(lockDir)).toBe(true);
 	});
 });
