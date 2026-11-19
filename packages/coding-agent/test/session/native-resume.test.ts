@@ -465,9 +465,13 @@ describe("native selected branch successor preparation", () => {
 		);
 	}
 
-	for (const owner of ["A", "B"] as const) {
+	for (const [owner, phase] of [
+		["A", "close"],
+		["B", "close"],
+		["B", "publish"],
+	] as const) {
 		it.skipIf(process.platform === "win32")(
-			`refuses B publication when ${owner}'s acquired lock is replaced at staged close`,
+			`retains B when ${owner}'s acquired lock is replaced at ${phase}`,
 			async () => {
 				const { fork: a, aFile, aBytes, storage, sourceFile, sourceBytes } = await selectedForkFixture(true);
 				const aKey = a.manager.getSessionOwnerEvidence()!.authorityKey;
@@ -476,24 +480,30 @@ describe("native selected branch successor preparation", () => {
 				let replacement: { file: string; bytes: string; ino: bigint; bOwnerBytes: string } | undefined;
 				const open = storage.openStagedWriter.bind(storage);
 				const dispatch = vi.fn();
+				let published: SessionNoReplacePublicationReceipt | undefined;
+				const displace = () => {
+					if (!candidate) throw new Error("B was not reserved");
+					const bOwnerBytes = storage.readTextSync(candidate.authorityKey);
+					const lock = `${owner === "A" ? aKey : candidate.authorityKey}.lock`;
+					const bytes = storage.readTextSync(lock);
+					fs.renameSync(lock, `${lock}.displaced`);
+					// Copy even the old token and digest: the acquired inode is still displaced.
+					fs.writeFileSync(lock, bytes, { mode: 0o600, flag: "wx" });
+					replacement = { file: lock, bytes, ino: fs.lstatSync(lock, { bigint: true }).ino, bOwnerBytes };
+				};
 				vi.spyOn(storage, "openStagedWriter").mockImplementation((file, options) => {
 					const writer = open(file, options);
 					const close = writer.closeSync.bind(writer);
 					writer.closeSync = () => {
 						close();
-						if (!candidate) throw new Error("B was not reserved");
-						const bOwnerBytes = storage.readTextSync(candidate.authorityKey);
-						const lock = `${owner === "A" ? aKey : candidate.authorityKey}.lock`;
-						const bytes = storage.readTextSync(lock);
-						fs.renameSync(lock, `${lock}.displaced`);
-						// Copy even the old token and digest: the acquired inode is still displaced.
-						fs.writeFileSync(lock, bytes, { mode: 0o600, flag: "wx" });
-						replacement = { file: lock, bytes, ino: fs.lstatSync(lock, { bigint: true }).ino, bOwnerBytes };
+						if (phase === "close") displace();
 					};
 					const publish = writer.publishNoReplace.bind(writer);
 					writer.publishNoReplace = () => {
 						dispatch();
-						return publish();
+						published = publish();
+						if (phase === "publish") displace();
+						return published;
 					};
 					return writer;
 				});
@@ -507,13 +517,23 @@ describe("native selected branch successor preparation", () => {
 				});
 				if (retained.kind !== "native_fork_retained") throw new Error(`B was not retained: ${retained.kind}`);
 				managers.push(retained.manager);
-				if (!candidate || !replacement) throw new Error("B did not reach staged close");
+				if (!candidate || !replacement) throw new Error("B did not reach the injected fault");
 				expect(retained.proven).toBe(false);
-				expect(retained.receipt).toBeUndefined();
 				expect(retained.error).toMatchObject({ code: "authority_changed", message: "authority_changed" });
-				expect(nativeResumeBinding(retained.pending).initialPublication).toBeUndefined();
-				expect(dispatch).not.toHaveBeenCalled();
-				expect(fs.existsSync(candidate.file)).toBe(false);
+				if (phase === "publish") {
+					if (!published || !retained.receipt) throw new Error("Expected the actual B publication receipt");
+					expect(retained.receipt).toMatchObject({
+						publicationId: published.publicationId,
+						sha256: published.sha256,
+					});
+					expect(dispatch).toHaveBeenCalledTimes(1);
+					expect(resumeDigest(storage.readTextSync(candidate.file))).toBe(published.sha256);
+				} else {
+					expect(retained.receipt).toBeUndefined();
+					expect(nativeResumeBinding(retained.pending).initialPublication).toBeUndefined();
+					expect(dispatch).not.toHaveBeenCalled();
+					expect(fs.existsSync(candidate.file)).toBe(false);
+				}
 				expect(storage.readTextSync(aFile)).toBe(aBytes);
 				expect(storage.readTextSync(sourceFile)).toBe(sourceBytes);
 				expect(storage.readTextSync(aKey)).toBe(aOwnerBytes);

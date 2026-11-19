@@ -1664,7 +1664,16 @@ async function withNativeForkSuccessorPublication<T>(
 		};
 		try {
 			assertOwners();
-			return await publishUnderOwnerLock(destination, destinationTarget, () => body(assertOwners), "unchecked");
+			return await publishUnderOwnerLock(
+				destination,
+				destinationTarget,
+				async () => {
+					const result = await body(assertOwners);
+					assertOwners();
+					return result;
+				},
+				"unchecked",
+			);
 		} finally {
 			active = false;
 		}
