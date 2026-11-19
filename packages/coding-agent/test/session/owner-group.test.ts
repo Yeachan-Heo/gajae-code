@@ -12,6 +12,7 @@ import {
 	admitOwnerMembership,
 	admitOwnerMembershipSync,
 	admitOwnerMembershipWithAsyncEvidence,
+	admitOwnerMembershipWithAsyncReceipt,
 	allocateFreshOwnerCreation,
 	captureLegacyTakeoverAttestationSync,
 	captureLegacyTakeoverAttestationWithAsyncEvidence,
@@ -1534,6 +1535,50 @@ describe("adjacent owner-group authority", () => {
 		} finally {
 			await fs.rm(retained, { recursive: true, force: true });
 		}
+	});
+
+	it("retains the installed membership when admission lock release reports failure", async () => {
+		const creation = allocateFreshOwnerCreation();
+		header = { ...header, id: creation.headerId };
+		target = captureOwnerTargetSync({ transcriptPath: path.join(dir, `${header.id}.jsonl`), headerId: header.id });
+		markers = { ...markers, snapshotDigest: target.snapshotDigest };
+		const acquireLock = FileSessionStorage.prototype.acquireExclusiveLockSync;
+		const releaseError = new Error("admission lock release unproven");
+		const acquire = spyOn(FileSessionStorage.prototype, "acquireExclusiveLockSync").mockImplementation(function (
+			this: FileSessionStorage,
+			lockPath,
+			lockOptions,
+		) {
+			const lock = acquireLock.call(this, lockPath, lockOptions);
+			if (!lock || lockPath !== `${target.authorityKey}.lock`) return lock;
+			return {
+				releaseSync: () => {
+					lock.releaseSync();
+					throw releaseError;
+				},
+			};
+		});
+		const outcome = await admitOwnerMembershipWithAsyncReceipt(
+			target,
+			{ ...exclusive(), freshCreation: creation },
+			{
+				...options,
+				inspectVetoes: async () => veto,
+				readMarkers: async () => markers,
+			},
+		).finally(() => acquire.mockRestore());
+		if (outcome.kind !== "retained") throw new Error("Expected retained admission evidence");
+		expect(outcome.error).toBe(releaseError);
+		const evidence = getOwnerMembershipEvidence(outcome.membership);
+		expect(await record()).toMatchObject({
+			state: "live",
+			mode: "exclusive_native",
+			epoch: evidence.epoch,
+			members: [{ memberId: evidence.memberId }],
+		});
+		expect(await Bun.file(target.transcriptPath).exists()).toBe(false);
+		expect(retireOwnerMembershipSync(outcome.membership)).toBe("retired");
+		expect(await record()).toMatchObject({ state: "retired", members: [] });
 	});
 
 	it("release uncertainty preserves body failure and never removes a successor lock generation", async () => {

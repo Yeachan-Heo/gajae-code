@@ -1314,6 +1314,20 @@ export async function admitOwnerMembershipWithAsyncEvidence(
 	options: OwnerAsyncAdmissionOptions,
 	timeoutMs = 1000,
 ): Promise<OwnerMembership> {
+	const outcome = await admitOwnerMembershipWithAsyncReceipt(target, policy, options, timeoutMs);
+	if (outcome.kind === "retained") throw outcome.error;
+	return outcome.membership;
+}
+
+/** Keep the exact installed token when post-admission lock disposal cannot be proved. @internal */
+export async function admitOwnerMembershipWithAsyncReceipt(
+	target: OwnerTarget,
+	policy: SessionOwnerPolicy,
+	options: OwnerAsyncAdmissionOptions,
+	timeoutMs = 1000,
+): Promise<
+	{ kind: "admitted"; membership: OwnerMembership } | { kind: "retained"; membership: OwnerMembership; error: Error }
+> {
 	target = copyTarget(target);
 	if (policy.kind !== "exclusive_native") refuse("policy_mismatch");
 	if (
@@ -1335,14 +1349,26 @@ export async function admitOwnerMembershipWithAsyncEvidence(
 		inspectVetoes: () => refuse("unknown_ownership"),
 		readMarkers: () => refuse("unknown_ownership"),
 	};
-	return withLocksAsync(
-		[target],
-		async () => {
-			const current = await observeAsync(target, inspectors, true);
-			return installAdmission(target, policy, syncOptions, member, before, current, inspectors);
-		},
-		timeoutMs,
-	);
+	let installed: OwnerMembership | undefined;
+	try {
+		const membership = await withLocksAsync(
+			[target],
+			async () => {
+				const current = await observeAsync(target, inspectors, true);
+				installed = installAdmission(target, policy, syncOptions, member, before, current, inspectors);
+				return installed;
+			},
+			timeoutMs,
+		);
+		return { kind: "admitted", membership };
+	} catch (error) {
+		if (!installed) throw error;
+		return {
+			kind: "retained",
+			membership: installed,
+			error: error instanceof Error ? error : new Error("Owner admission lock release failed", { cause: error }),
+		};
+	}
 }
 export async function probeSessionOwnershipWithAsyncEvidence(
 	target: OwnerTarget,
