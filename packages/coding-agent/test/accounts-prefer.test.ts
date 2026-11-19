@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SqliteAuthCredentialStore } from "@gajae-code/ai";
+import { type AuthBrokerServerHandle, AuthStorage, SqliteAuthCredentialStore, startAuthBroker } from "@gajae-code/ai";
 import { getAgentDbPath, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { runAccountsCommand } from "../src/cli/accounts-cli";
@@ -156,22 +156,111 @@ describe("gjc accounts prefer", () => {
 		CLI_TIMEOUT_MS,
 	);
 
+	it(
+		"stores organization ids for one login in several organizations, read back as those rows",
+		async () => {
+			const result = await preferJson(["org:org-b", `id:${ids[2]}=90`]);
+
+			const entries = ["org:org-b", { "org:org-a": 90 }];
+			expect(result).toEqual({ ok: true, provider: "anthropic", preferences: entries } as never);
+			expect(await writtenPreferences()).toEqual({ anthropic: entries });
+			const preferences = (await resolveStartupAuthConfig(agentDir)).credentialPreferences.anthropic ?? [];
+			expect(preferences).toEqual([
+				{ selector: { kind: "org", value: "org-b" } },
+				{ selector: { kind: "org", value: "org-a" }, maxUsedFraction: 0.9 },
+			]);
+			const storage = await discoverAuthStorage(agentDir);
+			try {
+				expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+				expect(
+					preferences.map(({ selector }) => storage.resolveOAuthPinTarget("anthropic", selector).credentialId),
+				).toEqual([ids[3], ids[2]]);
+			} finally {
+				storage.close();
+			}
+		},
+		CLI_TIMEOUT_MS,
+	);
+
 	it.each([
 		["an account that is not stored", ["missing@example.com"], "No active OAuth credential"],
 		["a zero cap", ["cheap@example.com=0"], "above 0 and at most 100"],
 		["a cap over 100", ["cheap@example.com=101"], "above 0 and at most 100"],
 		["a malformed cap", ["cheap@example.com=7o"], "above 0 and at most 100"],
 		["the same account twice", ["cheap@example.com", "id:" /* filled below */], "listed more than once"],
-		["an account with no unique email or account id", ["org:org-a"], "no unique email or account id"],
+		[
+			"an account with no unique email, account id, or organization id",
+			["id:" /* the organization-less row of the team login, filled below */],
+			"no unique email, account id, or organization id",
+		],
 	])(
 		"refuses %s and writes nothing",
 		async (_label, selectors, message) => {
-			const args = selectors.map(value => (value === "id:" ? `id:${ids[0]}` : value));
+			const orgless = selectors.length === 1 && selectors[0] === "id:";
+			let orglessId: number | undefined;
+			if (orgless) {
+				const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+				try {
+					store.upsertAuthCredentialForProvider("anthropic", oauth("team@example.com", "acct-team"));
+					orglessId = store.listAuthCredentials("anthropic").find(entry => !ids.includes(entry.id))!.id;
+				} finally {
+					store.close();
+				}
+			}
+			const args = selectors.map(value => (value === "id:" ? `id:${orglessId ?? ids[0]}` : value));
 			const result = await preferJson(args);
 
 			expect(result.ok).toBe(false);
 			expect(result.error?.message).toContain(message);
 			expect(await writtenPreferences()).toBeUndefined();
+		},
+		CLI_TIMEOUT_MS,
+	);
+
+	it(
+		"stores organization ids through an auth broker, whose inventory carries the identity fields",
+		async () => {
+			const brokerDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-accounts-prefer-broker-"));
+			const brokerStore = await SqliteAuthCredentialStore.open(path.join(brokerDir, "agent.db"));
+			const brokerStorage = new AuthStorage(brokerStore);
+			let handle: AuthBrokerServerHandle | undefined;
+			const savedUrl = process.env.GJC_AUTH_BROKER_URL;
+			const savedToken = process.env.GJC_AUTH_BROKER_TOKEN;
+			try {
+				brokerStore.upsertAuthCredentialForProvider(
+					"anthropic",
+					oauth("team@example.com", "acct-team", "broker-a"),
+				);
+				brokerStore.upsertAuthCredentialForProvider(
+					"anthropic",
+					oauth("team@example.com", "acct-team", "broker-b"),
+				);
+				await brokerStorage.reload();
+				handle = startAuthBroker({
+					storage: brokerStorage,
+					bind: "127.0.0.1:0",
+					bearerTokens: ["prefer-token"],
+					disableRefresher: true,
+				});
+				process.env.GJC_AUTH_BROKER_URL = handle.url;
+				process.env.GJC_AUTH_BROKER_TOKEN = "prefer-token";
+
+				const result = await preferJson(["org:broker-b", "org:broker-a=90"]);
+
+				// These organizations exist only on the broker, so a CLI that read the local store would refuse them.
+				const entries = ["org:broker-b", { "org:broker-a": 90 }];
+				expect(result).toEqual({ ok: true, provider: "anthropic", preferences: entries } as never);
+				expect(await writtenPreferences()).toEqual({ anthropic: entries });
+			} finally {
+				if (savedUrl === undefined) delete process.env.GJC_AUTH_BROKER_URL;
+				else process.env.GJC_AUTH_BROKER_URL = savedUrl;
+				if (savedToken === undefined) delete process.env.GJC_AUTH_BROKER_TOKEN;
+				else process.env.GJC_AUTH_BROKER_TOKEN = savedToken;
+				await handle?.close();
+				brokerStorage.close();
+				brokerStore.close();
+				await fs.rm(brokerDir, { recursive: true, force: true });
+			}
 		},
 		CLI_TIMEOUT_MS,
 	);

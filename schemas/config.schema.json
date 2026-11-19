@@ -49,7 +49,7 @@
 						"anyOf": [
 							{
 								"type": "string",
-								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$"
 							},
 							{
 								"type": "array",
@@ -59,14 +59,14 @@
 									"anyOf": [
 										{
 											"type": "string",
-											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$"
 										},
 										{
 											"type": "object",
 											"minProperties": 1,
 											"maxProperties": 1,
 											"propertyNames": {
-												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$"
 											},
 											"additionalProperties": {
 												"type": "number",
@@ -1438,6 +1438,10 @@
 				"circuitMaxCooldownMs": {
 					"type": "number",
 					"default": 1800000
+				},
+				"concurrencyWaitMs": {
+					"type": "number",
+					"default": 300000
 				}
 			},
 			"additionalProperties": false

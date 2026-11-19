@@ -186,6 +186,22 @@ export interface AskAnswerSource {
 }
 
 /** Session context for tool factories */
+/**
+ * Attribution and interruption state for nested eval `tool.<name>()` calls.
+ * One scope is created per model-facing eval call and propagated through any
+ * nesting depth so reminders and interruptions land on that call's result.
+ */
+export interface NestedToolScope {
+	/** Model-facing tool call id of the eval call that opened this scope. */
+	readonly parentToolCallId: string;
+	/** Aborts nested work still parked in an await when the eval call settles. */
+	readonly abortController: AbortController;
+	/** Rules whose interrupting match invalidated this scope. */
+	invalidatedBy?: string[];
+	/** Set when the model-facing eval call settled; late nested calls must not run. */
+	closed?: boolean;
+}
+
 export interface ToolSession {
 	/** Effective session-owned and inherited task role selectors. */
 	getAgentModelOverrides?: () => Record<string, ModelSelectorValue>;
@@ -260,6 +276,8 @@ export interface ToolSession {
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Resolves on a steer admitted after the wait starts, or when `signal` aborts, without consuming the steer. */
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
+	/** Resolves on a follow-up message queued after the wait starts, or when `signal` aborts, without consuming the message. */
+	waitForFollowUpQueued?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/**
@@ -282,8 +300,12 @@ export interface ToolSession {
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
-	/** Look up a registered tool with the session's execution guards applied. */
-	getToolForExecution?: (name: string) => AgentTool | undefined;
+	/**
+	 * Look up a registered tool with the session's execution guards applied.
+	 * `nestedToolScope` marks a nested call (eval `tool.<name>()`) made from inside
+	 * that model-facing tool call, so tool-scoped TTSR rules still apply to it.
+	 */
+	getToolForExecution?: (name: string, options?: { nestedToolScope?: NestedToolScope }) => AgentTool | undefined;
 	/** Purge undelivered queued custom messages matching the predicate. Returns counts. */
 	purgeQueuedCustomMessages?: (predicate: (message: CustomMessage) => boolean) => PurgeQueuedCustomMessagesResult;
 	/** Agent registry for IRC routing across live sessions. */

@@ -52,6 +52,12 @@ The full `diff.scopes`/`diff.summary`/`diff.file` family is prohibited through T
 
 
 
+## Exact local session views
+
+Trusted local hosts can persist `captureSessionView(session)`, exported by the SDK, as `{ sessionId, leafEntryId }`. `leafEntryId` is an exact transcript entry or `null` for the empty root. Transcript flushing does not persist this runtime cursor; cold opening otherwise selects the latest appended entry.
+
+After independently authorizing and opening the existing transcript, call `await restoreSessionView(session, savedView)` before publishing its history. The descriptor grants no file-opening or remote-control authority. Restore preserves the transcript and session identity, bypasses navigation hooks and summarization, and never issues a provider request or selects an inferred replacement branch. Missing entries or mismatched identities fail with `SdkRevisionError("resource_gone")`; unsettled work fails with `"busy"`. Invalid descriptors fail with `"invalid_input"`. Asynchronous context restoration is identity-fenced; failures roll back only operation-owned unchanged state and report `rollbackFailed` when rollback itself fails. Persist updated views at settled mutation boundaries, not during streaming.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:
@@ -528,8 +534,12 @@ gjc sdk session raw query <sessionId> --query turn.result \
 The alternate selector uses the same `kind` with
 `{"kind":"prompt","commandId":"command-id","turnId":"turn-id"}` as its JSON input.
 
-The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
-`unknown`. Known records include `acceptedAt`; in-flight and terminal records add
+The result status is `admitted`, `accepted`, `in_flight`, `terminal_ok`, `failed`,
+or `unknown`. `admitted` means the host generated the submission's `commandId`
+and `turnId` but still runs its preflight (for example a pre-prompt compaction)
+and has not acknowledged it yet; a submission whose preflight is rejected or
+cancelled (including by the requester connection closing) then reports `failed`
+with `receiptState: "missing"`, meaning it never ran and was not recorded. Known records include `acceptedAt`; in-flight and terminal records add
 `startedAt` and/or `terminalAt`; finalized records include `outcome`; failed records
 also include a bounded sanitized `error.code` and `error.message`. Cursors, partial
 generated-ID pairs, mixed selectors, and extra selector fields are rejected.

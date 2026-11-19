@@ -33,6 +33,7 @@ import {
 	type AgentState,
 	type AgentTerminalOwnerContext,
 	type AgentTool,
+	type AgentToolContext,
 	activeToolForCallName,
 	assertImagePlaceholdersHavePayload,
 	type BeforeToolCallContext,
@@ -143,11 +144,13 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
+	type FallbackTrigger,
 	type FallbackTriggerClass,
 	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
@@ -450,6 +453,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import ttsrToolBlockedReminderTemplate from "../prompts/system/ttsr-tool-blocked-reminder.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
@@ -491,7 +495,7 @@ import {
 	selectDiscoverableToolNamesByServer,
 	selectRestorableDiscoveredBuiltinToolNames,
 } from "../tool-discovery/tool-index";
-import type { AskAnswerSource, ToolSession } from "../tools";
+import type { AskAnswerSource, NestedToolScope, ToolSession } from "../tools";
 import { computeEssentialBuiltinNames } from "../tools";
 import { AskTool } from "../tools/ask";
 import {
@@ -1619,6 +1623,15 @@ type RetryErrorClassification =
 	| "local_buffer_overflow"
 	| "unknown";
 
+/** Longest single pause while waiting for a provider's parallel-request slot. */
+const CONCURRENCY_WAIT_MAX_POLL_MS = 15_000;
+/**
+ * Minimum poll interval when Retry-After is 0, used to bound request volume.
+ * With a budget of 300,000ms (default), this 1000ms interval bounds requests to ~300,
+ * preventing unbounded polling when a provider returns Retry-After: 0.
+ */
+const CONCURRENCY_POLL_MIN_INTERVAL_MS = 1000;
+
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
 const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
@@ -1862,16 +1875,13 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 	}
 	try {
 		const hostname = new URL(model.baseUrl).hostname.toLowerCase();
-		if (
-			hostname === "localhost" ||
-			hostname === "0.0.0.0" ||
-			hostname === "::1" ||
-			hostname === "[::1]" ||
-			hostname.endsWith(".local")
-		) {
+		// Share the transport's loopback definition so a fully qualified
+		// `localhost.` (now admitted for local providers) keeps local-overload
+		// handling instead of being treated as a remote endpoint.
+		if (isLoopbackHost(hostname) || hostname === "0.0.0.0" || hostname.endsWith(".local")) {
 			return true;
 		}
-		if (/^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname)) {
+		if (/^10\./.test(hostname) || /^192\.168\./.test(hostname)) {
 			return true;
 		}
 		const private172 = /^172\.(\d{1,2})\./.exec(hostname);
@@ -3053,6 +3063,16 @@ type PreparedExactMcpRetirement = {
 };
 
 /**
+ * Ownership fence for an exact session-view restoration. `isCurrent` authorizes the
+ * next publication; `onApplied` re-anchors ownership after this operation publishes
+ * its own tools and prompt, so a foreign publication is still detected as drift.
+ */
+interface SessionViewRestoreFence {
+	isCurrent: () => boolean;
+	onApplied: () => void;
+}
+
+/**
  * An entry states its transport with `type`, or implies it: a `command` entry is
  * stdio and a `url` entry is http. Only the discriminator is read — the command
  * string and URL themselves stay inside the config.
@@ -3926,6 +3946,13 @@ export class AgentSession {
 		| { kind: "held" }
 		| undefined;
 
+	/**
+	 * Steers a run left unconsumed and `#settleDisownedSteering` re-routed onto the
+	 * follow-up queue. They are still steering for the Esc-on-steer gesture: a
+	 * user interrupt resumes into them exactly as it would into the steering queue.
+	 */
+	readonly #rearmedSteerMessages = new WeakSet<AgentMessage>();
+
 	/** Remove run-bound steers from every queue mirror and terminalize them as removed. */
 	#discardRunBoundSteers(messages: readonly AgentMessage[]): void {
 		if (messages.length === 0) return;
@@ -4011,6 +4038,7 @@ export class AgentSession {
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
 		this.#markSteeringAsFollowUpPolicy(rearmed);
+		for (const message of rearmed) this.#rearmedSteerMessages.add(message);
 		const deferredAlreadyPresent = this.#deferredSdkFollowUps.length > 0;
 		if (deferredAlreadyPresent) {
 			// Deferred follow-ups are an older cross-store FIFO head. Keep rearmed
@@ -4355,6 +4383,7 @@ export class AgentSession {
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
 		this.#managedFallbackProviderAttemptCount = 0;
+		this.#resetConcurrencyWait();
 		this.#managedFallbackTriedCredentialRows.clear();
 		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
 		this.#managedFallbackQuotaCeilingModels.clear();
@@ -4403,6 +4432,14 @@ export class AgentSession {
 	#providerRetryMaxAttempts: number | undefined;
 	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
+	/** First concurrency-saturation failure of the current request; bounds `fallback.concurrencyWaitMs`. */
+	#concurrencyWaitStartedAt: number | undefined;
+	/** Tracks poll attempts in concurrency wait; bounds requests independently of elapsed time. */
+	#concurrencyWaitPollCount = 0;
+	/** Set to selector when Retry-After exceeds remaining budget; prevents same-entry credential rotations. Scoped to originating entry. */
+	#concurrencyWaitRetryAfterExceededBudgetEntry: string | undefined = undefined;
+	/** Tracks absolute deadline per selector when poll ceiling reached with active Retry-After, preventing same-entry retries before deadline. */
+	#concurrencyWaitRetryAfterDeadlines = new Map<string, number>();
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -4860,6 +4897,21 @@ export class AgentSession {
 	 * it had none), restored if the reminder is never delivered.
 	 */
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
+	/**
+	 * Settled per-tool reminders from tool results that completed before the TTSR retry.
+	 * Keyed by tool call id: { rules, reminderText, result }, where result is the delivered tool result
+	 * message that carries the reminder. Cleared after extraction into the retry injection.
+	 * Scoped to #ttsrSettledGeneration to prevent reminders from previous turns being re-injected.
+	 */
+	#settledToolTtsrReminders = new Map<string, { rules: Rule[]; reminderText: string; result: ToolResultMessage }>();
+	/** Generation that owns the current settled reminders; cleared when a new turn starts. */
+	#ttsrSettledGeneration = 0;
+	/**
+	 * Active nested-tool scopes keyed by the model-facing eval call id. Each scope
+	 * is closed when that call's result is produced, so a nested call that resumes
+	 * after settlement cannot claim a reminder or invalidate a finished call.
+	 */
+	#nestedToolScopes = new Map<string, NestedToolScope>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -6987,6 +7039,10 @@ export class AgentSession {
 			);
 		}
 		this.#ttsrManager = config.ttsrManager;
+		// Reconcile TTSR consumption from persisted custom messages. If ttsr_injection markers
+		// failed to publish but custom messages were persisted, we must mark those rules as consumed
+		// to prevent duplicate reminders on reopen (#7838).
+		this.#reconcileTtsrConsumptionFromMessages();
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
 		this.#agentRegistry = config.agentRegistry;
@@ -9514,6 +9570,7 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this.#providerRetryMaxAttempts = undefined;
 					this.#managedFallbackProviderAttemptCount = 0;
+					this.#resetConcurrencyWait();
 				}
 			}
 
@@ -10859,8 +10916,12 @@ export class AgentSession {
 	#getTtsrInjectionContent(): { content: string; rules: Rule[] } | undefined {
 		if (this.#pendingTtsrInjections.length === 0) return undefined;
 		const rules = this.#pendingTtsrInjections;
-		const content = rules.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r))).join("\n\n");
 		this.#pendingTtsrInjections = [];
+		return this.#renderTtsrInjection(rules);
+	}
+
+	#renderTtsrInjection(rules: Rule[]): { content: string; rules: Rule[] } {
+		const content = rules.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r))).join("\n\n");
 		return { content, rules };
 	}
 
@@ -10925,6 +10986,20 @@ export class AgentSession {
 	 * undo their provisional claims so the rules stay eligible.
 	 */
 	#releasePerToolTtsrInjections(toolCallId?: string): void {
+		if (toolCallId === undefined) {
+			for (const scope of this.#nestedToolScopes.values()) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
+			this.#nestedToolScopes.clear();
+		} else {
+			const scope = this.#nestedToolScopes.get(toolCallId);
+			if (scope) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
+			this.#nestedToolScopes.delete(toolCallId);
+		}
 		const ids =
 			toolCallId === undefined
 				? new Set([
@@ -10944,11 +11019,49 @@ export class AgentSession {
 	}
 
 	/**
+	 * Restore rules claimed by a nested call that was refused at the dispatch
+	 * fence. The call never ran, so its reminder has no result to fold into and
+	 * must stay eligible. Calls that dispatched are owned by the parent result and
+	 * cancellation paths, which settle their claims at fold or release points.
+	 */
+	#releaseUndeliveredNestedClaims(toolCallId: string, rules: Rule[]): void {
+		if (rules.length === 0) return;
+		const names = new Set(rules.map(rule => rule.name));
+		const claims = this.#perToolTtsrClaims.get(toolCallId);
+		for (const name of names) {
+			// Only undo a claim this call still owns. A parent cancellation may have
+			// restored and deleted it already, and releasing again would erase the
+			// previous injected record.
+			if (!claims?.has(name)) continue;
+			this.#ttsrManager?.releaseInjected(name, claims.get(name));
+			claims.delete(name);
+		}
+		const bucket = this.#perToolTtsrInjections.get(toolCallId);
+		if (bucket) {
+			const keeping = bucket.filter(rule => !names.has(rule.name));
+			if (keeping.length > 0) this.#perToolTtsrInjections.set(toolCallId, keeping);
+			else this.#perToolTtsrInjections.delete(toolCallId);
+		}
+		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
+	}
+
+
+	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
 	 * The claim stays provisional until #settlePerToolTtsrDelivery sees the
 	 * decorated result actually published.
 	 */
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, signal?: AbortSignal): AfterToolCallResult | undefined {
+		// The eval call is settling, so any nested call that resumes later must not run.
+		const nestedScope = this.#nestedToolScopes.get(ctx.toolCall.id);
+		// Rules that interrupted a nested call were folded into this result without
+		// running; mark them so the reminder reports the block, not a passthrough.
+		const blockedRuleNames = new Set(nestedScope?.invalidatedBy ?? []);
+		if (nestedScope) {
+			nestedScope.closed = true;
+			nestedScope.abortController.abort();
+			this.#nestedToolScopes.delete(ctx.toolCall.id);
+		}
 		// An aborted call's result is replaced by the loop's aborted result, so a
 		// folded reminder would never reach the model. A pending TTSR retry carries
 		// the bucket into its injection; any other cancellation releases it.
@@ -10959,7 +11072,14 @@ export class AgentSession {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
-		const reminder = rules.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r))).join("\n\n");
+		const reminder = rules
+			.map(r =>
+				prompt.render(
+					blockedRuleNames.has(r.name) ? ttsrToolBlockedReminderTemplate : ttsrToolReminderTemplate,
+					ttsrPromptFields(r),
+				),
+			)
+			.join("\n\n");
 		const block: TextContent = { type: "text", text: reminder };
 		this.#perToolTtsrFolded.set(ctx.toolCall.id, { rules, block });
 
@@ -10998,6 +11118,14 @@ export class AgentSession {
 			if (!this.#ttsrAbortPending) this.#releasePerToolTtsrInjections(message.toolCallId);
 			return;
 		}
+		// Store the settled reminder so it can be extracted into a retry injection if needed (#7838).
+		this.#settledToolTtsrReminders.set(message.toolCallId, {
+			rules: folded.rules,
+			reminderText: folded.block.text,
+			result: message,
+		});
+		// Track the generation that owns this reminder to prevent cross-turn leaks (#7838).
+		this.#ttsrSettledGeneration = this.#promptGeneration;
 		this.#perToolTtsrFolded.delete(message.toolCallId);
 		this.#perToolTtsrClaims.delete(message.toolCallId);
 		// The TTSR manager was already claimed at bucket time; only persistence remains.
@@ -11039,19 +11167,88 @@ export class AgentSession {
 		return rules.filter((ruleName): ruleName is string => typeof ruleName === "string");
 	}
 
-	#markTtsrInjected(ruleNames: string[]): void {
+	#reconcileTtsrConsumptionFromMessages(): void {
+		// A committed reminder can outlive its missing ttsr_injection marker and be compacted out
+		// of Agent context. Reconcile consumption without restoring the reminder text (#7838).
+		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
+			return;
+		}
+		// Latest published checkpoint per rule. A legacy entry without one only proves the rule
+		// was delivered, so it maps to undefined unless a checkpointed entry exists.
+		const checkpoints = new Map<string, number | undefined>();
+		const collectCheckpoints = (details: unknown) => {
+			const rawCount = (details as { messageCount?: unknown } | undefined)?.messageCount;
+			const checkpoint = typeof rawCount === "number" && Number.isFinite(rawCount) ? rawCount : undefined;
+			for (const ruleName of this.#extractTtsrRuleNames(details)) {
+				const previous = checkpoints.get(ruleName);
+				if (checkpoint === undefined) {
+					if (!checkpoints.has(ruleName)) checkpoints.set(ruleName, undefined);
+				} else {
+					checkpoints.set(ruleName, previous === undefined ? checkpoint : Math.max(previous, checkpoint));
+				}
+			}
+		};
+		// getBranch() walks the active leaf's ancestors, including entries before compaction.
+		// getEntries() would also include inactive sibling branches and consume their rules.
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "custom_message" && entry.customType === "ttsr-injection") {
+				collectCheckpoints(entry.details);
+			}
+		}
+		// Keep live-only evidence for in-memory sessions and definitively rejected publication.
+		for (const message of this.agent.state.messages) {
+			if (message.role === "custom" && message.customType === "ttsr-injection") {
+				collectCheckpoints(message.details);
+			}
+		}
+		if (checkpoints.size === 0) return;
+		// The counter is restored from ttsr_injection markers only. If a newer reminder's marker is
+		// missing, that counter lags its published checkpoint; advance it so the after-gap interval is
+		// measured from the checkpoint rather than from an older marker's count.
+		let latestCheckpoint: number | undefined;
+		for (const checkpoint of checkpoints.values()) {
+			if (checkpoint !== undefined && (latestCheckpoint === undefined || checkpoint > latestCheckpoint))
+				latestCheckpoint = checkpoint;
+		}
+		if (latestCheckpoint !== undefined && latestCheckpoint > this.#ttsrManager.getMessageCount()) {
+			this.#ttsrManager.restoreMessageCount(latestCheckpoint);
+		}
+		// Restored records carry exact checkpoints from ttsr_injection markers. Keep a record unless a
+		// newer published reminder proves a later injection whose marker is missing (#7838); re-marking
+		// at the restored current count would restart the after-gap interval.
+		const recorded = new Map<string, number>();
+		for (const record of this.#ttsrManager.getInjectedRecords()) {
+			recorded.set(record.name, record.lastInjectedAt);
+		}
+		for (const [name, checkpoint] of checkpoints) {
+			const lastInjectedAt = recorded.get(name);
+			if (checkpoint === undefined) {
+				// Legacy entry without a checkpoint: only fill a missing record, at the current count.
+				if (lastInjectedAt === undefined) {
+					this.#ttsrManager.markInjectedByNamesAt([name], this.#ttsrManager.getMessageCount());
+				}
+				continue;
+			}
+			if (lastInjectedAt === undefined || lastInjectedAt < checkpoint) {
+				this.#ttsrManager.markInjectedByNamesAt([name], checkpoint);
+			}
+		}
+	}
+
+	#markTtsrInjected(ruleNames: string[], persistMarker = true, atMessageCount?: number): void {
 		const uniqueRuleNames = Array.from(
 			new Set(ruleNames.map(ruleName => ruleName.trim()).filter(ruleName => ruleName.length > 0)),
 		);
 		if (uniqueRuleNames.length === 0) {
 			return;
 		}
-		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
+		if (atMessageCount === undefined) this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
+		else this.#ttsrManager?.markInjectedByNamesAt(uniqueRuleNames, atMessageCount);
+		if (!persistMarker) return;
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
 		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-		// A shared session refuses the legacy append once admission is armed, and this runs
-		// inside the message_end handler: publishing through the admitted path keeps a TTSR
-		// match from failing the run (#7815).
+		// A shared session refuses the legacy append once admission is armed. Publish durable
+		// markers through the admitted path so message_end handling and committed retries work.
 		if (!this.#usesSharedSessionPublication()) {
 			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
 			return;
@@ -11075,45 +11272,11 @@ export class AgentSession {
 		if (!tool) return undefined;
 		const toolCall = { ...ctx.toolCall, arguments: ctx.args };
 		const matchContext = this.#getTtsrToolMatchContext({ ...ctx.assistantMessage, content: [toolCall] }, 0);
-		const entries = tool.matcherEntries?.(ctx.args);
-		const matched: Rule[] = [];
-		if (entries && entries.length > 0) {
-			for (const entry of entries) {
-				const rules = await manager.checkAstSnapshot(
-					entry.digest,
-					{
-						...matchContext,
-						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
-						streamKey: `${matchContext.streamKey}:${entry.path}`,
-					},
-					signal,
-				);
-				// The run was cancelled or superseded while matching: keep the call
-				// from dispatching and leave every rule unclaimed.
-				if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-				matched.push(...rules);
-			}
-		} else {
-			const digest = tool.matcherDigest?.(ctx.args);
-			if (digest === undefined) return undefined;
-			matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
-			if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-		}
-
-		// A rule already headed for delivery as a prose reminder (pending, being
-		// admitted to the follow-up queue, or queued) must not be claimed a second
-		// time by this call.
-		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
-		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
-		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
-			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
-			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
-		}
-		const matches = matched.filter(rule => {
-			if (pending.has(rule.name)) return false;
-			pending.add(rule.name);
-			return true;
-		});
+		const matched = await this.#matchTtsrAstSnapshots(tool, ctx.args, matchContext, signal, generation);
+		// The run was cancelled or superseded while matching: keep the call from
+		// dispatching and leave every rule unclaimed.
+		if (!matched) return { block: true, reason: "Aborted" };
+		const matches = this.#withoutPendingTtsrRules(matched);
 		if (
 			matches.length > 0 &&
 			this.#handleTtsrMatches(matches, matchContext, ctx.assistantMessage.timestamp, activePromptHandle)
@@ -11127,6 +11290,178 @@ export class AgentSession {
 	}
 
 	/**
+	 * Match a tool's finalized source digests against AST rules. Returns undefined
+	 * when the run was cancelled or superseded while matching.
+	 */
+	async #matchTtsrAstSnapshots(
+		tool: AgentTool,
+		args: unknown,
+		matchContext: TtsrMatchContext,
+		signal: AbortSignal | undefined,
+		generation: number,
+	): Promise<Rule[] | undefined> {
+		const manager = this.#ttsrManager;
+		if (!manager?.hasAstRules()) return [];
+		const cancelled = () => signal?.aborted === true || this.#promptGeneration !== generation;
+		const matched: Rule[] = [];
+		const entries = tool.matcherEntries?.(args);
+		if (entries && entries.length > 0) {
+			for (const entry of entries) {
+				const rules = await manager.checkAstSnapshot(
+					entry.digest,
+					{
+						...matchContext,
+						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
+						streamKey: `${matchContext.streamKey}:${entry.path}`,
+					},
+					signal,
+				);
+				if (cancelled()) return undefined;
+				matched.push(...rules);
+			}
+			return matched;
+		}
+		const digest = tool.matcherDigest?.(args);
+		if (digest === undefined) return matched;
+		matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
+		return cancelled() ? undefined : matched;
+	}
+
+	/**
+	 * Deduplicate matches and drop rules already headed for delivery as a prose
+	 * reminder (pending, being admitted to the follow-up queue, or queued): they
+	 * must not be claimed a second time by a tool call.
+	 */
+	#withoutPendingTtsrRules(matched: Rule[]): Rule[] {
+		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
+		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
+		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
+			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
+			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
+		}
+		return matched.filter(rule => {
+			if (pending.has(rule.name)) return false;
+			pending.add(rule.name);
+			return true;
+		});
+	}
+
+	/**
+	 * Refuse a nested call whose eval call already settled or was invalidated by an
+	 * interrupting match. Checked on entry and again after every await so a call
+	 * paused in lazy materialization or AST matching cannot resume into a finished
+	 * or invalidated eval. Eval code can catch these errors, which is why every
+	 * later call is refused rather than only the one that matched.
+	 */
+	#assertNestedToolScopeActive(scope: NestedToolScope): void {
+		if (scope.closed || this.#nestedToolScopes.get(scope.parentToolCallId) !== scope) {
+			throw new ToolError(
+				"This eval call already settled; nested tool calls cannot run after its result was produced.",
+			);
+		}
+		if (scope.invalidatedBy) {
+			throw new ToolError(
+				`This eval call was invalidated by an interrupting TTSR match (${scope.invalidatedBy.join(", ")}). No further nested tool calls will run in it; apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+	}
+
+	/**
+	 * Nested calls (eval `tool.<name>()`) dispatch outside the agent loop, so the
+	 * argument-stream and pre-dispatch matching above never see them. Apply the
+	 * same tool-scoped rules to the nested call's final arguments before it runs:
+	 * every match is folded into the parent call's result as a per-tool reminder,
+	 * and an interrupting match keeps the nested call from executing (the nested
+	 * analogue of aborting the stream before a direct call dispatches).
+	 */
+	async #ttsrBeforeNestedToolCall(
+		tool: AgentTool,
+		scope: NestedToolScope,
+		callName: string,
+		args: unknown,
+		signal: AbortSignal | undefined,
+	): Promise<Rule[]> {
+		this.#assertNestedToolScopeActive(scope);
+		if (signal?.aborted) throw new ToolAbortError();
+		const manager = this.#ttsrManager;
+		if (!manager?.hasRules()) return [];
+		const generation = this.#promptGeneration;
+		const matchContext: TtsrMatchContext = {
+			source: "tool",
+			// Match the name the cell invoked (including a custom wire name such as
+			// `apply_patch`), exactly like the direct-call pre-dispatch path.
+			toolName: callName,
+			// Complete arguments, not a stream continuation: scan the whole snapshot for
+			// regex conditions, and keep AST snapshot dedupe isolated per nested call.
+			streamKey: `nested:${scope.parentToolCallId}:${crypto.randomUUID()}`,
+			filePaths: this.#extractTtsrFilePathsFromArgs(args),
+		};
+		const matched = manager.checkSnapshot(JSON.stringify(args) ?? "", matchContext);
+		if (manager.hasAstRules()) {
+			const matcherTool = await this.#materializeTtsrMatcherTool(tool);
+			const astMatched = matcherTool
+				? await this.#matchTtsrAstSnapshots(matcherTool, args, matchContext, signal, generation)
+				: [];
+			if (!astMatched || signal?.aborted || this.#promptGeneration !== generation) throw new ToolAbortError();
+			matched.push(...astMatched);
+		}
+		// A sibling nested call may have interrupted while this one was matching:
+		// recheck before claiming or dispatching anything.
+		this.#assertNestedToolScopeActive(scope);
+		const matches = this.#withoutPendingTtsrRules(matched);
+		if (matches.length === 0) return [];
+		const added = this.#addPerToolTtsrInjections(scope.parentToolCallId, matches);
+		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
+		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
+			// Only rules this call newly claimed describe the blocked call. A rule
+			// already claimed by an earlier sibling ran there and keeps its wording.
+			scope.invalidatedBy = added.map(rule => rule.name);
+			// Cancel nested calls still parked before dispatch (for example in an
+			// approval await) so an approval granted after this match cannot run them.
+			scope.abortController.abort();
+			throw new ToolError(
+				`${this.#formatTtsrAbortReason(matches)}. The nested ${callName} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+		return added;
+	}
+
+	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope, callName: string): T {
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return async (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: AgentToolContext | undefined,
+				) => {
+					if (!scope.closed) this.#nestedToolScopes.set(scope.parentToolCallId, scope);
+					const callSignal = signal
+						? AbortSignal.any([signal, scope.abortController.signal])
+						: scope.abortController.signal;
+					const claimed = await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
+					try {
+						// Dispatch fence, immediately before the call with no await between:
+						// the eval may have settled or been invalidated during preflight, and a
+						// settled or invalidated scope has aborted callSignal for anything
+						// parked further in.
+						this.#assertNestedToolScopeActive(scope);
+						if (callSignal.aborted) throw new ToolAbortError();
+					} catch (error) {
+						// This call never dispatched, so its claims have no result to fold into.
+						// Once dispatched, the parent result and cancellation paths own settlement.
+						this.#releaseUndeliveredNestedClaims(scope.parentToolCallId, claimed);
+						throw error;
+					}
+					return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
+				};
+			},
+		}) as T;
+	}
+
+	/**
 	 * The active tool a call dispatches to (canonical or wire name, e.g. OpenAI's
 	 * `apply_patch` for `edit`), resolved through lazy facades so its matcher
 	 * hooks are readable before the first execution. A tool that fails to load
@@ -11134,14 +11469,18 @@ export class AgentSession {
 	 */
 	async #resolveTtsrMatcherTool(callName: string): Promise<AgentTool | undefined> {
 		const tool = activeToolForCallName(this.agent.state.tools, callName);
-		if (!tool) return undefined;
+		return tool ? await this.#materializeTtsrMatcherTool(tool) : undefined;
+	}
+
+	/** Resolve a lazy facade so its matcher hooks are readable before the first execution. */
+	async #materializeTtsrMatcherTool(tool: AgentTool): Promise<AgentTool | undefined> {
 		const materialize = (tool as { materialize?: unknown }).materialize;
 		if (typeof materialize !== "function") return tool;
 		try {
 			return (await materialize.call(tool)) as AgentTool;
 		} catch (error) {
 			logger.debug("TTSR could not resolve tool for AST matching", {
-				toolName: callName,
+				toolName: tool.name,
 				error: error instanceof Error ? error.message : String(error),
 			});
 			return undefined;
@@ -11180,13 +11519,12 @@ export class AgentSession {
 		// late cleanup can only end the request it was scheduled for, never a newer admission's.
 		const recapRequest = this.#recapRequest;
 		this.#schedulePostPromptTask(
-			async () => {
+			async signal => {
 				if (this.#ttsrRetryToken !== retryToken) {
 					// A newer interrupt owns the resume (and the same request); leave the request to it.
 					this.#resolveTtsrResume();
 					return;
 				}
-				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
 				if (!this.#ttsrAbortPending || this.#promptGeneration !== generation) {
 					this.#ttsrAbortPending = false;
 					this.#pendingTtsrInjections = [];
@@ -11195,38 +11533,263 @@ export class AgentSession {
 					this.#endSessionRecapRequestIf(recapRequest);
 					return;
 				}
-				try {
-					this.sessionManager.assertLegacyMutationAllowed("resume TTSR");
-				} catch (error) {
-					if (!(error instanceof SharedSessionMutationUnsupportedError)) throw error;
-					this.#releasePerToolTtsrInjections();
-					this.#pendingTtsrInjections = [];
+				// Reminders bucketed onto tool calls that never produced a delivered
+				// result (blocked, aborted, or not started) are already claimed; carry
+				// them into the retry injection, whose delivery re-marks them. The per-tool
+				// maps hold their rollback records, so they are only cleared once the retry
+				// is committed below; a cancelled publication still releases those claims.
+				const carried = [...this.#pendingTtsrInjections];
+				const carriedNames = new Set(carried.map(rule => rule.name));
+				const carry = (rules: Rule[]) => {
+					for (const rule of rules) {
+						if (carriedNames.has(rule.name)) continue;
+						carried.push(rule);
+						carriedNames.add(rule.name);
+					}
+				};
+				for (const rules of this.#perToolTtsrInjections.values()) carry(rules);
+				for (const { rules } of this.#perToolTtsrFolded.values()) carry(rules);
+				// Identity snapshot of the buckets this retry owns, so a cancelled publication
+				// releases only them and never a newer prompt's claim on a reused tool call id.
+				const ownedBuckets = new Map<string, unknown[]>();
+				for (const map of [this.#perToolTtsrInjections, this.#perToolTtsrFolded, this.#perToolTtsrClaims]) {
+					for (const [id, bucket] of map) ownedBuckets.set(id, [...(ownedBuckets.get(id) ?? []), bucket]);
+				}
+				const releaseCarriedTtsr = () => {
+					if (this.#promptGeneration !== generation) return;
+					this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
+					for (const [id, buckets] of ownedBuckets) {
+						const live = [
+							this.#perToolTtsrInjections.get(id),
+							this.#perToolTtsrFolded.get(id),
+							this.#perToolTtsrClaims.get(id),
+						];
+						if (live.some(bucket => bucket !== undefined && buckets.includes(bucket)))
+							this.#releasePerToolTtsrInjections(id);
+					}
+				};
+				let injection = carried.length > 0 ? this.#renderTtsrInjection(carried) : undefined;
+				const ruleNames = injection ? injection.rules.map(rule => rule.name) : [];
+				// Discard mode drops the suffix holding settled per-tool and earlier retry reminders.
+				// Gather them into the final payload before publication so the durable entry and the
+				// live message carry the same content and rule set (#7838).
+				if (this.#ttsrManager?.getSettings().contextMode === "discard") {
+					const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
+					if (targetAssistantIndex !== -1) {
+						const discardedContent: string[] = [];
+						const settledRules: Rule[] = [];
+						if (this.#ttsrSettledGeneration === generation) {
+							// Only results in the discarded suffix lose their folded reminder; an earlier
+							// assistant turn of the same prompt keeps its result, so carrying it again
+							// would duplicate the reminder and restart its checkpoint. Match the delivered
+							// result itself, since a later turn may reuse its tool call id.
+							const discarded = new Set(this.agent.state.messages.slice(targetAssistantIndex));
+							for (const { rules, reminderText, result } of this.#settledToolTtsrReminders.values()) {
+								if (!discarded.has(result)) continue;
+								for (const rule of rules) {
+									if (!ruleNames.includes(rule.name)) {
+										settledRules.push(rule);
+										ruleNames.push(rule.name);
+									}
+								}
+								discardedContent.push(reminderText);
+							}
+						}
+						for (let i = targetAssistantIndex; i < this.agent.state.messages.length; i++) {
+							const msg = this.agent.state.messages[i];
+							if (msg.role === "custom" && msg.customType === "ttsr-injection") {
+								for (const ruleName of this.#extractTtsrRuleNames(msg.details)) {
+									if (!ruleNames.includes(ruleName)) ruleNames.push(ruleName);
+								}
+								if (msg.content && typeof msg.content === "string") {
+									discardedContent.push(msg.content);
+								}
+							}
+						}
+						if (discardedContent.length > 0) {
+							if (injection) {
+								injection = {
+									...injection,
+									content: `${injection.content}\n\n${discardedContent.join("\n\n")}`,
+								};
+							} else if (settledRules.length > 0) {
+								injection = { content: discardedContent.join("\n\n"), rules: settledRules };
+							}
+						}
+					}
+				}
+				// One payload for the durable entry and the live message. messageCount is the checkpoint the
+				// rules are marked at, so reopen reconciliation restores it instead of the current count.
+				const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
+				const details = injection ? { rules: ruleNames, messageCount: ttsrMessageCount } : undefined;
+				let publicationFailure: { error: unknown; outcome: SharedAppendFailureOutcome | undefined } | undefined;
+				// Live-history identity before the await: an abort advances the prompt generation without a
+				// successor, so delivery after an abort is fenced on this history being untouched instead.
+				const liveLengthBefore = this.agent.state.messages.length;
+				const liveTailBefore = this.agent.state.messages.at(-1);
+				if (injection && details) {
+					// Persist before any live mutation. A shared session refuses the legacy append,
+					// so publish through the admitted path like other in-turn custom messages
+					// (#7815). Only a typed rejected result permits retrying in memory.
+					try {
+						await this.#appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
+					} catch (error) {
+						publicationFailure = { error, outcome: getSharedAppendFailureOutcome(error) };
+					}
+				}
+				// The publication awaited: an abort, dispose, or newer prompt/interrupt may have landed
+				// meanwhile. Classify the outcome first so an uncertain append still fails closed (#7838).
+				const ownsRetry = () => this.#ttsrRetryToken === retryToken;
+				const endRetry = () => {
+					if (!ownsRetry()) return;
 					this.#ttsrAbortPending = false;
+					releaseCarriedTtsr();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
+				};
+				const retryInvalidated = () =>
+					!ownsRetry() ||
+					signal.aborted ||
+					this.#isDisposed ||
+					!this.#ttsrAbortPending ||
+					this.#promptGeneration !== generation;
+				if (publicationFailure) {
+					const { error, outcome } = publicationFailure;
+					// Stale and unknown outcomes require different handling:
+					// - Stale: persistent conditions (latched persistence, rewrite debt, uncommitted cursor)
+					//   make later shared writes uncommittable, so retry must stop and reopen (#7838).
+					// - Unknown: may have committed; require session close to prevent duplicate (#7838).
+					// - Rejected: definite non-commit; safe to retry in memory.
+					// Both fail-closed paths apply even after an abort or a newer interrupt, because the
+					// persistence state they report belongs to this session, not to the retry.
+					if (outcome?.kind === "stale") {
+						logger.warn("TTSR retry requires session reopen after stale shared append", {
+							rules: details?.rules,
+							reason: outcome.reason,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						endRetry();
+						// Stale conditions are persistent; shared writes will remain uncommittable.
+						// Require reopening to clear the persistent state.
+						void this.dispose().catch(() => {
+							logger.warn("Stale TTSR reminder teardown failed", {
+								code: "ttsr_stale_publication_teardown_failed",
+								reason: outcome.reason,
+							});
+						});
+						this.emitNotice(
+							"warning",
+							`TTSR reminder publication failed with ${outcome.reason}; session requires reopening to continue.`,
+							"ttsr",
+						);
+						return;
+					}
+					if (outcome?.kind !== "rejected") {
+						const attemptedId = outcome?.kind === "unknown" ? outcome.id : undefined;
+						logger.warn("TTSR injection publication may have committed; stopping retry", {
+							rules: details?.rules,
+							outcome: outcome?.kind ?? "unclassified",
+							attemptedId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						endRetry();
+						// An unknown append may already be in the transcript, but it does not
+						// prove the model received the reminder. Do not persist consumption or
+						// let a later prompt bypass it through another match path or repeat gap.
+						// Close this live session instead; attempted-entry reconciliation on reopen is separate.
+						void this.dispose().catch(() => {
+							logger.warn("Uncertain TTSR reminder teardown failed", {
+								code: "ttsr_uncertain_publication_teardown_failed",
+								attemptedId,
+							});
+						});
+						this.emitNotice(
+							"warning",
+							attemptedId
+								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped and the session was closed because the reminder may already be in the session transcript.`
+								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
+							"ttsr",
+						);
+						return;
+					}
+					// Rejected: nothing was committed, so an invalidated retry only releases its claims.
+					if (retryInvalidated()) {
+						endRetry();
+						return;
+					}
+					logger.warn("TTSR injection message could not be persisted", {
+						rules: details?.rules,
+						outcome: outcome.kind,
+						error: error instanceof Error ? error.message : String(error),
+					});
 					this.emitNotice(
 						"warning",
-						"TTSR recovery was refused because this session entered shared mode. The interrupted turn remains aborted; no retry was started.",
+						"TTSR reminder could not be saved to the session transcript; retrying with it in memory only.",
+						"ttsr",
+					);
+				} else if (retryInvalidated()) {
+					// The retry will not run. Without a committed reminder it only releases its claims.
+					if (!injection || !details) {
+						endRetry();
+						return;
+					}
+					// A committed reminder is delivered only into the live history this retry saw. A successor
+					// that appended to it or took over the resume must not receive a stale retry's message.
+					const messages = this.agent.state.messages;
+					const deliverable =
+						ownsRetry() &&
+						!this.#isDisposed &&
+						messages.length === liveLengthBefore &&
+						messages.at(-1) === liveTailBefore;
+					endRetry();
+					if (deliverable) {
+						// Deliver so the next prompt sees the committed reminder, marked at its published checkpoint.
+						this.agent.appendMessage({
+							role: "custom",
+							customType: "ttsr-injection",
+							content: injection.content,
+							display: false,
+							details,
+							attribution: "agent",
+							timestamp: Date.now(),
+						});
+						this.#markTtsrInjected(details.rules, false, ttsrMessageCount);
+						return;
+					}
+					if (this.#isDisposed) return;
+					// The reminder is in the transcript but cannot reach live context. Close the session so a
+					// later prompt neither runs without it nor publishes it again; reopen reconciles the entry.
+					logger.warn("TTSR reminder committed after its retry was cancelled; closing session", {
+						rules: details.rules,
+					});
+					void this.dispose().catch(() => {
+						logger.warn("Cancelled TTSR reminder teardown failed", {
+							code: "ttsr_cancelled_publication_teardown_failed",
+						});
+					});
+					this.emitNotice(
+						"warning",
+						"TTSR reminder was saved after its retry was cancelled and live history had changed; the session was closed and must be reopened to continue.",
 						"ttsr",
 					);
 					return;
 				}
-				// Reminders bucketed onto tool calls that never produced a delivered
-				// result (blocked, aborted, or not started) are already claimed; carry
-				// them into the retry injection, whose delivery re-marks them.
-				for (const rules of this.#perToolTtsrInjections.values()) this.#addPendingTtsrInjections(rules);
-				for (const { rules } of this.#perToolTtsrFolded.values()) this.#addPendingTtsrInjections(rules);
+				// Committed to the retry: the carried rules leave their pending and per-tool buckets.
+				this.#pendingTtsrInjections = this.#pendingTtsrInjections.filter(rule => !carriedNames.has(rule.name));
 				this.#perToolTtsrInjections.clear();
 				this.#perToolTtsrFolded.clear();
 				this.#perToolTtsrClaims.clear();
+				const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
+				// The discarded suffix's settled and earlier retry reminders were already folded into the
+				// published payload above; only truncate here so the live message matches the durable entry.
 				if (this.#ttsrManager?.getSettings().contextMode === "discard" && targetAssistantIndex !== -1) {
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
 						historyRewrite: { reason: "retry", preserveSeededPrefix: true },
 					});
+					// Discarded results' reminders were carried above; retained ones stay in history.
+					this.#settledToolTtsrReminders.clear();
 				}
-				const injection = this.#getTtsrInjectionContent();
-				if (injection) {
-					const details = { rules: injection.rules.map(rule => rule.name) };
+				if (injection && details) {
 					this.agent.appendMessage({
 						role: "custom",
 						customType: "ttsr-injection",
@@ -11236,28 +11799,29 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					this.sessionManager.appendCustomMessageEntry(
-						"ttsr-injection",
-						injection.content,
-						false,
-						details,
-						"agent",
-					);
-					this.#markTtsrInjected(details.rules);
+					// A rejected publication lets us retry with the reminder in
+					// memory only. Consume it in this live manager to avoid a repeatMode
+					// once interrupt loop, but do not persist a marker that would suppress
+					// the still-eligible rule when this session is reopened.
+					this.#markTtsrInjected(details.rules, publicationFailure === undefined, ttsrMessageCount);
 				}
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
 					generation,
+					// Owner-guarded like the outer onSkip: a newer interrupt may own the resume.
 					shouldContinue: () => {
+						if (this.#ttsrRetryToken !== retryToken) return false;
 						this.#ttsrAbortPending = false;
 						return true;
 					},
 					onSkip: () => {
+						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					onError: () => {
+						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
@@ -12610,6 +13174,8 @@ export class AgentSession {
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
 		this.#promptRunAcceptedObservers.clear();
+		// Clear TTSR state as part of session teardown.
+		this.#settledToolTtsrReminders.clear();
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;
@@ -12977,7 +13543,11 @@ export class AgentSession {
 			this.#pendingSelectionFences > 0 ||
 			this.#cancelAndSubmitInProgress ||
 			this.#sessionAdmissionClosing ||
-			this.#sessionAdmissionClosed
+			this.#sessionAdmissionClosed ||
+			this.#deferredSdkFollowUps.length > 0 ||
+			this.#pendingBackgroundExchanges.length > 0 ||
+			this.#admittedBackgroundExchanges.length > 0 ||
+			this.#sessionWorkLease.isHeld()
 		);
 	}
 
@@ -13385,10 +13955,17 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** Get a registered tool with the same guards used for model-facing execution. */
-	getToolForExecution(name: string): AgentTool | undefined {
+	/**
+	 * Get a registered tool with the same guards used for model-facing execution.
+	 * With `nestedToolScope` (a nested call such as eval `tool.<name>()`), the tool
+	 * also applies tool-scoped TTSR rules before it runs.
+	 */
+	getToolForExecution(name: string, options?: { nestedToolScope?: NestedToolScope }): AgentTool | undefined {
 		const tool = this.getToolByName(name);
-		return tool ? this.#prepareToolForExecution(tool) : undefined;
+		if (!tool) return undefined;
+		const prepared = this.#prepareToolForExecution(tool);
+		const scope = options?.nestedToolScope;
+		return scope ? this.#wrapNestedToolForTtsr(prepared, scope, name) : prepared;
 	}
 
 	/**
@@ -14567,6 +15144,7 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
+					if (signal?.aborted) throw new ToolAbortError("Permission request cancelled");
 					const bridge = this.#clientBridge;
 					const inheritedEpoch = this.#sdkPermissionProvider
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
@@ -14695,6 +15273,8 @@ export class AgentSession {
 					ctx: never,
 				) => {
 					return await this.sessionManager.runWithCwdReadLease(async () => {
+						// Lease admission can wait for a writer; fence before the target starts.
+						if (signal?.aborted) throw new ToolAbortError();
 						const admittedGeneration = this.sessionManager.getCwdGeneration();
 						const result = await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 						// The lease keeps writers out for the whole execution, so this can
@@ -14743,6 +15323,10 @@ export class AgentSession {
 							args,
 						});
 					}
+					// These guards can await; do not start the tool if the call was cancelled.
+					// Permission-required tools let the permission wrapper report its own
+					// cancellation reason just inside this guard.
+					if (signal?.aborted && !PERMISSION_REQUIRED_TOOLS.has(target.name)) throw new ToolAbortError();
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},
@@ -14797,9 +15381,12 @@ export class AgentSession {
 		return wrapped;
 	}
 
-	#setGuardedAgentTools(tools: AgentTool[]): void {
+	#setGuardedAgentTools(tools: AgentTool[], onPublished?: () => void): void {
 		this.#activeToolSelectionRevision++;
 		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
+		// Anchor ownership before observers run: a throwing observer must not leave
+		// the published tool set unattributed to this operation.
+		onPublished?.();
 		this.#onToolNamesChanged?.(tools.map(tool => tool.name));
 	}
 
@@ -14816,6 +15403,7 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
+			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
 		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
@@ -14827,6 +15415,7 @@ export class AgentSession {
 		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
+			(options?.fence?.isCurrent() ?? true) &&
 			(options?.expectedActiveToolSelectionRevision === undefined ||
 				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
 					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
@@ -14921,7 +15510,7 @@ export class AgentSession {
 				}
 				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools);
+				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 				this.#invalidateDiscoveryCaches();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
@@ -15017,6 +15606,7 @@ export class AgentSession {
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
 				this.#pendingAppliedToolSignature = undefined;
+				options?.fence?.onApplied();
 				break;
 			}
 		} else if (promptRelevantToolsChanged) {
@@ -15035,7 +15625,7 @@ export class AgentSession {
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-		this.#setGuardedAgentTools(tools);
+		this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 		this.#invalidateDiscoveryCaches();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
@@ -15196,10 +15786,14 @@ export class AgentSession {
 		}
 	}
 
-	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
+	async #restoreMCPSelectionsForSessionContext(
+		sessionContext: SessionContext,
+		fence?: SessionViewRestoreFence,
+	): Promise<void> {
+		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
-			await this.#attachAskToolIfWorkflowActive();
+			await this.#attachAskToolIfWorkflowActive(fence);
 			return;
 		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
@@ -15221,11 +15815,13 @@ export class AgentSession {
 				? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
 				: (constructorDiscoveredBuiltinToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
-		await this.#applyActiveToolsByName(
+		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false },
+			{ persistMCPSelection: false, fence },
 		);
-		await this.#attachAskToolIfWorkflowActive();
+		if (fence && (applied === undefined || !fence.isCurrent()))
+			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		await this.#attachAskToolIfWorkflowActive(fence);
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -16348,8 +16944,8 @@ export class AgentSession {
 		}
 	}
 
-	async #attachAskToolIfWorkflowActive(): Promise<void> {
-		if (this.#isDisposed || this.#sessionAdmissionClosing) return;
+	async #attachAskToolIfWorkflowActive(fence?: SessionViewRestoreFence): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || (fence && !fence.isCurrent())) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -16384,6 +16980,7 @@ export class AgentSession {
 				});
 				retryHydration = true;
 			}
+			if (fence && !fence.isCurrent()) return;
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
@@ -16406,7 +17003,23 @@ export class AgentSession {
 		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			this.#attachAskTool();
+			if (fence) {
+				// Exact view restoration must join prompt rebuilding and fence its publication.
+				if (
+					!this.#explicitEmptyToolSelection &&
+					this.#toolRegistry.has("ask") &&
+					!this.getActiveToolNames().includes("ask")
+				) {
+					const applied = await this.#applyActiveToolsByName([...this.getActiveToolNames(), "ask"], {
+						persistMCPSelection: false,
+						fence,
+					});
+					if (applied === undefined || !fence.isCurrent())
+						throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+				}
+			} else {
+				this.#attachAskTool();
+			}
 		} else if (this.#durableWorkflowSkillState?.sessionId === sessionId) {
 			this.#durableWorkflowSkillState = undefined;
 		}
@@ -17901,6 +18514,8 @@ export class AgentSession {
 			this.#promptGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
+			// Clear settled reminders from the previous turn to prevent cross-turn leaks (#7838).
+			this.#settledToolTtsrReminders.clear();
 		}
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
@@ -18896,6 +19511,11 @@ export class AgentSession {
 				this.#deferredFollowUpForceOneAtATime.add(message);
 			}
 			this.#deferredSdkFollowUps.push(message);
+			// Notify follow-up waiters that a message has been admitted to the deferred
+			// queue. This lets job poll and other callers to waitForFollowUpQueued interrupt
+			// immediately without waiting for the deferred message to enter the agent's live
+			// queue (which happens when streaming ends or the queue drains).
+			this.agent.notifyFollowUpWaiters();
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		}
@@ -20008,9 +20628,14 @@ export class AgentSession {
 
 	/** Whether the agent has queued steering messages that a `user_interrupt`
 	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
-	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts.
+	 *  Steers an interrupted run left unconsumed are re-routed onto the follow-up
+	 *  queue and still count: with two queued steers, the continuation that
+	 *  delivers the first leaves the second waiting there. */
 	get hasQueuedSteering(): boolean {
-		return this.agent.hasQueuedSteering();
+		if (this.agent.hasQueuedSteering()) return true;
+		if (this.agent.snapshotFollowUp().some(message => this.#rearmedSteerMessages.has(message))) return true;
+		return this.#deferredSdkFollowUps.some(message => this.#rearmedSteerMessages.has(message));
 	}
 
 	/** Get pending messages (read-only). Returns the public text-only view;
@@ -24064,7 +24689,7 @@ export class AgentSession {
 	async #setSharedSessionDefaultModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void },
+		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
 	): Promise<void> {
 		const operation = "set session model";
 		const assertMode = this.#controlPublicationModeFence(operation);
@@ -24132,12 +24757,13 @@ export class AgentSession {
 		const entries: SharedControlEntry[] = [{ type: "model_change", model: selector, role: "default" }];
 		if (effectiveLevel !== this.#thinkingLevel)
 			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
+		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 		entries.push({
 			type: "configured_model_chain",
 			chain: {
 				role: "default",
 				entries: [formatModelSelectorValue(selector, requestedLevel)],
-				origin: "model_selection",
+				origin,
 				explicitHead: true,
 				cleared: false,
 			},
@@ -24159,13 +24785,14 @@ export class AgentSession {
 		}
 		try {
 			assertCurrent();
-			this.markUserModelSelection();
+			const isUserSelection = options.cause !== "startup-override";
+			if (isUserSelection) this.markUserModelSelection();
 			this.#btwPrefixLedger.clear();
-			this.#setModelAuthoritatively(model, "user-selection");
+			this.#setModelAuthoritatively(model, isUserSelection ? "user-selection" : "startup-override");
 			this.#unavailableModelProfile = undefined;
-			this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+			if (isUserSelection) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 			this.#seedSessionCanonicalVariant(model);
-			this.#recordUserCanonicalVariantSelection();
+			if (isUserSelection) this.#recordUserCanonicalVariantSelection();
 			this.#applyThinkingLevel(requestedLevel, false, false, undefined, true);
 			this.#publishConcreteDefaultProfileState(materialized);
 			this.#defaultFallbackController = undefined;
@@ -24342,7 +24969,7 @@ export class AgentSession {
 		if (
 			this.#usesSharedSessionPublication() &&
 			options?.persistAsSessionDefault === true &&
-			options.cause === "user-selection"
+			(options.cause === "user-selection" || options.cause === "startup-override")
 		) {
 			return this.#setSharedSessionDefaultModel(model, thinkingLevel, options);
 		}
@@ -31210,6 +31837,89 @@ export class AgentSession {
 		};
 	}
 
+	#resetConcurrencyWait(): void {
+		this.#concurrencyWaitStartedAt = undefined;
+		this.#concurrencyWaitPollCount = 0;
+		this.#concurrencyWaitRetryAfterExceededBudgetEntry = undefined;
+		this.#concurrencyWaitRetryAfterDeadlines.clear();
+	}
+
+	/**
+	 * Delay before re-sending a request the provider refused for concurrency
+	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent,
+	 * poll count ceiling reached, and the failure must take the ordinary rate-limit path.
+	 * Also returns `undefined` when Retry-After exceeds the remaining budget, signaling
+	 * that the same entry should not be retried via credential rotation.
+	 */
+	#nextConcurrencyWaitMs(retryAfterMs: number | undefined, selector: string | undefined): number | undefined {
+		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
+		if (budgetMs <= 0) return undefined;
+		const now = Date.now();
+		this.#concurrencyWaitStartedAt ??= now;
+		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
+		if (remainingMs <= 0) {
+			// Record deadline on early exit when budget exhausted, before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// If the provider's Retry-After exceeds the remaining budget, mark the condition
+		// to prevent same-entry credential rotations (which would retry before deadline),
+		// and exit the concurrency wait to take the ordinary rate-limit path instead.
+		// This ensures we either advance to another entry or wait until budget expiry.
+		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
+			this.#concurrencyWaitRetryAfterExceededBudgetEntry = selector;
+			// Record deadline before no-poll return when budget would be exceeded.
+			if (selector !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// Bound poll count independently of elapsed time to prevent unbounded retries
+		// when Retry-After is zero or very small. The maximum poll attempts is determined
+		// by the budget divided by the minimum reasonable poll interval (1000ms).
+		// This prevents unbounded polling with tight intervals on a large budget (e.g., ~3000 requests with 100ms would fit 300s).
+		const maxPolls = Math.ceil(budgetMs / CONCURRENCY_POLL_MIN_INTERVAL_MS);
+		this.#concurrencyWaitPollCount++;
+		if (this.#concurrencyWaitPollCount > maxPolls) {
+			// Poll ceiling reached: if we have a Retry-After, track the absolute deadline per selector
+			// to prevent same-entry retries before the provider's deadline.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// A slot frees when any running request ends; poll with capped jitter so
+		// several waiting sessions do not retry in lockstep. Use explicit positive
+		// bounds independent of generic retry sentinels to avoid zero-delay bursts
+		// (when baseDelayMs is 0) or unbounded delays (when maxDelayMs is 0).
+		const minPollMs = CONCURRENCY_POLL_MIN_INTERVAL_MS;
+		let delayMs: number;
+		if (retryAfterMs !== undefined) {
+			// Use Retry-After as the base, with bounded jitter (0–1s when Retry-After > 0)
+			// to desynchronize concurrent waiters. Ensure we don't return sub-1s delays
+			// (which could burst when Retry-After is 0 and waste the budget).
+			const jitterMs = retryAfterMs > 0 ? Math.random() * 1000 : 0;
+			delayMs = Math.max(minPollMs, retryAfterMs + jitterMs);
+		} else {
+			// No Retry-After: poll with random jitter between 1s–15s.
+			delayMs = minPollMs + Math.random() * (CONCURRENCY_WAIT_MAX_POLL_MS - minPollMs);
+		}
+		// Cap by remaining budget.
+		const cappedDelayMs = Math.min(remainingMs, delayMs);
+		// If capped result falls below the minimum, exit concurrency wait
+		// to avoid sub-1s bursts at budget expiry.
+		if (cappedDelayMs < minPollMs) {
+			// Record deadline on early exit before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		return cappedDelayMs;
+	}
+
 	#fallbackTriggerFor(
 		message: AssistantMessage,
 		allowLegacyUsageLimit: boolean,
@@ -31217,7 +31927,7 @@ export class AgentSession {
 		// `authDisposition` is carried through from `classifyFallbackTrigger`, whose
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
-	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+	): FallbackTrigger | undefined {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return undefined;
 		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
@@ -31962,9 +32672,7 @@ export class AgentSession {
 				: false;
 		}
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		const trigger:
-			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined =
+		const trigger: FallbackTrigger | undefined =
 			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
 		if (!trigger) {
 			return managedOutcome
@@ -31977,6 +32685,18 @@ export class AgentSession {
 			: attemptsUsed;
 		const providerRetryCeilingReached =
 			providerRetryMaxAttempts !== undefined && providerAttemptsUsed >= providerRetryMaxAttempts;
+		// The account is running its maximum number of parallel requests: the
+		// model and credential are healthy, so wait on the same entry instead of
+		// spending fallback attempts, marking the credential, or opening the
+		// circuit for sibling sessions that share the same saturated account.
+		const concurrencyWaitMs =
+			managedFallback &&
+			trigger.concurrencyLimited &&
+			!providerRetryCeilingReached &&
+			!assistantMessageHasVisibleOrToolContent(message)
+				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs, controller.currentSelector())
+				: undefined;
+		const concurrencyWait = concurrencyWaitMs !== undefined;
 		if (
 			managedFallback &&
 			providerRetryCeilingReached &&
@@ -32007,6 +32727,7 @@ export class AgentSession {
 			}
 		}
 		if (
+			!concurrencyWait &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
@@ -32079,7 +32800,11 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (
+		if (concurrencyWait) {
+			// Waiting for a free parallel slot is not a failed fallback attempt.
+			controller.discardStartedAttempt();
+			outcome = "retry";
+		} else if (
 			managedFallback &&
 			(quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate") &&
 			!providerRetryCeilingReached
@@ -32087,10 +32812,36 @@ export class AgentSession {
 			// A credential retry is a separate dimension from model fallback
 			// attempts. Leave the controller on the current entry and refund its
 			// provisional request charge so every same-kind account is tried first.
-			controller.discardStartedAttempt();
-			outcome = "retry";
+			// However, enforce the concurrency Retry-After deadline before allowing
+			// same-selector rotation/retry: if a deadline exists for this selector,
+			// advance instead of retrying before the deadline.
+			const deadlineMs = failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+				// Deadline not yet reached; advance instead of retrying
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				// No deadline or deadline reached; allow credential rotation retry
+				controller.discardStartedAttempt();
+				outcome = "retry";
+			}
 		} else if (managedFallback) {
-			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			// When Retry-After exceeds the remaining budget, force advance to the next entry
+			// instead of retrying the same entry. This prevents re-sending before the provider's
+			// deadline via the ordinary rate-limit path.
+			// Only apply the flag if it matches the current failed selector (scoped per entry).
+			if (this.#concurrencyWaitRetryAfterExceededBudgetEntry === failedSelector) {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+				// If poll ceiling was reached with a Retry-After deadline for this entry,
+				// don't retry the same entry before the deadline. Advance instead.
+				if (outcome === "retry" && failedSelector !== undefined) {
+					const deadlineMs = this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector);
+					if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+						outcome = controller.advance() ? "advance" : "exhausted";
+					}
+				}
+			}
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
@@ -32214,8 +32965,9 @@ export class AgentSession {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
-		const delayMs =
-			credentialRotated || outcome === "advance"
+		const delayMs = concurrencyWait
+			? concurrencyWaitMs
+			: credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed)
@@ -32235,6 +32987,7 @@ export class AgentSession {
 			let quotaPoolExhausted = quotaCredentialMark === "exhausted";
 			if (
 				managedFallback &&
+				!concurrencyWait &&
 				!credentialRotated &&
 				quotaCredentialMark === undefined &&
 				!providerRetryCeilingReached &&
@@ -35293,6 +36046,220 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
+	 * Restore an exact runtime cursor, including the empty root. Unlike user tree
+	 * navigation this never runs hooks, summarizes, aborts work, or appends entries.
+	 * The caller must persist the cursor separately; flush does not persist it.
+	 */
+	async restoreTreeLeaf(targetId: string | null): Promise<void> {
+		const gone = () => Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (this.#isDisposed) throw gone();
+		this.#assertExternalSessionIngress();
+		const busy = () =>
+			this.isRevisionControlBusy ||
+			this.isCompacting ||
+			this.hasPendingBashMessages ||
+			this.hasPendingPythonMessages ||
+			this.queuedMessageCount > 0 ||
+			this.agent.hasQueuedMessages();
+		if (busy()) throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
+		if (targetId !== null && (typeof targetId !== "string" || targetId.length === 0))
+			throw Object.assign(new Error("Invalid session leaf."), { code: "invalid_input" });
+		const manager = this.sessionManager;
+		if (targetId !== null && !manager.getEntryForFidelity(targetId)) throw gone();
+		const previousLeaf = manager.getLeafId();
+		if (targetId === previousLeaf) return;
+		const agent = this.agent;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identity = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
+		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
+		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
+		const previousHasExplicitActiveToolSelectionForContext =
+			this.#committedHasExplicitActiveToolSelectionForContext;
+		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
+			? [...this.#committedExplicitMCPToolSelectionForContext]
+			: undefined;
+		const previousExplicitMCPToolSelectionPersistsForContext =
+			this.#committedExplicitMCPToolSelectionPersistsForContext;
+		const previousTools = [...agent.state.tools];
+		const previousBaseSystemPrompt = this.#baseSystemPrompt;
+		const previousSystemPrompt = agent.state.systemPrompt;
+		const previousLastAppliedToolSignature = this.#lastAppliedToolSignature;
+		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
+		const previousMessages = agent.state.messages.slice();
+		let ownedMessages = previousMessages;
+		let ownedContextRevision = agent.contextRevision;
+		let ownedHistoryRevision = agent.historyRevision;
+		let ownedLeaf = previousLeaf;
+		let revisions = manager.revisionSnapshot();
+		let moved = false;
+		// Identity only: the view may have moved on, but this session still owns the
+		// private selection-authority state this operation staged.
+		const sessionStillOurs = () =>
+			!this.#isDisposed &&
+			this.sessionManager === manager &&
+			this.agent === agent &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identity;
+		// View/history ownership: the leaf, transcript and transition identity this
+		// operation moved. Losing it means a foreign actor superseded the restoration.
+		const historyIsOurs = () => {
+			const now = manager.revisionSnapshot();
+			const messages = agent.state.messages;
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.agent === agent &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionFile() === file &&
+				manager.getSessionIdentityGeneration() === identity &&
+				this.#sessionTransitionKind === "navigate-tree" &&
+				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
+				this.#mcpCatalogGeneration === mcpCatalogGeneration &&
+				this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration &&
+				manager.getLeafId() === ownedLeaf &&
+				now.entry === revisions.entry &&
+				now.leaf === revisions.leaf &&
+				now.headerExport === revisions.headerExport &&
+				now.label === revisions.label &&
+				now.replayMetadata === revisions.replayMetadata &&
+				// Message-history only: prompt, tool and model publications must not
+				// suppress a history rollback of an independently drifted view.
+				agent.historyRevision === ownedHistoryRevision &&
+				messages.length === ownedMessages.length &&
+				messages.every((message, index) => message === ownedMessages[index]) &&
+				!busy()
+			);
+		};
+		const current = () => {
+			// Prompt and tool publications advance contextRevision even when they
+			// republish the same array, so ownership cannot rest on identity alone.
+			return historyIsOurs() && agent.contextRevision === ownedContextRevision;
+		};
+		const fence: SessionViewRestoreFence = {
+			isCurrent: current,
+			onApplied: () => {
+				ownedContextRevision = agent.contextRevision;
+			},
+		};
+		this.#beginSessionTransition("navigate-tree");
+		try {
+			if (!current()) throw gone();
+			if (targetId === null) manager.resetLeaf();
+			else manager.branch(targetId);
+			ownedLeaf = targetId;
+			revisions = { ...revisions, leaf: revisions.leaf + 1 };
+			moved = true;
+			this.#commitSessionTransition();
+			if (!current()) throw gone();
+			const context = this.buildDisplaySessionContext();
+			await this.#restoreMCPSelectionsForSessionContext(context, fence);
+			if (!current()) throw gone();
+			agent.replaceMessages(context.messages, {
+				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
+			});
+			ownedMessages = agent.state.messages.slice();
+			ownedHistoryRevision = agent.historyRevision;
+			ownedContextRevision = agent.contextRevision;
+			this.#resetInjectedContextSignatures();
+			this.#syncTodoPhasesFromBranch();
+			this.#closeCodexProviderSessionsForHistoryRewrite();
+			this.#resetActiveSdkRunOwnership();
+			if (!current()) throw gone();
+		} catch (error) {
+			// Undo independently-owned components. History (leaf and transcript) is
+			// reverted while the view is still ours; prompts, tools and selection
+			// authority only while this operation still owns them, so an independent
+			// publication is never overwritten.
+			if (moved && sessionStillOurs()) {
+				// Re-read ownership at each step: rollback callbacks are fallible and may
+				// publish prompt or history state of their own.
+				const selectionOurs = () =>
+					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
+				const authorityOurs = () =>
+					selectionOurs() &&
+					!this.#hasExplicitActiveToolSelectionForContext &&
+					this.#explicitMCPToolSelectionForContext === undefined &&
+					this.#explicitMCPToolSelectionPersistsForContext === true;
+				try {
+					if (historyIsOurs()) {
+						if (previousLeaf === null) manager.resetLeaf();
+						else manager.branch(previousLeaf);
+						// Re-anchor the cursor we just restored so later ownership reads
+						// reflect our own revert, not foreign drift.
+						ownedLeaf = previousLeaf;
+						revisions = { ...revisions, leaf: revisions.leaf + 1 };
+					}
+					if (authorityOurs()) {
+						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+						this.#explicitMCPToolSelectionPersistsForContext =
+							previousExplicitMCPToolSelectionPersistsForContext;
+						this.#commitExplicitMCPToolSelectionAuthority();
+					}
+					// Prompt before tools: the tool observer may publish prompt state of
+					// its own, and that later publication must win over this revert.
+					if (historyIsOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#baseSystemPrompt = previousBaseSystemPrompt;
+						agent.setSystemPrompt(previousSystemPrompt);
+						ownedContextRevision = agent.contextRevision;
+						// Invalidate rebuilds authorized for the abandoned target tools;
+						// otherwise one may publish their guidance over the reverted prompt.
+						this.#reserveBaseSystemPromptGeneration();
+					}
+					if (historyIsOurs() && selectionOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+						this.#activeToolSelectionRevision++;
+						agent.setTools(previousTools);
+						ownedContextRevision = agent.contextRevision;
+						// Signatures describe the prompt and tools this rollback just
+						// restored. Publish them before any observer can read or replace
+						// the cached signature with its own selection.
+						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+						this.#invalidateDiscoveryCaches();
+					} else if (selectionOurs() && agent.contextRevision === ownedContextRevision) {
+						// The view moved on, so its live tools stand. Only undo the
+						// discovered-selection staging this operation performed.
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+					}
+					if (historyIsOurs()) {
+						agent.replaceMessages(previousMessages, {
+							historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
+						});
+						// Re-anchor the history this rollback just published.
+						ownedMessages = agent.state.messages.slice();
+						ownedHistoryRevision = agent.historyRevision;
+						this.#resetInjectedContextSignatures();
+						this.#syncTodoPhasesFromBranch();
+						this.#closeCodexProviderSessionsForHistoryRewrite();
+					}
+				} catch {
+					throw Object.assign(new Error("Session view rollback failed."), {
+						code: "revision_failed",
+						rollbackFailed: true,
+					});
+				}
+				if (!historyIsOurs()) throw gone();
+			} else if (moved) {
+				throw gone();
+			}
+			throw error;
+		} finally {
+			this.#endSessionTransition();
+		}
+	}
+
+	/**
 	 * Navigate to a different node in the session tree.
 	 * Unlike branch() which creates a new session file, this stays in the same file.
 	 *
@@ -36271,6 +37238,31 @@ function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: s
 		};
 	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
 	return { outcome: outcome.kind };
+}
+
+type SharedAppendFailureOutcome = Extract<SharedAppendOutcome, { kind: "unknown" | "stale" | "rejected" }>;
+
+/** Preserve only recognized failure receipts carried by the custom-append wrapper. */
+function getSharedAppendFailureOutcome(error: unknown): SharedAppendFailureOutcome | undefined {
+	if (!(error instanceof Error)) return undefined;
+	const cause = error.cause;
+	if (cause === null || typeof cause !== "object" || Array.isArray(cause)) return undefined;
+	const record = cause as Record<string, unknown>;
+	if (record.kind === "unknown" && typeof record.id === "string" && Object.hasOwn(record, "error")) {
+		return cause as SharedAppendFailureOutcome;
+	}
+	if (
+		record.kind === "stale" &&
+		(record.reason === "transcript_moved" ||
+			record.reason === "cursor_not_committed" ||
+			record.reason === "persistence_latched" ||
+			record.reason === "rewrite_required" ||
+			record.reason === "unsupported_transcript")
+	) {
+		return cause as SharedAppendFailureOutcome;
+	}
+	if (record.kind === "rejected" && Object.hasOwn(record, "error")) return cause as SharedAppendFailureOutcome;
+	return undefined;
 }
 
 /**
