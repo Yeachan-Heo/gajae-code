@@ -664,6 +664,19 @@ export type SelectedForkTranscriptReservation = (identity: {
 	readonly file: string;
 }) => Promise<void>;
 
+/** The actual absent branch successor identity; reservation grants no cleanup rights. @internal */
+type SelectedForkSuccessorReservation = (identity: {
+	readonly role: "successor";
+	readonly sessionId: string;
+	readonly file: string;
+}) => Promise<void>;
+
+type NativeSelectedBranchSource = {
+	readonly selectedEntryId: string;
+	assertCurrent(): void;
+	assertOwner(): void;
+};
+
 type ReservedCapturedFork = {
 	readonly fresh: FreshSessionState & { readonly sessionFile: string };
 	assertDestination(): void;
@@ -746,7 +759,13 @@ function nativeForkAdmissionDiagnostic(error: unknown): NativeForkAdmissionDiagn
 }
 
 type NativeCapturedForkResult =
-	| { kind: "native_forked"; manager: SessionManager; membership: OwnerMembership; pending: PendingResumeOp }
+	| {
+			kind: "native_forked";
+			manager: SessionManager;
+			membership: OwnerMembership;
+			pending: PendingResumeOp;
+			receipt: SessionNoReplacePublicationReceipt;
+	  }
 	| { kind: "native_fork_admission_retained"; evidence: NativeForkAdmissionEvidence }
 	| {
 			kind: "native_fork_retained";
@@ -4178,6 +4197,7 @@ function prepareInitialCapturedFork(
 	directory: string,
 	managed: boolean,
 	creation?: OwnerFreshCreation,
+	parentSession = snapshot.identity.sessionId,
 ): ReservedCapturedFork {
 	const directoryIdentity = inspectCapturedForkDestination(directory);
 	const bindingFile = path.join(directory, MANAGED_SESSION_BINDING_FILE);
@@ -4186,7 +4206,7 @@ function prepareInitialCapturedFork(
 		cwd,
 		creation?.headerId ?? createSessionId(),
 		directory,
-		snapshot.identity.sessionId,
+		parentSession,
 	);
 	// Native admission is async; bind every source ancestor, not just the file's inode.
 	const sourceAncestors = new Map<string, fs.BigIntStats>();
@@ -4237,6 +4257,36 @@ function prepareInitialCapturedFork(
 	};
 	assertAvailable();
 	return { fresh, assertDestination, assertAvailable, assertSourceName };
+}
+
+/** Keep the selected ancestor path, with the effective labels of only its entries. */
+function projectNativeSelectedBranch(
+	branch: readonly SessionEntry[],
+	entries: readonly FileEntry[],
+): { entries: SessionEntry[]; target: string | null } {
+	const projected: SessionEntry[] = [];
+	let parentId: string | null = null;
+	for (const entry of branch) {
+		if (entry.type === "label") continue;
+		projected.push(entry.parentId === parentId ? entry : { ...entry, parentId });
+		parentId = entry.id;
+	}
+	const target = parentId;
+	const pathIds = new Set(projected.map(entry => entry.id));
+	const ids = new Set(entries.map(entry => entry.id));
+	const labels = new Map<string, LabelEntry>();
+	for (const entry of entries) {
+		if (entry.type !== "label" || !pathIds.has(entry.targetId)) continue;
+		if (entry.label) labels.set(entry.targetId, entry);
+		else labels.delete(entry.targetId);
+	}
+	for (const entry of labels.values()) {
+		const id = generateId(ids);
+		ids.add(id);
+		projected.push({ ...entry, id, parentId });
+		parentId = id;
+	}
+	return { entries: projected, target };
 }
 
 function capturedForkCursor(
@@ -8559,6 +8609,8 @@ export class SessionManager {
 	#strictCloseOutcome: SessionManagerCloseOutcome | undefined;
 	/** Keep the exact private stage through failure; its name is not discard authority. */
 	#nativeForkStage: NativeForkStage | undefined;
+	/** Successful producer identity and original storage, not an A-bound sidecar proxy. */
+	#nativeForkInstallation: { readonly pending: PendingResumeOp; readonly storage: SessionStorage } | undefined;
 	#rewriteCloseUnknownError: Error | undefined;
 	readonly #retryableRewriteCleanups = new Set<{
 		writer: NdjsonFileWriter;
@@ -20261,6 +20313,7 @@ export class SessionManager {
 	}
 
 	#releaseClosedSessionState(): void {
+		this.#nativeForkInstallation = undefined;
 		this.#clearManagedTranscriptRelocationResolver();
 		const runtime = this.#sidecarRuntime;
 		if (runtime) {
@@ -20744,7 +20797,10 @@ export class SessionManager {
 
 	#noteCommittedIdentityChange(previousId: string, previousFile: string | undefined): void {
 		const previous = this.#committedIdentity ?? { id: previousId, file: previousFile };
-		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) this.#committedIdentityGeneration++;
+		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) {
+			this.#nativeForkInstallation = undefined;
+			this.#committedIdentityGeneration++;
+		}
 		this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
 	}
 
@@ -28168,6 +28224,110 @@ export class SessionManager {
 		return result;
 	}
 
+	/**
+	 * Prepare a selected native branch from an unchanged captured fork. B owns its
+	 * own manager and operation; this does not adopt B, retire A, or unlink either.
+	 * The caller must carry the exact result (including retained outcomes) into the
+	 * native lifecycle rather than reopening B or treating a reserved name as proof.
+	 * @internal
+	 */
+	async prepareNativeBranchSuccessor(options: {
+		readonly sourceOp: PendingResumeOp;
+		readonly selectedEntryId: string;
+		readonly reserve: SelectedForkSuccessorReservation;
+		readonly signal?: AbortSignal;
+	}): Promise<NativeCapturedForkResult> {
+		const { sourceOp, selectedEntryId, reserve, signal } = options;
+		const file = this.#sessionFile;
+		const id = this.#sessionId;
+		const membership = this.#ownerMembership;
+		const installation = this.#nativeForkInstallation;
+		if (
+			!file ||
+			!membership ||
+			!installation ||
+			installation.pending !== sourceOp ||
+			this.#nativeResumeOperations.get(sourceOp.op) !== sourceOp
+		)
+			throw new Error("context_mismatch");
+		const state = nativeResumeBinding(sourceOp);
+		const installed = state.initialPublication;
+		if (
+			sourceOp.policy.kind !== "exclusive_native" ||
+			!installed ||
+			installed.canonicalPath !== file ||
+			installed.headerId !== id ||
+			state.durabilityState !== "proven" ||
+			this.#openCommittedDigest !== installed.successor.snapshotDigest
+		)
+			throw new Error("context_mismatch");
+		const revision = this.#entryRevision;
+		const leafRevision = this.#leafRevision;
+		const destination = this.destination;
+		const sourceStore = this.#managedTranscriptStoreCache?.store;
+		if (destination.kind === "managed" && !sourceStore) throw new Error("context_mismatch");
+		const assertCurrent = (): void => {
+			signal?.throwIfAborted();
+			if (
+				this.#sessionFile !== file ||
+				this.#sessionId !== id ||
+				this.#fileEntries[0]?.id !== id ||
+				this.destination !== destination ||
+				this.#ownerMembership !== membership ||
+				this.#nativeForkInstallation !== installation ||
+				this.#nativeResumeOperations.get(sourceOp.op) !== sourceOp ||
+				this.#entryRevision !== revision ||
+				this.#leafRevision !== leafRevision ||
+				this.#strictClosePending ||
+				this.#ownerTransfer ||
+				this.#persistError ||
+				this.#needsFullRewriteOnNextPersist ||
+				this.#heldPublicationEntries.size ||
+				state.durabilityState !== "proven"
+			)
+				throw new Error("stale_snapshot");
+			sourceStore?.assertBound();
+		};
+		// Check A's owner outside B's owner-publication critical section; never
+		// acquire the predecessor's owner lock under the successor's lock.
+		const assertOwner = (): void => withOwnerPublicationSync(membership, assertCurrent);
+		assertOwner();
+		const captured = SessionManager.captureTranscriptStrict(file, installation.storage);
+		if (captured.kind !== "captured") return captured;
+		const { snapshot } = captured;
+		try {
+			const before = snapshot.identity;
+			if (
+				before.canonicalPath !== file ||
+				before.sessionId !== id ||
+				String(before.dev) !== installed.successor.fileIdentity.dev ||
+				String(before.ino) !== installed.successor.fileIdentity.ino ||
+				before.size !== installed.successor.snapshotByteLength ||
+				before.sha256 !== installed.successor.snapshotDigest
+			)
+				return { kind: "error", reason: "identity-mismatch" };
+			const result = await SessionManager.#forkFromCaptured(
+				snapshot,
+				this.cwd,
+				destination,
+				"auto",
+				undefined,
+				{
+					executionTargetLeafId: null,
+					exclusiveNative: true,
+					signal,
+					reserveSelectedForkTranscript: ({ sessionId, file }) =>
+						reserve(Object.freeze({ role: "successor", sessionId, file })),
+				},
+				{ selectedEntryId, assertCurrent, assertOwner },
+			);
+			if (result.kind === "forked") throw new Error("unexpected_cooperative_fork");
+			return result;
+		} finally {
+			snapshot.close();
+		}
+	}
+
 	static async #forkFromCaptured(
 		snapshot: CapturedSessionTranscriptSnapshot,
 		cwd: string,
@@ -28176,6 +28336,7 @@ export class SessionManager {
 		sessionMemoryMode: SessionMemoryMode,
 		sourceEntryId?: string | null,
 		nativeResume?: CapturedForkSelection | NativeCapturedForkSelection,
+		successor?: NativeSelectedBranchSource,
 	): Promise<StrictSessionForkResult | NativeCapturedForkResult> {
 		const executionTargetLeafId = nativeResume?.executionTargetLeafId;
 		const reserve = nativeResume?.reserveSelectedForkTranscript;
@@ -28249,7 +28410,14 @@ export class SessionManager {
 				const directory = path.resolve(destination.directory);
 				if (destination.kind === "explicit" && destination.directory !== directory)
 					destination = explicitDestination(directory, explicitProfileAgentDirs.get(destination));
-				reservation = prepareInitialCapturedFork(snapshot, cwd, directory, destination.kind === "managed", creation);
+				reservation = prepareInitialCapturedFork(
+					snapshot,
+					cwd,
+					directory,
+					destination.kind === "managed",
+					creation,
+					successor ? snapshot.identity.canonicalPath : undefined,
+				);
 			}
 		}
 		if (!reserve && boundedRequested && destination) {
@@ -28335,7 +28503,8 @@ export class SessionManager {
 				return { kind: "error", reason: "identity-mismatch" };
 			migrateToCurrentVersion(forkEntries);
 			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
-			if (sourceEntryId !== undefined) {
+			let successorTarget: string | null = null;
+			if (sourceEntryId !== undefined || successor) {
 				// Follow the same parentId graph as getBranch/createBranchedSession,
 				// but reject ambiguous identities and incomplete/cyclic ancestry.
 				const byId = new Map<string, SessionEntry>();
@@ -28347,7 +28516,13 @@ export class SessionManager {
 				}
 				const branch: SessionEntry[] = [];
 				const visited = new Set<string>();
-				let currentId: string | null = sourceEntryId;
+				let currentId = sourceEntryId ?? null;
+				if (successor) {
+					const selected = byId.get(successor.selectedEntryId);
+					if (selected?.type !== "message" || selected.message.role !== "user")
+						return { kind: "error", reason: "malformed", message: "Invalid selected user entry." };
+					currentId = selected.parentId;
+				}
 				while (currentId !== null) {
 					const entry: SessionEntry | undefined = byId.get(currentId);
 					if (!entry || visited.has(currentId))
@@ -28356,16 +28531,23 @@ export class SessionManager {
 					branch.push(entry);
 					currentId = entry.parentId;
 				}
-				forkEntries = [sourceHeader, ...branch.reverse()];
+				branch.reverse();
+				if (successor) {
+					const selected = projectNativeSelectedBranch(branch, forkEntries);
+					successorTarget = selected.target;
+					forkEntries = [sourceHeader, ...selected.entries];
+				} else forkEntries = [sourceHeader, ...branch];
 			}
 			const sourceReduction = reduceResumeTranscript(forkEntries, snapshot.identity.sha256);
 			if (sourceReduction.checkpoint.kind === "invalid")
 				return { kind: "error", reason: "malformed", message: "Invalid fork source graph." };
-			forkTarget = executionTargetLeafId !== undefined
-				? executionTargetLeafId
-				: sourceEntryId !== undefined
-					? sourceEntryId
-					: sourceReduction.checkpoint.leafEntryId;
+			forkTarget = successor
+				? successorTarget
+				: executionTargetLeafId !== undefined
+					? executionTargetLeafId
+					: sourceEntryId !== undefined
+						? sourceEntryId
+						: sourceReduction.checkpoint.leafEntryId;
 			const sourceById = new Map(
 				forkEntries
 					.filter((entry): entry is SessionEntry => entry.type !== "session")
@@ -28396,8 +28578,10 @@ export class SessionManager {
 		if (reserve && reservation) {
 			const { fresh } = reservation;
 			const sourceHeader = forkEntries[0] as SessionHeader;
-			fresh.header.title = sourceHeader.title;
-			fresh.header.titleSource = sourceHeader.titleSource;
+			if (!successor) {
+				fresh.header.title = sourceHeader.title;
+				fresh.header.titleSource = sourceHeader.titleSource;
+			}
 			forkEntries[0] = fresh.header;
 			for (const entry of forkEntries) {
 				if (entry.type === "session") continue;
@@ -28408,9 +28592,11 @@ export class SessionManager {
 			const measured = measureReservedForkHistory(forkEntries, forkTarget, reservedMaxBytes);
 			if ("kind" in measured) return measured;
 			reservedHistory = measured;
+			successor?.assertOwner();
 			reservation.assertAvailable();
 			await reserve(Object.freeze({ role: "staging", sessionId: fresh.sessionId, file: fresh.sessionFile }));
 			exclusive?.signal?.throwIfAborted();
+			successor?.assertOwner();
 			reservation.assertAvailable();
 			const afterReservation = snapshot.revalidate();
 			if (afterReservation.kind !== "valid") return afterReservation;
@@ -28438,6 +28624,7 @@ export class SessionManager {
 		let membership: OwnerMembership | undefined;
 		let admittedIdentity: NativeForkAdmissionEvidence["identity"] | undefined;
 		const assertNativeSource = (): void => {
+			successor?.assertCurrent();
 			exclusive?.signal?.throwIfAborted();
 			reservation?.assertSourceName();
 			const checked = snapshot.revalidate();
@@ -28513,6 +28700,7 @@ export class SessionManager {
 					snapshotDigest,
 				});
 				if (admission.kind === "retained") throw admission.error;
+				successor?.assertOwner();
 				assertNativeSource();
 				reservation.assertAvailable();
 				manager.installOwnerMembership(membership);
@@ -28551,8 +28739,10 @@ export class SessionManager {
 					};
 				if (exclusive) {
 					if (!membership || !nativePublication.pending) throw new Error("participation_lost");
+					successor?.assertOwner();
 					assertNativeSource();
-					return { kind: "native_forked", manager, membership, pending: nativePublication.pending };
+					manager.#nativeForkInstallation = { pending: nativePublication.pending, storage: snapshot.storage };
+					return { kind: "native_forked", manager, membership, pending: nativePublication.pending, receipt };
 				}
 				writeTerminalBreadcrumb(manager.cwd, sessionFile);
 				return { kind: "forked", manager };

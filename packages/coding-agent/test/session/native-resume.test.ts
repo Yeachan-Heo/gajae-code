@@ -16,6 +16,7 @@ import {
 	FileSessionStorage,
 	type SessionDurabilityRepairRange,
 	type SessionDurabilityRepairReceipt,
+	type SessionNoReplacePublicationReceipt,
 	type SessionStorageExactReplacementExpectation,
 	type SessionStorageSecurityContext,
 	type SessionStorageWriter,
@@ -142,6 +143,283 @@ function readRecords(file: string, storage: FileSessionStorage): FileEntry[] {
 		.split("\n")
 		.map(line => JSON.parse(line) as FileEntry);
 }
+
+async function selectedForkFixture(managed: boolean) {
+	const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-native-successor-")));
+	directories.push(directory);
+	const storage = new FaultStorage();
+	const sourceFile = path.join(directory, "source.jsonl");
+	const agentDir = path.join(directory, "agent");
+	fs.mkdirSync(agentDir, { mode: 0o700 });
+	const destination = managed
+		? SessionManager.managedDestination(directory, agentDir, storage)
+		: SessionManager.explicitDestination(directory, agentDir);
+	function user(id: string, parentId: string | null): FileEntry {
+		return { type: "message", id, parentId, timestamp: "0", message: { role: "user", content: id, timestamp: 0 } };
+	}
+	const records: FileEntry[] = [
+		{ type: "session", version: 5, id: "native-successor-source", timestamp: "0", cwd: directory },
+		user("first", null),
+		{ type: "custom", id: "prior", parentId: "first", timestamp: "0", customType: "test", data: {} },
+		user("selected", "prior"),
+		user("tail", "prior"),
+		{ type: "label", id: "side-label", parentId: "tail", timestamp: "0", targetId: "first", label: "retained" },
+	];
+	const sourceBytes = `${records.map(entry => JSON.stringify(entry)).join("\n")}\n`;
+	storage.writeTextSync(sourceFile, sourceBytes);
+	const captured = SessionManager.captureTranscriptStrict(sourceFile, storage);
+	if (captured.kind !== "captured") throw new Error(`Source capture failed: ${captured.reason}`);
+	try {
+		const fork = await SessionManager.forkNativeFromCaptured(captured.snapshot, directory, destination, {
+			exclusiveNative: true,
+			executionTargetLeafId: "tail",
+			reserveSelectedForkTranscript: async identity => {
+				expect(identity.role).toBe("staging");
+				expect(fs.existsSync(identity.file)).toBe(false);
+			},
+		});
+		if (fork.kind !== "native_forked") throw new Error(`A was not produced: ${fork.kind}`);
+		managers.push(fork.manager);
+		const aFile = fork.manager.getSessionFile()!;
+		return { fork, aFile, aBytes: storage.readTextSync(aFile), storage, sourceFile, sourceBytes };
+	} finally {
+		captured.snapshot.close();
+	}
+}
+
+describe("native selected branch successor preparation", () => {
+	for (const managed of [false, true]) {
+		for (const selectedEntryId of ["first", "selected"] as const) {
+			it.skipIf(process.platform === "win32")(
+				`produces the exact ${managed ? "managed" : "explicit"} successor for ${selectedEntryId}`,
+				async () => {
+					const { fork: a, aFile, aBytes, storage, sourceFile, sourceBytes } = await selectedForkFixture(managed);
+					const aOwner = a.manager.getSessionOwnerEvidence()!;
+					const aGeneration = a.manager.getSessionIdentityGeneration();
+					const aLeaf = a.manager.getLeafId();
+					let reserved: { file: string; sessionId: string } | undefined;
+					let admittedB: SessionManager | undefined;
+					const install = SessionManager.prototype.installOwnerMembership;
+					vi.spyOn(SessionManager.prototype, "installOwnerMembership").mockImplementation(function (
+						this: SessionManager,
+						membership,
+					) {
+						install.call(this, membership);
+						if (this.getSessionFile() === reserved?.file) admittedB = this;
+					});
+					let issued: SessionNoReplacePublicationReceipt | undefined;
+					let firstBytes: string | undefined;
+					let publications = 0;
+					const open = storage.openStagedWriter.bind(storage);
+					const writes = vi.spyOn(storage, "openStagedWriter").mockImplementation((file, options) => {
+						if (!reserved) throw new Error("B must be reserved before opening its writer");
+						expect(file).toBe(reserved.file);
+						expect(fs.existsSync(file)).toBe(false);
+						expect(admittedB?.getSessionOwnerEvidence()?.policy.kind).toBe("exclusive_native");
+						const writer = open(file, options);
+						const publish = writer.publishNoReplace.bind(writer);
+						writer.publishNoReplace = () => {
+							publications++;
+							const receipt = publish();
+							issued = receipt;
+							firstBytes = storage.readTextSync(file);
+							return receipt;
+						};
+						return writer;
+					});
+					const b = await a.manager.prepareNativeBranchSuccessor({
+						sourceOp: a.pending,
+						selectedEntryId,
+						reserve: async identity => {
+							expect(reserved).toBeUndefined();
+							expect(identity.role).toBe("successor");
+							expect(identity.sessionId).not.toBe(a.manager.getSessionId());
+							expect(path.dirname(identity.file)).toBe(path.dirname(aFile));
+							expect(fs.existsSync(identity.file)).toBe(false);
+							reserved = identity;
+						},
+					});
+					if (b.kind !== "native_forked" || !reserved || !issued || !admittedB || firstBytes === undefined)
+						throw new Error(`B was not produced with the expected reservation and installation: ${b.kind}`);
+					managers.push(b.manager);
+					expect(writes).toHaveBeenCalledTimes(1);
+					expect(publications).toBe(1);
+					expect(b.receipt).toBe(issued);
+					expect(b.manager).toBe(admittedB);
+					expect(b.manager).not.toBe(a.manager);
+					expect(b.manager.getOwnerMembership()).toBe(b.membership);
+					const bOwner = b.manager.getSessionOwnerEvidence()!;
+					expect(bOwner.policy.kind).toBe("exclusive_native");
+					expect(bOwner.memberId).not.toBe(aOwner.memberId);
+					expect(bOwner.authorityKey).not.toBe(aOwner.authorityKey);
+					expect(b.pending).toMatchObject({
+						memberToken: bOwner.memberId,
+						authorityKey: bOwner.authorityKey,
+						epoch: bOwner.epoch,
+					});
+					expect(b.manager.getSessionFile()).toBe(reserved.file);
+					expect(b.manager.getSessionId()).toBe(reserved.sessionId);
+					const output = readRecords(reserved.file, storage);
+					const target = selectedEntryId === "first" ? null : "prior";
+					expect(output[0]).toMatchObject({ type: "session", id: reserved.sessionId, parentSession: aFile });
+					if (target === null) {
+						expect(output).toHaveLength(2);
+						expect(b.pending.plan.cursorIds).toEqual([]);
+					} else {
+						expect(output.slice(1, 3)).toEqual(readRecords(aFile, storage).slice(1, 3));
+						expect(output[3]).toMatchObject({ type: "label", targetId: "first", label: "retained" });
+						expect(output).toHaveLength(6);
+						expect(output[5]).toMatchObject({
+							id: b.pending.plan.cursorIds[0],
+							parentId: target,
+							customType: "gjc.resume_cursor",
+							data: { bind: reserved.sessionId, member: bOwner.memberId, op: b.pending.op, reason: "fork_init" },
+						});
+					}
+					const suffix = output.slice(-b.pending.manifest.length);
+					const enroll = b.pending.plan.enroll;
+					if (enroll === null) throw new Error("Fresh B must enroll its own owner");
+					expect(suffix.map(entry => entry.id)).toEqual([enroll, ...b.pending.plan.cursorIds]);
+					expect(suffix[0]).toMatchObject({
+						parentId: target,
+						customType: "gjc.owner_enroll",
+						data: { bind: reserved.sessionId, member: bOwner.memberId, epoch: bOwner.epoch },
+					});
+					expect(b.pending.manifest.map(entry => entry.payloadDigest)).toEqual(
+						suffix.map(entry => resumeDigest(JSON.stringify(entry))),
+					);
+					const binding = nativeResumeBinding(b.pending);
+					expect(binding.initialPublication).toMatchObject({
+						publicationId: b.receipt.publicationId,
+						canonicalPath: reserved.file,
+						predecessor: "absent",
+						successor: {
+							fileIdentity: { dev: String(b.receipt.stat.dev), ino: String(b.receipt.stat.ino) },
+							snapshotDigest: resumeDigest(firstBytes!),
+							snapshotByteLength: Buffer.byteLength(firstBytes!),
+						},
+					});
+					expect(binding.proofs[0]).toMatchObject({
+						op: b.pending.op,
+						publicationId: b.receipt.publicationId,
+						namespaceSynced: true,
+					});
+					const reconciliation = await b.manager.reconcileResumeOperation(b.pending, "verify", routing);
+					expect(reconciliation.outcome.kind).toBe("committed");
+					expect(reconciliation.receipt.commitment.continueEligible).toBe(true);
+					expect(reconciliation.receipt.targetLeafId).toBe(target);
+					expect(b.manager.getLeafId()).toBe(b.pending.CB);
+					expect(storage.readTextSync(reserved.file)).toBe(firstBytes);
+					expect(storage.readTextSync(aFile)).toBe(aBytes);
+					expect(storage.readTextSync(sourceFile)).toBe(sourceBytes);
+					expect(a.manager.getSessionIdentityGeneration()).toBe(aGeneration);
+					expect(a.manager.getSessionFile()).toBe(aFile);
+					expect(a.manager.getLeafId()).toBe(aLeaf);
+					expect(a.manager.getOwnerMembership()).toBe(a.membership);
+					expect(a.manager.getSessionOwnerEvidence()).toEqual(aOwner);
+				},
+			);
+		}
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a forged A operation or replacement of A during reservation",
+		async () => {
+			const { fork: a, aFile, aBytes, storage } = await selectedForkFixture(false);
+			const reserve = vi.fn(async () => {});
+			await expect(
+				a.manager.prepareNativeBranchSuccessor({
+					sourceOp: { ...a.pending },
+					selectedEntryId: "selected",
+					reserve,
+				}),
+			).rejects.toThrow("context_mismatch");
+			expect(reserve).not.toHaveBeenCalled();
+			let candidate: string | undefined;
+			const open = vi.spyOn(storage, "openStagedWriter");
+			await expect(
+				a.manager.prepareNativeBranchSuccessor({
+					sourceOp: a.pending,
+					selectedEntryId: "selected",
+					reserve: async identity => {
+						candidate = identity.file;
+						fs.renameSync(aFile, `${aFile}.original`);
+						storage.writeTextSync(aFile, aBytes);
+					},
+				}),
+			).rejects.toThrow("Captured fork source identity changed");
+			expect(open).not.toHaveBeenCalled();
+			expect(candidate).toBeDefined();
+			expect(fs.existsSync(candidate!)).toBe(false);
+			expect(storage.readTextSync(`${aFile}.original`)).toBe(aBytes);
+			expect(storage.readTextSync(aFile)).toBe(aBytes);
+			expect(a.manager.getOwnerMembership()).toBe(a.membership);
+		},
+	);
+
+	for (const fault of ["reservation", "publication", "close"] as const) {
+		it.skipIf(process.platform === "win32")(
+			`preserves a foreign B transcript and artifacts at ${fault}`,
+			async () => {
+				const { fork: a, aFile, aBytes, storage } = await selectedForkFixture(fault === "publication");
+				const open = storage.openStagedWriter.bind(storage);
+				let candidate: { file: string; sessionId: string } | undefined;
+				let foreignBytes: string | undefined;
+				const placeForeign = () => {
+					const { file, sessionId } = candidate!;
+					foreignBytes = `${JSON.stringify({ type: "session", version: 5, id: sessionId, timestamp: "0", cwd: path.dirname(aFile) })}\n`;
+					storage.writeTextSync(file, foreignBytes);
+					fs.mkdirSync(file.slice(0, -6));
+					storage.writeTextSync(path.join(file.slice(0, -6), "keep"), "foreign artifacts");
+				};
+				let publications = 0;
+				const writes = vi.spyOn(storage, "openStagedWriter").mockImplementation((file, options) => {
+					const writer = open(file, options);
+					const close = writer.closeSync.bind(writer);
+					writer.closeSync = () => {
+						close();
+						if (fault === "close") {
+							placeForeign();
+							throw new Error("injected unacknowledged successor close");
+						}
+					};
+					const publish = writer.publishNoReplace.bind(writer);
+					writer.publishNoReplace = () => {
+						publications++;
+						if (fault === "publication") placeForeign();
+						return publish();
+					};
+					return writer;
+				});
+				const result = a.manager.prepareNativeBranchSuccessor({
+					sourceOp: a.pending,
+					selectedEntryId: "selected",
+					reserve: async identity => {
+						candidate = identity;
+						if (fault === "reservation") placeForeign();
+					},
+				});
+				if (fault === "reservation") {
+					await expect(result).rejects.toThrow("Fork reservation destination is occupied");
+					expect(writes).not.toHaveBeenCalled();
+				} else {
+					const retained = await result;
+					if (retained.kind !== "native_fork_retained") throw new Error(`B was not retained: ${retained.kind}`);
+					expect(retained.proven).toBe(false);
+					expect(retained.manager.getOwnerMembership()).toBe(retained.membership);
+					expect(nativeResumeBinding(retained.pending).initialPublication).toBeUndefined();
+					expect((await retained.manager.closeStrict()).kind).toBe("close_unknown");
+				}
+				expect(publications).toBe(fault === "publication" ? 1 : 0);
+				if (!candidate || foreignBytes === undefined) throw new Error("Expected the foreign B fixture");
+				expect(storage.readTextSync(candidate.file)).toBe(foreignBytes);
+				expect(fs.readFileSync(path.join(candidate.file.slice(0, -6), "keep"), "utf8")).toBe("foreign artifacts");
+				expect(storage.readTextSync(aFile)).toBe(aBytes);
+				expect(a.manager.getOwnerMembership()).toBe(a.membership);
+			},
+		);
+	}
+});
 
 describe("actual manager resume publication and nonterminal recovery", () => {
 	const runtimeRouting: ResumeRouting = { ...routing, context: "runtime" };
