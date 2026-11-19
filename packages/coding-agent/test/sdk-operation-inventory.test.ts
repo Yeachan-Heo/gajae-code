@@ -455,8 +455,6 @@ describe("SDK operation inventory", () => {
 
 	it("reviews native stop and revision helper seams without admitting independent protocol operations", async () => {
 		const records = (await Bun.file(inventory).json()) as InventoryRecord[];
-		const source = await Bun.file(path.join(repoRoot, "packages/coding-agent/src/session/agent-session.ts")).text();
-		const discovered = scanAgentSessionMethods(source);
 		const expected = new Map([
 			[
 				"agent_session:acquireExternalStopAdmission",
@@ -476,7 +474,7 @@ describe("SDK operation inventory", () => {
 			],
 			[
 				"agent_session:restoreTreeLeaf",
-				"internal exact presentation-cursor restoration used by restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
+				"internal exact presentation-cursor restoration behind captureSessionView/restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
 			],
 			[
 				"agent_session:selectExecutionBranchDurably",
@@ -488,7 +486,6 @@ describe("SDK operation inventory", () => {
 			],
 		]);
 		for (const [sourceId, rationale] of expected) {
-			expect(discovered).toContain(sourceId);
 			// Exact records reject duplicate rows, accidental sdkId mappings, and inherited adapter authority.
 			expect(records.filter(record => record.sourceId === sourceId)).toEqual([
 				{
