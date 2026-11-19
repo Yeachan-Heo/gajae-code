@@ -16,7 +16,7 @@
  * search. State is tracked per-file to handle multi-hunk containers.
  */
 
-import { redactCrashSecrets } from "@gajae-code/utils";
+import { redactCrashSecrets, redactCrashSecretsPreservingLines } from "@gajae-code/utils";
 
 // Helper to split text while preserving empty lines and tracking terminal newline.
 // Returns [lines, hasTrailingNewline]
@@ -507,13 +507,12 @@ function redactHunk(
  * Redact accumulated content across multiple diff lines with per-side projection strategy.
  * Returns the redacted line infos and updated state.
  *
- * Strategy:
+ * Uses redactCrashSecretsPreservingLines to maintain exact line counts, eliminating
+ * the need for fail-closed behavior. Strategy:
  * 1. Build two projections: old = context + '-' lines, new = context + '+' lines
- * 2. Run the shared redactCrashSecrets on each projection independently
- * 3. If projection is unchanged, use original lines
- * 4. If changed and line count is preserved, map redacted lines back by index
- * 5. If changed and line count changed, fail closed: redact all lines on that side
- * 6. Track per-side "open container at hunk end" state for cross-hunk boundaries
+ * 2. Run redactCrashSecretsPreservingLines on each projection independently
+ * 3. Map redacted lines back by index (line counts are guaranteed to match)
+ * 4. For context lines, use the old-side redacted content (should be same on both sides)
  */
 function redactAccumulatedContentWithState(
 	lineInfos: LineInfo[],
@@ -545,26 +544,34 @@ function redactAccumulatedContentWithState(
 		}
 	}
 
-	// Join projections with newlines and redact them
-	const oldProjectionOriginal = oldProjectionLines.join("\n");
-	const newProjectionOriginal = newProjectionLines.join("\n");
-	const oldProjectionRedacted = redactCrashSecrets(oldProjectionOriginal);
-	const newProjectionRedacted = redactCrashSecrets(newProjectionOriginal);
+	// Join projections with newlines and redact them using line-preserving variant
+	const oldProjectionOriginal = oldProjectionLines.length === 0 ? "" : oldProjectionLines.join("\n");
+	const newProjectionOriginal = newProjectionLines.length === 0 ? "" : newProjectionLines.join("\n");
+	const oldProjectionRedacted = redactCrashSecretsPreservingLines(oldProjectionOriginal);
+	const newProjectionRedacted = redactCrashSecretsPreservingLines(newProjectionOriginal);
 
-	// Split back to lines by newline
-	const oldRedactedLines = oldProjectionRedacted.split("\n");
-	const newRedactedLines = newProjectionRedacted.split("\n");
+	// Split back to lines by newline, but handle empty projections
+	const oldRedactedLines = oldProjectionRedacted === "" ? [] : oldProjectionRedacted.split("\n");
+	const newRedactedLines = newProjectionRedacted === "" ? [] : newProjectionRedacted.split("\n");
 
-	// Determine which sides changed and their line counts
+	// Verify line count is preserved (should always be true with line-preserving redaction)
+	if (oldRedactedLines.length !== oldProjectionLines.length) {
+		throw new Error(
+			`Line count mismatch in old projection: original ${oldProjectionLines.length}, redacted ${oldRedactedLines.length}`,
+		);
+	}
+	if (newRedactedLines.length !== newProjectionLines.length) {
+		throw new Error(
+			`Line count mismatch in new projection: original ${newProjectionLines.length}, redacted ${newRedactedLines.length}`,
+		);
+	}
+
+	// Determine which sides changed
 	const oldSideChanged = oldProjectionOriginal !== oldProjectionRedacted;
 	const newSideChanged = newProjectionOriginal !== newProjectionRedacted;
-	const oldLineCountPreserved = oldProjectionLines.length === oldRedactedLines.length;
-	const newLineCountPreserved = newProjectionLines.length === newRedactedLines.length;
 
-	// Map redactions back to individual diff lines
+	// Map redactions back to individual diff lines by index
 	const result: LineInfo[] = [];
-	let oldSideContainerOpen = false;
-	let newSideContainerOpen = false;
 
 	for (let i = 0; i < lineInfos.length; i += 1) {
 		const info = lineInfos[i];
@@ -581,23 +588,9 @@ function redactAccumulatedContentWithState(
 				if (!oldSideChanged && !newSideChanged) {
 					// Neither side changed: use original
 					redactedContent = info.content;
-				} else if (oldLineCountPreserved && newLineCountPreserved) {
-					// Both changed but line counts preserved: use redacted version (should be same on both sides for context)
-					redactedContent = oldRedactedLines[oldIdx];
 				} else {
-					// Line count changed on at least one side: fail closed for context lines if either side changed
-					if (oldSideChanged && !oldLineCountPreserved) {
-						redactedContent = "«redacted»";
-					} else if (newSideChanged && !newLineCountPreserved) {
-						redactedContent = "«redacted»";
-					} else {
-						// One side preserved line count, use that
-						if (oldLineCountPreserved) {
-							redactedContent = oldRedactedLines[oldIdx];
-						} else {
-							redactedContent = newRedactedLines[newIdx];
-						}
-					}
+					// Use old-side redacted content (should match new-side for context lines)
+					redactedContent = oldRedactedLines[oldIdx];
 				}
 			}
 		} else if (prefix === "-") {
@@ -605,16 +598,9 @@ function redactAccumulatedContentWithState(
 			const oldIdx = oldProjectionIndices.indexOf(i);
 
 			if (oldIdx >= 0) {
-				if (!oldSideChanged) {
-					// Old side unchanged: use original
-					redactedContent = info.content;
-				} else if (oldLineCountPreserved) {
-					// Line count preserved: map by index
+				if (oldSideChanged) {
+					// Map by index - line count is guaranteed to match
 					redactedContent = oldRedactedLines[oldIdx];
-				} else {
-					// Line count changed: fail closed - redact all lines
-					redactedContent = "«redacted»";
-					oldSideContainerOpen = true;
 				}
 			}
 		} else if (prefix === "+") {
@@ -622,16 +608,9 @@ function redactAccumulatedContentWithState(
 			const newIdx = newProjectionIndices.indexOf(i);
 
 			if (newIdx >= 0) {
-				if (!newSideChanged) {
-					// New side unchanged: use original
-					redactedContent = info.content;
-				} else if (newLineCountPreserved) {
-					// Line count preserved: map by index
+				if (newSideChanged) {
+					// Map by index - line count is guaranteed to match
 					redactedContent = newRedactedLines[newIdx];
-				} else {
-					// Line count changed: fail closed - redact all lines
-					redactedContent = "«redacted»";
-					newSideContainerOpen = true;
 				}
 			}
 		}
@@ -639,17 +618,6 @@ function redactAccumulatedContentWithState(
 		result.push({ ...info, content: redactedContent });
 	}
 
-	// Determine final state: if a container is open at hunk end, preserve that state for next hunk
-	let finalState = inputState;
-	if (oldSideContainerOpen || newSideContainerOpen) {
-		// Mark that there's an open container for the next hunk to fail-closed on continuation lines
-		finalState = {
-			inCredentialValue: true,
-			bracketDepth: 1, // Non-zero to indicate container is open
-			bracketStack: ["{"],
-			inPemBlock: inputState.inPemBlock,
-		};
-	}
-
-	return { redactedLines: result, state: finalState };
+	// No longer need to track cross-hunk state since line counts are preserved
+	return { redactedLines: result, state: inputState };
 }
