@@ -370,7 +370,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:emitSubagentSteerRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:navigateTree": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:restoreTreeLeaf":
-		"internal exact presentation-cursor restoration used by restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
+		"internal exact presentation-cursor restoration behind captureSessionView/restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
 	"agent_session:selectExecutionBranchDurably":
 		"internal durable execution-selection publication at accepted prompt preflight inside createEmbeddedAgentSession().revise (session.revise C84/G11); it does not perform the complete revision or open a session and is distinct from selectEmbeddedExecutionBranch's native checkpoint API, so it is not an independent protocol ingress",
 	"agent_session:prepareTreeEdit":

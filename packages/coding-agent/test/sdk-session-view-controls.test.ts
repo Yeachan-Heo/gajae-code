@@ -54,7 +54,11 @@ describe("SDK exact session view", () => {
 	const restores: Array<() => void> = [];
 	const sessions: AgentSession[] = [];
 
-	async function createSession(manager: SessionManager, discovery = false): Promise<AgentSession> {
+	async function createSession(
+		manager: SessionManager,
+		discovery = false,
+		onToolNamesChanged?: (names: string[]) => void,
+	): Promise<AgentSession> {
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected bundled test model");
 		const runtime = new ExtensionRuntime();
@@ -94,6 +98,7 @@ describe("SDK exact session view", () => {
 			mcpDiscoveryEnabled: discovery,
 			toolRegistry: discovery ? new Map([[MCP_TOOL, lookupTool]]) : new Map(),
 			rebuildSystemPrompt: names => rebuild(names),
+			onToolNamesChanged,
 		});
 		sessions.push(created);
 		return created;
@@ -145,7 +150,9 @@ describe("SDK exact session view", () => {
 		return { sessionId: session.sessionId, leafEntryId };
 	}
 
-	async function seedMcpBranches(): Promise<{ old: string; previous: string }> {
+	async function seedMcpBranches(
+		onToolNamesChanged?: (names: string[]) => void,
+	): Promise<{ old: string; previous: string }> {
 		await session.dispose();
 		const manager = SessionManager.create(dir.path(), path.join(dir.path(), "mcp-sessions"));
 		manager.appendMCPToolSelection([MCP_TOOL]);
@@ -153,11 +160,11 @@ describe("SDK exact session view", () => {
 		manager.resetLeaf();
 		manager.appendMCPToolSelection([]);
 		const previous = manager.appendMessage({ role: "user", content: "previous context", timestamp: 2 });
-		session = await createSession(manager, true);
+		session = await createSession(manager, true, onToolNamesChanged);
 		return { old, previous };
 	}
 
-	it("restores old, revised and continued views across disposal and recreation without transcript writes", async () => {
+	it("restores old, revised and continued views across recreation around a native execution checkpoint", async () => {
 		const original = await prompt("original");
 		const oldAnswer = captureSessionView(session);
 		await prompt("old continuation");
@@ -179,6 +186,10 @@ describe("SDK exact session view", () => {
 		if (selected.status !== "selected") throw new Error("Expected selected branch");
 		const executionView = captureSessionView(session);
 		expect(executionView.leafEntryId).toBe(selected.leafEntryId);
+		expect(session.sessionManager.getEntry(selected.leafEntryId)).toMatchObject({
+			type: "custom",
+			customType: RESUME_CURSOR_CUSTOM_TYPE,
+		});
 		expect(session.sessionManager.getBranch().some(entry => entry.id === oldContinued.leafEntryId)).toBe(true);
 		const manager = session.sessionManager;
 		const entries = manager.getEntries();
@@ -191,6 +202,8 @@ describe("SDK exact session view", () => {
 		treeEvents.length = 0;
 		for (const view of [oldContinued, oldAnswer, revisedAnswer, revisedContinued, oldContinued]) {
 			await recreate();
+			// Native execution selection survives reopen; presentation restores below
+			// must neither replace that checkpoint nor follow append chronology.
 			expect(captureSessionView(session)).toEqual(executionView);
 			expect(await restoreSessionView(session, view)).toEqual(view);
 			expect(captureSessionView(session)).toEqual(view);
@@ -700,7 +713,8 @@ describe("SDK exact session view", () => {
 		const bytes = await Bun.file(file).text();
 		cancelTree = true;
 		for (const leaf of [null, user, marker, null]) {
-			expect(await restoreSessionView(session, target(leaf))).toEqual(target(leaf));
+			const view = target(leaf);
+			expect(await restoreSessionView(session, view)).toEqual(view);
 			expect(manager.getLeafId()).toBe(leaf);
 			expect(session.agent.state.messages).toEqual(session.buildDisplaySessionContext().messages);
 			if (leaf === null) expect(session.agent.state.messages).toEqual([]);
@@ -782,7 +796,7 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(1);
 	});
 
-	it("rejects a deleted leaf after recreation rather than selecting a fallback", async () => {
+	it("rejects mismatched identities and missing or deleted entries rather than falling back", async () => {
 		await prompt("retained");
 		const manager = session.sessionManager;
 		const marker = manager.appendCustomEntry("deleted-view", {});
@@ -802,7 +816,8 @@ describe("SDK exact session view", () => {
 		);
 		session = await createSession(await SessionManager.open(file, path.dirname(file)));
 		const active = captureSessionView(session);
-		await expect(restoreSessionView(session, deletedView)).rejects.toMatchObject({ code: "resource_gone" });
+		for (const view of [{ ...active, sessionId: "another-session" }, target("missing-entry"), deletedView])
+			await expect(restoreSessionView(session, view)).rejects.toMatchObject({ code: "resource_gone" });
 		expect(captureSessionView(session)).toEqual(active);
 		expect(model.calls).toHaveLength(1);
 	});
@@ -872,6 +887,7 @@ describe("SDK exact session view", () => {
 		const pending = restoreSessionView(session, target(old));
 		try {
 			await entered.promise;
+			expect(session.sessionManager.getLeafId()).toBe(old);
 			expect(() => captureSessionView(session)).toThrow(SdkRevisionError);
 			await expect(restoreSessionView(session, target(previous))).rejects.toMatchObject({ code: "busy" });
 			await expect(
@@ -889,7 +905,7 @@ describe("SDK exact session view", () => {
 		expect(treeEvents).toEqual([]);
 	});
 
-	it("refuses restore while a revision owns preparation before acquiring the native transition", async () => {
+	it("refuses restore while a revision owns preparation before acquiring the native lease", async () => {
 		const original = await prompt("original");
 		await prompt("continuation");
 		const view = captureSessionView(session);
@@ -989,7 +1005,7 @@ describe("SDK exact session view", () => {
 	}
 
 	for (const failureAt of ["rebuild", "messages"] as const) {
-		it(`restores live tools, prompts and selection authority after ${failureAt} publication failure`, async () => {
+		it(`restores a live prompt overlay, tools and selection authority after ${failureAt} publication failure`, async () => {
 			const { previous } = await seedMcpBranches();
 			await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
 			const manager = session.sessionManager;
@@ -1040,7 +1056,114 @@ describe("SDK exact session view", () => {
 		});
 	}
 
-	it("does not resurrect snapshotted MCP tools after a catalog change during a failed rebuild", async () => {
+	it("restores the previous leaf and context after MCP rebuild failure without exposing internal errors", async () => {
+		const { old, previous } = await seedMcpBranches();
+		const entries = session.sessionManager.getEntries();
+		const messages = session.agent.state.messages.slice();
+		rebuild = async names => {
+			if (names.includes(MCP_TOOL)) throw new Error("private-token /private/provider-path");
+			return { systemPrompt: ["previous context"] };
+		};
+		let observed: unknown;
+		try {
+			await restoreSessionView(session, target(old));
+		} catch (error) {
+			observed = error;
+		}
+		expect(observed).toBeInstanceOf(SdkRevisionError);
+		expect(observed).toMatchObject({ code: "revision_failed", rollbackFailed: false });
+		expect(String(observed)).not.toContain("private-token");
+		expect(String(observed)).not.toContain("provider-path");
+		expect(session.sessionManager.getLeafId()).toBe(previous);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.getActiveToolNames()).toEqual([]);
+		expect(session.sessionLifecycle.transitioning).toBe(false);
+	});
+
+	it("restores unpersisted live tools, prompts and selection authority after a one-shot rebuild failure", async () => {
+		const { previous } = await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const manager = session.sessionManager;
+		const messages = session.agent.state.messages.slice();
+		const tools = session.agent.state.tools.slice();
+		const basePrompt = session.systemPrompt.slice();
+		session.agent.setSystemPrompt(["live prompt overlay"]);
+		const entries = manager.getEntries();
+		await manager.ensureOnDisk();
+		await manager.flush();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected persisted transcript");
+		const transcript = await Bun.file(file).text();
+		let rebuilds = 0;
+		rebuild = async names => {
+			if (++rebuilds === 1) throw new Error("one-shot rebuild failure");
+			return { systemPrompt: [`tools:${names.join(",")}`] };
+		};
+
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(rebuilds).toBe(1);
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(session.systemPrompt).toEqual(["live prompt overlay"]);
+		expect(manager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(await Bun.file(file).text()).toBe(transcript);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+
+		// Catalog reconciliation must retain the live explicit authority, including
+		// its non-persisting policy, rather than falling back to the empty transcript.
+		await session.refreshMCPTools([lookupTool]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(manager.getEntries()).toEqual(entries);
+		await manager.flush();
+		expect(await Bun.file(file).text()).toBe(transcript);
+		expect(model.calls).toHaveLength(0);
+		await prompt("continue with live selection");
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.systemPrompt).toEqual(basePrompt);
+		expect(manager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(model.calls).toHaveLength(1);
+	});
+
+	it("restores live MCP state after target tools and prompt were already published", async () => {
+		const { previous } = await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const messages = session.agent.state.messages.slice();
+		const tools = session.agent.state.tools.slice();
+		const systemPrompt = session.systemPrompt.slice();
+		const entries = session.sessionManager.getEntries();
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			expect(session.getActiveToolNames()).toEqual([]);
+			expect(session.systemPrompt).toEqual(["tools:"]);
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		await session.refreshMCPTools([lookupTool]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+	});
+
+	it("does not resurrect snapshotted MCP tools when the catalog changes during a failed rebuild", async () => {
 		await seedMcpBranches();
 		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
 		const entered = Promise.withResolvers<void>();
@@ -1078,11 +1201,11 @@ describe("SDK exact session view", () => {
 		}
 	});
 
-	it("rolls back to an actual empty previous root after a post-transition failure", async () => {
+	it("rolls back to an actual empty previous root after a post-transition context failure", async () => {
 		const user = await prompt("retained");
 		await restoreSessionView(session, target(null));
 		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
-			throw new Error("publication failed");
+			throw new Error("context publication failed");
 		});
 		restores.push(() => replace.mockRestore());
 		await expect(restoreSessionView(session, target(user))).rejects.toMatchObject({
@@ -1113,6 +1236,283 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
+	it("reports failure when the snapshotted live prompt cannot be restored", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		rebuild = async () => {
+			throw new Error("target rebuild failed");
+		};
+		const setPrompt = spyOn(session.agent, "setSystemPrompt").mockImplementationOnce(() => {
+			throw new Error("rollback prompt publication failed");
+		});
+		restores.push(() => setPrompt.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: true,
+		});
+		expect(session.sessionLifecycle.transitioning).toBe(false);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("restores the previous view when only an independent prompt publication drifted", async () => {
+		const { previous } = await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entries = session.sessionManager.getEntries();
+		const messages = session.agent.state.messages.slice();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let rebuilds = 0;
+		rebuild = async () => {
+			if (++rebuilds === 1) {
+				entered.resolve();
+				await release.promise;
+				throw new Error("target rebuild failed");
+			}
+			return { systemPrompt: ["independent refresh"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		await session.refreshBaseSystemPrompt();
+		expect(session.systemPrompt).toEqual(["independent refresh"]);
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "revision_failed", rollbackFailed: false });
+		// Prompt ownership is independent of history ownership: the cursor and
+		// transcript still return to the predecessor view.
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(session.systemPrompt).toEqual(["independent refresh"]);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("rejects in-place history mutation instead of overwriting it", async () => {
+		const { old } = await seedMcpBranches();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(old));
+		void pending.catch(() => {});
+		await entered.promise;
+		const message = session.agent.state.messages[0];
+		if (message?.role !== "user") throw new Error("Expected user message");
+		message.content = "foreign in-place edit";
+		session.agent.touchContext();
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.agent.state.messages[0]).toMatchObject({ content: "foreign in-place edit" });
+	});
+
+	it("restores operation-owned explicit MCP authority when foreign history aborts the view", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const manager = session.sessionManager;
+		const entries = manager.getEntries();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		session.agent.appendMessage({ role: "user", content: "foreign agent work", timestamp: 3 });
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.agent.state.messages.at(-1)).toMatchObject({ content: "foreign agent work" });
+		// The aborted restore must not leave its cleared authority behind: catalog
+		// reconciliation has to keep the unpersisted live selection.
+		await session.refreshMCPTools([lookupTool]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		await manager.flush();
+		expect(manager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("invalidates a prompt rebuild authorized before rollback", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.getActiveToolNames();
+		const systemPrompt = session.systemPrompt.slice();
+		rebuild = async names => ({ systemPrompt: [`tools:${[...names].sort().join(",")}`] });
+		let pendingRefresh: Promise<void> | undefined;
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			// Target tools and prompt are already published; an independent refresh
+			// captures them and reserves the newest prompt generation.
+			pendingRefresh = session.refreshBaseSystemPrompt();
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		await pendingRefresh;
+		expect(session.getActiveToolNames()).toEqual(tools);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("fails closed when history is edited in place during a failed rebuild", async () => {
+		const { old } = await seedMcpBranches();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			throw new Error("target rebuild failed");
+		};
+		const pending = restoreSessionView(session, target(old));
+		void pending.catch(() => {});
+		await entered.promise;
+		const message = session.agent.state.messages[0];
+		if (message?.role !== "user") throw new Error("Expected user message");
+		message.content = "foreign in-place edit";
+		session.agent.touchContext();
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.agent.state.messages[0]).toMatchObject({ content: "foreign in-place edit" });
+	});
+
+	it("reverts published target tools when a tool observer throws", async () => {
+		let throwOnce = false;
+		const { previous } = await seedMcpBranches(() => {
+			if (!throwOnce) return;
+			throwOnce = false;
+			throw new Error("tool observer failed");
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.agent.state.tools.slice();
+		const systemPrompt = session.systemPrompt.slice();
+		const messages = session.agent.state.messages.slice();
+		throwOnce = true;
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("does not overwrite prompt state published by a reentrant tool observer", async () => {
+		let publish: (() => void) | undefined;
+		const { previous } = await seedMcpBranches(() => {
+			const publishNow = publish;
+			publish = undefined;
+			publishNow?.();
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.agent.state.tools.slice();
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			// The observer publishes during the rollback's own tool revert.
+			publish = () => session.agent.setSystemPrompt(["observer prompt"]);
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(session.systemPrompt).toEqual(["observer prompt"]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(captureSessionView(session)).toEqual(target(previous));
+	});
+
+	it("rejects a same-array prompt republication during the rebuild", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		const prompt = session.agent.state.systemPrompt;
+		prompt[0] = "foreign same-array edit";
+		session.agent.setSystemPrompt(prompt);
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.systemPrompt).toContain("foreign same-array edit");
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("rejects a same-array tool republication during the rebuild", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		rebuild = async () => {
+			entered.resolve();
+			await release.promise;
+			return { systemPrompt: ["target context"] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		await entered.promise;
+		const tools = session.agent.state.tools;
+		const first = tools[0];
+		if (!first) throw new Error("Expected an active tool");
+		tools.push({ ...first, name: "foreign_tool", label: "Foreign tool" });
+		session.agent.setTools(tools);
+		release.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+		expect(session.getActiveToolNames()).toContain("foreign_tool");
+		expect(model.calls).toHaveLength(0);
+	});
+
+	it("keeps the tool signature consistent with a reentrant observer publication", async () => {
+		let publish: (() => void) | undefined;
+		const { previous } = await seedMcpBranches(() => {
+			const publishNow = publish;
+			publish = undefined;
+			publishNow?.();
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		let rebuilds = 0;
+		rebuild = async names => {
+			rebuilds++;
+			return { systemPrompt: [`tools:${[...names].sort().join(",")}`] };
+		};
+		let publishTask: Promise<void> | undefined;
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			publish = () => {
+				publishTask = session.setActiveToolsByName([], { persistMCPSelection: false });
+			};
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		// The observer's explicit selection supersedes the aborted restore.
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "resource_gone",
+			rollbackFailed: false,
+		});
+		await publishTask;
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.getActiveToolNames()).toEqual([]);
+		expect(session.systemPrompt).toEqual(["tools:"]);
+		// The observer's publication owns the live signature: a repeat selection must
+		// not rebuild a prompt the cache already describes.
+		const settled = rebuilds;
+		await session.setActiveToolsByName([], { persistMCPSelection: false });
+		expect(rebuilds).toBe(settled);
+	});
 	for (const interference of [
 		"append",
 		"selection-roundtrip",
@@ -1135,6 +1535,7 @@ describe("SDK exact session view", () => {
 				return { systemPrompt: ["must not publish stale prompt"] };
 			};
 			const pending = restoreSessionView(session, target(old));
+			// Attach a handler while the rebuild is held; assert only after releasing it.
 			void pending.catch(() => {});
 			await entered.promise;
 			let successor: SessionManager | undefined;
@@ -1204,11 +1605,13 @@ describe("SDK exact session view", () => {
 			restores.push(() => restore.mockRestore());
 			await expect(restoreSessionView(session, target(user))).rejects.toMatchObject({ code: "resource_gone" });
 			if (mutation === "append") {
+				expect(session.sessionManager.getLeafId()).not.toBe(user);
 				expect(session.sessionManager.getEntries().at(-1)).toMatchObject({
 					type: "custom",
 					customType: "later-work",
 				});
 			} else {
+				expect(session.sessionManager.getLeafId()).toBe(user);
 				expect(session.sessionManager.getEntry(user)).toMatchObject({
 					message: { content: "foreign updated text" },
 				});

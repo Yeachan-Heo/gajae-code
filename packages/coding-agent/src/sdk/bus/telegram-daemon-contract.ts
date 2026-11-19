@@ -323,8 +323,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 229 tracks native ownership-descent completeness (#7765).
  * Generation 230 composes that ownership policy with retained replay and
  * SDK notification-authority bindings.
+ * Generation 233 combines exact-flight SDK notification startup and shutdown
+ * with dev's grace-topic recovery and prompt delivery fixes.
  */
-export const DAEMON_GENERATION = 231;
+export const DAEMON_GENERATION = 233;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

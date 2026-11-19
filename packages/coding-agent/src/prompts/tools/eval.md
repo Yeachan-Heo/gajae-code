@@ -19,6 +19,15 @@ Cell fields:
 - Put workflow explanations in the assistant message or `title` — never inside cell code.
 {{#if py}}- Python cells run inside an IPython kernel with a live event loop. Use top-level `await` directly (e.g. `await main()`); `asyncio.run(…)` raises "cannot be called from a running event loop".{{/if}}
 **On failure:** errors identify the failing cell (e.g., "Cell 3 failed"). Resubmit only the fixed cell (or fixed cell + remaining cells).
+
+**Batching tool calls through eval:**
+
+`tool.<name>(args)` calls from eval pass the same permission checks and tool-scoped rules as direct calls. Batch them in one cell to save round-trips only when all of these hold:
+- The work needs several calls whose results you filter or aggregate in code (e.g., reading many files, searching and then reading the matches).
+- Every batched tool is read-only and needs no approval: `read`, `search`, `find`, `ast_grep`, or `lsp` lookups.
+- This session does not ask for approval on tool calls. Where it does, a nested call waits for approval inside the cell timeout (default 30 s) and can be cancelled before it runs; make direct calls instead.
+
+Never batch `bash`, `edit`, `write`, or other side-effecting tools through eval: call them directly so approval, interruption, and backgrounding behave normally. `eval` itself cannot be called from inside a cell; add another cell to the same eval call instead. Skip eval when one direct call suffices.
 </instruction>
 
 <prelude>

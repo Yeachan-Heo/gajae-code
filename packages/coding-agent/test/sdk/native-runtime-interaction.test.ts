@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
-import { AuthStorage } from "../../src/session/auth-storage";
 import { createEmbeddedAgentSession } from "../../src/sdk/embedding";
 import {
 	consentEmbeddedDisconnect,
@@ -12,6 +11,7 @@ import {
 	prepareEmbeddedDisconnect,
 	terminateEmbeddedAgentSession,
 } from "../../src/sdk/native-embedding";
+import { AuthStorage } from "../../src/session/auth-storage";
 
 type Opened = Extract<NativeEmbeddedOpenResult, { kind: "opened" }>;
 const cleanups: Array<() => Promise<void>> = [];

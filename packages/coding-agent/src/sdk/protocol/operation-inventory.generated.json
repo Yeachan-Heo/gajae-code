@@ -7136,7 +7136,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "internal exact presentation-cursor restoration used by restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
+		"rationale": "internal exact presentation-cursor restoration behind captureSessionView/restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

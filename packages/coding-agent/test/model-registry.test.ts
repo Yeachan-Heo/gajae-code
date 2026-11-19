@@ -4872,42 +4872,248 @@ describe("ModelRegistry", () => {
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {
-			await Settings.init({
-				inMemory: true,
-				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
+			// Rapid-MLX discovery leaves through the direct loopback transport, so the
+			// global fetch hook cannot see it. Watch the endpoint itself; the positive
+			// control below proves the observation channel is live when the provider is
+			// enabled, so an empty probe list is the disabled guard and not a blind spot.
+			const rapidMlxProbes: string[] = [];
+			const rapidMlxAuthorizations: (string | null)[] = [];
+			const rapidMlxServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					rapidMlxProbes.push(pathname);
+					if (pathname === "/v1/models") {
+						rapidMlxAuthorizations.push(request.headers.get("authorization"));
+						return Response.json({ data: [{ id: "rapid-mlx-probe-model", context_window: 131_072 }] });
+					}
+					return new Response("not found", { status: 404 });
 				},
 			});
-			const requestedUrls: string[] = [];
-			using _hook = hookFetch(input => {
-				requestedUrls.push(String(input));
-				throw new Error(`Unexpected URL: ${String(input)}`);
+			const rapidMlxBaseUrl = `http://127.0.0.1:${rapidMlxServer.port}/v1`;
+			const shadowProbes: string[] = [];
+			const shadowServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					shadowProbes.push(request.url);
+					return Response.json({ data: [{ id: "shadow-endpoint-model" }] });
+				},
 			});
+			// Synthetic conflicting ambient values for the provider under test: these
+			// are exactly what credential resolution reads in this process, and the
+			// explicit keyless fixture entry must outrank both for the probe.
+			const restoreRapidMlxBaseUrl = setEnvForTest("RAPID_MLX_BASE_URL", `http://127.0.0.1:${shadowServer.port}/v1`);
+			const restoreRapidMlxApiKey = setEnvForTest("RAPID_MLX_API_KEY", "ambient-rapid-mlx-probe-key");
+			try {
+				expect($credentialEnv("RAPID_MLX_BASE_URL")).toBe(`http://127.0.0.1:${shadowServer.port}/v1`);
+				expect($credentialEnv("RAPID_MLX_API_KEY")).toBe("ambient-rapid-mlx-probe-key");
+				// The endpoint is fixture-owned: an explicit keyless provider entry pins
+				// the base URL and selects no credentials, so neither an ambient
+				// RAPID_MLX_BASE_URL (which credential resolution would otherwise prefer
+				// over the environment assignment) nor an ambient RAPID_MLX_API_KEY can
+				// redirect or authenticate this probe.
+				writeRawModelsJson({
+					"rapid-mlx": {
+						baseUrl: rapidMlxBaseUrl,
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "rapid-mlx" },
+					},
+				});
+				await Settings.init({
+					inMemory: true,
+					overrides: {
+						disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
+					},
+				});
+				const requestedUrls: string[] = [];
+				using _hook = hookFetch(input => {
+					requestedUrls.push(String(input));
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				});
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refresh("online");
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh("online");
 
-			const disabledProbeUrls = requestedUrls.filter(
-				url => url.includes("127.0.0.1:11434") || url.includes("127.0.0.1:8080") || url.includes("127.0.0.1:1234"),
-			);
-			expect(disabledProbeUrls).toEqual([]);
+				const disabledProbeUrls = requestedUrls.filter(
+					url =>
+						url.includes("127.0.0.1:11434") || url.includes("127.0.0.1:8080") || url.includes("127.0.0.1:1234"),
+				);
+				expect(disabledProbeUrls).toEqual([]);
+				expect(rapidMlxProbes).toEqual([]);
+
+				settings.override("disabledProviders", ["llama.cpp", "lm-studio", "ollama", "omlx"]);
+				// Provider-scoped online refresh: only Rapid-MLX is re-enabled, so the
+				// fixture listener is the only endpoint this phase can reach.
+				await registry.refreshProvider("rapid-mlx", "online");
+				expect(rapidMlxProbes).toEqual(["/v1/models"]);
+				// The conflicting ambient endpoint was never contacted, and the ambient
+				// key never authenticated the probe.
+				expect(shadowProbes).toEqual([]);
+				// The configured entry is keyless, so no ambient credential may be
+				// attached to the probe, and the discovered row must keep the fixture
+				// endpoint rather than an inherited environment one.
+				expect(rapidMlxAuthorizations).toEqual([null]);
+				expect(registry.find("rapid-mlx", "rapid-mlx-probe-model")?.baseUrl).toBe(rapidMlxBaseUrl);
+			} finally {
+				restoreRapidMlxApiKey();
+				restoreRapidMlxBaseUrl();
+				rapidMlxServer.stop(true);
+				shadowServer.stop(true);
+			}
+		});
+		test("routes a Rapid-MLX discovery probe to the loopback endpoint directly", async () => {
+			// The transport exemption follows provider identity, not the absence of a
+			// credential: a Rapid-MLX entry that carries a secret header still probes
+			// over the direct socket, so no proxy can read the header or inject a
+			// catalog. A fetch hook throws if the probe regresses to the shared path.
+			const probes: { pathname: string; apiKey: string | null }[] = [];
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					if (pathname !== "/v1/models") return new Response(null, { status: 404 });
+					probes.push({ pathname, apiKey: request.headers.get("x-api-key") });
+					return Response.json({ data: [{ id: "rapid-mlx-credentialed-model", context_window: 131_072 }] });
+				},
+			});
+			const baseUrl = `http://127.0.0.1:${server.port}/v1`;
+			try {
+				writeRawModelsJson({
+					"rapid-mlx": {
+						baseUrl,
+						api: "openai-completions",
+						auth: "none",
+						headers: { "X-API-Key": "rapid-mlx-header-key" },
+						discovery: { type: "rapid-mlx" },
+					},
+				});
+				const fetched: string[] = [];
+				using _hook = hookFetch(input => {
+					fetched.push(String(input));
+					throw new Error(`Rapid-MLX discovery must not use fetch: ${String(input)}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("rapid-mlx", "online");
+
+				expect(probes).toEqual([{ pathname: "/v1/models", apiKey: "rapid-mlx-header-key" }]);
+				expect(fetched).toEqual([]);
+				expect(registry.find("rapid-mlx", "rapid-mlx-credentialed-model")?.baseUrl).toBe(baseUrl);
+			} finally {
+				server.stop(true);
+			}
+		});
+		test("routes a non-Rapid-MLX implicit probe to the configured proxy target, not the loopback endpoint", async () => {
+			// The destination is the criterion: only a loopback Rapid-MLX probe is
+			// direct, so an oMLX probe must address the configured proxy target and
+			// never the implicit endpoint. Bun resolves and caches the proxy decision
+			// at startup, so the probe runs in a fresh process with the variables
+			// planted.
+			const endpointProbes: string[] = [];
+			const endpointServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					endpointProbes.push(new URL(request.url).pathname);
+					return Response.json({ data: [{ id: "omlx-proxy-probe-model" }] });
+				},
+			});
+			const proxiedRequests: { url: string; authorization: string | null }[] = [];
+			const proxyServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					proxiedRequests.push({
+						url: request.url,
+						authorization: request.headers.get("authorization"),
+					});
+					return new Response("forwarded through the proxy", { status: 502 });
+				},
+			});
+			const endpointBaseUrl = `http://127.0.0.1:${endpointServer.port}/v1`;
+			try {
+				const projectDir = path.join(tempDir, "omlx-proxy-project");
+				const agentDir = path.join(tempDir, "omlx-proxy-agent");
+				const scratchDir = path.join(tempDir, "omlx-proxy-scratch");
+				fs.mkdirSync(projectDir, { recursive: true });
+				fs.mkdirSync(agentDir, { recursive: true });
+				fs.mkdirSync(scratchDir, { recursive: true });
+				const inheritedEnv: Record<string, string> = {};
+				for (const [name, value] of Object.entries(process.env)) {
+					if (value === undefined) continue;
+					const normalized = name.toLowerCase();
+					if (
+						normalized === "http_proxy" ||
+						normalized === "https_proxy" ||
+						normalized === "all_proxy" ||
+						normalized === "no_proxy"
+					) {
+						continue;
+					}
+					inheritedEnv[name] = value;
+				}
+				const proxyUrl = `http://127.0.0.1:${proxyServer.port}`;
+				const child = Bun.spawn(
+					[process.execPath, path.join(import.meta.dir, "fixtures", "omlx-proxy-probe.ts"), scratchDir],
+					{
+						cwd: projectDir,
+						env: {
+							...inheritedEnv,
+							GJC_CODING_AGENT_DIR: agentDir,
+							HTTP_PROXY: proxyUrl,
+							http_proxy: proxyUrl,
+							HTTPS_PROXY: proxyUrl,
+							https_proxy: proxyUrl,
+							ALL_PROXY: proxyUrl,
+							all_proxy: proxyUrl,
+							OMLX_BASE_URL: endpointBaseUrl,
+							OMLX_API_KEY: "omlx-proxy-probe-key",
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+					},
+				);
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+				// The credentialed probe reached the configured proxy...
+				expect(proxiedRequests.filter(request => request.url === `${endpointBaseUrl}/models`)).toEqual([
+					{ url: `${endpointBaseUrl}/models`, authorization: "Bearer omlx-proxy-probe-key" },
+				]);
+				// ...and no direct socket was opened to the implicit endpoint.
+				expect(endpointProbes).toEqual([]);
+				// The proxy refused the request, so no direct-socket catalog may slip in.
+				expect(JSON.parse(stdout)).toEqual({ modelIds: [] });
+			} finally {
+				endpointServer.stop(true);
+				proxyServer.stop(true);
+			}
 		});
 		test("rebuilds implicit discovery when disabled providers change without models.json", async () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
 				},
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
 			expect(registry.getDiscoverableProviders()).not.toContain("omlx");
+			expect(registry.getDiscoverableProviders()).not.toContain("rapid-mlx");
 
 			settings.override("disabledProviders", []);
 			await registry.refresh("offline");
 
 			expect(registry.getDiscoverableProviders()).toContain("ollama");
 			expect(registry.getDiscoverableProviders()).toContain("omlx");
+			expect(registry.getDiscoverableProviders()).toContain("rapid-mlx");
 		});
 		test("rebuilds implicit discovery when endpoint environment changes without models.json", async () => {
 			const firstBaseUrl = "http://127.0.0.1:21334";

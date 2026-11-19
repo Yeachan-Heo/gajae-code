@@ -1,0 +1,3 @@
+### Changed
+
+- Deep-interview now offers a standing `This is enough — stop at current ambiguity (X%)` option as the last choice on every interview-round question from round 1, regardless of the ambiguity score, so you can end the interview without typing "stop". Choosing it records `exit_reason: "user_enough"` with the ambiguity at exit, shows the remaining weakest dimensions as a residual-risk warning when ambiguity is still above the threshold, and then crystallizes the spec as usual; the spec reports the exit reason, the ambiguity at exit, and a Residual Risks section. The previous round-3 minimum for early exit is removed. "stop", "cancel", and "abort" still stop immediately and save state for resume without writing a spec.

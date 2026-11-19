@@ -101,7 +101,6 @@ export {
 	selectEmbeddedExecutionBranch,
 	terminateEmbeddedAgentSession,
 } from "./native-embedding";
-export { NativeRuntimeRefusal } from "./native-lifecycle";
 export type {
 	NativeDisconnectConsent,
 	NativeDisconnectPreparation,
@@ -110,6 +109,7 @@ export type {
 	NativeReconcileMode,
 	NativeTerminationConsent,
 } from "./native-lifecycle";
+export { NativeRuntimeRefusal } from "./native-lifecycle";
 export * from "./notification-setup";
 export * from "./notification-setup-contract";
 export * from "./operator-controls";
@@ -119,6 +119,7 @@ export * from "./prompt-status";
 export * from "./protocol/client-control-contracts";
 
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
+export * from "./revision-controls";
 export * as router from "./router";
 export * from "./routing-settings";
 export * from "./session";

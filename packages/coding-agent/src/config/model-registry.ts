@@ -45,16 +45,18 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
-import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
+import { fetchModelsDevPayload, isRapidMlxCatalogRecord } from "@gajae-code/ai/provider-models/openai-compat";
 import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
 import { getAntigravityDiscoveryUserAgent } from "@gajae-code/ai/utils/discovery/antigravity";
 import {
 	detectDiscoveredApiFamily,
+	fetchLoopbackDirect,
 	isSafeCatalogModelId,
 	MODELS_LIST_REQUEST_TIMEOUT_MS,
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+import { isLoopbackEndpointUrl } from "@gajae-code/ai/utils/loopback-transport";
 // Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
 import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 import { JSONC, YAML } from "bun";
@@ -1253,6 +1255,7 @@ function getProviderBaseUrlEnvKeys(provider: string): string[] {
  */
 function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
 	const baseUrl = $pickCredentialEnv(...getProviderBaseUrlEnvKeys(provider));
+	if (provider === "rapid-mlx" && baseUrl) return resolveLoopbackOpenAIBaseUrl(baseUrl, "http://localhost:8000/v1");
 	return provider === "omlx" && baseUrl ? resolveLoopbackOpenAIBaseUrl(baseUrl, "http://127.0.0.1:8080/v1") : baseUrl;
 }
 
@@ -1336,6 +1339,8 @@ interface DiscoveryProviderConfig {
 	cacheRetention?: CacheRetention;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
+	/** Set only by the registry's own implicit Rapid-MLX probe, never by models.json. */
+	implicitProbe?: boolean;
 }
 
 const REUSABLE_DISCOVERY_HEADER_NAMES = new Set([
@@ -1355,6 +1360,21 @@ function isSensitiveDiscoveryHeader(name: string): boolean {
 	// Unknown headers fail closed because their semantics cannot be inferred from
 	// their names (for example, CF-Access-Jwt-Assertion carries a credential).
 	return !REUSABLE_DISCOVERY_HEADER_NAMES.has(name.toLowerCase());
+}
+
+/**
+ * Whether this Rapid-MLX probe describes an endpoint the operator selected or
+ * one the registry volunteered to probe.
+ *
+ * The implicit probe requires a Rapid-MLX-native field before publishing a row,
+ * while an explicit `discovery.type: rapid-mlx` entry is trusted as written. The
+ * admission policy is part of the cache provenance below: a row admitted under
+ * one policy (notably bare vLLM rows admitted by an operator's explicit
+ * selection) must not be reused by the other, because cache reuse skips the
+ * admission check entirely.
+ */
+function rapidMlxAdmissionPolicy(providerConfig: DiscoveryProviderConfig): "identity-required" | "operator-selected" {
+	return providerConfig.implicitProbe === true ? "identity-required" : "operator-selected";
 }
 
 /**
@@ -1398,8 +1418,32 @@ function fingerprintConfiguredDiscoveryRequestShape(
 		...(providerConfig.discovery.inputModalities
 			? { inputModalities: [...providerConfig.discovery.inputModalities].sort() }
 			: {}),
+		// Rapid-MLX publication depends on the admission policy above; keep it in
+		// the key so a cache written under one policy is not reusable under the
+		// other without re-running admission.
+		...(providerConfig.discovery.type === "rapid-mlx"
+			? { rapidMlxAdmission: rapidMlxAdmissionPolicy(providerConfig) }
+			: {}),
 	});
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
+}
+
+/**
+ * Descriptor discovery provenance predates the reciprocal Rapid-MLX identity
+ * guard. A cached vLLM/SGLang catalog written before it could carry rows the
+ * current admission rule refuses, and cache reuse skips admission, so tag the
+ * provenance and invalidate those rows once on the first refresh after upgrade.
+ */
+const RAPID_MLX_IDENTITY_GUARD_VERSION = "rapid-mlx-identity-v1";
+
+function localIdentityGuardVersion(providerId: string, endpoint: string): string | undefined {
+	if (providerId !== "vllm" && providerId !== "sglang") return undefined;
+	try {
+		if (!isLoopbackEndpointUrl(new URL(endpoint))) return undefined;
+	} catch {
+		return undefined;
+	}
+	return RAPID_MLX_IDENTITY_GUARD_VERSION;
 }
 
 function fingerprintDescriptorDiscoveryProvenance(
@@ -1418,6 +1462,7 @@ function fingerprintDescriptorDiscoveryProvenance(
 		providerId === "google-antigravity" || providerId === "google-gemini-cli"
 			? getAntigravityDiscoveryUserAgent()
 			: undefined;
+	const localIdentityGuard = localIdentityGuardVersion(providerId, endpoint);
 	return crypto
 		.createHash("sha256")
 		.update("gajae:model-discovery-provenance\0")
@@ -1427,6 +1472,7 @@ function fingerprintDescriptorDiscoveryProvenance(
 				endpoint,
 				...(projectId !== undefined ? { projectId } : {}),
 				...(discoveryIdentity !== undefined ? { discoveryIdentity } : {}),
+				...(localIdentityGuard !== undefined ? { localIdentityGuard } : {}),
 			}),
 		)
 		.digest("hex");
@@ -4039,6 +4085,7 @@ export class ModelRegistry {
 			providerConfig.discovery.type === "openai-models-list" ||
 			providerConfig.discovery.type === "lm-studio" ||
 			providerConfig.discovery.type === "omlx" ||
+			providerConfig.discovery.type === "rapid-mlx" ||
 			providerConfig.discovery.type === "vllm" ||
 			providerConfig.discovery.type === "sglang"
 				? this.#normalizeOpenAIModelsListBaseUrl(
@@ -4145,6 +4192,19 @@ export class ModelRegistry {
 			// Implicit oMLX auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("omlx");
 			this.#keylessProviders.add("omlx");
+		}
+		if (!configuredProviders.has("rapid-mlx") && !disabledProviders.has("rapid-mlx")) {
+			this.#discoveryManager.addProvider({
+				provider: "rapid-mlx",
+				api: "openai-completions",
+				baseUrl: resolveProviderBaseUrlFromEnv("rapid-mlx") ?? "http://localhost:8000/v1",
+				discovery: { type: "rapid-mlx" },
+				optional: true,
+				implicitProbe: true,
+			});
+			// Implicit Rapid-MLX auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("rapid-mlx");
+			this.#keylessProviders.add("rapid-mlx");
 		}
 	}
 
@@ -5152,7 +5212,35 @@ export class ModelRegistry {
 			authGenerationBeforeDiscovery,
 			endpoint,
 		);
-		if (cacheDynamicModelProvenance === undefined && strategy === "offline") {
+		const requiresWireAdmission =
+			effectiveProviderConfig.discovery.type === "rapid-mlx" &&
+			rapidMlxAdmissionPolicy(effectiveProviderConfig) === "identity-required";
+		// The implicit Rapid-MLX probe admits rows by evidence that exists only in
+		// the wire response, and a cached Model cannot be re-admitted; the offline
+		// cache path also serves a provenance-mismatched row on purpose. An offline
+		// refresh may therefore serve the cached catalog only while the row itself
+		// carries the current identity-required provenance, i.e. a live probe
+		// admitted it. A row from any other policy is refused instead of published.
+		const offlineCacheAdmitted =
+			requiresWireAdmission &&
+			cacheDynamicModelProvenance !== undefined &&
+			(() => {
+				const cached = readModelCache<Api>(
+					effectiveProviderConfig.provider,
+					24 * 60 * 60 * 1000,
+					Date.now,
+					this.#cacheDbPath,
+				);
+				return (
+					cached !== null &&
+					cached.dynamicModelIds !== undefined &&
+					cached.dynamicModelProvenance === cacheDynamicModelProvenance
+				);
+			})();
+		if (
+			(cacheDynamicModelProvenance === undefined || (requiresWireAdmission && !offlineCacheAdmitted)) &&
+			strategy === "offline"
+		) {
 			const previouslyPublishedModelIds = [...(evidence?.modelIds ?? [])];
 			this.#configuredDiscoveryEvidence.delete(provider);
 			return {
@@ -5291,6 +5379,7 @@ export class ModelRegistry {
 				break;
 			case "lm-studio":
 			case "omlx":
+			case "rapid-mlx":
 			case "vllm":
 			case "sglang":
 			case "openai-models-list":
@@ -5545,6 +5634,7 @@ export class ModelRegistry {
 				previousEvidence.projectId !== projectId);
 		const isGoogleProjectScopedProvider =
 			options.providerId === "google-antigravity" || options.providerId === "google-gemini-cli";
+		const requiresAdmissionProvenance = localIdentityGuardVersion(options.providerId, endpoint) !== undefined;
 		const canUseCredentialDerivedXiaomiEndpoint =
 			options.providerId === "xiaomi" &&
 			apiKey?.startsWith("tp-") === true &&
@@ -5597,13 +5687,19 @@ export class ModelRegistry {
 				}
 			}
 			if (strategy === "offline") {
+				// A descriptor cache whose admission depends on wire evidence must be bound to
+				// the current provenance: a vLLM/SGLang loopback row written before the
+				// reciprocal Rapid-MLX identity guard would otherwise skip the filter, since
+				// the model manager deliberately serves a mismatched row on an offline
+				// refresh. Google project-scoped caches already require this binding.
+				const requiresBoundCache = isGoogleProjectScopedProvider || requiresAdmissionProvenance;
 				const cache =
-					reusableCacheProvenance !== undefined && isGoogleProjectScopedProvider
+					reusableCacheProvenance !== undefined && requiresBoundCache
 						? readModelCache<Api>(options.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath)
 						: null;
-				const hasCurrentProjectCache =
+				const hasBoundCache =
 					cache?.dynamicModelIds !== undefined && cache.dynamicModelProvenance === reusableCacheProvenance;
-				if (reusableCacheProvenance === undefined || (isGoogleProjectScopedProvider && !hasCurrentProjectCache)) {
+				if (reusableCacheProvenance === undefined || (requiresBoundCache && !hasBoundCache)) {
 					if (discoveryContextChanged) {
 						this.#providerEvidenceApiKeys.set(options.providerId, apiKey);
 						this.#descriptorDiscoveryEvidence.set(options.providerId, {
@@ -6131,16 +6227,44 @@ export class ModelRegistry {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
+		const loopbackDiscovery = resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 		const hardenedLocalDiscovery =
-			(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang") &&
-			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
-		const response = await fetch(modelsUrl, {
-			headers: requestHeaders,
-			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
-				? { redirect: "error" as const }
-				: {}),
-			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS),
-		});
+			(providerConfig.discovery.type === "rapid-mlx" ||
+				providerConfig.discovery.type === "vllm" ||
+				providerConfig.discovery.type === "sglang") &&
+			loopbackDiscovery;
+		const signal = AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS);
+		// Discovery bypasses `fetch` only for a loopback Rapid-MLX probe: Bun
+		// applies HTTP_PROXY/HTTPS_PROXY/ALL_PROXY to loopback requests — including
+		// a proxy a project `.env` declared — caches that decision per process, and
+		// offers no per-request bypass, so only a direct socket proves that exact
+		// request cannot reach a proxy. A proxy that can answer `/models` can inject
+		// a catalog just as easily as it can read a bearer.
+		//
+		// The rule is narrower than "local probe". The direct socket requires BOTH
+		// an HTTP(S) loopback endpoint AND a Rapid-MLX identity: the canonical
+		// provider id (a configured `providers.rapid-mlx` entry that auto-selects
+		// `openai-models-list` because it has no discovery stanza) or
+		// `discovery.type: rapid-mlx` (an alias named in models.json). A configured
+		// Rapid-MLX endpoint can be non-loopback, and it then takes the ordinary
+		// `fetch` path. Every other provider — including the implicit Ollama,
+		// llama.cpp, LM Studio, and oMLX probes — is never direct, so a configured
+		// proxy is honoured for its discovery exactly as it is for inference;
+		// carrying a credential is not a transport exemption.
+		const directLoopbackProbe =
+			loopbackDiscovery &&
+			(providerConfig.provider === "rapid-mlx" || providerConfig.discovery.type === "rapid-mlx");
+		const response = directLoopbackProbe
+			? await fetchLoopbackDirect(modelsUrl, { headers: requestHeaders, signal })
+			: await fetch(modelsUrl, {
+					headers: requestHeaders,
+					...(providerConfig.discovery.type === "rapid-mlx" ||
+					providerConfig.discovery.type === "vllm" ||
+					providerConfig.discovery.type === "sglang"
+						? { redirect: "error" as const }
+						: {}),
+					signal,
+				});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
 				// Redacted by construction: name the provider, endpoint, and the
@@ -6170,6 +6294,18 @@ export class ModelRegistry {
 			// the live catalog or cache unsanitized.
 			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
 			if (!admitsDiscoveredCatalogModalities(providerConfig.discovery, item)) continue;
+			// vLLM and SGLang answer the same OpenAI `/v1/models` shape on the same
+			// loopback ports Rapid-MLX uses, so an unidentified response must not be
+			// republished as Rapid-MLX models. The implicit probe therefore requires
+			// a Rapid-MLX-native field; a `discovery.type: rapid-mlx` entry in
+			// models.json is an explicit selection and is trusted as written.
+			if (
+				providerConfig.discovery.type === "rapid-mlx" &&
+				rapidMlxAdmissionPolicy(providerConfig) === "identity-required" &&
+				!isRapidMlxCatalogRecord(item)
+			) {
+				continue;
+			}
 			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
 			// Names render directly in the model selector: apply the same
@@ -7430,6 +7566,7 @@ export class ModelRegistry {
 							: discoveryType === "openai-models-list" ||
 									discoveryType === "lm-studio" ||
 									discoveryType === "omlx" ||
+									discoveryType === "rapid-mlx" ||
 									discoveryType === "vllm" ||
 									discoveryType === "sglang"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
