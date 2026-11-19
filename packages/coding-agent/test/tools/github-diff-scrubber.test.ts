@@ -532,6 +532,53 @@ describe("unified diff scrubber", () => {
 				expect(lines).toHaveLength(originalLines.length);
 			});
 
+			it("[BLOCKING] redacts multi-line credentials on independent old/new projections", () => {
+				// BLOCKING: This test validates that the independent projection fix actually works.
+				// A replacement hunk where:
+				// - deleted lines contain a PEM block (which is redacted as a whole)
+				// - added lines contain a JSON structure with a credential
+				// - both should be redacted independently; the old PEM block closure
+				//   should NOT affect whether the new side recognizes its credential
+				const diffReplacementWithMultiline = [
+					...HEADER,
+					"@@ -1,6 +1,6 @@",
+					" context",
+					"------BEGIN RSA PRIVATE KEY-----",
+					'+  "token": [',
+					"-pem-body-canary-line",
+					'+    "json-token-canary-secret"',
+					"------END RSA PRIVATE KEY-----",
+					"+  ]",
+					" more context",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diffReplacementWithMultiline);
+
+				// CRITICAL: No canary from either side should survive
+				// These canaries test that independent projections are actually applied
+				expect(scrubbed).not.toContain("pem-body-canary-line");
+				expect(scrubbed).not.toContain("json-token-canary-secret");
+				expect(scrubbed).not.toContain("BEGIN RSA PRIVATE KEY");
+				expect(scrubbed).not.toContain("END RSA PRIVATE KEY");
+
+				// Line count must be preserved exactly
+				const originalLines = diffReplacementWithMultiline.split("\n");
+				const scrubbedLines = scrubbed.split("\n");
+				expect(scrubbedLines).toHaveLength(originalLines.length);
+
+				// Context lines must be preserved
+				expect(scrubbed).toContain(" context");
+				expect(scrubbed).toContain(" more context");
+
+				// Hunk header must be unchanged
+				expect(scrubbed).toContain("@@ -1,6 +1,6 @@");
+
+				// Deleted and added lines should have bracket structure preserved at appropriate lines
+				// The "+  ]" line should still be there (closing the JSON array)
+				expect(scrubbed).toContain("+  ]");
+			});
+
 			it("[P2] applies independent projections for replacement hunks", () => {
 				// Test: old and new sides with different structures
 				// Both sides have multi-line credentials that should be redacted independently
