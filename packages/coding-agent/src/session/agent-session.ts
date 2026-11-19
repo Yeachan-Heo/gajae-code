@@ -3099,6 +3099,15 @@ interface SessionViewRestoreFence {
 	onToolsApplied: () => void;
 }
 
+/** Predecessor tool selection while an exact restore owns a provisional cursor. */
+interface StagedTreeViewToolSelection {
+	isProvisional: () => boolean;
+	ownsActiveTools: () => boolean;
+	persistedMCPToolNames: string[] | undefined;
+	activeToolNames: string[];
+	selectedDiscoveredBuiltinToolNames: string[];
+}
+
 /**
  * An entry states its transport with `type`, or implies it: a `command` entry is
  * stdio and a `url` entry is http. Only the discriminator is read — the command
@@ -4915,6 +4924,7 @@ export class AgentSession {
 	#committedHasExplicitActiveToolSelectionForContext = false;
 	#committedExplicitMCPToolSelectionForContext: string[] | undefined;
 	#committedExplicitMCPToolSelectionPersistsForContext = true;
+	#stagedTreeViewToolSelection: StagedTreeViewToolSelection | undefined;
 	#mcpCatalogGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
@@ -7678,13 +7688,20 @@ export class AgentSession {
 		);
 	}
 
-	#getMCPToolSelectionAuthorityNames(): string[] | undefined {
+	#getPersistedMCPToolSelection(): string[] | undefined {
+		const staged = this.#stagedTreeViewToolSelection;
+		if (staged?.isProvisional()) return staged.persistedMCPToolNames;
+		const context = this.sessionManager.buildSessionContext();
+		return context.hasPersistedMCPToolSelection ? context.selectedMCPToolNames : undefined;
+	}
+
+	#getMCPToolSelectionAuthorityNames(persistedMCPToolNames?: string[]): string[] | undefined {
 		// Catalog reconciliation must observe committed selection state, not an explicit
 		// request whose prompt rebuild may still fail or be superseded by this update.
 		if (this.#committedHasExplicitActiveToolSelectionForContext)
 			return [...(this.#committedExplicitMCPToolSelectionForContext ?? [])];
-		const sessionContext = this.buildDisplaySessionContext();
-		if (sessionContext.hasPersistedMCPToolSelection) return [...sessionContext.selectedMCPToolNames];
+		const persisted = persistedMCPToolNames ?? this.#getPersistedMCPToolSelection();
+		if (persisted !== undefined) return [...persisted];
 		return this.#constructorMCPToolSelection === undefined ? undefined : [...this.#constructorMCPToolSelection];
 	}
 
@@ -13734,8 +13751,8 @@ export class AgentSession {
 		}
 	}
 
-	#getActiveNonMCPToolNames(): string[] {
-		return this.getActiveToolNames().filter(
+	#getActiveNonMCPToolNames(activeToolNames = this.getActiveToolNames()): string[] {
+		return activeToolNames.filter(
 			name => !this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name),
 		);
 	}
@@ -14720,7 +14737,7 @@ export class AgentSession {
 	/** Whether the current context has committed persisted, constructor, or caller MCP selection authority. */
 	hasCommittedMCPToolSelectionAuthority(): boolean {
 		return (
-			this.buildDisplaySessionContext().hasPersistedMCPToolSelection ||
+			this.#getPersistedMCPToolSelection() !== undefined ||
 			this.#constructorMCPToolSelection !== undefined ||
 			this.#committedHasExplicitActiveToolSelectionForContext
 		);
@@ -15611,7 +15628,7 @@ export class AgentSession {
 		fence?: SessionViewRestoreFence,
 	): Promise<void> {
 		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
-		this.#resetExplicitMCPToolSelectionAuthority();
+		if (!fence) this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive(fence);
 			return;
@@ -15634,10 +15651,14 @@ export class AgentSession {
 			: sessionContext.hasPersistedDiscoveredBuiltinToolSelection
 				? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
 				: (constructorDiscoveredBuiltinToolNames ?? []);
-		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
+		if (!fence) this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
 		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false, fence },
+			{
+				persistMCPSelection: false,
+				nextSelectedDiscoveredBuiltinToolNames: fence ? restoredDiscoveredBuiltinToolNames : undefined,
+				fence,
+			},
 		);
 		if (fence && (applied === undefined || !fence.isCurrent()))
 			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
@@ -15811,14 +15832,18 @@ export class AgentSession {
 				: retainedMandatory.filter(name => !this.#isNameHeldByNonMcpTool(name)),
 		);
 		this.#pruneSelectedMCPToolNames();
-		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
+		const staged = this.#stagedTreeViewToolSelection;
+		const provisionalCursor = staged?.isProvisional() === true;
+		const provisionalTools = provisionalCursor && staged?.ownsActiveTools() ? staged : undefined;
+		const persistedMCPToolNames = this.#getPersistedMCPToolSelection();
+		const hasPersistedMCPToolSelection = persistedMCPToolNames !== undefined;
 		const hasLiveMCPToolSelectionAuthority =
 			this.#mcpDiscoveryEnabled &&
 			(this.#constructorMCPToolSelection !== undefined || this.#committedHasExplicitActiveToolSelectionForContext);
-		const authoritativeMCPToolNames = this.#getMCPToolSelectionAuthorityNames();
 		if (options.selectedMCPToolNames) {
 			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(options.selectedMCPToolNames));
 		} else if (hasPersistedMCPToolSelection || hasLiveMCPToolSelectionAuthority) {
+			const authoritativeMCPToolNames = this.#getMCPToolSelectionAuthorityNames(persistedMCPToolNames);
 			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(authoritativeMCPToolNames ?? []));
 		} else {
 			this.#selectedMCPToolNames = new Set(
@@ -15826,16 +15851,20 @@ export class AgentSession {
 			);
 		}
 		const nextActive = [
-			...this.#getActiveNonMCPToolNames(),
+			...this.#getActiveNonMCPToolNames(provisionalTools?.activeToolNames),
 			...(options.activeMCPToolNames ?? this.getSelectedMCPToolNames()),
 		];
 		await this.#applyActiveToolsByName(nextActive, {
 			previousSelectedMCPToolNames,
+			nextSelectedDiscoveredBuiltinToolNames: provisionalTools?.selectedDiscoveredBuiltinToolNames,
+			expectedActiveToolSelectionRevision: provisionalCursor ? this.#activeToolSelectionRevision : undefined,
+			// Reconcile runtime tools immediately, but never append a selection to a staged branch.
 			persistMCPSelection:
-				options.persistMCPSelection ??
-				(this.#committedHasExplicitActiveToolSelectionForContext
-					? this.#committedExplicitMCPToolSelectionPersistsForContext
-					: hasPersistedMCPToolSelection),
+				!provisionalCursor &&
+				(options.persistMCPSelection ??
+					(this.#committedHasExplicitActiveToolSelectionForContext
+						? this.#committedExplicitMCPToolSelectionPersistsForContext
+						: hasPersistedMCPToolSelection)),
 		});
 	}
 
@@ -36032,13 +36061,7 @@ export class AgentSession {
 		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
 		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
-		const previousHasExplicitActiveToolSelectionForContext =
-			this.#committedHasExplicitActiveToolSelectionForContext;
-		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
-			? [...this.#committedExplicitMCPToolSelectionForContext]
-			: undefined;
-		const previousExplicitMCPToolSelectionPersistsForContext =
-			this.#committedExplicitMCPToolSelectionPersistsForContext;
+		const previousPersistedMCPToolNames = this.#getPersistedMCPToolSelection();
 		const previousTools = [...agent.state.tools];
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
 		const previousSystemPrompt = agent.state.systemPrompt;
@@ -36054,8 +36077,6 @@ export class AgentSession {
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
 		let moved = false;
-		// Identity only: the view may have moved on, but this session still owns the
-		// private selection-authority state this operation staged.
 		const sessionStillOurs = () =>
 			!this.#isDisposed &&
 			this.sessionManager === manager &&
@@ -36064,24 +36085,20 @@ export class AgentSession {
 			manager.getSessionId() === managerId &&
 			manager.getSessionFile() === file &&
 			manager.getSessionIdentityGeneration() === identity;
-		// View/history ownership: the leaf, transcript and transition identity this
-		// operation moved. Losing it means a foreign actor superseded the restoration.
+		// Cursor ownership is independent of live tools and messages: a catalog refresh
+		// or an agent-history edit does not ratify the restore's provisional branch.
+		const cursorIsOurs = (leafRevision: number) =>
+			sessionStillOurs() &&
+			this.#sessionTransitionKind === "navigate-tree" &&
+			this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
+			manager.getLeafId() === ownedLeaf &&
+			leafRevision === revisions.leaf;
 		const historyIsOurs = () => {
 			const now = manager.revisionSnapshot();
 			const messages = agent.state.messages;
 			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.agent === agent &&
-				this.sessionId === sessionId &&
-				manager.getSessionId() === managerId &&
-				manager.getSessionFile() === file &&
-				manager.getSessionIdentityGeneration() === identity &&
-				this.#sessionTransitionKind === "navigate-tree" &&
-				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
-				manager.getLeafId() === ownedLeaf &&
+				cursorIsOurs(now.leaf) &&
 				now.entry === revisions.entry &&
-				now.leaf === revisions.leaf &&
 				now.headerExport === revisions.headerExport &&
 				now.label === revisions.label &&
 				now.replayMetadata === revisions.replayMetadata &&
@@ -36125,6 +36142,13 @@ export class AgentSession {
 			ownedLeaf = targetId;
 			revisions = { ...revisions, leaf: revisions.leaf + 1 };
 			moved = true;
+			this.#stagedTreeViewToolSelection = {
+				isProvisional: () => cursorIsOurs(manager.revisionSnapshot().leaf),
+				ownsActiveTools: () => publishedTools && agent.toolRevision === ownedToolRevision,
+				persistedMCPToolNames: previousPersistedMCPToolNames,
+				activeToolNames: previousTools.map(tool => tool.name),
+				selectedDiscoveredBuiltinToolNames: [...previousSelectedDiscoveredToolNames],
+			};
 			this.#commitSessionTransition();
 			if (!current()) throw gone();
 			const context = this.buildDisplaySessionContext();
@@ -36141,19 +36165,15 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 			this.#resetActiveSdkRunOwnership();
 			if (!current()) throw gone();
+			// Only a successful restore retires the predecessor's explicit authority.
+			this.#resetExplicitMCPToolSelectionAuthority();
 		} catch (error) {
 			// Undo independently-owned components. History (leaf and transcript) is
-			// reverted while the view is still ours; prompts, tools and selection
-			// authority only while this operation still owns them, so an independent
-			// publication is never overwritten.
+			// reverted while the view is still ours; prompts and tools only while this
+			// operation still owns them, so an independent publication is never overwritten.
 			if (moved && sessionStillOurs()) {
 				// Re-read ownership at each step: rollback callbacks are fallible and may
 				// publish prompt or history state of their own.
-				const authorityOurs = () =>
-					selectionOurs() &&
-					!this.#hasExplicitActiveToolSelectionForContext &&
-					this.#explicitMCPToolSelectionForContext === undefined &&
-					this.#explicitMCPToolSelectionPersistsForContext === true;
 				try {
 					if (historyIsOurs()) {
 						if (previousLeaf === null) manager.resetLeaf();
@@ -36162,13 +36182,6 @@ export class AgentSession {
 						// reflect our own revert, not foreign drift.
 						ownedLeaf = previousLeaf;
 						revisions = { ...revisions, leaf: revisions.leaf + 1 };
-					}
-					if (authorityOurs()) {
-						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
-						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-						this.#explicitMCPToolSelectionPersistsForContext =
-							previousExplicitMCPToolSelectionPersistsForContext;
-						this.#commitExplicitMCPToolSelectionAuthority();
 					}
 					// Prompt before tools: the tool observer may publish prompt state of
 					// its own, and that later publication must win over this revert.
@@ -36195,10 +36208,6 @@ export class AgentSession {
 						this.#pendingAppliedToolSignature = sourcePromptRestored ? previousPendingAppliedToolSignature : undefined;
 						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 						this.#invalidateDiscoveryCaches();
-					} else if (liveContextOurs()) {
-						// The view moved on, so its live tools stand. Only undo the
-						// discovered-selection staging this operation performed.
-						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 					}
 					if (historyIsOurs()) {
 						agent.replaceMessages(previousMessages, {
@@ -36223,6 +36232,7 @@ export class AgentSession {
 			}
 			throw error;
 		} finally {
+			this.#stagedTreeViewToolSelection = undefined;
 			this.#endSessionTransition();
 		}
 	}

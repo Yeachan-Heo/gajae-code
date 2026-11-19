@@ -1163,9 +1163,60 @@ describe("SDK exact session view", () => {
 		expect(treeEvents).toEqual([]);
 	});
 
-	it("restores the cursor without resurrecting MCP tools when the catalog changes during a failed rebuild", async () => {
-		const { previous } = await seedMcpBranches();
-		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+	for (const catalog of ["retained", "replaced", "replaced with explicit predecessor selection"] as const) {
+		it(`reconciles an MCP refresh against the previous branch during a pending restore (${catalog})`, async () => {
+			const { old, previous } = await seedMcpBranches();
+			const explicit = catalog === "replaced with explicit predecessor selection";
+			const selected = explicit ? [MCP_TOOL] : [];
+			if (explicit) await session.setActiveToolsByName(selected, { persistMCPSelection: false });
+			const entries = session.sessionManager.getEntries();
+			const messages = session.agent.state.messages.slice();
+			const originalTool = session.getToolByName(MCP_TOOL);
+			const tool = catalog === "retained" ? lookupTool : { ...lookupTool, description: "Replacement lookup" };
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let rebuilds = 0;
+			rebuild = async names => {
+				if (++rebuilds === 1) {
+					entered.resolve();
+					await release.promise;
+					return { systemPrompt: ["staged target prompt"] };
+				}
+				return { systemPrompt: [`tools:${names.join(",")}`] };
+			};
+			const pending = restoreSessionView(session, target(explicit ? null : old));
+			void pending.catch(() => {});
+			try {
+				await entered.promise;
+				await session.refreshMCPTools([tool], { persistMCPSelection: false });
+				const refreshedTool = session.getToolByName(MCP_TOOL);
+				expect(refreshedTool?.description).toBe(tool.description);
+				expect(refreshedTool).not.toBe(originalTool);
+				expect(session.getActiveToolNames()).toEqual(selected);
+				expect(session.systemPrompt).toEqual([`tools:${selected.join(",")}`]);
+				release.resolve();
+				await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+				expect(captureSessionView(session)).toEqual(target(previous));
+				expect(session.sessionManager.getEntries()).toEqual(entries);
+				expect(session.agent.state.messages).toEqual(messages);
+				expect(session.getToolByName(MCP_TOOL)).toBe(refreshedTool);
+				expect(session.getActiveToolNames()).toEqual(selected);
+				expect(session.getSelectedMCPToolNames()).toEqual(selected);
+				if (explicit) expect(session.agent.state.tools[0]?.description).toBe(tool.description);
+				expect(session.systemPrompt).toEqual([`tools:${selected.join(",")}`]);
+				expect(model.calls).toHaveLength(0);
+				expect(treeEvents).toEqual([]);
+			} finally {
+				release.resolve();
+				await pending.catch(() => {});
+			}
+		});
+	}
+
+	it("restores the cursor without resurrecting removed MCP tools or persisting to a staged branch", async () => {
+		const { old, previous } = await seedMcpBranches();
+		await restoreSessionView(session, target(old));
+		const entries = session.sessionManager.getEntries();
 		const messages = session.agent.state.messages.slice();
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -1178,21 +1229,20 @@ describe("SDK exact session view", () => {
 			}
 			return { systemPrompt: [`tools:${names.join(",")}`] };
 		};
-		const pending = restoreSessionView(session, target(null));
+		const pending = restoreSessionView(session, target(previous));
 		void pending.catch(() => {});
 		try {
 			await entered.promise;
-			await session.refreshMCPTools([], { persistMCPSelection: false });
-			const entries = session.sessionManager.getEntries();
-			const systemPrompt = session.systemPrompt.slice();
+			await session.refreshMCPTools([]);
 			release.resolve();
 			await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
-			expect(captureSessionView(session)).toEqual(target(previous));
+			expect(captureSessionView(session)).toEqual(target(old));
 			expect(session.sessionManager.getEntries()).toEqual(entries);
 			expect(session.agent.state.messages).toEqual(messages);
+			expect(session.getToolByName(MCP_TOOL)).toBeUndefined();
 			expect(session.getActiveToolNames()).toEqual([]);
 			expect(session.getSelectedMCPToolNames()).toEqual([]);
-			expect(session.systemPrompt).toEqual(systemPrompt);
+			expect(session.systemPrompt).toEqual(["tools:"]);
 			expect(model.calls).toHaveLength(0);
 			expect(treeEvents).toEqual([]);
 		} finally {
