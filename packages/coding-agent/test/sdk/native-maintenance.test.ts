@@ -380,8 +380,8 @@ async function managedFile(f: Fixture, agentDir: string, id: string, cwd = f.cwd
 	return file;
 }
 
-async function preparedManagedFixture() {
-	const f = await fixture();
+async function preparedManagedFixture(entries: unknown[] = []) {
+	const f = await fixture(entries);
 	await fs.mkdir(f.agentDir, { mode: 0o700 });
 	await fs.mkdir(getSessionsDir(f.agentDir), { mode: 0o700 });
 	const policy = process.platform === "win32" ? "windows-existing-verify-first" : "default";
@@ -620,6 +620,184 @@ describe("checkpoint-selected full-history native forks", () => {
 			}
 		});
 	}
+
+	for (const managed of [false, true]) {
+		const scope = managed ? "managed" : "explicit";
+		it(`awaits the exact initial ${scope} reservation before publication`, async () => {
+			const entries = [user("a", null), user("b", "a"), user("c", null)];
+			const f = managed ? await preparedManagedFixture(entries) : await fixture(entries);
+			// Use a normally secured managed source, not one requiring repair on open.
+			if (managed && process.platform !== "win32") await fs.chmod(f.file, 0o600);
+			const before = await tree(f.root);
+			const entered = Promise.withResolvers<{ role: "staging"; sessionId: string; file: string }>();
+			const release = Promise.withResolvers<void>();
+			const targetLeafId = managed ? null : "a";
+			const destination = managed ? { managed: true as const } : { directory: f.directory };
+			let reservations = 0;
+			const fork = forkEmbeddedSession({
+				file: f.file,
+				cwd: f.cwd,
+				agentDir: f.agentDir,
+				...destination,
+				selection: { snapshotDigest: checkpoint(f.file).snapshotDigest, targetLeafId },
+				reserveSelectedForkTranscript: async identity => {
+					reservations++;
+					entered.resolve(identity);
+					await release.promise;
+				},
+			}).then(manager => {
+				managers.push(manager);
+				return manager;
+			});
+			const identity = await Promise.race([
+				entered.promise,
+				fork.then(() => {
+					throw new Error("Fork published without invoking the reservation");
+				}),
+			]);
+			try {
+				expect(Object.isFrozen(identity)).toBe(true);
+				expect(identity.role).toBe("staging");
+				expect(identity.sessionId).not.toBe("selected");
+				expect(path.dirname(identity.file)).toBe(await fs.realpath(f.directory));
+				expect(await fs.lstat(identity.file).catch((error: NodeJS.ErrnoException) => error.code)).toBe("ENOENT");
+				expect(await tree(f.root)).toEqual(before);
+			} finally {
+				release.resolve();
+				await fork;
+			}
+			const manager = await fork;
+			expect(reservations).toBe(1);
+			expect(manager.getSessionFile()).toBe(identity.file);
+			expect(manager.getSessionId()).toBe(identity.sessionId);
+			const rows = (await Bun.file(identity.file).text())
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(rows[0]).toMatchObject({ type: "session", id: identity.sessionId, parentSession: "selected" });
+			expect(rows.slice(1, f.records.length)).toEqual(entries);
+			expect(checkpoint(identity.file)).toMatchObject({ kind: "recorded", conversationLeafId: targetLeafId });
+			expect(await Bun.file(f.file).text()).toBe(`${f.records.map(row => JSON.stringify(row)).join("\n")}\n`);
+		});
+
+		it(`leaves the ${scope} tree unchanged when the reservation rejects`, async () => {
+			const f = managed ? await preparedManagedFixture([user("a", null)]) : await fixture([user("a", null)]);
+			const before = await tree(f.root);
+			const destination = managed ? { managed: true as const } : { directory: f.directory };
+			const refusal = new Error("reservation declined");
+			let reservations = 0;
+			const error = await caught(
+				forkEmbeddedSession({
+					file: f.file,
+					cwd: f.cwd,
+					agentDir: f.agentDir,
+					...destination,
+					reserveSelectedForkTranscript: async () => {
+						reservations++;
+						expect(await tree(f.root)).toEqual(before);
+						throw refusal;
+					},
+				}),
+			);
+			expect(error).toBe(refusal);
+			expect(reservations).toBe(1);
+			expect(await tree(f.root)).toEqual(before);
+		});
+	}
+
+	it("refuses a byte-identical replacement of the captured source during reservation", async () => {
+		const f = await fixture([user("a", null)]);
+		const before = await tree(f.root);
+		const bytes = await fs.readFile(f.file);
+		const original = path.join(f.root, "original-source.jsonl");
+		let afterReplacement: TreeRow[] | undefined;
+		const error = await caught(
+			forkEmbeddedSession({
+				...f,
+				reserveSelectedForkTranscript: async () => {
+					expect(await tree(f.root)).toEqual(before);
+					await fs.rename(f.file, original);
+					await fs.writeFile(f.file, bytes);
+					afterReplacement = await tree(f.root);
+				},
+			}),
+		);
+		expect(error.code).toBe("identity-mismatch");
+		if (!afterReplacement) throw new Error("Missing replacement snapshot");
+		expect(await tree(f.root)).toEqual(afterReplacement);
+	});
+
+	it("refuses a replacement destination directory without writing to either directory", async () => {
+		const f = await fixture([user("a", null)]);
+		const directory = path.join(f.root, "destination");
+		await fs.mkdir(directory);
+		const before = await tree(f.root);
+		let afterReplacement: TreeRow[] | undefined;
+		const error = await caught(
+			forkEmbeddedSession({
+				...f,
+				directory,
+				reserveSelectedForkTranscript: async () => {
+					expect(await tree(f.root)).toEqual(before);
+					await fs.rename(directory, `${directory}-original`);
+					await fs.mkdir(directory);
+					await fs.writeFile(path.join(directory, "foreign.txt"), "keep");
+					afterReplacement = await tree(f.root);
+				},
+			}),
+		);
+		expect(error.code).toBe("destination_unavailable");
+		if (!afterReplacement) throw new Error("Missing replacement snapshot");
+		expect(await tree(f.root)).toEqual(afterReplacement);
+	});
+
+	for (const occupant of ["file", "dangling symlink", "artifact directory"] as const) {
+		if (occupant === "dangling symlink" && process.platform === "win32") continue;
+		it(`does not overwrite or clean up a foreign ${occupant} at the reserved fork destination`, async () => {
+			const f = await fixture([user("a", null)]);
+			const before = await tree(f.root);
+			let afterCollision: TreeRow[] | undefined;
+			const error = await caught(
+				forkEmbeddedSession({
+					...f,
+					reserveSelectedForkTranscript: async ({ file, sessionId }) => {
+						expect(await tree(f.root)).toEqual(before);
+						if (occupant === "dangling symlink") await fs.symlink(path.join(f.root, "absent"), file);
+						else if (occupant === "artifact directory") {
+							const artifacts = file.slice(0, -6);
+							await fs.mkdir(artifacts);
+							await fs.writeFile(path.join(artifacts, "foreign.txt"), "keep");
+						} else {
+							await fs.writeFile(file, `${JSON.stringify({ type: "session", id: sessionId, cwd: f.cwd })}\n`);
+						}
+						afterCollision = await tree(f.root);
+					},
+				}),
+			);
+			expect(error.code).toBe("destination_unavailable");
+			if (!afterCollision) throw new Error("Missing collision snapshot");
+			expect(await tree(f.root)).toEqual(afterCollision);
+		});
+	}
+
+	it("refuses a reservation for a missing explicit directory before capturing the source", async () => {
+		const f = await fixture([user("a", null)]);
+		const before = await tree(f.root);
+		let reservations = 0;
+		const error = await caught(
+			forkEmbeddedSession({
+				...f,
+				file: path.join(f.root, "missing-source"),
+				directory: path.join(f.root, "missing-destination"),
+				reserveSelectedForkTranscript: async () => {
+					reservations++;
+				},
+			}),
+		);
+		expect(error.code).toBe("destination_unavailable");
+		expect(reservations).toBe(0);
+		expect(await tree(f.root)).toEqual(before);
+	});
 
 	it("uses the actual unique checkpoint rather than the physical metadata tail", async () => {
 		const f = await fixture([

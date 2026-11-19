@@ -294,8 +294,16 @@ is retried only under the existing authorized termination intent.
 `listEmbeddedProjectSessions` preserves display arrays and separately reports
 strict complete/incomplete inventory. `forkEmbeddedSession` copies captured history
 to independent destination membership and durably pins the selected execution
-checkpoint, rather than inferring it from a physical metadata tail. Deletion checks
-all owner vetoes before cleanup and requires a verified positive deletion outcome.
+checkpoint, rather than inferring it from a physical metadata tail. With
+`reserveSelectedForkTranscript`, it awaits an initial `{ role: "staging", sessionId, file }`
+reservation before publishing the transcript. The destination must be an existing
+canonical directory or an already bound managed scope. After the callback, the SDK
+checks that the source and destination are unchanged and the target is still
+absent. The hook reserves only the first identity, not a later branch successor;
+it grants neither native writer authority nor permission to clean up by pathname.
+
+Deletion checks all owner vetoes before cleanup and requires a verified positive
+deletion outcome.
 A `cleanup_pending` error retains an opaque same-process `retry` handle and exact
 native cleanup evidence; missing transcript bytes never authorize another delete
 or replacement cleanup. Ordinary artifact cleanup may retain its receipt-bound

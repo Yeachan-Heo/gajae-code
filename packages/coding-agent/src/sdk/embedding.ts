@@ -29,6 +29,7 @@ import {
 } from "../session/owner-group";
 import {
 	isProjectSessionTranscriptPath,
+	type SelectedForkTranscriptReservation,
 	type SessionEntry,
 	SessionManager,
 	type StrictInventoryCandidate,
@@ -712,11 +713,35 @@ export async function listEmbeddedProjectSessions(input: { cwd: string; agentDir
 
 /** Fork complete captured history with a separately selected execution checkpoint. */
 export async function forkEmbeddedSession(
-	input: { file: string; cwd: string; selection?: { snapshotDigest: string; targetLeafId: string | null } } & (
-		| { directory: string; agentDir?: string }
-		| { agentDir: string; managed: true }
-	),
+	input: {
+		file: string;
+		cwd: string;
+		selection?: { snapshotDigest: string; targetLeafId: string | null };
+		/**
+		 * Awaited before publication of the initial copy, for an existing canonical
+		 * explicit directory or existing bound managed scope. The frozen identity
+		 * names an absent file; it does not confer ownership, cleanup authority, or admission.
+		 */
+		reserveSelectedForkTranscript?: SelectedForkTranscriptReservation;
+	} & ({ directory: string; agentDir?: string } | { agentDir: string; managed: true }),
 ): Promise<SessionManager> {
+	const { reserveSelectedForkTranscript } = input;
+	const validateExplicitDestination = (directory: string, requireExisting: boolean): void => {
+		const existing = fs.lstatSync(directory, { throwIfNoEntry: false });
+		if (
+			existing
+				? !existing.isDirectory() ||
+					existing.isSymbolicLink() ||
+					(requireExisting && fs.realpathSync(directory) !== path.resolve(directory))
+				: requireExisting
+		)
+			throw Object.assign(new Error("Fork destination is not an available non-symlink directory"), {
+				code: "destination_unavailable",
+			});
+	};
+	// The legacy missing-directory fork publishes by directory rename. It has no
+	// existing final parent to bind an exact reservation to, so refuse before capture.
+	if (reserveSelectedForkTranscript && !("managed" in input)) validateExplicitDestination(input.directory, true);
 	const resolved = resolveEmbeddedResumeCheckpoint(input.file);
 	if (resolved.kind !== "resolved")
 		throw Object.assign(new Error("Could not resolve source transcript for fork"), { code: resolved.reason });
@@ -763,23 +788,12 @@ export async function forkEmbeddedSession(
 					checkpoint,
 				});
 		}
-		if (!("managed" in input)) {
-			// Refuse a known foreign collision before constructing a manager, whose
-			// owner admission and resident cache initialization have write effects.
-			let existing: fs.Stats | undefined;
-			try {
-				existing = fs.lstatSync(input.directory);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-			if (existing && (!existing.isDirectory() || existing.isSymbolicLink()))
-				throw Object.assign(new Error("Fork destination is not a non-symlink directory"), {
-					code: "destination_unavailable",
-				});
-		}
+		if (!("managed" in input) && !reserveSelectedForkTranscript) validateExplicitDestination(input.directory, false);
 		const destination =
 			"managed" in input
-				? SessionManager.managedDestination(input.cwd, input.agentDir)
+				? reserveSelectedForkTranscript
+					? { managed: true as const, agentDir: input.agentDir }
+					: SessionManager.managedDestination(input.cwd, input.agentDir)
 				: SessionManager.explicitDestination(input.directory, input.agentDir);
 		// Sixth argument remains the legacy history filter. Native target selection
 		// is separate so null and non-tail targets never discard original records.
@@ -790,7 +804,7 @@ export async function forkEmbeddedSession(
 			"copy-retain",
 			"auto",
 			undefined,
-			{ executionTargetLeafId: target },
+			{ executionTargetLeafId: target, reserveSelectedForkTranscript },
 		);
 		if (fork.kind !== "forked")
 			throw Object.assign(new Error("Could not publish forked session"), { code: fork.reason, outcome: fork });
