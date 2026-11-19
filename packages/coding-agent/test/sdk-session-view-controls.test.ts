@@ -1163,9 +1163,10 @@ describe("SDK exact session view", () => {
 		expect(treeEvents).toEqual([]);
 	});
 
-	it("does not resurrect snapshotted MCP tools when the catalog changes during a failed rebuild", async () => {
-		await seedMcpBranches();
+	it("restores the cursor without resurrecting MCP tools when the catalog changes during a failed rebuild", async () => {
+		const { previous } = await seedMcpBranches();
 		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const messages = session.agent.state.messages.slice();
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		let rebuilds = 0;
@@ -1183,11 +1184,10 @@ describe("SDK exact session view", () => {
 			await entered.promise;
 			await session.refreshMCPTools([], { persistMCPSelection: false });
 			const entries = session.sessionManager.getEntries();
-			const messages = session.agent.state.messages.slice();
 			const systemPrompt = session.systemPrompt.slice();
 			release.resolve();
 			await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
-			expect(session.sessionManager.getLeafId()).toBeNull();
+			expect(captureSessionView(session)).toEqual(target(previous));
 			expect(session.sessionManager.getEntries()).toEqual(entries);
 			expect(session.agent.state.messages).toEqual(messages);
 			expect(session.getActiveToolNames()).toEqual([]);
@@ -1283,6 +1283,9 @@ describe("SDK exact session view", () => {
 		expect(session.agent.state.messages).toEqual(messages);
 		expect(session.sessionManager.getEntries()).toEqual(entries);
 		expect(session.systemPrompt).toEqual(["independent refresh"]);
+		// The live tools were never changed, so the refresh's signature remains valid.
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		expect(rebuilds).toBe(2);
 		expect(model.calls).toHaveLength(0);
 	});
 
@@ -1404,6 +1407,70 @@ describe("SDK exact session view", () => {
 		expect(session.systemPrompt).toEqual(systemPrompt);
 		expect(session.agent.state.messages).toEqual(messages);
 		expect(model.calls).toHaveLength(0);
+	});
+
+	it("reverts installed target tools without overwriting the forward observer's prompt", async () => {
+		const publications: string[][] = [];
+		let observe = false;
+		const { previous } = await seedMcpBranches(names => {
+			if (!observe) return;
+			publications.push(names);
+			if (publications.length !== 1) return;
+			expect(session.getActiveToolNames()).toEqual([]);
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+			const prompt = session.agent.state.systemPrompt;
+			expect(prompt).toEqual(["tools:"]);
+			prompt[0] = "forward observer prompt";
+			session.agent.setSystemPrompt(prompt);
+		});
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const tools = session.agent.state.tools.slice();
+		const messages = session.agent.state.messages.slice();
+		const entries = session.sessionManager.getEntries();
+		observe = true;
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "resource_gone",
+			rollbackFailed: false,
+		});
+		expect(publications).toEqual([[], [MCP_TOOL]]);
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(session.systemPrompt).toEqual(["forward observer prompt"]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		// The observer's prompt is not certified for the reinstated tool selection.
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		expect(session.systemPrompt).toEqual([`tools:${MCP_TOOL}`]);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+	});
+
+	it("leaves a forward observer's same-array tool republication untouched", async () => {
+		let observe = false;
+		let republished: AgentTool[] | undefined;
+		const { old, previous } = await seedMcpBranches(() => {
+			if (!observe || republished) return;
+			expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+			republished = session.agent.state.tools;
+			session.agent.setTools(republished);
+			session.agent.setSystemPrompt(["forward observer prompt"]);
+		});
+		await session.setActiveToolsByName([], { persistMCPSelection: false });
+		const messages = session.agent.state.messages.slice();
+		observe = true;
+		await expect(restoreSessionView(session, target(old))).rejects.toMatchObject({
+			code: "resource_gone",
+			rollbackFailed: false,
+		});
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		if (!republished) throw new Error("Expected the observer's tool publication");
+		expect(session.agent.state.tools).toBe(republished);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(session.systemPrompt).toEqual(["forward observer prompt"]);
 	});
 
 	it("does not overwrite prompt state published by a reentrant tool observer", async () => {
@@ -1567,7 +1634,7 @@ describe("SDK exact session view", () => {
 					await disposal;
 					expect(session.sessionLifecycle.disposed).toBe(true);
 				} else {
-					expect(active.getLeafId()).toBe(leaf);
+					expect(active.getLeafId()).toBe(interference === "tool-selection" ? previous : leaf);
 					expect(active.getEntries()).toEqual(entries);
 				}
 				expect(session.agent.state.messages).toEqual(messages);

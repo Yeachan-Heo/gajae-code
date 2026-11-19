@@ -3090,12 +3090,13 @@ type PreparedExactMcpRetirement = {
 
 /**
  * Ownership fence for an exact session-view restoration. `isCurrent` authorizes the
- * next publication; `onApplied` re-anchors ownership after this operation publishes
- * its own tools and prompt, so a foreign publication is still detected as drift.
+ * next publication; each callback accounts only for its own publication, before
+ * observers can publish newer state.
  */
 interface SessionViewRestoreFence {
 	isCurrent: () => boolean;
-	onApplied: () => void;
+	onPromptApplied: () => void;
+	onToolsApplied: () => void;
 }
 
 /**
@@ -15320,6 +15321,7 @@ export class AgentSession {
 				if (builtPrompt) {
 					this.#baseSystemPrompt = builtPrompt;
 					this.agent.setSystemPrompt(builtPrompt);
+					options?.fence?.onPromptApplied();
 				}
 				if (promptRelevantToolsChanged) {
 					this.#lastAppliedToolSignature = signature;
@@ -15328,7 +15330,7 @@ export class AgentSession {
 				}
 				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
+				this.#setGuardedAgentTools(tools, options?.fence?.onToolsApplied);
 				this.#invalidateDiscoveryCaches();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
@@ -15424,7 +15426,7 @@ export class AgentSession {
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
 				this.#pendingAppliedToolSignature = undefined;
-				options?.fence?.onApplied();
+				options?.fence?.onPromptApplied();
 				break;
 			}
 		} else if (promptRelevantToolsChanged) {
@@ -15443,7 +15445,7 @@ export class AgentSession {
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-		this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
+		this.#setGuardedAgentTools(tools, options?.fence?.onToolsApplied);
 		this.#invalidateDiscoveryCaches();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
@@ -36046,6 +36048,9 @@ export class AgentSession {
 		let ownedMessages = previousMessages;
 		let ownedContextRevision = agent.contextRevision;
 		let ownedHistoryRevision = agent.historyRevision;
+		let ownedPromptRevision = agent.systemPromptRevision;
+		let ownedToolRevision = agent.toolRevision;
+		let publishedTools = false;
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
 		let moved = false;
@@ -36074,8 +36079,6 @@ export class AgentSession {
 				manager.getSessionIdentityGeneration() === identity &&
 				this.#sessionTransitionKind === "navigate-tree" &&
 				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
-				this.#mcpCatalogGeneration === mcpCatalogGeneration &&
-				this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration &&
 				manager.getLeafId() === ownedLeaf &&
 				now.entry === revisions.entry &&
 				now.leaf === revisions.leaf &&
@@ -36090,15 +36093,28 @@ export class AgentSession {
 				!busy()
 			);
 		};
-		const current = () => {
-			// Prompt and tool publications advance contextRevision even when they
-			// republish the same array, so ownership cannot rest on identity alone.
-			return historyIsOurs() && agent.contextRevision === ownedContextRevision;
-		};
+		const selectionOurs = () =>
+			this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
+		const toolAuthorityOurs = () => this.#mcpCatalogGeneration === mcpCatalogGeneration && selectionOurs();
+		const toolsAreOurs = () => toolAuthorityOurs() && agent.toolRevision === ownedToolRevision;
+		const liveContextOurs = () => toolsAreOurs() && agent.contextRevision === ownedContextRevision;
+		const current = () => historyIsOurs() && liveContextOurs();
+		// Only an identified prompt publication relaxes the tool rollback fence.
+		// Model changes and unclassified touchContext() calls still fail closed.
+		const nonPromptContextOurs = () =>
+			agent.contextRevision - ownedContextRevision === agent.systemPromptRevision - ownedPromptRevision;
+		// Count our own writes rather than sampling live revisions, which could
+		// accidentally adopt a reentrant publication into this operation's fence.
 		const fence: SessionViewRestoreFence = {
 			isCurrent: current,
-			onApplied: () => {
-				ownedContextRevision = agent.contextRevision;
+			onPromptApplied: () => {
+				ownedContextRevision++;
+				ownedPromptRevision++;
+			},
+			onToolsApplied: () => {
+				ownedContextRevision++;
+				ownedToolRevision++;
+				publishedTools = true;
 			},
 		};
 		this.#beginSessionTransition("navigate-tree");
@@ -36118,8 +36134,8 @@ export class AgentSession {
 				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
 			});
 			ownedMessages = agent.state.messages.slice();
-			ownedHistoryRevision = agent.historyRevision;
-			ownedContextRevision = agent.contextRevision;
+			ownedHistoryRevision++;
+			ownedContextRevision++;
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -36133,8 +36149,6 @@ export class AgentSession {
 			if (moved && sessionStillOurs()) {
 				// Re-read ownership at each step: rollback callbacks are fallible and may
 				// publish prompt or history state of their own.
-				const selectionOurs = () =>
-					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
 				const authorityOurs = () =>
 					selectionOurs() &&
 					!this.#hasExplicitActiveToolSelectionForContext &&
@@ -36158,28 +36172,30 @@ export class AgentSession {
 					}
 					// Prompt before tools: the tool observer may publish prompt state of
 					// its own, and that later publication must win over this revert.
-					if (historyIsOurs() && agent.contextRevision === ownedContextRevision) {
+					if (current()) {
 						this.#baseSystemPrompt = previousBaseSystemPrompt;
 						agent.setSystemPrompt(previousSystemPrompt);
-						ownedContextRevision = agent.contextRevision;
-						// Invalidate rebuilds authorized for the abandoned target tools;
-						// otherwise one may publish their guidance over the reverted prompt.
+						fence.onPromptApplied();
+						// Invalidate rebuilds authorized for the abandoned target tools.
 						this.#reserveBaseSystemPromptGeneration();
 					}
-					if (historyIsOurs() && selectionOurs() && agent.contextRevision === ownedContextRevision) {
+					const sourcePromptRestored = current();
+					const canRestoreTools =
+						sourcePromptRestored || (publishedTools && historyIsOurs() && toolsAreOurs() && nonPromptContextOurs());
+					if (canRestoreTools) {
 						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
 						this.#activeToolSelectionRevision++;
 						agent.setTools(previousTools);
-						ownedContextRevision = agent.contextRevision;
-						// Signatures describe the prompt and tools this rollback just
-						// restored. Publish them before any observer can read or replace
-						// the cached signature with its own selection.
-						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
-						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+						if (!sourcePromptRestored) this.#reserveBaseSystemPromptGeneration();
+						// A newer prompt may describe target tools; neither the target nor
+						// the source signature can certify the pair we are leaving live.
+						// Set the cache before an observer can publish another selection.
+						this.#lastAppliedToolSignature = sourcePromptRestored ? previousLastAppliedToolSignature : undefined;
+						this.#pendingAppliedToolSignature = sourcePromptRestored ? previousPendingAppliedToolSignature : undefined;
 						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 						this.#invalidateDiscoveryCaches();
-					} else if (selectionOurs() && agent.contextRevision === ownedContextRevision) {
+					} else if (liveContextOurs()) {
 						// The view moved on, so its live tools stand. Only undo the
 						// discovered-selection staging this operation performed.
 						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
@@ -36201,7 +36217,7 @@ export class AgentSession {
 						rollbackFailed: true,
 					});
 				}
-				if (!historyIsOurs()) throw gone();
+				if (!historyIsOurs() || !toolAuthorityOurs()) throw gone();
 			} else if (moved) {
 				throw gone();
 			}

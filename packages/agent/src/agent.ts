@@ -535,6 +535,8 @@ export class Agent {
 	};
 	#contextRevision = 0;
 	#historyRevision = 0;
+	#systemPromptRevision = 0;
+	#toolRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
@@ -968,6 +970,16 @@ export class Agent {
 		return this.#historyRevision;
 	}
 
+	/** Advances on every system prompt publication, including same-array republication. */
+	get systemPromptRevision(): number {
+		return this.#systemPromptRevision;
+	}
+
+	/** Advances on every tool publication, including same-array republication. */
+	get toolRevision(): number {
+		return this.#toolRevision;
+	}
+
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
 		return this.#appendOnlyContext;
 	}
@@ -1266,6 +1278,7 @@ export class Agent {
 	setSystemPrompt(v: string[]) {
 		this.#state.systemPrompt = v;
 		this.#contextRevision++;
+		this.#systemPromptRevision++;
 	}
 
 	setModel(m: Model | undefined) {
@@ -1304,6 +1317,7 @@ export class Agent {
 	setTools(t: AgentTool<any>[]) {
 		this.#state.tools = t;
 		this.#contextRevision++;
+		this.#toolRevision++;
 	}
 
 	replaceMessages(
@@ -1343,9 +1357,9 @@ export class Agent {
 	}
 
 	/**
-	 * For callers that mutate committed messages in place outside Agent-owned
-	 * mutators. Prompt mutations must use `setSystemPrompt` so they stay out of the
-	 * history revision.
+	 * Marks an in-place edit outside Agent-owned mutators. This unclassified edit
+	 * conservatively invalidates both context and history ownership. Use
+	 * `setSystemPrompt` or `setTools` for those specific publications.
 	 */
 	touchContext(): void {
 		this.#contextRevision++;
