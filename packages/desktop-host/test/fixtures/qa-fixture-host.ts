@@ -15,7 +15,7 @@ import {
 	QA_PROVIDER,
 	validateFixtureEnvironment,
 } from "../../../desktop/scripts/qa-model-fixture";
-import { createFrameWriter } from "../../src/frame-writer";
+import { createFrameWriter, createWritableFrameSink } from "../../src/frame-writer";
 import { DesktopHost } from "../../src/host";
 import { registerDesktopProcessShutdown } from "../../src/process-lifecycle";
 import type { DesktopFrame } from "../../src/protocol";
@@ -133,11 +133,10 @@ export async function main(): Promise<void> {
 	// Install before host initialization, registry refresh, or session construction.
 	globalThis.fetch = fixtureFetch(baseUrl, providerToken, globalThis.fetch, mcpUrl);
 	await setModelPresetRegistryDisabled({ agentDir: layout.agentDir, disabled: true });
+	const writeFrame = createWritableFrameSink(process.stdout);
 	process.stdout.write = process.stderr.write.bind(process.stderr);
 	const frames = createFrameWriter({
-		write: async bytes => {
-			await Bun.write(Bun.stdout, bytes);
-		},
+		write: writeFrame,
 		onError: () => {
 			process.exitCode = 1;
 			process.stdin.destroy();
