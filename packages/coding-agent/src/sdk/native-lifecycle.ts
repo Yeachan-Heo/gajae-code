@@ -15,7 +15,6 @@ import {
 	acquireEmbeddedStopAdmission,
 	cancelEmbeddedOwnedWork,
 	type EmbeddedOwnedWork,
-	type EmbeddedWorkCancellation,
 	type EmbeddedWorkConsent,
 	type EmbeddedWorkSource,
 	type EmbeddedWorkTarget,
@@ -117,6 +116,7 @@ interface Member {
 	/** Dispatch currently awaiting its completion; adoption re-bases it instead of fencing it. */
 	currentInvocation?: RuntimeInvocation;
 	publicationEpoch: number;
+	ttsrPublicationFailed?: true;
 	readonly runtimeWork: Set<Promise<unknown>>;
 	pendingCalls: number;
 	tail: Promise<void>;
@@ -210,6 +210,7 @@ function invocationCurrent(invocation: RuntimeInvocation): boolean {
 		member.context === "runtime" &&
 		member.workSource?.result.session === binding.session &&
 		member.manager === binding.session.sessionManager &&
+		!member.ttsrPublicationFailed &&
 		member.publicationEpoch === invocation.epoch &&
 		binding.pending() === invocation.op &&
 		binding.sameIdentity() &&
@@ -272,6 +273,26 @@ export function bindNativeRuntimeInvocation(
 	member.publicationEpoch++;
 }
 
+/** Permanently fence runtime effects without changing the live owner or admitting TERM. */
+export function fenceNativeTtsrPublication(manager: SessionManager): boolean {
+	const member = managers.get(manager);
+	if (!member) return false;
+	member.ttsrPublicationFailed = true;
+	return true;
+}
+
+/** Allow the named stop to acquire its exact lease even when TTSR already closed ingress. */
+export function isNativeTtsrStopAdmissionAuthorized(session: AgentSession): boolean {
+	const stopping = runtimeCancellation.getStore();
+	const member = stopping?.member;
+	return (
+		stopping?.active === true &&
+		member?.ttsrPublicationFailed === true &&
+		member.manager === session.sessionManager &&
+		member.workSource?.result.session === session
+	);
+}
+
 /** Raw registered native sessions are not a second, unguarded consumer API. */
 export function assertNativeRuntimeInvocation(session: AgentSession, cancellation = false): void {
 	const member = managers.get(session.sessionManager);
@@ -281,6 +302,7 @@ export function assertNativeRuntimeInvocation(session: AgentSession, cancellatio
 		return;
 	const disposing = disposalScope.getStore();
 	if (cancellation && disposing?.active && disposing.member === member) return;
+	if (member.ttsrPublicationFailed) throw new NativeRuntimeRefusal("not_ready");
 	const invocation = runtimeInvocation.getStore();
 	if (!invocation || invocation.binding.session !== session || !invocationCurrent(invocation))
 		throw new NativeRuntimeRefusal(closeState(member) === "none_started" ? "context_mismatch" : "manager_closed");
@@ -415,6 +437,12 @@ export async function invokeNativeRuntime<T>(
 					reason: "manager_closed" as const,
 					reconciliation: await postReadonly(member, op, "RECON"),
 				};
+			if (member.ttsrPublicationFailed)
+				return {
+					kind: "refused" as const,
+					reason: "context_mismatch" as const,
+					reconciliation: await refuse(member, op, "RECON", "context_mismatch"),
+				};
 			return member.manager!.admitNativeRuntimeEffect(
 				op,
 				routing(member, "RECON", "RETAIN_LIVE"),
@@ -515,6 +543,7 @@ export function serializeNativeRuntimeSelection<T>(
 ): Promise<T> {
 	const member = memberFor(handle);
 	return serialized(member, async () => {
+		if (member.ttsrPublicationFailed) throw new NativeRuntimeRefusal("not_ready");
 		const result = await select();
 		member.publicationEpoch++;
 		return result;
@@ -798,6 +827,8 @@ export function reconcileNativeHandle(
 	const member = memberFor(handle);
 	return serialized(member, async () => {
 		if (closeState(member) !== "none_started") return postReadonly(member, op, "RECON");
+		if (member.ttsrPublicationFailed && (mode === "complete" || mode === "repairDurability"))
+			return refuse(member, op, "RECON", "context_mismatch");
 		const result = await reconcileLive(member, op, mode, "RECON");
 		return closeState(member) !== "none_started" ? postReadonly(member, op, "RECON") : result;
 	});
@@ -964,26 +995,25 @@ async function terminateLive(
 		// TERM has a distinct exact-owner cancellation scope, never prompt authority.
 		member.publicationEpoch++;
 		const cancellation = { member, active: true };
-		let cancelled: EmbeddedWorkCancellation;
 		try {
-			cancelled = await runtimeCancellation.run(cancellation, () => cancelEmbeddedOwnedWork(source, work));
+			const cancelled = await runtimeCancellation.run(cancellation, () => cancelEmbeddedOwnedWork(source, work));
+			if (cancelled.status === "rejected")
+				return refuse(
+					member,
+					op,
+					coordinatorAbort ? "OPEN" : "TERM",
+					coordinatorAbort ? "context_mismatch" : "termination_not_authorized",
+				);
+			if (record) record.started = true;
+			if (
+				cancelled.remaining.blockers.length > 0 ||
+				cancelled.results.some(result => !["removed", "cancelled", "settled"].includes(result.status))
+			)
+				return remember(member, op, observed);
+			member.lease ??= runtimeCancellation.run(cancellation, () => acquireEmbeddedStopAdmission(source));
 		} finally {
 			cancellation.active = false;
 		}
-		if (cancelled.status === "rejected")
-			return refuse(
-				member,
-				op,
-				coordinatorAbort ? "OPEN" : "TERM",
-				coordinatorAbort ? "context_mismatch" : "termination_not_authorized",
-			);
-		if (record) record.started = true;
-		if (
-			cancelled.remaining.blockers.length > 0 ||
-			cancelled.results.some(result => !["removed", "cancelled", "settled"].includes(result.status))
-		)
-			return remember(member, op, observed);
-		member.lease ??= acquireEmbeddedStopAdmission(source);
 		if (getEmbeddedOwnedWork(source).blockers.length > 0) {
 			member.lease.release();
 			member.lease = undefined;
@@ -1191,6 +1221,7 @@ export function createNativeOpenCoordinator(driver: NativeLifecycleDriver): Nati
 				member.context !== "owned_pre" ||
 				member.token !== token ||
 				!member.openReady ||
+				member.ttsrPublicationFailed ||
 				!member.workSource
 			)
 				throw new Error("Native runtime handoff context mismatch");

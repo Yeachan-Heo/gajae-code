@@ -12,6 +12,7 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
@@ -23,6 +24,14 @@ import { EditTool } from "../src/edit";
 import { disposeAllVmContexts } from "../src/eval/js/context-manager";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { createAgentSession } from "../src/sdk";
+import { createEmbeddedAgentSession } from "../src/sdk/embedding";
+import {
+	consentEmbeddedDisconnect,
+	prepareEmbeddedDisconnect,
+	reconcileEmbeddedResumeCheckpoint,
+	recordEmbeddedResumeCheckpoint,
+	terminateEmbeddedAgentSession,
+} from "../src/sdk/native-embedding";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import type {
@@ -1327,6 +1336,163 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 					session = undefined;
 				}
 			}
+		}
+	});
+
+	it("fences a native runtime after uncertain TTSR publication without taking Disconnect authority", async () => {
+		const cwd = await fsPromises.realpath(tempDir);
+		const agentDir = path.join(cwd, "native-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			JSON.stringify({
+				recipe: { enabled: false },
+				compaction: { enabled: false },
+				retry: { enabled: false },
+				tools: { discoveryMode: "off" },
+				modelRoles: { default: `${model.provider}/${model.id}` },
+			}),
+		);
+		const opened = await createEmbeddedAgentSession({
+			cwd,
+			agentDir,
+			authStorage,
+			model,
+			storage: { managed: true },
+			native: { create: true, ownerPolicy: { kind: "exclusive_native" } },
+			asyncJobs: "none",
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			rules: [makeRule({ condition: ["TTSR-NATIVE-MARKER"], interruptMode: "always" })],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMcpAutoload: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			deferOptionalModelRefresh: true,
+			deferMemoryBackendStartup: true,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+			toolNames: ["read"],
+		});
+		if (opened.kind !== "opened") throw new Error(`Expected native open, got ${opened.kind}`);
+		const { handle, op, runtime } = opened;
+		const nativeSession = opened.result.session;
+		const manager = nativeSession.sessionManager;
+		const transport = createMockModel({
+			responses: [{ content: ["TTSR-NATIVE-MARKER"] }],
+			handler: { content: ["unexpected continuation"] },
+		});
+		nativeSession.agent.streamFn = transport.stream;
+		const notices: { level: string; message: string }[] = [];
+		const unsubscribe = nativeSession.subscribe(event => {
+			if (event.type === "notice" && event.source === "ttsr")
+				notices.push({ level: event.level, message: event.message });
+		});
+		const barrier = holdTtsrRetry(nativeSession);
+		const publish = manager.appendCustomMessageEntrySharingSession.bind(manager);
+		let committedReminderId: string | undefined;
+		const sharedAppend = spyOn(manager, "appendCustomMessageEntrySharingSession").mockImplementation(
+			async (...args: Parameters<typeof publish>) => {
+				const outcome = await publish(...args);
+				if (args[0] !== "ttsr-injection" || outcome.kind !== "committed") return outcome;
+				committedReminderId = outcome.id;
+				throw new Error("persistence failed after commit");
+			},
+		);
+		const dispose = spyOn(nativeSession, "dispose");
+		const membership = manager.getOwnerMembership();
+		const first = runtime.prompt.prompt("start the turn");
+		const disconnect = async () => {
+			const preparation = await prepareEmbeddedDisconnect(handle, op);
+			if (!preparation.inventory) throw new Error("Missing native work inventory");
+			const consent = consentEmbeddedDisconnect(handle, preparation, {
+				stopAndJoin: true,
+				work: { inventory: preparation.inventory, targets: [] },
+			});
+			if (!consent) throw new Error("Missing native Disconnect consent");
+			return terminateEmbeddedAgentSession(handle, { op, consent });
+		};
+		try {
+			await Promise.race([
+				barrier.entered,
+				first.then(() => {
+					throw new Error("Native prompt completed without reaching the TTSR retry");
+				}),
+			]);
+			await nativeSession.agent.waitForIdle();
+			await nativeSession.waitForAgentEndHandlingForTests();
+			await manager.flush();
+			const sharedAdmission = await manager.appendMessageSharingSession({
+				role: "user",
+				content: "arm shared admission",
+				timestamp: Date.now(),
+			});
+			expect(sharedAdmission.kind).toBe("committed");
+			barrier.release();
+			expect((await first).kind).toBe("applied");
+			await nativeSession.waitForIdle();
+			expect(nativeSession.isTtsrAbortPending).toBe(false);
+			expect(notices).toHaveLength(1);
+			expect(notices[0].level).toBe("warning");
+			expect(notices[0].message).toContain(
+				"persistence failed without confirming it was not committed; retry stopped",
+			);
+			expect(notices[0].message).toContain("use Disconnect to request teardown");
+			expect(notices[0].message).not.toContain("session was closed");
+			expect(dispose).not.toHaveBeenCalled();
+			expect(nativeSession.isDisposed).toBe(false);
+			expect(membership).toBeDefined();
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(manager.getStrictCloseState().kind).toBe("none_started");
+			expect(() => nativeSession.dispose()).toThrow("Native disposal requires registry termination authorization");
+
+			if (!committedReminderId) throw new Error("The native TTSR reminder was not committed");
+			const file = Bun.file(manager.getSessionFile()!);
+			const transcript = await file.text();
+			const entries = manager.getEntries();
+			expect(
+				entries
+					.filter(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection")
+					.map(entry => entry.id),
+			).toEqual([committedReminderId]);
+			expect(entries.some(entry => entry.type === "ttsr_injection")).toBe(false);
+			expect(transcript).toContain(committedReminderId);
+			expect(
+				nativeSession.agent.state.messages.some(
+					message => message.role === "custom" && message.customType === "ttsr-injection",
+				),
+			).toBe(false);
+			expect((await runtime.prompt.prompt("try another turn")).kind).toBe("refused");
+			expect((await runtime.session.setSessionName("not admitted")).kind).toBe("refused");
+			await expect(recordEmbeddedResumeCheckpoint(handle, { op: "not admitted" })).rejects.toMatchObject({
+				name: "NativeRuntimeRefusal",
+			});
+			const observation = await reconcileEmbeddedResumeCheckpoint(handle, { op, mode: "verifyReadOnly" });
+			expect(observation.receipt.routing.action).toBe("RETAIN_LIVE");
+			const refused = await terminateEmbeddedAgentSession(handle, { op });
+			expect(refused.refusal).toBe("termination_not_authorized");
+			expect(manager.getStrictCloseState().kind).toBe("none_started");
+			expect(manager.getOwnerMembership()).toBe(membership);
+			expect(transport.calls).toHaveLength(1);
+			expect(sharedAppend.mock.calls.filter(([type]) => type === "ttsr-injection")).toHaveLength(1);
+			expect(await file.text()).toBe(transcript);
+
+			const disconnected = await disconnect();
+			expect(disconnected.receipt.routing.authorization.terminationIntent).toBe("consented_teardown");
+			expect(manager.getStrictCloseState().kind).toBe("closed");
+			// Close is not proof of retirement when final publication evidence is incomplete.
+		} finally {
+			barrier.release();
+			await Promise.allSettled([first]);
+			barrier.restore();
+			sharedAppend.mockRestore();
+			dispose.mockRestore();
+			unsubscribe();
+			if (manager.getStrictCloseState().kind === "none_started") await disconnect();
 		}
 	});
 

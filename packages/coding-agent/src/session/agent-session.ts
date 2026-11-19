@@ -156,6 +156,8 @@ import {
 	assertNativeDisposalAuthorized,
 	assertNativeRuntimeEffect,
 	assertNativeRuntimeInvocation,
+	fenceNativeTtsrPublication,
+	isNativeTtsrStopAdmissionAuthorized,
 	NativeRuntimeRefusal,
 	noteNativeRuntimeViewTransition,
 	retainNativeRuntimeWork,
@@ -5232,7 +5234,8 @@ export class AgentSession {
 	acquireExternalStopAdmission(expected: ExternalAdmissionTarget): ExternalStopAdmissionLease {
 		const { sessionId, generation, identityGeneration } = expected;
 		const current = this.externalAdmissionTarget;
-		this.#assertSessionAdmissionOpen();
+		if (this.#isDisposed || this.#sessionAdmissionClosed || !isNativeTtsrStopAdmissionAuthorized(this))
+			this.#assertSessionAdmissionOpen();
 		if (
 			this.#sessionTransitionKind !== undefined ||
 			this.#handoffTransitionActive ||
@@ -11646,6 +11649,17 @@ export class AgentSession {
 		return `TTSR matched ${label}: ${rules.map(rule => rule.name).join(", ")}`;
 	}
 
+	/** Stop work without inventing disposal authority for a registered native writer. */
+	#stopAfterTtsrPublicationFailure(onTeardownFailure: () => void): string {
+		if (fenceNativeTtsrPublication(this.sessionManager)) {
+			// Also stop session-local producers that do not start through the SDK facade.
+			this.#sessionAdmissionClosing = true;
+			return "the native session stopped accepting work; use Disconnect to request teardown";
+		}
+		void this.dispose().catch(onTeardownFailure);
+		return "the session was closed";
+	}
+
 	/** Shared stream/AST match handling: bucket non-interrupting tools or retry. */
 	#handleTtsrMatches(
 		matches: Rule[],
@@ -11825,7 +11839,7 @@ export class AgentSession {
 						endRetry();
 						// Stale conditions are persistent; shared writes will remain uncommittable.
 						// Require reopening to clear the persistent state.
-						void this.dispose().catch(() => {
+						const disposition = this.#stopAfterTtsrPublicationFailure(() => {
 							logger.warn("Stale TTSR reminder teardown failed", {
 								code: "ttsr_stale_publication_teardown_failed",
 								reason: outcome.reason,
@@ -11833,7 +11847,7 @@ export class AgentSession {
 						});
 						this.emitNotice(
 							"warning",
-							`TTSR reminder publication failed with ${outcome.reason}; session requires reopening to continue.`,
+							`TTSR reminder publication failed with ${outcome.reason}; ${disposition}. The session requires reopening to continue.`,
 							"ttsr",
 						);
 						return;
@@ -11850,8 +11864,8 @@ export class AgentSession {
 						// An unknown append may already be in the transcript, but it does not
 						// prove the model received the reminder. Do not persist consumption or
 						// let a later prompt bypass it through another match path or repeat gap.
-						// Close this live session instead; attempted-entry reconciliation on reopen is separate.
-						void this.dispose().catch(() => {
+						// Stop this live session instead; attempted-entry reconciliation on reopen is separate.
+						const disposition = this.#stopAfterTtsrPublicationFailure(() => {
 							logger.warn("Uncertain TTSR reminder teardown failed", {
 								code: "ttsr_uncertain_publication_teardown_failed",
 								attemptedId,
@@ -11860,8 +11874,8 @@ export class AgentSession {
 						this.emitNotice(
 							"warning",
 							attemptedId
-								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped and the session was closed because the reminder may already be in the session transcript.`
-								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
+								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped because the reminder may already be in the session transcript, and ${disposition}.`
+								: `TTSR reminder persistence failed without confirming it was not committed; retry stopped because the reminder may already be in the session transcript, and ${disposition}.`,
 							"ttsr",
 						);
 						return;
@@ -11911,19 +11925,19 @@ export class AgentSession {
 						return;
 					}
 					if (this.#isDisposed) return;
-					// The reminder is in the transcript but cannot reach live context. Close the session so a
+					// The reminder is in the transcript but cannot reach live context. Stop the session so a
 					// later prompt neither runs without it nor publishes it again; reopen reconciles the entry.
-					logger.warn("TTSR reminder committed after its retry was cancelled; closing session", {
+					logger.warn("TTSR reminder committed after its retry was cancelled; stopping session", {
 						rules: details.rules,
 					});
-					void this.dispose().catch(() => {
+					const disposition = this.#stopAfterTtsrPublicationFailure(() => {
 						logger.warn("Cancelled TTSR reminder teardown failed", {
 							code: "ttsr_cancelled_publication_teardown_failed",
 						});
 					});
 					this.emitNotice(
 						"warning",
-						"TTSR reminder was saved after its retry was cancelled and live history had changed; the session was closed and must be reopened to continue.",
+						`TTSR reminder was saved after its retry was cancelled and live history had changed; ${disposition}. The session must be reopened to continue.`,
 						"ttsr",
 					);
 					return;
