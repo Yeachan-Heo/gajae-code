@@ -205,6 +205,16 @@ and storage scope. Its native overload also requires `native.expected` (the exac
 destination and no existing file. Interpretation and independent ownership vetoes
 precede hydration, writer admission, sanitation and runtime factory effects.
 
+For a fresh native full-history fork, use the same `native.create: true` options
+with `native.fork: { file, selection, reserveSelectedForkTranscript, signal }`.
+`selection` and `signal` are optional. Supply the exact source digest and target
+when the source requires an explicit selection. The destination must meet the
+reserved-fork requirements below. The SDK admits a fresh exclusive owner and
+opens the fork on its original `fork_init` operation, not a second open or pin.
+The source is unchanged. This creates the first fork identity only; it does not
+reserve or publish a subsequent selected-entry branch. An uncertain publication
+may retain ownership and is not permission to delete the reserved path.
+
 The result is a discriminated union: `opened`, `selector`, `refused`,
 `uncertain_cursor`, `selection_incomplete`, or `startup_failed`. Only `opened`
 contains a published runtime and its registered `interaction` service/connection.

@@ -73,7 +73,7 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
-import { createCooperativeOwnerInspectors } from "../sdk/native-ownership";
+import { createCooperativeOwnerInspectors, createNativeOwnerInspectors } from "../sdk/native-ownership";
 import {
 	applyHeaderPatch,
 	buildStoredSessionEntries,
@@ -136,6 +136,7 @@ import {
 import {
 	admitOwnerMembership,
 	admitOwnerMembershipSync,
+	admitOwnerMembershipWithAsyncEvidence,
 	allocateFreshOwnerCreation,
 	assertOwnerTransferPublicationSourceSync,
 	captureOwnerTargetSync,
@@ -179,6 +180,7 @@ import {
 	RESUME_CURSOR_MAX_SUPERSEDES,
 	type ResumeGraphRecord,
 	reduceResumeTranscript,
+	resolveResumeCheckpoint,
 } from "./resume-cursor";
 import {
 	classifyResumeOperation,
@@ -188,6 +190,7 @@ import {
 	type ReconcileResult,
 	type ResumeClosureEvidence,
 	type ResumeCompletionRefusal,
+	type ResumeFreshCapture,
 	type ResumeMemberBinding,
 	type ResumeOperationEvidence,
 	type ResumeResidentEntry,
@@ -664,7 +667,38 @@ type ReservedCapturedFork = {
 	readonly fresh: FreshSessionState & { readonly sessionFile: string };
 	assertDestination(): void;
 	assertAvailable(): void;
+	assertSourceName(): void;
 };
+
+type CapturedForkSelection = {
+	readonly executionTargetLeafId: string | null;
+	readonly reserveSelectedForkTranscript?: SelectedForkTranscriptReservation;
+};
+
+type NativeCapturedForkSelection = CapturedForkSelection & {
+	readonly reserveSelectedForkTranscript: SelectedForkTranscriptReservation;
+	readonly exclusiveNative: true;
+	readonly signal?: AbortSignal;
+};
+
+type NativeCapturedForkPublication = {
+	pending?: PendingResumeOp;
+	dispatched?: boolean;
+	stagedCloseUncertain?: boolean;
+	proven?: boolean;
+};
+
+type NativeCapturedForkResult =
+	| { kind: "native_forked"; manager: SessionManager; membership: OwnerMembership; pending: PendingResumeOp }
+	| {
+			kind: "native_fork_retained";
+			manager: SessionManager;
+			membership: OwnerMembership;
+			pending: PendingResumeOp;
+			proven: boolean;
+			error: Error;
+	  }
+	| StrictSessionOpenFailure;
 
 type ReservedForkHistory = {
 	readonly bytes: number;
@@ -4085,11 +4119,25 @@ function prepareInitialCapturedFork(
 	cwd: string,
 	directory: string,
 	managed: boolean,
+	creation?: OwnerFreshCreation,
 ): ReservedCapturedFork {
 	const directoryIdentity = inspectCapturedForkDestination(directory);
 	const bindingFile = path.join(directory, MANAGED_SESSION_BINDING_FILE);
 	const binding = managed ? captureManagedFileNoFollow(bindingFile) : undefined;
-	const state = buildFreshSessionState(cwd, createSessionId(), directory, snapshot.identity.sessionId);
+	const state = buildFreshSessionState(
+		cwd,
+		creation?.headerId ?? createSessionId(),
+		directory,
+		snapshot.identity.sessionId,
+	);
+	// Native admission is async; bind every source ancestor, not just the file's inode.
+	const sourceAncestors = new Map<string, fs.BigIntStats>();
+	if (creation) {
+		for (let dir = path.dirname(snapshot.sourcePath); ; dir = path.dirname(dir)) {
+			sourceAncestors.set(dir, inspectCapturedForkDestination(dir));
+			if (path.dirname(dir) === dir) break;
+		}
+	}
 	const file = state.sessionFile!;
 	const fresh = { ...state, sessionFile: file };
 	const assertDestination = (): void => {
@@ -4101,11 +4149,12 @@ function prepareInitialCapturedFork(
 		)
 			throw Object.assign(new Error("Fork reservation destination changed"), { code: "destination_unavailable" });
 	};
-	const assertAvailable = (): void => {
-		assertDestination();
-		// lstat (not exists) also refuses a dangling symlink at either candidate name.
-		if (fs.lstatSync(file, { throwIfNoEntry: false }) || fs.lstatSync(file.slice(0, -6), { throwIfNoEntry: false }))
-			throw Object.assign(new Error("Fork reservation destination is occupied"), { code: "destination_unavailable" });
+	const assertSourceName = (): void => {
+		for (const [dir, expected] of sourceAncestors) {
+			const named = fs.lstatSync(dir, { bigint: true, throwIfNoEntry: false });
+			if (!named?.isDirectory() || named.dev !== expected.dev || named.ino !== expected.ino)
+				throw Object.assign(new Error("Captured fork source ancestry changed"), { code: "identity-mismatch" });
+		}
 		// The snapshot checks exact bytes and descriptor identity via its original
 		// canonical path. Also check that the requested name hasn't been rerouted.
 		const source = fs.lstatSync(snapshot.sourcePath, { bigint: true, throwIfNoEntry: false });
@@ -4121,8 +4170,15 @@ function prepareInitialCapturedFork(
 		)
 			throw Object.assign(new Error("Captured fork source identity changed"), { code: "identity-mismatch" });
 	};
+	const assertAvailable = (): void => {
+		assertDestination();
+		// lstat (not exists) also refuses a dangling symlink at either candidate name.
+		if (fs.lstatSync(file, { throwIfNoEntry: false }) || fs.lstatSync(file.slice(0, -6), { throwIfNoEntry: false }))
+			throw Object.assign(new Error("Fork reservation destination is occupied"), { code: "destination_unavailable" });
+		assertSourceName();
+	};
 	assertAvailable();
-	return { fresh, assertDestination, assertAvailable };
+	return { fresh, assertDestination, assertAvailable, assertSourceName };
 }
 
 function capturedForkCursor(
@@ -14142,6 +14198,7 @@ export class SessionManager {
 	#stageResumeOperation(
 		targetLeafId: string | null,
 		options: { op: string; reason: "explicit" | "pin" | "fork_init" },
+		reservedFork?: ReservedForkHistory,
 	): PendingResumeOp {
 		// An earlier ordinary first-write may already have published this member's
 		// marker. Certify that exact attempt before capturing the immutable prefix;
@@ -14161,6 +14218,7 @@ export class SessionManager {
 			!this.#flushed &&
 			!this.#ensuredOnDisk;
 		if (before.capture.kind !== "captured" && !initial) throw new Error(before.capture.error);
+		if (reservedFork && !initial) throw new Error("stale_snapshot");
 		const captured = before.capture.kind === "captured" ? before.capture : undefined;
 		const binding = this.#resumeBinding();
 		const initialPublication = initial
@@ -14177,7 +14235,10 @@ export class SessionManager {
 		const reduction = reduceResumeTranscript([...debt0.entries], captured?.snapshotDigest ?? resumeDigest(""));
 		if (reduction.checkpoint.kind === "invalid") throw new Error("invalid_resume_graph");
 		const candidates = (reduction.checkpoint.candidates ?? []).filter(id => id !== targetLeafId);
-		const marker = this.#stageOwnerMarker();
+		if (reservedFork && !util.isDeepStrictEqual(candidates, reservedFork.candidates))
+			throw new Error("stale_snapshot");
+		const marker = this.#stageOwnerMarker(reservedFork ? targetLeafId : this.#leafId);
+		if (reservedFork && !marker) throw new Error("participation_lost");
 		const planned: SessionEntry[] = marker ? [marker] : [];
 		const cursorIds: string[] = [];
 		let parent = targetLeafId;
@@ -14254,7 +14315,7 @@ export class SessionManager {
 				: debt0.preparedEntries
 						.filter(entry => entry.entry.type !== "session")
 						.map((entry, index) => resumeManifestEntry(entry, index, "dependent")),
-			preOpCommittedTail: before.executionTail ?? null,
+			preOpCommittedTail: reservedFork ? targetLeafId : (before.executionTail ?? null),
 			prepared,
 			ledger,
 			proofs: [],
@@ -26238,9 +26299,14 @@ export class SessionManager {
 		reservation: ReservedCapturedFork,
 		history: ReservedForkHistory,
 		target: string | null,
+		nativeFork?: {
+			readonly publication: NativeCapturedForkPublication;
+			assertSource(): void;
+		},
 	): Promise<SessionNoReplacePublicationReceipt> {
 		const file = reservation.fresh.sessionFile;
 		const publish = () => this.#withSessionPersistenceFenceSync(() => {
+			nativeFork?.assertSource();
 			reservation.assertAvailable();
 			const managed = this.destination.kind === "managed" ? this.#managedTranscriptStore(file) : undefined;
 			const openStagedWriter = this.#storage.openStagedWriter;
@@ -26264,7 +26330,13 @@ export class SessionManager {
 			);
 			if (bytes !== history.bytes || digest.copy().digest("hex") !== history.sha256)
 				throw new Error("stale_snapshot");
-			const { planned, parent } = this.#stageCapturedForkSelection(target, history.candidates);
+			const pending = nativeFork
+				? this.#stageResumeOperation(target, { op: crypto.randomUUID(), reason: "fork_init" }, history)
+				: undefined;
+			if (nativeFork) nativeFork.publication.pending = pending;
+			const { planned, parent } = pending
+				? { planned: nativeResumeBinding(pending).prepared.map(record => record.entry), parent: pending.CB }
+				: this.#stageCapturedForkSelection(target, history.candidates);
 			const marker = this.#ownerMarker;
 			if (!marker) throw new Error("participation_lost");
 			const suffix = planned.map(encode);
@@ -26274,6 +26346,7 @@ export class SessionManager {
 				throw new Error("invalid_resume_target");
 			reservation.assertAvailable();
 			managed?.assertBound();
+			if (nativeFork) nativeFork.publication.stagedCloseUncertain = true;
 			const staged = openStagedWriter.call(this.#storage, file, {
 				securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
 			});
@@ -26283,15 +26356,19 @@ export class SessionManager {
 				for (const line of suffix) staged.writeLine(line);
 				staged.fsync();
 				staged.closeSync();
+				if (nativeFork) nativeFork.publication.stagedCloseUncertain = false;
+				nativeFork?.assertSource();
 				reservation.assertAvailable();
 				managed?.assertBound();
 				marker.attempted = true;
+				if (nativeFork) nativeFork.publication.dispatched = true;
 				receipt = staged.publishNoReplace();
 			} catch (error) {
 				try {
 					staged.closeSync();
+					if (nativeFork) nativeFork.publication.stagedCloseUncertain = false;
 				} catch {
-					// Preserve the primary failure; the reserved pathname is not a cleanup capability.
+					// Neither the reserved pathname nor a failed close proves safe release.
 				}
 				throw error;
 			}
@@ -26305,6 +26382,7 @@ export class SessionManager {
 				throw new Error("durability_unproven");
 			const { capture, markers } = this.#verifyReservedForkInstallation(reservation, receipt);
 			if (capture.reducerView.leafEntryId !== parent) throw new Error("stale_snapshot");
+			if (pending) this.#proveReservedNativeFork(pending, receipt, capture);
 			const markerDigest = resumeDigest(suffix[0]!);
 			confirmOwnerFirstWriteMarkerSync(
 				owner,
@@ -26319,7 +26397,7 @@ export class SessionManager {
 					),
 			);
 			this.#ownerMarker = undefined;
-			for (const entry of planned) this.#heldPublicationEntries.delete(entry.id);
+			for (const entry of planned) if (entry.type !== "session") this.#heldPublicationEntries.delete(entry.id);
 			this.#leafId = parent;
 			this.#leafRevision++;
 			this.#flushed = true;
@@ -26338,6 +26416,54 @@ export class SessionManager {
 				},
 			);
 		});
+	}
+
+	#proveReservedNativeFork(
+		pending: PendingResumeOp,
+		receipt: SessionNoReplacePublicationReceipt,
+		capture: ResumeFreshCapture,
+	): void {
+		const state = nativeResumeBinding(pending);
+		const intent = pending.durabilityDebt.initialPublication;
+		if (!intent || capture.entries.length !== state.preOpEntries.length + pending.manifest.length)
+			throw new Error("stale_snapshot");
+		const initialPublication = Object.freeze({
+			...intent,
+			kind: "no_replace" as const,
+			publicationId: receipt.publicationId,
+			predecessor: "absent" as const,
+			successor: Object.freeze({
+				fileIdentity: Object.freeze({ dev: String(receipt.stat.dev), ino: String(receipt.stat.ino) }),
+				snapshotDigest: receipt.sha256,
+				snapshotByteLength: receipt.stat.size,
+			}),
+		});
+		state.initialPublication = initialPublication;
+		const refusal = validateNativeResumeCapture(pending, { capture });
+		if (refusal) throw new Error(refusal);
+		const ranges = Object.freeze(
+			capture.entries.slice(state.preOpEntries.length).map(entry => Object.freeze({ ...entry.range })),
+		);
+		const proof = Object.freeze({
+			kind: "sync_ok" as const,
+			initialPublication,
+			publicationId: receipt.publicationId,
+			fileIdentity: initialPublication.successor.fileIdentity,
+			namespaceSynced: receipt.namespaceSynced,
+			snapshotDigest: receipt.sha256,
+			snapshotByteLength: receipt.stat.size,
+			op: pending.op,
+			idxs: Object.freeze(ranges.map(range => range.idx)),
+			syncSeq: ++state.attempts,
+			ranges,
+		});
+		if (
+			validateDurabilityProof(proof, pending, capture, state.publicationSuccessions, initialPublication).length !==
+			ranges.length
+		)
+			throw new Error("durability_unproven");
+		state.proofs.push(proof);
+		state.durabilityState = "proven";
 	}
 
 	#verifyReservedForkInstallation(reservation: ReservedCapturedFork, receipt: SessionNoReplacePublicationReceipt) {
@@ -27933,18 +28059,47 @@ export class SessionManager {
 	static async forkFromCaptured(
 		snapshot: CapturedSessionTranscriptSnapshot,
 		cwd: string,
-		// Deferred managed placement keeps write preparation behind the reservation.
 		destinationInput?: SessionDestinationInput | { readonly managed: true; readonly agentDir: string },
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		sourceEntryId?: string | null,
-		nativeResume?: {
-			readonly executionTargetLeafId: string | null;
-			readonly reserveSelectedForkTranscript?: SelectedForkTranscriptReservation;
-		},
+		nativeResume?: CapturedForkSelection,
 	): Promise<StrictSessionForkResult> {
+		const result = await SessionManager.#forkFromCaptured(
+			snapshot, cwd, destinationInput, sessionMemoryMode, sourceEntryId, nativeResume,
+		);
+		if (result.kind !== "error" && result.kind !== "forked") throw new Error("unexpected_native_fork");
+		return result;
+	}
+
+	/** Produce the exact first operation for the native embedded coordinator. @internal */
+	static async forkNativeFromCaptured(
+		snapshot: CapturedSessionTranscriptSnapshot,
+		cwd: string,
+		destinationInput: SessionDestinationInput | { readonly managed: true; readonly agentDir: string },
+		selection: NativeCapturedForkSelection,
+	): Promise<NativeCapturedForkResult> {
+		const result = await SessionManager.#forkFromCaptured(snapshot, cwd, destinationInput, "auto", undefined, selection);
+		if (result.kind === "forked") throw new Error("unexpected_cooperative_fork");
+		return result;
+	}
+
+	static async #forkFromCaptured(
+		snapshot: CapturedSessionTranscriptSnapshot,
+		cwd: string,
+		// Deferred managed placement keeps write preparation behind the reservation.
+		destinationInput: SessionDestinationInput | { readonly managed: true; readonly agentDir: string },
+		sessionMemoryMode: SessionMemoryMode,
+		sourceEntryId?: string | null,
+		nativeResume?: CapturedForkSelection | NativeCapturedForkSelection,
+	): Promise<StrictSessionForkResult | NativeCapturedForkResult> {
 		const executionTargetLeafId = nativeResume?.executionTargetLeafId;
 		const reserve = nativeResume?.reserveSelectedForkTranscript;
+		const exclusive = nativeResume && "exclusiveNative" in nativeResume ? nativeResume : undefined;
+		const creation = exclusive ? allocateFreshOwnerCreation() : undefined;
+		const nativePublication: NativeCapturedForkPublication = {};
+		if (exclusive && (!reserve || sourceEntryId !== undefined)) throw new Error("fork_reservation_unsupported");
+		exclusive?.signal?.throwIfAborted();
 		if (reserve) cwd = path.resolve(cwd);
 		if (
 			sourceEntryId !== undefined &&
@@ -27988,7 +28143,7 @@ export class SessionManager {
 			const scopeInput = { cwd, agentDir, sessionsRoot: getSessionsDir(agentDir) };
 			const resolved = resolveManagedScope(scopeInput);
 			if (resolved.kind === "error") throw managedScopeStartupError("resolve", resolved);
-			reservation = prepareInitialCapturedFork(snapshot, cwd, resolved.scope.directoryPath, true);
+			reservation = prepareInitialCapturedFork(snapshot, cwd, resolved.scope.directoryPath, true, creation);
 			prepareReservedDestination = () => {
 				const current = resolveManagedScope(scopeInput);
 				if (current.kind === "error") throw managedScopeStartupError("resolve", current);
@@ -28006,7 +28161,7 @@ export class SessionManager {
 				const directory = path.resolve(destination.directory);
 				if (destination.kind === "explicit" && destination.directory !== directory)
 					destination = explicitDestination(directory, explicitProfileAgentDirs.get(destination));
-				reservation = prepareInitialCapturedFork(snapshot, cwd, directory, destination.kind === "managed");
+				reservation = prepareInitialCapturedFork(snapshot, cwd, directory, destination.kind === "managed", creation);
 			}
 		}
 		if (!reserve && boundedRequested && destination) {
@@ -28167,6 +28322,7 @@ export class SessionManager {
 			reservedHistory = measured;
 			reservation.assertAvailable();
 			await reserve(Object.freeze({ role: "staging", sessionId: fresh.sessionId, file: fresh.sessionFile }));
+			exclusive?.signal?.throwIfAborted();
 			reservation.assertAvailable();
 			const afterReservation = snapshot.revalidate();
 			if (afterReservation.kind !== "valid") return afterReservation;
@@ -28191,6 +28347,14 @@ export class SessionManager {
 		let privateStagingSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
 		let privateStagingPublished = false;
 		let directoryPublicationUncertain = false;
+		let membership: OwnerMembership | undefined;
+		const assertNativeSource = (): void => {
+			exclusive?.signal?.throwIfAborted();
+			reservation?.assertSourceName();
+			const checked = snapshot.revalidate();
+			if (checked.kind !== "valid")
+				throw Object.assign(new Error("Captured fork source changed"), { code: checked.reason });
+		};
 
 		try {
 			reservation?.assertAvailable();
@@ -28218,13 +28382,39 @@ export class SessionManager {
 						sourceStores: { textStore: null, imageStore: manager.#residentImageBlobStore },
 					},
 				},
-				"memory-fallback",
+				exclusive ? "memory-only" : "memory-fallback",
 			);
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition, !reservation);
 			manager.#retireEphemeralArtifacts();
 			reservation?.assertAvailable();
-			if (nativeResume) manager.#ensureOwnerMembershipSync();
+			if (exclusive) {
+				if (!creation || !reservation) throw new Error("fork_reservation_unsupported");
+				assertNativeSource();
+				const target = captureOwnerTargetSync({
+					transcriptPath: reservation.fresh.sessionFile,
+					headerId: fresh.sessionId,
+				});
+				if (target.transcriptPath !== reservation.fresh.sessionFile || target.transcriptExists)
+					throw new OwnerAuthorityError("stale_snapshot");
+				reservation.assertAvailable();
+				const expected = {
+					snapshotDigest: target.snapshotDigest,
+					resolved: resolveResumeCheckpoint([fresh.header], target.snapshotDigest),
+				};
+				membership = await admitOwnerMembershipWithAsyncEvidence(
+					target,
+					{ kind: "exclusive_native", expected, freshCreation: creation },
+					{
+						...createNativeOwnerInspectors({ cwd, agentDir: manager.#residentCacheProfileAgentDir() }),
+						runtime: "embedded_native",
+						capabilities: ["native_resume"],
+					},
+				);
+				assertNativeSource();
+				reservation.assertAvailable();
+				manager.installOwnerMembership(membership);
+			} else if (nativeResume) manager.#ensureOwnerMembershipSync();
 			if (!reservation) manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 			const beforeWrite = snapshot.revalidate();
 			if (beforeWrite.kind !== "valid") {
@@ -28235,7 +28425,13 @@ export class SessionManager {
 			if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
 			if (reservation) {
 				if (!reservedHistory) throw new Error("fork_reservation_envelope_unavailable");
-				const receipt = await manager.#publishReservedCapturedFork(reservation, reservedHistory, forkTarget);
+				const receipt = await manager.#publishReservedCapturedFork(
+					reservation,
+					reservedHistory,
+					forkTarget,
+					exclusive ? { publication: nativePublication, assertSource: assertNativeSource } : undefined,
+				);
+				if (exclusive) nativePublication.proven = true;
 				const finalSource = snapshot.revalidate();
 				if (finalSource.kind !== "valid") {
 					authorityFailure = finalSource;
@@ -28248,6 +28444,11 @@ export class SessionManager {
 						...managedIdentityFromDescriptor(receipt.stat),
 						sha256: receipt.sha256,
 					};
+				if (exclusive) {
+					if (!membership || !nativePublication.pending) throw new Error("participation_lost");
+					assertNativeSource();
+					return { kind: "native_forked", manager, membership, pending: nativePublication.pending };
+				}
 				writeTerminalBreadcrumb(manager.cwd, sessionFile);
 				return { kind: "forked", manager };
 			}
@@ -28405,6 +28606,33 @@ export class SessionManager {
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
 		} catch (error) {
+			if (exclusive && manager) {
+				const pending = nativePublication.pending;
+				if (membership && pending && (nativePublication.dispatched || nativePublication.stagedCloseUncertain))
+					return {
+						kind: "native_fork_retained",
+						manager,
+						membership,
+						pending,
+						proven: nativePublication.proven === true,
+						error: toError(error),
+					};
+				// No transcript publication was dispatched and the manager never escaped.
+				// Close the private resident state before releasing only its exact admission.
+				// No transcript or artifact pathname is cleanup authority here.
+				try {
+					const closed = await manager.closeStrict();
+					if (closed.kind !== "closed") throw closed.error;
+					if (membership) retireOwnerMembershipSync(membership);
+				} catch (retirementError) {
+					throw Object.assign(
+						new AggregateError([error, retirementError], "Fresh fork admission could not be retired"),
+						{ code: "fork_ownership_retained" },
+					);
+				}
+				if (authorityFailure) return authorityFailure;
+				throw error;
+			}
 			if (directoryPublicationUncertain) throw error;
 			if (manager) {
 				const cleanupErrors: Error[] = [];

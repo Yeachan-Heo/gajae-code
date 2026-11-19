@@ -22,7 +22,7 @@ import type {
 	ResumeRetirementEvidence,
 	ResumeTerminationAuthorization,
 } from "../session/resume-operation";
-import { SessionManager } from "../session/session-manager";
+import { type SelectedForkTranscriptReservation, SessionManager } from "../session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
 import type {
 	ActivityControlOperation,
@@ -36,6 +36,7 @@ import type { SdkComposerObservation } from "./composer-observation";
 import type { SdkDiffObservation } from "./diff-observation";
 import type { EmbeddedWorkSource } from "./embedded-work";
 import {
+	captureEmbeddedForkSource,
 	createEmbeddedAgentSession,
 	type EmbeddedAgentSessionOptions,
 	type EmbeddedAgentSessionResult,
@@ -77,6 +78,14 @@ export interface NativeEmbeddedOptions {
 export interface NativeFreshEmbeddedOptions {
 	readonly create: true;
 	readonly ownerPolicy: { readonly kind: "exclusive_native" };
+	/** Create from full captured history in an existing canonical destination (bound when managed). */
+	readonly fork?: {
+		readonly file: string;
+		readonly selection?: { readonly snapshotDigest: string; readonly targetLeafId: string | null };
+		/** Called before admission or publication. The reserved name conveys no ownership. */
+		readonly reserveSelectedForkTranscript: SelectedForkTranscriptReservation;
+		readonly signal?: AbortSignal;
+	};
 }
 export interface NativeEmbeddedAgentSessionOptions extends Omit<EmbeddedAgentSessionOptions, "storage"> {
 	readonly native: NativeEmbeddedOptions | NativeFreshEmbeddedOptions;
@@ -264,6 +273,10 @@ interface NativeOwner {
 	pending: PendingResumeOp;
 	readonly operations: Set<PendingResumeOp>;
 	readonly options: EmbeddedAgentSessionOptions;
+	readonly fork?: {
+		readonly signal?: AbortSignal;
+		readonly failure?: { readonly error: Error; readonly proven: boolean };
+	};
 	cleanup?: () => Promise<void>;
 	interaction?: NonNullable<EmbeddedWorkSource["interaction"]>;
 	last?: ReconcileResult;
@@ -357,7 +370,11 @@ export async function createNativeEmbeddedAgentSession(
 	options: NativeEmbeddedAgentSessionOptions,
 ): Promise<NativeEmbeddedOpenResult> {
 	const { native, storage, ...factory } = options;
-	if ("create" in native) return createFreshNative(options);
+	if ("create" in native) {
+		if (native.create !== true || native.ownerPolicy.kind !== "exclusive_native" || storage.file || storage.manager)
+			return { kind: "refused", reason: "policy_mismatch" };
+		return native.fork ? createCapturedNativeFork(options, native.fork) : createFreshNative(options);
+	}
 	if (!(native.ownerPolicy.kind === "exclusive_native") || !storage.file)
 		return { kind: "refused", reason: "policy_mismatch" };
 	const resolved = resolveEmbeddedResumeCheckpoint(storage.file);
@@ -434,7 +451,6 @@ export async function createNativeEmbeddedAgentSession(
 
 async function createFreshNative(options: NativeEmbeddedAgentSessionOptions): Promise<NativeEmbeddedOpenResult> {
 	const { storage, native: _native, ...factory } = options;
-	if (storage.file || storage.manager) return { kind: "refused", reason: "policy_mismatch" };
 	const destination =
 		"managed" in storage
 			? SessionManager.managedDestination(options.cwd, options.agentDir)
@@ -457,16 +473,67 @@ async function createFreshNative(options: NativeEmbeddedAgentSessionOptions): Pr
 	return beginNativeFactory(manager, membership, pending, { ...factory, storage: { ...storage, manager } });
 }
 
+async function createCapturedNativeFork(
+	options: NativeEmbeddedAgentSessionOptions,
+	fork: NonNullable<NativeFreshEmbeddedOptions["fork"]>,
+): Promise<NativeEmbeddedOpenResult> {
+	const { storage: inputStorage, native: _native, ...factory } = options;
+	const storage = { ...inputStorage };
+	const { signal, reserveSelectedForkTranscript } = fork;
+	if (options.controlOnly || typeof reserveSelectedForkTranscript !== "function")
+		return { kind: "refused", reason: "policy_mismatch" };
+	try {
+		signal?.throwIfAborted();
+		const { snapshot, target } = captureEmbeddedForkSource(fork);
+		try {
+			const destination =
+				"managed" in storage
+					? { managed: true as const, agentDir: factory.agentDir }
+					: SessionManager.explicitDestination(storage.directory, factory.agentDir);
+			const produced = await SessionManager.forkNativeFromCaptured(snapshot, factory.cwd, destination, {
+				executionTargetLeafId: target,
+				exclusiveNative: true,
+				reserveSelectedForkTranscript,
+				signal,
+			});
+			if (produced.kind === "error") return { kind: "refused", reason: produced.reason };
+			const { manager, membership, pending } = produced;
+			// Register this exact operation with the existing coordinator, never reopen the child.
+			return beginNativeFactory(
+				manager,
+				membership,
+				pending,
+				{ ...factory, storage: { ...storage, manager } },
+				{
+					signal,
+					failure: produced.kind === "native_fork_retained" ? produced : undefined,
+				},
+			);
+		} finally {
+			snapshot.close();
+		}
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+		if (code === "fork_ownership_retained") return { kind: "refused", reason: code };
+		if (signal?.aborted || (error instanceof Error && error.name === "AbortError"))
+			return { kind: "refused", reason: "cancelled" };
+		return { kind: "refused", reason: typeof code === "string" ? code : "fork_refused" };
+	}
+}
+
 function beginNativeFactory(
 	manager: SessionManager,
 	membership: OwnerMembership,
 	pending: PendingResumeOp,
 	admittedOptions: EmbeddedAgentSessionOptions,
+	fork?: NativeOwner["fork"],
 ): Promise<NativeEmbeddedOpenResult> {
 	const closures = new WeakMap<ResumeTerminationAuthorization, ResumeClosureEvidence>();
+	const unprovenFork = fork?.failure && !fork.failure.proven;
 	const coordinator = createNativeOpenCoordinator({
 		manager,
-		reconcile: (op, mode, routing) => manager.reconcileResumeOperation(op, mode, routing),
+		reconcile: (op, mode, routing) =>
+			manager.reconcileResumeOperation(op, unprovenFork ? "verifyReadOnly" : mode, routing),
 		captureAfterClose: (op, routing, closure) => manager.captureResumeOperationAfterClose(op, routing, closure),
 		getClosureEvidence: async (op, authorization) => {
 			const closure = await manager.getResumeClosureEvidence(op, authorization);
@@ -474,8 +541,10 @@ function beginNativeFactory(
 			else closures.delete(authorization);
 			return closure;
 		},
-		retire: (op, result, authorization) =>
-			retire({ manager, membership }, op, result, authorization, closures.get(authorization)),
+		retire: async (op, result, authorization) => {
+			if (unprovenFork) return undefined;
+			return retire({ manager, membership }, op, result, authorization, closures.get(authorization));
+		},
 	});
 	const owner: NativeOwner = {
 		manager,
@@ -484,6 +553,7 @@ function beginNativeFactory(
 		coordinator,
 		operations: new Set([pending]),
 		options: admittedOptions,
+		fork,
 	};
 	nativeOwners.set(manager, owner);
 	handles.set(coordinator.handle, owner);
@@ -507,22 +577,38 @@ async function constructNativeRuntime(
 	options: EmbeddedAgentSessionOptions,
 ): Promise<NativeEmbeddedOpenResult> {
 	const pending = owner.pending;
-	const selection = await owner.coordinator.resumeOpen(pending);
-	owner.last = selection;
-	if (selection.receipt.routing.action !== "PROCEED")
+	if (owner.fork?.failure && !owner.fork.failure.proven) {
+		// Lost or unconfirmed publication evidence can be observed but never replayed.
+		const selection = await reconcileNativeHandle(owner.coordinator.handle, pending, "verifyReadOnly");
+		owner.last = selection;
 		return {
-			kind: selection.receipt.routing.action === "RETAIN_LIVE" ? "uncertain_cursor" : "selection_incomplete",
+			kind: "uncertain_cursor",
 			handle: owner.coordinator.handle,
 			op: pending,
 			selection,
+			error: owner.fork.failure.error.message,
 		};
+	}
 	try {
+		if (owner.fork?.failure) throw owner.fork.failure.error;
+		const selection = await owner.coordinator.resumeOpen(pending);
+		owner.last = selection;
+		if (selection.receipt.routing.action !== "PROCEED")
+			return {
+				kind: selection.receipt.routing.action === "RETAIN_LIVE" ? "uncertain_cursor" : "selection_incomplete",
+				handle: owner.coordinator.handle,
+				op: pending,
+				selection,
+			};
+		owner.fork?.signal?.throwIfAborted();
 		const result = await createEmbeddedAgentSession(options);
 		if (!owner.interaction) throw new Error("native_interaction_not_registered");
 		owner.cleanup = () => result.releaseResources();
+		owner.fork?.signal?.throwIfAborted();
 		const handoff = await owner.coordinator.resumeOpen(pending);
 		owner.last = handoff;
 		if (handoff.receipt.routing.action !== "PROCEED") throw new Error("native_runtime_handoff_not_ready");
+		owner.fork?.signal?.throwIfAborted();
 		const handle = owner.coordinator.publishRuntime();
 		bindNativeRuntimeInvocation(
 			handle,
@@ -545,12 +631,21 @@ async function constructNativeRuntime(
 	} catch (error) {
 		const final = await owner.coordinator.startupFailed(pending);
 		owner.last = final;
+		let message = error instanceof Error ? error.message : String(error);
+		if (owner.fork) {
+			try {
+				await releaseClosedDependencies(owner);
+			} catch (cleanupError) {
+				// Keep the exact handle and cleanup capability if dependencies could not release.
+				message += `; ${String(cleanupError)}`;
+			}
+		}
 		return {
 			kind: "startup_failed",
 			handle: owner.coordinator.handle,
 			op: pending,
 			selection: final,
-			error: error instanceof Error ? error.message : String(error),
+			error: message,
 		};
 	}
 }

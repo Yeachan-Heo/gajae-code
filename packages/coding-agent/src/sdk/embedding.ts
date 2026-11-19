@@ -35,6 +35,7 @@ import {
 	type StrictInventoryCandidate,
 	type StrictInventoryFailure,
 	type StrictInventoryResult,
+	type TranscriptSnapshotHandle,
 } from "../session/session-manager";
 import {
 	assertSessionSpillCleanup,
@@ -747,6 +748,38 @@ export async function forkEmbeddedSession(
 	// The legacy missing-directory fork publishes by directory rename. It has no
 	// existing final parent to bind an exact reservation to, so refuse before capture.
 	if (reserveSelectedForkTranscript && !("managed" in input)) validateExplicitDestination(input.directory, true);
+	const { snapshot, target } = captureEmbeddedForkSource(input);
+	try {
+		if (!("managed" in input) && !reserveSelectedForkTranscript) validateExplicitDestination(input.directory, false);
+		const destination =
+			"managed" in input
+				? reserveSelectedForkTranscript
+					? { managed: true as const, agentDir: input.agentDir }
+					: SessionManager.managedDestination(input.cwd, input.agentDir)
+				: SessionManager.explicitDestination(input.directory, input.agentDir);
+		// Execution selection is separate from the legacy source history filter.
+		const fork = await SessionManager.forkFromCaptured(
+			snapshot,
+			input.cwd,
+			destination,
+			"copy-retain",
+			"auto",
+			undefined,
+			{ executionTargetLeafId: target, reserveSelectedForkTranscript },
+		);
+		if (fork.kind !== "forked")
+			throw Object.assign(new Error("Could not publish forked session"), { code: fork.reason, outcome: fork });
+		return fork.manager;
+	} finally {
+		snapshot.close();
+	}
+}
+
+/** Internal shared descriptor capture; the caller closes the returned snapshot. */
+export function captureEmbeddedForkSource(input: {
+	readonly file: string;
+	readonly selection?: { snapshotDigest: string; targetLeafId: string | null };
+}): { snapshot: TranscriptSnapshotHandle; target: string | null } {
 	const resolved = resolveEmbeddedResumeCheckpoint(input.file);
 	if (resolved.kind !== "resolved")
 		throw Object.assign(new Error("Could not resolve source transcript for fork"), { code: resolved.reason });
@@ -774,8 +807,12 @@ export async function forkEmbeddedSession(
 	try {
 		if (
 			capture.snapshot.identity.sha256 !== checkpoint.snapshotDigest ||
+			capture.snapshot.identity.canonicalPath !== resolved.identity.canonicalPath ||
 			capture.snapshot.identity.dev !== resolved.identity.dev ||
-			capture.snapshot.identity.ino !== resolved.identity.ino
+			capture.snapshot.identity.ino !== resolved.identity.ino ||
+			capture.snapshot.identity.ctimeNs !== resolved.identity.ctimeNs ||
+			capture.snapshot.identity.mtimeNs !== resolved.identity.mtimeNs ||
+			capture.snapshot.identity.nlink !== resolved.identity.nlink
 		)
 			throw Object.assign(new Error("Fork source changed since selection"), { code: "stale_snapshot", checkpoint });
 		const validated = capture.snapshot.revalidate();
@@ -793,29 +830,10 @@ export async function forkEmbeddedSession(
 					checkpoint,
 				});
 		}
-		if (!("managed" in input) && !reserveSelectedForkTranscript) validateExplicitDestination(input.directory, false);
-		const destination =
-			"managed" in input
-				? reserveSelectedForkTranscript
-					? { managed: true as const, agentDir: input.agentDir }
-					: SessionManager.managedDestination(input.cwd, input.agentDir)
-				: SessionManager.explicitDestination(input.directory, input.agentDir);
-		// Sixth argument remains the legacy history filter. Native target selection
-		// is separate so null and non-tail targets never discard original records.
-		const fork = await SessionManager.forkFromCaptured(
-			capture.snapshot,
-			input.cwd,
-			destination,
-			"copy-retain",
-			"auto",
-			undefined,
-			{ executionTargetLeafId: target, reserveSelectedForkTranscript },
-		);
-		if (fork.kind !== "forked")
-			throw Object.assign(new Error("Could not publish forked session"), { code: fork.reason, outcome: fork });
-		return fork.manager;
-	} finally {
+		return { snapshot: capture.snapshot, target };
+	} catch (error) {
 		capture.snapshot.close();
+		throw error;
 	}
 }
 

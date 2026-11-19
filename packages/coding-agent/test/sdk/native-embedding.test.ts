@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as sync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,6 +9,7 @@ import { createEmbeddedAgentSession } from "../../src/sdk/embedding";
 import {
 	attestEmbeddedLegacyTakeover,
 	consentEmbeddedDisconnect,
+	currentEmbeddedResumeOperation,
 	prepareEmbeddedDisconnect,
 	reconcileEmbeddedResumeCheckpoint,
 	resolveEmbeddedResumeCheckpoint,
@@ -20,7 +22,8 @@ import {
 	createAgentSession,
 } from "../../src/sdk/session";
 import { AuthStorage } from "../../src/session/auth-storage";
-import { FileSessionStorage } from "../../src/session/session-storage";
+import { SessionManager } from "../../src/session/session-manager";
+import { FileSessionStorage, type SessionNoReplacePublicationReceipt } from "../../src/session/session-storage";
 
 const roots: string[] = [];
 const authStores: AuthStorage[] = [];
@@ -51,6 +54,377 @@ const user = (id: string, parentId: string | null) => ({
 	timestamp: "2026-01-01T00:00:00.000Z",
 	message: { role: "user", content: id, timestamp: 1 },
 });
+
+describe("captured fresh native SDK fork", () => {
+	for (const scenario of ["explicit non-tail", "managed null", "explicit without cursors"] as const) {
+		it.skipIf(process.platform === "win32")(`opens ${scenario} from its one actual no-replace write`, async () => {
+			const managed = scenario === "managed null";
+			const history = managed
+				? Array.from({ length: 257 }, (_, i) => user(`u${i}`, null))
+				: scenario === "explicit non-tail"
+					? [user("a", null), user("b", "a")]
+					: [user("a", null)];
+			const f = await fixture(history);
+			const runtimeOptions = await forkRuntimeOptions(f);
+			const directory = managed ? SessionManager.managedDestination(f.cwd, f.agentDir).directory : f.root;
+			const file = managed ? path.join(directory, path.basename(f.file)) : f.file;
+			if (managed) {
+				await fs.rename(f.file, file);
+				await fs.chmod(file, 0o600);
+			}
+			const original = await Bun.file(file).text();
+			let reservedFile: string | undefined;
+			let reservedId: string | undefined;
+			let firstBytes: string | undefined;
+			let issued: SessionNoReplacePublicationReceipt | undefined;
+			let publications = 0;
+			let factories = 0;
+			const openStagedWriter = FileSessionStorage.prototype.openStagedWriter;
+			const stagedWriter = spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
+				this: FileSessionStorage,
+				file,
+				options,
+			) {
+				const staged = openStagedWriter.call(this, file, options);
+				if (file === reservedFile) {
+					const publish = staged.publishNoReplace.bind(staged);
+					staged.publishNoReplace = () => {
+						publications++;
+						issued = publish();
+						firstBytes = sync.readFileSync(file, "utf8");
+						return issued;
+					};
+				}
+				return staged;
+			});
+			const opened = await createEmbeddedAgentSession({
+				...runtimeOptions,
+				storage: managed ? { managed: true } : { directory },
+				native: {
+					create: true,
+					ownerPolicy: { kind: "exclusive_native" },
+					fork: {
+						file,
+						selection: {
+							snapshotDigest: f.resolution.checkpoint.snapshotDigest,
+							targetLeafId: managed ? null : "a",
+						},
+						reserveSelectedForkTranscript: async identity => {
+							expect(reservedFile).toBeUndefined();
+							expect(identity.role).toBe("staging");
+							expect(path.dirname(identity.file)).toBe(directory);
+							expect(sync.existsSync(identity.file)).toBe(false);
+							expect(sync.existsSync(ownerRecord(directory, identity.sessionId))).toBe(false);
+							reservedFile = identity.file;
+							reservedId = identity.sessionId;
+						},
+					},
+				},
+				createSession: async options => {
+					factories++;
+					expect(options.sessionManager?.getSessionOwnerEvidence()?.policy.kind).toBe("exclusive_native");
+					expect(options.sessionManager?.getSessionFile()).toBe(reservedFile);
+					expect(publications).toBe(1);
+					return createAgentSession(options);
+				},
+			}).finally(() => stagedWriter.mockRestore());
+			if (opened.kind !== "opened" || !reservedFile || !issued || firstBytes === undefined)
+				throw new Error(`Expected one actual native fork open: ${JSON.stringify(opened)}`);
+			const { handle, op, selection } = opened;
+			const manager = opened.result.session.sessionManager;
+			const owner = manager.getSessionOwnerEvidence();
+			expect(factories).toBe(1);
+			expect(publications).toBe(1);
+			expect(currentEmbeddedResumeOperation(handle)).toBe(op);
+			expect(op).toMatchObject({
+				memberToken: owner?.memberId,
+				authorityKey: owner?.authorityKey,
+				epoch: owner?.epoch,
+			});
+			expect(selection.receipt.routing.action).toBe("PROCEED");
+			expect(selection.receipt.durability.proof).toMatchObject({
+				op: op.op,
+				publicationId: issued.publicationId,
+				namespaceSynced: true,
+				snapshotDigest: issued.sha256,
+				initialPublication: { canonicalPath: reservedFile, headerId: reservedId, predecessor: "absent" },
+			});
+			const bytes = await Bun.file(reservedFile).text();
+			expect(bytes).toBe(firstBytes);
+			const [header, ...rows] = bytes
+				.trimEnd()
+				.split("\n")
+				.map(row => JSON.parse(row));
+			expect(header).toMatchObject({ type: "session", id: reservedId, parentSession: "selected" });
+			expect(rows.slice(0, history.length)).toEqual(history);
+			const [marker, ...cursors] = rows.slice(history.length);
+			expect(marker).toMatchObject({
+				id: op.plan.enroll,
+				parentId: managed ? null : "a",
+				customType: "gjc.owner_enroll",
+				data: { bind: reservedId, member: op.memberToken, epoch: op.epoch, runtime: "embedded_native" },
+			});
+			expect(cursors).toHaveLength(managed ? 2 : scenario === "explicit non-tail" ? 1 : 0);
+			expect(op.plan.cursorIds).toEqual(cursors.map(cursor => cursor.id));
+			for (const [idx, cursor] of cursors.entries())
+				expect(cursor).toMatchObject({
+					customType: "gjc.resume_cursor",
+					data: { op: op.op, idx, reason: "fork_init" },
+				});
+			expect(op.manifest.map(entry => entry.id)).toEqual(rows.slice(history.length).map(entry => entry.id));
+			expect(resolveEmbeddedResumeCheckpoint(reservedFile)).toMatchObject({
+				kind: "resolved",
+				checkpoint: { leafEntryId: op.CB, conversationLeafId: managed ? null : "a" },
+			});
+			expect(await Bun.file(file).text()).toBe(original);
+			expect(sync.existsSync(ownerRecord(path.dirname(file), "selected"))).toBe(false);
+			expect(() => opened.result.session.dispose({ strictCloseAttempts: 1 })).toThrow(
+				"Native disposal requires registry termination authorization",
+			);
+			const preparation = await prepareEmbeddedDisconnect(handle, op);
+			if (!preparation.inventory) throw new Error("Missing native owned-work inventory");
+			const consent = consentEmbeddedDisconnect(handle, preparation, {
+				stopAndJoin: true,
+				work: { inventory: preparation.inventory, targets: [] },
+			});
+			if (!consent) throw new Error("Missing registry termination consent");
+			const final = await terminateEmbeddedAgentSession(handle, { op, consent });
+			expect(final.receipt.terminalDisposition.kind).toBe("retired");
+			expect(await Bun.file(file).text()).toBe(original);
+		});
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a changed source or occupied reservation without claiming the name",
+		async () => {
+			for (const scenario of ["source ancestor", "foreign occupant"] as const) {
+				const f = await fixture([user("a", null)]);
+				const sourceDir = path.join(f.root, "source");
+				await fs.mkdir(sourceDir);
+				const file = path.join(sourceDir, "selected.jsonl");
+				await fs.rename(f.file, file);
+				const bytes = await Bun.file(file).text();
+				let reservedFile: string | undefined;
+				let reservedId: string | undefined;
+				let factories = 0;
+				const result = await createEmbeddedAgentSession({
+					cwd: f.cwd,
+					agentDir: f.agentDir,
+					storage: { directory: f.root },
+					native: {
+						create: true,
+						ownerPolicy: { kind: "exclusive_native" },
+						fork: {
+							file,
+							reserveSelectedForkTranscript: async ({ file, sessionId }) => {
+								reservedFile = file;
+								reservedId = sessionId;
+								if (scenario === "foreign occupant") await Bun.write(file, "foreign\n");
+								else {
+									await fs.rename(sourceDir, `${sourceDir}-original`);
+									await fs.mkdir(sourceDir);
+									await Bun.write(path.join(sourceDir, "selected.jsonl"), bytes);
+								}
+							},
+						},
+					},
+					createSession: async () => {
+						factories++;
+						throw new Error("Factory must not run");
+					},
+				});
+				expect(result).toMatchObject({
+					kind: "refused",
+					reason: scenario === "source ancestor" ? "identity-mismatch" : "destination_unavailable",
+				});
+				if (!reservedFile || !reservedId) throw new Error("Missing reservation");
+				expect(factories).toBe(0);
+				expect(sync.existsSync(ownerRecord(f.root, reservedId))).toBe(false);
+				if (scenario === "foreign occupant") expect(await Bun.file(reservedFile).text()).toBe("foreign\n");
+				else expect(sync.existsSync(reservedFile)).toBe(false);
+				expect(await Bun.file(file).text()).toBe(bytes);
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"retires only its unpublished admission on cancellation before dispatch",
+		async () => {
+			const f = await fixture([user("a", null)]);
+			await fs.mkdir(f.agentDir, { mode: 0o700 });
+			const bytes = await Bun.file(f.file).text();
+			const abort = new AbortController();
+			let file: string | undefined;
+			let record: string | undefined;
+			let memberBeforeAbort: string | undefined;
+			let factories = 0;
+			const install = SessionManager.prototype.installOwnerMembership;
+			const installing = spyOn(SessionManager.prototype, "installOwnerMembership").mockImplementation(function (
+				this: SessionManager,
+				membership,
+			) {
+				install.call(this, membership);
+				if (this.getSessionFile() === file) {
+					memberBeforeAbort = this.getSessionOwnerEvidence()?.policy.kind;
+					abort.abort();
+				}
+			});
+			const result = await createEmbeddedAgentSession({
+				cwd: f.cwd,
+				agentDir: f.agentDir,
+				storage: { directory: f.root },
+				native: {
+					create: true,
+					ownerPolicy: { kind: "exclusive_native" },
+					fork: {
+						file: f.file,
+						signal: abort.signal,
+						reserveSelectedForkTranscript: async identity => {
+							file = identity.file;
+							record = ownerRecord(f.root, identity.sessionId);
+						},
+					},
+				},
+				createSession: async () => {
+					factories++;
+					throw new Error("Factory must not run");
+				},
+			}).finally(() => installing.mockRestore());
+			expect(result).toMatchObject({ kind: "refused", reason: "cancelled" });
+			if (!file || !record) throw new Error("Missing reservation");
+			expect(memberBeforeAbort).toBe("exclusive_native");
+			expect(await Bun.file(record).json()).toMatchObject({ state: "retired", members: [] });
+			expect(sync.existsSync(file)).toBe(false);
+			expect(factories).toBe(0);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		},
+	);
+
+	for (const loseReceipt of [true, false])
+		it.skipIf(process.platform === "win32")(
+			loseReceipt
+				? "retains the exact attempt when the publication receipt is lost"
+				: "retires through the coordinator if cancelled after publication",
+			async () => {
+				const f = await fixture([user("a", null), user("b", "a")]);
+				await fs.mkdir(f.agentDir, { mode: 0o700 });
+				const abort = new AbortController();
+				const original = await Bun.file(f.file).text();
+				let file: string | undefined;
+				let factories = 0;
+				let publications = 0;
+				const openStagedWriter = FileSessionStorage.prototype.openStagedWriter;
+				const stagedWriter = spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
+					this: FileSessionStorage,
+					destination,
+					options,
+				) {
+					const staged = openStagedWriter.call(this, destination, options);
+					if (destination === file) {
+						const publish = staged.publishNoReplace.bind(staged);
+						staged.publishNoReplace = () => {
+							publications++;
+							const receipt = publish();
+							if (loseReceipt) throw new Error("lost initial publication receipt");
+							abort.abort();
+							return receipt;
+						};
+					}
+					return staged;
+				});
+				const retained = await createEmbeddedAgentSession({
+					cwd: f.cwd,
+					agentDir: f.agentDir,
+					storage: { directory: f.root },
+					native: {
+						create: true,
+						ownerPolicy: { kind: "exclusive_native" },
+						fork: {
+							file: f.file,
+							selection: { snapshotDigest: f.resolution.checkpoint.snapshotDigest, targetLeafId: "a" },
+							signal: abort.signal,
+							reserveSelectedForkTranscript: async identity => {
+								file = identity.file;
+							},
+						},
+					},
+					createSession: async () => {
+						factories++;
+						throw new Error("Factory must not run");
+					},
+				}).finally(() => stagedWriter.mockRestore());
+				if (!file || (retained.kind !== "uncertain_cursor" && retained.kind !== "startup_failed"))
+					throw new Error(`Expected a cancelled or unproven fork, got ${retained.kind}`);
+				const { handle, op } = retained;
+				const bytes = await Bun.file(file).text();
+				expect(bytes).toContain(`"op":"${op.op}"`);
+				if (loseReceipt) {
+					expect(retained.kind).toBe("uncertain_cursor");
+					expect(await Bun.file(op.authorityKey).json()).toMatchObject({
+						state: "live",
+						mode: "exclusive_native",
+						epoch: op.epoch,
+					});
+					expect(await resumeEmbeddedAgentSession(handle)).toMatchObject({ kind: "uncertain_cursor", handle, op });
+					const repair = await reconcileEmbeddedResumeCheckpoint(handle, { op, mode: "repairDurability" });
+					expect(repair.receipt.commitment.continueEligible).toBe(false);
+					const denied = await terminateEmbeddedAgentSession(handle, { op });
+					expect(denied.refusal).toBe("termination_not_authorized");
+				} else {
+					expect(retained.kind).toBe("startup_failed");
+					expect(retained.selection.receipt.terminalDisposition.kind).toBe("retired");
+					expect(await Bun.file(op.authorityKey).json()).toMatchObject({ state: "retired", members: [] });
+				}
+				expect(await Bun.file(file).text()).toBe(bytes);
+				expect(await Bun.file(f.file).text()).toBe(original);
+				expect(publications).toBe(1);
+				expect(factories).toBe(0);
+			},
+		);
+});
+
+function ownerRecord(directory: string, sessionId: string): string {
+	return path.join(directory, ".gjc-owners", `${sessionId}.json`);
+}
+
+async function forkRuntimeOptions(f: { cwd: string; agentDir: string }) {
+	const auth = await AuthStorage.create(path.join(f.agentDir, "auth.db"));
+	authStores.push(auth);
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Missing bundled test model");
+	auth.setRuntimeApiKey(model.provider, "test-only-key");
+	await Bun.write(
+		path.join(f.agentDir, "config.yml"),
+		JSON.stringify({
+			recipe: { enabled: false },
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			tools: { discoveryMode: "off" },
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		}),
+	);
+	return {
+		cwd: f.cwd,
+		agentDir: f.agentDir,
+		authStorage: auth,
+		model,
+		disableExtensionDiscovery: true,
+		extensions: [],
+		skills: [],
+		rules: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		enableMcpAutoload: false,
+		enableLsp: false,
+		skipPythonPreflight: true,
+		deferOptionalModelRefresh: true,
+		deferMemoryBackendStartup: true,
+		notificationHostModeSupported: false,
+		sdkHostModeSupported: false,
+		toolNames: ["read"],
+	} satisfies Omit<CreateAgentSessionOptions, "sessionManager" | "settings" | "modelRegistry" | "agentRegistry">;
+}
 
 describe("readonly-first native SDK embedding", () => {
 	for (const closureAvailable of [true, false])
