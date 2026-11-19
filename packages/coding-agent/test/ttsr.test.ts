@@ -1848,6 +1848,81 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(retry.split(siblingContent)).toHaveLength(2);
 	});
 
+	it.each([
+		["a distinct", "fast-2"],
+		["a reused", "slow-1"],
+	])("does not re-carry a reminder settled in an earlier assistant turn of the same prompt (%s tool call id)", async (_label, interruptingId) => {
+		// #7838: discard only drops the interrupted assistant turn. A reminder folded into an
+		// earlier turn's result stays in history, so the retry must not carry or re-mark it, even
+		// when the interrupted turn reuses that result's tool call id.
+		const siblingContent = "TTSR-SIBLING-REMINDER: settled in assistant turn one.";
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: new WriteTool(createToolSession()).parameters,
+			concurrency: "shared",
+			matcherDigest: args => (args as { content?: string }).content,
+			async execute() {
+				return { content: [{ type: "text", text: `${name} done` }] };
+			},
+		});
+		const call = (id: string, name: string, file: string, content: string): ToolCall => ({
+			type: "toolCall",
+			id,
+			name,
+			arguments: { path: path.join(tempDir, file), content },
+		});
+		const { session, modelMessages, ttsrManager } = createSession(
+			[makeTool("slow"), makeTool("fast")],
+			[[call("slow-1", "slow", "a.txt", "SIBLING-MARKER")]],
+			[
+				makeRule({
+					name: "sibling",
+					content: siblingContent,
+					condition: ["SIBLING-MARKER"],
+					interruptMode: "never",
+					repeatMode: "once",
+				}),
+				defaultExportRule({ interruptMode: "always", repeatMode: "once" }),
+			],
+			// The second assistant turn of the same prompt interrupts on the fast call.
+			{
+				streamToolArgs: true,
+				contextMode: "discard",
+				retryToolCalls: [call(interruptingId, "fast", "b.ts", "export default 1;\n")],
+			},
+		);
+		let settledCheckpoint: number | undefined;
+		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId === "slow-1"
+			)
+				settledCheckpoint ??= ttsrManager
+					.getInjectedRecords()
+					.find(record => record.name === "sibling")?.lastInjectedAt;
+		});
+		await run(session, "one prompt");
+
+		expect(toolResultText(session, "slow-1")).toContain(siblingContent);
+		// Turn one, the interrupted turn two, and the retry, all inside one prompt.
+		expect(modelMessages).toHaveLength(3);
+		const retry = JSON.stringify(modelMessages[2]);
+		expect(retry.split(RULE_CONTENT)).toHaveLength(2);
+		expect(retry.split(siblingContent)).toHaveLength(2);
+		const durable = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection");
+		expect(durable).toHaveLength(1);
+		expect((durable[0] as { details?: { rules?: string[] } }).details?.rules).toEqual(["named-exports"]);
+		expect(settledCheckpoint).toBeDefined();
+		expect(ttsrManager.getInjectedRecords().find(record => record.name === "sibling")?.lastInjectedAt).toBe(
+			settledCheckpoint,
+		);
+	});
+
 	async function exerciseManagedRetry(
 		contextMode: "keep" | "discard",
 		mode: "legacy" | "shared" | "shared-stale" | "shared-rejected",

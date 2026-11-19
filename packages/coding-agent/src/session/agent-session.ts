@@ -4899,10 +4899,11 @@ export class AgentSession {
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
 	/**
 	 * Settled per-tool reminders from tool results that completed before the TTSR retry.
-	 * Keyed by tool call id: { rules, reminderText }. Cleared after extraction into the retry injection.
+	 * Keyed by tool call id: { rules, reminderText, result }, where result is the delivered tool result
+	 * message that carries the reminder. Cleared after extraction into the retry injection.
 	 * Scoped to #ttsrSettledGeneration to prevent reminders from previous turns being re-injected.
 	 */
-	#settledToolTtsrReminders = new Map<string, { rules: Rule[]; reminderText: string }>();
+	#settledToolTtsrReminders = new Map<string, { rules: Rule[]; reminderText: string; result: ToolResultMessage }>();
 	/** Generation that owns the current settled reminders; cleared when a new turn starts. */
 	#ttsrSettledGeneration = 0;
 	/**
@@ -11121,6 +11122,7 @@ export class AgentSession {
 		this.#settledToolTtsrReminders.set(message.toolCallId, {
 			rules: folded.rules,
 			reminderText: folded.block.text,
+			result: message,
 		});
 		// Track the generation that owns this reminder to prevent cross-turn leaks (#7838).
 		this.#ttsrSettledGeneration = this.#promptGeneration;
@@ -11577,7 +11579,13 @@ export class AgentSession {
 						const discardedContent: string[] = [];
 						const settledRules: Rule[] = [];
 						if (this.#ttsrSettledGeneration === generation) {
-							for (const { rules, reminderText } of this.#settledToolTtsrReminders.values()) {
+							// Only results in the discarded suffix lose their folded reminder; an earlier
+							// assistant turn of the same prompt keeps its result, so carrying it again
+							// would duplicate the reminder and restart its checkpoint. Match the delivered
+							// result itself, since a later turn may reuse its tool call id.
+							const discarded = new Set(this.agent.state.messages.slice(targetAssistantIndex));
+							for (const { rules, reminderText, result } of this.#settledToolTtsrReminders.values()) {
+								if (!discarded.has(result)) continue;
 								for (const rule of rules) {
 									if (!ruleNames.includes(rule.name)) {
 										settledRules.push(rule);
@@ -11778,8 +11786,7 @@ export class AgentSession {
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
 						historyRewrite: { reason: "retry", preserveSeededPrefix: true },
 					});
-					
-					// Clear settled reminders after extraction
+					// Discarded results' reminders were carried above; retained ones stay in history.
 					this.#settledToolTtsrReminders.clear();
 				}
 				if (injection && details) {
