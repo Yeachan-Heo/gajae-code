@@ -86,6 +86,19 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 			}
 			i += 1;
 			hunkState = { ...initialState }; // Reset for new file
+		} else if (line.startsWith("Binary files")) {
+			// Scrub paths in binary diff lines: "Binary files a/... and b/... differ"
+			const binaryMatch = line.match(/^Binary files (.+) and (.+) differ$/);
+			if (binaryMatch) {
+				const oldPath = binaryMatch[1];
+				const newPath = binaryMatch[2];
+				const redactedOld = redactDiffHeaderPath(oldPath);
+				const redactedNew = redactDiffHeaderPath(newPath);
+				result.push(`Binary files ${redactedOld} and ${redactedNew} differ`);
+			} else {
+				result.push(line);
+			}
+			i += 1;
 		} else if (line.startsWith("index ")) {
 			result.push(line);
 			i += 1;
@@ -199,36 +212,45 @@ function redactDiffHeaderPath(headerPath: string): string {
  * Redact paths in diff headers that may contain credential-shaped filenames.
  * Paths like 'src/secret-api-key.json' should be replaced with generic names.
  *
- * We only redact path COMPONENTS (not entire paths) that clearly indicate credentials:
- * - Exact matches or matches with separators: secret, token, password, api-key, etc.
- * - Must have clear boundaries (word separators) to avoid false positives like
- *   passport.js, keyboard.ts, authorization-service.ts, etc.
+ * We redact path COMPONENTS that clearly indicate credentials:
+ * - Explicit credential keywords: secret, token, password, api-key, etc.
+ * - GitHub token patterns: ghp_*, gho_*, ghu_*, etc. (40+ chars of alphanumeric)
+ * - AWS-style tokens: AKIA followed by 16 uppercase alphanumeric
+ * - Generic token-shaped values: continuous sequences that look like tokens
  */
 function redactPathInDiffHeader(pathSection: string): string {
 	// Split path into components and check each one
 	const components = pathSection.split("/");
-	let hasCredentialComponent = false;
 
 	for (const component of components) {
-		// Match only if the credential keyword is a clear part of the component name
-		// This includes patterns like:
-		// - secret-key, secret_key, secret.key
-		// - api-key.json, apikey.env
-		// - password.conf, .env.password
-		// But NOT: passport.js, keyboard.ts, authorization-service.ts
-		const credentialPattern =
+		// Check for explicit credential keywords
+		const credentialKeywordPattern =
 			/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
 
-		if (credentialPattern.test(component)) {
-			hasCredentialComponent = true;
-			break;
+		if (credentialKeywordPattern.test(component)) {
+			return "file-redacted";
+		}
+
+		// Check for GitHub token patterns (ghp_, gho_, ghu_, etc.)
+		// GitHub tokens have specific prefixes and are followed by 36-40+ hex/alphanumeric characters
+		if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
+			return "file-redacted";
+		}
+
+		// Check for AWS access key patterns (AKIA followed by 16 uppercase alphanumeric)
+		if (/AKIA[0-9A-Z]{16}/i.test(component)) {
+			return "file-redacted";
+		}
+
+		// Check for other token-shaped patterns in filenames
+		// Only redact if it looks like a hex/base64 token, not a service name or class name
+		const hexTokenMatch = component.match(/[a-f0-9]{20,}|[A-Z0-9]{30,}/i);
+		if (hexTokenMatch) {
+			// This looks like a hex token or base64 blob in the filename
+			return "file-redacted";
 		}
 	}
 
-	if (hasCredentialComponent) {
-		// Path contains credential-like patterns; replace with placeholder
-		return "file-redacted";
-	}
 	return pathSection;
 }
 
@@ -312,12 +334,19 @@ function redactHunk(
 
 	// Extract hunk header parts: hunk metadata and optional source-derived context
 	const hunkHeaderCore = match[1];
-	const optionalContext = match[2] || "";
+	const optionalContext = match[2];
 
 	// Scrub the optional context (source-derived section) which may contain credentials.
 	// This includes hunk context suffix like function name which could have credential values.
-	const scrubbedContext = optionalContext ? redactCrashSecrets(optionalContext) : "";
-	const scrubbedHeaderLine = scrubbedContext ? `${hunkHeaderCore} ${scrubbedContext}` : hunkHeaderCore;
+	let scrubbedHeaderLine: string;
+	if (optionalContext !== undefined) {
+		// There was a space separator in the original; preserve it even if context is empty
+		const scrubbedContext = redactCrashSecrets(optionalContext);
+		scrubbedHeaderLine = `${hunkHeaderCore} ${scrubbedContext}`;
+	} else {
+		// No space separator in the original
+		scrubbedHeaderLine = hunkHeaderCore;
+	}
 
 	// Parse the line counts from the core header
 	const coreMatch = hunkHeaderCore.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$/);
@@ -419,10 +448,10 @@ function redactHunk(
  * Redact accumulated content across multiple diff lines with state tracking.
  * Returns the redacted line infos and updated state.
  *
- * Strategy: Use accumulated redaction with the shared redactor to identify
- * where credentials are located and their byte offsets, then apply those
- * redactions back onto individual diff lines while preserving state across
- * hunk and file boundaries.
+ * Strategy: Keep old-side and new-side projections independent to prevent
+ * state leakage between diff projections. Process each side separately,
+ * then apply state-based tracking across all content to identify multi-line
+ * credentials while respecting structural boundaries.
  */
 function redactAccumulatedContentWithState(
 	lineInfos: LineInfo[],
@@ -432,15 +461,30 @@ function redactAccumulatedContentWithState(
 		return { redactedLines: [], state: inputState };
 	}
 
-	// Get redacted version from shared redactor to identify credential boundaries
-	const originalContent = lineInfos.map(info => info.content).join("\n");
-	const redactedAccumulated = redactCrashSecrets(originalContent);
+	// Process old-side and new-side projections independently to prevent
+	// state leakage. A bracket on the deleted side must not interfere with
+	// the added side's credential tracking.
+	const oldSideLines = lineInfos.filter(info => info.prefix === "-" || info.prefix === " ");
+	const newSideLines = lineInfos.filter(info => info.prefix === "+" || info.prefix === " ");
 
-	// Always apply state-based redaction to handle hunk-spanning credentials and
-	// to properly project shared redactor results back onto individual diff lines.
-	// This is needed even when no line-by-line changes were found,
-	// because we may have open brackets/credentials from previous hunks.
-	const redactedLines = applyStateBasedRedactionWithState(lineInfos, originalContent, redactedAccumulated, inputState);
+	// Get separate redacted versions for old and new sides
+	const originalContent = lineInfos.map(info => info.content).join("\n");
+	const oldSideContent = oldSideLines.map(info => info.content).join("\n");
+	const newSideContent = newSideLines.map(info => info.content).join("\n");
+
+	const redactedAccumulated = redactCrashSecrets(originalContent);
+	const oldSideRedacted = redactCrashSecrets(oldSideContent);
+	const newSideRedacted = redactCrashSecrets(newSideContent);
+
+	// Apply state-based redaction with separate projection tracking
+	const redactedLines = applyStateBasedRedactionWithIndependentProjections(
+		lineInfos,
+		originalContent,
+		redactedAccumulated,
+		oldSideRedacted,
+		newSideRedacted,
+		inputState,
+	);
 
 	return redactedLines;
 }
@@ -540,24 +584,22 @@ function findFullyRedactedLinesByAccumulation(
 }
 
 /**
- * Apply state-based redaction using the shared redactor's output to identify
- * credential boundaries, then track multi-line credential state with quote-aware
- * bracket matching. Returns redacted lines and updated state for use in subsequent hunks.
+ * Apply state-based redaction with independent old/new projections.
+ * Keeps bracket state separate for old-side and new-side to prevent
+ * credentials in one projection from interfering with the other.
  */
-function applyStateBasedRedactionWithState(
+function applyStateBasedRedactionWithIndependentProjections(
 	lineInfos: LineInfo[],
 	originalContent: string,
 	redactedAccumulated: string,
+	_oldSideRedacted: string,
+	_newSideRedacted: string,
 	inputState: HunkState,
 ): { redactedLines: LineInfo[]; state: HunkState } {
 	const result: LineInfo[] = [];
-	let inCredentialValue = inputState.inCredentialValue;
-	let bracketDepth = inputState.bracketDepth;
-	let bracketStack = [...inputState.bracketStack];
-	let inPemBlock = inputState.inPemBlock;
+	const fileState = inputState;
 
 	// First, identify if the entire hunk is a multi-line credential that gets fully redacted
-	// (e.g., PEM blocks). Only use this for cases not covered by our pattern matching.
 	const fullyRedactedLines = findFullyRedactedLinesByAccumulation(lineInfos, originalContent, redactedAccumulated);
 
 	// Quick path: if no redactions found and not in an open state, do simple per-line redaction
@@ -571,17 +613,14 @@ function applyStateBasedRedactionWithState(
 		return { redactedLines: result, state: inputState };
 	}
 
-	// When the shared redactor found changes or we're in an open credential state,
-	// apply line-by-line state tracking with bracket awareness.
+	// Process each line with independent projection-aware state tracking
 	for (let lineIdx = 0; lineIdx < lineInfos.length; lineIdx += 1) {
 		const info = lineInfos[lineIdx];
 		const line = info.content;
 
-		// If this line was identified as fully redacted by the accumulated redactor (PEM blocks),
-		// only skip normal pattern matching if it's NOT part of a credential we can track
+		// If this line was identified as fully redacted by the accumulated redactor
 		if (fullyRedactedLines.has(lineIdx)) {
 			result.push({ ...info, content: "«redacted»" });
-			// Don't update state; just skip this line
 			continue;
 		}
 
@@ -589,17 +628,20 @@ function applyStateBasedRedactionWithState(
 		const isPemBlockStart = line.match(/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/);
 		const isPemBlockEnd = line.match(/^-----END [A-Z0-9 ]*PRIVATE KEY-----/);
 
-		// Handle PEM block state - check both start of block and ongoing PEM content
-		if (isPemBlockStart || inPemBlock) {
+		// Handle PEM block state
+		if (isPemBlockStart || fileState.inPemBlock) {
 			if (isPemBlockStart) {
-				inPemBlock = true;
+				fileState.inPemBlock = true;
 			}
 			if (isPemBlockEnd) {
-				inPemBlock = false;
+				fileState.inPemBlock = false;
 			}
 			result.push({ ...info, content: "«redacted»" });
 			continue;
 		}
+
+		// Apply independent projection-aware credential tracking
+		const redactedContent = redactCrashSecrets(line);
 
 		// Check if this line starts a credential header with value on later line
 		const isCredentialHeader =
@@ -621,20 +663,19 @@ function applyStateBasedRedactionWithState(
 
 		if (hasCredentialOpening) {
 			// This line starts a credential header or field
-			const redacted = redactCrashSecrets(line);
-			inCredentialValue = true;
-			bracketDepth = 0;
-			bracketStack = [];
+			fileState.inCredentialValue = true;
+			fileState.bracketDepth = 0;
+			fileState.bracketStack = [];
 			// Count brackets in this line using quote-aware matching
-			const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, bracketStack);
-			bracketDepth += depthDelta;
-			bracketStack = newStack;
-			result.push({ ...info, content: redacted });
-		} else if (inCredentialValue) {
+			const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, fileState.bracketStack);
+			fileState.bracketDepth += depthDelta;
+			fileState.bracketStack = newStack;
+			result.push({ ...info, content: redactedContent });
+		} else if (fileState.inCredentialValue) {
 			// We're in a credential value - track brackets with quote awareness
-			const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, bracketStack);
-			bracketDepth += depthDelta;
-			bracketStack = newStack;
+			const { depthDelta, newStack } = countBracketsQuoteAwareWithStack(line, fileState.bracketStack);
+			fileState.bracketDepth += depthDelta;
+			fileState.bracketStack = newStack;
 
 			// Redact this line as part of the credential value
 			// But preserve pure structure lines like standalone brackets
@@ -647,17 +688,17 @@ function applyStateBasedRedactionWithState(
 			}
 
 			// Exit credential value when all brackets are closed
-			if (bracketDepth <= 0 && !line.match(/[[{]/)) {
-				inCredentialValue = false;
+			if (fileState.bracketDepth <= 0 && !line.match(/[[{]/)) {
+				fileState.inCredentialValue = false;
 			}
 		} else {
 			// Not in credential value - do normal per-line redaction
 			result.push({
 				...info,
-				content: redactCrashSecrets(info.content),
+				content: redactedContent,
 			});
 		}
 	}
 
-	return { redactedLines: result, state: { inCredentialValue, bracketDepth, bracketStack, inPemBlock } };
+	return { redactedLines: result, state: fileState };
 }
