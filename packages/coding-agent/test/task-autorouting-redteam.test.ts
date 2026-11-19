@@ -14,7 +14,6 @@ import { generateTierChains } from "../src/config/autorouting-generator";
 import { CURATED_TIER_LABELS } from "../src/config/autorouting-tier-map";
 import { Settings } from "../src/config/settings";
 import type { RenderResultOptions } from "../src/extensibility/custom-tools/types";
-import { getThemeByName } from "../src/modes/theme/theme";
 import taskSummaryTemplate from "../src/prompts/tools/task-summary.md" with { type: "text" };
 import { projectRoutingForSummary, TaskTool } from "../src/task";
 import * as discoveryModule from "../src/task/discovery";
@@ -23,6 +22,7 @@ import { renderResult } from "../src/task/render";
 import type { SingleResult, TaskToolDetails } from "../src/task/types";
 import { assertRoutingEvidenceInvariant, type TaskRoutingEvidence } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({
@@ -382,8 +382,7 @@ describe("autorouting red-team adversarial suite", () => {
 	});
 
 	it("strips control sequences and bounds width when the TUI renders routing evidence", async () => {
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Failed to load test theme");
+		const theme = await loadTestTheme();
 		const hostile = "\x1b]0;pwned\x07\x1b[2Jprovider/model\x07\tx\nINJECTED-RESULT-ROW\r\nINJECTED-CRLF-ROW";
 		const evidence: TaskRoutingEvidence = {
 			tier: "fast",

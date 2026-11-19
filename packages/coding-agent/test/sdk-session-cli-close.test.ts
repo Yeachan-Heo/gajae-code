@@ -1,7 +1,8 @@
 import { beforeEach, expect, test } from "bun:test";
 import path from "node:path";
+import { scanPublicCommand } from "../src/cli/public-command-entry";
 import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
-import { runSdkSessionCli, type SdkSessionCliDependencies } from "../src/sdk/cli/session-cli";
+import { runSdkSessionCli, type SdkSessionCliDependencies, sdkPublicFailure } from "../src/sdk/cli/session-cli";
 
 const captured: { requests: unknown[]; listCalls: number } = { requests: [], listCalls: 0 };
 let executeResult: unknown = {
@@ -100,7 +101,7 @@ test("close reports a missing session without issuing a lifecycle mutation", asy
 	expect(exitCode).toBe(1);
 	expect(outputs[0]).toMatchObject({
 		ok: false,
-		error: { code: "endpoint_stale", category: "unavailable", outcomeCertainty: "unknown" },
+		error: { code: "not_found", category: "operation", outcomeCertainty: "not-applied", retryability: "no" },
 	});
 	expect(captured.requests).toEqual([]);
 	expect(captured.listCalls).toBe(1);
@@ -148,6 +149,52 @@ test("a retried close replays the identical request key for one endpoint generat
 test("an explicit idempotency key wins over the derived one", async () => {
 	await run({ action: "close", sessionId: "sess-1", idempotencyKey: "attempt-7" });
 	expect(captured.requests[0]).toMatchObject({ requestKey: "attempt-7" });
+});
+
+test("close --if-idle is public grammar and forwards the fence with a distinct stable request key", async () => {
+	const parsed = scanPublicCommand("sdk", ["session", "close", "sess-1", "--if-idle"]);
+	expect(parsed.kind).toBe("operation");
+	if (parsed.kind !== "operation") throw new Error("Expected close operation");
+	expect(parsed.flags["if-idle"]).toBe(true);
+	await run({ action: "close", sessionId: "sess-1", ifIdle: true });
+	await run({ action: "close", sessionId: "sess-1", jsonInput: '{"ifIdle":true}' });
+	expect(captured.requests).toHaveLength(2);
+	for (const request of captured.requests)
+		expect(request).toMatchObject({
+			target: { ifIdle: true },
+			requestKey: `sdk:session-cli:session.close:sess-1:3:${"a".repeat(64)}:if-idle`,
+		});
+});
+
+for (const [code, certainty, retryability] of [
+	["busy", "retryable", "yes"],
+	["not_found", "terminal", "no"],
+] as const) {
+	test(`broker ${code} remains a definite public refusal`, async () => {
+		executeResult = {
+			ok: false,
+			operation: "session.close",
+			certainty,
+			error: { code, message: "Private broker details" },
+		};
+		const { outputs, exitCode } = await run({ action: "close", sessionId: "sess-1", ifIdle: true });
+		expect(exitCode).toBe(1);
+		expect(outputs[0]).toMatchObject({ ok: false, error: { code, outcomeCertainty: "not-applied", retryability } });
+		expect(JSON.stringify(outputs)).not.toContain("Private broker details");
+	});
+}
+
+test("a generic not_found code cannot erase prior acceptance proof or invent no-effect proof", async () => {
+	for (const [proof, certainty] of [
+		[undefined, "unknown"],
+		["accepted", "applied"],
+	] as const) {
+		const rendered = await renderPublicCommandFailure(sdkPublicFailure("not_found", undefined, proof), {
+			command: ["sdk", "session", "send"],
+			json: true,
+		});
+		expect(rendered.envelope.error).toMatchObject({ code: "not_found", outcomeCertainty: certainty });
+	}
 });
 
 test("a refused close surfaces an unknown operation outcome and exits nonzero", async () => {

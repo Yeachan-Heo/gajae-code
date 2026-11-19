@@ -1,4 +1,11 @@
+import { logger } from "@gajae-code/utils";
+import { publishedRuntimeAbortCapability } from "../../broker/runtime-abort-capability";
 import { findOperation } from "../../protocol/operation-registry";
+import {
+	MAX_DURABLE_TERMINAL_RESERVATIONS,
+	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
+} from "../../protocol/terminal-abort-contract";
+import type { SdkFrame } from "../types";
 
 /**
  * Private fields carried only on Broker-authorized endpoint controls.
@@ -8,6 +15,15 @@ import { findOperation } from "../../protocol/operation-registry";
  * callers that do not hold the Broker's indexed lifecycle record cannot satisfy
  * either gate.
  */
+export const BROKER_RUNTIME_REVISE_CAPABILITY_FIELD = "__gjcBrokerReviseCapability";
+export function hasBrokerRuntimeReviseCapability(input: unknown): boolean {
+	const expected = EXPECTED_BROKER_RUNTIME_CLOSE_CAPABILITY;
+	return (
+		typeof expected === "string" &&
+		expected.length > 0 &&
+		record(input)?.[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD] === expected
+	);
+}
 export const BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD = "__gjcBrokerCloseCapability";
 /** Private field carried only on the Broker-authorized terminal-abort request. */
 export const BROKER_RUNTIME_ABORT_CAPABILITY_FIELD = "__gjcBrokerAbortCapability";
@@ -37,7 +53,11 @@ export function redactBrokerRuntimeCapabilities(frame: Record<string, unknown>):
 	let redacted = false;
 	const publicInput: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(input)) {
-		if (key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD || key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD) {
+		if (
+			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_REVISE_CAPABILITY_FIELD
+		) {
 			redacted = true;
 			continue;
 		}
@@ -225,8 +245,69 @@ export function setBrokerRuntimeAbortCapabilityForTest(capability: string | unde
 	brokerRuntimeAbortCapabilityOverrideForTest = capability;
 }
 
+/**
+ * Runtime-local authority check for the Broker-routed operator terminal abort.
+ *
+ * A lifecycle child expects its GJC_LIFECYCLE_REQUEST_ID. A TUI or direct CLI
+ * host expects the marker it published in its own index registration
+ * (`runtime-abort-capability.ts`); before that registration it accepts none.
+ */
 export function hasBrokerRuntimeAbortCapability(input: unknown): boolean {
-	const expected = brokerRuntimeAbortCapabilityOverrideForTest ?? EXPECTED_BROKER_RUNTIME_ABORT_CAPABILITY;
+	const expected =
+		brokerRuntimeAbortCapabilityOverrideForTest ??
+		(EXPECTED_BROKER_RUNTIME_ABORT_CAPABILITY || publishedRuntimeAbortCapability());
 	const actual = brokerRuntimeAbortCapability(input);
 	return typeof expected === "string" && expected.length > 0 && actual === expected;
+}
+
+/**
+ * Idempotency keys the attribution observer remembers: the full durable replay
+ * window (retained terminal-scope rows plus evicted-key tombstones). A same-key
+ * replay of a stopped abort is delivered as `turn: "stopped"` for as long as the
+ * durable store can replay it, so the notice dedup must outlive that window.
+ */
+export const OPERATOR_ABORT_ATTRIBUTION_KEY_WINDOW =
+	MAX_DURABLE_TERMINAL_RESERVATIONS + MAX_RETAINED_TERMINAL_KEY_TOMBSTONES;
+
+/** Terminal notice shown when a Broker-routed operator abort stops this host's turn. */
+export const OPERATOR_TERMINAL_ABORT_NOTICE = "Turn stopped by a remote operator.";
+
+/**
+ * Delivery observer that tells the person at this terminal who stopped the turn.
+ *
+ * Shared by every session host (SDK-only runtime and notification bus) so both
+ * attribute the same requests: only a Broker-authorized terminal abort whose
+ * written response reports `turn: "stopped"` is announced, and an idempotent
+ * replay of the same key is not announced twice while the durable store can still
+ * replay it. The oldest remembered key is forgotten first, mirroring the durable
+ * FIFO retention.
+ */
+export function createOperatorTerminalAbortAttribution(
+	notify: (message: string) => void,
+): (request: SdkFrame, response: SdkFrame | undefined) => void {
+	const attributed = new Set<string>();
+	return (request, response) => {
+		if (request.operation !== "turn.abort" || !response || response.ok !== true) return;
+		const input = request.input;
+		if (typeof input !== "object" || input === null || (input as { mode?: unknown }).mode !== "terminal") return;
+		if (!hasBrokerRuntimeAbortCapability(input)) return;
+		const result = response.result;
+		if (typeof result !== "object" || result === null || (result as { turn?: unknown }).turn !== "stopped") return;
+		const key = typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined;
+		if (key !== undefined) {
+			if (attributed.has(key)) return;
+			attributed.add(key);
+			if (attributed.size > OPERATOR_ABORT_ATTRIBUTION_KEY_WINDOW) {
+				const oldest = attributed.values().next();
+				if (!oldest.done) attributed.delete(oldest.value);
+			}
+		}
+		try {
+			notify(OPERATOR_TERMINAL_ABORT_NOTICE);
+		} catch (error) {
+			logger.warn("sdk: operator abort attribution failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
 }

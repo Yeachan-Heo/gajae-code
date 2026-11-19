@@ -10,7 +10,7 @@ import { UserMessageSelectorComponent } from "@gajae-code/coding-agent/modes/com
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import { ExtensionUiController } from "@gajae-code/coding-agent/modes/controllers/extension-ui-controller";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -20,6 +20,7 @@ import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator"
 import { type Component, Container, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { attachExactMcpControls } from "../src/runtime-mcp/redaction";
+import { loadTestTheme } from "./helpers/test-theme";
 
 class TestEditor extends Container {
 	#text = "";
@@ -55,8 +56,7 @@ interface Harness {
 const harnesses: Harness[] = [];
 
 beforeAll(async () => {
-	const selectedTheme = await getThemeByName("red-claw");
-	if (!selectedTheme) throw new Error("Expected red-claw theme");
+	const selectedTheme = await loadTestTheme();
 	setThemeInstance(selectedTheme);
 });
 

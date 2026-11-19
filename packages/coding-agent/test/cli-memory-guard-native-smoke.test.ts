@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { isMemoryGuardNativeSmokeFastPath, runMemoryGuardNativeSmokeFastPath } from "../src/cli-main";
+import { runMemoryGuardNativeSmoke } from "../src/cli/native-smoke";
+import { isMemoryGuardNativeSmokeFastPath } from "../src/cli-main";
 
 describe("memory-guard native smoke fast path", () => {
 	it("matches only the exact internal argv", () => {
@@ -15,9 +16,9 @@ describe("memory-guard native smoke fast path", () => {
 		);
 	});
 
-	it("emits the tagged native receipt without normal command dispatch", () => {
+	it("serializes the tagged native receipt through the dispatched smoke handler", async () => {
 		let stdout = "";
-		runMemoryGuardNativeSmokeFastPath({
+		await runMemoryGuardNativeSmoke({
 			loadNative: () => ({
 				probeWindowsJobMemory: () => ({ kind: "unsupported_platform", platform: "darwin" }),
 			}),

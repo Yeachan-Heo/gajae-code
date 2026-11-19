@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -8,6 +8,9 @@ import {
 	SessionManager,
 } from "../src/session/session-manager";
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "../src/session/session-staging-paths";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 async function makeTranscript(filePath: string, cwd: string, id: string): Promise<void> {
 	await mkdir(path.dirname(filePath), { recursive: true });
@@ -19,8 +22,8 @@ async function makeTranscript(filePath: string, cwd: string, id: string): Promis
 
 describe("staged session discovery exclusion", () => {
 	it("hides staged project transcripts while retaining a sibling transcript", async () => {
-		const cwd = await mkdtemp(path.join(tmpdir(), "gjc-discovery-cwd-"));
-		const agentDir = await mkdtemp(path.join(tmpdir(), "gjc-discovery-agent-"));
+		const cwd = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-discovery-cwd-"));
+		const agentDir = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-discovery-agent-"));
 		const scope = path.join(cwd, ".gjc", "sessions", "scope");
 		const staged = path.join(scope, SESSION_STAGING_DIRNAME, "attempt.jsonl");
 		const sibling = path.join(scope, "sibling.jsonl");
@@ -43,13 +46,53 @@ describe("staged session discovery exclusion", () => {
 		expect(isStagedSessionPath(path.join("/srv", SESSION_STAGING_DIRNAME, "gjc-sessions", "session.jsonl"))).toBe(
 			false,
 		);
-		const source = await readFile(new URL("../src/session/session-staging-paths.ts", import.meta.url), "utf8");
-		expect(source).not.toContain("session-manager");
-		expect(source).not.toContain("./artifacts");
+		const child = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"--eval",
+				`
+				const identities = JSON.parse(process.argv[1]).map(file => require.resolve(file));
+				const loaded = () => identities.map(file => Object.hasOwn(require.cache, file));
+				const cold = loaded();
+				const leaf = require(identities[0]);
+				const afterImport = loaded();
+				const results = JSON.parse(process.argv[2]).map(file => leaf.isStagedSessionPath(file));
+				const afterUse = loaded();
+				// Positive control: the same loader must expose the real session layer
+				// and its transitive artifact dependency, but only after the leaf observation.
+				require(identities[1]);
+				process.stdout.write(JSON.stringify({ cold, afterImport, results, afterUse, control: loaded() }));
+				`,
+				JSON.stringify(
+					["session-staging-paths.ts", "session-manager.ts", "artifacts.ts"].map(file =>
+						path.resolve(import.meta.dir, "../src/session", file),
+					),
+				),
+				JSON.stringify([
+					stagedPath,
+					path.join("/tmp", "agent-session", "sibling.jsonl"),
+					path.join("/srv", SESSION_STAGING_DIRNAME, "gjc-sessions", "session.jsonl"),
+				]),
+			],
+			cwd: path.resolve(import.meta.dir, ".."),
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+			killSignal: "SIGKILL",
+		});
+		expect(new TextDecoder().decode(child.stderr)).toBe("");
+		expect(child.exitCode).toBe(0);
+		expect(JSON.parse(new TextDecoder().decode(child.stdout))).toEqual({
+			cold: [false, false, false],
+			afterImport: [true, false, false],
+			results: [true, false, false],
+			afterUse: [true, false, false],
+			control: [true, true, true],
+		});
 	});
 
 	it("excludes sessions/<cwd>/.staging and agent-session/.staging from all four readers individually", async () => {
-		const cwd = await mkdtemp(path.join(tmpdir(), "gjc-four-reader-cwd-"));
+		const cwd = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-four-reader-cwd-"));
 		const projectScope = path.join(cwd, ".gjc", "sessions", "cwd-scope");
 		const agentSessionScope = path.join(cwd, ".gjc", "agent-session");
 		const projectStaged = path.join(projectScope, SESSION_STAGING_DIRNAME, "project-staged.jsonl");
@@ -75,8 +118,8 @@ describe("staged session discovery exclusion", () => {
 		expect(agentSessionPicker.map(session => session.id)).toEqual(["agent-sibling-id"]);
 
 		// Reader 3: managed picker/inventory must reject a managed .staging child.
-		const managedCwd = await mkdtemp(path.join(tmpdir(), "gjc-four-reader-managed-cwd-"));
-		const managedAgentDir = await mkdtemp(path.join(tmpdir(), "gjc-four-reader-managed-agent-"));
+		const managedCwd = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-four-reader-managed-cwd-"));
+		const managedAgentDir = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-four-reader-managed-agent-"));
 		const managedDestination = SessionManager.managedDestination(managedCwd, managedAgentDir);
 		const managedParent = SessionManager.create(managedCwd, managedDestination);
 		await managedParent.flush();

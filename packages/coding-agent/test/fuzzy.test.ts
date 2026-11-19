@@ -52,6 +52,22 @@ describe("fuzzyMatch", () => {
 		expect(notAtBoundary.matches).toBe(true);
 		expect(atBoundary.score).toBeLessThan(notAtBoundary.score);
 	});
+
+	test("scores the best alignment, not the first occurrence of each character", () => {
+		// Greedy matching takes "mode" from "modes" and pays a gap to reach the
+		// "l" in "model"; the contiguous, word-boundary "model" is the real match.
+		const laterExact = fuzzyMatch("model", "src/modes/model-picker.ts");
+		expect(laterExact.matches).toBe(true);
+		expect(laterExact.score).toBe(fuzzyMatch("model", "src/modes/model").score);
+		expect(laterExact.score).toBeLessThan(fuzzyMatch("model", "src/mode-list.ts").score);
+	});
+
+	test("finds a contiguous match behind a provider prefix", () => {
+		const prefixed = fuzzyMatch("argon", "anthropic-gpt-argon");
+		const scattered = fuzzyMatch("argon", "a-r-g-o-n");
+		expect(prefixed.matches).toBe(true);
+		expect(prefixed.score).toBeLessThan(scattered.score);
+	});
 });
 
 describe("fuzzyFilter", () => {
@@ -75,6 +91,11 @@ describe("fuzzyFilter", () => {
 
 		// "app" should be first (exact consecutive match at start)
 		expect(result[0]).toBe("app");
+	});
+
+	test("ranks an exact word above a scattered match earlier in the list", () => {
+		const items = ["src/mode-list.ts", "src/modes/model-picker.ts"];
+		expect(fuzzyFilter(items, "model", x => x)).toEqual(["src/modes/model-picker.ts", "src/mode-list.ts"]);
 	});
 
 	test("works with custom getText function", () => {

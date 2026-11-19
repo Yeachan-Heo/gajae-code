@@ -11,7 +11,7 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
-import { resolveEvalBackends, type ToolSession } from ".";
+import { type NestedToolScope, resolveEvalBackends, type ToolSession } from ".";
 import {
 	formatStyledTruncationWarning,
 	resolveOutputMaxColumns,
@@ -231,7 +231,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: z.infer<typeof evalSchema>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
@@ -257,14 +257,42 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const sessionFile = session.getSessionFile?.() ?? null;
 		const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? null;
 		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
-		const evalSession = {
+		// Reuse the model-facing eval call's scope, so nested tool reminders fold into
+		// that call's result and a late nested call cannot claim or invalidate a
+		// finished eval. Nested eval is refused: it would otherwise rebind the
+		// attribution to its synthetic bridge call id and the backend cannot re-enter
+		// its own kernel session.
+		const nestedToolScope: NestedToolScope = { parentToolCallId: toolCallId, abortController: new AbortController() };
+		const rejectNestedEval = (name: string): void => {
+			if (name === "eval") {
+				throw new ToolError("eval cannot be called from inside eval; add another cell to this eval call instead.");
+			}
+		};
+		const evalSession: ToolSession = {
 			...session,
 			cwd,
 			settings,
 			getSessionFile: () => sessionFile,
 			getEvalKernelOwnerId: () => kernelOwnerId,
+			getToolByName: name => {
+				rejectNestedEval(name);
+				return session.getToolByName?.(name);
+			},
+			// Nested `tool.<name>()` calls are attributed to this eval call so the
+			// session can apply tool-scoped TTSR rules and fold reminders into it.
+			getToolForExecution: session.getToolForExecution
+				? name => {
+						rejectNestedEval(name);
+						return session.getToolForExecution?.(name, { nestedToolScope });
+					}
+				: undefined,
 		};
 		const sessionAbortController = new AbortController();
+		// abortEval() aborts this controller, and detached nested calls must stop with
+		// it even when the bridge no longer forwards the eval-local signal.
+		const abortNestedScope = (): void => nestedToolScope.abortController.abort();
+		if (sessionAbortController.signal.aborted) abortNestedScope();
+		else sessionAbortController.signal.addEventListener("abort", abortNestedScope, { once: true });
 		const abortFromCaller = (): void => sessionAbortController.abort(signal?.reason);
 		if (signal?.aborted) abortFromCaller();
 		else signal?.addEventListener("abort", abortFromCaller, { once: true });

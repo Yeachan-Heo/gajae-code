@@ -16,7 +16,7 @@ import {
 	type ProviderSessionState,
 	type Usage,
 } from "@gajae-code/ai";
-import { logger, prompt } from "@gajae-code/utils";
+import { assertEndpointConfiguration, type EndpointConfiguration, logger, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage, AgentTool } from "../types";
 import type { AdaptiveCompactionDecisionState, AdaptiveCompactionOptions } from "./adaptive";
@@ -877,6 +877,8 @@ function formatAdditionalContext(context: string[] | undefined): string {
  * If previousSummary is provided, uses the update prompt to merge.
  */
 export interface SummaryOptions {
+	/** Opaque captured endpoint routing shared with the originating request. */
+	endpointConfiguration?: EndpointConfiguration;
 	promptOverride?: string;
 	extraContext?: string[];
 	remoteEndpoint?: string;
@@ -987,15 +989,21 @@ const SUMMARY_FENCE_OPEN = "<untrusted-content>\n";
 const SUMMARY_FENCE_CLOSE = "\n</untrusted-content>";
 
 /**
- * Closers that would end the summary fence or the surrounding conversation
- * block. Whitespace before ">" still closes the tag, so those spellings go too.
+ * Neutralize sequences that would close wrapper tags used in the compaction prompt
+ * (conversation, untrusted-content, previous-summary, summary), without lossy HTML
+ * entity encoding that corrupts code. We insert zero-width spaces to break the tag
+ * syntax instead. Whitespace before ">" still closes the tag, so those spellings go too.
  */
 function escapeSummaryFenceClosers(text: string): string {
 	return text
-		.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "&lt;/untrusted-content>")
-		.replace(/<\/conversation>/gi, "&lt;/conversation>")
-		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "&lt;/conversation>");
+		.replace(/<\/untrusted-content>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/untrusted-content[ \t\n\r\f]+>/gi, "<\u200b/untrusted-content>")
+		.replace(/<\/conversation>/gi, "<\u200b/conversation>")
+		.replace(/<\/conversation[ \t\n\r\f]+>/gi, "<\u200b/conversation>")
+		.replace(/<\/previous-summary>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/summary>/gi, "<\u200b/summary>")
+		.replace(/<\/summary[ \t\n\r\f]+>/gi, "<\u200b/summary>");
 }
 
 /**
@@ -1028,6 +1036,18 @@ function outboundSummaryText(text: string, convert: ConvertToLlm): string {
 	return text;
 }
 
+/**
+ * Frame a stored previous summary at the model boundary.
+ * Outbound conversion already ran; this text is not clipped.
+ * Fence and conversation closers stay neutralized, and previous-summary closers are too.
+ */
+export function frameOutboundPreviousSummary(text: string): string {
+	const escaped = escapeSummaryFenceClosers(text)
+		.replace(/<\/previous-summary>/gi, "<\u200b/previous-summary>")
+		.replace(/<\/previous-summary[ \t\n\r\f]+>/gi, "<\u200b/previous-summary>");
+	return `${SUMMARY_FENCE_OPEN}${escaped}${SUMMARY_FENCE_CLOSE}`;
+}
+
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model,
@@ -1038,6 +1058,7 @@ export async function generateSummary(
 	previousSummary?: string,
 	options?: SummaryOptions,
 ): Promise<string> {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
@@ -1059,7 +1080,8 @@ export async function generateSummary(
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		const outboundPreviousSummary = outboundSummaryText(previousSummary, options?.convertToLlm ?? convertToLlm);
-		promptText += `<previous-summary>\n${outboundPreviousSummary}\n</previous-summary>\n\n`;
+		const framedPreviousSummary = frameOutboundPreviousSummary(outboundPreviousSummary);
+		promptText += `<previous-summary>\n${framedPreviousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
 	promptText += basePrompt;
@@ -1099,6 +1121,8 @@ export async function generateSummary(
 			providerSessionId: options?.providerSessionId,
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
+			endpointConfiguration: options?.endpointConfiguration,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary" },
 	);
@@ -1120,6 +1144,8 @@ export async function generateSummary(
 // ============================================================================
 
 export interface HandoffOptions {
+	/** Opaque captured endpoint routing shared with the originating request. */
+	endpointConfiguration?: EndpointConfiguration;
 	/** Live agent system prompt — passed verbatim so providers hit the cached prefix. */
 	systemPrompt: string[];
 	/** Live agent tool list — same purpose. Forced to `toolChoice: "none"`. */
@@ -1159,11 +1185,38 @@ export interface HandoffOptions {
 	preferWebsockets?: boolean;
 }
 
+/** Characters of handoff focus or prompt extension kept before framing. */
+export const HANDOFF_UNTRUSTED_FIELD_MAX_CHARS = 4_000;
+
+const HANDOFF_FIELD_OPEN = "<untrusted-content>\n";
+const HANDOFF_FIELD_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Tail-clip, then frame. The fence is the last step so a tail cut cannot drop
+ * the opener or leave a closer outside it.
+ */
+function clipHandoffField(text: string): string {
+	if (text.length <= HANDOFF_UNTRUSTED_FIELD_MAX_CHARS) return text;
+	let start = text.length - HANDOFF_UNTRUSTED_FIELD_MAX_CHARS;
+	// A code-unit cut can begin on a low surrogate and emit an isolated half of a character.
+	const code = text.charCodeAt(start);
+	if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+	return text.slice(start);
+}
+
+function frameHandoffField(text: string): string {
+	const clipped = clipHandoffField(text);
+	const escaped = clipped
+		.replace(/<\s*\/?\s*untrusted-content(?=[\s>/]|$)/gi, tag => tag.replace(/</g, "&lt;"))
+		.replace(/<\s*\/\s*instruction(?=[\s>/]|$)/gi, tag => tag.replace(/</g, "&lt;"));
+	return `${HANDOFF_FIELD_OPEN}${escaped}${HANDOFF_FIELD_CLOSE}`;
+}
+
 export function renderHandoffPrompt(customInstructions?: string, promptExtension?: string): string {
 	if (!customInstructions && !promptExtension) return HANDOFF_DOCUMENT_PROMPT;
 	return prompt.render(handoffDocumentPrompt, {
-		additionalFocus: customInstructions,
-		promptExtension,
+		additionalFocus: customInstructions ? frameHandoffField(customInstructions) : customInstructions,
+		promptExtension: promptExtension ? frameHandoffField(promptExtension) : promptExtension,
 	});
 }
 
@@ -1174,6 +1227,7 @@ export async function generateHandoff(
 	options: HandoffOptions,
 	signal?: AbortSignal,
 ): Promise<string> {
+	assertEndpointConfiguration(options.endpointConfiguration);
 	const llmMessages = (options.convertToLlm ?? convertToLlm)(messages);
 	const requestMessages: Message[] = [
 		...llmMessages,
@@ -1204,6 +1258,8 @@ export async function generateHandoff(
 			providerSessionId: options.providerSessionId,
 			providerSessionState: options.providerSessionState,
 			preferWebsockets: options.preferWebsockets,
+			endpointConfiguration: options.endpointConfiguration,
+			authCredentialType: options.authCredentialType,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "handoff" },
 	);
@@ -1479,6 +1535,7 @@ export async function compact(
 	signal?: AbortSignal,
 	options?: SummaryOptions,
 ): Promise<CompactionResult> {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -1493,6 +1550,8 @@ export async function compact(
 	} = preparation;
 
 	const summaryOptions: SummaryOptions = {
+		endpointConfiguration: options?.endpointConfiguration,
+		authCredentialType: options?.authCredentialType,
 		promptOverride: options?.promptOverride,
 		extraContext: options?.extraContext,
 		remoteEndpoint: settings.remoteEnabled === false ? undefined : settings.remoteEndpoint,
@@ -1530,7 +1589,10 @@ export async function compact(
 					remoteHistory,
 					summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PROMPT,
 					signal,
-					{ authCredentialType: options?.authCredentialType },
+					{
+						authCredentialType: options?.authCredentialType,
+						endpointConfiguration: summaryOptions.endpointConfiguration,
+					},
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
 				summaryOptions.remoteCompactionFallbackHealth?.recordRemoteCompactionFallback({
@@ -1654,6 +1716,7 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	options?: SummaryOptions,
 ): Promise<string> {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
@@ -1682,6 +1745,8 @@ async function generateTurnPrefixSummary(
 			providerSessionId: options?.providerSessionId,
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
+			endpointConfiguration: options?.endpointConfiguration,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix" },
 	);

@@ -1,19 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { trustedTmuxLaunchIdentityEnv } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import type { ProjectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { mulberry32 } from "../helpers/seeded-random";
 
 const PROPERTY_SEED = 493;
 const PROPERTY_INPUTS = 64;
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let next = Math.imul(state ^ (state >>> 15), 1 | state);
-		next = (next + Math.imul(next ^ (next >>> 7), 61 | next)) ^ next;
-		return ((next ^ (next >>> 14)) >>> 0) / 4294967296;
-	};
-}
 
 describe("tmux launch identity property", () => {
 	it("property: tmux launch identity snapshot agreement, seed 493, 64 inputs", () => {

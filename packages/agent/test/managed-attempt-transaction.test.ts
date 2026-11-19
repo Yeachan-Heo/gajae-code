@@ -14,6 +14,7 @@ import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agen
 import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
 import { classifyFallbackTrigger, transportFailureFacts } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { kProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { attachUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import { logger } from "@gajae-code/utils";
@@ -1904,6 +1905,57 @@ describe("managed attempt transaction", () => {
 				const partial = assistantMessage(mock.model);
 				partial.content.push({ type: "text", text: "\uD800".repeat(100_000) });
 				stream.push({ type: "start", partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		let outcomeCalls = 0;
+		const previous = process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+		process.env.GJC_FALLBACK_MAX_STAGED_BYTES = String(400 * 1024);
+		try {
+			await agent.prompt("run", {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: () => {
+					outcomeCalls += 1;
+					return { type: "retry", continuation: () => {} };
+				},
+			});
+			await agent.waitForIdle();
+			expect(outcomeCalls).toBe(0);
+			expect(agent.state.error).toBe("Agent run failed.");
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind).toBe("local_buffer_overflow");
+			const overflow = (terminal as unknown as { bufferOverflow?: { stage: string; maxStagedBytes: number } })
+				.bufferOverflow;
+			expect(overflow?.stage).toBe("overflow.preMeasure");
+			expect(overflow?.maxStagedBytes).toBe(400 * 1024);
+		} finally {
+			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+			else process.env.GJC_FALLBACK_MAX_STAGED_BYTES = previous;
+		}
+	});
+
+	it("counts a multi-line non-ASCII string as its UTF-8 bytes plus its JSON escapes when bounding staging", async () => {
+		// 90 000 repeats of a Hangul syllable and a newline are 180 002 bytes
+		// counted as UTF-16 units and 360 002 as UTF-8 without the `\n`
+		// escapes, both under the 400 KiB cap used here, but 450 002 as
+		// serialized JSON (over it). The walk must reject it up front as
+		// `overflow.preMeasure`; either undercount would accept the message.
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				partial.content.push({ type: "text", text: "한\n".repeat(90_000) });
+				stream.push({ type: "start", partial });
+				// Ends the stream so an accepted start fails the assertions below
+				// instead of the test timeout. The final message is empty on
+				// purpose: a `done` carrying `partial` is rejected at `message_end`
+				// with the same `overflow.preMeasure` and hides an undercount.
+				stream.push({ type: "done", reason: "stop", message: assistantMessage(mock.model) });
 			});
 			return stream;
 		};
@@ -4380,5 +4432,137 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			0,
 		);
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+	});
+
+	// An agent-in-a-call provider (Devin ACP) reports tool calls it already ran and
+	// re-publishes the whole growing message on every update. Staging such a run
+	// hid side effects that already happened and overflowed the provisional cap
+	// on long runs, killing the subagent.
+	describe("provider-executed tool calls", () => {
+		const inheritedBytes = process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+		afterEach(() => {
+			if (inheritedBytes === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+			else process.env.GJC_FALLBACK_MAX_STAGED_BYTES = inheritedBytes;
+		});
+		const providerRun = (mock: ReturnType<typeof createMockModel>, updates: number, terminal: "done" | "error") => {
+			const stream = new AssistantMessageEventStream();
+			const partial = assistantMessage(mock.model);
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial });
+				for (let i = 0; i < updates; i++) {
+					const block = {
+						type: "toolCall" as const,
+						id: `call-${i}`,
+						name: "edit",
+						arguments: { path: `f${i}.ts`, body: "y".repeat(2_000) },
+						[kProviderResolvedToolCall]: true as const,
+					};
+					partial.content.push(block);
+					const index = partial.content.length - 1;
+					stream.push({ type: "toolcall_start", contentIndex: index, partial });
+					stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial });
+				}
+				if (terminal === "done") {
+					partial.content.push({ type: "text", text: "done" });
+					stream.push({ type: "done", reason: "stop", message: partial });
+				} else {
+					const failure: AssistantMessage = {
+						...partial,
+						stopReason: "error",
+						errorMessage: "upstream 503",
+						transportFailure: { kind: "transport", status: 503 },
+					};
+					stream.push({ type: "error", reason: "error", error: failure });
+				}
+			});
+			return stream;
+		};
+
+		it("publishes a long provider-executed run live instead of overflowing the staging cap", async () => {
+			process.env.GJC_FALLBACK_MAX_STAGED_BYTES = String(64 * 1024);
+			const mock = createMockModel();
+			// 60 calls of ~2 KB each, every update re-publishing the whole message:
+			// staged, the cumulative snapshots exceed 64 KB many times over.
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => providerRun(mock, 60, "done"),
+			});
+			const seenBeforeEnd: number[] = [];
+			let ended = false;
+			agent.subscribe(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") ended = true;
+				if (event.type === "message_update" && !ended) seenBeforeEnd.push(1);
+			});
+
+			await agent.prompt("run", { fallbackManaged: true });
+			await agent.waitForIdle();
+
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind).toBeUndefined();
+			expect(terminal.stopReason).toBe("stop");
+			expect(terminal.content.filter(block => block.type === "toolCall")).toHaveLength(60);
+			expect(seenBeforeEnd.length).toBeGreaterThan(0);
+		});
+
+		it("reports the real incoming size when accumulated snapshots overflow, not the whole cap", async () => {
+			process.env.GJC_FALLBACK_MAX_STAGED_BYTES = String(64 * 1024);
+			const mock = createMockModel();
+			// Same growth without the provider-executed marker: these frames are staged.
+			const streamFn = () => {
+				const stream = new AssistantMessageEventStream();
+				const partial = assistantMessage(mock.model);
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial });
+					for (let i = 0; i < 60; i++) {
+						const block = {
+							type: "toolCall" as const,
+							id: `c${i}`,
+							name: "edit",
+							arguments: { b: "y".repeat(300) },
+						};
+						partial.content.push(block);
+						stream.push({ type: "toolcall_end", contentIndex: i, toolCall: block, partial });
+					}
+				});
+				return stream;
+			};
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn,
+			});
+
+			await agent.prompt("run", { fallbackManaged: true });
+			await agent.waitForIdle();
+
+			const overflow = (agent.state.messages.at(-1) as AssistantMessage).bufferOverflow!;
+			expect(overflow.stagedBytes).toBeGreaterThan(0);
+			// Each pair is far below the cap; the overflow is accumulation.
+			expect(overflow.incomingEventBytes).toBeLessThan(overflow.maxStagedBytes);
+			expect(overflow.stagedBytes + overflow.incomingEventBytes).toBeGreaterThan(overflow.maxStagedBytes);
+		});
+
+		it("does not offer a failure after provider-executed calls for a managed replay", async () => {
+			const mock = createMockModel();
+			const outcomes: ManagedAttemptOutcome[] = [];
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => providerRun(mock, 2, "error"),
+			});
+
+			await agent.prompt("run", {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: outcome => {
+					outcomes.push(outcome);
+					return { type: "terminal", terminal: { stopReason: "error" } };
+				},
+			});
+			await agent.waitForIdle();
+
+			// A 503 is normally a retryable server failure; here the calls already ran.
+			expect(outcomes).toHaveLength(0);
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.stopReason).toBe("error");
+			expect(terminal.content.filter(block => block.type === "toolCall")).toHaveLength(2);
+		});
 	});
 });

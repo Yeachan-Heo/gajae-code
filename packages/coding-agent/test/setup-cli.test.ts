@@ -165,6 +165,49 @@ describe("setup CLI parsing", () => {
 		expect(parsed.providers["custom-minimax"]?.models.map(model => model.id)).toEqual(["custom-model"]);
 	});
 
+	it("reports failure instead of JSON success when the merged models config cannot load", async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-setup-cli-"));
+		const modelsPath = path.join(tempRoot, "models.yml");
+		const broken = [
+			"providers:",
+			"  broken:",
+			"    baseUrl: https://broken.example/v1",
+			"    api: openai-completions",
+			"    auth: apiKey",
+			"    models:",
+			"      - id: broken-model",
+			"",
+		].join("\n");
+		await Bun.write(modelsPath, broken);
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("exit");
+		}) as never);
+
+		await expect(
+			runSetupCommand({
+				component: "provider",
+				flags: {
+					json: true,
+					compat: "openai",
+					provider: "new-provider",
+					baseUrl: "https://example.invalid/v1",
+					apiKeyEnv: "NEW_PROVIDER_KEY",
+					model: ["new-model"],
+					modelsPath,
+				},
+			}),
+		).rejects.toThrow("exit");
+
+		const output = stdout.mock.calls.map(call => String(call[0])).join("");
+		expect(exit).toHaveBeenCalledWith(1);
+		expect(output).toContain('"ok": false');
+		expect(output).toContain("Provider broken: custom models need a credential source");
+		expect(output).not.toContain('"providerId"');
+		// The atomic rename never ran, so the pre-existing broken file is untouched.
+		expect(await Bun.file(modelsPath).text()).toBe(broken);
+	});
+
 	describe("Hermes setup", () => {
 		afterEach(async () => {
 			vi.restoreAllMocks();

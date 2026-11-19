@@ -39,12 +39,14 @@ let beforeCorruptRetireForTests: (() => void) | undefined;
 let beforeLockExactUnlinkForTests: ((lockPath: string) => void) | undefined;
 
 /**
- * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
- * "tool_choice forces tool use is not compatible with this model"). Catalog
- * generation and dynamic discovery use this to default `toolChoiceSupport`.
+ * Claude Mythos and Claude Fable 5.1+ accept tools but reject forced tool use
+ * (Anthropic 400: "tool_choice forces tool use is not compatible with this
+ * model"). Fable 5 still accepts it. Catalog generation and dynamic discovery
+ * use this to default `toolChoiceSupport`.
+ * https://platform.claude.com/docs/en/build-with-claude/thinking#response-prefill-and-forced-tool-use
  */
 export function isClaudeForcedToolChoiceIncapableModelId(modelId: string): boolean {
-	return /(?:^|[/.])claude-mythos(?:-|$)/i.test(modelId);
+	return /(?:^|[/.])claude-(?:mythos(?:-|$)|fable-5[-.][1-9](?!\d))/i.test(modelId);
 }
 
 /** Derives the effective static tool-choice support from compatibility flags. */

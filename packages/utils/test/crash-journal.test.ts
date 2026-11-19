@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,10 +13,20 @@ import {
 } from "../src/crash-journal";
 import { recordFatalCrash } from "../src/postmortem";
 
+const trackedTempDirs: string[] = [];
+function trackedTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(() => {
+	for (const dir of trackedTempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 const FP = "0123456789abcdef0123456789abcdef";
 
 function tempDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-journal-"));
+	return trackedTempDir("gjc-crash-journal-");
 }
 
 function occurrence(overrides: Partial<CrashOccurrenceEvent> = {}): CrashOccurrenceEvent {

@@ -6,16 +6,11 @@ import {
 	resetTerminalAbortRegistriesForTests,
 } from "@gajae-code/coding-agent/session/terminal-abort";
 import { logger } from "@gajae-code/utils";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import { JobsObserver } from "../../src/modes/jobs-observer";
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 describe("AsyncJobManager delivery reliability", () => {
 	test("reentrant drains wait for the enrolled delivery callback", async () => {

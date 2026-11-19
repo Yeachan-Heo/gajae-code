@@ -1,10 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { getThemeByName } from "@gajae-code/coding-agent/modes/theme/theme";
+
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { ResolveTool, resolveToolRenderer } from "@gajae-code/coding-agent/tools/resolve";
 import { sanitizeText } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function createSession(handler?: (input: unknown) => Promise<unknown>): ToolSession {
 	return {
@@ -105,7 +106,7 @@ describe("ResolveTool", () => {
 });
 
 it("renders a highlighted apply summary", async () => {
-	const theme = await getThemeByName("red-claw");
+	const theme = await loadTestTheme();
 	expect(theme).toBeDefined();
 	const uiTheme = theme!;
 

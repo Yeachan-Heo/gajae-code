@@ -235,11 +235,19 @@ const PROVIDER_OWNED_STREAM_WATCHDOG: LazyStreamLimits = {
  * the heavier Gemini 3.x Pro tiers at high thinking levels. Bump the first-event
  * floor to five minutes so duke et al. stop seeing spurious "stream timed out
  * while waiting for the first event" aborts on legitimate cold reasoning starts.
- * The steady-state idle watchdog stays on the global default since the upstream
- * emits thinking tokens frequently once it gets going.
+ *
+ * The steady-state idle window gets the same five-minute floor. Cloud Code
+ * Assist delivers a `functionCall` part only after the model has generated its
+ * complete arguments, so a large tool call (for example a `bash` or `write`
+ * call carrying a multi-kilobyte file body) is preceded by minutes with no
+ * SSE data at all after earlier text/thinking chunks. Under the shared 120s
+ * idle default those turns failed with "Provider stream stalled while waiting
+ * for the next event" and lost every streamed chunk, and the retry regenerated
+ * the same oversized call into the same silent gap.
  */
 const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 	defaultFirstEventTimeoutMs: 300_000,
+	defaultIdleTimeoutMs: 300_000,
 };
 
 /**

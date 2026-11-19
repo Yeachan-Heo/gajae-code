@@ -898,6 +898,24 @@ function ownerStartIdentity(pid: number): { start_time: string; start_time_forma
 	return { start_time: "unknown" };
 }
 
+/**
+ * Parse owner-record bytes, treating a trailing run of NUL bytes like the space padding
+ * `writeOwnerBytes` emits.
+ *
+ * NTFS and file-system filters (cloud sync placeholders, crash recovery) can publish a
+ * file length whose tail data never landed, and that tail reads back as zero-filled.
+ * The complete record before it is still a fully attributable owner, so it is judged by
+ * the same validation as any other record. Rejecting it as unparseable instead wedges
+ * the lock forever with `lock_owner_record_unprovenanced`, even when it is a released
+ * tombstone. Only TRAILING NULs are stripped: a NUL anywhere inside the document still
+ * fails `JSON.parse`.
+ */
+function parseOwnerRecordBytes(bytes: string): unknown {
+	let end = bytes.length;
+	while (end > 0 && bytes.charCodeAt(end - 1) === 0) end--;
+	return JSON.parse(end === bytes.length ? bytes : bytes.slice(0, end));
+}
+
 function validLockOwner(value: unknown): value is SessionStateLockOwner {
 	if (!value || typeof value !== "object") return false;
 	const owner = value as Partial<SessionStateLockOwner>;
@@ -1637,7 +1655,7 @@ async function rewriteHeldOwnerRecord(
 		if (canonical.bytes !== writtenBytes.toString("utf8")) {
 			let successor: unknown;
 			try {
-				successor = JSON.parse(canonical.bytes);
+				successor = parseOwnerRecordBytes(canonical.bytes);
 			} catch {
 				successor = null;
 			}
@@ -1706,7 +1724,7 @@ async function acquireOwnerLock(
 		if (!current) throw error;
 		let observed: unknown;
 		try {
-			observed = JSON.parse(current.bytes);
+			observed = parseOwnerRecordBytes(current.bytes);
 		} catch {
 			throw error;
 		}
@@ -1746,7 +1764,7 @@ async function acquireOwnerLock(
 async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
 	let owner: unknown;
 	try {
-		owner = JSON.parse(held.bytes);
+		owner = parseOwnerRecordBytes(held.bytes);
 	} catch {
 		owner = null;
 	}
@@ -1807,7 +1825,7 @@ async function reclaimStaleOwnerRecord(
 	if (!snapshot) return "absent_or_changed";
 	let owner: unknown;
 	try {
-		owner = JSON.parse(snapshot.bytes);
+		owner = parseOwnerRecordBytes(snapshot.bytes);
 	} catch {
 		owner = null;
 	}
@@ -1912,7 +1930,7 @@ async function releaseTransitionClaim(
 ): Promise<void> {
 	let heldOwner: SessionStateLockOwner;
 	try {
-		heldOwner = JSON.parse(held.bytes) as SessionStateLockOwner;
+		heldOwner = parseOwnerRecordBytes(held.bytes) as SessionStateLockOwner;
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
 	}
@@ -2005,7 +2023,7 @@ async function reclaimStaleTransitionClaim(
 	if (!ownerSnapshot) return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	let owner: unknown;
 	try {
-		owner = JSON.parse(ownerSnapshot.bytes);
+		owner = parseOwnerRecordBytes(ownerSnapshot.bytes);
 	} catch {
 		return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	}
@@ -2203,7 +2221,7 @@ async function recoverPendingTransitionRelease(
 			if (!pendingOwner) return false;
 			let parsed: Partial<SessionStateLockOwner>;
 			try {
-				parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+				parsed = parseOwnerRecordBytes(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 			} catch {
 				// A rewrite can truncate the held inode and fail before replacement
 				// bytes land. The malformed payload is still ours only when its object
@@ -2237,7 +2255,7 @@ async function recoverPendingTransitionRelease(
 				pendingOwner = await captureRegularLockOwner(ownerFile);
 				if (!pendingOwner) return false;
 				try {
-					parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+					parsed = parseOwnerRecordBytes(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 				} catch {
 					return false;
 				}

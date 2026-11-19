@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import { type GeneratedProvider, getBundledModel, type Usage } from "@gajae-code/ai";
-import { getConfigRootDir, getStatsDbPath } from "@gajae-code/utils";
+import { getConfigRootDir, getStatsDbPath, redactCrashSecrets } from "@gajae-code/utils";
 import type {
 	AgentRole,
 	AgentStats,
@@ -64,6 +64,7 @@ const AGENT_ROLE_BACKFILL_KEY = "agent_role_attribution_v1";
 const USER_MESSAGES_BACKFILL_KEY = "user_messages_v5";
 const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v1";
 const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v1";
+const FOLDER_ATTRIBUTION_BACKFILL_KEY = "folder_attribution_v1";
 function shouldResetBackfill(value: string | undefined): boolean {
 	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
 }
@@ -220,6 +221,7 @@ export async function initDb(): Promise<Database> {
 	backfillUserMessages(db);
 	repairUserMessageLinks(db);
 	backfillPriorityPremiumRequests(db);
+	backfillFolderAttribution(db);
 	backfillMissingCatalogCosts(db);
 	return db;
 }
@@ -357,13 +359,22 @@ export function setFileOffset(sessionFile: string, offset: number, lastModified:
 }
 
 /**
+ * Credential shapes are removed before the row is bound. The session file stays as recorded.
+ * The full error string is scrubbed first; nothing is sliced before that call.
+ */
+function scrubbedErrorMessage(errorMessage: string | null): string | null {
+	if (errorMessage === null) return null;
+	return redactCrashSecrets(errorMessage);
+}
+
+/**
  * Insert message stats into the database.
  */
 export function insertMessageStats(stats: ParsedMessageStats[]): number {
 	if (!db || stats.length === 0) return 0;
 
-	// Re-syncs repair role attribution for existing rows and only promote
-	// `premium_requests`; every other message field stays immutable.
+	// Re-syncs repair role and folder attribution for existing rows and only
+	// promote `premium_requests`; every other message field stays immutable.
 	const stmt = db.prepare(`
 		INSERT INTO messages (
 			session_file, entry_id, agent, folder, model, provider, api, timestamp,
@@ -374,8 +385,11 @@ export function insertMessageStats(stats: ParsedMessageStats[]): number {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(session_file, entry_id) DO UPDATE SET
 			agent = excluded.agent,
+			folder = excluded.folder,
 			premium_requests = MAX(messages.premium_requests, excluded.premium_requests)
-		WHERE messages.agent <> excluded.agent OR messages.premium_requests < excluded.premium_requests
+		WHERE messages.agent <> excluded.agent
+			OR messages.folder <> excluded.folder
+			OR messages.premium_requests < excluded.premium_requests
 	`);
 
 	let inserted = 0;
@@ -394,7 +408,7 @@ export function insertMessageStats(stats: ParsedMessageStats[]): number {
 				s.duration,
 				s.ttft,
 				s.stopReason,
-				s.errorMessage,
+				scrubbedErrorMessage(s.errorMessage),
 				s.usage.input,
 				s.usage.output,
 				s.usage.cacheRead,
@@ -1101,6 +1115,35 @@ export function markUserMessageLinksRepairComplete(): void {
 		USER_MESSAGE_LINKS_REPAIR_KEY,
 		BACKFILL_COMPLETE,
 	);
+}
+
+/**
+ * One-shot wipe of `file_offsets` so the next sync re-parses every session
+ * and re-derives `folder` from the session header's recorded `cwd`. Sessions
+ * written by the v2 managed session storage live under opaque
+ * `v2-<digest>` directories, so rows ingested before the parser learned to
+ * read the header carry the digest as their folder. The ON CONFLICT repair
+ * in `insertMessageStats` updates `folder` on re-parse; `user_messages`
+ * keeps its historical values because no query reads its folder column.
+ * Idempotent: gated by a sentinel row in `meta`.
+ *
+ * Sentinel lifecycle: identical to the four shipped backfill keys above.
+ * Both "pending" and "complete" suppress the wipe (shouldResetBackfill),
+ * legacy timestamp values force a retry, and the exported mark*Complete
+ * helpers have no shipped caller, so "pending" is the terminal state in
+ * practice for every key. Marking "complete" after sync would be behavior
+ * no existing backfill has; this key deliberately follows the same contract.
+ */
+function backfillFolderAttribution(database: Database): void {
+	const row = database.prepare("SELECT value FROM meta WHERE key = ?").get(FOLDER_ATTRIBUTION_BACKFILL_KEY) as
+		| { value: string }
+		| undefined;
+	if (!shouldResetBackfill(row?.value)) return;
+
+	database.exec("DELETE FROM file_offsets");
+	database
+		.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+		.run(FOLDER_ATTRIBUTION_BACKFILL_KEY, BACKFILL_PENDING);
 }
 
 /**

@@ -1,7 +1,9 @@
 import { visibleWidth, wrapTextWithAnsi, truncateToWidth, sliceWithWidth, extractSegments, Ellipsis } from "../src/utils";
 import { matchesKey } from "../src/keys";
+import { createBench } from "./harness";
 
 const ITERATIONS = 2000;
+const bench = createBench(ITERATIONS);
 
 const samples = {
 	plain: "hello world this is a plain ASCII string with some words",
@@ -12,18 +14,6 @@ const samples = {
 };
 
 const wrapWidth = 40;
-
-function bench(name: string, fn: () => void): number {
-	const start = Bun.nanoseconds();
-	for (let i = 0; i < ITERATIONS; i++) {
-		fn();
-	}
-	const elapsed = (Bun.nanoseconds() - start) / 1e6;
-	const perOp = (elapsed / ITERATIONS).toFixed(6);
-	console.log(`${name}: ${elapsed.toFixed(2)}ms total (${perOp}ms/op)`);
-	return elapsed;
-}
-
 console.log(`Text layout benchmark (${ITERATIONS} iterations)\n`);
 
 bench("visibleWidth/plain", () => {

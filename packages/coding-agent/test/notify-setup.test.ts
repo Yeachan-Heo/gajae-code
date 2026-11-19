@@ -102,10 +102,7 @@ function setupSettings(globalSettings: Record<string, unknown> = {}): Settings {
 		configurable: true,
 		writable: true,
 		value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
-			for (const patch of patches) {
-				if (patch.op === "set") settings.set(patch.path, patch.value as never);
-				else settings.unset(patch.path);
-			}
+			await Settings.prototype.commitAtomicBatch.call(settings, patches);
 			return {
 				revisions: [],
 				restore: async () => ({ status: "discarded" }),
@@ -536,10 +533,7 @@ describe("notify setup cli", () => {
 			let commits = 0;
 			Object.defineProperty(settings, "commitAtomicBatch", {
 				value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
-					for (const patch of patches) {
-						if (patch.op === "set") settings.set(patch.path, patch.value as never);
-						else settings.unset(patch.path);
-					}
+					await Settings.prototype.commitAtomicBatch.call(settings, patches);
 					const commit = ++commits;
 					return {
 						revisions: [],
@@ -618,10 +612,7 @@ describe("notify setup cli", () => {
 			let commits = 0;
 			Object.defineProperty(settings, "commitAtomicBatch", {
 				value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
-					for (const patch of patches) {
-						if (patch.op === "set") settings.set(patch.path, patch.value as never);
-						else settings.unset(patch.path);
-					}
+					await Settings.prototype.commitAtomicBatch.call(settings, patches);
 					const commit = ++commits;
 					return {
 						revisions: [],
@@ -1567,10 +1558,7 @@ test("CLI setup reports a save when the durable identity landed before the failu
 		configurable: true,
 		writable: true,
 		value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
-			for (const patch of patches) {
-				if (patch.op === "set") settings.set(patch.path, patch.value as never);
-				else settings.unset(patch.path);
-			}
+			await Settings.prototype.commitAtomicBatch.call(settings, patches);
 			throw new Error("Telegram daemon provisional ownership could not be retired safely");
 		},
 	});

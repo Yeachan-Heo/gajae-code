@@ -2,10 +2,19 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
+import { Broker, type SpawnPromptLayer, type SpawnRegistrationRequest } from "../src/sdk/broker/broker";
 import { managedIdentity, managedTaskDomainPath } from "../src/sdk/broker/managed-task-dag";
-import { processIncarnation } from "../src/sdk/broker/process-incarnation";
-import type { SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
+import type { SpawnLifecycleOwnerResolution, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
+import { createAttest } from "./helpers/managed-attestation";
+
+type SpawnRegistrationInput = SpawnRegistrationRequest;
+
+/** Headless fixtures: the launched process is its own SDK host. */
+async function resolveHeadlessOwner(proof: SpawnSubstrateProof): Promise<SpawnLifecycleOwnerResolution> {
+	if (!Number.isSafeInteger(proof.pid) || !proof.pid || proof.pid <= 0 || !proof.processIncarnation)
+		return { ok: false, code: "owner_proof_failed" };
+	return { ok: true, owner: { pid: proof.pid, incarnation: proof.processIncarnation } };
+}
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -93,28 +102,7 @@ const verifier = {
 	}),
 };
 
-async function attest(broker: Broker, cwd: string): Promise<void> {
-	const incarnation = processIncarnation(process.pid);
-	if (!incarnation) throw new Error("Test owner has no process incarnation");
-	for (const endpointGeneration of [0, 1]) {
-		await broker.index.append({
-			type: "host_registered",
-			sessionId: ownerId,
-			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
-			endpointGeneration,
-			pid: process.pid,
-			hostIncarnation: incarnation,
-			masterRole: {
-				version: 2,
-				ownerSessionId: ownerId,
-				launchPid: process.pid,
-				launchProcessIncarnation: incarnation,
-				role: "master",
-				attestationEpoch: epoch,
-			},
-		});
-	}
-}
+const attest = createAttest(ownerId, epoch);
 
 type Counts = { launches: number; closes: number };
 
@@ -133,6 +121,7 @@ function scriptedProvider(counts: Counts, options: { failDispatch?: boolean; gon
 				} satisfies SpawnSubstrateProof,
 			};
 		},
+		resolveLifecycleOwner: resolveHeadlessOwner,
 		verify: async () => {
 			if (options.goneOnVerify && counts.closes > 0) return "gone" as const;
 			return "verified" as const;
@@ -146,13 +135,14 @@ function scriptedProvider(counts: Counts, options: { failDispatch?: boolean; gon
 
 function scriptedPrompt(options: { writes?: Record<string, string>; failDispatch?: boolean } = {}): SpawnPromptLayer {
 	return {
-		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+		awaitRegistration: async (input: SpawnRegistrationInput) => ({
 			ok: true as const,
 			registration: {
 				sessionId: input.childId,
 				endpointGeneration: 1,
-				pid: 5201,
-				processIncarnation: "inc-5201",
+				pid: input.owner.pid,
+				processIncarnation: input.owner.incarnation,
+				lifecycleRequestId: input.effectMarker,
 				cwd: input.cwd,
 				stateRoot: input.stateRoot,
 			},
@@ -877,6 +867,7 @@ const broker = new Broker({
 				},
 			};
 		},
+		resolveLifecycleOwner: async proof => ({ ok: true, owner: { pid: proof.pid, incarnation: proof.processIncarnation } }),
 		verify: async () => (counts.closes > 0 ? "gone" : "verified"),
 		close: async () => {
 			counts.closes += 1;
@@ -889,8 +880,9 @@ const broker = new Broker({
 			registration: {
 				sessionId: input.childId,
 				endpointGeneration: 1,
-				pid: 5201,
-				processIncarnation: "inc-5201",
+				pid: input.owner.pid,
+				processIncarnation: input.owner.incarnation,
+				lifecycleRequestId: input.effectMarker,
 				cwd: input.cwd,
 				stateRoot: input.stateRoot,
 			},

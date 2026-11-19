@@ -993,6 +993,119 @@ test("accepted base64 copies and transient decoding share a process-wide budget"
 	}
 }, 60_000);
 
+test("stores bound to the same real-session key share decoder slots without sharing ownership", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = {};
+	const first = new PromptImageUploadStore(alwaysConnected, session);
+	const second = new PromptImageUploadStore(alwaysConnected, session);
+	try {
+		const one = upload(first, "first-owner", tinyPng());
+		const two = upload(second, "second-owner", tinyPng());
+		const finishing = first.finish("first-owner", { id: one });
+		await expect(second.finish("second-owner", { id: two })).rejects.toMatchObject({ code: "busy" });
+		first.close();
+		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
+		await second.finish("second-owner", { id: two });
+		second.redeem("second-owner", [{ id: two }]).release();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	} finally {
+		first.close();
+		second.close();
+	}
+});
+
+test("stores bound to one session share raw staging limits and recover only owned bytes", () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = {};
+	const first = new PromptImageUploadStore(alwaysConnected, session);
+	const second = new PromptImageUploadStore(alwaysConnected, session);
+	try {
+		fillNearLimit(first);
+		const { id } = second.begin("sender", { ...descriptor(tinyPng()), byteLength: 20 * 1024 * 1024 });
+		expect(() =>
+			second.append("sender", { id, sequence: 0, data: Buffer.alloc(MAX_CHUNK_BYTES).toString("base64") }),
+		).toThrow(expect.objectContaining({ code: "busy" }));
+		first.close();
+		second.append("sender", { id, sequence: 0, data: tinyPng().toString("base64") });
+		second.discard("sender", { id });
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	} finally {
+		first.close();
+		second.close();
+	}
+});
+
+test("canonical normalization retains the original selected-byte session charge", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const original = tinyPng();
+	const bytes = Buffer.concat([
+		original.subarray(0, -12),
+		pngChunk("ruSt", Buffer.alloc(17 * 1024 * 1024 - original.length - 12)),
+		original.subarray(-12),
+	]);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const accepted: Array<{ release: () => void }> = [];
+	try {
+		for (let index = 0; index < 3; index++) {
+			const lease = await store.prepareCanonicalImages(
+				"sender",
+				[{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }],
+				{ autoResize: true },
+			);
+			expect(lease.images[0]!.data.length).toBeLessThan(1024);
+			accepted.push(lease);
+		}
+		await expect(
+			store.prepareCanonicalImages(
+				"sender",
+				[{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }],
+				{ autoResize: true },
+			),
+		).rejects.toMatchObject({ code: "busy" });
+		accepted[0]!.release();
+		accepted.push(
+			await store.prepareCanonicalImages(
+				"sender",
+				[{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }],
+				{ autoResize: true },
+			),
+		);
+	} finally {
+		for (const lease of accepted) lease.release();
+		store.close();
+	}
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+}, 60_000);
+
+test("default wire finish preserves original bytes while canonical preparation normalizes", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const bytes = originalLargePng();
+	const wire = new PromptImageUploadStore(alwaysConnected);
+	const canonical = new PromptImageUploadStore(alwaysConnected);
+	const leases: Array<{ release: () => void }> = [];
+	try {
+		const id = await stage(wire, "wire", bytes);
+		const unchanged = wire.redeem("wire", [{ id }]);
+		leases.push(unchanged);
+		expect(unchanged.images[0]!.data).toBe(bytes.toString("base64"));
+		const normalized = await canonical.prepareCanonicalImages(
+			"local",
+			[{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }],
+			{ autoResize: true },
+		);
+		leases.push(normalized);
+		const metadata = await new Bun.Image(Buffer.from(normalized.images[0]!.data, "base64")).metadata();
+		expect(metadata.width).toBe(400);
+		expect(metadata.height).toBe(300);
+		expect(Buffer.from(normalized.images[0]!.data, "base64").length).toBeLessThanOrEqual(500 * 1024);
+	} finally {
+		for (const lease of leases) lease.release();
+		wire.close();
+		canonical.close();
+	}
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
 test("discarded in-flight source bytes remain reserved until decode settles, then capacity recovers", async () => {
 	const original = originalLargePng();
 	const image = Buffer.concat([

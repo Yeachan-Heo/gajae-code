@@ -198,9 +198,8 @@ function createSession(
 		settings: Settings.isolated(),
 		sendCustomMessage: async (message, options) => {
 			capture.push({ message, options });
-			// streaming flag is a placeholder; underlying agent-session.ts handles steer-vs-append
-			// based on its own isStreaming. The test asserts the options arg the tool passes
-			// to sendCustomMessage, which is what matters for behavior verification.
+			// streaming flag is a placeholder. These tests assert the options the tool
+			// passes; skill-same-turn-delivery.test.ts covers the real session routing.
 			void streaming;
 		},
 		...overrides,
@@ -447,7 +446,7 @@ describe("SkillTool", () => {
 		}
 	});
 
-	it("dispatches the chained skill same-turn without deliverAs nextTurn", async () => {
+	it("dispatches the chained skill same-turn as a steer", async () => {
 		const cwd = await makeTempCwd();
 		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\n# Ultragoal\nTrack execution.");
 		const captured: CapturedSend[] = [];
@@ -467,8 +466,7 @@ describe("SkillTool", () => {
 		const sent = captured[0]!;
 		expect(sent.message.customType).toBe(SKILL_PROMPT_MESSAGE_TYPE);
 		expect(sent.message.attribution).toBe("user");
-		expect(sent.options).toEqual({ triggerTurn: false });
-		expect(sent.options?.deliverAs).toBeUndefined();
+		expect(sent.options).toEqual({ triggerTurn: false, deliverAs: "steer" });
 
 		const content = sent.message.content as string;
 		expect(content).toContain("# Ultragoal");

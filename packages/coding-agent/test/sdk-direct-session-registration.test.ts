@@ -7,9 +7,12 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { parseArgs } from "../src/cli/args";
 import { FileLockAcquireError, withFileLock } from "../src/config/file-lock";
 import { Settings } from "../src/config/settings";
-import { registerDirectSession, runRootCommand } from "../src/main";
+import { directSessionRegistrationId, registerDirectSession, runRootCommand } from "../src/main";
+import { initializeExtensions } from "../src/modes/runtime-init";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
+import { Broker } from "../src/sdk/broker/broker";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { AgentDirSessionLifecycleClient } from "../src/sdk/lifecycle/broker-client";
 import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
@@ -700,6 +703,52 @@ describe("direct CLI session-index registration", () => {
 		}
 	});
 
+	test("ACP mode does not index the startup session it never runs", async () => {
+		const root = await makeTempRoot("gjc-direct-acp-");
+		const authStorage = await AuthStorage.create(":memory:");
+		const originalAgentDir = getAgentDir();
+		// ACP startup sets the no-title flags process-wide; restore them for later tests.
+		const originalTitleEnv = { GJC_NO_TITLE: Bun.env.GJC_NO_TITLE, PI_NO_TITLE: Bun.env.PI_NO_TITLE };
+		try {
+			setAgentDir(root);
+			const startupManager = SessionManager.create(
+				root,
+				SessionManager.explicitDestination(path.join(root, "sessions")),
+			);
+			// Outside ACP this manager would be registered as a durable direct session.
+			expect(directSessionRegistrationId(startupManager, process.env.GJC_LIFECYCLE_REQUEST_ID)).toBe(
+				startupManager.getSessionId(),
+			);
+			let acpStarted = false;
+			await runRootCommand(parseArgs(["--mode", "acp"]), [], {
+				createSessionManager: async () => startupManager,
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				suppressProcessExit: true,
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				runAcpMode: async () => {
+					acpStarted = true;
+				},
+			});
+
+			// ACP sessions run in broker-launched hosts; an indexed startup session would
+			// be listed by ACP `session/list` with no transcript for `session/load`.
+			expect(acpStarted).toBe(true);
+			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+			expect(rows.map(row => row.sessionId)).toEqual([]);
+		} finally {
+			for (const [key, value] of Object.entries(originalTitleEnv)) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+			setAgentDir(originalAgentDir);
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
 	test("publishes the committed branch identity when a transition cleanup fails", async () => {
 		const root = await makeTempRoot("gjc-direct-branch-cleanup-");
 		const authStorage = await AuthStorage.create(":memory:");
@@ -778,6 +827,71 @@ describe("direct CLI session-index registration", () => {
 			await removeTempRoot(root);
 		}
 	});
+
+	test("SDK-only ephemeral sessions are registered as temporary and excluded from session.list", async () => {
+		const root = await makeTempRoot("gjc-sdk-ephemeral-registration-");
+		const authStorage = await AuthStorage.create(":memory:");
+		const broker = new Broker({ agentDir: root });
+		const priorNotifications = process.env.GJC_NOTIFICATIONS;
+		const priorSdkDisable = process.env.GJC_SDK_DISABLE;
+		process.env.GJC_NOTIFICATIONS = "0";
+		delete process.env.GJC_SDK_DISABLE;
+		try {
+			await broker.start();
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				settings: Settings.isolated({ "notifications.enabled": false }),
+				sessionManager: SessionManager.inMemory(root),
+				ephemeral: true,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			try {
+				await initializeExtensions(session, {
+					reportSendError: () => {},
+					reportRuntimeError: () => {},
+				});
+				let indexedSession = (await new SessionIndex(root).open())
+					.listSessions()
+					.sessions.find(row => row.sessionId === session.sessionId);
+				for (let attempt = 0; attempt < 200 && !indexedSession; attempt++) {
+					await Bun.sleep(50);
+					indexedSession = (await new SessionIndex(root).open())
+						.listSessions()
+						.sessions.find(row => row.sessionId === session.sessionId);
+				}
+				expect(indexedSession).toMatchObject({ sessionId: session.sessionId, ephemeral: true });
+
+				const sessionList = await new AgentDirSessionLifecycleClient(root).global("session.list", {}, {});
+				expect(sessionList).toMatchObject({
+					ok: true,
+					result: {
+						sessions: expect.not.arrayContaining([expect.objectContaining({ sessionId: session.sessionId })]),
+					},
+				});
+			} finally {
+				await session.extensionRunner?.emit({ type: "session_shutdown" });
+				await session.dispose();
+			}
+		} finally {
+			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+			else process.env.GJC_NOTIFICATIONS = priorNotifications;
+			if (priorSdkDisable === undefined) delete process.env.GJC_SDK_DISABLE;
+			else process.env.GJC_SDK_DISABLE = priorSdkDisable;
+			await broker.stop();
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	}, 30_000);
 
 	test("top-level in-memory SDK sessions retain SDK hosting", async () => {
 		const root = await makeTempRoot("gjc-5438-sdk-host-");

@@ -337,7 +337,13 @@ const TIME_RANGE_TO_CONFIG: Record<TimeRange, Omit<TimeRangeConfig, "cutoff">> =
 
 function getTimeRangeConfig(range?: string | null): TimeRangeConfig {
 	const normalized = range?.trim().toLowerCase() ?? DEFAULT_TIME_RANGE;
-	const config = TIME_RANGE_TO_CONFIG[normalized as TimeRange];
+	// Only own properties are range configs: a plain-object lookup also resolves
+	// inherited members, so "constructor" and "__proto__" (the two inherited
+	// names that survive lowercase normalization) would otherwise produce a
+	// NaN cutoff instead of the documented unknown-range fallback.
+	const config = Object.hasOwn(TIME_RANGE_TO_CONFIG, normalized)
+		? TIME_RANGE_TO_CONFIG[normalized as TimeRange]
+		: undefined;
 	if (config) {
 		const cutoff = normalized === "all" ? null : Date.now() - Math.max(1, config.timeSeriesHours * 60 * 60 * 1000);
 		return { ...config, cutoff };

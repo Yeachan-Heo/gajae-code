@@ -1,14 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 5 });
 
 describe("AsyncJobManager.failNow", () => {
 	// An externally owned wait can fail while its owner tears down. cancel() marks

@@ -2,6 +2,7 @@ import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AsyncJobManager, FoldReason } from "../async";
+import type { ModelSelectorValue } from "../config/model-selector-value";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
@@ -90,9 +91,13 @@ export interface AskRemoteControl {
 }
 
 export interface AskAnswerRequest {
+	/** Execution-owned logical question identity, stable across selector/editor waits. */
+	questionId?: string;
 	question: string;
 	options: string[];
 	interaction: "selector" | "custom_editor" | "clarification_editor";
+	/** Editor state when the interaction accepts free text. */
+	editor?: { title: string; prefill: string };
 	controls: readonly AskRemoteControl[];
 	/** Optional zero-based recommendation into the authoritative raw options. */
 	recommendedIndex?: number;
@@ -181,7 +186,27 @@ export interface AskAnswerSource {
 }
 
 /** Session context for tool factories */
+/**
+ * Attribution and interruption state for nested eval `tool.<name>()` calls.
+ * One scope is created per model-facing eval call and propagated through any
+ * nesting depth so reminders and interruptions land on that call's result.
+ */
+export interface NestedToolScope {
+	/** Model-facing tool call id of the eval call that opened this scope. */
+	readonly parentToolCallId: string;
+	/** Aborts nested work still parked in an await when the eval call settles. */
+	readonly abortController: AbortController;
+	/** Rules whose interrupting match invalidated this scope. */
+	invalidatedBy?: string[];
+	/** Set when the model-facing eval call settled; late nested calls must not run. */
+	closed?: boolean;
+}
+
 export interface ToolSession {
+	/** Effective session-owned and inherited task role selectors. */
+	getAgentModelOverrides?: () => Record<string, ModelSelectorValue>;
+	/** Whether a role selector is explicitly owned by this session. */
+	hasSessionAgentModelOverride?: (role: string) => boolean;
 	/** Current working directory */
 	cwd: string;
 	/**
@@ -256,6 +281,8 @@ export interface ToolSession {
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Resolves on a steer admitted after the wait starts, or when `signal` aborts, without consuming the steer. */
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
+	/** Resolves on a follow-up message queued after the wait starts, or when `signal` aborts, without consuming the message. */
+	waitForFollowUpQueued?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/**
@@ -278,8 +305,12 @@ export interface ToolSession {
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
-	/** Look up a registered tool with the session's execution guards applied. */
-	getToolForExecution?: (name: string) => AgentTool | undefined;
+	/**
+	 * Look up a registered tool with the session's execution guards applied.
+	 * `nestedToolScope` marks a nested call (eval `tool.<name>()`) made from inside
+	 * that model-facing tool call, so tool-scoped TTSR rules still apply to it.
+	 */
+	getToolForExecution?: (name: string, options?: { nestedToolScope?: NestedToolScope }) => AgentTool | undefined;
 	/** Purge undelivered queued custom messages matching the predicate. Returns counts. */
 	purgeQueuedCustomMessages?: (predicate: (message: CustomMessage) => boolean) => PurgeQueuedCustomMessagesResult;
 	/** Agent registry for IRC routing across live sessions. */
@@ -371,6 +402,8 @@ export interface ToolSession {
 	rescopeSessionCwd?: (path: string) => Promise<{ from: string; to: string }>;
 	/** Live ACP/SDK approval mode. Task children copy this at spawn; absent means `allow`. */
 	getSdkPermissionMode?: () => "prompt" | "allow" | "deny";
+	/** SDK approval callback only, shared with task descendants without client IO capabilities. */
+	getSdkPermissionProvider?: () => ClientBridge["requestPermission"];
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
@@ -622,8 +655,10 @@ export async function createTools(
 	for (const [name, descriptor] of allToolDescriptorEntries) {
 		allToolsByRequestName.set(name.toLowerCase(), [name, descriptor]);
 	}
-	if (includeYield && requestedTools && !requestedTools.includes("yield")) {
-		requestedTools.push("yield");
+	if (includeYield && requestedTools) {
+		for (const name of ["yield", "report_metric"]) {
+			if (!requestedTools.includes(name)) requestedTools.push(name);
+		}
 	}
 
 	if (requestedTools) {
@@ -653,7 +688,12 @@ export async function createTools(
 								descriptor.isAvailable(session, availabilityContext),
 						)
 						.map(([name, descriptor]) => [name, descriptor] as const),
-					...(includeYield ? ([["yield", HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
+					...(includeYield
+						? ([
+								["yield", HIDDEN_TOOL_DESCRIPTORS.yield],
+								["report_metric", HIDDEN_TOOL_DESCRIPTORS.report_metric],
+							] as const)
+						: []),
 				];
 
 	const selectedDiscoveredNames = new Set(

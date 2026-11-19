@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { access, chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { planTmuxOwnerIsolation } from "../src/gjc-runtime/tmux-owner-isolation";
@@ -285,6 +286,41 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 		expect(await readFile(log, "utf8")).toContain("display-message -p #{pid}");
 		expect(await readFile(log, "utf8")).not.toContain("new-session");
 		await expect(access(path.join(root, sessionId, "owner-lifecycle", "generation.json"))).rejects.toThrow();
+	});
+
+	it("refuses a linked owner lifecycle root before planning or writing through it", async () => {
+		const seam = await createScopedHarnessSeam();
+		const outside = await mkdtemp(path.join(tmpdir(), "harness-tmux-outside-"));
+		try {
+			await mkdir(path.join(root, sessionId), { recursive: true });
+			await symlink(outside, path.join(root, sessionId, "owner-lifecycle"));
+			const result = await runHarness(seam.tmuxCommand, 1, {
+				GJC_HARNESS_TEST_CALLER_CGROUP: "/\n",
+				GJC_HARNESS_TEST_SERVER_CGROUP: "/gjc-owner-test.scope\n",
+				GJC_HARNESS_TEST_SERVER_START_TIME: "1",
+				PATH: `${seam.path}:${process.env.PATH ?? ""}`,
+			});
+			expect((result.evidence as Record<string, unknown>).ownerFallbackReason).toBe(
+				"tmux-owner-lifecycle_root_unsafe",
+			);
+			expect(await readdir(outside)).toEqual([]);
+			const calls = await readFile(seam.log, "utf8").catch(() => "");
+			expect(calls).not.toContain("new-session");
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("names a harness state root below a linked .gjc through its canonical path", async () => {
+		const { command } = await createUnverifiableTmux();
+		const storage = path.join(root, "gjc-storage");
+		await mkdir(storage);
+		await symlink(storage, path.join(workspace, ".gjc"));
+		const stateRoot = path.join(realpathSync(workspace), ".gjc", "harness");
+		const result = await runHarness(command, 1, { GJC_HARNESS_STATE_ROOT: stateRoot });
+		// The lifecycle root is accepted, so startup goes on to the server probe.
+		expect((result.evidence as Record<string, unknown>).ownerFallbackReason).toBe("tmux-owner-server_unverifiable");
+		await access(path.join(storage, "harness", sessionId, "owner-lifecycle"));
 	});
 
 	it("proves a private tmux owner through the HarnessCommand path", async () => {

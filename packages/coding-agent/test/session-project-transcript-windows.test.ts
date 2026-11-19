@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
-import * as managedStorage from "../src/session/internal/managed-session-storage";
+import * as managedStorage from "../src/sdk/session-readonly/inspection";
 import {
 	listProjectSessionTranscriptFiles,
 	readAuthorizedProjectSessionTranscript,

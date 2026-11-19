@@ -24,7 +24,7 @@ describe("--confine session selection", () => {
 					undefined,
 					"copy-retain",
 					"enabled",
-					true,
+					"resume",
 				),
 			).rejects.toThrow(/missing path/);
 			await expect(fs.stat(missing)).rejects.toMatchObject({ code: "ENOENT" });
@@ -47,7 +47,7 @@ describe("--confine session selection", () => {
 				undefined,
 				"copy-retain",
 				"shadow",
-				true,
+				"resume",
 			);
 			expect(resumed.isFilesystemConfined()).toBe(true);
 			expect(resumed.getSessionId()).toBe(sessionId);
@@ -77,6 +77,7 @@ describe("confinement escapes", () => {
 				SessionManager.explicitDestination(forkDir),
 				"copy-retain",
 				"shadow",
+				undefined,
 				true,
 			);
 			if (forked.kind !== "forked") throw new Error(forked.reason);

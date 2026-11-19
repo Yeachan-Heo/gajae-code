@@ -2,6 +2,7 @@
  * JSON tree rendering utilities shared across tool renderers.
  */
 import { INTENT_FIELD } from "@gajae-code/agent-core";
+import { isRecord } from "@gajae-code/utils";
 import type { Theme } from "../modes/theme/theme";
 import { truncateToWidth } from "./render-utils";
 
@@ -19,10 +20,6 @@ const ARGS_INLINE_PAIR_SEP = ", ";
 const ARGS_INLINE_PAIR_SEP_WIDTH = Bun.stringWidth(ARGS_INLINE_PAIR_SEP);
 const ARGS_INLINE_MORE = "…";
 const ARGS_INLINE_MORE_WIDTH = Bun.stringWidth(ARGS_INLINE_MORE);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
-}
 
 /**
  * Format a scalar value for inline display.
@@ -52,7 +49,7 @@ export function formatArgsInline(args: Record<string, unknown>, maxWidth: number
 	let result = "";
 	let width = 0;
 	for (const key in args) {
-		if (key in HIDDEN_ARG_KEYS) continue;
+		if (Object.hasOwn(HIDDEN_ARG_KEYS, key)) continue;
 		const value = args[key];
 		const sep = width > 0 ? ARGS_INLINE_PAIR_SEP : "";
 		const sepW = width > 0 ? ARGS_INLINE_PAIR_SEP_WIDTH : 0;
@@ -233,7 +230,7 @@ export function renderJsonTreeLines(
 	// Render root level
 	if (isRecord(value)) {
 		for (const key in value) {
-			if (key in HIDDEN_ARG_KEYS) continue;
+			if (Object.hasOwn(HIDDEN_ARG_KEYS, key)) continue;
 			renderNode(value[key], key, [], true, 1);
 			if (lines.length >= maxLines) {
 				truncated = true;

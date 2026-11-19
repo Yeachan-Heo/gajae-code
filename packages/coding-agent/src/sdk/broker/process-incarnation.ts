@@ -1,6 +1,6 @@
 import { dlopen, ptr } from "bun:ffi";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
+import { probeLinuxProcPidSync, readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
 
 const DARWIN_PROC_PIDTBSDINFO = 3;
 const DARWIN_PROC_BSDINFO_SIZE = 136;
@@ -203,6 +203,42 @@ export function observeProcessIncarnation(
 		// death: the caller has no OS confirmation either way.
 		return { status: "unknown", reasonCode: "native_addon_unavailable" };
 	}
+}
+
+export type ProcessObservation = "alive" | "exited" | "uncertain";
+
+/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
+export function observeProcess(
+	pid: number,
+	expectedIncarnation: string | undefined,
+	readIncarnation: (pid: number) => string | undefined = processIncarnation,
+): ProcessObservation {
+	if (process.platform === "win32") {
+		try {
+			const reference = nativeProcessBindings().Process.fromPid(pid);
+			if (reference?.status() !== "running") return "exited";
+		} catch {
+			return "uncertain";
+		}
+		if (!expectedIncarnation) return "uncertain";
+		const actualIncarnation = readIncarnation(pid);
+		if (!actualIncarnation) return "uncertain";
+		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+	}
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
+	}
+	if (process.platform === "linux") {
+		const probe = probeLinuxProcPidSync(pid);
+		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
+			return "exited";
+	}
+	if (!expectedIncarnation) return "uncertain";
+	const actualIncarnation = readIncarnation(pid);
+	if (!actualIncarnation) return "uncertain";
+	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
 }
 
 /** A PID is reusable; bind it to the strongest OS-provided process start incarnation available. */
