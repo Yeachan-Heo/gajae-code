@@ -679,9 +679,19 @@ export function fsyncCanonicalBinding(bindingPath: string, expected: string): vo
 		throw new Error("binding_invalid");
 }
 
-export async function ensureManagedScope(
+type ManagedScopeBindingMode = "initialize" | "verify_existing";
+
+export function ensureManagedScope(
 	scope: ManagedScope,
 	policy: ManagedSessionSecurityPolicy = "default",
+): Promise<ManagedScopeResolution> {
+	return ensureManagedScopeBinding(scope, policy, "initialize");
+}
+
+async function ensureManagedScopeBinding(
+	scope: ManagedScope,
+	policy: ManagedSessionSecurityPolicy,
+	bindingMode: ManagedScopeBindingMode,
 ): Promise<ManagedScopeResolution> {
 	try {
 		assertRetainedManagedDirectoryIdentity(scope);
@@ -690,16 +700,20 @@ export async function ensureManagedScope(
 		ensureManagedDirectory(scope.directoryPath, root, policy);
 		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
 		const binding = `${JSON.stringify(bindingFor(scope))}\n`;
-		let bindingCollision = false;
-		try {
-			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root, policy);
-		} catch (error) {
-			if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
-			bindingCollision = true;
+		// Replay verifies and syncs the existing binding without staging a competing
+		// write. A missing binding is a refusal, not permission to recreate it.
+		let existingBinding = bindingMode === "verify_existing";
+		if (!existingBinding) {
+			try {
+				await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root, policy);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
+				existingBinding = true;
+			}
 		}
 		const validated = validateExistingBinding(scope);
 		if (validated) return validated;
-		if (bindingCollision) fsyncCanonicalBinding(bindingPath, binding);
+		if (existingBinding) fsyncCanonicalBinding(bindingPath, binding);
 
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink()) throw new Error("reparse_point");
@@ -1269,6 +1283,15 @@ export function prepareManagedSessionScopeForWriteSync(
 	policy: ManagedSessionSecurityPolicy = "default",
 	authority?: ManagedCandidateWriteAuthority,
 ): ManagedScopeResolution {
+	return prepareManagedSessionScopeSync(scope, policy, authority);
+}
+
+function prepareManagedSessionScopeSync(
+	scope: ManagedScope,
+	policy: ManagedSessionSecurityPolicy,
+	authority: ManagedCandidateWriteAuthority | undefined,
+	bindingMode: ManagedScopeBindingMode = "initialize",
+): ManagedScopeResolution {
 	let stage: ManagedScopePrepareStage = "retained_identity";
 	try {
 		assertRetainedManagedDirectoryIdentity(scope);
@@ -1330,12 +1353,14 @@ export function prepareManagedSessionScopeForWriteSync(
 			return next;
 		};
 		store = openManagedStore();
-		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
-		stage = "binding_publish";
-		try {
-			store.publishNoReplaceSync(MANAGED_SESSION_BINDING_FILE, binding);
-		} catch (error) {
-			if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
+		if (bindingMode === "initialize") {
+			const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
+			stage = "binding_publish";
+			try {
+				store.publishNoReplaceSync(MANAGED_SESSION_BINDING_FILE, binding);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
+			}
 		}
 		stage = "binding_read";
 		const capturedBinding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
@@ -7082,13 +7107,13 @@ async function deleteManagedSessionCandidateInternal(
 	// Direct deletion replays its selected tombstone below under the original
 	// operation lease. General write preparation would reconcile that same
 	// pending operation first, before this coordinator has bound its journal.
-	// Keep async binding publication and its typed failures before structural
-	// preparation, but do not run a second cleanup.
+	// Verify an established binding without attempting to publish another copy.
 	const policy = scope.platform === "win32" ? "windows-existing-verify-first" : "default";
-	const initialized = await ensureManagedScope(scope, policy);
+	const bindingMode = existingTombstone ? "verify_existing" : "initialize";
+	const initialized = await ensureManagedScopeBinding(scope, policy, bindingMode);
 	if (initialized.kind === "error")
 		return { kind: "error", code: expectedFailure(new Error(initialized.code)), message: initialized.message };
-	const prepared = prepareManagedSessionScopeForWriteSync(scope, policy);
+	const prepared = prepareManagedSessionScopeSync(scope, policy, undefined, bindingMode);
 	if (prepared.kind === "error")
 		return {
 			kind: "error",

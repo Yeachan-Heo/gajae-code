@@ -12,6 +12,7 @@ import * as managedInspection from "../../src/sdk/session-readonly/inspection";
 import {
 	listManagedCandidates,
 	MANAGED_INTERNAL_DIRECTORY,
+	MANAGED_SESSION_BINDING_FILE,
 	MANAGED_TOMBSTONES_DIRECTORY,
 	resolveManagedScope,
 } from "../../src/sdk/session-readonly/scope";
@@ -24,6 +25,7 @@ import {
 import {
 	type LockRecord,
 	ManagedLockTestHooks,
+	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
 } from "../../src/session/internal/managed-session-storage";
 import {
@@ -2339,8 +2341,15 @@ describe("owner-checked native deletion", () => {
 			const cleanup = vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified");
 			const remove = vi.spyOn(native, "exactRemoveDirectoryTree");
 			const retire = vi.spyOn(taskOwnerRetirement, "retireTaskArtifactOwner");
+			const publish = vi.spyOn(native, "renameNoReplacePathAsync");
+			const publishSync = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
 			const replay = await deleteManagedSessionCandidate(f.scope, candidate);
 			expect(progressReads).toBeGreaterThan(0);
+			const binding = path.join(f.directory, MANAGED_SESSION_BINDING_FILE);
+			expect(publish.mock.calls.map(([, destination]) => destination)).not.toContain(binding);
+			expect(publishSync.mock.calls.map(([relativePath]) => relativePath)).not.toContain(
+				MANAGED_SESSION_BINDING_FILE,
+			);
 			expect(replay).toMatchObject({ kind: "error", code: "durability_failed", message: "durability_failed" });
 			expect(cleanup).not.toHaveBeenCalled();
 			expect(remove).not.toHaveBeenCalled();
