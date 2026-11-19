@@ -136,7 +136,7 @@ import {
 import {
 	admitOwnerMembership,
 	admitOwnerMembershipSync,
-	admitOwnerMembershipWithAsyncEvidence,
+	admitOwnerMembershipWithAsyncReceipt,
 	allocateFreshOwnerCreation,
 	assertOwnerTransferPublicationSourceSync,
 	captureOwnerTargetSync,
@@ -257,6 +257,7 @@ import {
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	resecureOwnerOnlyManagedTree,
+	resolveManagedGcScopeForRead,
 	resolveManagedScopeForWrite,
 } from "./internal/managed-session-scope";
 import {
@@ -684,12 +685,21 @@ type NativeCapturedForkSelection = CapturedForkSelection & {
 type NativeCapturedForkPublication = {
 	pending?: PendingResumeOp;
 	dispatched?: boolean;
-	stagedCloseUncertain?: boolean;
 	proven?: boolean;
 };
 
+type NativeForkStage =
+	| { readonly kind: "open_unknown"; readonly error: Error }
+	| { readonly kind: "closed"; readonly writer: StagedStreamingWriter; readonly error?: never }
+	| {
+			readonly kind: "close_unknown" | "publish_unknown";
+			readonly writer: StagedStreamingWriter;
+			readonly error: Error;
+	  };
+
 type NativeCapturedForkResult =
 	| { kind: "native_forked"; manager: SessionManager; membership: OwnerMembership; pending: PendingResumeOp }
+	| { kind: "native_fork_admission_retained"; manager: SessionManager; membership: OwnerMembership; error: Error }
 	| {
 			kind: "native_fork_retained";
 			manager: SessionManager;
@@ -8499,6 +8509,8 @@ export class SessionManager {
 	#strictClosePending = false;
 	#strictCloseInFlight: Promise<SessionManagerCloseOutcome> | undefined;
 	#strictCloseOutcome: SessionManagerCloseOutcome | undefined;
+	/** Keep the exact private stage through failure; its name is not discard authority. */
+	#nativeForkStage: NativeForkStage | undefined;
 	#rewriteCloseUnknownError: Error | undefined;
 	readonly #retryableRewriteCleanups = new Set<{
 		writer: NdjsonFileWriter;
@@ -15136,6 +15148,7 @@ export class SessionManager {
 			this.#strictCloseInFlight ||
 			this.#strictCloseOutcome?.kind !== "closed" ||
 			!this.#strictClosePending ||
+			this.#nativeForkStage?.error ||
 			this.#persistWriter ||
 			this.#publication.active ||
 			this.#fileEntries.length !== 0 ||
@@ -20291,7 +20304,7 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
-		if (this.#strictClosePending) {
+		if (this.#strictClosePending || this.#nativeForkStage) {
 			const outcome = await this.closeStrict();
 			if (outcome.kind !== "closed") throw outcome.error;
 			return;
@@ -20358,6 +20371,7 @@ export class SessionManager {
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
 	async flushAndCloseStrict(): Promise<SessionManagerCloseOutcome> {
+		if (this.#nativeForkStage) return this.closeStrict();
 		let priorFlushError: Error | undefined;
 		if (this.#persistWriter?.getCloseState() !== "close_failed_retryable") {
 			try {
@@ -20433,6 +20447,10 @@ export class SessionManager {
 
 	async #closeStrictInternal(): Promise<SessionManagerCloseOutcome> {
 		await this.#publication.joinClose();
+		// A missing append writer does not prove the original staged resource closed.
+		// The storage contract cannot certify a safe retry; neither close nor unlink by name.
+		const stageError = this.#nativeForkStage?.error;
+		if (stageError) return { kind: "close_unknown", error: stageError };
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
 		await this.joinCwdReaders();
@@ -26346,30 +26364,48 @@ export class SessionManager {
 				throw new Error("invalid_resume_target");
 			reservation.assertAvailable();
 			managed?.assertBound();
-			if (nativeFork) nativeFork.publication.stagedCloseUncertain = true;
-			const staged = openStagedWriter.call(this.#storage, file, {
-				securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
-			});
-			let receipt: SessionNoReplacePublicationReceipt;
+			let staged: StagedStreamingWriter;
+			try {
+				staged = openStagedWriter.call(this.#storage, file, {
+					securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
+				});
+			} catch (error) {
+				// Construction may have acquired a descriptor without returning its writer.
+				if (nativeFork) this.#nativeForkStage = { kind: "open_unknown", error: toError(error) };
+				throw error;
+			}
+			let writeFailure: { error: unknown } | undefined;
 			try {
 				for (const line of lines) staged.writeLine(line);
 				for (const line of suffix) staged.writeLine(line);
 				staged.fsync();
+			} catch (error) {
+				writeFailure = { error };
+			}
+			try {
 				staged.closeSync();
-				if (nativeFork) nativeFork.publication.stagedCloseUncertain = false;
-				nativeFork?.assertSource();
-				reservation.assertAvailable();
-				managed?.assertBound();
-				marker.attempted = true;
-				if (nativeFork) nativeFork.publication.dispatched = true;
+			} catch (error) {
+				const closeError = toError(error);
+				if (nativeFork) this.#nativeForkStage = { kind: "close_unknown", writer: staged, error: closeError };
+				if (writeFailure && writeFailure.error !== error && nativeFork) {
+					const writeError = toError(writeFailure.error);
+					throw new AggregateError([writeError, closeError], `${writeError.message}; ${closeError.message}`);
+				}
+				throw writeFailure ? writeFailure.error : error;
+			}
+			if (nativeFork) this.#nativeForkStage = { kind: "closed", writer: staged };
+			if (writeFailure) throw writeFailure.error;
+			nativeFork?.assertSource();
+			reservation.assertAvailable();
+			managed?.assertBound();
+			marker.attempted = true;
+			if (nativeFork) nativeFork.publication.dispatched = true;
+			let receipt: SessionNoReplacePublicationReceipt;
+			try {
 				receipt = staged.publishNoReplace();
 			} catch (error) {
-				try {
-					staged.closeSync();
-					if (nativeFork) nativeFork.publication.stagedCloseUncertain = false;
-				} catch {
-					// Neither the reserved pathname nor a failed close proves safe release.
-				}
+				// Publication may own a second descriptor whose close was not acknowledged.
+				if (nativeFork) this.#nativeForkStage = { kind: "publish_unknown", writer: staged, error: toError(error) };
 				throw error;
 			}
 			if (
@@ -28135,23 +28171,27 @@ export class SessionManager {
 			});
 		let reservation: ReservedCapturedFork | undefined;
 		let destination: SessionDestination | undefined;
-		let prepareReservedDestination: (() => SessionDestination) | undefined;
+		let bindReservedDestination: (() => SessionDestination) | undefined;
 		if (typeof destinationInput === "object" && "managed" in destinationInput) {
 			if (!reserve || !(snapshot.storage instanceof FileSessionStorage))
 				throw new Error("fork_reservation_unsupported");
 			const agentDir = path.resolve(destinationInput.agentDir);
 			const scopeInput = { cwd, agentDir, sessionsRoot: getSessionsDir(agentDir) };
-			const resolved = resolveManagedScope(scopeInput);
+			const resolveScope = exclusive ? resolveManagedGcScopeForRead : resolveManagedScope;
+			const resolved = resolveScope(scopeInput);
 			if (resolved.kind === "error") throw managedScopeStartupError("resolve", resolved);
 			reservation = prepareInitialCapturedFork(snapshot, cwd, resolved.scope.directoryPath, true, creation);
-			prepareReservedDestination = () => {
-				const current = resolveManagedScope(scopeInput);
+			bindReservedDestination = () => {
+				const current = resolveScope(scopeInput);
 				if (current.kind === "error") throw managedScopeStartupError("resolve", current);
 				if (current.scope.directoryPath !== resolved.scope.directoryPath)
 					throw Object.assign(new Error("Fork reservation managed scope changed"), {
 						code: "destination_unavailable",
 					});
-				return prepareManagedDestination(resolved.scope, agentDir);
+				// Native admissions bind existing authority without provisioning or repair.
+				return exclusive
+					? freezeManagedDestination(current.scope, agentDir)
+					: prepareManagedDestination(resolved.scope, agentDir);
 			};
 		} else {
 			if (reserve && (destinationInput === undefined || !(snapshot.storage instanceof FileSessionStorage)))
@@ -28326,7 +28366,7 @@ export class SessionManager {
 			reservation.assertAvailable();
 			const afterReservation = snapshot.revalidate();
 			if (afterReservation.kind !== "valid") return afterReservation;
-			if (prepareReservedDestination) destination = prepareReservedDestination();
+			if (bindReservedDestination) destination = bindReservedDestination();
 		}
 		if (!destination) throw new Error("fork_destination_unavailable");
 		const dir = destination.directory;
@@ -28402,7 +28442,7 @@ export class SessionManager {
 					snapshotDigest: target.snapshotDigest,
 					resolved: resolveResumeCheckpoint([fresh.header], target.snapshotDigest),
 				};
-				membership = await admitOwnerMembershipWithAsyncEvidence(
+				const admission = await admitOwnerMembershipWithAsyncReceipt(
 					target,
 					{ kind: "exclusive_native", expected, freshCreation: creation },
 					{
@@ -28411,6 +28451,8 @@ export class SessionManager {
 						capabilities: ["native_resume"],
 					},
 				);
+				membership = admission.membership;
+				if (admission.kind === "retained") throw admission.error;
 				assertNativeSource();
 				reservation.assertAvailable();
 				manager.installOwnerMembership(membership);
@@ -28431,7 +28473,10 @@ export class SessionManager {
 					forkTarget,
 					exclusive ? { publication: nativePublication, assertSource: assertNativeSource } : undefined,
 				);
-				if (exclusive) nativePublication.proven = true;
+				if (exclusive) {
+					nativePublication.proven = true;
+					manager.#nativeForkStage = undefined;
+				}
 				const finalSource = snapshot.revalidate();
 				if (finalSource.kind !== "valid") {
 					authorityFailure = finalSource;
@@ -28608,7 +28653,7 @@ export class SessionManager {
 		} catch (error) {
 			if (exclusive && manager) {
 				const pending = nativePublication.pending;
-				if (membership && pending && (nativePublication.dispatched || nativePublication.stagedCloseUncertain))
+				if (membership && pending && (nativePublication.dispatched || manager.#nativeForkStage))
 					return {
 						kind: "native_fork_retained",
 						manager,
@@ -28625,10 +28670,13 @@ export class SessionManager {
 					if (closed.kind !== "closed") throw closed.error;
 					if (membership) retireOwnerMembershipSync(membership);
 				} catch (retirementError) {
-					throw Object.assign(
-						new AggregateError([error, retirementError], "Fresh fork admission could not be retired"),
-						{ code: "fork_ownership_retained" },
+					const retainedError = new AggregateError(
+						[error, retirementError],
+						"Fresh fork admission could not be retired",
 					);
+					if (membership)
+						return { kind: "native_fork_admission_retained", manager, membership, error: retainedError };
+					throw retainedError;
 				}
 				if (authorityFailure) return authorityFailure;
 				throw error;

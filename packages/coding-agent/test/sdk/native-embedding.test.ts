@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { LifecycleLedger } from "../../src/sdk/broker/lifecycle-ledger";
 import { createEmbeddedAgentSession } from "../../src/sdk/embedding";
 import {
 	attestEmbeddedLegacyTakeover,
@@ -300,38 +301,152 @@ describe("captured fresh native SDK fork", () => {
 		},
 	);
 
-	for (const loseReceipt of [true, false])
+	for (const canRetire of [true, false])
 		it.skipIf(process.platform === "win32")(
-			loseReceipt
-				? "retains the exact attempt when the publication receipt is lost"
-				: "retires through the coordinator if cancelled after publication",
+			`never constructs or publishes after an admission lock release failure (${canRetire ? "settled" : "retained"})`,
 			async () => {
-				const f = await fixture([user("a", null), user("b", "a")]);
+				const f = await fixture([user("a", null)]);
 				await fs.mkdir(f.agentDir, { mode: 0o700 });
-				const abort = new AbortController();
-				const original = await Bun.file(f.file).text();
 				let file: string | undefined;
+				let record: string | undefined;
+				let reportedReleaseFailure = false;
 				let factories = 0;
-				let publications = 0;
-				const openStagedWriter = FileSessionStorage.prototype.openStagedWriter;
-				const stagedWriter = spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
-					this: FileSessionStorage,
-					destination,
-					options,
-				) {
-					const staged = openStagedWriter.call(this, destination, options);
-					if (destination === file) {
-						const publish = staged.publishNoReplace.bind(staged);
-						staged.publishNoReplace = () => {
-							publications++;
-							const receipt = publish();
-							if (loseReceipt) throw new Error("lost initial publication receipt");
-							abort.abort();
-							return receipt;
+				const acquireLock = FileSessionStorage.prototype.acquireExclusiveLockSync;
+				const acquire = spyOn(FileSessionStorage.prototype, "acquireExclusiveLockSync").mockImplementation(
+					function (this: FileSessionStorage, lockPath, options) {
+						if (lockPath !== `${record}.lock`) return acquireLock.call(this, lockPath, options);
+						if (reportedReleaseFailure && !canRetire) return undefined;
+						const lock = acquireLock.call(this, lockPath, options);
+						if (!lock || reportedReleaseFailure) return lock;
+						return {
+							releaseSync: () => {
+								lock.releaseSync();
+								reportedReleaseFailure = true;
+								throw new Error("Injected admission lock release failure");
+							},
 						};
-					}
-					return staged;
+					},
+				);
+				const result = await createEmbeddedAgentSession({
+					cwd: f.cwd,
+					agentDir: f.agentDir,
+					storage: { directory: f.root },
+					native: {
+						create: true,
+						ownerPolicy: { kind: "exclusive_native" },
+						fork: {
+							file: f.file,
+							reserveSelectedForkTranscript: async identity => {
+								file = identity.file;
+								record = ownerRecord(f.root, identity.sessionId);
+							},
+						},
+					},
+					createSession: async () => {
+						factories++;
+						throw new Error("Factory must not run");
+					},
+				}).finally(() => acquire.mockRestore());
+				if (!file || !record) throw new Error("Expected exact fork reservation");
+				expect(reportedReleaseFailure).toBe(true);
+				expect(result).toMatchObject({
+					kind: "refused",
+					reason: canRetire ? "fork_refused" : "fork_ownership_retained",
 				});
+				const owner = await Bun.file(record).json();
+				expect(owner.state).toBe(canRetire ? "retired" : "live");
+				expect(owner.members).toHaveLength(canRetire ? 0 : 1);
+				expect(sync.existsSync(file)).toBe(false);
+				expect(factories).toBe(0);
+			},
+		);
+
+	it.skipIf(process.platform === "win32")("does not prepare a managed scope when admission is vetoed", async () => {
+		const f = await fixture([user("a", null)]);
+		const directory = SessionManager.managedDestination(f.cwd, f.agentDir).directory;
+		const internal = path.join(directory, ".gjc-managed-session-internal");
+		await fs.rm(internal, { recursive: true });
+		const before = (await fs.readdir(directory)).sort();
+		let file: string | undefined;
+		let vetoes = 0;
+		let factories = 0;
+		const inspect = LifecycleLedger.inspectOwnershipReadOnly;
+		const veto = spyOn(LifecycleLedger, "inspectOwnershipReadOnly").mockImplementation((agentDir, target, limits) => {
+			if (target.transcriptPath !== file) return inspect.call(LifecycleLedger, agentDir, target, limits);
+			vetoes++;
+			return Promise.resolve({ kind: "unknown_ownership", reason: "Injected admission veto" });
+		});
+		try {
+			const result = await createEmbeddedAgentSession({
+				cwd: f.cwd,
+				agentDir: f.agentDir,
+				storage: { managed: true },
+				native: {
+					create: true,
+					ownerPolicy: { kind: "exclusive_native" },
+					fork: {
+						file: f.file,
+						reserveSelectedForkTranscript: async identity => {
+							file = identity.file;
+						},
+					},
+				},
+				createSession: async () => {
+					factories++;
+					throw new Error("Factory must not run");
+				},
+			});
+			expect(result).toMatchObject({ kind: "refused", reason: "unknown_ownership" });
+			expect(vetoes).toBe(1);
+			expect(factories).toBe(0);
+			expect((await fs.readdir(directory)).sort()).toEqual(before);
+			expect(sync.existsSync(internal)).toBe(false);
+		} finally {
+			veto.mockRestore();
+		}
+	});
+
+	for (const fault of ["construction", "fsync and close", "close", "sealed before dispatch"] as const)
+		it.skipIf(process.platform === "win32")(`retains the original fork attempt after ${fault}`, async () => {
+			const f = await fixture([user("a", null)]);
+			await fs.mkdir(f.agentDir, { mode: 0o700 });
+			const original = await Bun.file(f.file).text();
+			const abort = new AbortController();
+			let file: string | undefined;
+			let releaseStage: (() => void) | undefined;
+			let closeAttempts = 0;
+			let publications = 0;
+			let factories = 0;
+			const openStagedWriter = FileSessionStorage.prototype.openStagedWriter;
+			const stagedWriter = spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
+				this: FileSessionStorage,
+				destination,
+				options,
+			) {
+				const staged = openStagedWriter.call(this, destination, options);
+				if (destination !== file) return staged;
+				const close = staged.closeSync.bind(staged);
+				releaseStage = close;
+				if (fault === "construction") throw new Error("Injected staged construction failure");
+				if (fault === "fsync and close") {
+					staged.fsync = () => {
+						throw new Error("Injected staged fsync failure");
+					};
+				}
+				staged.closeSync = () => {
+					closeAttempts++;
+					if (fault !== "sealed before dispatch" && closeAttempts === 1)
+						throw new Error("Injected staged close failure");
+					close();
+					if (fault === "sealed before dispatch") abort.abort();
+				};
+				staged.publishNoReplace = () => {
+					publications++;
+					throw new Error("Unexpected staged publication");
+				};
+				return staged;
+			});
+			try {
 				const retained = await createEmbeddedAgentSession({
 					cwd: f.cwd,
 					agentDir: f.agentDir,
@@ -341,7 +456,6 @@ describe("captured fresh native SDK fork", () => {
 						ownerPolicy: { kind: "exclusive_native" },
 						fork: {
 							file: f.file,
-							selection: { snapshotDigest: f.resolution.checkpoint.snapshotDigest, targetLeafId: "a" },
 							signal: abort.signal,
 							reserveSelectedForkTranscript: async identity => {
 								file = identity.file;
@@ -352,35 +466,142 @@ describe("captured fresh native SDK fork", () => {
 						factories++;
 						throw new Error("Factory must not run");
 					},
-				}).finally(() => stagedWriter.mockRestore());
-				if (!file || (retained.kind !== "uncertain_cursor" && retained.kind !== "startup_failed"))
-					throw new Error(`Expected a cancelled or unproven fork, got ${retained.kind}`);
-				const { handle, op } = retained;
-				const bytes = await Bun.file(file).text();
-				expect(bytes).toContain(`"op":"${op.op}"`);
-				if (loseReceipt) {
-					expect(retained.kind).toBe("uncertain_cursor");
-					expect(await Bun.file(op.authorityKey).json()).toMatchObject({
-						state: "live",
-						mode: "exclusive_native",
-						epoch: op.epoch,
-					});
-					expect(await resumeEmbeddedAgentSession(handle)).toMatchObject({ kind: "uncertain_cursor", handle, op });
-					const repair = await reconcileEmbeddedResumeCheckpoint(handle, { op, mode: "repairDurability" });
-					expect(repair.receipt.commitment.continueEligible).toBe(false);
-					const denied = await terminateEmbeddedAgentSession(handle, { op });
-					expect(denied.refusal).toBe("termination_not_authorized");
-				} else {
-					expect(retained.kind).toBe("startup_failed");
-					expect(retained.selection.receipt.terminalDisposition.kind).toBe("retired");
-					expect(await Bun.file(op.authorityKey).json()).toMatchObject({ state: "retired", members: [] });
-				}
-				expect(await Bun.file(file).text()).toBe(bytes);
+				});
+				if (!file || retained.kind !== "uncertain_cursor")
+					throw new Error(`Expected the original retained fork handle, got ${retained.kind}`);
+				const { handle, op, selection, error } = retained;
+				expect(selection.receipt.terminalDisposition.kind).toBe("retained_live");
+				expect(selection.receipt.commitment.continueEligible).toBe(false);
+				if (fault === "fsync and close") expect(error).toContain("Injected staged fsync failure");
+				if (fault === "close" || fault === "fsync and close")
+					expect(error).toContain("Injected staged close failure");
+				if (fault === "construction") expect(error).toContain("Injected staged construction failure");
+				if (fault === "sealed before dispatch") expect(error).toContain("Fork cancelled; ownership retained");
+				const record = await Bun.file(op.authorityKey).text();
+				expect(JSON.parse(record)).toMatchObject({ state: "live", mode: "exclusive_native", epoch: op.epoch });
+				const stagePrefix = `.${path.basename(file)}.`;
+				const stageName = (await fs.readdir(f.root)).find(
+					name => name.startsWith(stagePrefix) && name.endsWith(".staged"),
+				);
+				if (!stageName) throw new Error("Missing original private staged transcript");
+				const stageFile = path.join(f.root, stageName);
+				const stagedBytes = await Bun.file(stageFile).text();
+				const resumed = await resumeEmbeddedAgentSession(handle);
+				if (resumed.kind !== "uncertain_cursor") throw new Error(`Expected retained fork; got ${resumed.kind}`);
+				expect(resumed.handle).toBe(handle);
+				expect(resumed.op).toBe(op);
+				const preparation = await prepareEmbeddedDisconnect(handle, op);
+				const consent = consentEmbeddedDisconnect(handle, preparation, {
+					discardUnpublished: { ids: preparation.heldIds },
+				});
+				if (!consent) throw new Error("Expected original handle to accept exact teardown consent");
+				const term = await terminateEmbeddedAgentSession(handle, { op, consent });
+				const closeOutcome = fault === "sealed before dispatch" ? "closed" : "close_unknown";
+				expect(term.receipt.routing).toMatchObject({ action: "POST_READONLY", closeOutcome });
+				expect(term.receipt.terminalDisposition).toMatchObject({
+					kind: "retained_after_close",
+					reason: "closure_or_durability_unresolved",
+				});
+				const again = await terminateEmbeddedAgentSession(handle, { op, consent });
+				expect(again.receipt.routing.closeOutcome).toBe(closeOutcome);
+				expect(await Bun.file(op.authorityKey).text()).toBe(record);
+				expect(await Bun.file(stageFile).text()).toBe(stagedBytes);
 				expect(await Bun.file(f.file).text()).toBe(original);
-				expect(publications).toBe(1);
+				expect(sync.existsSync(file)).toBe(false);
+				expect(closeAttempts).toBe(fault === "construction" ? 0 : 1);
+				expect(publications).toBe(0);
 				expect(factories).toBe(0);
-			},
-		);
+			} finally {
+				stagedWriter.mockRestore();
+				releaseStage?.();
+			}
+		});
+
+	for (const outcome of ["receipt lost", "cancelled", "cancelled with receipt lost"] as const)
+		it.skipIf(process.platform === "win32")(`reports ${outcome} after initial publication`, async () => {
+			const f = await fixture([user("a", null), user("b", "a")]);
+			await fs.mkdir(f.agentDir, { mode: 0o700 });
+			const abort = new AbortController();
+			const original = await Bun.file(f.file).text();
+			let file: string | undefined;
+			let factories = 0;
+			let publications = 0;
+			const openStagedWriter = FileSessionStorage.prototype.openStagedWriter;
+			const stagedWriter = spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
+				this: FileSessionStorage,
+				destination,
+				options,
+			) {
+				const staged = openStagedWriter.call(this, destination, options);
+				if (destination === file) {
+					const publish = staged.publishNoReplace.bind(staged);
+					staged.publishNoReplace = () => {
+						publications++;
+						const receipt = publish();
+						if (outcome !== "receipt lost") abort.abort();
+						if (outcome !== "cancelled") throw new Error("lost initial publication receipt");
+						return receipt;
+					};
+				}
+				return staged;
+			});
+			const retained = await createEmbeddedAgentSession({
+				cwd: f.cwd,
+				agentDir: f.agentDir,
+				storage: { directory: f.root },
+				native: {
+					create: true,
+					ownerPolicy: { kind: "exclusive_native" },
+					fork: {
+						file: f.file,
+						selection: { snapshotDigest: f.resolution.checkpoint.snapshotDigest, targetLeafId: "a" },
+						signal: abort.signal,
+						reserveSelectedForkTranscript: async identity => {
+							file = identity.file;
+						},
+					},
+				},
+				createSession: async () => {
+					factories++;
+					throw new Error("Factory must not run");
+				},
+			}).finally(() => stagedWriter.mockRestore());
+			if (!file || (retained.kind !== "uncertain_cursor" && retained.kind !== "startup_failed"))
+				throw new Error(`Expected a cancelled or unproven fork, got ${retained.kind}`);
+			const { handle, op } = retained;
+			const bytes = await Bun.file(file).text();
+			expect(bytes).toContain(`"op":"${op.op}"`);
+			if (outcome !== "cancelled") {
+				const error =
+					outcome === "receipt lost"
+						? "lost initial publication receipt"
+						: "Fork cancelled; ownership retained; lost initial publication receipt";
+				expect(retained).toMatchObject({ kind: "uncertain_cursor", error });
+				expect(await Bun.file(op.authorityKey).json()).toMatchObject({
+					state: "live",
+					mode: "exclusive_native",
+					epoch: op.epoch,
+				});
+				expect(await resumeEmbeddedAgentSession(handle)).toMatchObject({
+					kind: "uncertain_cursor",
+					handle,
+					op,
+					error,
+				});
+				const repair = await reconcileEmbeddedResumeCheckpoint(handle, { op, mode: "repairDurability" });
+				expect(repair.receipt.commitment.continueEligible).toBe(false);
+				const denied = await terminateEmbeddedAgentSession(handle, { op });
+				expect(denied.refusal).toBe("termination_not_authorized");
+			} else {
+				expect(retained.kind).toBe("startup_failed");
+				expect(retained.selection.receipt.terminalDisposition.kind).toBe("retired");
+				expect(await Bun.file(op.authorityKey).json()).toMatchObject({ state: "retired", members: [] });
+			}
+			expect(await Bun.file(file).text()).toBe(bytes);
+			expect(await Bun.file(f.file).text()).toBe(original);
+			expect(publications).toBe(1);
+			expect(factories).toBe(0);
+		});
 });
 
 function ownerRecord(directory: string, sessionId: string): string {

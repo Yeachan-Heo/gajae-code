@@ -205,7 +205,12 @@ export type NativeEmbeddedOpenResult =
 			readonly selection: ReconcileResult;
 			readonly error?: string;
 	  }
-	| { readonly kind: "refused"; readonly reason: string; readonly checkpoint?: SdkResumeCheckpoint };
+	| {
+			readonly kind: "refused";
+			readonly reason: string;
+			readonly checkpoint?: SdkResumeCheckpoint;
+			readonly error?: string;
+	  };
 
 /** Descriptor-bound read-only interpretation. No writer, registry, factory, or catalog effects. */
 export function resolveEmbeddedResumeCheckpoint(
@@ -284,6 +289,11 @@ interface NativeOwner {
 }
 const nativeOwners = new WeakMap<SessionManager, NativeOwner>();
 const handles = new WeakMap<NativeLifecycleHandle, NativeOwner>();
+// A refusal can retain an installed admission, but cannot mint a lifecycle handle without an operation.
+const retainedForkAdmissions = new WeakMap<
+	NativeEmbeddedOpenResult,
+	{ readonly manager: SessionManager; readonly membership: OwnerMembership; readonly error: Error }
+>();
 
 /** Internal baseline-factory hook: only a coordinator already owning this exact manager participates. */
 export function nativeEmbeddedRuntimeConstructed(manager: SessionManager, result: CreateAgentSessionResult): void {
@@ -497,6 +507,15 @@ async function createCapturedNativeFork(
 				signal,
 			});
 			if (produced.kind === "error") return { kind: "refused", reason: produced.reason };
+			if (produced.kind === "native_fork_admission_retained") {
+				const refusal: NativeEmbeddedOpenResult = {
+					kind: "refused",
+					reason: "fork_ownership_retained",
+					error: `${signal?.aborted ? "Fork cancelled; " : ""}${produced.error.message}`,
+				};
+				retainedForkAdmissions.set(refusal, produced);
+				return refusal;
+			}
 			const { manager, membership, pending } = produced;
 			// Register this exact operation with the existing coordinator, never reopen the child.
 			return beginNativeFactory(
@@ -514,7 +533,6 @@ async function createCapturedNativeFork(
 		}
 	} catch (error) {
 		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-		if (code === "fork_ownership_retained") return { kind: "refused", reason: code };
 		if (signal?.aborted || (error instanceof Error && error.name === "AbortError"))
 			return { kind: "refused", reason: "cancelled" };
 		return { kind: "refused", reason: typeof code === "string" ? code : "fork_refused" };
@@ -536,6 +554,7 @@ function beginNativeFactory(
 			manager.reconcileResumeOperation(op, unprovenFork ? "verifyReadOnly" : mode, routing),
 		captureAfterClose: (op, routing, closure) => manager.captureResumeOperationAfterClose(op, routing, closure),
 		getClosureEvidence: async (op, authorization) => {
+			if (unprovenFork) return undefined;
 			const closure = await manager.getResumeClosureEvidence(op, authorization);
 			if (closure) closures.set(authorization, closure);
 			else closures.delete(authorization);
@@ -586,12 +605,16 @@ async function constructNativeRuntime(
 			handle: owner.coordinator.handle,
 			op: pending,
 			selection,
-			error: owner.fork.failure.error.message,
+			error: owner.fork.signal?.aborted
+				? `Fork cancelled; ownership retained; ${owner.fork.failure.error.message}`
+				: owner.fork.failure.error.message,
 		};
 	}
+	// For an ordinary native open, first-selection failures reject without starting teardown.
+	const ordinarySelection = owner.fork ? undefined : await owner.coordinator.resumeOpen(pending);
 	try {
 		if (owner.fork?.failure) throw owner.fork.failure.error;
-		const selection = await owner.coordinator.resumeOpen(pending);
+		const selection = ordinarySelection ?? (await owner.coordinator.resumeOpen(pending));
 		owner.last = selection;
 		if (selection.receipt.routing.action !== "PROCEED")
 			return {
@@ -599,6 +622,7 @@ async function constructNativeRuntime(
 				handle: owner.coordinator.handle,
 				op: pending,
 				selection,
+				...(owner.fork?.signal?.aborted ? { error: "Fork cancelled; open did not proceed" } : {}),
 			};
 		owner.fork?.signal?.throwIfAborted();
 		const result = await createEmbeddedAgentSession(options);
@@ -633,6 +657,7 @@ async function constructNativeRuntime(
 		owner.last = final;
 		let message = error instanceof Error ? error.message : String(error);
 		if (owner.fork) {
+			if (owner.fork.signal?.aborted) message = `Fork cancelled; ${message}`;
 			try {
 				await releaseClosedDependencies(owner);
 			} catch (cleanupError) {
