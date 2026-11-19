@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:te
 import * as path from "node:path";
 import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { TempDir } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AsyncJobManager } from "../src/async";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -11,14 +12,8 @@ import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { STEER_FOLD_GRACE_MS } from "../src/tools/bash";
 
-async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("timeout");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 15_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 /**
  * The interactive composer is the surface users actually steer from, and it is

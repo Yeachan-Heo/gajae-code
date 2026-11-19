@@ -166,20 +166,29 @@ describe("shared temporary model control", () => {
 	});
 
 	for (const optedIn of [false, true]) {
-		it(`refuses ${optedIn ? "persistent" : "non-opted-in temporary"} role cycles before effects`, async () => {
+		// #7824: an adopted non-root session keeps using shared publication, and a
+		// persistent cycle publishes additively instead of staging a transcript rewrite.
+		it(`publishes ${optedIn ? "persistent root" : "adopted non-root temporary"} role cycles additively`, async () => {
 			const f = await fixture(undefined, optedIn);
 			const roles = configureRoleCycle(f);
 			const before = await Bun.file(f.file).text();
-			const revision = f.session.getUserModelSelectionRevision();
-			const key = vi.spyOn(f.registry, "getApiKey");
-			await expect(f.session.cycleRoleModels(["default", "smol"], { temporary: !optedIn })).rejects.toThrow(
-				"Shared session mutation requires transaction admission: cycle role models",
-			);
-			expect(key).not.toHaveBeenCalled();
-			expect(f.session.getUserModelSelectionRevision()).toBe(revision);
-			expect(f.session.model).toBe(f.initial);
-			expect(f.settings.get("modelRoles")).toEqual(roles);
-			expect(await Bun.file(f.file).text()).toBe(before);
+			const leaf = f.manager.getLeafId();
+			const result = await f.session.cycleRoleModels(["default", "smol"], { temporary: !optedIn });
+			expect(result?.role).toBe("smol");
+			expect(f.session.model).toMatchObject({ provider: f.selected.provider, id: f.selected.id });
+			const after = await Bun.file(f.file).text();
+			expect(after.startsWith(before)).toBe(true);
+			const appended = (await records(f.file)).slice(before.trim().split("\n").length);
+			expect(appended[0]).toMatchObject({ parentId: leaf });
+			if (optedIn) {
+				expect(appended.filter(entry => entry.type === "model_change").map(entry => entry.role)).toEqual([
+					"default",
+					"smol",
+				]);
+			} else {
+				expect(f.settings.get("modelRoles")).toEqual(roles);
+				expect(appended[0]).toMatchObject({ type: "model_change", role: "temporary" });
+			}
 		});
 	}
 

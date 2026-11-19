@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import { liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
@@ -16,14 +17,8 @@ function tmpPath(name: string): string {
 	return path;
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 function isAlive(pid: number): boolean {
 	try {

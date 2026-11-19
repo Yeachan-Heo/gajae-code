@@ -654,8 +654,10 @@ adapter dispositions up front and never renders endpoint-disclosure results.
 
 ## Lossless prompt results
 
-`turn.result` with `kind: "prompt"` reports `accepted`, `in_flight`,
-`terminal_ok`, or `failed`; only retained-record capacity eviction yields
+`turn.result` with `kind: "prompt"` reports `admitted`, `accepted`, `in_flight`,
+`terminal_ok`, or `failed`. `admitted` covers a submission whose preflight (such
+as a pre-prompt compaction) is still running before acknowledgement; a rejected
+or cancelled preflight reports `failed` with `receiptState: "missing"`. Only retained-record capacity eviction yields
 `unknown`. `turn.prompt_status` remains a legacy prompt-only alias. A prompt
 that is active at process restart is finalized from its durable pending outcome
 (or `prompt_failed` when it has none), so it never reports as `unknown` while a

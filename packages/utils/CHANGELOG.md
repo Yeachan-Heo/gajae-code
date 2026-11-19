@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Added
+
+- `logger.close()` flushes every record written so far and closes the rotating log file, resolving once the file stream finishes (bounded by a 2-second deadline). A later log call opens the transports again. The shared test preload calls it before removing each test file's isolated `gjc-test-logs-*` directory, so a test that logs no longer leaves that directory behind in the OS temp root.
+
+### Fixed
+
+- A direct `process.stderr.write` whose reader has gone away (`EPIPE`/`EIO`/`EBADF`, e.g. a closed console on Windows or `gjc ... 2>&1 | head`) now exits quietly with the broken-pipe status 141 instead of being recorded and reported as a crash, matching the existing stdout handling ([#7790](https://github.com/Yeachan-Heo/gajae-code/issues/7790)).
+
 ## [0.20.0] - 2026-11-08
 
 ### Fixed

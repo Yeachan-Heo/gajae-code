@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
+import { describe, expect, it, setDefaultTimeout } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * `agentLoop` reads `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` when
@@ -16,17 +15,7 @@ const CANARY = "gjc-capture-canary";
 
 setDefaultTimeout(60_000);
 
-const tempDirs: string[] = [];
-
-afterEach(async () => {
-	for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
-});
-
-async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-otel-capture-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
+const { tempDir } = createTrustTempDirs("gjc-otel-capture-trust-");
 
 interface CaptureProbe {
 	spanFound: boolean;

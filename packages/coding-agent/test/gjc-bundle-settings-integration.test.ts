@@ -10,11 +10,12 @@ import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { bundleIdentity } from "../src/extensibility/gjc-plugins/lifecycle-reconciliation";
 import { GjcRuntimeSnapshotStore } from "../src/extensibility/gjc-plugins/runtime-quarantine";
 import { SettingsSelectorComponent } from "../src/modes/components/settings-selector";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
 import { createAgentSession } from "../src/sdk/session";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const sixSurfaceBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 
@@ -31,8 +32,7 @@ const sixSurfaceBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "
 
 beforeAll(async () => {
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
-	const theme = await getThemeByName("red-claw");
-	if (!theme) throw new Error("Failed to load test theme");
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 

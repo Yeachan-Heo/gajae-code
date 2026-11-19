@@ -11,6 +11,7 @@ import {
 	resolveLoopbackOpenAIBaseUrl,
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
+import { createLoopbackDirectFetch } from "../utils/loopback-transport";
 import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { isClaudeForcedToolChoiceIncapableModelId } from "../utils/tool-choice-capability";
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
@@ -1659,6 +1660,51 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 }
 
 // ---------------------------------------------------------------------------
+// 12.7. Rapid-MLX (Apple Silicon MLX Local Server)
+// ---------------------------------------------------------------------------
+
+export interface RapidMlxModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function rapidMlxModelManagerOptions(
+	config?: RapidMlxModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = resolveLoopbackOpenAIBaseUrl(
+		config?.baseUrl ?? $credentialEnv("RAPID_MLX_BASE_URL"),
+		"http://localhost:8000/v1",
+	);
+	// Every Rapid-MLX call — keyed or keyless — leaves through the shared
+	// loopback transport: Bun applies HTTP(S)_PROXY/ALL_PROXY to loopback
+	// requests and caches that decision per process, so no environment check
+	// here can prove where `fetch` would send the bearer. A keyless probe needs
+	// the same protection, otherwise the proxy could answer `/models` and inject
+	// the catalog.
+	return {
+		providerId: "rapid-mlx",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "rapid-mlx",
+				baseUrl,
+				apiKey,
+				// The endpoint is always loopback (rewritten above), so a stalled
+				// server must not hold registry refresh for the full remote timeout,
+				// and a redirect must not forward RAPID_MLX_API_KEY off-host. Mirrors
+				// the local vLLM/SGLang discovery hardening.
+				fetch: (input, init) => {
+					const signal = init?.signal
+						? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
+						: AbortSignal.timeout(500);
+					return createLoopbackDirectFetch(fetch)(input, { ...init, redirect: "error", signal });
+				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 13. Synthetic
 // ---------------------------------------------------------------------------
 
@@ -1989,6 +2035,30 @@ export interface VllmModelManagerConfig {
 	baseUrl?: string;
 }
 
+/**
+ * Rapid-MLX-native `/v1/models` fields. The bare OpenAI shape is shared with
+ * vLLM and SGLang, which can also serve loopback port 8000, so the response
+ * alone cannot name the implementation. Rapid-MLX publishes these runtime-fact
+ * fields (and, because its model card does not drop nulls, `reasoning_parser`
+ * is present even when it is null); vLLM and SGLang never do. Presence,
+ * including a null value, is the identity signal, and it is checked in both
+ * directions: Rapid-MLX refuses a vLLM-shaped catalog, and the vLLM/SGLang
+ * implicit probes refuse a Rapid-MLX-shaped one, so one endpoint cannot be
+ * published under both providers.
+ */
+const RAPID_MLX_NATIVE_MODEL_FIELDS = [
+	"context_window",
+	"reasoning_parser",
+	"tool_call_parser",
+	"recommended_sampling",
+	"is_hybrid",
+	"is_moe",
+] as const;
+
+export function isRapidMlxCatalogRecord(entry: Record<string, unknown>): boolean {
+	return RAPID_MLX_NATIVE_MODEL_FIELDS.some(field => Object.hasOwn(entry, field));
+}
+
 export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "http://127.0.0.1:8000/v1";
@@ -2002,6 +2072,11 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 				provider: "vllm",
 				baseUrl,
 				apiKey,
+				// A Rapid-MLX server answers the same shape on the same loopback
+				// ports. Publishing its rows here would label one endpoint as both
+				// providers; an operator-named vllm entry bypasses this implicit
+				// descriptor, exactly like the Rapid-MLX operator-selected policy.
+				filterModel: entry => !(isLoopback && isRapidMlxCatalogRecord(entry)),
 				fetch: (input, init) =>
 					fetch(input, {
 						...init,
@@ -2052,6 +2127,8 @@ export function sglangModelManagerOptions(
 				provider: "sglang",
 				baseUrl,
 				apiKey,
+				// See vLLM: the reciprocal of the Rapid-MLX identity guard.
+				filterModel: entry => !(isLoopback && isRapidMlxCatalogRecord(entry)),
 				fetch: (input, init) =>
 					fetch(input, {
 						...init,
@@ -2480,6 +2557,23 @@ function bedrockCrossRegionId(id: string): string {
 	return id;
 }
 
+// Anthropic Bedrock models whose AWS model card lists no EU Geo inference profile
+// (only `us.` Geo and `global.`); synthesizing `eu.` ids for them yields unsupported ids.
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-fable-5-2.html
+const BEDROCK_NO_EU_PROFILE_MODEL_IDS = new Set(["anthropic.claude-fable-5-1", "anthropic.claude-fable-5-2"]);
+
+// Bedrock Anthropic models AWS documents only as us./global. inference profiles: emit those
+// two profile ids and no bare id, since the request path sends a bare id unchanged.
+const BEDROCK_PROFILE_ONLY_MODEL_IDS = new Set(["anthropic.claude-fable-5-2"]);
+
+export function hasBedrockEuInferenceProfile(modelId: string): boolean {
+	return modelId.startsWith("anthropic.claude-") && !BEDROCK_NO_EU_PROFILE_MODEL_IDS.has(modelId);
+}
+
+function isBedrockProfileOnlyModel(modelId: string): boolean {
+	return BEDROCK_PROFILE_ONLY_MODEL_IDS.has(modelId);
+}
+
 interface ApiResolutionRule {
 	matches: (modelId: string, raw: ModelsDevModel) => boolean;
 	resolved: { api: Api; baseUrl: string };
@@ -2641,14 +2735,28 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_BEDROCK: readonly ModelsDevProviderDescrip
 			return true;
 		},
 		transformModel: (model, modelId, m) => {
+			// Profile-only models: emit the us. and global. ids, never the uninvokable bare id.
+			if (isBedrockProfileOnlyModel(modelId)) {
+				const usModel: Model<Api> = {
+					...model,
+					id: `us.${modelId}`,
+					name: toModelName(m.name, `us.${modelId}`),
+				};
+				const globalModel: Model<Api> = {
+					...model,
+					id: `global.${modelId}`,
+					name: toModelName(m.name, `global.${modelId}`),
+				};
+				return [usModel, globalModel];
+			}
 			const crossRegionId = bedrockCrossRegionId(modelId);
 			const bedrockModel: Model<Api> = {
 				...model,
 				id: crossRegionId,
 				name: toModelName(m.name, crossRegionId),
 			};
-			// Also emit EU variants for Anthropic model models
-			if (modelId.startsWith("anthropic.claude-")) {
+			// Also emit EU variants for Anthropic models that have an EU Geo inference profile
+			if (hasBedrockEuInferenceProfile(modelId)) {
 				return [
 					bedrockModel,
 					{

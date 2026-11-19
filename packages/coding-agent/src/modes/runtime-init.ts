@@ -104,10 +104,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return send;
 			},
 			appendEntry: (customType, data) => {
-				session.sessionManager.appendCustomEntry(customType, data);
+				session.appendCustomEntryInBackground(customType, data);
 			},
 			setLabel: (targetId, label) => {
-				session.sessionManager.appendLabelChange(targetId, label);
+				session.appendLabelChangeInBackground(targetId, label);
 			},
 			getActiveTools: () => session.getActiveToolNames(),
 			getAllTools: () => session.getAllToolNames(),
@@ -132,7 +132,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 			getSessionName: () => session.sessionManager.getSessionName(),
 			setSessionName: async name => {
-				await session.sessionManager.setSessionName(name, "user");
+				await session.setSessionName(name, "user");
 			},
 		},
 		// ExtensionContextActions
@@ -451,7 +451,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						await session.reload();
 						return { reloaded: true };
 					case "service_tier.set":
-						session.setServiceTier(input.tier as never);
+						await session.setServiceTier(input.tier as never);
 						return { changed: true };
 					case "queue.message.remove": {
 						const removed = session.removeQueuedMessageForEditing(String(input.id));

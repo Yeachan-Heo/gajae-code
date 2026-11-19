@@ -874,6 +874,7 @@ export async function writeTopicRegistryAtomic(
 			new Error("topic registry destination disappeared after generation validation"),
 		);
 	if (!destinationExists) {
+		await ensureDir(fsImpl, parent);
 		try {
 			await fsImpl.writeFile(file, serialized, { mode: 0o600, flag: "wx" });
 		} catch (error) {
@@ -1585,12 +1586,6 @@ async function ownershipLockIsReclaimable(input: {
 		isProcessIncarnation(current) &&
 		current !== input.lock.metadata.incarnation
 	);
-}
-
-/** True when a path is permanently gone (not a transient I/O blip). */
-export function isPermanentMissingPathError(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "ENOENT" || code === "ENOTDIR";
 }
 
 function validBotToken(token: unknown): token is string {
@@ -4868,6 +4863,13 @@ export class TelegramNotificationDaemon {
 		if (!this.stopRequested) this.effects.openAdmission();
 	}
 
+	/** @internal Test-only method to refresh ownership heartbeat for all active topics. */
+	async refreshOwnershipHeartbeat(sessionId: string): Promise<void> {
+		// Calls renewActiveTopicLeases which iterates all sessions and re-arms expired leases.
+		// sessionId is for test instrumentation only; the method renews all sessions.
+		await this.renewActiveTopicLeases();
+	}
+
 	#lifecycleActor(): SessionLifecycleActor {
 		return { id: String(this.opts.chatId), namespace: `telegram:${tokenFingerprint(this.opts.botToken)}` };
 	}
@@ -5521,6 +5523,7 @@ export class TelegramNotificationDaemon {
 		if (reason === "removed" && !session.logicalSessionIdTrusted) {
 			// Router disappearance alone is not durable archive authority.
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+			this.#prunePublicationReceipts();
 			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
@@ -5542,6 +5545,7 @@ export class TelegramNotificationDaemon {
 				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+			this.#prunePublicationReceipts();
 			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
@@ -5549,6 +5553,7 @@ export class TelegramNotificationDaemon {
 		}
 		this.#dropSession(session, "router_session_removed");
 		this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
+		this.#prunePublicationReceipts();
 		void this.#persistPublicationReceipts().catch(() => {
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 		});
@@ -5986,7 +5991,14 @@ export class TelegramNotificationDaemon {
 			this.#claimedPublications.delete(publicationId);
 			this.#ambiguousPublications.delete(publicationId);
 		}
+		const loadedCleanupReceipts = this.#cleanupReceipts.size;
 		this.#prunePublicationReceipts();
+		if (this.#cleanupReceipts.size < loadedCleanupReceipts)
+			await this.#persistPublicationReceipts().catch(error =>
+				logger.warn(
+					`notifications: pruned Telegram cleanup receipts were not persisted: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				),
+			);
 		const uncertainCount = this.#claimedPublications.size + this.#ambiguousPublications.size;
 		if (uncertainCount > 0)
 			logger.warn(
@@ -5995,6 +6007,15 @@ export class TelegramNotificationDaemon {
 	}
 
 	#prunePublicationReceipts(): void {
+		let completedCleanup = 0;
+		for (const receipt of this.#cleanupReceipts.values()) if (receipt.state === "completed") completedCleanup++;
+		// Completed receipts are terminal; pending and failed receipts retain outstanding work.
+		for (const [subscriptionId, receipt] of this.#cleanupReceipts) {
+			if (completedCleanup <= TELEGRAM_PRESENTATION_STATE_LIMIT) break;
+			if (receipt.state !== "completed") continue;
+			this.#cleanupReceipts.delete(subscriptionId);
+			completedCleanup--;
+		}
 		while (this.#deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
 			const oldest = [...this.#deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
 			if (oldest === undefined) return;
@@ -7131,7 +7152,11 @@ export class TelegramNotificationDaemon {
 				? undefined
 				: { session, token: 0, logicalSessionId };
 	}
-	async #renewTopicLease(sessionId: string, session?: AttachmentSession): Promise<boolean> {
+	async #renewTopicLease(
+		sessionId: string,
+		session?: AttachmentSession,
+		admits: () => boolean = () => true,
+	): Promise<boolean> {
 		if (!this.#topicRegistryMutationAllowed() || !this.#topicAdmissionAllows(session)) return false;
 		const record = this.topics.get(sessionId);
 		if (!record) return true;
@@ -7145,6 +7170,7 @@ export class TelegramNotificationDaemon {
 		};
 		return this.#persistTopicMutation(
 			() =>
+				admits() &&
 				this.topics.acquireLease(
 					sessionId,
 					this.installationHostId,
@@ -7353,6 +7379,24 @@ export class TelegramNotificationDaemon {
 		return competingLiveClaim || competingRecoveryClaim ? { state: "ambiguous" as const } : authority;
 	}
 
+	#disconnectedResumeAuthority(binding: TopicEndpointBinding, excludedSession: AttachmentSession) {
+		if (this.#isClosedEndpoint(binding.logicalSessionId, binding.chatId, excludedSession))
+			return { state: "ambiguous" as const };
+		const competingLiveClaim = [...this.sessions.values()].some(
+			session => session !== excludedSession && this.#logicalSessionId(session) === binding.logicalSessionId,
+		);
+		const competingRecoveryClaim = [...this.sessions.values()].some(
+			session =>
+				session !== excludedSession &&
+				session.recoveryLease?.state === "pending" &&
+				session.recoveryLease.binding.chatId === binding.chatId &&
+				session.recoveryLease.binding.logicalSessionId === binding.logicalSessionId,
+		);
+		return competingLiveClaim || competingRecoveryClaim
+			? { state: "ambiguous" as const }
+			: this.topics.disconnectedResumeAuthority(binding, this.installationHostId, this.runtime.now());
+	}
+
 	#ownsLiveOpenEndpoint(session: AttachmentSession, binding: TopicEndpointBinding): boolean {
 		return (
 			this.sessions.get(session.sessionId) === session &&
@@ -7403,6 +7447,15 @@ export class TelegramNotificationDaemon {
 		let claim: { previousSessionId: string; hadDurableTopic: boolean } | undefined;
 		try {
 			claim = await this.#withRecoveryBindingClaim(async () => {
+				const topicIsExclusive = (): boolean => {
+					const record = this.topics.get(candidateSessionId);
+					return (
+						!record ||
+						Object.entries(this.topics.serialize().topics).every(
+							([id, other]) => id === candidateSessionId || other.topicId !== record.topicId,
+						)
+					);
+				};
 				const existing = this.topics.get(candidateSessionId);
 				const hadDurableTopic = existing !== undefined;
 				const previousBinding = existing
@@ -7415,6 +7468,20 @@ export class TelegramNotificationDaemon {
 				let retiredTopicState: TopicRegistryState | undefined;
 				const outcome = await this.#persistTopicMutation(
 					() => {
+						if (!topicIsExclusive()) return "rejected";
+
+						if (
+							identitylessAdmission === "resume" &&
+							this.topics.get(candidateSessionId)?.authorityState === "disconnect_grace"
+						) {
+							const authority = this.topics.disconnectedResumeAuthority(
+								{ ...binding, logicalSessionId: candidateSessionId },
+								this.installationHostId,
+								this.runtime.now(),
+							);
+							if (authority.state !== "unique" || authority.sessionId !== candidateSessionId)
+								return "rejected" as const;
+						}
 						if (allowEndpointRotation && this.topics.get(candidateSessionId)?.authorityState === "inactive") {
 							retiredTopicState = this.topics.serialize();
 							this.topics.retireInactiveEndpointForSuccessor(candidateSessionId, binding);
@@ -7444,7 +7511,7 @@ export class TelegramNotificationDaemon {
 						};
 					return undefined;
 				}
-				if (!(await this.#renewTopicLease(candidateSessionId, session))) {
+				if (!(await this.#renewTopicLease(candidateSessionId, session, topicIsExclusive))) {
 					if (session.recoveryLease?.token === pendingToken)
 						session.recoveryLease = {
 							state: "rejected",
@@ -10396,11 +10463,16 @@ export class TelegramNotificationDaemon {
 			// rekeyed A→B transport remains denied unless replay proves B.
 			const endpointAuthority = this.#endpointAuthority(endpointBinding, session);
 			const ownsLiveOpenEndpoint = this.#ownsLiveOpenEndpoint(session, endpointBinding);
+			const disconnectedAuthority =
+				replayIdentitySessionId === undefined
+					? this.#disconnectedResumeAuthority(endpointBinding, session)
+					: undefined;
 			const canResumeTransport =
-				endpointAuthority.state === "unique" &&
-				endpointAuthority.sessionId === session.sessionId &&
 				ownsLiveOpenEndpoint &&
-				this.topics.matchesEndpoint(session.sessionId, endpointBinding);
+				((endpointAuthority.state === "unique" &&
+					endpointAuthority.sessionId === session.sessionId &&
+					this.topics.matchesEndpoint(session.sessionId, endpointBinding)) ||
+					(disconnectedAuthority?.state === "unique" && disconnectedAuthority.sessionId === session.sessionId));
 			const inactiveSuccessor =
 				this.topics.get(session.sessionId)?.authorityState === "inactive" &&
 				this.topics.get(session.sessionId)?.chatId === endpointBinding.chatId;

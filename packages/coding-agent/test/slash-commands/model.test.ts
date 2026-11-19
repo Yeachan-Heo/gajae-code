@@ -43,6 +43,10 @@ function createRuntime() {
 		setThinkingLevel(thinkingLevel: string) {
 			this.thinkingLevel = thinkingLevel;
 		},
+		// Unshared sessions apply session-only thinking through the synchronous setter.
+		async setThinkingLevelForSession(thinkingLevel: string | undefined) {
+			this.thinkingLevel = thinkingLevel;
+		},
 		getActiveModelProfile() {
 			return activeModelProfile;
 		},

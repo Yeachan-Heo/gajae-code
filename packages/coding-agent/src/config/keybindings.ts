@@ -175,7 +175,7 @@ export const KEYBINDINGS = {
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: defaultClipboardPasteImageKeysForPlatform(),
-		description: "Paste image from clipboard",
+		description: "Paste image or text from clipboard",
 	},
 	"app.clipboard.pasteText": {
 		defaultKeys: [],
@@ -359,7 +359,6 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	newLine: "tui.input.newLine",
 	submit: "tui.input.submit",
 	tab: "tui.input.tab",
-	copy: "tui.input.copy",
 	// TUI select (old names for backward compatibility)
 	selectUp: "tui.select.up",
 	selectDown: "tui.select.down",

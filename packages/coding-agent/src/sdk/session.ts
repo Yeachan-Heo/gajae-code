@@ -3484,6 +3484,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				else signal.addEventListener("abort", () => resolve(), { once: true });
 				return promise;
 			},
+			waitForFollowUpQueued: signal => {
+				if (agent) return agent.waitForFollowUpArrival(signal);
+				const { promise, resolve } = Promise.withResolvers<void>();
+				if (signal.aborted) resolve();
+				else signal.addEventListener("abort", () => resolve(), { once: true });
+				return promise;
+			},
 			getSessionId: () => sessionManager.getSessionId(),
 			// Subagents inherit the parent's manager; its registered endpoint is
 			// authoritative for owned-registration keying and endpoint-first
@@ -3523,7 +3530,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			goalToolAllowedOps: options.goalToolAllowedOps,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
 			getToolByName: name => session?.getToolByName(name),
-			getToolForExecution: name => session?.getToolForExecution(name),
+			getToolForExecution: (name, toolOptions) => session?.getToolForExecution(name, toolOptions),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
 			getMasterBashCapability: () => masterModeContext?.getCapability(),

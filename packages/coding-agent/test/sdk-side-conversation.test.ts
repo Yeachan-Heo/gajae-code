@@ -28,6 +28,7 @@ import { AgentSession, type EphemeralTurnArgs } from "../src/session/agent-sessi
 import { AuthStorage } from "../src/session/auth-storage";
 import { BTW_MAX_ANSWER_UTF8_BYTES, BTW_MAX_CONTEXT_TURNS } from "../src/session/btw-contract";
 import { SessionManager } from "../src/session/session-manager";
+import { drainMicrotasks } from "./helpers/microtasks";
 
 const model: Model = {
 	id: "test",
@@ -48,7 +49,7 @@ const backendCleanup: Array<() => void> = [];
 afterEach(async () => {
 	vi.useRealTimers();
 	for (const release of backendCleanup.splice(0)) release();
-	await settle();
+	await drainMicrotasks(50);
 	vi.restoreAllMocks();
 	for (const fn of cleanup.splice(0)) await fn();
 	unregisterCustomApis(CONTROLLED_SOURCE);
@@ -84,9 +85,6 @@ function captureError(action: () => unknown): unknown {
 		return error;
 	}
 	throw new Error("Expected a side conversation error.");
-}
-async function settle() {
-	for (let i = 0; i < 50; i++) await Promise.resolve();
 }
 function assistant(text: string): AssistantMessage {
 	return {
@@ -259,7 +257,7 @@ describe("SDK frozen-context side conversations", () => {
 		finish(sideCall);
 		await run.mock.results[0]!.value;
 		await session.joinBtwTurnsForControl();
-		await settle();
+		await drainMicrotasks(50);
 		expect(
 			captureError(() => controls.control("btw.submit", { conversationId: opened.id, question: "new ingress" })),
 		).toMatchObject({ code: "busy" });
@@ -284,7 +282,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(next, "continued");
 		finish(next);
 		await run.mock.results[1]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		session.settings.override("compaction.enabled", false);
 		mainCall.message.content = [{ type: "text", text: "main completed" }];
 		finish(mainCall);
@@ -307,12 +305,12 @@ describe("SDK frozen-context side conversations", () => {
 		const opened = snapshot(controls.control("btw.open", { question: "uncertain side" }));
 		const call = await backend.started;
 		emit(call, "safe record\n");
-		await settle();
+		await drainMicrotasks(50);
 		if (cancelled) controls.control("btw.cancel", { conversationId: opened.id, turnId: opened.turns[0]!.id });
 		finish(call);
 		await expect(run.mock.results[0]!.value).rejects.toMatchObject({ code: "unknown_effect" });
 		await expect(session.joinBtwTurnsForControl()).rejects.toMatchObject({ code: "unknown_effect" });
-		await settle();
+		await drainMicrotasks(50);
 		const uncertain = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(uncertain.turns[0]).toMatchObject({
 			status: "unknown_effect",
@@ -359,7 +357,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(next, "successor answer");
 		finish(next);
 		await run.mock.results.at(-1)!.value;
-		await settle();
+		await drainMicrotasks(50);
 		expect(snapshot(successor.control("btw.read", { conversationId: reopened.id })).turns[0]).toMatchObject({
 			status: "completed",
 			cleanup: "settled",
@@ -403,7 +401,7 @@ describe("SDK frozen-context side conversations", () => {
 		await auth.set("test", { type: "api_key", key: "replacement-private-credential" });
 		const prefix = first.slice(0, 14);
 		emit(call, `public record\n${prefix}`);
-		await settle();
+		await drainMicrotasks(50);
 		getAll.mockClear();
 		resolve.mockClear();
 		const partial = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor }));
@@ -414,7 +412,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(call, answer.slice(`public record\n${prefix}`.length));
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(completed.turns[0]?.status).toBe("completed");
 		expect(completed.turns[0]?.answer).toContain("public record");
@@ -435,7 +433,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(next, "continued");
 		finish(next);
 		await run.mock.results[1]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		expect(session.messages).toEqual([]);
 	});
 
@@ -464,17 +462,17 @@ describe("SDK frozen-context side conversations", () => {
 		expect(accepted.turns[0]?.question).toBe("Explain «redacted» and «redacted»");
 		const firstAnswer = `${previous} ${current}\nend`;
 		emit(call, previous.slice(0, 12));
-		await settle();
+		await drainMicrotasks(50);
 		const partial = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(JSON.stringify(partial)).not.toContain(previous.slice(0, 12));
 		emit(call, `${previous.slice(12)} ${current.slice(0, 12)}`);
-		await settle();
+		await drainMicrotasks(50);
 		const split = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(JSON.stringify(split)).not.toContain(current.slice(0, 12));
 		emit(call, `${current.slice(12)}\nend`);
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(completed.turns[0]?.status).toBe("completed");
 		for (const value of [previous, current]) expect(JSON.stringify(completed)).not.toContain(value);
@@ -494,7 +492,7 @@ describe("SDK frozen-context side conversations", () => {
 		expect(nextAccepted.turns[1]?.question).toBe("Recall «redacted» «redacted» «redacted»");
 		for (const value of [previous, current, latest]) {
 			emit(next, value.slice(0, 12));
-			await settle();
+			await drainMicrotasks(50);
 			const fragment = snapshot(
 				controls.control("btw.read", { conversationId: opened.id, cursor: completed.nextCursor }),
 			);
@@ -504,7 +502,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(next, "end");
 		finish(next);
 		await run.mock.results[1]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		getAll.mockImplementation(() => {
 			throw new Error("read must not consult credential storage");
 		});
@@ -576,14 +574,14 @@ describe("SDK frozen-context side conversations", () => {
 		else {
 			const prefix = actualKey.slice(0, mode === "derived" || mode === "structured" ? 100 : 12);
 			emit(call, prefix);
-			await settle();
+			await drainMicrotasks(50);
 			const partial = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 			expect(JSON.stringify(partial)).not.toContain(prefix);
 			emit(call, echoed.slice(prefix.length));
 		}
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(completed.turns[0]?.status).toBe("completed");
 		for (const secret of [previous, current, actualKey, ...(mode === "structured" ? [token] : [])])
@@ -604,7 +602,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(next, `${actualKey}\nnext-native-key-6w\nsafe`);
 		finish(next);
 		await run.mock.results[1]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const getAll = vi.spyOn(auth, "getAll");
 		const resolve = vi.spyOn(session.modelRegistry, "getApiKey");
 		const history = snapshot(controls.control("btw.read", { conversationId: opened.id }));
@@ -651,7 +649,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(call, "safe retry");
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		expect(snapshot(controls.control("btw.read", { conversationId: admitted.id })).turns[0]).toMatchObject({
 			status: "completed",
 			answer: "safe retry",
@@ -670,7 +668,7 @@ describe("SDK frozen-context side conversations", () => {
 		const opened = snapshot(controls.control("btw.open", { question: `check ${secret}` }));
 		const call = await backend.started;
 		emit(call, secret.slice(0, 15));
-		await settle();
+		await drainMicrotasks(50);
 		const hidden = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor }));
 		expect(hidden.turns[0]?.answer).toBe("");
 		expect(hidden.deltas).toEqual([]);
@@ -678,7 +676,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(call, `${secret.slice(15)}\n`);
 		for (let index = 0; index < SIDE_CONVERSATION_MAX_DELTA_CHUNKS + 8; index++) {
 			emit(call, `record ${index} ${secret}\n${"f".repeat(secret.length)}\n`);
-			await settle();
+			await drainMicrotasks(50);
 		}
 		expect(() => controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor })).toThrow(
 			"expired",
@@ -694,7 +692,7 @@ describe("SDK frozen-context side conversations", () => {
 		expect(resumed.deltas).toEqual(recovered.deltas.slice(1));
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const final = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: recovered.nextCursor }));
 		expect(final.turns[0]?.status).toBe("completed");
 		expect(final.deltas.length).toBeGreaterThan(0);
@@ -718,14 +716,14 @@ describe("SDK frozen-context side conversations", () => {
 			"  UNREGISTERED_YAML_PASSWORD\nnormal: visible\n",
 		]) {
 			emit(call, chunk);
-			await settle();
+			await drainMicrotasks(50);
 			const projected = JSON.stringify(controls.control("btw.read", { conversationId: opened.id }));
 			for (const privateText of ["unregistered-", "/private/.", "UNREGISTERED_PRIVATE", "UNREGISTERED_YAML"])
 				expect(projected).not.toContain(privateText);
 		}
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(completed.turns[0]?.status).toBe("completed");
 		expect(completed.turns[0]?.answer).toContain("normal: visible");
@@ -753,7 +751,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(call, "a".repeat(BTW_MAX_ANSWER_UTF8_BYTES - reserve) + secret);
 		finish(call);
 		await run.mock.results[0]!.value;
-		await settle();
+		await drainMicrotasks(50);
 		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(completed.turns[0]?.status).toBe("completed");
 		expect(completed.turns[0]?.answer).toBe("a".repeat(BTW_MAX_ANSWER_UTF8_BYTES - reserve) + marker);
@@ -776,7 +774,7 @@ describe("SDK frozen-context side conversations", () => {
 		call.stream.push({ type: "error", reason: "error", error });
 		call.stream.end(error);
 		await expect(run.mock.results[0]!.value).rejects.toBeInstanceOf(Error);
-		await settle();
+		await drainMicrotasks(50);
 		const failed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(failed.turns[0]).toMatchObject({ status: "failed", answer: "«redacted»" });
 		expect(JSON.stringify(failed)).not.toContain(secret.slice(0, 14));
@@ -787,7 +785,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(next, "recovered");
 		finish(next);
 		await run.mock.results[1]!.value;
-		await settle();
+		await drainMicrotasks(50);
 	});
 
 	it("redacts full service results before truncating and masks overlapping stored literals as a union", async () => {
@@ -804,7 +802,7 @@ describe("SDK frozen-context side conversations", () => {
 			return reply(text);
 		});
 		const opened = snapshot(controls.control("btw.open", { question: "large private result" }));
-		await settle();
+		await drainMicrotasks(50);
 		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(completed.turns[0]?.answer).toBe("lead «redacted» «redacted» tail");
 		expect(completed.deltas.map(delta => delta.text).join("")).toBe(completed.turns[0]?.answer);
@@ -839,13 +837,13 @@ describe("SDK frozen-context side conversations", () => {
 			"still running",
 		);
 		pending.resolve(reply("answer"));
-		await settle();
+		await drainMicrotasks(50);
 		run.mockImplementationOnce(input => {
 			input.onTextDelta?.("second");
 			return Promise.resolve(reply("second"));
 		});
 		const next = snapshot(controls.control("btw.submit", { conversationId: opened.id, question: "more?" }));
-		await settle();
+		await drainMicrotasks(50);
 		expect(scope).toHaveBeenCalledTimes(1);
 		expect(run.mock.calls[1]?.[0]).toMatchObject({
 			purpose: "btw",
@@ -928,10 +926,10 @@ describe("SDK frozen-context side conversations", () => {
 			return reply(text);
 		});
 		const opened = snapshot(controls.control("btw.open", { question: "first" }));
-		await settle();
+		await drainMicrotasks(50);
 		const first = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		controls.control("btw.submit", { conversationId: opened.id, question: "second" });
-		await settle();
+		await drainMicrotasks(50);
 		const second = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(second.turns.map(turn => turn.answer)).toEqual([text, text]);
 		expect(second.deltas).toHaveLength(1);
@@ -951,7 +949,7 @@ describe("SDK frozen-context side conversations", () => {
 			return reply(unicode);
 		});
 		const unicodeOpened = snapshot(controls.control("btw.open", { question: "unicode" }));
-		await settle();
+		await drainMicrotasks(50);
 		const bounded = snapshot(controls.control("btw.read", { conversationId: unicodeOpened.id }));
 		expect(bounded.turns[0]?.answer).toBe("𐐀".repeat(BTW_MAX_ANSWER_UTF8_BYTES / 4));
 		expect(bounded.turns[0]?.answer.isWellFormed()).toBe(true);
@@ -968,10 +966,10 @@ describe("SDK frozen-context side conversations", () => {
 		});
 		const opened = snapshot(controls.control("btw.open", {}));
 		const started = snapshot(controls.control("btw.submit", { conversationId: opened.id, question: "first" }));
-		await settle();
+		await drainMicrotasks(50);
 		for (let i = 0; i < BTW_MAX_CONTEXT_TURNS; i++) {
 			controls.control("btw.submit", { conversationId: opened.id, question: `question ${i}` });
-			await settle();
+			await drainMicrotasks(50);
 		}
 		const result = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(result.turns).toHaveLength(BTW_MAX_CONTEXT_TURNS);
@@ -1008,7 +1006,7 @@ describe("SDK frozen-context side conversations", () => {
 			"still running",
 		);
 		pending.reject(new Error("provider-secret"));
-		await settle();
+		await drainMicrotasks(50);
 		const result = snapshot(controls.control("btw.read", { conversationId: opened.id }));
 		expect(result.turns[0]).toMatchObject({ status: "cancelled", answer: "before cancel" });
 		expect(result.deltas.map(delta => delta.text)).toEqual(["before cancel"]);
@@ -1029,22 +1027,22 @@ describe("SDK frozen-context side conversations", () => {
 		const opened = snapshot(controls.control("btw.open", { question: "gated" }));
 		const call = await backend.started;
 		emit(call, "visible");
-		await settle();
+		await drainMicrotasks(50);
 		vi.useFakeTimers();
 		if (operation === "cancel")
 			controls.control("btw.cancel", { conversationId: opened.id, turnId: opened.turns[0]!.id });
 		else expect(controls.control("btw.close", { conversationId: opened.id })).toEqual({ closed: true });
 		await backend.returning;
-		await settle();
+		await drainMicrotasks(50);
 		expect(call.options?.signal?.aborted).toBe(true);
 		vi.advanceTimersByTime(5_000);
 		await expect(run.mock.results[0]?.value).rejects.toMatchObject({ code: "unknown_effect" });
-		await settle();
+		await drainMicrotasks(50);
 		let actuallySettled = false;
 		const actualJoin = session.joinBtwTurnsForControl().then(() => {
 			actuallySettled = true;
 		});
-		await settle();
+		await drainMicrotasks(50);
 		expect(actuallySettled).toBe(false);
 		if (operation === "cancel") {
 			expect(
@@ -1063,7 +1061,7 @@ describe("SDK frozen-context side conversations", () => {
 			code: operation === "cancel" ? "unknown_effect" : "busy",
 		});
 		backend.releaseReturn.resolve();
-		await settle();
+		await drainMicrotasks(50);
 		expect(actuallySettled).toBe(false);
 		expect(release).not.toHaveBeenCalled();
 		expect(captureError(() => controls.control("btw.open", { question: "overlap" }))).toMatchObject({
@@ -1072,7 +1070,7 @@ describe("SDK frozen-context side conversations", () => {
 		emit(call, "late private bytes");
 		finish(call);
 		await actualJoin;
-		await settle();
+		await drainMicrotasks(50);
 		expect(actuallySettled).toBe(true);
 		expect(release).toHaveBeenCalledTimes(1);
 		expect(backend.calls).toHaveLength(1);
@@ -1107,11 +1105,11 @@ describe("SDK frozen-context side conversations", () => {
 		cleanup.push(async () => replacement.dispose());
 		expect(() => replacement.control("btw.open", {})).toThrow("still running");
 		pending.resolve(reply("stale answer"));
-		await settle();
+		await drainMicrotasks(50);
 		expect(release).not.toHaveBeenCalled();
 		expect(() => replacement.control("btw.open", { question: "new" })).toThrow("still running");
 		backend.resolve();
-		await settle();
+		await drainMicrotasks(50);
 		expect(release).toHaveBeenCalledTimes(1);
 		const reopened = snapshot(replacement.control("btw.open", {}));
 		args?.onTextDelta?.("stale delta");

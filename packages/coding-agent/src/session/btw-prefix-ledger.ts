@@ -13,6 +13,7 @@ import type {
 } from "@gajae-code/ai/core";
 import { toolWireSchema } from "@gajae-code/ai/core";
 import { convertAnthropicMessages } from "@gajae-code/ai/providers/anthropic";
+import { isRecord } from "@gajae-code/utils";
 
 /** Upper bound for one (decompressed) request body the ledger will parse. */
 export const BTW_PREFIX_MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -213,10 +214,6 @@ function completionEligible(message: AssistantMessage, captured: CapturedMain): 
 
 function validCount(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** JSON with recursively sorted object keys, for order-insensitive digests. Throws on cycles. */

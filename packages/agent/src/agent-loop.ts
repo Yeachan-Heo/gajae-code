@@ -837,6 +837,9 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 }
 
 function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
+	// The provider already executed tool calls in this attempt; a replay would
+	// repeat their side effects, and the attempt was published live.
+	if (transaction?.providerExecuted || managedMessageHasProviderResolvedToolCall(failure)) return false;
 	const hasObservableOutput =
 		transaction?.hasObservableAssistantOutput(failure) ?? managedAssistantMessageHasContent(failure);
 	if (
@@ -2784,9 +2787,28 @@ function isSupersededStreamingDelta(item: ManagedAttemptBatchItem): boolean {
 	return MANAGED_SUPERSEDED_DELTA_EVENT_TYPES.has(item.event.assistantMessageEvent.type);
 }
 
+/**
+ * True when the live assistant message already carries a tool call the provider
+ * executed itself (an agent-in-a-call provider such as Devin ACP). Its side
+ * effects happened outside this process, so the attempt can no longer be
+ * discarded and replayed invisibly.
+ */
+function managedMessageHasProviderResolvedToolCall(message: unknown): boolean {
+	const content = managedProperty(message, "content");
+	if (!Array.isArray(content)) return false;
+	return content.some(block => typeof block === "object" && block !== null && isProviderResolvedToolCall(block));
+}
+
 class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
 	#hasObservableAssistantOutput = false;
+	/**
+	 * Set once the provider reports a tool call it already executed. From then on
+	 * the attempt is published live instead of staged: hiding it would not undo
+	 * the side effects, a replay would repeat them, and staging an agent run that
+	 * lasts hours grows without bound.
+	 */
+	#providerExecuted = false;
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
 	/** Caps for this transaction, read once from the operator env knobs. */
@@ -2810,6 +2832,15 @@ class ManagedAttemptTransaction {
 	) {}
 
 	push(event: AgentEvent): void {
+		if (
+			!this.#committed &&
+			!this.#discarded &&
+			"message" in event &&
+			managedMessageHasProviderResolvedToolCall(event.message)
+		) {
+			this.#providerExecuted = true;
+			this.flush();
+		}
 		if (this.#committed) {
 			if (event.type === "message_end" || event.type === "turn_end") {
 				this.#retain({ type: "event", event });
@@ -2826,6 +2857,10 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
+		if (!this.#committed && !this.#discarded && managedMessageHasProviderResolvedToolCall(message)) {
+			this.#providerExecuted = true;
+			this.flush();
+		}
 		if (this.#committed) {
 			// Already published: nothing is retained, so the live pair can go
 			// straight to the consumer without a staging measurement. One
@@ -2870,10 +2905,14 @@ class ManagedAttemptTransaction {
 				// Report the POST-compaction remaining budget + 1 (a valid lower
 				// bound for the live pair's size, and arithmetically consistent
 				// with the post-compaction retained shape #overflowShape reports).
+				// Read BEFORE discard() zeroes the counters: reading after it
+				// fabricated the constant `maxStagedBytes + 1`, which made every
+				// accumulated overflow look like a single cap-sized event.
+				const incomingBytes = this.#maxStagedBytes - this.#stagedBytes + 1;
 				this.discard();
 				throw new ManagedAttemptBufferOverflowError(
 					"overflow.staged",
-					this.#overflowShape("overflow.staged", this.#maxStagedBytes - this.#stagedBytes + 1),
+					this.#overflowShape("overflow.staged", incomingBytes),
 				);
 			}
 		}
@@ -2923,6 +2962,11 @@ class ManagedAttemptTransaction {
 		});
 		this.#stagedEventCount += 1;
 		this.#stagedBytes += retainedBytes;
+	}
+
+	/** Whether the provider executed tool calls during this attempt (see `#providerExecuted`). */
+	get providerExecuted(): boolean {
+		return this.#providerExecuted;
 	}
 
 	hasObservableAssistantOutput(terminalMessage?: unknown): boolean {

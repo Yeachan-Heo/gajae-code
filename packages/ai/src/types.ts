@@ -201,6 +201,7 @@ export const KNOWN_PROVIDERS = [
 	"zenmux",
 	"lm-studio",
 	"omlx",
+	"rapid-mlx",
 ] as const;
 
 export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];
@@ -1274,7 +1275,7 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	/**
 	 * Whether the model explicitly supports the ultrafast service tier.
 	 * Only models that set this flag will send ultrafast tier to the API.
-	 * Models: gpt-6-astra and gpt-6.1-sol.
+	 * Models: gpt-6-astra, gpt-6.1-sol, gpt-6.2-astra, and gpt-6.2-sol.
 	 */
 	supportsUltrafastTier?: boolean;
 	/**

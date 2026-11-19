@@ -20,6 +20,12 @@ export interface FallbackTrigger {
 	retryAfterMs?: number;
 	/** Present only when `class === "auth"`. */
 	authDisposition?: AuthDisposition;
+	/**
+	 * Present only on a `rate_limit` whose typed code says the account is running
+	 * its maximum number of parallel requests. The credential and model are
+	 * healthy; the request succeeds once one of the running requests finishes.
+	 */
+	concurrencyLimited?: true;
 }
 
 /** Stable code for streams that time out before producing semantic progress. */
@@ -385,6 +391,16 @@ function isRateLimitCode(code: string | undefined): boolean {
 	);
 }
 
+/** Typed codes for "too many requests in flight on this account", not a request-rate or quota limit. */
+function isConcurrencyLimitCode(code: string | undefined): boolean {
+	return (
+		code === "session_limit_reached" ||
+		code === "concurrency_limit_exceeded" ||
+		code === "concurrent_request_limit_exceeded" ||
+		code === "too_many_concurrent_requests"
+	);
+}
+
 /** Classifies only typed upstream transport facts without consuming response bodies. */
 export function classifyFallbackTrigger(
 	errorOrFacts: TransportFailureFacts | FallbackTriggerInput | unknown,
@@ -420,6 +436,7 @@ export function classifyFallbackTrigger(
 	const trigger: FallbackTrigger = { class: triggerClass };
 	if (retryAfterMs !== undefined) trigger.retryAfterMs = retryAfterMs;
 	if (triggerClass === "auth") trigger.authDisposition = resolveAuthDisposition(codes, facts.status);
+	if (triggerClass === "rate_limit" && codes.some(isConcurrencyLimitCode)) trigger.concurrencyLimited = true;
 	return trigger;
 }
 

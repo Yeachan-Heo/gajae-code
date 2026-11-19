@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
 import { canonicalEnvKey, parseEnvFileContent, projectEnvSnapshot } from "../src/env-file";
+import { lcgUnit } from "./helpers/prng";
 
 const tempDirs: string[] = [];
 
@@ -15,14 +16,6 @@ function tempDir(prefix: string): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
-}
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
 }
 
 function randomString(random: () => number, alphabet: string, maxLength: number): string {
@@ -37,7 +30,7 @@ function randomString(random: () => number, alphabet: string, maxLength: number)
 describe("parseEnvFileContent dotenv comment properties", () => {
 	test("matches Bun for seeded comment, quoted-hash, and escaped-quote values", async () => {
 		const seed = 0x5eedc0de;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 		const literalAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-";
 		const commentAlphabet = `${literalAlphabet} \\"'`;
 		const cases: Array<{ key: string; raw: string; expected: string }> = [];
@@ -112,7 +105,7 @@ describe("parseEnvFileContent dotenv comment properties", () => {
 describe("projectEnvSnapshot non-identifier declaration properties", () => {
 	test("marks seeded Bun-loaded npm key variants dynamic across dotenv layers", async () => {
 		const seed = 0x5eedc0de;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 		const separators = ["_", "-", "."];
 		const layerFiles = [".env", ".env.development", ".env.local", ".env.development.local"];
 		const declarationsByLayer: Record<string, string[]> = Object.fromEntries(layerFiles.map(file => [file, []]));

@@ -281,6 +281,8 @@ export interface SubagentRecord {
 	effectiveModel?: string;
 	/** True when the requested model lacked credentials and the subagent fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** Why the subagent left its requested model: `no_credentials`, or the fallback trigger class (e.g. `rate_limit`). */
+	modelFallbackReason?: string;
 	/** True when the effective subagent provider is in fast mode. */
 	fastMode?: boolean;
 	duplicateIdentity?: string;
@@ -1622,13 +1624,20 @@ export class AsyncJobManager {
 	 */
 	updateSubagentModel(
 		subagentId: string,
-		model: { requestedModel?: string; effectiveModel?: string; modelFellBack?: boolean; fastMode?: boolean },
+		model: {
+			requestedModel?: string;
+			effectiveModel?: string;
+			modelFellBack?: boolean;
+			modelFallbackReason?: string;
+			fastMode?: boolean;
+		},
 	): void {
 		const record = this.#subagentRecords.get(subagentId);
 		if (!record) return;
 		record.requestedModel = model.requestedModel ?? record.requestedModel;
 		record.effectiveModel = model.effectiveModel ?? record.effectiveModel;
 		record.modelFellBack = model.modelFellBack ?? record.modelFellBack;
+		record.modelFallbackReason = model.modelFallbackReason ?? record.modelFallbackReason;
 		record.fastMode = model.fastMode ?? record.fastMode;
 	}
 
@@ -3452,28 +3461,7 @@ export class AsyncJobManager {
 	markBackgrounded(jobId: string, generation: string, reason: FoldReason): boolean {
 		const job = this.#jobs.get(jobId);
 		if (!job || job.generation !== generation) return false;
-		if (job.metadata?.backgrounded === true) {
-			// A direct async start is already backgrounded, but a later `job` await
-			// can still be folded by a steer. Preserve the existing background state
-			// while recording the first fold reason and publishing its event.
-			if (job.metadata.foldReason !== undefined) return true;
-			job.metadata = { ...job.metadata, foldReason: reason };
-			for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
-				if (delivery.jobId === jobId && delivery.generation === generation) delivery.foldReason = reason;
-			}
-			this.#notifyChange();
-			const event: JobFoldEvent = { jobId, generation, reason };
-			for (const cb of this.#foldListeners) {
-				try {
-					cb(event);
-				} catch (error) {
-					logger.warn("Async job fold listener failed", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-			return true;
-		}
+		if (job.metadata?.backgrounded === true) return true;
 		job.metadata = { ...job.metadata, backgrounded: true, foldReason: reason };
 		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
 			if (delivery.jobId === jobId && delivery.generation === generation) {

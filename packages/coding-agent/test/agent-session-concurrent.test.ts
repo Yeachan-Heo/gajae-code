@@ -26,6 +26,7 @@ import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -131,15 +132,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		return session;
 	}
 
-	async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-		const deadline = Date.now() + timeoutMs;
-		while (Date.now() < deadline) {
-			if (predicate()) return;
-			await Bun.sleep(10);
-		}
-
-		throw new Error("Timed out waiting for condition");
-	}
+	const waitFor = (predicate: () => boolean, timeoutMs = 500): Promise<void> =>
+		waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
@@ -1419,15 +1413,8 @@ describe("AgentSession TTSR resume gate", () => {
 		}
 	});
 
-	async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-		const deadline = Date.now() + timeoutMs;
-		while (Date.now() < deadline) {
-			if (predicate()) return;
-			await Bun.sleep(10);
-		}
-
-		throw new Error("Timed out waiting for condition");
-	}
+	const waitFor = (predicate: () => boolean, timeoutMs = 500): Promise<void> =>
+		waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 	const testRule: Rule = {
 		name: "no-unwrap",
 		path: "/tmp/no-unwrap.md",

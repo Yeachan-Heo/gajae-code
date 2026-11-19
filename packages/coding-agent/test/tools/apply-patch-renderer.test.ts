@@ -8,10 +8,11 @@ import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/component
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "../helpers/test-theme";
 
 async function getUiTheme() {
 	await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
-	const theme = await themeModule.getThemeByName("red-claw");
+	const theme = await loadTestTheme();
 	expect(theme).toBeDefined();
 	return theme!;
 }

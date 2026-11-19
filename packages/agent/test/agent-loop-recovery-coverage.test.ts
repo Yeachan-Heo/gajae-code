@@ -4,7 +4,7 @@ import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "@ga
 import type { Context, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 // Coverage for the repeated-malformed-tool-call recovery turn (PR #3169).
 //
@@ -29,10 +29,6 @@ const LEAKED = [
 	'<parameter name="query">portfolio copywriting examples</parameter>',
 	"</invoke>",
 ].join("\n");
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 const toolSchema = z.object({ value: z.string() });
 

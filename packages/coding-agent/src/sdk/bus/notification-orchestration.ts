@@ -8,7 +8,6 @@ import {
 	isProviderEffectivelyEnabled,
 	type NotificationProvider,
 	type NotificationSettingsReader,
-	type ProviderSecretDisposition,
 	readTelegramActivationMarkers,
 	type TelegramActivationMarker,
 	type TelegramActivationMarkers,
@@ -924,9 +923,4 @@ export async function setGlobalNotificationsEnabled(input: {
 	return failed.length === 0
 		? { status: "saved", receipt, observerFailed }
 		: { status: "global_deactivation_partial", receipt, failed, observerFailed };
-}
-
-/** Safe helper for UI contracts that must retain only the disposition, never replacement material. */
-export function providerSecretDisposition(mutation: ProviderSecretMutation): ProviderSecretDisposition {
-	return mutation.action;
 }

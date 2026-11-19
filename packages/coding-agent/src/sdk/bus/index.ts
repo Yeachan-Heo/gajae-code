@@ -36,6 +36,8 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
+import { containsSecretConfigKey } from "../protocol/adapter-validation";
 import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
@@ -54,7 +56,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 
 type NotificationServer = NativeNotificationServer;
 
-import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+import { $credentialEnv, isRecord, logger, postmortem, VERSION } from "@gajae-code/utils";
 
 import { AsyncJobManager } from "../../async";
 import {
@@ -283,6 +285,19 @@ const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
  * provider error cannot flood the log file.
  */
 const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
+/**
+ * Native directed-delivery rejection causes that concern one frame rather than
+ * the destination connection: the frame's own encoding, size, or capability
+ * gate, or a momentarily full writer. Every other cause (`connection_unavailable`
+ * or an unclassified native failure) means nothing more can reach that
+ * connection.
+ */
+const FRAME_LOCAL_DIRECTED_DELIVERY_CAUSES: ReadonlySet<string> = new Set([
+	"invalid_frame",
+	"oversized_frame",
+	"unauthorized",
+	"writer_backlog_full",
+]);
 /**
  * #4743: bounded wait for durable reconciliation quiescence during session
  * teardown. Expiry is OBSERVABLE (owner-release failure), never silently
@@ -1880,10 +1895,6 @@ interface SafeUsageWindow {
 	resetsAt?: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function classifyUsageWindow(limit: Record<string, unknown>): "5h" | "7d" | undefined {
 	const window = isRecord(limit.window) ? limit.window : undefined;
 	const scope = isRecord(limit.scope) ? limit.scope : undefined;
@@ -2584,61 +2595,6 @@ function sdkQuerySurface(
 	}).query;
 }
 
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
-	);
-}
-
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
-}
-
 /**
  * Holds one session work lease handle for a dispatched submission from dispatch
  * until the submission's own settlement boundary:
@@ -2762,8 +2718,9 @@ function sdkControlSurface(
 	) => void,
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
-	admitPrompt: (clientRef?: string) => void,
-	releasePromptAdmission: (clientRef?: string) => void,
+	/** Reserves the clientRef; the returned binder publishes the generated correlation to `turn.result`. */
+	admitPrompt: (clientRef?: string) => (correlation: { commandId: string; turnId: string }) => void,
+	releasePromptAdmission: (clientRef?: string, rejection?: { cause: unknown }) => void,
 	awaitReconciliationReady: () => Promise<void> = async () => {},
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
@@ -3125,6 +3082,7 @@ function sdkControlSurface(
 		// that finds the loop busy at dispatch is queued as steering (below), and
 		// one the session itself diverts reports that through onDispatchDisposition.
 		const admission = createAdmissionWorkLease(hostWorkLease, deliverAs !== undefined, promoteWorkLease);
+		let bindAdmission: ((correlation: { commandId: string; turnId: string }) => void) | undefined;
 		if (trackReconciliation) {
 			// Restart recovery must be committed before a tracked prompt reserves capacity,
 			// otherwise it can admit against pre-hydration state or a lost clientRef.
@@ -3137,7 +3095,7 @@ function sdkControlSurface(
 				});
 			}
 			try {
-				admitPrompt(trimmedClientRef);
+				bindAdmission = admitPrompt(trimmedClientRef);
 			} catch (error) {
 				admission.abandon();
 				throw error;
@@ -3192,6 +3150,9 @@ function sdkControlSurface(
 		const submissionSettled = Promise.withResolvers<void>();
 		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		// Preflight (a pre-prompt compaction, for example) can outlast the client's
+		// acknowledgement budget; make the admission observable until it settles.
+		bindAdmission?.(correlation);
 		let queuedRunRefused = false;
 		const imageLifecycle = onCorrelation?.(correlation, preflightController.signal, submissionSettled.promise);
 		const key = preflightKey(requesterConnectionId, correlation);
@@ -3332,7 +3293,7 @@ function sdkControlSurface(
 			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
 		} catch (error) {
 			admission.abandon();
-			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
+			if (trackReconciliation) releasePromptAdmission(trimmedClientRef, { cause: error });
 			throw error;
 		} finally {
 			pendingPreflightCancellations.delete(key);
@@ -5663,7 +5624,7 @@ export function createNotificationsExtension(
 			connectionId: string;
 			abandoned: boolean;
 			terminalRetry?: Promise<void>;
-			backlogDropLogged?: boolean;
+			frameDropLogged?: boolean;
 			failed: boolean;
 			terminal: boolean;
 			retainCorrelation: boolean;
@@ -5844,14 +5805,19 @@ export function createNotificationsExtension(
 		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
 		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
-		const admitPromptSubmission = (clientRef?: string) => kindReconciliation.admit("prompt", clientRef);
+		const admitPromptSubmission = (clientRef?: string) => {
+			kindReconciliation.admit("prompt", clientRef);
+			return (correlation: { commandId: string; turnId: string }) =>
+				kindReconciliation.bindAdmission("prompt", clientRef, correlation);
+		};
 		const notePromptReconciliationAccepted = async (
 			correlation: { commandId: string; turnId: string },
 			clientRef?: string,
 		) => {
 			await kindReconciliation.noteAccepted("prompt", correlation, clientRef);
 		};
-		const releasePromptAdmission = (clientRef?: string) => kindReconciliation.releaseAdmission("prompt", clientRef);
+		const releasePromptAdmission = (clientRef?: string, rejection?: { cause: unknown }) =>
+			kindReconciliation.releaseAdmission("prompt", clientRef, rejection);
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
@@ -6090,21 +6056,25 @@ export function createNotificationsExtension(
 			if (!activeRuntime) return;
 			const fail = (cause: string, frameBytes: number, failedJson = JSON.stringify(frame)) => {
 				// A non-terminal frame only reports progress from a still-running
-				// prompt. Abandon its delivery on failure instead of publishing a
-				// synthetic terminal that could race the real run and make ACP
-				// settle the prompt while provider/tool execution continues.
+				// prompt, so its failure never publishes a synthetic terminal that
+				// could race the real run and make ACP settle the prompt while
+				// provider/tool execution continues. A frame-local rejection drops
+				// only this frame: the prompt's later frames, including its real
+				// terminal, must still reach the requester instead of leaving it to
+				// time out (#7867). Any other cause means the connection itself is
+				// gone, which ends the prompt's delivery.
 				if (frame.type !== "agent_end" && frame.type !== "agent_failed") {
-					if (cause === "writer_backlog_full") {
-						if (!submission.backlogDropLogged) {
-							submission.backlogDropLogged = true;
-							logger.warn(
-								`sdk: correlated non-terminal delivery dropped: cause=${cause} frameBytes=${frameBytes}`,
-							);
-						}
+					if (!FRAME_LOCAL_DIRECTED_DELIVERY_CAUSES.has(cause)) {
+						logger.warn(
+							`sdk: correlated non-terminal delivery abandoned: cause=${cause} frameBytes=${frameBytes}`,
+						);
+						abandonPrompt(submission);
 						return;
 					}
-					logger.warn(`sdk: correlated non-terminal delivery abandoned: cause=${cause} frameBytes=${frameBytes}`);
-					abandonPrompt(submission);
+					if (!submission.frameDropLogged) {
+						submission.frameDropLogged = true;
+						logger.warn(`sdk: correlated non-terminal delivery dropped: cause=${cause} frameBytes=${frameBytes}`);
+					}
 					return;
 				}
 				if (cause === "writer_backlog_full") {

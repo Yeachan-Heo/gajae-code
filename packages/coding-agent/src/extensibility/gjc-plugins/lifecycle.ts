@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import {
 	candidateRegistryEntry,
 	type GjcBundleTransactionDecision,
@@ -253,9 +254,6 @@ function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: strin
 	const relative = path.relative(scopeRoot, root);
 	if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return null;
 	return root;
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
 }
 
 function isStringArray(value: unknown): value is string[] {

@@ -163,6 +163,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	tavily: "TAVILY_API_KEY",
 	parallel: "PARALLEL_API_KEY",
 	kagi: "KAGI_API_KEY",
+	keenable: "KEENABLE_API_KEY",
 	// Kiro API keys use the ksk_ prefix; preserve the AWS bearer fallback for OAuth.
 	kiro: () => {
 		const apiKey = $credentialEnv("KIRO_API_KEY");
@@ -211,6 +212,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	nanogpt: "NANO_GPT_API_KEY",
 	"lm-studio": "LM_STUDIO_API_KEY",
 	omlx: "OMLX_API_KEY",
+	"rapid-mlx": "RAPID_MLX_API_KEY",
 	ollama: "OLLAMA_API_KEY",
 	"ollama-cloud": "OLLAMA_CLOUD_API_KEY",
 	"llama.cpp": "LLAMA_CPP_API_KEY",

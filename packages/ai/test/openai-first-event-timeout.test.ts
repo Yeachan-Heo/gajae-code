@@ -6,6 +6,7 @@ import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Context, Model, TextContent } from "../src/types";
 import { waitForDelayOrAbort, withEnv } from "./helpers";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 
@@ -119,15 +120,6 @@ function createAbortIgnoringHangingFetch(): typeof fetch {
 
 	return Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
 }
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function createNoProgressOpenAIResponsesStream(signal: AbortSignal | undefined): Response {
 	const encoder = new TextEncoder();
 	let interval: NodeJS.Timeout | undefined;
@@ -999,6 +991,36 @@ describe("OpenAI-family first-event timeouts", () => {
 			expect(fetchAttempts).toBe(1);
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toBe("OpenAI completions stream timed out while waiting for the first event");
+			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		});
+	});
+
+	it("normalizes any completions provider's SDK setup timeout as a typed first-event timeout", async () => {
+		// A slow OpenAI-compatible relay times out before response headers. Untyped,
+		// the failure carried no transport facts and the managed fallback chain
+		// could not classify it as the retryable server failure it is.
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: "5000" }, async () => {
+			const delayedFetch = createDelayedFetch(60_000, () =>
+				createOpenAICompletionsSuccessResponse(lmStudioCompletionsModel.id),
+			);
+			global.fetch = Object.assign(delayedFetch, { preconnect: originalFetch.preconnect });
+			const relayModel: Model<"openai-completions"> = {
+				...lmStudioCompletionsModel,
+				provider: "custom-relay",
+				baseUrl: "https://relay.example/v1",
+			};
+
+			const pending = streamOpenAICompletions(relayModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+			}).result();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(5_000);
+			await flushMicrotasks(100);
+			const result = await pending;
+
+			expect(result.stopReason).toBe("error");
 			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
 		});
 	});

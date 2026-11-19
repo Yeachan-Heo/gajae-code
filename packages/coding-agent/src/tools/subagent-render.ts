@@ -13,7 +13,7 @@ import { formatNumber } from "@gajae-code/utils";
 import { isSettingsInitialized, settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
-import { providerRetryPhaseLabel } from "../task/provider-retry-status";
+import { modelFallbackLabel, providerRetryPhaseLabel } from "../task/provider-retry-status";
 import { Ellipsis, Hasher, renderStatusLine } from "../tui";
 import {
 	formatDuration,
@@ -394,7 +394,7 @@ function renderSubagentSnapshotBody(
 		const fastSuffix = snapshot.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : "";
 		if (snapshot.modelFellBack && snapshot.requestedModel) {
 			lines.push(
-				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}${fastSuffix}`,
+				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, ${modelFallbackLabel(snapshot.modelFallbackReason)})`)}${fastSuffix}`,
 			);
 		} else {
 			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}${fastSuffix}`);

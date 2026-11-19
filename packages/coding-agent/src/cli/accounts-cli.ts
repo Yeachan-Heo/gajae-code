@@ -313,8 +313,9 @@ function parsePreferArgument(raw: string): { account: string; cap: number | unde
 }
 
 /**
- * Portable config text for a resolved OAuth row: its email, else its account id, whichever no other OAuth row of the
- * provider shares. Numeric row ids are never persisted as preferences; a row with neither unique value is refused.
+ * Portable config text for a resolved OAuth row: its email, else its account id, else its organization id, whichever no
+ * other OAuth row of the provider shares (one login signed in to several organizations shares email and account id
+ * across those rows). Numeric row ids are never persisted as preferences; a row with no unique value is refused.
  * Each candidate text is written only when {@link parsePreferenceAccount} reads it back as the same selector, so a
  * successful write neither fails the next startup nor retargets the row: the email is written bare when that
  * round-trips, else as `email:<address>` (an address such as `account:team@example.com` would otherwise parse as an
@@ -335,6 +336,15 @@ function portablePreferenceAccount(
 	if (accountId && oauthRows.filter(other => other.accountId?.trim() === accountId).length === 1) {
 		const written = `account:${accountId}`;
 		if (readsBackAs(written, { kind: "account", value: accountId })) return written;
+	}
+	const organizationId = row.organizationId?.trim().toLowerCase();
+	if (
+		organizationId &&
+		oauthRows.filter(other => other.organizationId?.trim().toLowerCase() === organizationId).length === 1
+	) {
+		const value = row.organizationId!.trim();
+		const written = `org:${value}`;
+		if (readsBackAs(written, { kind: "org", value })) return written;
 	}
 	return undefined;
 }
@@ -411,7 +421,7 @@ async function runPrefer(
 			const portable = row ? portablePreferenceAccount(row, providerRows) : undefined;
 			if (!portable) {
 				throw new AccountsCommandError(
-					`${account} has no unique email or account id to store as a preference; no preference was written.`,
+					`${account} has no unique email, account id, or organization id to store as a preference; no preference was written.`,
 				);
 			}
 			return { account: portable, cap: cap === 100 ? undefined : cap };

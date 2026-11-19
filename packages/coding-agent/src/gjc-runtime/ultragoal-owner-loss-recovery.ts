@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import type { ManagedOwnerSigabrtReceipt } from "./managed-owner-binding";
 import { sessionStateDir, sessionUltragoalDir } from "./session-layout";
 import { appendJsonlIdempotent, writeJsonAtomic } from "./state-writer";
@@ -66,10 +67,6 @@ interface TranscriptYield {
 
 function nonEmpty(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function exactChild(

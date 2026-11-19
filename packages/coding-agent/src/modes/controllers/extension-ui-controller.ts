@@ -437,7 +437,7 @@ export class ExtensionUiController {
 				await session.reload();
 				return { reloaded: true };
 			case "service_tier.set":
-				session.setServiceTier(input.tier as never);
+				await session.setServiceTier(input.tier as never);
 				return { changed: true };
 			case "queue.message.remove": {
 				const removed = session.removeQueuedMessageForEditing(String(input.id));
@@ -620,12 +620,8 @@ export class ExtensionUiController {
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
-			appendEntry: (customType, data) => {
-				this.ctx.sessionManager.appendCustomEntry(customType, data);
-			},
-			setLabel: (targetId, label) => {
-				this.ctx.sessionManager.appendLabelChange(targetId, label);
-			},
+			appendEntry: (customType, data) => this.ctx.session.appendCustomEntryInBackground(customType, data),
+			setLabel: (targetId, label) => this.ctx.session.appendLabelChangeInBackground(targetId, label),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
 			resolveTool: name => {
@@ -865,12 +861,8 @@ export class ExtensionUiController {
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
-			appendEntry: (customType, data) => {
-				this.ctx.sessionManager.appendCustomEntry(customType, data);
-			},
-			setLabel: (targetId, label) => {
-				this.ctx.sessionManager.appendLabelChange(targetId, label);
-			},
+			appendEntry: (customType, data) => this.ctx.session.appendCustomEntryInBackground(customType, data),
+			setLabel: (targetId, label) => this.ctx.session.appendLabelChangeInBackground(targetId, label),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
 			resolveTool: name => {
@@ -1622,7 +1614,7 @@ export class ExtensionUiController {
 	}
 
 	async #updateSessionName(name: string): Promise<void> {
-		await this.ctx.sessionManager.setSessionName(name, "user");
+		await this.ctx.session.setSessionName(name, "user");
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 	}
 

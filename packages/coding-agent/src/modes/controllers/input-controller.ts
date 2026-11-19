@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
+import type { ClipboardImage } from "@gajae-code/natives";
 import { type AutocompleteProvider, getKeybindings, matchesKey, type SlashCommand } from "@gajae-code/tui";
 import { $pickenv, logger, sanitizeText } from "@gajae-code/utils";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
@@ -18,11 +19,17 @@ import {
 	type SubmittedUserInput,
 	stopInteractiveActivityIndicator,
 } from "../../modes/types";
-import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { copyToClipboard, pasteFromClipboard, readImageFromClipboard } from "../../utils/clipboard";
+import {
+	copyToClipboard,
+	pasteFromClipboard,
+	readImageFromClipboard,
+	readMacFileUrlsFromClipboard,
+	readTextFromClipboard,
+} from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
@@ -30,6 +37,7 @@ import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-
 import {
 	decodePastedPathCandidate,
 	formatPastedImageReference,
+	imageFilePathsFromList,
 	imageReferenceNumbers,
 	locatePastedImageReferenceAroundCursor,
 	parsePastedImagePaths,
@@ -85,8 +93,15 @@ function isItermPetDragPaste(text: string): boolean {
 	return ITERM_PET_DRAG_PATH_PATTERN.test(decodePastedPathCandidate(text) ?? "");
 }
 
+interface ClipboardReaders {
+	readImage: typeof readImageFromClipboard;
+	readText: typeof readTextFromClipboard;
+	readMacFileUrls: typeof readMacFileUrlsFromClipboard;
+}
+
 interface InputControllerDependencies {
 	loadPastedImageBatch?: typeof loadPastedImageBatch;
+	clipboard?: Partial<ClipboardReaders>;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -96,6 +111,7 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	readonly #clipboard: ClipboardReaders;
 	/** Session id with an automatic-title request pending, if any. */
 	#autoTitleInFlightSessionId: string | undefined;
 	#deferredSubmission?: {
@@ -114,6 +130,12 @@ export class InputController {
 		dependencies: InputControllerDependencies = {},
 	) {
 		this.#loadPastedImageBatch = dependencies.loadPastedImageBatch ?? loadPastedImageBatch;
+		this.#clipboard = {
+			readImage: readImageFromClipboard,
+			readText: readTextFromClipboard,
+			readMacFileUrls: readMacFileUrlsFromClipboard,
+			...dependencies.clipboard,
+		};
 		this.actionRegistry = new ActionRegistry({
 			context: undefined,
 			showError: actionId => this.ctx.showError(actionId),
@@ -314,10 +336,12 @@ export class InputController {
 	#lastBackgroundFoldKeyTime = 0;
 	#slashCommands: SlashCommand[] = [];
 
-	/** Set after a first Esc silently consumes a queued steer. Kept until the
-	 *  queued steer is either cancelled by a second Esc or drained by continuation,
-	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
-	#steerConsumePending = false;
+	/** Set after a first Esc silently consumes a queued steer, bound to the session
+	 *  it interrupted. Kept until a second Esc cancels the queued steer or the
+	 *  steer-on-interrupt continuation starts (that session's next `agent_start`),
+	 *  so abort cleanup going idle cannot turn the second Esc into an idle action,
+	 *  while a steer still queued behind the delivered one gets a fresh first Esc. */
+	#steerConsume: { session: AgentSession; unsubscribe: () => void } | undefined;
 	#commandPaletteActions = new Map<AppKeybinding, CommandPaletteAction>();
 	/** Opt-in subset of `#commandPaletteActions` whose listing is filtered by the
 	 *  action registry's availability predicate. Deliberately a sibling set rather
@@ -402,15 +426,35 @@ export class InputController {
 		);
 	}
 
-	#handlePendingSteerInterrupt(): boolean {
-		if (!this.#steerConsumePending) return false;
-		this.#resetEscapeGestures();
-		if (!this.ctx.session.hasQueuedSteering) {
-			this.#steerConsumePending = false;
-			return false;
-		}
+	#isSteerConsumePending(): boolean {
+		return this.#steerConsume?.session === this.ctx.session;
+	}
 
-		this.#steerConsumePending = false;
+	/** First Esc on a queued steer: silently abort so steer-on-interrupt resumes
+	 *  into it, and latch the gesture until that continuation starts. */
+	#consumeQueuedSteer(): void {
+		this.#endSteerConsume();
+		const session = this.ctx.session;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start" && this.#steerConsume?.unsubscribe === unsubscribe) this.#endSteerConsume();
+		});
+		this.#steerConsume = { session, unsubscribe };
+		void this.#abortInteractive({ silent: true });
+	}
+
+	#endSteerConsume(): void {
+		const consume = this.#steerConsume;
+		this.#steerConsume = undefined;
+		consume?.unsubscribe();
+	}
+
+	#handlePendingSteerInterrupt(): boolean {
+		if (!this.#steerConsume) return false;
+		const pending = this.#isSteerConsumePending();
+		this.#endSteerConsume();
+		if (!pending) return false;
+		this.#resetEscapeGestures();
+		if (!this.ctx.session.hasQueuedSteering) return false;
 		this.restoreQueuedMessagesToEditor({ abort: true });
 		return true;
 	}
@@ -449,10 +493,9 @@ export class InputController {
 				this.ctx.session.hasQueuedSteering &&
 				!this.ctx.session.isBashRunning &&
 				!this.ctx.session.isEvalRunning &&
-				!this.#steerConsumePending
+				!this.#isSteerConsumePending()
 			) {
-				this.#steerConsumePending = true;
-				void this.#abortInteractive({ silent: true });
+				this.#consumeQueuedSteer();
 				return true;
 			}
 			// Only count queues this handler can actually drain. The aggregate
@@ -524,12 +567,11 @@ export class InputController {
 			this.ctx.retryEscapePrimed = false;
 		}
 		if (options.streaming && this.ctx.session.isStreaming) {
-			if (this.ctx.session.hasQueuedSteering && !this.#steerConsumePending) {
+			if (this.ctx.session.hasQueuedSteering && !this.#isSteerConsumePending()) {
 				// First Esc with a queued steer: silently consume it and
 				// auto-continue via steer-on-interrupt instead of stalling on
 				// "Operation aborted".
-				this.#steerConsumePending = true;
-				void this.#abortInteractive({ silent: true });
+				this.#consumeQueuedSteer();
 			} else {
 				void this.#abortInteractive();
 			}
@@ -634,7 +676,7 @@ export class InputController {
 			const bypassAutocomplete = Boolean(
 				this.ctx.loadingAnimation ||
 					this.ctx.hasActiveBtw() ||
-					(this.#steerConsumePending && this.ctx.session.hasQueuedSteering) ||
+					(this.#isSteerConsumePending() && this.ctx.session.hasQueuedSteering) ||
 					this.ctx.session.isStreaming ||
 					this.ctx.session.isCompacting ||
 					this.ctx.session.isGeneratingHandoff ||
@@ -1660,7 +1702,7 @@ export class InputController {
 		)
 			.then(async title => {
 				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
-				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+				const applied = await this.ctx.session.setSessionName(title, "auto");
 				if (applied) {
 					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
 					this.ctx.updateEditorBorderColor();
@@ -1992,19 +2034,32 @@ export class InputController {
 			return true;
 		}
 		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
+		// Cmd+V on an image-only clipboard arrives as an empty bracketed paste in some
+		// terminals: read the image from the clipboard instead of inserting nothing.
+		if (text.length === 0) return this.handleImagePaste();
 		const parsed = parsePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
 		if (!parsed) return false;
 		if (parsed.kind === "too-many") {
 			this.ctx.showStatus(`Cannot attach more than ${parsed.maxCandidates} pasted images.`);
 			return false;
 		}
-		return this.#attachPastedImagePaths(parsed.paths, parsed.requiresConfirmation, context);
+		return this.#attachPastedImagePaths(
+			parsed.paths,
+			parsed.requiresConfirmation ? "confirm" : "clipboard-temp",
+			context,
+		);
 	}
 
-	/** Return false on every failure so CustomEditor restores the exact paste. */
+	/**
+	 * Return false on every failure so CustomEditor restores the exact paste.
+	 *
+	 * `clipboard-temp` attaches one terminal-written temp image without asking; `confirm` asks
+	 * before reading any other pasted path; `user-selected` (files copied in Finder and pasted
+	 * with the image-paste key) is already an explicit choice and attaches without asking.
+	 */
 	async #attachPastedImagePaths(
 		imagePaths: readonly string[],
-		requiresConfirmation: boolean,
+		access: "clipboard-temp" | "confirm" | "user-selected",
 		context: PasteTextContext,
 	): Promise<boolean> {
 		const signal = context.signal;
@@ -2013,7 +2068,7 @@ export class InputController {
 		const pendingImages = this.ctx.pendingImages;
 		const pendingImageCount = pendingImages.length;
 		try {
-			if (requiresConfirmation) {
+			if (access === "confirm") {
 				const selection = await this.ctx.showHookSelector(
 					`Attach ${imagePaths.length} pasted images?\nOnly attach files you intend to send to the model.`,
 					["Attach images", "Paste paths literally"],
@@ -2026,7 +2081,7 @@ export class InputController {
 			const loaded = await this.#loadPastedImageBatch({
 				paths: imagePaths,
 				autoResize: this.ctx.settings.get("images.autoResize"),
-				sourcePolicy: requiresConfirmation ? "confirmed" : "automatic-temp",
+				sourcePolicy: access === "clipboard-temp" ? "automatic-temp" : "confirmed",
 				signal,
 			});
 			signal.throwIfAborted();
@@ -2184,54 +2239,83 @@ export class InputController {
 		this.ctx.pendingImages = [];
 	}
 
+	/**
+	 * Ctrl+V / Cmd+V smart paste. Order matters: macOS pasteboard file URLs first (a Finder-copied
+	 * image also carries a generic file-icon bitmap), then the bitmap, then clipboard text, inserted
+	 * verbatim.
+	 */
 	async handleImagePaste(): Promise<boolean> {
 		try {
-			const image = await readImageFromClipboard();
-			if (image) {
-				const base64Data = image.data.toBase64();
-				let imageData = await ensureSupportedImageInput({
-					type: "image",
-					data: base64Data,
-					mimeType: image.mimeType,
-				});
-				if (!imageData) {
-					this.ctx.showStatus(`Unsupported clipboard image format: ${image.mimeType}`);
-					return false;
-				}
-				if (this.ctx.settings.get("images.autoResize")) {
-					try {
-						const resized = await resizeImage({
-							type: "image",
-							data: imageData.data,
-							mimeType: imageData.mimeType,
-						});
-						imageData = { type: "image", data: resized.data, mimeType: resized.mimeType };
-					} catch {
-						// Keep the normalized image when resize fails.
-					}
-				}
+			const filePaths = imageFilePathsFromList(await this.#clipboard.readMacFileUrls());
+			if (filePaths.length > 0)
+				return await this.#attachPastedImagePaths(filePaths, "user-selected", this.#unguardedPasteContext());
 
-				this.ctx.pendingImages = [
-					...this.ctx.pendingImages,
-					{
-						type: "image",
-						data: imageData.data,
-						mimeType: imageData.mimeType,
-					},
-				];
-				this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
-				this.ctx.ui.requestRender();
-				return true;
-			}
-			this.ctx.showStatus(
-				"No image in clipboard. Use #paste-image, paste a copied image, or attach an image file with @path/to/image.png.",
+			// Start the text bridge alongside the image bridge: either can shell out, so serial awaits
+			// would stall an empty clipboard by their sum. Settle-mark it so an image-read throw that
+			// skips the text await can never become an unhandled rejection.
+			const textPromise = this.#clipboard.readText();
+			textPromise.then(
+				() => {},
+				() => {},
 			);
-			return false;
+			const image = await this.#clipboard.readImage();
+			if (image) return await this.#attachClipboardImage(image);
+
+			const text = await textPromise;
+			if (!text) {
+				this.ctx.showStatus("Clipboard is empty");
+				return false;
+			}
+			this.ctx.editor.insertText(text);
+			this.ctx.ui.requestRender();
+			return true;
 		} catch {
 			this.ctx.showStatus("Failed to read clipboard");
 			return false;
 		}
 	}
+
+	/** Paste context for keybinding-driven pastes, which have no editor transaction to abort or commit. */
+	#unguardedPasteContext(): PasteTextContext {
+		return { signal: new AbortController().signal, commit: commit => commit() };
+	}
+
+	async #attachClipboardImage(image: ClipboardImage): Promise<boolean> {
+		let imageData = await ensureSupportedImageInput({
+			type: "image",
+			data: image.data.toBase64(),
+			mimeType: image.mimeType,
+		});
+		if (!imageData) {
+			this.ctx.showStatus(`Unsupported clipboard image format: ${image.mimeType}`);
+			return false;
+		}
+		if (this.ctx.settings.get("images.autoResize")) {
+			try {
+				const resized = await resizeImage({
+					type: "image",
+					data: imageData.data,
+					mimeType: imageData.mimeType,
+				});
+				imageData = { type: "image", data: resized.data, mimeType: resized.mimeType };
+			} catch {
+				// Keep the normalized image when resize fails.
+			}
+		}
+
+		this.ctx.pendingImages = [
+			...this.ctx.pendingImages,
+			{
+				type: "image",
+				data: imageData.data,
+				mimeType: imageData.mimeType,
+			},
+		];
+		this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
 	/**
 	 * Explicit "Paste text from configured clipboard" action (P3-b v1). Only
 	 * meaningful when `clipboard.transport` is `ssh` — reads via `pbpaste` on

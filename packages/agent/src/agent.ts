@@ -534,6 +534,7 @@ export class Agent {
 		error: undefined,
 	};
 	#contextRevision = 0;
+	#historyRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
@@ -549,6 +550,7 @@ export class Agent {
 	#steeringQueue: AgentMessage[] = [];
 	#steeringWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
+	#followUpWaiters = new Set<() => void>();
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#followUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
@@ -957,6 +959,15 @@ export class Agent {
 		return this.#contextRevision;
 	}
 
+	/**
+	 * Revision of the committed message history alone. Unlike `contextRevision`,
+	 * prompt, tool and model publications do not advance it, so callers that need
+	 * to fence message ownership independently can compare only this counter.
+	 */
+	get historyRevision(): number {
+		return this.#historyRevision;
+	}
+
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
 		return this.#appendOnlyContext;
 	}
@@ -1305,6 +1316,7 @@ export class Agent {
 		}
 		this.#state.messages = ms.slice();
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	appendMessage(m: AgentMessage) {
@@ -1313,6 +1325,7 @@ export class Agent {
 		// via slice() at the API boundary, so no caller relies on per-append array identity.
 		this.#state.messages.push(m);
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	popMessage(): AgentMessage | undefined {
@@ -1320,6 +1333,7 @@ export class Agent {
 		const removed = this.#state.messages.at(-1);
 		this.#state.messages = messages;
 		this.#contextRevision++;
+		this.#historyRevision++;
 
 		if (removed && this.#state.streamMessage === removed) {
 			this.#state.streamMessage = null;
@@ -1329,11 +1343,13 @@ export class Agent {
 	}
 
 	/**
-	 * For callers that mutate committed messages or the system prompt in place
-	 * outside Agent-owned mutators.
+	 * For callers that mutate committed messages in place outside Agent-owned
+	 * mutators. Prompt mutations must use `setSystemPrompt` so they stay out of the
+	 * history revision.
 	 */
 	touchContext(): void {
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	/**
@@ -1406,6 +1422,34 @@ export class Agent {
 	}
 
 	/**
+	 * Resolves when a follow-up message is queued after the wait starts, or when `signal` aborts, without consuming the message. Used by wait-style tools to interrupt their observation when the user queues a follow-up.
+	 */
+	waitForFollowUpArrival(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			this.#followUpWaiters.delete(settle);
+			signal.removeEventListener("abort", settle);
+			resolve();
+		};
+		this.#followUpWaiters.add(settle);
+		signal.addEventListener("abort", settle, { once: true });
+		return promise;
+	}
+
+	/**
+	 * Notify follow-up waiters without queueing a message. Used by the session
+	 * when a deferred SDK follow-up is admitted, so job poll can interrupt
+	 * immediately without waiting for the message to enter the agent queue.
+	 */
+	notifyFollowUpWaiters(): void {
+		for (const notify of [...this.#followUpWaiters]) notify();
+	}
+
+	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 *
@@ -1419,6 +1463,7 @@ export class Agent {
 			this.#followUpForceOneAtATime.add(m);
 		}
 		this.#followUpQueue.push(m);
+		for (const notify of [...this.#followUpWaiters]) notify();
 	}
 
 	/**
@@ -1658,6 +1703,7 @@ export class Agent {
 	clearMessages() {
 		this.#state.messages = [];
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	abort() {
@@ -1779,6 +1825,7 @@ export class Agent {
 	reset() {
 		this.#state.messages = [];
 		this.#contextRevision++;
+		this.#historyRevision++;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls = new Set<string>();
@@ -2436,13 +2483,32 @@ export class Agent {
 				return;
 			}
 			const providerCode = providerFailureCode(err);
-			const runtimeFailureCode = abortController.signal.aborted
-				? "aborted"
-				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
+			const aborted = abortController.signal.aborted;
+			const abortReason = abortController.signal.reason;
+			// A publication rejection aborts the run with its own error. That is a
+			// failure to diagnose, not a caller cancellation, so keep the cause log.
+			// Only the DOMException our own `abort()` installs marks a caller cancellation.
+			// Keying on the name alone would also suppress a publication error that happens
+			// to be named "AbortError".
+			const cancelled = aborted && abortReason instanceof DOMException && abortReason.name === "AbortError";
+			const runtimeFailureCode = aborted ? "aborted" : (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			} else if (!cancelled) {
+				// The only in-band abort reason is a canonical publication rejection, which
+				// aborts with its own error. Report that cause under a distinct diagnostic
+				// instead of mislabeling it as a run failure. `forceAbort` clears the active
+				// run before this catch can observe it, so a deliberate forced abort never
+				// reaches here, and `abort()` takes the cancellation branch above.
+				logger.warn("Agent run aborted with an underlying failure", {
 					provider: model.provider,
 					model: model.id,
 					code: sanitized.code,
@@ -2465,7 +2531,7 @@ export class Agent {
 					totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
-				stopReason: abortController.signal.aborted ? "aborted" : "error",
+				stopReason: aborted ? "aborted" : "error",
 				errorMessage: sanitized.message,
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
@@ -2483,7 +2549,7 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				this.#emit({
 					type: "agent_failed",
 					// Only the identity-checked local staging diagnostic may assert a
@@ -2493,7 +2559,7 @@ export class Agent {
 				});
 			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
-				stopReason: abortController.signal.aborted ? "cancelled" : "error",
+				stopReason: aborted ? "cancelled" : "error",
 				messages: [errorMsg],
 			});
 		} finally {

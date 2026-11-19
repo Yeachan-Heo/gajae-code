@@ -7,7 +7,6 @@ import { type AsyncJob, AsyncJobManager, type FoldReason, isBackgroundJobSupport
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import jobDescription from "../prompts/tools/job.md" with { type: "text" };
-import type { FoldAdapter } from "../session/fold-coordinator";
 import { lookupOwnedRegistration, unregisterOwnedRegistration } from "../session/terminal-abort";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
@@ -22,7 +21,6 @@ import {
 	type ToolUIColor,
 	type ToolUIStatus,
 } from "./render-utils";
-import { foldAwaitReasonLine, watchSteerForFold } from "./steer-fold";
 import { ToolError } from "./tool-errors";
 
 const jobSchema = z.object({
@@ -44,6 +42,13 @@ const WAIT_DURATION_MS: Record<string, number> = {
 
 function parseWaitDurationMs(value: string | undefined): number {
 	return (value ? WAIT_DURATION_MS[value] : undefined) ?? WAIT_DURATION_MS["30s"];
+}
+
+/** Model-facing line appended when a user steer ends a `poll` wait early. */
+function jobAwaitInterruptedLine(jobIds: string[]): string {
+	const names = jobIds.map(id => `\`${id}\``).join(", ");
+	const plural = jobIds.length !== 1;
+	return `Job await interrupted by a new user message; ${names} ${plural ? "keep" : "keeps"} running and ${plural ? "their results" : "its result"} will be delivered automatically on completion. Handle the user message next; do not re-poll first.`;
 }
 
 interface JobSnapshot {
@@ -243,73 +248,6 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		const waitMs = parseWaitDurationMs(this.session.settings.get("async.pollWaitDuration"));
 		const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<void>();
 		const timeoutHandle = setTimeout(() => timeoutResolve(), waitMs);
-		// Settled the moment ANY watched wait is released by a fold, so the await
-		// never outlives its own fold. `job-await` adapters are never implicit
-		// chord / SDK-control targets (the jobs are already in the background);
-		// only the steer watcher below folds them, explicitly. `task`/`subagent`
-		// waits are a non-goal, so task-backed jobs are watched but never folded.
-		const foldedAwait = Promise.withResolvers<void>();
-		const foldedJobs = new Map<string, FoldReason>();
-		const foldTargets: Array<{ adapter: FoldAdapter; release: (reason: FoldReason) => boolean }> = [];
-		const unregisterFoldAdapters: Array<() => void> = [];
-		const startedAt = Date.now();
-		for (const job of runningJobs) {
-			if (job.type === "task" || job.metadata?.subagent !== undefined) continue;
-			const generation = job.generation;
-			let detached = false;
-			const release = (reason: FoldReason): boolean => {
-				if (detached) return false;
-				detached = true;
-				manager.markBackgrounded(job.id, generation, reason);
-				foldedJobs.set(job.id, reason);
-				foldedAwait.resolve();
-				return true;
-			};
-			const adapter: FoldAdapter = {
-				kind: "job-await",
-				jobId: job.id,
-				jobGeneration: generation,
-				label: job.label,
-				cwdSensitive: false,
-				signal,
-				originatingTurn: false,
-				outputRef: {
-					jobId: job.id,
-					generation,
-					instruction: `Use the job tool's tail operation for ${job.id} to read this job's output.`,
-				},
-				getJob: () => {
-					const current = manager.getJob(job.id);
-					return current?.generation === generation ? current : undefined;
-				},
-				detachObserver: receipt => (release(receipt.reason) ? "resolved" : "already-settled"),
-				resolveForegroundObserver: () => (detached ? "already-settled" : "resolved"),
-			};
-			foldTargets.push({ adapter, release });
-			unregisterFoldAdapters.push(this.session.registerForegroundFoldParticipant?.(adapter) ?? (() => {}));
-		}
-		// Fold every foldable wait on one steer. A job that an earlier fold already
-		// moved still owns its receipt slot until it completes, so the coordinator
-		// refuses a second fold for it; that receipt already guarantees the wake,
-		// so this await is simply released for it. Every other job folds through
-		// the coordinator, whose `detachObserver` call releases the await with the
-		// recorded reason.
-		const stopSteerWatch =
-			foldTargets.length > 0
-				? watchSteerForFold(this.session, startedAt, async fold => {
-						await Promise.all(
-							foldTargets.map(async ({ adapter, release }) => {
-								const current = adapter.getJob();
-								if (current?.status !== "running") return;
-								if (current.metadata?.foldReason !== undefined) {
-									release("steer");
-									return;
-								}
-								await fold("steer", adapter);
-							}),
-						);
-					})
-				: () => {};
 		racePromises.push(timeoutPromise);
 
 		const watchedJobIds = runningJobs.map(job => job.id);
@@ -336,6 +274,19 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		racePromises.push(progressError);
 		let progressTimer: Timer | undefined;
 
+		// A busy user message must not sit behind this observation window: end
+		// the wait so the tool boundary handles the message next, while every
+		// watched job keeps running and still delivers its result on completion
+		// (`subagent await` parity). Interrupts on steering arrivals (steer mode)
+		// or follow-up queue additions (queue mode). Nothing is folded: the jobs
+		// are already in the background, so no grace window applies.
+		const steeringWaitAbort = new AbortController();
+		const followUpWaitAbort = new AbortController();
+		const steered = this.session.waitForUserSteering?.(steeringWaitAbort.signal).then(() => "steered" as const);
+		const queued = this.session.waitForFollowUpQueued?.(followUpWaitAbort.signal).then(() => "steered" as const);
+		const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
+		const onAbort = () => abortResolve();
+		let waitOutcome: "settled" | "steered";
 		try {
 			progressTimer = onUpdate
 				? setInterval(() => {
@@ -347,22 +298,19 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 					}, PROGRESS_INTERVAL_MS)
 				: undefined;
 			emitProgress();
-			if (signal) {
-				const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
-				const onAbort = () => abortResolve();
-				signal.addEventListener("abort", onAbort, { once: true });
-				racePromises.push(abortPromise);
-				try {
-					await Promise.race([...racePromises, foldedAwait.promise]);
-				} finally {
-					signal.removeEventListener("abort", onAbort);
-				}
-			} else {
-				await Promise.race([...racePromises, foldedAwait.promise]);
-			}
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+			const steerSignals: Promise<"steered">[] = [];
+			if (steered) steerSignals.push(steered);
+			if (queued) steerSignals.push(queued);
+			waitOutcome = await Promise.race([
+				Promise.race([...racePromises, abortPromise]).then(() => "settled" as const),
+				...steerSignals,
+			]);
 		} finally {
-			stopSteerWatch();
-			for (const unregister of unregisterFoldAdapters) unregister();
+			steeringWaitAbort.abort();
+			followUpWaitAbort.abort();
+			signal?.removeEventListener("abort", onAbort);
 			manager.unwatchJobs(watchedJobIds);
 			clearTimeout(timeoutHandle);
 			if (progressTimer) clearInterval(progressTimer);
@@ -374,14 +322,14 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			cancelOutcomes,
 			this.#readOutputTails(manager, params.tail, ownerFilter),
 		);
-		if (foldedJobs.size > 0) {
-			const existingText = result.content.find(block => block.type === "text")?.text ?? "";
-			return {
-				...result,
-				content: [{ type: "text", text: `${existingText}\n\n${foldAwaitReasonLine(foldedJobs)}`.trim() }],
-			};
-		}
-		return result;
+		if (waitOutcome !== "steered") return result;
+		const stillRunning = (result.details?.jobs ?? []).filter(job => job.status === "running").map(job => job.id);
+		if (stillRunning.length === 0) return result;
+		const existingText = result.content.find(block => block.type === "text")?.text ?? "";
+		return {
+			...result,
+			content: [{ type: "text", text: `${existingText}\n\n${jobAwaitInterruptedLine(stillRunning)}`.trim() }],
+		};
 	}
 
 	/**

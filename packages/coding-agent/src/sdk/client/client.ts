@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { SECURE_LOCAL_PROOF_FIELD, secureLocalFrameOperation } from "../secure-local-controls";
+import { lifecycleFingerprint } from "./lifecycle-fingerprint";
 
 export type SdkErrorCode =
 	| "invalid_input"
@@ -38,6 +39,18 @@ export class SdkClientError extends Error {
 		this.details = details;
 		this.transport = options.transport === true;
 		if (reconnect) this.reconnect = reconnect;
+	}
+}
+
+/** Bound a caller-visible operation by a timeout that reports `SdkClientError("timeout")`. */
+export async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	const timeout = Promise.withResolvers<never>();
+	try {
+		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
+		return await Promise.race([promise, timeout.promise]);
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 
@@ -240,7 +253,7 @@ function parseFrame(value: unknown): Frame {
  * mutating callback can never desynchronize the advertised identity or the
  * reconciliation fingerprint from the request that was actually sent.
  */
-function deepFreeze<T>(value: T): T {
+export function deepFreeze<T>(value: T): T {
 	if (value && typeof value === "object") {
 		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
 		Object.freeze(value);
@@ -278,21 +291,6 @@ function sinkThenable(value: unknown): void {
 		// A throwing then-accessor already surfaced synchronously to the caller
 		// of the observer; nothing further to sink.
 	}
-}
-
-function lifecycleFingerprint(operation: string, input: unknown): string {
-	const identity =
-		input !== null && typeof input === "object" && !Array.isArray(input)
-			? { ...(input as Record<string, unknown>) }
-			: input;
-	if (identity !== null && typeof identity === "object" && !Array.isArray(identity)) {
-		const lifecycleIdentity = identity as Record<string, unknown>;
-		delete lifecycleIdentity.coordinatorSidecarSigningKey;
-		delete lifecycleIdentity.coordinatorSidecarKeyId;
-	}
-	return createHash("sha256")
-		.update(JSON.stringify({ operation, input: identity }))
-		.digest("hex");
 }
 
 function inputFingerprint(input: unknown): string {

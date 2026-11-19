@@ -15,6 +15,22 @@ import type {
 export const PROMPT_FAILURE_CODE_MAX = 64;
 const LOCAL_FAILURE_LOG_MAX = 16_384;
 
+/** Provider failure codes retained across deadline recovery instead of being cleared. */
+const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
+	"provider_down",
+	"provider_unavailable",
+	"provider_rejected",
+	"upstream_stream_interrupted",
+	"argument_validation",
+	"execution",
+	"upstream_error",
+	"transport_reset",
+]);
+
+export function isPreservedProviderFailure(code: string | undefined): boolean {
+	return code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
+}
+
 export const PROMPT_FAILURE_MESSAGE_SUBMISSION = "Prompt submission failed.";
 export const PROMPT_FAILURE_MESSAGE_POST_START_PROVIDER = "Provider failure after execution started.";
 export const PROMPT_FAILURE_MESSAGE_POST_START_AGENT = "Agent run failed after execution started.";

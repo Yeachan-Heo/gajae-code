@@ -21,6 +21,8 @@ export interface SteerHarness {
 	manager: AsyncJobManager;
 	/** Admit a steer into the simulated live run (never consumed by the harness). */
 	steer: (text?: string) => void;
+	/** Queue a follow-up into the simulated live run. */
+	queueFollowUp: (text?: string) => void;
 	hasQueuedSteering: () => boolean;
 	fenceArmed: () => boolean;
 	stopRequested: () => boolean;
@@ -93,6 +95,7 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 	const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: options.retentionMs });
 	AsyncJobManager.setInstance(manager);
 	const steeringWaiters = new Set<() => void>();
+	const followUpWaiters = new Set<() => void>();
 	let queuedSteering = false;
 	let fenceArmed = false;
 	let stopRequested = false;
@@ -152,6 +155,18 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 						signal.addEventListener("abort", settle, { once: true });
 						return promise;
 					},
+					waitForFollowUpQueued: (signal: AbortSignal) => {
+						if (signal.aborted) return Promise.resolve();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						const settle = () => {
+							followUpWaiters.delete(settle);
+							signal.removeEventListener("abort", settle);
+							resolve();
+						};
+						followUpWaiters.add(settle);
+						signal.addEventListener("abort", settle, { once: true });
+						return promise;
+					},
 				}),
 	};
 	return {
@@ -161,6 +176,9 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 		steer: () => {
 			queuedSteering = true;
 			for (const resolve of [...steeringWaiters]) resolve();
+		},
+		queueFollowUp: () => {
+			for (const resolve of [...followUpWaiters]) resolve();
 		},
 		hasQueuedSteering: () => queuedSteering,
 		fenceArmed: () => fenceArmed,

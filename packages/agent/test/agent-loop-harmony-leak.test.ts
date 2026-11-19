@@ -1,13 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, StreamFn } from "@gajae-code/agent-core/types";
-import type { AssistantMessageEvent, Message } from "@gajae-code/ai";
+import type { AssistantMessageEvent } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
-import { createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createUserMessage, identityConverter } from "./helpers";
 
 // A leaked tool-call envelope on the assistant text surface: the openai-codex
 // model emitted the `ask` call as visible text instead of a native function

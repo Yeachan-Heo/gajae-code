@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * The remote-compaction endpoint is built from `OPENAI_BASE_URL` and carries the
@@ -16,18 +16,7 @@ import { pathToFileURL } from "node:url";
  */
 
 const PROBE = path.join(import.meta.dir, "fixtures", "compaction-endpoint-probe.ts");
-const tempDirs: string[] = [];
-
-function projectDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-compaction-endpoint-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { projectDir } = createTrustTempDirs("gjc-compaction-endpoint-trust-");
 
 async function endpointIn(cwd: string, overrides: Record<string, string> = {}): Promise<string> {
 	const env: Record<string, string> = {};

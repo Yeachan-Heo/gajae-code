@@ -33,6 +33,7 @@ import {
 	type AgentState,
 	type AgentTerminalOwnerContext,
 	type AgentTool,
+	type AgentToolContext,
 	activeToolForCallName,
 	assertImagePlaceholdersHavePayload,
 	type BeforeToolCallContext,
@@ -126,15 +127,15 @@ import {
 	getSupportedEfforts,
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
+	isImageOnlyModel,
 	isUsageLimitError,
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
-	isImageOnlyModel,
 	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
-import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
+import { clearAnthropicFastModeFallback, normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
 import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import {
@@ -143,11 +144,13 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
+	type FallbackTrigger,
 	type FallbackTriggerClass,
 	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
@@ -251,9 +254,12 @@ import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/c
 import {
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
+	buildModelProfileTranscriptPlan,
+	type CommittedModelProfileSessionPublication,
 	finishPreparedModelProfileActivation,
 	getModelAssignmentPatches,
 	getModelProfileAssignmentMaterializationPatches,
+	ModelProfilePublicationError,
 	materializeActiveModelProfileAssignment,
 	type PreparedModelProfileActivation,
 	prepareModelProfileActivation,
@@ -447,6 +453,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import ttsrToolBlockedReminderTemplate from "../prompts/system/ttsr-tool-blocked-reminder.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
@@ -477,7 +484,7 @@ import {
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { DelegationHintController } from "../task/delegation-hint";
-import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
+import { modelSupportsThinkingOff, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
 	collectDiscoverableTools,
@@ -488,7 +495,7 @@ import {
 	selectDiscoverableToolNamesByServer,
 	selectRestorableDiscoveredBuiltinToolNames,
 } from "../tool-discovery/tool-index";
-import type { AskAnswerSource, ToolSession } from "../tools";
+import type { AskAnswerSource, NestedToolScope, ToolSession } from "../tools";
 import { computeEssentialBuiltinNames } from "../tools";
 import { AskTool } from "../tools/ask";
 import {
@@ -496,12 +503,12 @@ import {
 	notifyWorkflowGateEmitterChanged,
 } from "../tools/ask-answer-registry";
 import { assertEditableFile } from "../tools/auto-generated-guard";
-import { closePendingAsks } from "../tools/pending-asks";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
+import { closePendingAsks } from "../tools/pending-asks";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -577,13 +584,16 @@ import {
 	wrapUntrustedContent,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
-import type { SessionRecapAppendResult } from "./recap";
+import type { SessionRecapAppendResult, SessionRecapInput } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
+	DefaultModelSelectionEntriesOptions,
+	DefaultModelSelectionPromotion,
 	DefaultModelSelectionStage,
+	ModelProfileTranscriptPlan,
 	NewSessionOptions,
 	PreparedNewSession,
 	RecoveryHydrationContext,
@@ -594,6 +604,8 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 	SharedAppendOutcome,
+	SharedControlEntry,
+	SharedEntriesAppendOutcome,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -627,6 +639,17 @@ import {
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { TerminalIdleAdmissionError, YieldQueue } from "./yield-queue";
+
+/**
+ * Message shapes this session persists through the manager. `appendMessageSharingSession` and
+ * `appendMessage` accept the same set including hook messages, which this session never writes.
+ */
+type SessionPersistedMessage =
+	| Message
+	| CustomMessage
+	| BashExecutionMessage
+	| PythonExecutionMessage
+	| FileMentionMessage;
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -846,6 +869,59 @@ export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" |
 }
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
+
+/**
+ * A session control could not complete its admitted shared publication (#7823, #7824).
+ *
+ * `rejected`/`stale` prove nothing was written and nothing live changed. `unknown`
+ * and `committed_not_applied` mean the transcript may hold (or holds) the change while
+ * this session did not apply it; the session is closed instead of compensating.
+ */
+export class SharedControlPublicationError extends Error {
+	readonly code: "rejected" | "stale" | "unknown" | "committed_not_applied";
+
+	constructor(
+		readonly operation: string,
+		readonly outcome: SharedEntriesAppendOutcome,
+		publicationCause?: unknown,
+	) {
+		const code = outcome.kind === "committed" ? "committed_not_applied" : outcome.kind;
+		super(sharedControlPublicationMessage(operation, outcome), { cause: publicationCause ?? outcome });
+		this.name = "SharedControlPublicationError";
+		this.code = code;
+	}
+}
+
+/**
+ * Durable session intent a model-selection rollback restores along with the live model:
+ * the configured DEFAULT chain and the resume default. Absent fields are left alone.
+ */
+export interface ModelSelectionRollbackDurableState {
+	readonly defaultChain?: {
+		readonly state:
+			| {
+					readonly entries: readonly string[];
+					readonly origin: string;
+					readonly identity?: string;
+					readonly explicitHead?: boolean;
+			  }
+			| undefined;
+	};
+	readonly resumeDefault?: { readonly selector: string | undefined };
+}
+
+function sharedControlPublicationMessage(operation: string, outcome: SharedEntriesAppendOutcome): string {
+	switch (outcome.kind) {
+		case "stale":
+			return `Could not ${operation}: the shared session changed before the update was written (${outcome.reason}). Nothing was changed; reopen the session and retry.`;
+		case "rejected":
+			return `Could not ${operation}: the shared session refused the update before writing it. Nothing was changed; retry.`;
+		case "unknown":
+			return `Could not confirm ${operation} (entries ${outcome.ids.join(", ") || "none"}). The session was closed to protect its history; reopen it to see the result.`;
+		case "committed":
+			return `The change (${operation}) was saved to the session history but could not be applied here. The session was closed; reopen it to continue.`;
+	}
+}
 
 class SharedCompactionPublicationError extends Error {
 	constructor(readonly outcome: Exclude<SharedAppendOutcome, { kind: "committed" }>) {
@@ -1547,6 +1623,15 @@ type RetryErrorClassification =
 	| "local_buffer_overflow"
 	| "unknown";
 
+/** Longest single pause while waiting for a provider's parallel-request slot. */
+const CONCURRENCY_WAIT_MAX_POLL_MS = 15_000;
+/**
+ * Minimum poll interval when Retry-After is 0, used to bound request volume.
+ * With a budget of 300,000ms (default), this 1000ms interval bounds requests to ~300,
+ * preventing unbounded polling when a provider returns Retry-After: 0.
+ */
+const CONCURRENCY_POLL_MIN_INTERVAL_MS = 1000;
+
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
 const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
@@ -1790,16 +1875,13 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 	}
 	try {
 		const hostname = new URL(model.baseUrl).hostname.toLowerCase();
-		if (
-			hostname === "localhost" ||
-			hostname === "0.0.0.0" ||
-			hostname === "::1" ||
-			hostname === "[::1]" ||
-			hostname.endsWith(".local")
-		) {
+		// Share the transport's loopback definition so a fully qualified
+		// `localhost.` (now admitted for local providers) keeps local-overload
+		// handling instead of being treated as a remote endpoint.
+		if (isLoopbackHost(hostname) || hostname === "0.0.0.0" || hostname.endsWith(".local")) {
 			return true;
 		}
-		if (/^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname)) {
+		if (/^10\./.test(hostname) || /^192\.168\./.test(hostname)) {
 			return true;
 		}
 		const private172 = /^172\.(\d{1,2})\./.exec(hostname);
@@ -2981,6 +3063,16 @@ type PreparedExactMcpRetirement = {
 };
 
 /**
+ * Ownership fence for an exact session-view restoration. `isCurrent` authorizes the
+ * next publication; `onApplied` re-anchors ownership after this operation publishes
+ * its own tools and prompt, so a foreign publication is still detected as drift.
+ */
+interface SessionViewRestoreFence {
+	isCurrent: () => boolean;
+	onApplied: () => void;
+}
+
+/**
  * An entry states its transport with `type`, or implies it: a `command` entry is
  * stdio and a `url` entry is http. Only the discriminator is read — the command
  * string and URL themselves stay inside the config.
@@ -3854,6 +3946,13 @@ export class AgentSession {
 		| { kind: "held" }
 		| undefined;
 
+	/**
+	 * Steers a run left unconsumed and `#settleDisownedSteering` re-routed onto the
+	 * follow-up queue. They are still steering for the Esc-on-steer gesture: a
+	 * user interrupt resumes into them exactly as it would into the steering queue.
+	 */
+	readonly #rearmedSteerMessages = new WeakSet<AgentMessage>();
+
 	/** Remove run-bound steers from every queue mirror and terminalize them as removed. */
 	#discardRunBoundSteers(messages: readonly AgentMessage[]): void {
 		if (messages.length === 0) return;
@@ -3939,6 +4038,7 @@ export class AgentSession {
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
 		this.#markSteeringAsFollowUpPolicy(rearmed);
+		for (const message of rearmed) this.#rearmedSteerMessages.add(message);
 		const deferredAlreadyPresent = this.#deferredSdkFollowUps.length > 0;
 		if (deferredAlreadyPresent) {
 			// Deferred follow-ups are an older cross-store FIFO head. Keep rearmed
@@ -4283,6 +4383,7 @@ export class AgentSession {
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
 		this.#managedFallbackProviderAttemptCount = 0;
+		this.#resetConcurrencyWait();
 		this.#managedFallbackTriedCredentialRows.clear();
 		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
 		this.#managedFallbackQuotaCeilingModels.clear();
@@ -4331,6 +4432,14 @@ export class AgentSession {
 	#providerRetryMaxAttempts: number | undefined;
 	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
+	/** First concurrency-saturation failure of the current request; bounds `fallback.concurrencyWaitMs`. */
+	#concurrencyWaitStartedAt: number | undefined;
+	/** Tracks poll attempts in concurrency wait; bounds requests independently of elapsed time. */
+	#concurrencyWaitPollCount = 0;
+	/** Set to selector when Retry-After exceeds remaining budget; prevents same-entry credential rotations. Scoped to originating entry. */
+	#concurrencyWaitRetryAfterExceededBudgetEntry: string | undefined = undefined;
+	/** Tracks absolute deadline per selector when poll ceiling reached with active Retry-After, preventing same-entry retries before deadline. */
+	#concurrencyWaitRetryAfterDeadlines = new Map<string, number>();
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -4343,6 +4452,18 @@ export class AgentSession {
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
+	#profilePublicationReceipts = new WeakMap<
+		Extract<SharedEntriesAppendOutcome, { kind: "committed" }>,
+		{
+			manager: SessionManager;
+			sessionId: string;
+			identityGeneration: number;
+			leaf: string | null;
+			parent: string | null;
+			ids: readonly string[];
+			plan: ModelProfileTranscriptPlan;
+		}
+	>();
 	#defaultFallbackController: FallbackChainController | undefined;
 	#activeProfileConfiguredDefaultChain: readonly string[] | undefined;
 	#startupRecoveryBindingsRequired = false;
@@ -4546,6 +4667,8 @@ export class AgentSession {
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
 	}> = [];
+	/** The one in-flight deferred command-result drain; later drains join it first. */
+	#executionMessageDrain: Promise<void> | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -4774,6 +4897,12 @@ export class AgentSession {
 	 * it had none), restored if the reminder is never delivered.
 	 */
 	#perToolTtsrClaims = new Map<string, Map<string, TtsrInjectionRecord | undefined>>();
+	/**
+	 * Active nested-tool scopes keyed by the model-facing eval call id. Each scope
+	 * is closed when that call's result is produced, so a nested call that resumes
+	 * after settlement cannot claim a reminder or invalidate a finished call.
+	 */
+	#nestedToolScopes = new Map<string, NestedToolScope>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -5016,6 +5145,7 @@ export class AgentSession {
 			this.#sessionAdmissionQueue.length > 0 ||
 			this.#startupPromptWaiters.size > 0 ||
 			this.#pendingSelectionFences > 0 ||
+			this.#pendingFastControls.size > 0 ||
 			this.#sessionTransitionKind !== undefined ||
 			this.#handoffTransitionActive ||
 			this.#cancelAndSubmitInProgress ||
@@ -5943,6 +6073,9 @@ export class AgentSession {
 
 	#isSessionSettlementPending(ignoreSelectionFenceGeneration?: number): boolean {
 		return (
+			[...this.#pendingFastControls.values()].some(
+				generation => ignoreSelectionFenceGeneration === undefined || generation < ignoreSelectionFenceGeneration,
+			) ||
 			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
@@ -6051,7 +6184,7 @@ export class AgentSession {
 		}
 	}
 
-	#endInFlight(token: symbol): unknown {
+	async #endInFlight(token: symbol): Promise<unknown> {
 		const wasAbandoned = this.#abandonedInFlightPrompts.has(token);
 		this.#inFlightPromptTokens.delete(token);
 		this.#abandonedInFlightPrompts.delete(token);
@@ -6073,7 +6206,10 @@ export class AgentSession {
 			// agent state and the session now, not at the next prompt. Until it does,
 			// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
 			// so a rebuild in that gap drops the only rendering of the execution.
-			this.#flushPendingPromptMessages();
+			// Shared sessions publish through the lease, so this flush is asynchronous;
+			// awaiting it here is what keeps the retry/requeue guarantee before the next
+			// prompt rather than after it.
+			await this.#flushPendingPromptMessages();
 		} catch (error) {
 			flushError = error;
 		}
@@ -6085,7 +6221,7 @@ export class AgentSession {
 		promptWait?: "publication" | "full",
 		sdkPublication?: Promise<void>,
 	): Promise<void> {
-		const flushError = this.#endInFlight(token);
+		const flushError = await this.#endInFlight(token);
 		const predecessorPromptStillInFlight = this.#livePromptsInFlight() > 0;
 		if (promptWait === "publication") {
 			await (sdkPublication ?? this.#agentEndPublicationPromise);
@@ -6112,15 +6248,15 @@ export class AgentSession {
 		return false;
 	}
 
-	#flushPendingPromptMessages(): void {
+	async #flushPendingPromptMessages(): Promise<void> {
 		const errors: unknown[] = [];
 		try {
-			this.#flushPendingBashMessages();
+			await this.#flushPendingBashMessages();
 		} catch (error) {
 			errors.push(error);
 		}
 		try {
-			this.#flushPendingPythonMessages();
+			await this.#flushPendingPythonMessages();
 		} catch (error) {
 			errors.push(error);
 		}
@@ -7117,9 +7253,9 @@ export class AgentSession {
 			},
 			persist: (mode, state) => {
 				if (mode === "none") {
-					this.sessionManager.appendModeChange("none");
+					this.appendModeChangeInBackground("none");
 				} else if (state) {
-					this.sessionManager.appendModeChange(mode, { goal: state.goal });
+					this.appendModeChangeInBackground(mode, { goal: state.goal });
 				}
 			},
 			sendHiddenMessage: async message => {
@@ -8270,14 +8406,20 @@ export class AgentSession {
 	}
 
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
-	#thinkingControlAdmissionGroup: {
-		predecessor: CanonicalMessageAdmissionSlot;
-		workflowPredecessors: Promise<void>[];
-		completion: CanonicalMessageAdmissionSlot;
-		release: () => void;
-		members: number;
-	} | undefined;
+	#thinkingControlAdmissionGroup:
+		| {
+				predecessor: CanonicalMessageAdmissionSlot;
+				workflowPredecessors: Promise<void>[];
+				completion: CanonicalMessageAdmissionSlot;
+				release: () => void;
+				members: number;
+		  }
+		| undefined;
 	#startedSharedControlPublications = new Set<Promise<void>>();
+	/** Background shared publications that teardown must join before the manager goes away. */
+	#backgroundPublications = new Set<Promise<void>>();
+	#fastControlTail: Promise<void> = Promise.resolve();
+	#pendingFastControls = new Map<Promise<void>, number>();
 
 	#reserveCanonicalSchedulingSlot() {
 		const predecessor = this.#canonicalMessageAdmissionTail;
@@ -8296,11 +8438,12 @@ export class AgentSession {
 	}
 
 	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
-		const group = (this.#thinkingControlAdmissionGroup ??= {
+		this.#thinkingControlAdmissionGroup ??= {
 			...this.#reserveCanonicalSchedulingSlot(),
 			workflowPredecessors: [...this.#startedSharedControlPublications],
 			members: 0,
-		});
+		};
+		const group = this.#thinkingControlAdmissionGroup;
 		group.members++;
 		try {
 			if (!group.predecessor.released || group.workflowPredecessors.length)
@@ -9080,7 +9223,7 @@ export class AgentSession {
 				const isRosterReminder = event.message.role === "custom" && event.message.customType === "irc-peer-roster";
 				if (!isRosterReminder) {
 					try {
-						this.#appendCustomMessageEntry(
+						await this.#appendCustomMessageEntry(
 							event.message.customType,
 							event.message.content,
 							event.message.display,
@@ -9089,8 +9232,7 @@ export class AgentSession {
 							getSessionMessageObservationId(event.message),
 						);
 					} catch (error) {
-						this.agent.abort();
-						throw error;
+						this.#abortRunForPublicationFailure("custom message append", error);
 					}
 				}
 			} else if (
@@ -9100,7 +9242,7 @@ export class AgentSession {
 				event.message.role === "toolResult" ||
 				event.message.role === "fileMention"
 			) {
-				const sharedAppend = this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
+				const sharedAppend = this.#usesSharedSessionPublication();
 				try {
 					let appendedEntryId: string;
 					if (sharedAppend) {
@@ -9119,10 +9261,7 @@ export class AgentSession {
 				} catch (error) {
 					canonicalAdmission?.fail(error);
 					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
-					if (sharedAppend) {
-						this.agent.abort();
-						throw error;
-					}
+					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -9418,6 +9557,7 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this.#providerRetryMaxAttempts = undefined;
 					this.#managedFallbackProviderAttemptCount = 0;
+					this.#resetConcurrencyWait();
 				}
 			}
 
@@ -9895,7 +10035,7 @@ export class AgentSession {
 		if (!current || `${current.provider}/${current.id}` !== modelKey) return;
 		let outcome: SessionRecapAppendResult;
 		try {
-			outcome = this.sessionManager.appendSessionRecap({
+			outcome = await this.appendSessionRecapForSession({
 				text: result.text,
 				sourceEntryId: snapshot.sourceEntryId,
 				requestEntryId: snapshot.requestEntryId,
@@ -10829,6 +10969,20 @@ export class AgentSession {
 	 * undo their provisional claims so the rules stay eligible.
 	 */
 	#releasePerToolTtsrInjections(toolCallId?: string): void {
+		if (toolCallId === undefined) {
+			for (const scope of this.#nestedToolScopes.values()) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
+			this.#nestedToolScopes.clear();
+		} else {
+			const scope = this.#nestedToolScopes.get(toolCallId);
+			if (scope) {
+				scope.closed = true;
+				scope.abortController.abort();
+			}
+			this.#nestedToolScopes.delete(toolCallId);
+		}
 		const ids =
 			toolCallId === undefined
 				? new Set([
@@ -10848,11 +11002,49 @@ export class AgentSession {
 	}
 
 	/**
+	 * Restore rules claimed by a nested call that was refused at the dispatch
+	 * fence. The call never ran, so its reminder has no result to fold into and
+	 * must stay eligible. Calls that dispatched are owned by the parent result and
+	 * cancellation paths, which settle their claims at fold or release points.
+	 */
+	#releaseUndeliveredNestedClaims(toolCallId: string, rules: Rule[]): void {
+		if (rules.length === 0) return;
+		const names = new Set(rules.map(rule => rule.name));
+		const claims = this.#perToolTtsrClaims.get(toolCallId);
+		for (const name of names) {
+			// Only undo a claim this call still owns. A parent cancellation may have
+			// restored and deleted it already, and releasing again would erase the
+			// previous injected record.
+			if (!claims?.has(name)) continue;
+			this.#ttsrManager?.releaseInjected(name, claims.get(name));
+			claims.delete(name);
+		}
+		const bucket = this.#perToolTtsrInjections.get(toolCallId);
+		if (bucket) {
+			const keeping = bucket.filter(rule => !names.has(rule.name));
+			if (keeping.length > 0) this.#perToolTtsrInjections.set(toolCallId, keeping);
+			else this.#perToolTtsrInjections.delete(toolCallId);
+		}
+		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
+	}
+
+
+	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
 	 * The claim stays provisional until #settlePerToolTtsrDelivery sees the
 	 * decorated result actually published.
 	 */
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, signal?: AbortSignal): AfterToolCallResult | undefined {
+		// The eval call is settling, so any nested call that resumes later must not run.
+		const nestedScope = this.#nestedToolScopes.get(ctx.toolCall.id);
+		// Rules that interrupted a nested call were folded into this result without
+		// running; mark them so the reminder reports the block, not a passthrough.
+		const blockedRuleNames = new Set(nestedScope?.invalidatedBy ?? []);
+		if (nestedScope) {
+			nestedScope.closed = true;
+			nestedScope.abortController.abort();
+			this.#nestedToolScopes.delete(ctx.toolCall.id);
+		}
 		// An aborted call's result is replaced by the loop's aborted result, so a
 		// folded reminder would never reach the model. A pending TTSR retry carries
 		// the bucket into its injection; any other cancellation releases it.
@@ -10863,7 +11055,14 @@ export class AgentSession {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
-		const reminder = rules.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r))).join("\n\n");
+		const reminder = rules
+			.map(r =>
+				prompt.render(
+					blockedRuleNames.has(r.name) ? ttsrToolBlockedReminderTemplate : ttsrToolReminderTemplate,
+					ttsrPromptFields(r),
+				),
+			)
+			.join("\n\n");
 		const block: TextContent = { type: "text", text: reminder };
 		this.#perToolTtsrFolded.set(ctx.toolCall.id, { rules, block });
 
@@ -10908,11 +11107,20 @@ export class AgentSession {
 		const ruleNames = folded.rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
 			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
+			const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
+			// A shared session refuses the legacy append; record through the admitted path
+			// like #markTtsrInjected (#7824).
+			if (this.#usesSharedSessionPublication()) {
+				void this.#publishInBackground("ttsr injection", () =>
+					this.sessionManager.appendTtsrInjectionSharingSession(ruleNames, records, ttsrMessageCount),
+				);
+				return;
+			}
 			// This runs inside the synchronous agent listener entry: a failed record
 			// write must not abort canonical handling of the published result. The
 			// reminder was delivered, so the claim stays consumed in memory.
 			try {
-				this.sessionManager.appendTtsrInjection(ruleNames, records, this.#ttsrManager?.getMessageCount());
+				this.sessionManager.appendTtsrInjection(ruleNames, records, ttsrMessageCount);
 			} catch (error) {
 				logger.warn("TTSR injection record could not be persisted", {
 					rules: ruleNames,
@@ -10943,7 +11151,17 @@ export class AgentSession {
 		}
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
-		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, this.#ttsrManager?.getMessageCount());
+		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
+		// A shared session refuses the legacy append once admission is armed, and this runs
+		// inside the message_end handler: publishing through the admitted path keeps a TTSR
+		// match from failing the run (#7815).
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
+			return;
+		}
+		void this.#publishInBackground("ttsr injection", () =>
+			this.sessionManager.appendTtsrInjectionSharingSession(uniqueRuleNames, records, ttsrMessageCount),
+		);
 	}
 
 	/** Parse only finalized, tool-provided source digests, before dispatch. */
@@ -10960,45 +11178,11 @@ export class AgentSession {
 		if (!tool) return undefined;
 		const toolCall = { ...ctx.toolCall, arguments: ctx.args };
 		const matchContext = this.#getTtsrToolMatchContext({ ...ctx.assistantMessage, content: [toolCall] }, 0);
-		const entries = tool.matcherEntries?.(ctx.args);
-		const matched: Rule[] = [];
-		if (entries && entries.length > 0) {
-			for (const entry of entries) {
-				const rules = await manager.checkAstSnapshot(
-					entry.digest,
-					{
-						...matchContext,
-						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
-						streamKey: `${matchContext.streamKey}:${entry.path}`,
-					},
-					signal,
-				);
-				// The run was cancelled or superseded while matching: keep the call
-				// from dispatching and leave every rule unclaimed.
-				if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-				matched.push(...rules);
-			}
-		} else {
-			const digest = tool.matcherDigest?.(ctx.args);
-			if (digest === undefined) return undefined;
-			matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
-			if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-		}
-
-		// A rule already headed for delivery as a prose reminder (pending, being
-		// admitted to the follow-up queue, or queued) must not be claimed a second
-		// time by this call.
-		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
-		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
-		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
-			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
-			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
-		}
-		const matches = matched.filter(rule => {
-			if (pending.has(rule.name)) return false;
-			pending.add(rule.name);
-			return true;
-		});
+		const matched = await this.#matchTtsrAstSnapshots(tool, ctx.args, matchContext, signal, generation);
+		// The run was cancelled or superseded while matching: keep the call from
+		// dispatching and leave every rule unclaimed.
+		if (!matched) return { block: true, reason: "Aborted" };
+		const matches = this.#withoutPendingTtsrRules(matched);
 		if (
 			matches.length > 0 &&
 			this.#handleTtsrMatches(matches, matchContext, ctx.assistantMessage.timestamp, activePromptHandle)
@@ -11012,6 +11196,178 @@ export class AgentSession {
 	}
 
 	/**
+	 * Match a tool's finalized source digests against AST rules. Returns undefined
+	 * when the run was cancelled or superseded while matching.
+	 */
+	async #matchTtsrAstSnapshots(
+		tool: AgentTool,
+		args: unknown,
+		matchContext: TtsrMatchContext,
+		signal: AbortSignal | undefined,
+		generation: number,
+	): Promise<Rule[] | undefined> {
+		const manager = this.#ttsrManager;
+		if (!manager?.hasAstRules()) return [];
+		const cancelled = () => signal?.aborted === true || this.#promptGeneration !== generation;
+		const matched: Rule[] = [];
+		const entries = tool.matcherEntries?.(args);
+		if (entries && entries.length > 0) {
+			for (const entry of entries) {
+				const rules = await manager.checkAstSnapshot(
+					entry.digest,
+					{
+						...matchContext,
+						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
+						streamKey: `${matchContext.streamKey}:${entry.path}`,
+					},
+					signal,
+				);
+				if (cancelled()) return undefined;
+				matched.push(...rules);
+			}
+			return matched;
+		}
+		const digest = tool.matcherDigest?.(args);
+		if (digest === undefined) return matched;
+		matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
+		return cancelled() ? undefined : matched;
+	}
+
+	/**
+	 * Deduplicate matches and drop rules already headed for delivery as a prose
+	 * reminder (pending, being admitted to the follow-up queue, or queued): they
+	 * must not be claimed a second time by a tool call.
+	 */
+	#withoutPendingTtsrRules(matched: Rule[]): Rule[] {
+		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
+		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
+		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
+			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
+			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
+		}
+		return matched.filter(rule => {
+			if (pending.has(rule.name)) return false;
+			pending.add(rule.name);
+			return true;
+		});
+	}
+
+	/**
+	 * Refuse a nested call whose eval call already settled or was invalidated by an
+	 * interrupting match. Checked on entry and again after every await so a call
+	 * paused in lazy materialization or AST matching cannot resume into a finished
+	 * or invalidated eval. Eval code can catch these errors, which is why every
+	 * later call is refused rather than only the one that matched.
+	 */
+	#assertNestedToolScopeActive(scope: NestedToolScope): void {
+		if (scope.closed || this.#nestedToolScopes.get(scope.parentToolCallId) !== scope) {
+			throw new ToolError(
+				"This eval call already settled; nested tool calls cannot run after its result was produced.",
+			);
+		}
+		if (scope.invalidatedBy) {
+			throw new ToolError(
+				`This eval call was invalidated by an interrupting TTSR match (${scope.invalidatedBy.join(", ")}). No further nested tool calls will run in it; apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+	}
+
+	/**
+	 * Nested calls (eval `tool.<name>()`) dispatch outside the agent loop, so the
+	 * argument-stream and pre-dispatch matching above never see them. Apply the
+	 * same tool-scoped rules to the nested call's final arguments before it runs:
+	 * every match is folded into the parent call's result as a per-tool reminder,
+	 * and an interrupting match keeps the nested call from executing (the nested
+	 * analogue of aborting the stream before a direct call dispatches).
+	 */
+	async #ttsrBeforeNestedToolCall(
+		tool: AgentTool,
+		scope: NestedToolScope,
+		callName: string,
+		args: unknown,
+		signal: AbortSignal | undefined,
+	): Promise<Rule[]> {
+		this.#assertNestedToolScopeActive(scope);
+		if (signal?.aborted) throw new ToolAbortError();
+		const manager = this.#ttsrManager;
+		if (!manager?.hasRules()) return [];
+		const generation = this.#promptGeneration;
+		const matchContext: TtsrMatchContext = {
+			source: "tool",
+			// Match the name the cell invoked (including a custom wire name such as
+			// `apply_patch`), exactly like the direct-call pre-dispatch path.
+			toolName: callName,
+			// Complete arguments, not a stream continuation: scan the whole snapshot for
+			// regex conditions, and keep AST snapshot dedupe isolated per nested call.
+			streamKey: `nested:${scope.parentToolCallId}:${crypto.randomUUID()}`,
+			filePaths: this.#extractTtsrFilePathsFromArgs(args),
+		};
+		const matched = manager.checkSnapshot(JSON.stringify(args) ?? "", matchContext);
+		if (manager.hasAstRules()) {
+			const matcherTool = await this.#materializeTtsrMatcherTool(tool);
+			const astMatched = matcherTool
+				? await this.#matchTtsrAstSnapshots(matcherTool, args, matchContext, signal, generation)
+				: [];
+			if (!astMatched || signal?.aborted || this.#promptGeneration !== generation) throw new ToolAbortError();
+			matched.push(...astMatched);
+		}
+		// A sibling nested call may have interrupted while this one was matching:
+		// recheck before claiming or dispatching anything.
+		this.#assertNestedToolScopeActive(scope);
+		const matches = this.#withoutPendingTtsrRules(matched);
+		if (matches.length === 0) return [];
+		const added = this.#addPerToolTtsrInjections(scope.parentToolCallId, matches);
+		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
+		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
+			// Only rules this call newly claimed describe the blocked call. A rule
+			// already claimed by an earlier sibling ran there and keeps its wording.
+			scope.invalidatedBy = added.map(rule => rule.name);
+			// Cancel nested calls still parked before dispatch (for example in an
+			// approval await) so an approval granted after this match cannot run them.
+			scope.abortController.abort();
+			throw new ToolError(
+				`${this.#formatTtsrAbortReason(matches)}. The nested ${callName} call was not executed; this eval call is now invalidated so no further nested calls will run. Apply the rule reminder folded into this result, then start a new eval call.`,
+			);
+		}
+		return added;
+	}
+
+	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, scope: NestedToolScope, callName: string): T {
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return async (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: AgentToolContext | undefined,
+				) => {
+					if (!scope.closed) this.#nestedToolScopes.set(scope.parentToolCallId, scope);
+					const callSignal = signal
+						? AbortSignal.any([signal, scope.abortController.signal])
+						: scope.abortController.signal;
+					const claimed = await this.#ttsrBeforeNestedToolCall(target, scope, callName, args, callSignal);
+					try {
+						// Dispatch fence, immediately before the call with no await between:
+						// the eval may have settled or been invalidated during preflight, and a
+						// settled or invalidated scope has aborted callSignal for anything
+						// parked further in.
+						this.#assertNestedToolScopeActive(scope);
+						if (callSignal.aborted) throw new ToolAbortError();
+					} catch (error) {
+						// This call never dispatched, so its claims have no result to fold into.
+						// Once dispatched, the parent result and cancellation paths own settlement.
+						this.#releaseUndeliveredNestedClaims(scope.parentToolCallId, claimed);
+						throw error;
+					}
+					return await target.execute(toolCallId, args as never, callSignal, onUpdate, ctx);
+				};
+			},
+		}) as T;
+	}
+
+	/**
 	 * The active tool a call dispatches to (canonical or wire name, e.g. OpenAI's
 	 * `apply_patch` for `edit`), resolved through lazy facades so its matcher
 	 * hooks are readable before the first execution. A tool that fails to load
@@ -11019,14 +11375,18 @@ export class AgentSession {
 	 */
 	async #resolveTtsrMatcherTool(callName: string): Promise<AgentTool | undefined> {
 		const tool = activeToolForCallName(this.agent.state.tools, callName);
-		if (!tool) return undefined;
+		return tool ? await this.#materializeTtsrMatcherTool(tool) : undefined;
+	}
+
+	/** Resolve a lazy facade so its matcher hooks are readable before the first execution. */
+	async #materializeTtsrMatcherTool(tool: AgentTool): Promise<AgentTool | undefined> {
 		const materialize = (tool as { materialize?: unknown }).materialize;
 		if (typeof materialize !== "function") return tool;
 		try {
 			return (await materialize.call(tool)) as AgentTool;
 		} catch (error) {
 			logger.debug("TTSR could not resolve tool for AST matching", {
-				toolName: callName,
+				toolName: tool.name,
 				error: error instanceof Error ? error.message : String(error),
 			});
 			return undefined;
@@ -12489,6 +12849,7 @@ export class AgentSession {
 		}
 		await awaitDisposeStep("exact MCP retirement", this.#exactMcpRetirementCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep("MCP manager replacement", this.#mcpManagerReplacement, true);
+		await awaitDisposeStep("background session publications", this.#joinBackgroundPublications(), true);
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
@@ -12534,6 +12895,7 @@ export class AgentSession {
 			Promise.allSettled([...this.#autoCompactionCompletions]).then(() => {}),
 			true,
 		);
+		await awaitDisposeStep("fast controls", this.#fastControlTail, true);
 		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
 		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
 		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
@@ -12945,7 +13307,15 @@ export class AgentSession {
 	async awaitSessionSettlement(): Promise<void> {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
+		await this.#joinBackgroundPublications();
 		await this.sessionManager.flush();
+	}
+
+	/** Join in-flight background shared publications so teardown never races one. */
+	async #joinBackgroundPublications(): Promise<void> {
+		while (this.#backgroundPublications.size > 0) {
+			await Promise.all([...this.#backgroundPublications]);
+		}
 	}
 
 	/** Test seam: hold prompt admission while bypassing a pending selection fence. */
@@ -13189,6 +13559,28 @@ export class AgentSession {
 				previousSelectedDiscoveredBuiltinToolNames,
 				nextSelectedDiscoveredBuiltinToolNames,
 			);
+		if (!mcpSelectionChanged && !discoveredBuiltinSelectionChanged) return;
+		// Internal refreshes (MCP catalog, /ssh, plugin/subskill tools) are synchronous
+		// producers: in a shared session their selection is published through admitted
+		// background publication instead of the refused legacy append (#7824).
+		if (this.#usesSharedSessionPublication()) {
+			const manager = this.sessionManager;
+			const identityGeneration = manager.getSessionIdentityGeneration();
+			void this.#publishInBackground("tool selection", async () => {
+				const outcome = await manager.appendToolSelectionsSharingSession(
+					mcpSelectionChanged ? nextSelectedMCPToolNames : undefined,
+					discoveredBuiltinSelectionChanged ? nextSelectedDiscoveredBuiltinToolNames : undefined,
+					() =>
+						!this.#isDisposed &&
+						this.sessionManager === manager &&
+						manager.getSessionIdentityGeneration() === identityGeneration,
+				);
+				if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids.at(-1) ?? "" };
+				if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids.join(","), error: outcome.error };
+				return outcome;
+			});
+			return;
+		}
 		const mutationCorrelationId =
 			mcpSelectionChanged && discoveredBuiltinSelectionChanged ? crypto.randomUUID() : undefined;
 		if (mcpSelectionChanged) {
@@ -13242,10 +13634,17 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** Get a registered tool with the same guards used for model-facing execution. */
-	getToolForExecution(name: string): AgentTool | undefined {
+	/**
+	 * Get a registered tool with the same guards used for model-facing execution.
+	 * With `nestedToolScope` (a nested call such as eval `tool.<name>()`), the tool
+	 * also applies tool-scoped TTSR rules before it runs.
+	 */
+	getToolForExecution(name: string, options?: { nestedToolScope?: NestedToolScope }): AgentTool | undefined {
 		const tool = this.getToolByName(name);
-		return tool ? this.#prepareToolForExecution(tool) : undefined;
+		if (!tool) return undefined;
+		const prepared = this.#prepareToolForExecution(tool);
+		const scope = options?.nestedToolScope;
+		return scope ? this.#wrapNestedToolForTtsr(prepared, scope, name) : prepared;
 	}
 
 	/**
@@ -14337,12 +14736,12 @@ export class AgentSession {
 				return tool !== undefined && isMCPBridgeTool(tool);
 			});
 			if (activated.length > 0) {
-				if (!this.#usesSharedWorkflowIntentAppend())
+				if (!this.#usesSharedSessionPublication())
 					this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
-					sharedDiscoveredActivation: true,
+					sharedPublication: true,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
 					persistedMCPToolNames:
 						activatedMCPToolNames.length > 0
@@ -14424,6 +14823,7 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
+					if (signal?.aborted) throw new ToolAbortError("Permission request cancelled");
 					const bridge = this.#clientBridge;
 					const inheritedEpoch = this.#sdkPermissionProvider
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
@@ -14552,6 +14952,8 @@ export class AgentSession {
 					ctx: never,
 				) => {
 					return await this.sessionManager.runWithCwdReadLease(async () => {
+						// Lease admission can wait for a writer; fence before the target starts.
+						if (signal?.aborted) throw new ToolAbortError();
 						const admittedGeneration = this.sessionManager.getCwdGeneration();
 						const result = await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 						// The lease keeps writers out for the whole execution, so this can
@@ -14600,6 +15002,10 @@ export class AgentSession {
 							args,
 						});
 					}
+					// These guards can await; do not start the tool if the call was cancelled.
+					// Permission-required tools let the permission wrapper report its own
+					// cancellation reason just inside this guard.
+					if (signal?.aborted && !PERMISSION_REQUIRED_TOOLS.has(target.name)) throw new ToolAbortError();
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},
@@ -14654,9 +15060,12 @@ export class AgentSession {
 		return wrapped;
 	}
 
-	#setGuardedAgentTools(tools: AgentTool[]): void {
+	#setGuardedAgentTools(tools: AgentTool[], onPublished?: () => void): void {
 		this.#activeToolSelectionRevision++;
 		this.agent.setTools(tools.map(tool => this.#prepareToolForExecution(tool)));
+		// Anchor ownership before observers run: a throwing observer must not leave
+		// the published tool set unattributed to this operation.
+		onPublished?.();
 		this.#onToolNamesChanged?.(tools.map(tool => tool.name));
 	}
 
@@ -14665,7 +15074,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
-			sharedDiscoveredActivation?: boolean;
+			sharedPublication?: boolean;
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
@@ -14673,10 +15082,10 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
-			isCurrent?: () => boolean;
+			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
-		const sharedDiscovery = options?.sharedDiscoveredActivation === true && this.#usesSharedWorkflowIntentAppend();
+		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
 		const assertControlMutationAllowed = () => {
 			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedDiscovery) {
 				this.sessionManager.assertLegacyMutationAllowed("select active tools");
@@ -14685,7 +15094,7 @@ export class AgentSession {
 		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
-			(options?.isCurrent?.() ?? true) &&
+			(options?.fence?.isCurrent() ?? true) &&
 			(options?.expectedActiveToolSelectionRevision === undefined ||
 				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
 					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
@@ -14780,16 +15189,18 @@ export class AgentSession {
 				}
 				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools);
+				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 				this.#invalidateDiscoveryCaches();
 			};
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
 				promote();
 			} else {
+				const operation = "select active tools";
 				let promoted = false;
+				let promotionError: unknown;
 				const outcome = await this.#withStartedSharedControlPublication(
 					() => {
-						if (!current()) throw new Error("Shared discovered-tool activation superseded");
+						if (!current()) throw new Error("Shared tool selection superseded");
 					},
 					async () => {
 						const result = await manager.appendToolSelectionsSharingSession(
@@ -14797,25 +15208,28 @@ export class AgentSession {
 							builtinChanged ? selectedBuiltinNames : undefined,
 							current,
 						);
+						// No await between the committed receipt and live promotion.
 						if (result.kind === "committed" && current()) {
 							try {
 								promote();
 								promoted = true;
 							} catch (error) {
-								throw new AggregateError(
-									[error],
-									"Shared discovered-tool activation committed but promotion failed",
-									{ cause: result },
-								);
+								promotionError = error;
 							}
 						}
 						return result;
 					},
 				);
-				if (outcome.kind !== "committed")
-					throw new Error(`Shared discovered-tool activation ${outcome.kind}`, { cause: outcome });
+				// A possibly durable selection this session did not apply keeps its receipt and
+				// closes the session instead of running on tools its transcript no longer names.
+				if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+				if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
 				if (!promoted)
-					throw new Error("Shared discovered-tool activation committed but superseded", { cause: outcome });
+					return this.#failClosedSharedControl(
+						operation,
+						outcome,
+						promotionError ?? new Error("Committed shared tool selection superseded"),
+					);
 			}
 			return this.#activeToolSelectionRevision;
 		}
@@ -14871,6 +15285,7 @@ export class AgentSession {
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
 				this.#pendingAppliedToolSignature = undefined;
+				options?.fence?.onApplied();
 				break;
 			}
 		} else if (promptRelevantToolsChanged) {
@@ -14889,7 +15304,7 @@ export class AgentSession {
 		if (promptRelevantToolsChanged) this.#defaultModelSelectionMutationRevision++;
 		this.#selectedMCPToolNames = nextSelectedMCPToolNames;
 		this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-		this.#setGuardedAgentTools(tools);
+		this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
 		this.#invalidateDiscoveryCaches();
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(
@@ -14959,7 +15374,10 @@ export class AgentSession {
 		toolNames: string[],
 		options?: { explicit?: boolean; persistMCPSelection?: boolean; retryOnMcpCatalogChange?: boolean },
 	): Promise<void> {
-		this.sessionManager.assertLegacyMutationAllowed("select active tools");
+		// Shared sessions publish the selection and promote prompt/tools together through the
+		// admitted tool-selection path; legacy sessions keep the legacy refusal.
+		const assertPublicationMode = this.#controlPublicationModeFence("select active tools");
+		const sharedPublication = this.#usesSharedSessionPublication();
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
 		const shouldPersistMCPSelectionIfUnchanged =
@@ -14982,6 +15400,7 @@ export class AgentSession {
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
+				sharedPublication,
 			});
 			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
 				if (sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
@@ -15011,6 +15430,7 @@ export class AgentSession {
 							sessionTransitionGeneration,
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
+							sharedPublication,
 						},
 					);
 					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {
@@ -15025,7 +15445,12 @@ export class AgentSession {
 					!sessionContext.hasPersistedMCPToolSelection ||
 					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
 				) {
-					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
+					if (sharedPublication)
+						await this.#publishSharedMCPToolSelection(selectedMCPToolNames, assertPublicationMode);
+					else {
+						assertPublicationMode();
+						this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
+					}
 				}
 			}
 			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
@@ -15042,12 +15467,12 @@ export class AgentSession {
 
 	async #restoreMCPSelectionsForSessionContext(
 		sessionContext: SessionContext,
-		isCurrent?: () => boolean,
+		fence?: SessionViewRestoreFence,
 	): Promise<void> {
-		if (isCurrent && !isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
-			await this.#attachAskToolIfWorkflowActive(isCurrent);
+			await this.#attachAskToolIfWorkflowActive(fence);
 			return;
 		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
@@ -15071,11 +15496,11 @@ export class AgentSession {
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
 		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false, isCurrent },
+			{ persistMCPSelection: false, fence },
 		);
-		if (isCurrent && (applied === undefined || !isCurrent()))
+		if (fence && (applied === undefined || !fence.isCurrent()))
 			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
-		await this.#attachAskToolIfWorkflowActive(isCurrent);
+		await this.#attachAskToolIfWorkflowActive(fence);
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -15720,29 +16145,83 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const authStorageOwner = this.#modelRegistry.getAuthStorageOwner();
 		const target = authStorage.resolveOAuthPinTarget(provider, selector, authStorageOwner);
-		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector, authStorageOwner);
-		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
-		this.sessionManager.appendCustomEntry("auth-credential-pin", {
-			v: 1,
-			scopeId,
-			provider,
-			pin: target.canonicalSelector,
-			...(target.canonicalSelector.kind === "id" && this.#credentialStoreIdentity
-				? { credentialStoreIdentity: this.#credentialStoreIdentity }
-				: {}),
-		});
+		const apply = () =>
+			authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector, authStorageOwner);
+		// An id pin without a credential-store identity is process-local and never persisted.
+		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) {
+			apply();
+			return;
+		}
+		await this.#publishCredentialIntentThenApply(
+			{
+				v: 1,
+				scopeId,
+				provider,
+				pin: target.canonicalSelector,
+				...(target.canonicalSelector.kind === "id" && this.#credentialStoreIdentity
+					? { credentialStoreIdentity: this.#credentialStoreIdentity }
+					: {}),
+			},
+			apply,
+		);
+	}
+
+	/**
+	 * Credential intent is durable before it is live (#7824): a refused write leaves
+	 * AuthStorage untouched. Shared sessions publish through the admitted control path;
+	 * an uncertain or committed-but-unapplied outcome closes the session instead of
+	 * compensating.
+	 */
+	async #publishCredentialIntentThenApply(data: Record<string, unknown>, apply: () => void): Promise<void> {
+		const operation = "change credential selection";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendCustomEntry("auth-credential-pin", data);
+			apply();
+			return;
+		}
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				manager.getSessionId() === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration
+			);
+		};
+		const assertCurrent = () => {
+			if (!current())
+				throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+		};
+		const outcome = await this.#withStartedSharedControlPublication(assertCurrent, () =>
+			manager.appendControlEntriesSharingSession(
+				[{ type: "custom", customType: "auth-credential-pin", data }],
+				current,
+			),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		try {
+			assertCurrent();
+			apply();
+		} catch (error) {
+			return this.#failClosedSharedControl(operation, outcome, error);
+		}
 	}
 
 	/** Mask persistent/global selection for this session and restore AUTO ranking. */
 	async setCredentialAuto(provider: string): Promise<void> {
 		const scopeId = this.credentialSessionId;
-		this.#modelRegistry.authStorage.setSessionCredentialAuto(provider, scopeId);
-		this.sessionManager.appendCustomEntry("auth-credential-pin", {
-			v: 1,
-			scopeId,
-			provider,
-			pin: { auto: true },
-		});
+		await this.#publishCredentialIntentThenApply({ v: 1, scopeId, provider, pin: { auto: true } }, () =>
+			this.#modelRegistry.authStorage.setSessionCredentialAuto(provider, scopeId),
+		);
 	}
 
 	/** Current session display name, if set */
@@ -16149,8 +16628,8 @@ export class AgentSession {
 		}
 	}
 
-	async #attachAskToolIfWorkflowActive(isCurrent?: () => boolean): Promise<void> {
-		if (this.#isDisposed || this.#sessionAdmissionClosing || (isCurrent && !isCurrent())) return;
+	async #attachAskToolIfWorkflowActive(fence?: SessionViewRestoreFence): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || (fence && !fence.isCurrent())) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -16185,7 +16664,7 @@ export class AgentSession {
 				});
 				retryHydration = true;
 			}
-			if (isCurrent && !isCurrent()) return;
+			if (fence && !fence.isCurrent()) return;
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
@@ -16208,7 +16687,7 @@ export class AgentSession {
 		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			if (isCurrent) {
+			if (fence) {
 				// Exact view restoration must join prompt rebuilding and fence its publication.
 				if (
 					!this.#explicitEmptyToolSelection &&
@@ -16217,9 +16696,9 @@ export class AgentSession {
 				) {
 					const applied = await this.#applyActiveToolsByName([...this.getActiveToolNames(), "ask"], {
 						persistMCPSelection: false,
-						isCurrent,
+						fence,
 					});
-					if (applied === undefined || !isCurrent())
+					if (applied === undefined || !fence.isCurrent())
 						throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 				}
 			} else {
@@ -16733,16 +17212,28 @@ export class AgentSession {
 		if (withoutEphemeralMessages.length !== messages.length) this.agent.replaceMessages(withoutEphemeralMessages);
 	}
 
-	#appendCustomMessageEntry<T = unknown>(
+	async #appendCustomMessageEntry<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
 		attribution: MessageAttribution = "agent",
 		observationId?: string,
-	): string | undefined {
+	): Promise<string | undefined> {
 		if (this.#isEphemeralCustomMessageType(customType)) return undefined;
-		return this.sessionManager.appendCustomMessageEntry(
+		// A session that publishes canonical messages through the shared lease arms
+		// shared admission, which refuses every later legacy append.
+		if (!this.#usesSharedSessionPublication()) {
+			return this.sessionManager.appendCustomMessageEntry(
+				customType,
+				content,
+				display,
+				details,
+				attribution,
+				observationId,
+			);
+		}
+		const outcome = await this.sessionManager.appendCustomMessageEntrySharingSession(
 			customType,
 			content,
 			display,
@@ -16750,6 +17241,221 @@ export class AgentSession {
 			attribution,
 			observationId,
 		);
+		if (outcome.kind !== "committed") {
+			throw new Error(
+				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+				{ cause: outcome },
+			);
+		}
+		return outcome.id;
+	}
+
+	/**
+	 * Publish an additive custom entry at this opener's admitted branch cursor.
+	 *
+	 * A shared-append session refuses legacy appends once a canonical shared publication
+	 * adopted an identity this opener did not import, so every in-turn producer publishes
+	 * through the shared lease instead (the custom-message path does the same). Throws when
+	 * the publication is refused: a silently dropped entry is worse than a loud failure.
+	 */
+	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
+		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendCustomEntry(customType, data);
+		const outcome = await this.sessionManager.appendCustomEntrySharingSession(customType, data);
+		assertSharedAppendCommitted(`Shared ${customType} entry append`, outcome);
+		return outcome.id;
+	}
+
+	/**
+	 * Publish a custom entry from a synchronous call site.
+	 *
+	 * A shared-append session publishes through its admitted path in the background and
+	 * logs a refusal, because such a caller cannot await a transaction and a refusal must
+	 * not abort its turn. The legacy form throws inline exactly as before.
+	 */
+	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendCustomEntry(customType, data);
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground(`custom entry ${customType}`, () =>
+			this.sessionManager.appendCustomEntrySharingSession(customType, data),
+		);
+	}
+
+	/** Publish a message from a synchronous call site. */
+	appendMessageInBackground(message: SessionPersistedMessage): Promise<BackgroundPublicationResult> {
+		return this.#publishMessageInBackground("session message", message);
+	}
+
+	/** Publish a message at this opener's admitted branch cursor. */
+	async appendMessageForSession(message: SessionPersistedMessage): Promise<string> {
+		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendMessage(message);
+		const outcome = await this.sessionManager.appendMessageSharingSession(message);
+		assertSharedAppendCommitted("Shared message append", outcome);
+		return outcome.id;
+	}
+
+	/** Publish a session recap at this opener's admitted branch cursor. */
+	async appendSessionRecapForSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
+		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendSessionRecap(input);
+		return this.sessionManager.appendSessionRecapSharingSession(input);
+	}
+
+	/** Publish a label change from a synchronous call site. */
+	appendLabelChangeInBackground(targetId: string, label: string | undefined): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendLabelChange(targetId, label);
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground("label change", () =>
+			this.sessionManager.appendLabelChangeSharingSession(targetId, label),
+		);
+	}
+
+	/** Publish a mode change from a synchronous call site. */
+	appendModeChangeInBackground(mode: string, data?: Record<string, unknown>): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendModeChange(mode, data);
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground("mode change", () =>
+			this.sessionManager.appendModeChangeSharingSession(mode, data),
+		);
+	}
+
+	/**
+	 * Run one background publication.
+	 *
+	 * Returns the real outcome: `false` means nothing was committed, and the caller must
+	 * treat the entry as not persisted. A refusal never throws into the turn (a synchronous
+	 * producer cannot await a transaction and must not abort the run), so the cause is
+	 * logged here with the operation and the promise is registered for settlement joining.
+	 */
+	#publishInBackground(
+		operation: string,
+		publish: () => Promise<SharedAppendOutcome>,
+	): Promise<BackgroundPublicationResult> {
+		const task = publish()
+			.then((outcome): BackgroundPublicationResult => {
+				if (outcome.kind === "committed") return { committed: true };
+				const cause = describeSharedAppendFailure(outcome);
+				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
+				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
+				return { committed: false, cause: cause.reason };
+			})
+			.catch((error: unknown): BackgroundPublicationResult => {
+				const reason = error instanceof Error ? error.message : String(error);
+				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
+				this.#reportBackgroundRefusal(operation, reason);
+				return { committed: false, cause: reason };
+			});
+		return this.#trackBackgroundPublication(task);
+	}
+
+	/**
+	 * Surface a refused background publication to the operator.
+	 *
+	 * A log line alone is not enough: an extension entry, label, todo/goal update, or
+	 * command result that never reached the transcript must be visible where the user is
+	 * looking, or it silently disappears from the next reload.
+	 */
+	#reportBackgroundRefusal(operation: string, reason: string): void {
+		if (this.#isDisposed) return;
+		this.emitNotice("warning", `Could not save the ${operation} to this session: ${reason}`, "session-publication");
+	}
+
+	/** Join a background publication at settlement time; never leaves a rejection unobserved. */
+	#trackBackgroundPublication<T>(task: Promise<T>): Promise<T> {
+		// The removal is part of the tracked promise itself, so awaiting the set is enough
+		// for settlement: `#joinBackgroundPublications` can never re-observe a settled entry
+		// and spin on a deletion that is still queued behind it.
+		let settled: Promise<void>;
+		const remove = () => {
+			this.#backgroundPublications.delete(settled);
+		};
+		settled = task.then(remove, remove);
+		this.#backgroundPublications.add(settled);
+		return task;
+	}
+
+	/**
+	 * Persist one message from a synchronous call site.
+	 *
+	 * The legacy form throws inline as before. The shared form publishes in the background:
+	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
+	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
+	 * `onCommitted` fires only when the entry is durable.
+	 */
+	#publishMessageInBackground(
+		label: string,
+		message: SessionPersistedMessage,
+		onCommitted?: () => void,
+	): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendMessage(message);
+			onCommitted?.();
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground(label, () => this.sessionManager.appendMessageSharingSession(message)).then(
+			result => {
+				if (result.committed) onCommitted?.();
+				return result;
+			},
+		);
+	}
+
+	/**
+	 * Persist one deferred command result and throw when it was not committed.
+	 *
+	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
+	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
+	 * cannot express that, so this path awaits the lease and converts every non-committed
+	 * outcome into a throw carrying the cause. An `unknown` outcome may already be durable,
+	 * so it throws a {@link SharedControlPublicationError} with code `unknown` that carries
+	 * the attempted id: the caller must never re-append it under a new id.
+	 */
+	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
+		if (!this.#usesSharedSessionPublication()) {
+			this.sessionManager.appendMessage(message);
+			return;
+		}
+		const outcome = await this.#trackBackgroundPublication(this.sessionManager.appendMessageSharingSession(message));
+		if (outcome.kind !== "committed") {
+			const cause = describeSharedAppendFailure(outcome);
+			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
+		}
+		if (outcome.kind === "unknown")
+			throw new SharedControlPublicationError(`record the ${label}`, {
+				kind: "unknown",
+				ids: [outcome.id],
+				error: outcome.error,
+			});
+		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
+	}
+
+	/**
+	 * Abort the run for a refused canonical publication.
+	 *
+	 * The abort carries no reason so the agent's own cancellation path stays silent; the
+	 * underlying cause is logged here instead, where the operation that failed is known.
+	 */
+	#abortRunForPublicationFailure(operation: string, error: unknown): never {
+		// The thrown wrapper keeps the publication outcome as its cause; surface the
+		// underlying refusal so the log names why the append was rejected.
+		const refusal = error instanceof Error ? error.cause : undefined;
+		const underlying =
+			refusal !== null && typeof refusal === "object" && "error" in refusal
+				? refusal.error instanceof Error
+					? refusal.error.message
+					: String(refusal.error)
+				: undefined;
+		logger.warn("Canonical session publication failed; aborting run", {
+			operation,
+			error: error instanceof Error ? error.message : String(error),
+			...(underlying === undefined ? {} : { cause: underlying }),
+		});
+		this.agent.abort();
+		throw error instanceof Error ? error : new Error(String(error));
 	}
 
 	#buildUntrustedMcpServerInstructionsMessage(): CustomMessage | undefined {
@@ -17005,13 +17711,15 @@ export class AgentSession {
 		let waitedForAbortUnwind = false;
 		const busyInputCancellationGeneration = this.#promptPreflightCancellationGeneration;
 		const commitBusyWorkflowIntent = async () => {
-			if (!workflowIntentDiff || !this.#usesSharedWorkflowIntentAppend()) return;
+			if (!workflowIntentDiff || !this.#usesSharedSessionPublication()) return;
 			// A busy predecessor may become idle while publication awaits. Its normal
 			// generation change is not cancellation: the queue helpers admit a follow-up
 			// against the current state rather than pretending the old run remains live.
 			const assertCurrent = () => {
-				if (options?.preflightSignal?.aborted ||
-					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
+				if (
+					options?.preflightSignal?.aborted ||
+					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration
+				)
 					throw promptPreflightCancelledError();
 			};
 			assertCurrent();
@@ -17037,7 +17745,7 @@ export class AgentSession {
 		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
 		// This ensures steers are injected immediately even when config hot reload is pending.
 		// However, steers still wait behind explicit model-selection fences to preserve selection ordering.
-		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+		if (options?.streamingBehavior === "steer" && this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 			// However, do not bypass for steers with an already-aborted preflight signal.
 			// The signal abort indicates user cancellation and must be respected.
 			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -17047,12 +17755,12 @@ export class AgentSession {
 				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 			}
 			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
-			if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
+			if (workflowIntentDiff && this.#usesSharedSessionPublication()) await commitBusyWorkflowIntent();
 			await this.#queueSteer(expandedText, options?.images, {
 				claimsGenuineUserIntent,
 				forceOneAtATime: options.steerQueuePolicy === "sequential",
 			});
-			if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
+			if (workflowIntentDiff && !this.#usesSharedSessionPublication()) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -17082,7 +17790,7 @@ export class AgentSession {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
-			if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
+			if (workflowIntentDiff && this.#usesSharedSessionPublication()) await commitBusyWorkflowIntent();
 			if (options.streamingBehavior === "followUp") {
 				await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
 					forceOneAtATime: options.followUpQueuePolicy === "sequential",
@@ -17094,7 +17802,7 @@ export class AgentSession {
 					forceOneAtATime: options.steerQueuePolicy === "sequential",
 				});
 			}
-			if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
+			if (workflowIntentDiff && !this.#usesSharedSessionPublication()) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -17117,7 +17825,7 @@ export class AgentSession {
 					options.preflightSignal?.aborted !== true &&
 					!this.#abortUnwind
 				) {
-					if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
+					if (workflowIntentDiff && this.#usesSharedSessionPublication()) await commitBusyWorkflowIntent();
 					admission.release();
 					if (options.streamingBehavior === "followUp") {
 						await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
@@ -17130,7 +17838,7 @@ export class AgentSession {
 							forceOneAtATime: options.steerQueuePolicy === "sequential",
 						});
 					}
-					if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
+					if (workflowIntentDiff && !this.#usesSharedSessionPublication()) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 					}
 					this.#assertExternalSessionIngress();
@@ -17527,7 +18235,7 @@ export class AgentSession {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
 			// Retry anything whose previous post-turn persistence failed before the new prompt.
-			this.#flushPendingPromptMessages();
+			await this.#flushPendingPromptMessages();
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
@@ -17872,10 +18580,11 @@ export class AgentSession {
 				onAccepted: () => {
 					// The shared workflow record must commit before the prompt starts or its
 					// canonical user message advances the branch. Other hosts retain sync admission.
-					if (options?.workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) {
+					if (options?.workflowIntentDiff && this.#usesSharedSessionPublication()) {
 						return (async () => {
 							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!, () =>
-								this.#throwIfPromptPreflightCancelled(generation, preflightSignal));
+								this.#throwIfPromptPreflightCancelled(generation, preflightSignal),
+							);
 							this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 							if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
 						})();
@@ -18484,6 +19193,11 @@ export class AgentSession {
 				this.#deferredFollowUpForceOneAtATime.add(message);
 			}
 			this.#deferredSdkFollowUps.push(message);
+			// Notify follow-up waiters that a message has been admitted to the deferred
+			// queue. This lets job poll and other callers to waitForFollowUpQueued interrupt
+			// immediately without waiting for the deferred message to enter the agent's live
+			// queue (which happens when streaming ends or the queue drains).
+			this.agent.notifyFollowUpWaiters();
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		}
@@ -19078,7 +19792,7 @@ export class AgentSession {
 				return;
 			}
 			this.agent.appendMessage(appMessage);
-			this.#appendCustomMessageEntry(
+			await this.#appendCustomMessageEntry(
 				message.customType,
 				message.content,
 				message.display,
@@ -19135,7 +19849,7 @@ export class AgentSession {
 		}
 
 		this.agent.appendMessage(appMessage);
-		this.#appendCustomMessageEntry(
+		await this.#appendCustomMessageEntry(
 			message.customType,
 			message.content,
 			message.display,
@@ -19596,9 +20310,14 @@ export class AgentSession {
 
 	/** Whether the agent has queued steering messages that a `user_interrupt`
 	 *  abort would resume into (steer-on-interrupt). Drives the Esc-on-steer UX:
-	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts. */
+	 *  the first Esc consumes the steer and auto-continues, a second Esc aborts.
+	 *  Steers an interrupted run left unconsumed are re-routed onto the follow-up
+	 *  queue and still count: with two queued steers, the continuation that
+	 *  delivers the first leaves the second waiting there. */
 	get hasQueuedSteering(): boolean {
-		return this.agent.hasQueuedSteering();
+		if (this.agent.hasQueuedSteering()) return true;
+		if (this.agent.snapshotFollowUp().some(message => this.#rearmedSteerMessages.has(message))) return true;
+		return this.#deferredSdkFollowUps.some(message => this.#rearmedSteerMessages.has(message));
 	}
 
 	/** Get pending messages (read-only). Returns the public text-only view;
@@ -20167,11 +20886,11 @@ export class AgentSession {
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
 		if (hadLivePrompt) this.#releasePowerAssertion();
-		try {
-			this.#flushPendingPromptMessages();
-		} catch (error) {
+		// Recovery must not block on a shared publication; the flush keeps uncommitted
+		// entries queued for a later retry and logs its own failure here instead.
+		void this.#flushPendingPromptMessages().catch(error => {
 			logger.warn("Failed to flush deferred prompt messages during forced recovery", { error: String(error) });
-		}
+		});
 		this.#resolveSessionSettlement();
 		const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
 		try {
@@ -20931,7 +21650,9 @@ export class AgentSession {
 					}
 					// Follow-ups bound to the aborted run were discarded at its agent_end; keep
 					// the snapshots from handing them back to the replacement run or a rollback.
-					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(entry => !this.#isPromptRunLive(entry.target));
+					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(
+						entry => !this.#isPromptRunLive(entry.target),
+					);
 					if (endedFollowUps.length > 0) {
 						const ended = new Set(endedFollowUps.map(entry => entry.message));
 						queueSnapshot.followUp.splice(
@@ -21135,6 +21856,16 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
+		// /drop deletes the predecessor after the successor is live. A shared session's
+		// transcript cannot be deleted by this opener (#7824): refuse before switching
+		// instead of switching and then reporting a drop that never happened.
+		if (options?.drop) {
+			try {
+				this.sessionManager.assertLegacyMutationAllowed("drop session");
+			} catch (error) {
+				return Promise.reject(error);
+			}
+		}
 		// Acquire the shared session-transition lease only when starting a fresh transition
 		// (the dedup above returns the in-flight promise without re-acquiring).
 		this.#beginSessionTransition("new-session");
@@ -21440,6 +22171,13 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
+		// A context clear appends a parentless root marker. A shared session publishes that
+		// root through the common admitted control publication before resetting anything
+		// (#7824); a legacy session keeps the legacy refusal. Adoption while the turn is
+		// aborted refuses before the reset rather than switching protocols mid-clear.
+		const operation = "clear context";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const sharedPublication = this.#usesSharedSessionPublication();
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -21454,6 +22192,17 @@ export class AgentSession {
 			this.#closeAllProviderSessions("context clear");
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
+			// Shared admission may have latched while the turn was aborted and settled.
+			assertMode();
+			if (sharedPublication) {
+				const committed = await this.#publishSharedContextClear(operation, sessionId, assertMode);
+				try {
+					this.#applyContextClear(sessionId);
+				} catch (error) {
+					return this.#failClosedSharedControl(operation, committed, error);
+				}
+				return true;
+			}
 			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
@@ -21481,11 +22230,82 @@ export class AgentSession {
 	}
 
 	/**
+	 * Publish the shared `/clear` root and its carried-over model, thinking, tier and
+	 * profile-ownership intent as one admitted append at this opener's cursor. The root
+	 * is parentless, so the earlier branch and any unseen sibling stay in the transcript;
+	 * nothing is rewritten. Throws before any live reset unless the entries committed.
+	 */
+	async #publishSharedContextClear(
+		operation: string,
+		sessionId: string,
+		assertMode: () => void,
+	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
+		// Entries already handed to background publication belong to the cleared branch.
+		await this.#joinBackgroundPublications();
+		assertMode();
+		const manager = this.sessionManager;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const model = this.model;
+		const thinkingLevel = this.thinkingLevel;
+		const serviceTier = this.serviceTier ?? null;
+		const entries: SharedControlEntry[] = [
+			...manager.contextClearControlEntries({ sessionId }),
+			{ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false },
+		];
+		if (model) entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "default" });
+		entries.push({ type: "service_tier_change", serviceTier });
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === model &&
+				this.thinkingLevel === thinkingLevel &&
+				(this.serviceTier ?? null) === serviceTier
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => manager.appendControlEntriesSharingSession(entries, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return outcome;
+	}
+
+	/** The live half of a committed shared `/clear`; its transcript entries are already durable. */
+	#applyContextClear(sessionId: string): void {
+		this.#commitSessionTransition();
+		this.agent.reset();
+		this.setTodoPhases([]);
+		this.#syncAgentSessionId(sessionId);
+		this.#steeringMessages = [];
+		this.#followUpMessages = [];
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#todoReminderCount = 0;
+		this.#planReferenceSent = false;
+		this.#planReferencePath = "local://PLAN.md";
+	}
+
+	/**
 	 * Generate and conditionally apply a title for the first accepted text input.
 	 * Call independently of prompt delivery, before the first user message is recorded.
 	 * A host retiring this session must abort signal synchronously before retirement.
 	 */
 	async generateAutoSessionTitle(text: string, options?: { signal?: AbortSignal }): Promise<AutoSessionTitleResult> {
+		const sharedPublication = this.#usesSharedSessionPublication();
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
 		const managerId = manager.getSessionId();
@@ -21542,13 +22362,19 @@ export class AgentSession {
 			if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return { kind: "skipped", reason: "disabled" };
 			if (!title) return { kind: "skipped", reason: "unavailable" };
 			if (manager.getSessionName()) return { kind: "skipped", reason: "named" };
+			if (this.#usesSharedSessionPublication() !== sharedPublication)
+				throw new Error("Session publication protocol changed while generating title");
 			let committedTitle = "";
-			if (this.#usesSharedWorkflowIntentAppend()) {
+			if (sharedPublication) {
 				const outcome = await this.#withStartedSharedControlPublication(
 					() => {
 						if (stale()) throw new SessionTitlePersistenceStaleError();
 					},
-					() => manager.setSessionNameSharingSession(title, "auto", { isCurrent: () => !stale(), onlyIfUnnamed: true }),
+					() =>
+						manager.setSessionNameSharingSession(title, "auto", {
+							isCurrent: () => !stale(),
+							onlyIfUnnamed: true,
+						}),
 				);
 				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
 				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
@@ -21576,7 +22402,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
-		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.setSessionName(name, source);
+		if (!this.#usesSharedSessionPublication()) return this.sessionManager.setSessionName(name, source);
 		const manager = this.sessionManager;
 		const sessionId = manager.getSessionId();
 		const identityGeneration = manager.getSessionIdentityGeneration();
@@ -21801,7 +22627,8 @@ export class AgentSession {
 			recordUsage?: boolean;
 		},
 	): Promise<void> {
-		this.sessionManager.assertLegacyMutationAllowed("set model");
+		// A default user selection is admitted by setDefaultModelSelection, which publishes
+		// through the shared protocol when the session requires it.
 		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
 			// The default role has no parent level to inherit. A selector reports `inherit`
 			// when the chosen model cannot keep the current level (e.g. a non-reasoning
@@ -21841,6 +22668,11 @@ export class AgentSession {
 			);
 			return;
 		}
+		// Internal role/cause writes have no shared publication protocol: refuse before any
+		// live effect rather than mutate the model and then hit the legacy append guard.
+		if (this.#usesSharedSessionPublication())
+			throw new SharedSessionMutationUnsupportedError(`set ${role} model (${options?.cause ?? "user-selection"})`);
+		this.sessionManager.assertLegacyMutationAllowed("set model");
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (!apiKey) {
@@ -22336,6 +23168,28 @@ export class AgentSession {
 						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
 					}
 
+					// A shared session publishes the profile/live-model transcript entries through the
+					// common admitted control publication before settings, catalog or live model
+					// publication (#7824); a legacy session keeps the synchronous legacy writes.
+					let sharedReload: CommittedModelProfileSessionPublication | undefined;
+					if (prepared || preparedLiveModelSelection) {
+						try {
+							if (this.#usesSharedSessionPublication()) {
+								sharedReload = await this.#publishSharedConfigurationReload(
+									prepared,
+									preparedLiveModelSelection,
+									{ preserveDefaultModelSelection, preserveLiveModelSelection },
+									() => stagedModels?.isCurrent() === true && !reloadSignal.aborted,
+								);
+							} else {
+								this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
+							}
+						} catch (error) {
+							stagedModels!.rollback();
+							modelRollbackAttempted = true;
+							throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
+						}
+					}
 					let publication: SettingsConfigReloadPublication | undefined;
 					let modelCommitStarted = false;
 					let activationPublicationStarted = false;
@@ -22348,12 +23202,22 @@ export class AgentSession {
 							stagedModels!.commit();
 							if (prepared) {
 								activationPublicationStarted = true;
-								publishPreparedModelProfileActivation(prepared, {
-									preserveDefaultModelSelection,
-									preserveLiveModelSelection,
-								});
+								publishPreparedModelProfileActivation(
+									prepared,
+									{
+										preserveDefaultModelSelection,
+										preserveLiveModelSelection,
+									},
+									sharedReload,
+								);
+							} else if (sharedReload) {
+								this.publishCommittedModelProfileSessionState(
+									sharedReload.plan,
+									sharedReload.receipt,
+									sharedReload.selection,
+								);
 							}
-							if (preparedLiveModelSelection) {
+							if (preparedLiveModelSelection && !sharedReload) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
 								this.commitPreparedProfileModelSelection(preparedLiveModelSelection, mutationRevision => {
@@ -22366,6 +23230,34 @@ export class AgentSession {
 						publication.finalize();
 						modelCommitSucceeded = true;
 					} catch (error) {
+						if (sharedReload) {
+							// The transcript already holds the reload's intent: restore only the
+							// process-wide settings and catalog, never compensate the session over its
+							// admitted write. The session is closed instead.
+							const rollbackErrors: unknown[] = [];
+							try {
+								publication?.rollback();
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+							if (modelCommitStarted) {
+								try {
+									stagedModels!.rollback();
+								} catch (rollbackError) {
+									rollbackErrors.push(rollbackError);
+								}
+								modelRollbackAttempted = true;
+							}
+							try {
+								this.#failClosedSharedControl(
+									"reload model profile configuration",
+									sharedReload.receipt,
+									rollbackErrors.length > 0 ? new AggregateError([error, ...rollbackErrors]) : error,
+								);
+							} catch (closed) {
+								throw new ConfigurationReloadError("PUBLICATION_FAILED", closed);
+							}
+						}
 						const rollbackErrors: unknown[] = [];
 						if (liveModelSelectionCommitted && committedThinkingLevelLiveMutationRevision === undefined) {
 							committedThinkingLevelLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
@@ -22982,7 +23874,8 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
-		this.sessionManager.assertLegacyMutationAllowed("select model profile");
+		const sharedPublication = this.usesSharedControlPublication();
+		if (!sharedPublication) this.sessionManager.assertLegacyMutationAllowed("select model profile");
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		this.#assertSessionAdmissionOpen();
@@ -23046,7 +23939,9 @@ export class AgentSession {
 			}
 		};
 		const assertRuntime = () => {
-			this.sessionManager.assertLegacyMutationAllowed("select model profile");
+			if (this.usesSharedControlPublication() !== sharedPublication)
+				throw new Error("Session publication protocol changed while selecting profile");
+			if (!sharedPublication) this.sessionManager.assertLegacyMutationAllowed("select model profile");
 			assertBound();
 			if (!util.isDeepStrictEqual(captureRuntime(), expectedRuntime))
 				throw new Error("Session model, thinking, or role intent changed while selecting profile");
@@ -23150,6 +24045,26 @@ export class AgentSession {
 				},
 			);
 		} catch (error) {
+			const sharedOutcome = prepared?.sharedPublicationOutcome;
+			if (sharedOutcome?.kind === "committed" || sharedOutcome?.kind === "unknown") {
+				if (error instanceof ModelProfileApplyCommittedError || error instanceof ModelProfilePublicationError)
+					throw error;
+				try {
+					void this.dispose().catch(disposalError => {
+						logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+					});
+				} catch (disposalError) {
+					logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+				}
+				const failure = new ModelProfilePublicationError(sharedOutcome, error);
+				if (prepared?.committedOwnership)
+					throw new ModelProfileApplyCommittedError(
+						prepared.profileName,
+						prepared.committedOwnership.version,
+						failure,
+					);
+				throw failure;
+			}
 			if (prepared?.committedOwnership && !(error instanceof ModelProfileApplyCommittedError)) {
 				try {
 					void this.dispose().catch(disposalError => {
@@ -23233,6 +24148,84 @@ export class AgentSession {
 			identity: chain.identity,
 			explicitHead: chain.explicitHead,
 		};
+	}
+
+	/**
+	 * Refuse before any caller-side effect when {@link setConfiguredModelChain}'s legacy
+	 * append would be refused (shared admission latched; #7824).
+	 */
+	assertConfiguredModelChainWritable(): void {
+		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
+	}
+
+	/**
+	 * Persist a configured chain on behalf of a control that already committed its durable
+	 * settings. A shared session publishes the chain through the common admitted control
+	 * publication before the runtime fallback controller changes (#7824); a legacy session
+	 * appends it as {@link setConfiguredModelChain} does. `isCurrent` is the caller's own
+	 * currentness fence and is re-checked under the publication lease.
+	 */
+	async setConfiguredModelChainForControl(
+		role: string,
+		entries: readonly string[],
+		origin: string,
+		identity: string | undefined,
+		explicitHead: boolean,
+		isCurrent: () => boolean,
+	): Promise<void> {
+		const operation = "set configured model chain";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		if (!this.#usesSharedSessionPublication()) {
+			this.setConfiguredModelChain(role, entries, origin, identity, explicitHead);
+			return;
+		}
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent()
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() =>
+				manager.appendControlEntriesSharingSession(
+					[
+						{
+							type: "configured_model_chain",
+							chain: {
+								role,
+								entries: [...entries],
+								origin,
+								identity,
+								explicitHead,
+								cleared: entries.length === 0,
+							},
+						},
+					],
+					current,
+				),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		if (role === "default") {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
 	}
 
 	/** Persist the configured fallback selectors for a model role. */
@@ -23370,6 +24363,128 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(selector, "default");
 	}
 
+	/**
+	 * A user's per-session default model choice (ACP/SDK `model.set`) in a shared session.
+	 * The resume default, effective thinking and configured chain are published as one
+	 * admitted append before any live model, thinking or profile state changes.
+	 */
+	async #setSharedSessionDefaultModel(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
+	): Promise<void> {
+		const operation = "set session model";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		if (options.signal?.aborted) return;
+		const manager = this.sessionManager;
+		const expectedSessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const observedAtRequest = readDurableModelProfileOwnership(this.settings);
+		const previousEditMode = this.#resolveActiveEditMode();
+		const selector = `${model.provider}/${model.id}`;
+		let committedOwnership: DurableModelProfileOwnership | undefined;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!options.signal?.aborted &&
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === expectedSessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.#defaultModelSelectionMutationRevision === expectedMutationRevision &&
+				this.#thinkingLevelMutationRevision === thinkingRevision &&
+				options.shouldMutate?.() !== false &&
+				(!committedOwnership ||
+					util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), committedOwnership))
+			);
+		};
+		const assertCurrent = () => {
+			if (!current()) throw new Error("Session changed while selecting model");
+		};
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+		if (options.signal?.aborted) return;
+		assertCurrent();
+		if (!apiKey) throw new Error(`No API key for ${selector}`);
+		if (options.shouldMutate && !options.shouldMutate()) return;
+		options.onMutationStarted?.();
+		const requestedLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
+		const effectiveLevel = resolveThinkingLevelForModel(model, requestedLevel);
+		let materialized = false;
+		if (observedAtRequest.marker.kind === "profile") {
+			const patches = this.#concreteDefaultModelSelectionPatches(model, effectiveLevel);
+			materialized = patches.some(patch => patch.path === "modelRoles");
+			committedOwnership = (
+				await commitDurableModelProfileOwnershipWithResult(
+					this.settings,
+					{ kind: "cleared" },
+					patches,
+					assertCurrent,
+					observedAtRequest,
+				)
+			).ownership;
+		}
+		// A durable ownership winner is never rewound: any later failure closes the session.
+		const failAfterOwnership = (error: unknown): never => {
+			void this.dispose().catch(disposalError =>
+				logger.warn("Committed model teardown failed", { error: String(disposalError) }),
+			);
+			throw new ModelProfileApplyCommittedError(selector, committedOwnership!.version, error);
+		};
+		const entries: SharedControlEntry[] = [{ type: "model_change", model: selector, role: "default" }];
+		if (effectiveLevel !== this.#thinkingLevel)
+			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
+		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
+		entries.push({
+			type: "configured_model_chain",
+			chain: {
+				role: "default",
+				entries: [formatModelSelectorValue(selector, requestedLevel)],
+				origin,
+				explicitHead: true,
+				cleared: false,
+			},
+		});
+		let outcome: SharedEntriesAppendOutcome;
+		try {
+			outcome = await this.#withStartedSharedControlPublication(assertCurrent, () =>
+				manager.appendControlEntriesSharingSession(entries, current),
+			);
+		} catch (error) {
+			if (committedOwnership) return failAfterOwnership(error);
+			throw error;
+		}
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") {
+			const error = new SharedControlPublicationError(operation, outcome);
+			if (committedOwnership) return failAfterOwnership(error);
+			throw error;
+		}
+		try {
+			assertCurrent();
+			const isUserSelection = options.cause !== "startup-override";
+			if (isUserSelection) this.markUserModelSelection();
+			this.#btwPrefixLedger.clear();
+			this.#setModelAuthoritatively(model, isUserSelection ? "user-selection" : "startup-override");
+			this.#unavailableModelProfile = undefined;
+			if (isUserSelection) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+			this.#seedSessionCanonicalVariant(model);
+			if (isUserSelection) this.#recordUserCanonicalVariantSelection();
+			this.#applyThinkingLevel(requestedLevel, false, false, undefined, true);
+			this.#publishConcreteDefaultProfileState(materialized);
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		} catch (error) {
+			return this.#failClosedSharedControl(operation, outcome, error);
+		}
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
 	async #setSharedTemporaryModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
@@ -23380,7 +24495,7 @@ export class AgentSession {
 			shouldMutate?: () => boolean;
 			onMutationStarted?: () => void;
 		},
-	): Promise<TemporaryProviderSessionScope | void> {
+	): Promise<TemporaryProviderSessionScope | undefined> {
 		const manager = this.sessionManager;
 		const sessionId = manager.getSessionId();
 		const file = manager.getSessionFile();
@@ -23527,11 +24642,18 @@ export class AgentSession {
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
 		if (
-			this.#usesSharedWorkflowIntentAppend() &&
+			this.#usesSharedSessionPublication() &&
 			!options?.persistAsSessionDefault &&
 			(options?.cause === undefined || options.cause === "temporary-operation")
 		) {
 			return this.#setSharedTemporaryModel(model, thinkingLevel, options ?? {});
+		}
+		if (
+			this.#usesSharedSessionPublication() &&
+			options?.persistAsSessionDefault === true &&
+			(options.cause === "user-selection" || options.cause === "startup-override")
+		) {
+			return this.#setSharedSessionDefaultModel(model, thinkingLevel, options);
 		}
 		if (options?.signal?.aborted) return;
 		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
@@ -23727,6 +24849,208 @@ export class AgentSession {
 		};
 	}
 
+	/** All migrated controls and canonical messages share one publication protocol. */
+	usesSharedControlPublication(): boolean {
+		return this.#usesSharedSessionPublication();
+	}
+
+	withModelProfilePublication<T>(assertCurrent: () => void, body: () => Promise<T>): Promise<T> {
+		return this.#withStartedSharedControlPublication(assertCurrent, () =>
+			this.sessionManager.withSharedThinkingControl(async () => {
+				assertCurrent();
+				return body();
+			}),
+		);
+	}
+
+	async appendModelProfileActivationForControl(
+		plan: ModelProfileTranscriptPlan,
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const parent = manager.getLeafId();
+		const snapshot = structuredClone(plan);
+		const outcome = await manager.appendModelProfileActivationSharingSession(
+			snapshot,
+			() =>
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent(),
+		);
+		if (outcome.kind === "committed") {
+			this.#profilePublicationReceipts.set(outcome, {
+				manager,
+				sessionId,
+				identityGeneration,
+				parent,
+				leaf: outcome.ids.at(-1) ?? parent,
+				ids: [...outcome.ids],
+				plan: snapshot,
+			});
+		}
+		return outcome;
+	}
+
+	/**
+	 * Publish a configuration reload's profile and live-model transcript entries as one
+	 * admitted append, before any settings, catalog or live model publication (#7824).
+	 * The receipt is consumed by the reload's synchronous publication step.
+	 */
+	async #publishSharedConfigurationReload(
+		prepared: PreparedModelProfileActivation | undefined,
+		liveSelection: PreparedProfileModelSelection | undefined,
+		options: { preserveDefaultModelSelection: boolean; preserveLiveModelSelection: boolean },
+		isCurrent: () => boolean,
+	): Promise<CommittedModelProfileSessionPublication> {
+		const operation = "reload model profile configuration";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const plan: ModelProfileTranscriptPlan = prepared ? buildModelProfileTranscriptPlan(prepared, options) : {};
+		if (liveSelection) {
+			if (plan.temporaryModel !== undefined)
+				throw new Error("Configuration reload prepared both a profile and a live model selection");
+			plan.temporaryModel = `${liveSelection.model.provider}/${liveSelection.model.id}`;
+			plan.thinking = { level: liveSelection.committedThinkingLevel };
+		}
+		// Entries already handed to background publication precede the reload's intent.
+		await this.#joinBackgroundPublications();
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+				if (liveSelection) this.#assertPreparedProfileModelSelectionCurrent(liveSelection);
+				if (prepared?.preparedDefaultModelSelection && plan.temporaryModel !== undefined)
+					this.#assertPreparedProfileModelSelectionCurrent(prepared.preparedDefaultModelSelection);
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent()
+			);
+		};
+		const outcome = await this.withModelProfilePublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => this.appendModelProfileActivationForControl(plan, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return { plan, receipt: outcome, selection: liveSelection };
+	}
+
+	/** Consume only a receipt issued by this session for these exact committed entries. */
+	publishCommittedModelProfileSessionState(
+		plan: ModelProfileTranscriptPlan,
+		receipt: Extract<SharedEntriesAppendOutcome, { kind: "committed" }>,
+		selection?: PreparedProfileModelSelection,
+	): void {
+		const admitted = this.#profilePublicationReceipts.get(receipt);
+		const manager = this.sessionManager;
+		if (
+			!admitted ||
+			admitted.manager !== manager ||
+			admitted.sessionId !== this.sessionId ||
+			admitted.identityGeneration !== manager.getSessionIdentityGeneration() ||
+			admitted.leaf !== manager.getLeafId() ||
+			!util.isDeepStrictEqual(admitted.plan, plan) ||
+			!util.isDeepStrictEqual(admitted.ids, receipt.ids) ||
+			this.#isDisposed ||
+			this.#sessionTransitionKind !== undefined
+		)
+			throw new Error("Invalid or stale model profile publication receipt");
+		const expected: Array<(entry: SessionEntry) => boolean> = [];
+		if (plan.configuredDefaultChain !== undefined) {
+			const chain = plan.configuredDefaultChain;
+			if (chain.role !== "default") throw new Error("Invalid model profile default chain");
+			expected.push(
+				entry =>
+					entry.type === "configured_model_chain" &&
+					entry.role === chain.role &&
+					util.isDeepStrictEqual(entry.entries, chain.entries) &&
+					entry.origin === chain.origin &&
+					entry.identity === chain.identity &&
+					entry.explicitHead === chain.explicitHead &&
+					entry.cleared === chain.cleared,
+			);
+		}
+		if (plan.temporaryModel !== undefined) {
+			if (
+				!selection ||
+				plan.temporaryModel !== `${selection.model.provider}/${selection.model.id}` ||
+				!plan.thinking ||
+				plan.thinking.level !== selection.committedThinkingLevel
+			)
+				throw new Error("Profile selection does not match committed transcript");
+			expected.push(
+				entry =>
+					entry.type === "model_change" &&
+					entry.role === "temporary" &&
+					entry.model === plan.temporaryModel &&
+					!entry.cleared,
+			);
+		} else if (selection) throw new Error("Profile selection lacks committed model intent");
+		if (plan.thinking !== undefined) {
+			if (
+				resolveThinkingLevelForModel(
+					selection?.model ?? this.model,
+					plan.thinking.level as ThinkingLevel | undefined,
+				) !== plan.thinking.level
+			)
+				throw new Error("Profile thinking does not match effective model thinking");
+			expected.push(
+				entry =>
+					entry.type === "thinking_level_change" &&
+					entry.thinkingLevel === (plan.thinking!.level ?? null) &&
+					!entry.operatorIntent,
+			);
+		}
+		if (plan.resumeDefault !== undefined) {
+			expected.push(
+				entry =>
+					entry.type === "model_change" &&
+					entry.role === "default" &&
+					(plan.resumeDefault!.selector === undefined
+						? entry.cleared === true && entry.model === ""
+						: !entry.cleared && entry.model === plan.resumeDefault!.selector),
+			);
+		}
+		if (expected.length !== receipt.ids.length) throw new Error("Incomplete profile publication receipt");
+		for (let index = 0; index < expected.length; index++) {
+			const entry = manager.getEntry(receipt.ids[index]!);
+			if (
+				!entry ||
+				!expected[index]!(entry) ||
+				entry.parentId !== (index === 0 ? admitted.parent : receipt.ids[index - 1])
+			)
+				throw new Error("Profile publication entries do not match receipt");
+		}
+		if (receipt.ids.length > 0 && receipt.ids.at(-1) !== admitted.leaf)
+			throw new Error("Profile publication cursor changed");
+		if (selection) this.#assertPreparedProfileModelSelectionCurrent(selection);
+		this.#profilePublicationReceipts.delete(receipt);
+		if (plan.configuredDefaultChain !== undefined) {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
+		if (selection) {
+			this.#setModelAuthoritatively(selection.model, "profile-activation");
+			this.#syncAppendOnlyContext(selection.model);
+		}
+		if (plan.thinking !== undefined)
+			this.#applyThinkingLevel(plan.thinking.level as ThinkingLevel | undefined, false, false, undefined, true);
+	}
+
 	commitPreparedProfileModelSelection(
 		prepared: PreparedProfileModelSelection,
 		onThinkingLevelApplied?: (mutationRevision: number) => void,
@@ -23790,7 +25114,23 @@ export class AgentSession {
 	async restoreModelSelectionForRollback(
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
+		durable?: ModelSelectionRollbackDurableState,
 	): Promise<void> {
+		// A shared session compensates through its own admitted publication (#7824).
+		if (this.#usesSharedSessionPublication())
+			return this.#restoreSharedModelSelectionForRollback(model, thinkingLevel, durable);
+		this.sessionManager.assertLegacyAppendAllowed("restore model selection");
+		if (durable?.defaultChain) {
+			const chain = durable.defaultChain.state;
+			this.setConfiguredModelChain(
+				"default",
+				chain?.entries ?? [],
+				chain?.origin ?? "rollback",
+				chain?.identity,
+				chain?.explicitHead ?? true,
+			);
+		}
+		if (durable?.resumeDefault) this.recordResumeDefaultModel(durable.resumeDefault.selector);
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (model) {
 			// Restoring a captured live model is compensation, not a new selection:
@@ -23806,9 +25146,129 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
+	/**
+	 * Shared-session compensation for a failed selector transaction. It compares the
+	 * captured state with the current live and durable state and publishes only the
+	 * entries that actually differ, through the common admitted control publication,
+	 * before any live change. Nothing that differs means nothing is written or changed.
+	 * A refused publication changes nothing; an unknown one closes the session.
+	 */
+	async #restoreSharedModelSelectionForRollback(
+		model: Model | undefined,
+		thinkingLevel: ThinkingLevel | undefined,
+		durable: ModelSelectionRollbackDurableState | undefined,
+	): Promise<void> {
+		const operation = "restore model selection";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const liveModel = this.model;
+		const liveThinking = this.#thinkingLevel;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const entries: SharedControlEntry[] = [];
+		const targetChain = durable?.defaultChain?.state;
+		const chainChanges =
+			durable?.defaultChain !== undefined &&
+			!util.isDeepStrictEqual(
+				targetChain === undefined
+					? undefined
+					: {
+							entries: [...targetChain.entries],
+							origin: targetChain.origin,
+							identity: targetChain.identity,
+							explicitHead: targetChain.explicitHead ?? true,
+						},
+				this.getConfiguredModelChainState("default"),
+			);
+		if (chainChanges) {
+			const chainEntries = [...(targetChain?.entries ?? [])];
+			entries.push({
+				type: "configured_model_chain",
+				chain: {
+					role: "default",
+					entries: chainEntries,
+					origin: targetChain?.origin ?? "rollback",
+					identity: targetChain?.identity,
+					explicitHead: targetChain?.explicitHead ?? true,
+					cleared: chainEntries.length === 0,
+				},
+			});
+		}
+		const resumeDefault = durable?.resumeDefault;
+		if (resumeDefault && this.getSessionDefaultModelSelector() !== resumeDefault.selector) {
+			entries.push(
+				resumeDefault.selector === undefined
+					? { type: "model_role_clear", role: "default" }
+					: { type: "model_change", model: resumeDefault.selector, role: "default" },
+			);
+		}
+		const modelChanges = model !== liveModel;
+		if (model && modelChanges)
+			entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "temporary" });
+		const effectiveThinking = resolveThinkingLevelForModel(model, thinkingLevel);
+		if (effectiveThinking !== liveThinking)
+			entries.push({ type: "thinking_level_change", level: effectiveThinking, operatorIntent: false });
+		if (entries.length === 0 && !modelChanges) return;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === liveModel &&
+				this.#thinkingLevel === liveThinking &&
+				this.#thinkingLevelMutationRevision === thinkingRevision
+			);
+		};
+		let committed: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
+		if (entries.length > 0) {
+			const outcome = await this.#withStartedSharedControlPublication(
+				() => {
+					if (!current())
+						throw new SharedControlPublicationError(operation, {
+							kind: "rejected",
+							error: new Error("superseded"),
+						});
+				},
+				() => manager.appendControlEntriesSharingSession(entries, current),
+			);
+			if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+			if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+			if (!current()) return this.#failClosedSharedControl(operation, outcome);
+			committed = outcome;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		try {
+			if (chainChanges) {
+				this.#defaultFallbackController = undefined;
+				this.#defaultFallbackExhaustedLastTurn = false;
+			}
+			if (model) {
+				if (modelChanges) this.#setModelAuthoritatively(model, "rollback");
+			} else if (modelChanges) {
+				this.#clearActiveRetryFallback();
+				this.#setModelWithProviderSessionReset(undefined);
+				this.#syncAppendOnlyContext(undefined);
+			}
+			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
+		} catch (error) {
+			if (committed) return this.#failClosedSharedControl(operation, committed, error);
+			throw error;
+		}
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
 	async #discardDefaultModelSelectionStage(
-		stage: DefaultModelSelectionStage,
+		stage: DefaultModelSelectionStage | undefined,
 	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
+		// A shared selection stages nothing; a refused publication left no transcript write.
+		if (!stage) return undefined;
 		try {
 			await this.sessionManager.discardDefaultModelSelectionStage(stage);
 			return undefined;
@@ -23836,7 +25296,7 @@ export class AgentSession {
 
 	async #throwDefaultModelSelectionRecovery(
 		error: Error,
-		stage: DefaultModelSelectionStage,
+		stage: DefaultModelSelectionStage | undefined,
 		commit: DurableModelProfileOwnership,
 		roleRollback?: { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] },
 	): Promise<never> {
@@ -23996,7 +25456,8 @@ export class AgentSession {
 			onAfterMutationAdmissionReadyForTests?: () => Promise<void>;
 		},
 	): Promise<DefaultModelSelectionResult> {
-		this.sessionManager.assertLegacyMutationAllowed("select default model");
+		const assertPublicationMode = this.#controlPublicationModeFence("select default model");
+		const sharedPublication = this.#usesSharedSessionPublication();
 		// Reserve the causal selection fence synchronously, before credential
 		// probing can yield. Later external prompts wait behind this operation,
 		// while an inherited post-prompt continuation may bypass the fence so
@@ -24056,7 +25517,7 @@ export class AgentSession {
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
-					this.sessionManager.assertLegacyMutationAllowed("select default model");
+					assertPublicationMode();
 					options?.onBeforeMutation?.();
 					if (this.sessionId !== expectedSessionId) {
 						throw new Error("Session changed while selecting model");
@@ -24083,31 +25544,37 @@ export class AgentSession {
 						materializedRolesPatch?.op === "set"
 							? (materializedRolesPatch.value as Record<string, ModelSelectorValue>)
 							: undefined;
-					const stage = await this.sessionManager.stageDefaultModelSelection(
-						`${model.provider}/${model.id}`,
-						effectiveLevel,
-						{
-							appendThinkingLevel: true,
-							appendTemporaryModelChange:
-								options?.roleCycle === undefined && options?.selectionIntent === undefined,
-							configuredDefaultChain: options?.roleCycle
-								? normalizeModelSelectorValue(
-										materializedRoles?.[options.roleCycle.role] ?? options.roleCycle.chain,
-									)
-								: (options?.selectionIntent?.chain ??
-									(options?.selectionIntent
-										? undefined
-										: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)])),
-							selectionRole: options?.roleCycle?.role,
-						},
-					);
+					const selectionEntries: DefaultModelSelectionEntriesOptions = {
+						appendThinkingLevel: true,
+						appendTemporaryModelChange:
+							options?.roleCycle === undefined && options?.selectionIntent === undefined,
+						configuredDefaultChain: options?.roleCycle
+							? normalizeModelSelectorValue(
+									materializedRoles?.[options.roleCycle.role] ?? options.roleCycle.chain,
+								)
+							: (options?.selectionIntent?.chain ??
+								(options?.selectionIntent
+									? undefined
+									: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)])),
+						selectionRole: options?.roleCycle?.role,
+					};
+					// Shared sessions publish the same entries additively at this opener's cursor
+					// after the durable settings commit; legacy sessions stage a replacement.
+					const stage = sharedPublication
+						? undefined
+						: await this.sessionManager.stageDefaultModelSelection(
+								`${model.provider}/${model.id}`,
+								effectiveLevel,
+								selectionEntries,
+							);
 					let durableCommit = observedAtRequest;
 					let roleRollback:
 						| { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] }
 						| undefined;
+					let sharedOutcome: SharedEntriesAppendOutcome | undefined;
 					const materialized = materializedRoles !== undefined;
 					const assertCurrent = () => {
-						this.sessionManager.assertLegacyMutationAllowed("select default model");
+						assertPublicationMode();
 						// Disposal drains the already-authorized selection transaction;
 						// it rejects new/queued ingress without revoking that owner's lease.
 						if (
@@ -24161,6 +25628,7 @@ export class AgentSession {
 							});
 						}
 					} catch (error) {
+						if (!stage) throw error;
 						try {
 							await this.sessionManager.discardDefaultModelSelectionStage(stage);
 						} catch (cleanupError) {
@@ -24175,7 +25643,36 @@ export class AgentSession {
 						assertCurrent();
 						if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), durableCommit))
 							throw new Error("Default model selection ownership changed before publication");
-						const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
+						const promotion: DefaultModelSelectionPromotion = stage
+							? this.sessionManager.promoteDefaultModelSelection(stage)
+							: await (async () => {
+									sharedOutcome = await this.sessionManager.appendControlEntriesSharingSession(
+										this.sessionManager.defaultModelSelectionControlEntries(
+											`${model.provider}/${model.id}`,
+											effectiveLevel,
+											selectionEntries,
+										),
+										() => {
+											try {
+												assertCurrent();
+												return util.isDeepStrictEqual(
+													readDurableModelProfileOwnership(this.settings),
+													durableCommit,
+												);
+											} catch {
+												return false;
+											}
+										},
+									);
+									if (sharedOutcome.kind !== "committed")
+										return {
+											kind: "not_promoted",
+											error: new SharedControlPublicationError("select default model", sharedOutcome),
+										};
+									// The entries are durable; runtime promotion must still be current.
+									assertCurrent();
+									return { kind: "promoted" };
+								})();
 						switch (promotion.kind) {
 							case "promoted": {
 								this.#publishDefaultModelSelection(
@@ -24218,6 +25715,8 @@ export class AgentSession {
 						return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 					} catch (error) {
 						if (roleRollback && error instanceof DefaultModelSelectionRecoveryError) throw error;
+						if (sharedOutcome?.kind === "committed" || sharedOutcome?.kind === "unknown")
+							return this.#failClosedSharedControl("select default model", sharedOutcome, error);
 						return this.#throwDefaultModelSelectionRecovery(
 							error instanceof Error ? error : new Error(String(error)),
 							stage,
@@ -24314,9 +25813,9 @@ export class AgentSession {
 	): Promise<RoleModelCycleResult | undefined> {
 		const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
 		if (roleModels.length <= 1) return undefined;
-		if (!(options?.temporary && this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination())) {
-			this.sessionManager.assertLegacyMutationAllowed("cycle role models");
-		}
+		// Shared sessions route both temporary and persistent cycles through admitted
+		// publication (setModelTemporary / setDefaultModelSelection).
+		if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("cycle role models");
 
 		const currentModel = this.model!;
 
@@ -24378,7 +25877,7 @@ export class AgentSession {
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		if (this.#scopedModels.length <= 1) return undefined;
-		this.sessionManager.assertLegacyMutationAllowed("cycle models");
+		if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("cycle models");
 		const observedOwnership = readDurableModelProfileOwnership(this.settings);
 		const scopedModels = await this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
@@ -24458,8 +25957,10 @@ export class AgentSession {
 		onApplied?: (mutationRevision: number) => void,
 		entryAlreadyCommitted = false,
 	): void {
-		if (!entryAlreadyCommitted &&
-			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)) {
+		if (
+			!entryAlreadyCommitted &&
+			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)
+		) {
 			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		}
 		this.#btwPrefixLedger.clear();
@@ -24491,7 +25992,7 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		if (this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination()) {
+		if (this.#usesSharedSessionPublication()) {
 			const run = persist
 				? this.#prepareSharedPersistedThinkingLevelForControl(level)
 				: this.#prepareSharedThinkingLevelForControl(level);
@@ -24503,26 +26004,51 @@ export class AgentSession {
 		return this.#setThinkingLevelForControl(level, false);
 	}
 
-	#prepareSharedThinkingLevelForControl(level: ThinkingLevel): () => Promise<void> {
+	/**
+	 * Non-operator, session-only thinking change (plan mode model follow). Shared sessions
+	 * publish the entry through admitted shared publication before the live change;
+	 * other sessions keep the synchronous legacy write.
+	 */
+	async setThinkingLevelForSession(level: ThinkingLevel | undefined): Promise<void> {
+		if (
+			level === undefined ||
+			!this.#usesSharedSessionPublication() ||
+			resolveThinkingLevelForModel(
+				this.model,
+				level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+			) === this.#thinkingLevel
+		) {
+			this.setThinkingLevel(level);
+			return;
+		}
+		return this.#withThinkingControlScheduling(this.#prepareSharedThinkingLevelForControl(level, false));
+	}
+
+	#prepareSharedThinkingLevelForControl(
+		level: ThinkingLevel,
+		operatorIntent = level !== ThinkingLevel.Inherit,
+	): () => Promise<void> {
 		const revision = ++this.#thinkingLevelMutationRevision;
 		const liveRevision = this.#thinkingLevelLiveMutationRevision;
 		const sessionId = this.sessionManager.getSessionId();
 		const model = this.model;
 		const contextGeneration = this.#reasoningControlContextGeneration;
-		const current = () => revision === this.#thinkingLevelMutationRevision &&
+		const current = () =>
+			revision === this.#thinkingLevelMutationRevision &&
 			liveRevision === this.#thinkingLevelLiveMutationRevision &&
-			sessionId === this.sessionManager.getSessionId() && model === this.model &&
+			sessionId === this.sessionManager.getSessionId() &&
+			model === this.model &&
 			contextGeneration === this.#reasoningControlContextGeneration;
 		return async () => {
 			if (!current()) return;
 			return this.sessionManager.withSharedThinkingControl(async () => {
 				const selected = level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level;
 				const effective = resolveThinkingLevelForModel(model, selected);
-				let outcome;
+				let outcome: SharedAppendOutcome;
 				try {
 					outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
 						level === ThinkingLevel.Inherit ? level : effective,
-						level !== ThinkingLevel.Inherit,
+						operatorIntent,
 						current,
 					);
 				} catch (error) {
@@ -24532,7 +26058,8 @@ export class AgentSession {
 					outcome.kind === "rejected" &&
 					outcome.error instanceof Error &&
 					outcome.error.message === "shared_thinking_control_superseded"
-				) return;
+				)
+					return;
 				if (outcome.kind !== "committed") {
 					throw new Error(
 						`Session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
@@ -24551,26 +26078,39 @@ export class AgentSession {
 		const sessionId = this.sessionManager.getSessionId();
 		const model = this.model;
 		const contextGeneration = this.#reasoningControlContextGeneration;
-		const sameContext = () => contextGeneration === this.#reasoningControlContextGeneration &&
-			sessionId === this.sessionManager.getSessionId() && model === this.model;
-		const current = () => revision === this.#thinkingLevelMutationRevision &&
-			liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext();
+		const sameContext = () =>
+			contextGeneration === this.#reasoningControlContextGeneration &&
+			sessionId === this.sessionManager.getSessionId() &&
+			model === this.model;
+		const current = () =>
+			revision === this.#thinkingLevelMutationRevision &&
+			liveRevision === this.#thinkingLevelLiveMutationRevision &&
+			sameContext();
 		return async () => {
 			if (!current()) return;
 			return this.sessionManager.withSharedThinkingControl(async () => {
-				const effective = resolveThinkingLevelForModel(model,
-					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+				const effective = resolveThinkingLevelForModel(
+					model,
+					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+				);
 				const persisted = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effective;
 				const publish = async (isCurrent: () => boolean) => {
-					let outcome;
+					let outcome: SharedAppendOutcome;
 					try {
 						outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
-							ThinkingLevel.Inherit, false, isCurrent);
+							ThinkingLevel.Inherit,
+							false,
+							isCurrent,
+						);
 					} catch (error) {
 						throw new Error("Reasoning settings saved; session thinking publication failed", { cause: error });
 					}
-					if (outcome.kind === "rejected" && outcome.error instanceof Error &&
-						outcome.error.message === "shared_thinking_control_superseded") return false;
+					if (
+						outcome.kind === "rejected" &&
+						outcome.error instanceof Error &&
+						outcome.error.message === "shared_thinking_control_superseded"
+					)
+						return false;
 					if (outcome.kind !== "committed") {
 						throw new Error(
 							`Reasoning settings saved; session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
@@ -24587,11 +26127,20 @@ export class AgentSession {
 					if (revision === this.#thinkingLevelMutationRevision && sameContext()) {
 						const pending = this.#pendingThinkingLevelControlSuccess;
 						this.#pendingThinkingLevelControlSuccess = undefined;
-						if (pending && pending.contextGeneration === contextGeneration &&
-							pending.sessionId === sessionId && pending.model === model && current()) {
+						if (
+							pending &&
+							pending.contextGeneration === contextGeneration &&
+							pending.sessionId === sessionId &&
+							pending.model === model &&
+							current()
+						) {
 							try {
-								if (await publish(current) && current())
-									apply(pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level);
+								if ((await publish(current)) && current())
+									apply(
+										pending.level === ThinkingLevel.Inherit
+											? this.#getInheritedThinkingLevel()
+											: pending.level,
+									);
 							} catch (recoveryError) {
 								const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
 								throw new AggregateError(
@@ -24602,34 +26151,47 @@ export class AgentSession {
 							}
 						} else {
 							this.#pendingThinkingLevelControlFailure = {
-								mutationRevision: revision, liveMutationRevision: liveRevision,
-								sessionId, model, contextGeneration,
+								mutationRevision: revision,
+								liveMutationRevision: liveRevision,
+								sessionId,
+								model,
+								contextGeneration,
 							};
 						}
 					}
 					throw new Error("Unable to persist reasoning settings.", { cause: settingsError });
 				}
 				if (!current()) {
-					if (liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext() &&
-						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision) {
-						this.#pendingThinkingLevelControlSuccess = { level, mutationRevision: revision,
-							sessionId, model, contextGeneration };
+					if (
+						liveRevision === this.#thinkingLevelLiveMutationRevision &&
+						sameContext() &&
+						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision
+					) {
+						this.#pendingThinkingLevelControlSuccess = {
+							level,
+							mutationRevision: revision,
+							sessionId,
+							model,
+							contextGeneration,
+						};
 						const failure = this.#pendingThinkingLevelControlFailure;
-						const recoverable = () => failure !== undefined &&
+						const recoverable = () =>
+							failure !== undefined &&
 							failure.mutationRevision === this.#thinkingLevelMutationRevision &&
 							failure.liveMutationRevision === this.#thinkingLevelLiveMutationRevision &&
-							failure.sessionId === this.sessionManager.getSessionId() && failure.model === this.model &&
+							failure.sessionId === this.sessionManager.getSessionId() &&
+							failure.model === this.model &&
 							failure.contextGeneration === this.#reasoningControlContextGeneration;
 						if (recoverable()) {
 							this.#pendingThinkingLevelControlSuccess = undefined;
 							this.#pendingThinkingLevelControlFailure = undefined;
-							if (await publish(recoverable) && recoverable())
+							if ((await publish(recoverable)) && recoverable())
 								apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 						}
 					}
 					return;
 				}
-				if (await publish(current) && current())
+				if ((await publish(current)) && current())
 					apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 			});
 		};
@@ -24872,8 +26434,11 @@ export class AgentSession {
 	async cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {
 		if (!this.model?.reasoning) return undefined;
 
-		const levels = [ThinkingLevel.Off, ...this.getAvailableThinkingLevels()];
-		const currentLevel = this.thinkingLevel === ThinkingLevel.Inherit ? ThinkingLevel.Off : this.thinkingLevel;
+		const levels = [
+			...(modelSupportsThinkingOff(this.model) ? [ThinkingLevel.Off] : []),
+			...this.getAvailableThinkingLevels(),
+		];
+		const currentLevel = this.thinkingLevel === ThinkingLevel.Inherit ? levels[0] : this.thinkingLevel;
 		const currentIndex = currentLevel ? levels.indexOf(currentLevel) : -1;
 		const nextIndex = (currentIndex + 1) % levels.length;
 		const nextLevel = levels[nextIndex];
@@ -24966,8 +26531,6 @@ export class AgentSession {
 	 * never by the transient Q1 auto-disable path.
 	 */
 	#rearmFastMode(): void {
-		const { clearAnthropicFastModeFallback } =
-			require("@gajae-code/ai/providers/anthropic") as typeof import("@gajae-code/ai/providers/anthropic");
 		clearAnthropicFastModeFallback(this.#providerSessionState);
 		this.#fastModeAutoDisabledProviderKeys.clear();
 	}
@@ -24987,41 +26550,156 @@ export class AgentSession {
 		);
 	}
 
-	setServiceTier(serviceTier: ServiceTier | undefined): void {
-		if (this.serviceTier !== serviceTier || serviceTier === "priority" || serviceTier === "claude-only") {
-			this.sessionManager.assertLegacyMutationAllowed("set service tier");
+	async setServiceTier(serviceTier: ServiceTier | undefined): Promise<void> {
+		if (this.#usesSharedSessionPublication()) {
+			await this.#enqueueFastControl("set service tier", () => ({
+				serviceTier,
+				rearm: serviceTier === "priority" || serviceTier === "claude-only",
+			}));
+			return;
 		}
+		this.#applyLegacyServiceTier(serviceTier);
+	}
+
+	#applyLegacyServiceTier(serviceTier: ServiceTier | undefined): void {
+		const rearm = serviceTier === "priority" || serviceTier === "claude-only";
+		if (this.serviceTier === serviceTier && !rearm) return;
+		this.sessionManager.assertLegacyMutationAllowed("set service tier");
 		this.#btwPrefixLedger.clear();
-		// Re-arming a priority-granting tier always clears the per-session
-		// auto-fallback sticky disable AND the auto-disable markers so the next
-		// request carries `speed: "fast"` again — even when the tier is unchanged
-		// (re-selecting the same tier is a deliberate re-arm), and before the
-		// no-op early-return below.
-		if (serviceTier === "priority" || serviceTier === "claude-only") {
-			this.#rearmFastMode();
-		}
+		if (rearm) this.#rearmFastMode();
 		if (this.serviceTier === serviceTier) return;
 		this.agent.serviceTier = serviceTier;
 		this.sessionManager.appendServiceTierChange(serviceTier ?? null);
 	}
 
-	setFastMode(enabled: boolean): void {
+	async setFastMode(enabled: boolean): Promise<void> {
+		if (this.#usesSharedSessionPublication()) {
+			await this.#enqueueFastControl("set fast mode", () => this.#resolveFastModeIntent(enabled));
+			return;
+		}
 		if (enabled && this.isFastModeEnabled()) {
 			this.sessionManager.assertLegacyMutationAllowed("rearm fast mode");
-			// Intent already grants fast mode under some scope — keep the user's
-			// scoped value but still re-arm, so an explicit `/fast on` after a
-			// provider auto-disable actually clears the sticky fallback + markers
-			// (otherwise it is a silent no-op). No history append: intent is unchanged.
 			this.#rearmFastMode();
 			return;
 		}
-		this.setServiceTier(enabled ? "priority" : undefined);
+		this.#applyLegacyServiceTier(enabled ? "priority" : undefined);
 	}
 
-	toggleFastMode(): boolean {
+	async toggleFastMode(): Promise<boolean> {
+		if (this.#usesSharedSessionPublication()) {
+			return this.#enqueueFastControl("toggle fast mode", () =>
+				this.#resolveFastModeIntent(!this.isFastModeEnabled()),
+			);
+		}
 		const enabled = !this.isFastModeEnabled();
-		this.setFastMode(enabled);
+		await this.setFastMode(enabled);
 		return enabled;
+	}
+
+	#resolveFastModeIntent(enabled: boolean): { serviceTier: ServiceTier | undefined; rearm: boolean } {
+		return {
+			// Resolve at execution, not enqueue: /fast on preserves provider scope,
+			// and two queued toggles are successive intents rather than duplicates.
+			serviceTier: enabled ? (this.isFastModeEnabled() ? this.serviceTier : "priority") : undefined,
+			rearm: enabled,
+		};
+	}
+
+	#enqueueFastControl(
+		operation: SharedControlPublicationError["operation"],
+		resolveIntent: () => { serviceTier: ServiceTier | undefined; rearm: boolean },
+	): Promise<boolean> {
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identity = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const abortEpoch = this.#abortAdmissionEpoch;
+		const transitionEpoch = this.#coordinatorPersistGeneration;
+		const current = () =>
+			!this.#isDisposed &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.#sessionTransitionGeneration === generation &&
+			this.#coordinatorPersistGeneration === transitionEpoch &&
+			this.#abortAdmissionEpoch === abortEpoch &&
+			this.sessionManager === manager &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identity &&
+			this.#usesSharedSessionPublication();
+		const assertCurrent = () => {
+			if (!current())
+				throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+		};
+		// Only a still-pending fast control is a predecessor: awaiting a settled tail would
+		// yield and let a later grouped control overtake this one (FIFO intent order).
+		const predecessor = this.#pendingFastControls.size > 0 ? this.#fastControlTail : undefined;
+		// Reserve canonical/thinking order at enqueue, but resolve tier intent only
+		// after the preceding fast control settles. Never wait for session idle or
+		// acquire a selection lease inside this group (both can wait on this queue).
+		const result = this.#withThinkingControlScheduling(async () => {
+			if (predecessor) await predecessor;
+			assertCurrent();
+			return manager.withSharedThinkingControl(async () => {
+				assertCurrent();
+				const { serviceTier, rearm } = resolveIntent();
+				const changed = this.serviceTier !== serviceTier;
+				if (!changed && !rearm) return this.isFastModeEnabled();
+				let outcome: SharedEntriesAppendOutcome;
+				try {
+					outcome = await manager.appendServiceTierChangeSharingSession(serviceTier ?? null, changed, current);
+				} catch {
+					throw new SharedControlPublicationError(operation, {
+						kind: "rejected",
+						error: new Error("publication_failed_before_admission"),
+					});
+				}
+				if (outcome.kind !== "committed" || !current()) {
+					if (outcome.kind === "unknown" || outcome.kind === "committed") {
+						// Retain the exact receipt; never compensate or retry a possibly
+						// durable write. Dispose synchronously fences ingress, but joining
+						// teardown here would wait on this control's own completion.
+						void this.dispose().catch(() => {
+							logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed" });
+						});
+					}
+					throw new SharedControlPublicationError(operation, outcome);
+				}
+				try {
+					this.#btwPrefixLedger.clear();
+					if (rearm) this.#rearmFastMode();
+					if (changed) this.agent.serviceTier = serviceTier;
+				} catch {
+					void this.dispose().catch(() => {
+						logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed" });
+					});
+					throw new SharedControlPublicationError(operation, outcome);
+				}
+				return this.isFastModeEnabled();
+			});
+		}).catch(error => {
+			if (error instanceof SharedControlPublicationError) throw error;
+			throw new SharedControlPublicationError(operation, {
+				kind: "rejected",
+				error: new Error("publication_failed_before_admission"),
+			});
+		});
+		const settled = result.then(
+			() => {},
+			() => {},
+		);
+		this.#pendingFastControls.set(settled, this.#selectionFenceGeneration);
+		this.#fastControlTail = settled;
+		void settled.then(() => {
+			this.#pendingFastControls.delete(settled);
+			this.#resolveSessionSettlement();
+		});
+		return result;
 	}
 
 	/**
@@ -25086,7 +26764,7 @@ export class AgentSession {
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<ToolOutputPruneResult | undefined> {
 		// Shared branches retain canonical output; threshold maintenance can append a compaction instead.
-		if (this.#usesSharedWorkflowIntentAppend()) return undefined;
+		if (this.#usesSharedSessionPublication()) return undefined;
 		this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
@@ -25538,7 +27216,7 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		const sharedCompaction = this.#usesSharedWorkflowIntentAppend();
+		const sharedCompaction = this.#usesSharedSessionPublication();
 		const invocationManager = this.sessionManager;
 		const invocationSessionId = invocationManager.getSessionId();
 		const invocationIdentityGeneration = invocationManager.getSessionIdentityGeneration();
@@ -26423,6 +28101,11 @@ export class AgentSession {
 		// Case 2: Threshold - turn succeeded but context is getting large
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return false;
+		// Skip if the message is from before the last compaction entry.
+		// This prevents re-triggering compaction with stale usage after a compaction
+		// completes and the user prompts again. The stale message still has pre-compaction
+		// usage stats, which would incorrectly trigger another compaction attempt.
+		if (errorIsFromBeforeCompaction) return false;
 		let contextTokens = calculateContextTokens(assistantMessage.usage);
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
@@ -26921,7 +28604,7 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.sessionManager.appendCustomMessageEntry("rewind-report", report, false, details, "agent");
+		await this.#appendCustomMessageEntry("rewind-report", report, false, details, "agent");
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
 	}
@@ -27139,7 +28822,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			};
 			this.agent.appendMessage(reminderMessage);
-			this.sessionManager.appendMessage(reminderMessage);
+			await this.appendMessageForSession(reminderMessage);
 			this.#scheduleAgentContinue({
 				generation: agentEndGeneration,
 				skipCompactionCheck: true,
@@ -28054,7 +29737,7 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+		if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("compact session");
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
@@ -28072,7 +29755,7 @@ export class AgentSession {
 				continue;
 			}
 
-			if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+			if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -28369,7 +30052,7 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
-			const sharedCompaction = this.#usesSharedWorkflowIntentAppend();
+			const sharedCompaction = this.#usesSharedSessionPublication();
 			const owner = this.#captureCompactionPublicationOwner(autoCompactionSignal, "auto-compaction");
 			const branchIds = new Set(pathEntries.map(entry => entry.id));
 
@@ -29394,18 +31077,104 @@ export class AgentSession {
 			},
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
-		if (activeIndex > resolutionStart) {
-			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-		} else {
-			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-		}
-		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
-		const previousEditMode = this.#resolveActiveEditMode();
-		this.#setModelAuthoritatively(resolution.model, "restore");
-		this.setThinkingLevel(
-			this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
+		const thinkingLevel = this.#thinkingLevelForResolvedFallback(
+			resolution.explicitThinkingLevel,
+			resolution.thinkingLevel,
 		);
+		const effectiveThinking = resolution.model
+			? resolveThinkingLevelForModel(resolution.model, thinkingLevel)
+			: this.#thinkingLevel;
+		let committedThinking: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
+		if (resolution.model && effectiveThinking !== this.#thinkingLevel) {
+			// A shared session publishes the thinking entry through admitted shared publication
+			// (#7824); a legacy session keeps its refusal. Either way, before seeding fallback
+			// state or switching the model.
+			if (this.#usesSharedSessionPublication())
+				committedThinking = await this.#publishSharedFallbackThinking(
+					controller,
+					resolutionStart,
+					effectiveThinking,
+				);
+			else this.sessionManager.assertLegacyMutationAllowed("set thinking level");
+		}
+		const applyResolution = (model: Model | undefined): Model => {
+			if (activeIndex > resolutionStart) {
+				this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+			} else {
+				controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+			}
+			if (!model) throw new Error(this.#fallbackExhaustionError(controller));
+			return model;
+		};
+		if (!committedThinking) {
+			const model = applyResolution(resolution.model);
+			const previousEditMode = this.#resolveActiveEditMode();
+			this.#setModelAuthoritatively(model, "restore");
+			this.setThinkingLevel(thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			return;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		try {
+			this.#setModelAuthoritatively(applyResolution(resolution.model), "restore");
+			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
+		} catch (error) {
+			return this.#failClosedSharedControl("set thinking level for default fallback", committedThinking, error);
+		}
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/**
+	 * Publish the thinking entry a default-fallback switch implies, at this opener's cursor
+	 * and before any fallback state or live model changes. Bound to the controller position,
+	 * live model, thinking revision and session identity it was resolved against.
+	 */
+	async #publishSharedFallbackThinking(
+		controller: FallbackChainController,
+		resolutionStart: number,
+		level: ThinkingLevel | undefined,
+	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
+		const operation = "set thinking level for default fallback";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const model = this.model;
+		const thinkingLevel = this.#thinkingLevel;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === model &&
+				this.#thinkingLevel === thinkingLevel &&
+				this.#thinkingLevelMutationRevision === thinkingRevision &&
+				this.#defaultFallbackController === controller &&
+				controller.activeIndex === resolutionStart
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() =>
+				manager.appendControlEntriesSharingSession(
+					[{ type: "thinking_level_change", level, operatorIntent: false }],
+					current,
+				),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return outcome;
 	}
 
 	/**
@@ -29750,6 +31519,89 @@ export class AgentSession {
 		};
 	}
 
+	#resetConcurrencyWait(): void {
+		this.#concurrencyWaitStartedAt = undefined;
+		this.#concurrencyWaitPollCount = 0;
+		this.#concurrencyWaitRetryAfterExceededBudgetEntry = undefined;
+		this.#concurrencyWaitRetryAfterDeadlines.clear();
+	}
+
+	/**
+	 * Delay before re-sending a request the provider refused for concurrency
+	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent,
+	 * poll count ceiling reached, and the failure must take the ordinary rate-limit path.
+	 * Also returns `undefined` when Retry-After exceeds the remaining budget, signaling
+	 * that the same entry should not be retried via credential rotation.
+	 */
+	#nextConcurrencyWaitMs(retryAfterMs: number | undefined, selector: string | undefined): number | undefined {
+		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
+		if (budgetMs <= 0) return undefined;
+		const now = Date.now();
+		this.#concurrencyWaitStartedAt ??= now;
+		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
+		if (remainingMs <= 0) {
+			// Record deadline on early exit when budget exhausted, before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// If the provider's Retry-After exceeds the remaining budget, mark the condition
+		// to prevent same-entry credential rotations (which would retry before deadline),
+		// and exit the concurrency wait to take the ordinary rate-limit path instead.
+		// This ensures we either advance to another entry or wait until budget expiry.
+		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
+			this.#concurrencyWaitRetryAfterExceededBudgetEntry = selector;
+			// Record deadline before no-poll return when budget would be exceeded.
+			if (selector !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// Bound poll count independently of elapsed time to prevent unbounded retries
+		// when Retry-After is zero or very small. The maximum poll attempts is determined
+		// by the budget divided by the minimum reasonable poll interval (1000ms).
+		// This prevents unbounded polling with tight intervals on a large budget (e.g., ~3000 requests with 100ms would fit 300s).
+		const maxPolls = Math.ceil(budgetMs / CONCURRENCY_POLL_MIN_INTERVAL_MS);
+		this.#concurrencyWaitPollCount++;
+		if (this.#concurrencyWaitPollCount > maxPolls) {
+			// Poll ceiling reached: if we have a Retry-After, track the absolute deadline per selector
+			// to prevent same-entry retries before the provider's deadline.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		// A slot frees when any running request ends; poll with capped jitter so
+		// several waiting sessions do not retry in lockstep. Use explicit positive
+		// bounds independent of generic retry sentinels to avoid zero-delay bursts
+		// (when baseDelayMs is 0) or unbounded delays (when maxDelayMs is 0).
+		const minPollMs = CONCURRENCY_POLL_MIN_INTERVAL_MS;
+		let delayMs: number;
+		if (retryAfterMs !== undefined) {
+			// Use Retry-After as the base, with bounded jitter (0–1s when Retry-After > 0)
+			// to desynchronize concurrent waiters. Ensure we don't return sub-1s delays
+			// (which could burst when Retry-After is 0 and waste the budget).
+			const jitterMs = retryAfterMs > 0 ? Math.random() * 1000 : 0;
+			delayMs = Math.max(minPollMs, retryAfterMs + jitterMs);
+		} else {
+			// No Retry-After: poll with random jitter between 1s–15s.
+			delayMs = minPollMs + Math.random() * (CONCURRENCY_WAIT_MAX_POLL_MS - minPollMs);
+		}
+		// Cap by remaining budget.
+		const cappedDelayMs = Math.min(remainingMs, delayMs);
+		// If capped result falls below the minimum, exit concurrency wait
+		// to avoid sub-1s bursts at budget expiry.
+		if (cappedDelayMs < minPollMs) {
+			// Record deadline on early exit before no-poll return.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
+			return undefined;
+		}
+		return cappedDelayMs;
+	}
+
 	#fallbackTriggerFor(
 		message: AssistantMessage,
 		allowLegacyUsageLimit: boolean,
@@ -29757,7 +31609,7 @@ export class AgentSession {
 		// `authDisposition` is carried through from `classifyFallbackTrigger`, whose
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
-	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+	): FallbackTrigger | undefined {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return undefined;
 		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
@@ -30502,9 +32354,7 @@ export class AgentSession {
 				: false;
 		}
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		const trigger:
-			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined =
+		const trigger: FallbackTrigger | undefined =
 			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
 		if (!trigger) {
 			return managedOutcome
@@ -30517,6 +32367,18 @@ export class AgentSession {
 			: attemptsUsed;
 		const providerRetryCeilingReached =
 			providerRetryMaxAttempts !== undefined && providerAttemptsUsed >= providerRetryMaxAttempts;
+		// The account is running its maximum number of parallel requests: the
+		// model and credential are healthy, so wait on the same entry instead of
+		// spending fallback attempts, marking the credential, or opening the
+		// circuit for sibling sessions that share the same saturated account.
+		const concurrencyWaitMs =
+			managedFallback &&
+			trigger.concurrencyLimited &&
+			!providerRetryCeilingReached &&
+			!assistantMessageHasVisibleOrToolContent(message)
+				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs, controller.currentSelector())
+				: undefined;
+		const concurrencyWait = concurrencyWaitMs !== undefined;
 		if (
 			managedFallback &&
 			providerRetryCeilingReached &&
@@ -30547,6 +32409,7 @@ export class AgentSession {
 			}
 		}
 		if (
+			!concurrencyWait &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
@@ -30619,7 +32482,11 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (
+		if (concurrencyWait) {
+			// Waiting for a free parallel slot is not a failed fallback attempt.
+			controller.discardStartedAttempt();
+			outcome = "retry";
+		} else if (
 			managedFallback &&
 			(quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate") &&
 			!providerRetryCeilingReached
@@ -30627,10 +32494,36 @@ export class AgentSession {
 			// A credential retry is a separate dimension from model fallback
 			// attempts. Leave the controller on the current entry and refund its
 			// provisional request charge so every same-kind account is tried first.
-			controller.discardStartedAttempt();
-			outcome = "retry";
+			// However, enforce the concurrency Retry-After deadline before allowing
+			// same-selector rotation/retry: if a deadline exists for this selector,
+			// advance instead of retrying before the deadline.
+			const deadlineMs = failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+				// Deadline not yet reached; advance instead of retrying
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				// No deadline or deadline reached; allow credential rotation retry
+				controller.discardStartedAttempt();
+				outcome = "retry";
+			}
 		} else if (managedFallback) {
-			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			// When Retry-After exceeds the remaining budget, force advance to the next entry
+			// instead of retrying the same entry. This prevents re-sending before the provider's
+			// deadline via the ordinary rate-limit path.
+			// Only apply the flag if it matches the current failed selector (scoped per entry).
+			if (this.#concurrencyWaitRetryAfterExceededBudgetEntry === failedSelector) {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			} else {
+				outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+				// If poll ceiling was reached with a Retry-After deadline for this entry,
+				// don't retry the same entry before the deadline. Advance instead.
+				if (outcome === "retry" && failedSelector !== undefined) {
+					const deadlineMs = this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector);
+					if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+						outcome = controller.advance() ? "advance" : "exhausted";
+					}
+				}
+			}
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
@@ -30754,8 +32647,9 @@ export class AgentSession {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
-		const delayMs =
-			credentialRotated || outcome === "advance"
+		const delayMs = concurrencyWait
+			? concurrencyWaitMs
+			: credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed)
@@ -30775,6 +32669,7 @@ export class AgentSession {
 			let quotaPoolExhausted = quotaCredentialMark === "exhausted";
 			if (
 				managedFallback &&
+				!concurrencyWait &&
 				!credentialRotated &&
 				quotaCredentialMark === undefined &&
 				!providerRetryCeilingReached &&
@@ -31069,8 +32964,82 @@ export class AgentSession {
 		this.#resolveRetry();
 	}
 
-	#usesSharedWorkflowIntentAppend(): boolean {
-		return this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
+	/**
+	 * The single eligibility rule for admitted shared publication (#7824):
+	 * managed destination && (root shared mode || session already requires shared admission).
+	 * Every migrated control and canonical producer routes through this predicate.
+	 */
+	#usesSharedSessionPublication(): boolean {
+		return (
+			this.sessionManager.isManagedDestination() &&
+			(this.#rootInteractiveSharedAppend || this.sessionManager.requiresSharedMutationAdmission())
+		);
+	}
+
+	/**
+	 * Bind a control to the publication protocol chosen when it started. A legacy control
+	 * keeps the legacy refusal; a session that adopts shared admission (or a shared control
+	 * that loses it) while the control awaits is refused before effects rather than
+	 * switching protocols mid-transaction.
+	 */
+	#controlPublicationModeFence(operation: string): () => void {
+		const manager = this.sessionManager;
+		const shared = this.#usesSharedSessionPublication();
+		const assertMode = () => {
+			if (this.sessionManager !== manager || this.#usesSharedSessionPublication() !== shared)
+				throw new SharedControlPublicationError(operation, {
+					kind: "rejected",
+					error: new Error("publication_mode_changed"),
+				});
+			if (!shared) manager.assertLegacyMutationAllowed(operation);
+		};
+		assertMode();
+		return assertMode;
+	}
+
+	/**
+	 * A possibly durable shared control write that this session cannot apply: retain the
+	 * exact receipt, never retry or compensate, and close the session so it cannot keep
+	 * running on state that diverges from its transcript.
+	 */
+	/** Make an already-live MCP selection durable in a shared session (no runtime change). */
+	async #publishSharedMCPToolSelection(selected: string[], assertMode: () => void): Promise<void> {
+		const operation = "select active tools";
+		const manager = this.sessionManager;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.#selectedMCPToolNamesMatch(this.getSelectedMCPToolNames(), selected)
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => manager.appendToolSelectionsSharingSession(selected, undefined, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+	}
+
+	#failClosedSharedControl(
+		operation: string,
+		outcome: Extract<SharedEntriesAppendOutcome, { kind: "committed" | "unknown" }>,
+		cause?: unknown,
+	): never {
+		void this.dispose().catch(() => {
+			logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed", operation });
+		});
+		throw new SharedControlPublicationError(operation, outcome, cause);
 	}
 
 	async #withStartedSharedControlPublication<T>(assertCurrent: () => void, publish: () => Promise<T>): Promise<T> {
@@ -31094,7 +33063,7 @@ export class AgentSession {
 
 	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
 		await this.#withStartedSharedControlPublication(assertCurrent, async () => {
-			let outcome;
+			let outcome: SharedAppendOutcome;
 			try {
 				outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
 			} catch (error) {
@@ -31428,8 +33397,7 @@ export class AgentSession {
 			this.agent.appendMessage(bashMessage);
 
 			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
-			options?.onPersisted?.();
+			void this.#publishMessageInBackground("bash result", bashMessage, options?.onPersisted);
 		}
 	}
 
@@ -31456,8 +33424,8 @@ export class AgentSession {
 	 * Flush pending bash messages to agent state and session.
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
-	#flushPendingBashMessages(): void {
-		this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
+	async #flushPendingBashMessages(): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
 	}
 
 	// =========================================================================
@@ -31623,7 +33591,7 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			this.sessionManager.appendMessage(pythonMessage);
+			void this.#publishMessageInBackground("python result", pythonMessage);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -31689,20 +33657,46 @@ export class AgentSession {
 	/**
 	 * Flush pending Python messages to agent state and session.
 	 */
-	#flushPendingPythonMessages(): void {
-		this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
+	async #flushPendingPythonMessages(): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
 	}
 
-	#flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
+	/**
+	 * Serialize deferred command-result drains.
+	 *
+	 * Queue items stay in place while a shared publication awaits, so a second drain
+	 * (forced recovery, a replacement prompt, a prompt finalizer) must wait for the
+	 * in-flight one instead of publishing the same item again and running its
+	 * `onPersisted` twice. Waiting also keeps transcript order: a later drain retries
+	 * only what the earlier one left queued, behind the entry that failed.
+	 */
+	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
 		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
 		kind: "bash" | "python",
-	): void {
+	): Promise<void> {
+		while (this.#executionMessageDrain) {
+			// The owning caller observes the drain's failure; a joiner only waits for it.
+			await this.#executionMessageDrain.catch(() => {});
+		}
 		if (pendingMessages.length === 0) return;
+		const drain = this.#drainPendingExecutionMessages(pendingMessages, kind);
+		this.#executionMessageDrain = drain;
+		try {
+			await drain;
+		} finally {
+			if (this.#executionMessageDrain === drain) this.#executionMessageDrain = undefined;
+		}
+	}
 
+	async #drainPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		kind: "bash" | "python",
+	): Promise<void> {
 		const total = pendingMessages.length;
 		const remaining: typeof pendingMessages = [];
 		const errors: unknown[] = [];
 		const persisted: string[] = [];
+		const unconfirmed: string[] = [];
 		let callbackFailureCount = 0;
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
@@ -31730,14 +33724,19 @@ export class AgentSession {
 			}
 
 			try {
-				this.sessionManager.appendMessage(pending.message);
+				await this.#persistExecutionMessage("deferred command result", pending.message);
 			} catch (error) {
 				// Session entries form a leaf-linked transcript. Once one append fails,
 				// later entries must remain queued behind it or a retry would append the
 				// failed entry after messages that originally followed it.
 				persistenceBlocked = true;
-				remaining.push(pending);
 				errors.push(error);
+				// An unknown outcome may already be durable under its attempted id. It is
+				// never queued for a retry that would append it again under a new id; the
+				// session closes below with that receipt instead.
+				if (error instanceof SharedControlPublicationError && error.outcome.kind === "unknown")
+					unconfirmed.push(...error.outcome.ids);
+				else remaining.push(pending);
 				continue;
 			}
 
@@ -31753,17 +33752,27 @@ export class AgentSession {
 		pendingMessages.splice(0, pendingMessages.length, ...remaining);
 		if (errors.length === 0) return;
 
-		const persistedCount = total - remaining.length;
-		const persistenceFailureCount = remaining.length;
+		const persistedCount = total - remaining.length - unconfirmed.length;
+		const persistenceFailureCount = remaining.length + unconfirmed.length;
 		const persistenceSummary =
-			persistenceFailureCount > 0
-				? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
-				: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
+			unconfirmed.length > 0
+				? `Could not confirm ${unconfirmed.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"} (attempted ids: ${unconfirmed.join(", ")}); ${persistedCount} persisted, ${remaining.length} not written; the session was closed to protect its history`
+				: persistenceFailureCount > 0
+					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
 				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
 				: "";
 		const pending = remaining.map(item => ("command" in item.message ? item.message.command : item.message.code));
+		if (unconfirmed.length > 0) {
+			void this.dispose().catch(() => {
+				logger.warn("Deferred command result teardown failed", {
+					code: "shared_execution_result_teardown_failed",
+					attemptedIds: unconfirmed,
+				});
+			});
+		}
 		throw new AggregateError(
 			errors,
 			`${persistenceSummary}${callbackSummary}; persisted: ${JSON.stringify(persisted)}; pending: ${JSON.stringify(pending)}`,
@@ -32182,7 +34191,10 @@ export class AgentSession {
 		const rosterClaim = callerOwnsRosterClaim ? turnArgs.ircRosterClaim : this.#claimIrcRosterCandidate();
 		const execution = this.#runBackgroundTurn(turnArgs, rosterClaim ?? null, callerOwnsRosterClaim);
 		// Retain ownership of actual credential and iterator work, not its abort race.
-		void execution.then(() => lease.release(), () => lease.release());
+		void execution.then(
+			() => lease.release(),
+			() => lease.release(),
+		);
 		try {
 			return await awaitEphemeralAbort(execution, signal);
 		} finally {
@@ -32327,8 +34339,11 @@ export class AgentSession {
 	async #runOwnedBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 		this.#assertExternalSessionIngress();
 		const manager = this.sessionManager;
-		if (this.#btwCleanupFailures.some(failure =>
-			failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration())) {
+		if (
+			this.#btwCleanupFailures.some(
+				failure => failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration(),
+			)
+		) {
 			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.");
 		}
 		if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
@@ -33759,10 +35774,24 @@ export class AgentSession {
 		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
 		const previousMessages = agent.state.messages.slice();
 		let ownedMessages = previousMessages;
+		let ownedContextRevision = agent.contextRevision;
+		let ownedHistoryRevision = agent.historyRevision;
 		let ownedLeaf = previousLeaf;
 		let revisions = manager.revisionSnapshot();
 		let moved = false;
-		const current = () => {
+		// Identity only: the view may have moved on, but this session still owns the
+		// private selection-authority state this operation staged.
+		const sessionStillOurs = () =>
+			!this.#isDisposed &&
+			this.sessionManager === manager &&
+			this.agent === agent &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identity;
+		// View/history ownership: the leaf, transcript and transition identity this
+		// operation moved. Losing it means a foreign actor superseded the restoration.
+		const historyIsOurs = () => {
 			const now = manager.revisionSnapshot();
 			const messages = agent.state.messages;
 			return (
@@ -33783,10 +35812,24 @@ export class AgentSession {
 				now.headerExport === revisions.headerExport &&
 				now.label === revisions.label &&
 				now.replayMetadata === revisions.replayMetadata &&
+				// Message-history only: prompt, tool and model publications must not
+				// suppress a history rollback of an independently drifted view.
+				agent.historyRevision === ownedHistoryRevision &&
 				messages.length === ownedMessages.length &&
 				messages.every((message, index) => message === ownedMessages[index]) &&
 				!busy()
 			);
+		};
+		const current = () => {
+			// Prompt and tool publications advance contextRevision even when they
+			// republish the same array, so ownership cannot rest on identity alone.
+			return historyIsOurs() && agent.contextRevision === ownedContextRevision;
+		};
+		const fence: SessionViewRestoreFence = {
+			isCurrent: current,
+			onApplied: () => {
+				ownedContextRevision = agent.contextRevision;
+			},
 		};
 		this.#beginSessionTransition("navigate-tree");
 		try {
@@ -33799,59 +35842,96 @@ export class AgentSession {
 			this.#commitSessionTransition();
 			if (!current()) throw gone();
 			const context = this.buildDisplaySessionContext();
-			await this.#restoreMCPSelectionsForSessionContext(context, current);
+			await this.#restoreMCPSelectionsForSessionContext(context, fence);
 			if (!current()) throw gone();
 			agent.replaceMessages(context.messages, {
 				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
 			});
 			ownedMessages = agent.state.messages.slice();
+			ownedHistoryRevision = agent.historyRevision;
+			ownedContextRevision = agent.contextRevision;
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 			this.#resetActiveSdkRunOwnership();
 			if (!current()) throw gone();
 		} catch (error) {
-			// Revision counters catch even a competing selection away and back. Never
-			// overwrite appended work, a successor, disposal, or foreign agent history.
-			if (moved && current()) {
+			// Undo independently-owned components. History (leaf and transcript) is
+			// reverted while the view is still ours; prompts, tools and selection
+			// authority only while this operation still owns them, so an independent
+			// publication is never overwritten.
+			if (moved && sessionStillOurs()) {
+				// Re-read ownership at each step: rollback callbacks are fallible and may
+				// publish prompt or history state of their own.
+				const selectionOurs = () =>
+					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration;
+				const authorityOurs = () =>
+					selectionOurs() &&
+					!this.#hasExplicitActiveToolSelectionForContext &&
+					this.#explicitMCPToolSelectionForContext === undefined &&
+					this.#explicitMCPToolSelectionPersistsForContext === true;
 				try {
-					if (previousLeaf === null) manager.resetLeaf();
-					else manager.branch(previousLeaf);
-					ownedLeaf = previousLeaf;
-					revisions = { ...revisions, leaf: revisions.leaf + 1 };
-					if (!current()) throw gone();
-					// The transcript may intentionally differ from the live selection. Restore
-					// prepared tools and both prompts without rebuilding or persisting it.
-					this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
-					this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-					this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
-					this.#commitExplicitMCPToolSelectionAuthority();
-					this.#selectedMCPToolNames = previousSelectedMCPToolNames;
-					this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
-					this.#activeToolSelectionRevision++;
-					agent.setTools(previousTools);
-					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
-					if (!current()) throw gone();
-					this.#baseSystemPrompt = previousBaseSystemPrompt;
-					agent.setSystemPrompt(previousSystemPrompt);
-					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
-					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
-					this.#invalidateDiscoveryCaches();
-					if (!current()) throw gone();
-					agent.replaceMessages(previousMessages, {
-						historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
-					});
-					ownedMessages = agent.state.messages.slice();
-					this.#resetInjectedContextSignatures();
-					this.#syncTodoPhasesFromBranch();
-					this.#closeCodexProviderSessionsForHistoryRewrite();
-					if (!current()) throw gone();
+					if (historyIsOurs()) {
+						if (previousLeaf === null) manager.resetLeaf();
+						else manager.branch(previousLeaf);
+						// Re-anchor the cursor we just restored so later ownership reads
+						// reflect our own revert, not foreign drift.
+						ownedLeaf = previousLeaf;
+						revisions = { ...revisions, leaf: revisions.leaf + 1 };
+					}
+					if (authorityOurs()) {
+						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+						this.#explicitMCPToolSelectionPersistsForContext =
+							previousExplicitMCPToolSelectionPersistsForContext;
+						this.#commitExplicitMCPToolSelectionAuthority();
+					}
+					// Prompt before tools: the tool observer may publish prompt state of
+					// its own, and that later publication must win over this revert.
+					if (historyIsOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#baseSystemPrompt = previousBaseSystemPrompt;
+						agent.setSystemPrompt(previousSystemPrompt);
+						ownedContextRevision = agent.contextRevision;
+						// Invalidate rebuilds authorized for the abandoned target tools;
+						// otherwise one may publish their guidance over the reverted prompt.
+						this.#reserveBaseSystemPromptGeneration();
+					}
+					if (historyIsOurs() && selectionOurs() && agent.contextRevision === ownedContextRevision) {
+						this.#selectedMCPToolNames = previousSelectedMCPToolNames;
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+						this.#activeToolSelectionRevision++;
+						agent.setTools(previousTools);
+						ownedContextRevision = agent.contextRevision;
+						// Signatures describe the prompt and tools this rollback just
+						// restored. Publish them before any observer can read or replace
+						// the cached signature with its own selection.
+						this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+						this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+						this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+						this.#invalidateDiscoveryCaches();
+					} else if (selectionOurs() && agent.contextRevision === ownedContextRevision) {
+						// The view moved on, so its live tools stand. Only undo the
+						// discovered-selection staging this operation performed.
+						this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+					}
+					if (historyIsOurs()) {
+						agent.replaceMessages(previousMessages, {
+							historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
+						});
+						// Re-anchor the history this rollback just published.
+						ownedMessages = agent.state.messages.slice();
+						ownedHistoryRevision = agent.historyRevision;
+						this.#resetInjectedContextSignatures();
+						this.#syncTodoPhasesFromBranch();
+						this.#closeCodexProviderSessionsForHistoryRewrite();
+					}
 				} catch {
 					throw Object.assign(new Error("Session view rollback failed."), {
 						code: "revision_failed",
 						rollbackFailed: true,
 					});
 				}
+				if (!historyIsOurs()) throw gone();
 			} else if (moved) {
 				throw gone();
 			}
@@ -33892,7 +35972,12 @@ export class AgentSession {
 		try {
 			const oldLeafId = currentLeafId;
 			const leafTarget = targetId === oldLeafId ? this.sessionManager.getEntryForFidelity(targetId) : undefined;
-			if (targetId === oldLeafId && (options.includeTarget || options.summarize || !(leafTarget?.type === "message" && leafTarget.message.role === "user")))
+			if (
+				targetId === oldLeafId &&
+				(options.includeTarget ||
+					options.summarize ||
+					!(leafTarget?.type === "message" && leafTarget.message.role === "user"))
+			)
 				return { cancelled: false };
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
@@ -33941,12 +36026,14 @@ export class AgentSession {
 				}
 			}
 
-			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0)
+				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
 
-			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0)
+				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
@@ -34815,6 +36902,41 @@ export class AgentSession {
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
 	}
+}
+
+/** Outcome of a background publication: `false` means nothing reached the transcript. */
+interface BackgroundPublicationResult {
+	readonly committed: boolean;
+	readonly cause?: string;
+}
+
+/** Flatten a non-committed shared outcome into log/report fields. */
+function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: string; reason?: string } {
+	if (outcome.kind === "stale") return { outcome: outcome.kind, reason: outcome.reason };
+	if (outcome.kind === "rejected")
+		return {
+			outcome: outcome.kind,
+			reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+		};
+	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
+	return { outcome: outcome.kind };
+}
+
+/**
+ * Narrow a shared publication outcome to `committed` or throw with its cause.
+ *
+ * Used by every AgentSession seam that replaces a legacy append: the refusal must be
+ * loud, because a silently dropped entry is worse than a surfaced failure.
+ */
+function assertSharedAppendCommitted(
+	operation: string,
+	outcome: SharedAppendOutcome,
+): asserts outcome is Extract<SharedAppendOutcome, { kind: "committed" }> {
+	if (outcome.kind === "committed") return;
+	throw new Error(
+		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+		{ cause: outcome },
+	);
 }
 
 async function awaitBtwSettlement(pending: Promise<void>): Promise<void> {

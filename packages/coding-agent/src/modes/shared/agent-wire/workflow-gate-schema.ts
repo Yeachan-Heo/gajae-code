@@ -57,7 +57,7 @@ export class WorkflowGateSchemaError extends Error {
 	}
 }
 
-/** Canonical (stable-key-ordered) JSON serialization used for hashing. */
+/** Canonical (stable-key-ordered) JSON serialization used for hashing. Byte-identical to harness-control-plane/receipts.ts canonicalJson. */
 export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

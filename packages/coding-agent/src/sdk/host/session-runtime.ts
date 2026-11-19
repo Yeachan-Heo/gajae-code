@@ -10,7 +10,6 @@ import {
 } from "@gajae-code/agent-core";
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
-
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
@@ -69,6 +68,7 @@ import {
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
+import { captureConfigOverridesShadow, reconcileConfigOverridesShadow } from "../config-override-shadow";
 import { collectSdkStoredSecrets } from "../credential-secrets";
 import { readSdkWorkingTreeDiff, SdkDiffObservationError } from "../diff-observation";
 import {
@@ -79,6 +79,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { PreflightAdmissionLedger } from "../preflight-admissions";
 import { autosaveWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	PromptDeadlineManager,
@@ -92,6 +93,7 @@ import {
 	failureEvidence,
 	failureProviderDiagnostic,
 	formatPromptFailureForLocalLog,
+	isPreservedProviderFailure,
 	PROMPT_FAILURE_MESSAGE_SUBMISSION,
 	type PromptFailureEvidence,
 	providerDiagnosticField,
@@ -102,7 +104,7 @@ import {
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
-import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
+import { containsSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { MAX_DURABLE_TERMINAL_RESERVATIONS } from "../protocol/terminal-abort-contract";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
@@ -909,6 +911,7 @@ interface AcceptedQueueCancellation {
 	disposition: AcceptedQueueDisposition;
 	dispositionPromise: Promise<AcceptedQueueDisposition>;
 	resolveDisposition: (disposition: AcceptedQueueDisposition) => void;
+	ExecutionStarted: boolean;
 	removalTerminalization?: Promise<boolean>;
 	removalFailure?: unknown;
 }
@@ -946,18 +949,6 @@ type InvocationOutcomeInput = {
 	provenance?: unknown;
 };
 const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
-const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
-	"provider_down",
-	"provider_unavailable",
-	"provider_rejected",
-	"upstream_stream_interrupted",
-	"argument_validation",
-	"execution",
-	"upstream_error",
-	"transport_reset",
-]);
-const isPreservedProviderFailure = (code: string | undefined): boolean =>
-	code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
 
 /**
  * Durable reconciliation accepts only the bounded outcome vocabulary from
@@ -1039,8 +1030,13 @@ interface InvocationRecord extends InvocationCorrelation {
 export interface InvocationReconciliation {
 	/** Shared v2 reconciliation owner; present for durable terminal admission. */
 	readonly store?: SdkOnlyReconciliationStore;
-	admit(kind: InvocationKind, clientRef?: string): void;
-	release(kind: InvocationKind, clientRef?: string): void;
+	/**
+	 * Reserves the clientRef. The generated `correlation` stays observable through
+	 * `turn.result` as `admitted` until the submission is accepted or released.
+	 */
+	admit(kind: InvocationKind, clientRef?: string, correlation?: InvocationCorrelation): void;
+	/** Releases an unaccepted admission; a `rejection` is reported by `turn.result` as a definite failure. */
+	release(kind: InvocationKind, clientRef?: string, rejection?: { cause: unknown }): void;
 	noteAccepted(kind: InvocationKind, correlation: InvocationCorrelation, clientRef?: string): Promise<void>;
 	noteTransition(
 		kind: InvocationKind,
@@ -1193,6 +1189,7 @@ export function createInvocationReconciliation(
 	const PENDING_TERMINAL_OUTCOME_RETRY_DELAY_MS = 25;
 	const records = new Map<string, InvocationRecord>();
 	const reservations = new Map<string, InvocationKind>();
+	const admissions = new PreflightAdmissionLedger();
 	const reservationCounts = new Map<InvocationKind, number>([
 		["prompt", 0],
 		["skill", 0],
@@ -1456,7 +1453,7 @@ export function createInvocationReconciliation(
 	};
 	return {
 		store,
-		admit(kind, clientRef) {
+		admit(kind, clientRef, correlation) {
 			cleanup();
 			const active = [...records.values()].filter(
 				record => record.kind === kind && record.terminalAt === undefined,
@@ -1476,12 +1473,16 @@ export function createInvocationReconciliation(
 						{ code: "client_ref_conflict" },
 					);
 				reservations.set(ref(kind, clientRef), kind);
+				if (correlation && kind !== "steer") admissions.admitted(kind, clientRef, correlation);
 			}
 			reservationCounts.set(kind, reservedCount + 1);
 		},
-		release(kind, clientRef) {
+		release(kind, clientRef, rejection) {
 			if (clientRef !== undefined) reservations.delete(ref(kind, clientRef));
 			reservationCounts.set(kind, Math.max(0, (reservationCounts.get(kind) ?? 1) - 1));
+			if (kind === "steer") return;
+			if (rejection) admissions.rejected(kind, clientRef, rejection.cause);
+			else admissions.accepted(kind, clientRef);
 		},
 		async noteAccepted(kind, correlation, clientRef) {
 			const recordKey = key(kind, correlation);
@@ -1505,6 +1506,7 @@ export function createInvocationReconciliation(
 			}
 			if (clientRef !== undefined) reservations.delete(ref(kind, clientRef));
 			reservationCounts.set(kind, Math.max(0, (reservationCounts.get(kind) ?? 1) - 1));
+			if (kind !== "steer") admissions.accepted(kind, clientRef);
 		},
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
@@ -1987,7 +1989,8 @@ export function createInvocationReconciliation(
 		},
 		lookupResult(kind, selector) {
 			const result = this.lookup(kind, selector) as Record<string, unknown>;
-			return result.status === "unknown" ? result : { kind, ...result };
+			if (result.status !== "unknown") return { kind, ...result };
+			return (kind === "steer" ? undefined : admissions.lookup(kind, selector)) ?? result;
 		},
 		listDeadlineRecoveryPendingPrompts() {
 			return [...records.values()]
@@ -2879,59 +2882,6 @@ export function createSdkSurfaceFactory(
 	};
 }
 
-function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
-	const before = new Map<string, unknown>();
-	for (const key of configOverrides.keys()) {
-		try {
-			before.set(key, settings.get(key as never));
-		} catch {
-			before.set(key, undefined);
-		}
-	}
-	return before;
-}
-
-function reconcileConfigOverridesShadow(
-	settings: Settings,
-	configOverrides: Map<string, unknown>,
-	before: ReadonlyMap<string, unknown>,
-): void {
-	for (const [key, prior] of before) {
-		let current: unknown;
-		try {
-			current = settings.get(key as never);
-		} catch {
-			current = undefined;
-		}
-		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
-	}
-}
-
-function deepStructuralEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right))
-		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
-	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-	const leftRecord = left as Record<string, unknown>;
-	const rightRecord = right as Record<string, unknown>;
-	const leftKeys = Object.keys(leftRecord);
-	const rightKeys = Object.keys(rightRecord);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
-	);
-}
-
-/** True when a patch contains any secret-shaped key, recursively. */
-function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
-	if (!value || typeof value !== "object") return false;
-	if (seen.has(value)) return false;
-	seen.add(value);
-	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
-	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
-	);
-}
 async function resolveSdkWorkflowGate(
 	ctx: ExtensionContext,
 	operation: "workflow.gate_answer" | "workflow.plan_approve",
@@ -3371,7 +3321,7 @@ function createControlSurface(
 			: { changed: true };
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
-	const pendingPreflights = new Map<string, Set<() => void>>();
+	const pendingPreflights = new Map<string, Set<() => undefined | boolean>>();
 	// The SDK connection that accepted the currently active prompt/skill, if
 	// any: terminal aborts are requester-scoped, so another connection must
 	// never stop it, and an agent-initiated turn (monitor/cron follow-up) has
@@ -3477,8 +3427,10 @@ function createControlSurface(
 		// (review thread P1).
 		const requesterConnectionId = sdkControlRequesterContext.getStore();
 		const retainedClientRef = normalizeClientRef(clientRef);
-		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
+		// Preflight (a pre-prompt compaction, for example) can outlast the client's
+		// acknowledgement budget; the admission stays observable until it settles.
+		reconciliation.admit(kind, retainedClientRef, correlation);
 		onCreated?.(correlation);
 		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
@@ -3514,17 +3466,39 @@ function createControlSurface(
 			disposition: "preflight",
 			dispositionPromise: queueDisposition.promise,
 			resolveDisposition: queueDisposition.resolve,
+			ExecutionStarted: false,
 		};
 		let accepted = false;
 		let settled = false;
 		let submission: Promise<unknown> | undefined;
-		const cancelPreflight = () => {
+		let unregisteredOnExecutionStart = false;
+		const cancelPreflight = (): boolean => {
 			preflightController.abort();
-			if (settled) return;
+			// Issue #7853: Check if execution has started. Only return true if the submission
+			// is still in the preflight phase (accepted but NOT started). Once execution starts
+			// (at agent_start), we cannot cancel the preflight anymore.
+			const cancellationRecord = acceptedQueueCancellations.get(`${correlation.commandId}:${correlation.turnId}`);
+			if (cancellationRecord?.ExecutionStarted === true) {
+				// Execution has started; cannot cancel preflight after agent_start has fired.
+				// Unregister this callback so it won't be called again.
+				if (!unregisteredOnExecutionStart) {
+					unregisteredOnExecutionStart = true;
+					const requesterPreflights = currentRequesterPreflights();
+					requesterPreflights.delete(cancelPreflight);
+				}
+				return false; // Cannot cancel; execution has already started
+			}
+			if (accepted) {
+				// The preflight was accepted (durable write succeeded) and execution has NOT started yet.
+				// The signal is now aborted, which interrupts the preflight. This is a successful cancellation.
+				return true;
+			}
+			if (settled) return false; // Already settled and not accepted, didn't cancel
 			settled = true;
 			preflight.reject(
 				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			);
+			return true; // Successfully cancelled
 		};
 		const requesterPreflights = currentRequesterPreflights();
 		requesterPreflights.add(cancelPreflight);
@@ -3574,7 +3548,7 @@ function createControlSurface(
 		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
 		queueCancellation.queueCandidate = queuedAtDispatch;
 		if (queuedAtDispatch && queueCancellation.accepted) queueCancellation.disposition = "queued";
-		if (kind === "prompt")
+		if (kind === "prompt" || kind === "skill")
 			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
 		let queuedRunStartRefused = false;
@@ -3873,11 +3847,33 @@ function createControlSurface(
 			if (!submission) settleAcceptedImageSubmission?.(correlation);
 			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
-			if (!accepted) reconciliation.release(kind, retainedClientRef);
+			if (!accepted) reconciliation.release(kind, retainedClientRef, { cause: error });
 			throw error;
 		} finally {
-			requesterPreflights.delete(cancelPreflight);
-			if (requesterPreflights.size === 0) pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
+			// Issue #7853: Keep the preflight in the set until the submission completes
+			// or is aborted, so that a terminal abort can still cancel an accepted preflight.
+			// Delete only happens after submission completes or abort successfully cancels it.
+			const connectionId = sdkControlRequesterContext.getStore() ?? "";
+			if (!submission) {
+				// Cleanup synchronously when dispatch throws before submission is assigned:
+				// imageUploads.redeem() throws before submission is created, leaving the
+				// preflight callback in the set indefinitely.
+				requesterPreflights.delete(cancelPreflight);
+				if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+					pendingPreflights.delete(connectionId);
+			}
+			void submission?.then(
+				() => {
+					requesterPreflights.delete(cancelPreflight);
+					if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+						pendingPreflights.delete(connectionId);
+				},
+				() => {
+					requesterPreflights.delete(cancelPreflight);
+					if (requesterPreflights.size === 0 && pendingPreflights.get(connectionId) === requesterPreflights)
+						pendingPreflights.delete(connectionId);
+				},
+			);
 		}
 	};
 	const terminalAbort = async (
@@ -3959,20 +3955,33 @@ function createControlSurface(
 							code: "idempotency_conflict",
 						});
 					const persisted = stored(existing);
-					if (existing.turnDisposition === "stopped")
+					if (existing.turnDisposition === "stopped") {
+						const isPrefCancelled = existing.ownedWorkDisposition === "not_requested";
+						const isPreflightPath =
+							isPrefCancelled || (scope === "turn" && existing.ownedWorkDisposition === "uncertain");
 						return {
 							ok: true,
 							selection: scope,
 							turn: "stopped",
 							...(scope === "owned"
 								? {
-										ownedWork: existing.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+										ownedWork: isPrefCancelled
+											? "stopped"
+											: existing.ownedWorkDisposition === "stopped"
+												? "stopped"
+												: "uncertain",
 										automaticDelivery: "none",
 										resumeOnOwnedCompletion: false,
 									}
 								: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
+							...(isPreflightPath
+								? {
+										reason: isPrefCancelled ? "preflight_cancelled" : "worker_unsettled",
+									}
+								: {}),
 							replay: persisted,
 						};
+					}
 					if (existing.turnDisposition === "no_effect")
 						return {
 							ok: true,
@@ -4025,23 +4034,35 @@ function createControlSurface(
 								code: "idempotency_conflict",
 							});
 						return tombstone.turnDisposition === "stopped"
-							? {
-									ok: true,
-									selection: scope,
-									turn: "stopped",
-									...(scope === "owned"
-										? {
-												ownedWork: tombstone.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
-												automaticDelivery: "none",
-												resumeOnOwnedCompletion: false,
-											}
-										: {
-												ownedWork: "left_running",
-												automaticDelivery: "enabled",
-												resumeOnOwnedCompletion: true,
-											}),
-									replay: stored(tombstone),
-								}
+							? (() => {
+									const isPrefCancelled = tombstone.ownedWorkDisposition === "not_requested";
+									const isPreflightPath =
+										isPrefCancelled || (scope === "turn" && tombstone.ownedWorkDisposition === "uncertain");
+									return {
+										ok: true,
+										selection: scope,
+										turn: "stopped",
+										...(scope === "owned"
+											? {
+													ownedWork: isPrefCancelled
+														? "stopped"
+														: tombstone.ownedWorkDisposition === "stopped"
+															? "stopped"
+															: "uncertain",
+													automaticDelivery: "none",
+													resumeOnOwnedCompletion: false,
+												}
+											: {
+													ownedWork: "left_running",
+													automaticDelivery: "enabled",
+													resumeOnOwnedCompletion: true,
+												}),
+										...(isPreflightPath
+											? { reason: isPrefCancelled ? "preflight_cancelled" : "worker_unsettled" }
+											: {}),
+										replay: stored(tombstone),
+									};
+								})()
 							: tombstone.turnDisposition === "no_effect"
 								? {
 										ok: true,
@@ -4290,9 +4311,27 @@ function createControlSurface(
 			// of this abort — only the callbacks present when it was admitted are
 			// its to cancel, mirroring the full-bus capture (review thread P1).
 			const admittedRequesterPreflights = new Set(requesterPreflights ?? []);
+			let preflightsCancelledByAbort = false;
 			const cancelRequesterPreflights = () => {
-				for (const cancel of [...admittedRequesterPreflights]) cancel();
-				if (admittedRequesterPreflights.size > 0) {
+				let actualCancellations = 0;
+				for (const cancel of [...admittedRequesterPreflights]) {
+					if (cancel()) {
+						actualCancellations++;
+					}
+				}
+				if (actualCancellations > 0) {
+					// Issue #7853: Check if ANY cancellation record for this requester has
+					// started execution. If so, we can't be certain the specific invocation
+					// being aborted had its preflight cancelled—only mark stopped if the
+					// requester's cancellations are all pre-execution and we have no other
+					// active submissions with started execution on this connection.
+					const requesterCancellations = [...acceptedQueueCancellations.values()].filter(
+						r => r.connectionId === abortingConnectionId,
+					);
+					const hasStartedExecution = requesterCancellations.some(r => r.ExecutionStarted === true);
+					if (!hasStartedExecution) {
+						preflightsCancelledByAbort = true;
+					}
 					// Remove the admitted callbacks from the live set so a preflight
 					// added by a LATER submission is untouched by this abort (and the
 					// bucket cleanup below reflects what actually remains).
@@ -4634,16 +4673,23 @@ function createControlSurface(
 			steeringSnapshotConsumed = proof.status === "settled";
 			if (proof.status !== "settled" || proof.terminalScope === undefined) {
 				removeTerminalPublicationWaiter();
+				// Issue #7853: if preflights were successfully cancelled, the prompt never
+				// actually started execution, so the abort is effective. Settle as stopped
+				// instead of uncertain.
+				const turnValue = preflightsCancelledByAbort ? "stopped" : "uncertain";
+				const reason = preflightsCancelledByAbort ? "preflight_cancelled" : "worker_unsettled";
 				const result = {
 					ok: true,
 					selection: scope,
-					turn: "uncertain",
-					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					turn: turnValue,
+					ownedWork: scope === "turn" ? "left_running" : preflightsCancelledByAbort ? "stopped" : "uncertain",
 					automaticDelivery: scope === "turn" ? "enabled" : "none",
 					resumeOnOwnedCompletion: scope === "turn",
-					reason: "worker_unsettled",
+					reason,
 				};
-				const workerUnsettledPayloadHash = hashResult(result);
+				const payloadHash = hashResult(result);
+				const turnDisposition = preflightsCancelledByAbort ? "stopped" : "uncertain";
+				const ownedWorkDisposition = preflightsCancelledByAbort ? "not_requested" : "uncertain";
 				await transactBoundedTerminalScopes(scopes =>
 					scopes.map(record =>
 						(keyHash
@@ -4652,10 +4698,10 @@ function createControlSurface(
 						record.turnDisposition === "pending"
 							? {
 									...record,
-									turnDisposition: "uncertain",
-									ownedWorkDisposition: "uncertain",
-									responsePayloadHash: workerUnsettledPayloadHash,
-									replayPayloadHash: replayShapedHash(record, result, workerUnsettledPayloadHash),
+									turnDisposition,
+									ownedWorkDisposition,
+									responsePayloadHash: payloadHash,
+									replayPayloadHash: replayShapedHash(record, result, payloadHash),
 									terminalAt: Date.now(),
 								}
 							: record,
@@ -4922,8 +4968,10 @@ function createControlSurface(
 			const ownedPreflights = connectionId === undefined ? [] : [...(pendingPreflights.get(connectionId) ?? [])];
 			// Capture both phases before cancellation or any awaited terminal work:
 			// acceptance can settle its callback before agent_start owns the run.
-			for (const cancel of ownedPreflights) cancel();
-			let cancelledAdmission = ownedPreflights.length > 0;
+			let cancelledAdmission = false;
+			for (const cancel of ownedPreflights) {
+				if (cancel()) cancelledAdmission = true;
+			}
 			for (const request of ownedAdmissions) {
 				if (request.disposition !== "preflight" || request.controller.signal.aborted) continue;
 				request.controller.abort();
@@ -6073,6 +6121,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				else current.deadlineManager.onRunStarted(entry.correlation);
 			}
 			transitions = drained.map(({ kind, correlation }) => ({ kind, correlation }));
+			// Mark submissions as having started execution so cancelPreflight can distinguish
+			// preflight cancellations (which succeed) from aborts after agent_start (which don't).
+			for (const { correlation } of transitions) {
+				const cancellationRecord = acceptedQueueCancellations.get(`${correlation.commandId}:${correlation.turnId}`);
+				if (cancellationRecord) {
+					cancellationRecord.ExecutionStarted = true;
+				}
+			}
 		} else {
 			// Pair this agent_end with the oldest unmatched start. A delayed
 			// aborted-turn end that lands after a successor agent_start must

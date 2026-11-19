@@ -211,6 +211,49 @@ describe("calculateCost", () => {
 		expect(aboveThreshold.cost.total).toBeCloseTo(0.043500625, 12);
 	});
 
+	it.each([
+		["claude-fable-5-2", 8, 10, 16],
+		["claude-fable-5-1", 10, 12.5, 20],
+		["claude-fable-5", 10, 12.5, 20],
+	] as const)("bills %s 1-hour cache writes at twice the input rate", (id, input, fiveMinute, oneHour) => {
+		const model = getBundledModel("anthropic", id);
+		expect(model.cost.input).toBe(input);
+		expect(model.cost.cacheWrite).toBe(fiveMinute);
+		const usageWith = (cacheWrite: number, ephemeral1h?: number): Usage => ({
+			input: 1_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite,
+			...(ephemeral1h === undefined ? {} : { cttl: { ephemeral1h } }),
+			totalTokens: 1_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const allOneHour = usageWith(1_000_000, 1_000_000);
+		calculateCost(model, allOneHour);
+		expect(allOneHour.cost.cacheWrite).toBeCloseTo(oneHour, 12);
+		const mixed = usageWith(1_000_000, 250_000);
+		calculateCost(model, mixed);
+		expect(mixed.cost.cacheWrite).toBeCloseTo(0.75 * fiveMinute + 0.25 * oneHour, 12);
+		const unsplit = usageWith(1_000_000);
+		calculateCost(model, unsplit);
+		expect(unsplit.cost.cacheWrite).toBeCloseTo(fiveMinute, 12);
+	});
+
+	it("bills date-pinned Fable ids discovered at runtime at the 1-hour rate", () => {
+		const model = { ...getBundledModel("anthropic", "claude-fable-5-2"), id: "claude-fable-5-2-20261109" };
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 1_000_000,
+			cttl: { ephemeral1h: 1_000_000 },
+			totalTokens: 1_000_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		calculateCost(model, usage);
+		expect(usage.cost.cacheWrite).toBeCloseTo(16, 12);
+	});
+
 	it("bills Haiku 5.5 1-hour cache writes at the 1-hour rate in both prompt tiers", () => {
 		const model = getBundledModel("anthropic", "claude-haiku-5-5");
 		const usageWith = (input: number, cacheWrite: number, ephemeral1h?: number): Usage => ({
@@ -528,6 +571,15 @@ describe("calculateCost", () => {
 			cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
 		});
 
+		for (const provider of ["openai", "openai-codex"] as const) {
+			const sol62 = getBundledModel(provider, "gpt-6.2-sol");
+			expect(sol62.cost).toEqual({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 });
+			expect(sol62.longContextPricing).toEqual({
+				threshold: 272_000,
+				cost: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
+			});
+		}
+
 		const luna = getBundledModel("openai-codex", "gpt-6-luna");
 		expect(luna.cost).toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 });
 		expect(luna.longContextPricing).toEqual({
@@ -576,6 +628,36 @@ describe("calculateCost", () => {
 
 		expect(threshold.cost.total).toBeCloseTo(2.122, 8);
 		expect(aboveThreshold.cost.total).toBeCloseTo(4.219025, 8);
+	});
+
+	it("bundles GPT-6.2 Astra pricing and switches it only above 272K input tokens", () => {
+		for (const provider of ["openai", "openai-codex"] as const) {
+			const model = getBundledModel(provider, "gpt-6.2-astra");
+			expect(model.cost).toEqual({ input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 });
+			expect(model.longContextPricing).toEqual({
+				threshold: 272_000,
+				cost: { input: 16, output: 60, cacheRead: 0.8, cacheWrite: 20 },
+			});
+
+			const usage = (cacheWrite: number): Usage => ({
+				input: 200_000,
+				output: 1_000,
+				cacheRead: 72_000,
+				cacheWrite,
+				totalTokens: 273_000 + cacheWrite,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			});
+			const threshold = usage(0);
+			const aboveThreshold = usage(1);
+
+			calculateCost(model, threshold);
+			calculateCost(model, aboveThreshold);
+
+			// 200K input @ $8 + 1K output @ $40 + 72K cacheRead @ $0.40
+			expect(threshold.cost.total).toBeCloseTo(1.6688, 8);
+			// same request one cache-write token past the threshold, at 2x/1.5x rates
+			expect(aboveThreshold.cost.total).toBeCloseTo(3.31762, 8);
+		}
 	});
 
 	it("keeps GPT-5.6 short-context pricing at exactly 272K input tokens", () => {

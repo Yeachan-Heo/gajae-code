@@ -914,7 +914,7 @@ async function assertCheckedOutSourceHead(sourceSha: string): Promise<void> {
 	}
 }
 
-async function resolveBaseRef(): Promise<string> {
+export async function resolveBaseRef(): Promise<string> {
 	const eventName = Bun.env.GITHUB_EVENT_NAME?.trim();
 	const before = Bun.env.GITHUB_EVENT_BEFORE?.trim();
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();

@@ -83,6 +83,7 @@ import {
 	isCompleteJson,
 	parseStreamingJson,
 } from "../utils/json-parse";
+import { resolveProviderFetch } from "../utils/loopback-transport";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -1413,7 +1414,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 			const localAbortReason = abortTracker.getLocalAbortReason();
 			const normalizedError =
-				!streamConnected && model.provider === "alibaba-token-plan" && error instanceof APIConnectionTimeoutError
+				!streamConnected && error instanceof APIConnectionTimeoutError
 					? new FirstEventTimeoutError(OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE)
 					: error;
 			const capturedErrorResponse = getCapturedErrorResponse?.();
@@ -1589,7 +1590,7 @@ async function createClient(
 	// has an opaque identity owned by the agent's conversation lifecycle.
 	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
-	const baseFetch = fetchOverride ?? fetch;
+	const baseFetch = resolveProviderFetch(model.provider, fetchOverride);
 	const wrappedFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const response = await baseFetch(

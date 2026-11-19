@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Component, renderMetrics, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 const FLAG = "PI_TUI_VIRTUAL_VIEWPORT";
 const ROWS = 12;
@@ -55,12 +55,6 @@ class MutableLines implements Component {
 
 function makeRows(count: number, prefix = "line"): string[] {
 	return Array.from({ length: count }, (_value, index) => `${prefix}-${index}`);
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
 }
 
 function capture(term: VirtualTerminal): Capture {

@@ -42,6 +42,7 @@ import {
 } from "../sdk/session-activation";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../sdk/session-list";
 import { sanitizeSdkStartupMessage } from "../sdk/startup-capability";
+import { canonicalJson } from "./canonical-json";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
@@ -1396,16 +1397,6 @@ async function readCoordinatorIdempotencyFile(file: string): Promise<Coordinator
 
 async function writeCoordinatorIdempotencyFile(file: string, value: CoordinatorToolIdempotencyRecord): Promise<void> {
 	await writeCoordinatorAtomic(file, `${JSON.stringify(value)}\n`);
-}
-
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
 }
 
 function sensitivePublicField(key: string): boolean {

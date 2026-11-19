@@ -20,14 +20,21 @@ import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
+import { disposeAllVmContexts } from "../src/eval/js/context-manager";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import type {
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../src/session/client-bridge";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
-import type { ToolSession } from "../src/tools";
+import type { NestedToolScope, ToolSession } from "../src/tools";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "../src/tools/descriptors";
+import { EvalTool } from "../src/tools/eval";
 import { WriteTool } from "../src/tools/write";
 
 /** Deep copy that keeps symbol-keyed schema annotations (unlike structuredClone). */
@@ -1004,6 +1011,11 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			streamToolArgs?: boolean;
 			streamText?: string;
 			toolInterruptPolicy?: "abort_tools" | "finish_tools";
+			sdkPermissionProvider?: (
+				toolCall: ClientBridgePermissionToolCall,
+				options: ClientBridgePermissionOption[],
+				signal?: AbortSignal,
+			) => Promise<ClientBridgePermissionOutcome>;
 		} = {},
 	) {
 		const tools = sessionTools.map(tool => tool as AgentTool);
@@ -1077,6 +1089,10 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		});
+		if (options.sdkPermissionProvider) {
+			session.setSdkPermissionMode("prompt");
+			session.setSdkPermissionProvider(options.sdkPermissionProvider);
+		}
 		const triggered: string[][] = [];
 		session.subscribe(event => {
 			if (event.type === "ttsr_triggered") triggered.push(event.rules.map(rule => rule.name));
@@ -1834,6 +1850,53 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
 	});
 
+	it("publishes a delivered per-tool fold through shared admission in a shared session (#7824)", async () => {
+		const agentDir = path.join(tempDir, "shared-per-tool-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const destination = SessionManager.managedDestination(tempDir, agentDir);
+		const manager = SessionManager.create(tempDir, destination);
+		const opened: SessionManager[] = [manager];
+		try {
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const adopted = await manager.appendMessageSharingSession({ role: "user", content: "shared", timestamp: 2 });
+			expect(adopted.kind).toBe("committed");
+			expect(manager.requiresSharedMutationAdmission()).toBe(true);
+			const legacy = spyOn(manager, "appendTtsrInjection");
+			const shared = spyOn(manager, "appendTtsrInjectionSharingSession");
+			const target = createSession(
+				[new WriteTool(createToolSession())],
+				[[writeCall("write-1", "a.ts", "export default 1;\n")]],
+				[defaultExportRule({ repeatMode: "once" })],
+				{ sessionManager: manager },
+			);
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			await run(target.session, "write it");
+			await target.session.awaitSessionSettlement();
+
+			// The fold reached the model through the published tool result.
+			expect(toolResultText(target.session, "write-1")).toContain(RULE_CONTENT);
+			expect(legacy).not.toHaveBeenCalled();
+			expect(shared).toHaveBeenCalledTimes(1);
+			expect(shared.mock.calls[0]![0]).toEqual(["named-exports"]);
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
+			const reopened = await SessionManager.open(manager.getSessionFile()!, destination);
+			opened.push(reopened);
+			expect(
+				reopened.getEntries().flatMap(entry => (entry.type === "ttsr_injection" ? entry.injectedRules : [])),
+			).toEqual(["named-exports"]);
+		} finally {
+			await session?.dispose();
+			session = undefined;
+			for (const each of opened) await each.closeStrict();
+		}
+	});
+
 	it("keeps handling a published result when its injection record fails to persist", async () => {
 		const { session, ttsrManager } = createSession(
 			[new WriteTool(createToolSession())],
@@ -1932,6 +1995,600 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(retry).toContain(RULE_CONTENT);
 		expect(retry).toContain(siblingContent);
 		expect(injectedNames(session).sort()).toEqual(["named-exports", "sibling"]);
+	});
+
+	describe("nested eval tool.<name>() calls", () => {
+		const READ_RULE_CONTENT = "TTSR-NESTED-READ-REMINDER: secrets stay unread.";
+
+		afterEach(async () => {
+			await disposeAllVmContexts();
+		});
+
+		function secretReadRule(partial: Partial<Rule> = {}): Rule {
+			return makeRule({
+				name: "secret-reads",
+				content: READ_RULE_CONTENT,
+				condition: ["secrets\\.txt"],
+				scope: ["tool:read"],
+				...partial,
+			});
+		}
+
+		function recordingRead(calls: unknown[]): AgentTool {
+			return {
+				name: "read",
+				label: "Read",
+				description: "read",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					calls.push(args);
+					return { content: [{ type: "text", text: "FILE-BODY" }] };
+				},
+			};
+		}
+
+		/** The real eval tool, dispatching nested calls through the AgentSession under test. */
+		function evalToolFor(getSession: () => AgentSession): AgentTool {
+			const tool = new EvalTool({
+				...createToolSession(),
+				getToolForExecution: (name, options) => getSession().getToolForExecution(name, options),
+				trackEvalExecution: (execution, controller) => getSession().trackEvalExecution(execution, controller),
+			} as ToolSession);
+			// EvalTool's execute is typed against its own schema; the session dispatches it generically.
+			return tool as unknown as AgentTool;
+		}
+
+		function evalToolCapturingScope(
+			getSession: () => AgentSession,
+			onScope: (scope: NestedToolScope | undefined) => void,
+		): AgentTool {
+			const tool = new EvalTool({
+				...createToolSession(),
+				getToolForExecution: (name, options) => {
+					onScope(options?.nestedToolScope);
+					return getSession().getToolForExecution(name, options);
+				},
+				trackEvalExecution: (execution, controller) => getSession().trackEvalExecution(execution, controller),
+			} as ToolSession);
+			return tool as unknown as AgentTool;
+		}
+
+		function evalCall(id: string, code: string): ToolCall {
+			return { type: "toolCall", id, name: "eval", arguments: { cells: [{ language: "js", code }] } };
+		}
+
+		it("folds a non-interrupting tool:read rule matched by a nested read into the eval result", async () => {
+			const reads: unknown[] = [];
+			const { session, triggered, ttsrManager } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", "return await tool.read({ path: 'secrets.txt' });")]],
+				[secretReadRule()],
+				{ interruptMode: "never" },
+			);
+			await run(session, "batch reads");
+
+			expect(reads).toHaveLength(1);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("FILE-BODY");
+			expect(text).toContain("allowed to run because the rule is configured not to interrupt");
+			expect(ttsrManager.getInjectedRuleNames()).toEqual(["secret-reads"]);
+			expect(injectedNames(session)).toEqual(["secret-reads"]);
+		});
+
+		it("blocks an interrupting nested read and delivers the rule with the eval result", async () => {
+			const reads: unknown[] = [];
+			const { session, triggered, modelMessages } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"await tool.read({ path: 'public.txt' }); return await tool.read({ path: 'secrets.txt' });",
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+
+			// Only the non-matching read ran; the matching one never reached the tool.
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("The nested read call was not executed");
+			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
+			expect(text).not.toContain("allowed to run because the rule is configured not to interrupt");
+			expect(injectedNames(session)).toEqual(["secret-reads"]);
+			// No stream abort/retry: the eval turn and the final turn only.
+			expect(modelMessages).toHaveLength(2);
+		});
+
+		it("refuses every later nested call when cell code catches an interrupting match", async () => {
+			const reads: unknown[] = [];
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`await tool.read({ path: 'public-1.txt' });
+								 const errors = [];
+								 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { errors.push(String(error?.message ?? error)); }
+								 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { errors.push(String(error?.message ?? error)); }
+								 try { await tool.read({ path: 'public-2.txt' }); } catch (error) { errors.push(String(error?.message ?? error)); }
+								 console.log(errors.join('\\n'));`,
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+
+			// The first read ran; the interrupting read never reached the tool, and
+			// catching its error must not let either a retry or a later call run
+			// before the folded reminder is delivered.
+			expect(reads).toEqual([{ path: "public-1.txt", _i: "js prelude" }]);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("invalidated by an interrupting TTSR match");
+			expect(injectedNames(session)).toEqual(["secret-reads"]);
+		});
+
+		it("keeps batched read results in call order when one item fails and a rule folds", async () => {
+			const reads: unknown[] = [];
+			const scriptedRead: AgentTool = {
+				name: "read",
+				label: "Read",
+				description: "read",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					const filePath = (args as { path: string }).path;
+					reads.push(args);
+					if (filePath === "boom.txt") throw new Error("BOOM");
+					return { content: [{ type: "text" as const, text: `BODY:${filePath}` }] };
+				},
+			};
+			const { session } = createSession(
+				[evalToolFor(() => session), scriptedRead],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`const results = await Promise.allSettled([
+							   tool.read({ path: 'secrets.txt' }),
+							   tool.read({ path: 'boom.txt' }),
+							   tool.read({ path: 'public.txt' }),
+							 ]);
+							 console.log(results.map(result => result.status).join(','));
+							 console.log(results.map(result => result.status === 'fulfilled' ? result.value : String(result.reason.message ?? result.reason)).join('|'));`,
+						),
+					],
+				],
+				[secretReadRule()],
+			);
+			await run(session, "batch reads");
+
+			expect(reads.map(arg => (arg as { path: string }).path)).toEqual(["secrets.txt", "boom.txt", "public.txt"]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("fulfilled,rejected,fulfilled");
+			expect(text).toContain("BODY:secrets.txt|BOOM|BODY:public.txt");
+			expect(text).toContain(READ_RULE_CONTENT);
+		});
+
+		it("refuses a nested call that resumes after its eval call settled", async () => {
+			const reads: unknown[] = [];
+			let scope: NestedToolScope | undefined;
+			const evalTool = evalToolCapturingScope(
+				() => session,
+				captured => {
+					scope = captured ?? scope;
+				},
+			);
+			const { session } = createSession(
+				[evalTool, recordingRead(reads)],
+				[[evalCall("eval-1", "return await tool.read({ path: 'public.txt' });")]],
+				[secretReadRule()],
+			);
+			await run(session, "read once");
+
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			expect(scope?.parentToolCallId).toBe("eval-1");
+			// A detached nested call that resumes after the eval result was produced
+			// must not reach the tool or re-claim rules against a finished call id.
+			const late = session.getToolForExecution("read", { nestedToolScope: scope! })!;
+			await expect(late.execute("late-read", { path: "late.txt", _i: "test" })).rejects.toThrow(
+				/aborted|already settled/i,
+			);
+			expect(reads).toHaveLength(1);
+		});
+
+		it("aborts a nested call parked on approval when the eval call settles", async () => {
+			const bashCalls: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const approval = Promise.withResolvers<ClientBridgePermissionOutcome>();
+			let bashApprovals = 0;
+			const asked: string[] = [];
+			const { session } = createSession(
+				[evalToolFor(() => session), bashTool],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"tool.bash({ command: 'echo X' }).catch(() => {}); await new Promise(resolve => setTimeout(resolve, 200)); return 'CELL-DONE';",
+						),
+					],
+				],
+				[],
+				{
+					sdkPermissionProvider: toolCall => {
+						asked.push(toolCall.toolName);
+						if (toolCall.toolName !== "bash") {
+							return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+						}
+						bashApprovals += 1;
+						return approval.promise;
+					},
+				},
+			);
+			await run(session, "start bash");
+			expect(asked).toEqual(["eval", "bash"]);
+			expect(bashApprovals).toBe(1);
+			expect(toolResultText(session, "eval-1")).toContain("CELL-DONE");
+
+			// Approval arrives only after the eval result was produced; the parked call
+			// must already have been aborted instead of dispatching now.
+			approval.resolve({ outcome: "selected", optionId: "allow_once" });
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
+		});
+
+		it("aborts a nested call parked on approval when a sibling interrupts", async () => {
+			const bashCalls: unknown[] = [];
+			const reads: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const asked: string[] = [];
+			const code = `tool.bash({ command: 'echo X' }).catch(() => {});
+			 await new Promise(resolve => setTimeout(resolve, 200));
+			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('READ-BLOCKED'); }
+			 try { await tool.read({ path: 'public.txt' }); } catch (error) { console.log('AFTER:' + String(error?.message ?? error)); }
+			 await new Promise(resolve => setTimeout(resolve, 400));`;
+			const { session } = createSession(
+				[evalToolFor(() => session), bashTool, recordingRead(reads)],
+				[[evalCall("eval-1", code)]],
+				[secretReadRule()],
+				{
+					interruptMode: "always",
+					sdkPermissionProvider: (toolCall, _options, signal) => {
+						asked.push(toolCall.toolName);
+						if (toolCall.toolName !== "bash") {
+							return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+						}
+						// Approve 300 ms after the request, after the sibling interrupt, while
+						// the cell is still running; an abort must cancel it first.
+						return new Promise<ClientBridgePermissionOutcome>(resolve => {
+							const timer = setTimeout(() => resolve({ outcome: "selected", optionId: "allow_once" }), 300);
+							signal?.addEventListener(
+								"abort",
+								() => {
+									clearTimeout(timer);
+									resolve({ outcome: "cancelled" });
+								},
+								{ once: true },
+							);
+						});
+					},
+				},
+			);
+			await run(session, "start bash and read");
+
+			expect(asked).toEqual(["eval", "bash"]);
+			expect(reads).toEqual([]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("READ-BLOCKED");
+			expect(text).toContain("invalidated by an interrupting TTSR match");
+
+			// The parked call must not run even though approval was granted in-cell.
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
+		});
+
+		it("runs nested calls in a new eval call after an earlier eval was invalidated", async () => {
+			const reads: unknown[] = [];
+			const firstCode = `try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('CAUGHT'); }
+			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log(String(error?.message ?? error)); }`;
+			const { session } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", firstCode)], [evalCall("eval-2", "return await tool.read({ path: 'public.txt' });")]],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+			await run(session, "batch reads again");
+
+			// The invalidation is scoped to the interrupted eval call, not the session.
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			expect(toolResultText(session, "eval-1")).toContain("invalidated by an interrupting TTSR match");
+			expect(toolResultText(session, "eval-2")).toContain("FILE-BODY");
+		});
+
+		it("matches a short condition early in long nested arguments", async () => {
+			const reads: unknown[] = [];
+			const filler = `FILLER-${"x".repeat(400)}`;
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`try { await tool.read({ path: 'secrets.txt', content: '${filler}' }); } catch (error) { console.log(String(error?.message ?? error)); }`,
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+
+			// The condition matches the early path field; the long trailing content
+			// must not hide it behind the incremental-stream tail window.
+			expect(reads).toEqual([]);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("The nested read call was not executed");
+		});
+
+		it("refuses eval called from inside eval without breaking the outer cell", async () => {
+			const reads: unknown[] = [];
+			const outerCode = `try {
+			   await tool.eval({ cells: [{ language: 'js', code: "console.log('INNER-RAN')" }] });
+			 } catch (error) { console.log('NESTED-EVAL-REFUSED:' + String(error?.message ?? error)); }
+			 return await tool.read({ path: 'public.txt' });`;
+			const { session } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", outerCode)]],
+				[],
+			);
+			await run(session, "batch reads");
+
+			// Recursion would rebind attribution to the synthetic bridge id; refuse it
+			// while other nested calls in the same cell keep working.
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("NESTED-EVAL-REFUSED");
+			expect(text).toContain("eval cannot be called from inside eval");
+			expect(text).not.toContain("INNER-RAN");
+			expect(text).toContain("FILE-BODY");
+		});
+
+		it("keeps a rule claimed by an earlier sibling out of the blocked reminder", async () => {
+			const reads: unknown[] = [];
+			const passthrough = makeRule({
+				name: "passthrough-a",
+				content: "TTSR-PASS-A: read ran.",
+				condition: ["secrets"],
+				scope: ["tool:read"],
+				interruptMode: "never",
+				repeatMode: "after-gap",
+				repeatGap: 0,
+			});
+			const blocking = makeRule({
+				name: "blocking-b",
+				content: "TTSR-BLOCK-B: read was blocked.",
+				condition: ["block"],
+				scope: ["tool:read"],
+				interruptMode: "always",
+			});
+			const code = `await tool.read({ path: 'secrets.txt' });
+			 try { await tool.read({ path: 'secrets-block.txt' }); } catch (error) { console.log(String(error?.message ?? error)); }`;
+			const { session } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", code)]],
+				[passthrough, blocking],
+			);
+			await run(session, "batch reads");
+
+			// The first read ran with the passthrough rule; the second was blocked by
+			// the other rule. The earlier claim must keep its passthrough wording.
+			expect(reads).toEqual([{ path: "secrets.txt", _i: "js prelude" }]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("TTSR-PASS-A");
+			expect(text).toContain("TTSR-BLOCK-B");
+			expect(text).toContain("allowed to run because the rule is configured not to interrupt");
+			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
+		});
+
+		it("does not start a lazily loaded tool after a sibling interrupts", async () => {
+			const lazyGate = Promise.withResolvers<void>();
+			const lazyCalls: unknown[] = [];
+			const fakeRead: AgentTool = {
+				name: "read",
+				label: "Read",
+				description: "read",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					lazyCalls.push(args);
+					return { content: [{ type: "text" as const, text: "LAZY-BODY" }] };
+				},
+			};
+			const lazyEntered = Promise.withResolvers<void>();
+			const lazyRead = new LazyAgentTool(BUILTIN_TOOL_DESCRIPTORS.read!, undefined, async () => {
+				lazyEntered.resolve();
+				await lazyGate.promise;
+				return fakeRead;
+			});
+			const code = `tool.read({ path: 'public.txt' }).catch(() => {});
+			 await new Promise(resolve => setTimeout(resolve, 50));
+			 try { await tool.read({ path: 'secrets.txt' }); } catch (error) { console.log('BLOCKED'); }`;
+			const { session } = createSession(
+				[evalToolFor(() => session), lazyRead as unknown as AgentTool],
+				[[evalCall("eval-1", code)]],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			const runPromise = run(session, "start lazy reads");
+			await lazyEntered.promise;
+			await runPromise;
+
+			expect(toolResultText(session, "eval-1")).toContain("BLOCKED");
+			lazyGate.resolve();
+			await Bun.sleep(10);
+			expect(lazyCalls).toEqual([]);
+		});
+
+		it("aborts a parked nested call when the eval execution is aborted", async () => {
+			const bashCalls: unknown[] = [];
+			const bashTool: AgentTool = {
+				name: "bash",
+				label: "Bash",
+				description: "bash",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					bashCalls.push(args);
+					return { content: [{ type: "text" as const, text: "RAN" }] };
+				},
+			};
+			const approval = Promise.withResolvers<ClientBridgePermissionOutcome>();
+			const bashAsked = Promise.withResolvers<void>();
+			const { session } = createSession(
+				[evalToolFor(() => session), bashTool],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"tool.bash({ command: 'echo X' }).catch(() => {}); await new Promise(resolve => setTimeout(resolve, 1000));",
+						),
+					],
+				],
+				[],
+				{
+					sdkPermissionProvider: toolCall => {
+						if (toolCall.toolName !== "bash") {
+							return Promise.resolve({ outcome: "selected", optionId: "allow_once" });
+						}
+						bashAsked.resolve();
+						return approval.promise;
+					},
+				},
+			);
+			const runPromise = run(session, "start bash");
+			await bashAsked.promise;
+			session.abortEval();
+			approval.resolve({ outcome: "selected", optionId: "allow_once" });
+			await runPromise;
+			await Bun.sleep(10);
+			expect(bashCalls).toEqual([]);
+		});
+
+		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), new WriteTool(createToolSession())],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`return await tool.write({ path: ${JSON.stringify(path.join(tempDir, "a.ts"))}, content: "export default 1;\\n" });`,
+						),
+					],
+				],
+				[defaultExportRule({ scope: ["tool:write(*.ts)"] })],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch writes");
+
+			expect(triggered).toEqual([["named-exports"]]);
+			expect(fs.existsSync(path.join(tempDir, "a.ts"))).toBe(false);
+			expect(toolResultText(session, "eval-1")).toContain(RULE_CONTENT);
+			expect(injectedNames(session)).toEqual(["named-exports"]);
+		});
+
+		it("leaves nested calls of other tools untouched by a tool:read rule", async () => {
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), new WriteTool(createToolSession())],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`return await tool.write({ path: ${JSON.stringify(path.join(tempDir, "secrets.txt"))}, content: "x" });`,
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch writes");
+
+			expect(triggered).toEqual([]);
+			expect(await Bun.file(path.join(tempDir, "secrets.txt")).text()).toBe("x");
+			expect(toolResultText(session, "eval-1")).not.toContain(READ_RULE_CONTENT);
+		});
+
+		it("matches a nested call by its invoked wire alias", async () => {
+			const calls: unknown[] = [];
+			const wireAliasTool: AgentTool = {
+				name: "edit",
+				label: "Edit",
+				description: "edit",
+				customWireName: "apply_patch",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					calls.push(args);
+					return { content: [{ type: "text" as const, text: "PATCHED" }] };
+				},
+			};
+			const aliasRule = makeRule({
+				name: "alias-patch",
+				content: "TTSR-ALIAS-REMINDER: apply patch carefully.",
+				condition: ["ALIAS-MARKER"],
+				scope: ["tool:apply_patch"],
+			});
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), wireAliasTool],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"try { await tool.apply_patch({ content: 'ALIAS-MARKER' }); } catch (error) { console.log(String(error?.message ?? error)); }",
+						),
+					],
+				],
+				[aliasRule],
+				{ interruptMode: "always" },
+			);
+			await run(session, "apply patch");
+
+			// Direct calls match the invoked `apply_patch` name; nested calls must too.
+			expect(calls).toEqual([]);
+			expect(triggered).toEqual([["alias-patch"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain("TTSR-ALIAS-REMINDER");
+			expect(text).toContain("The nested apply_patch call was not executed");
+			expect(text).toContain("was not executed because a matching rule is configured to interrupt");
+		});
 	});
 });
 
