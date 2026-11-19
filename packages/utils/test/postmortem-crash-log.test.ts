@@ -1374,11 +1374,7 @@ here`;
 		});
 
 		it("maintains backwards compatibility with original redactCrashSecrets on single-line input", () => {
-			const inputs = [
-				"password=secret",
-				"token=abc123 safe=keep",
-				'api_key="secret" note=diagnostic',
-			];
+			const inputs = ["password=secret", "token=abc123 safe=keep", 'api_key="secret" note=diagnostic'];
 			for (const input of inputs) {
 				const original = redactCrashSecrets(input);
 				const preserving = redactCrashSecretsPreservingLines(input);

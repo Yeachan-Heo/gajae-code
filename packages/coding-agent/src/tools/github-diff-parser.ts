@@ -619,5 +619,6 @@ function redactAccumulatedContentWithState(
 	}
 
 	// No longer need to track cross-hunk state since line counts are preserved
+	// Cross-hunk containers would require per-file projections (future work)
 	return { redactedLines: result, state: inputState };
 }
