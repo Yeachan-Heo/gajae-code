@@ -918,7 +918,8 @@ describe("checkpoint-selected full-history native forks", () => {
 			}),
 		);
 		expect(reserveSelectedForkTranscript).not.toHaveBeenCalled();
-		expect(error.code).toBe("malformed");
+		// Windows rejects before parsing the transformed fork because it cannot sync the namespace.
+		expect(error.code).toBe(process.platform === "win32" ? "destination_unavailable" : "malformed");
 		expect(await tree(f.root)).toEqual(before);
 	});
 
