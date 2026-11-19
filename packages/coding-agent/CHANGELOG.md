@@ -2,6 +2,96 @@
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-19
+
+### Added
+
+- Added implicit, keyless Rapid-MLX discovery at `http://localhost:8000/v1`, explicit `discovery.type: rapid-mlx` configuration, and served context-window metadata. Implicit and dedicated Rapid-MLX discovery requests to a loopback endpoint use a 500 ms timeout and a direct socket that does not follow redirects, so an unresponsive or redirecting server cannot stall startup or forward `RAPID_MLX_API_KEY`. Every such loopback probe bypasses `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (including a proxy a project `.env` declared), keyless or credentialed, while a non-loopback discovery endpoint uses the ambient `fetch`. The implicit probe only publishes entries that carry a Rapid-MLX-native field, so a vLLM-only server on port 8000 keeps its own `vllm` catalog, and that admission policy is part of the discovery cache provenance; an `offline` refresh republishes the cache only while the cached row was admitted under the current policy.
+- By default, Rapid-MLX inference uses the direct loopback transport selected by provider identity: the endpoint check limits a direct socket to HTTP(S) loopback endpoints, and a non-loopback endpoint keeps the ambient proxy-aware `fetch`, so a configured `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` never receives the bearer or the request body on the direct path. A caller-supplied `fetch` owns its inference transport and redirect policy. Discovery is a separate rule from inference: a Rapid-MLX `/models` probe of a loopback endpoint is direct and does not follow redirects, keyless or credentialed, so a proxy cannot answer discovery and inject a catalog, and an inference `fetch` override does not change that probe. The implicit vLLM/SGLang loopback probes skip individual entries that carry a Rapid-MLX-native field.
+- By default, Rapid-MLX inference on the `openai-responses` api selects the same provider-identity direct transport, with the endpoint check limiting the direct socket to HTTP(S) loopback endpoints, so that supported path cannot forward the bearer or the request body to a proxy either. The inference transport follows the provider, not the destination host, so another loopback provider — vLLM, SGLang, Ollama, LM Studio, or a custom OpenAI-compatible entry — keeps the proxy-aware transport for inference and selects `NO_PROXY` when it must connect directly. A custom provider id that selects `discovery.type: rapid-mlx` for a loopback endpoint keeps the direct `/models` probe but not the direct inference transport. A catalog cached by implicit loopback vLLM/SGLang discovery before the reciprocal identity guard is refused on an `offline` refresh instead of being republished.
+
+- Expose `captureSessionView` and `restoreSessionView` for retaining an exact session-tree view across session recreation, including the empty root. View metadata never authorizes opening a transcript; restoration requires an existing idle session and never generates or appends conversation content. Failed restoration reverts only live tools, prompts, and unpersisted selection authority that the failed operation still owns, and never revives tools from a superseded MCP catalog.
+
+- Added an autorouting strong/high label for `openai-codex/gpt-6.2-sol` at rank 3, after GPT-6 Sol and GPT-6.1 Sol.
+
+### Changed
+
+- Deep-interview now offers a standing `This is enough — stop at current ambiguity (X%)` option as the last choice on every interview-round question from round 1, regardless of the ambiguity score, so you can end the interview without typing "stop". Choosing it records `exit_reason: "user_enough"` with the ambiguity at exit, shows the remaining weakest dimensions as a residual-risk warning when ambiguity is still above the threshold, and then crystallizes the spec as usual; the spec reports the exit reason, the ambiguity at exit, and a Residual Risks section. The previous round-3 minimum for early exit is removed. "stop", "cancel", and "abort" still stop immediately and save state for resume without writing a spec.
+
+- Eval's tool description now recommends batching `tool.<name>()` calls in one cell only for read-only, approval-free tools (`read`, `search`, `find`, `ast_grep`, `lsp` lookups). It tells the model not to batch through eval when the session asks for approval on tool calls, and to call `bash`, `edit`, `write`, and other side-effecting tools directly (#6237).
+
+- Every built-in profile role that used `openai-codex/gpt-6.1-sol` now uses `openai-codex/gpt-6.2-sol` at the same effort. This covers `codex-medium`, `codex-pro`, `astra-lite`, `astra-default`, `astra-heavy`, `opus-codex`, `codex-opencodego`, and `fable-opus-codex`.
+- Every built-in profile role that used `openai-codex/gpt-6-astra` now uses `openai-codex/gpt-6.2-astra` at the same effort. This covers `astra-lite`, `astra-default`, `astra-heavy`, `astra-fable`, and `astra-fable-opus`. Luna and non-Codex roles are unchanged.
+- Codex web search now tries `gpt-6.2-sol` first, then `gpt-6.1-sol`, then `gpt-6-luna`. It still uses only models that the account's model discovery advertises.
+
+- `OAuthSelectorOptions` now includes an optional `credentialsToRemoveAfterLogin` field to track credentials pending removal after successful login.
+- `#handleOAuthLogin` now handles removal of disabled credentials after successful OAuth login, ensuring the disabled credential is only deleted when the new one is established.
+
+- Move Session in a shared root TUI session is refused again, as before #7858, until a design exists that cannot drop entries other processes have saved (#7856).
+
+- A `job` `poll` wait now ends the moment a new user message arrives, matching `subagent` await: there is no 2-second grace window and no `busyPromptMode` gate, and waits over `task`-backed jobs pass through too. The result appends `Job await interrupted by a new user message; …`, the watched jobs keep running, and their results are still delivered automatically on completion. The await is no longer folded, so it records no `foldReason`, emits no `bash_folded` frame, and the `job-await` fold wait kind is removed.
+
+### Fixed
+
+- A managed fallback chain no longer abandons a healthy model when its account is merely running its maximum number of parallel requests. A 429 with a typed concurrency code (`session_limit_reached`, `concurrency_limit_exceeded`, `concurrent_request_limit_exceeded`, `too_many_concurrent_requests`) used to be treated as an ordinary rate limit: a few seconds of retries spent the entry's attempts, marked the credential, opened the selector circuit for sibling sessions and advanced to the next model. The session now waits on the same entry without spending attempts, marking the credential or opening the circuit. When no provider Retry-After is present, it polls between 1 second and 15 seconds with random jitter; when Retry-After is supplied, the wait respects that deadline plus bounded jitter (0–1s when Retry-After > 0) to desynchronize concurrent waiters. The wait is bounded per request by the new `fallback.concurrencyWaitMs` setting (default 5 minutes).
+- When the concurrency-wait budget is exhausted and a Retry-After deadline is pending, the session no longer incorrectly applies that deadline to other fallback entries. The budget-exceeded flag is now scoped to the originating entry, so subsequent entries get normal retry attempts instead of being immediately advanced.
+- When the concurrency-wait poll ceiling is reached with an active Retry-After deadline, the session now advances to the next fallback entry instead of falling back to the ordinary rate-limit retry path that would violate the deadline. Same-entry retries before the Retry-After deadline are prevented by tracking an absolute deadline per entry.
+
+- The SDK session host no longer rejects progress frames as `invalid_frame` when they contain an unpaired UTF-16 surrogate. This happened, for example, when a streamed Korean or emoji snapshot was cut in the middle of an astral character. Directed delivery now replaces lone surrogate escapes with U+FFFD and keeps the frame's byte length unchanged (#7867).
+- A rejected non-terminal frame (`invalid_frame`, `oversized_frame`, `unauthorized`, `writer_backlog_full`) now drops only that frame. Previously it abandoned the whole prompt delivery, so the real terminal never reached `gjc acp` (#7867).
+- `turn.result` now reports `admitted` (with the generated `commandId`/`turnId`) for a submission whose preflight is still running, such as a long pre-prompt compaction. Once that preflight is rejected or cancelled, it reports a definite `failed` with `receiptState: "missing"`. Previously it reported `unknown` in both cases (#7867).
+- `gjc acp` keeps waiting for a prompt that the host reports as `admitted`, `accepted`, or `in_flight` instead of tearing down the session. That teardown closed the requester connection, which cancelled the pending preflight, so the prompt was silently lost (#7867).
+- After an uncertain prompt outcome or a lost host connection, `gjc acp` reattaches the same session id to its live host. If it cannot reattach, it reports a typed `session_closed` error instead of `not_found: Unknown session`. When the host never acknowledged the prompt, the `terminal_uncertain` message now gives the exact `turn.result` query by `clientRef` instead of `commandId=unknown, turnId=unknown` (#7867).
+
+- With two or more queued steers in `one-at-a-time` mode, Esc during the continuation that delivered the first steer now silently interrupts and injects the next queued steer instead of hard-aborting the turn and dumping it into the composer. The first-Esc gesture re-arms once the steer-on-interrupt continuation starts; a second Esc before the consumed steer is delivered still cancels and restores the queue to the composer.
+
+- Conditional TTSR rules scoped to `tool:<name>` now apply to nested eval `tool.<name>()` calls. A match folds the rule reminder into the eval result, and an interrupting match keeps the nested call from running and invalidates the rest of that eval call, so code that catches the error cannot retry before the reminder is delivered (#6237).
+
+- Fixed false positive blocks in workflow mutation guard when command arguments contain quoted glob characters like `--require="[a-z]"`. The scanner was incorrectly treating these as unquoted globs because it inspected the dequoted word instead of checking the original quoting. This could cause legitimate commands with option arguments containing brackets, asterisks, or question marks to be incorrectly blocked if those characters were quoted in the shell command. (Fixes #7857)
+
+- Agent file tools (`write`, `edit`, `ast_edit`, `python`/`eval`) can now create and edit project skills under `.gjc/skills/<name>/`; previously the always-on `.gjc/**` guard refused them even though no `gjc` CLI command writes skills. The `.gjc/skills` directory itself, every other `.gjc/**` path, `..` escapes, and symlink/hardlink redirects into other `.gjc` state stay blocked, and planning-phase boundaries are unchanged.
+
+- Hook import migration now validates the hooks directory root is a real directory (not a symlink or regular file) before planning to generate hook modules, matching the safety checks already in place for skills and commands. Without `--force`, unsafe destinations are skipped; with `--force`, they fail with a clear error. This prevents the migration from planning to write hooks to unsafe locations that could escape the project, and allows timeouts or permission denials during native discovery to be handled gracefully (#7847).
+- Hook import migration now properly distinguishes between I/O errors (like permission denied) and destination structure errors (like a file where a directory should be), reporting `failed_invalid_destination` for structure errors to match the semantics of other migration types.
+
+- **Issue #7848**: OAuth re-login now keeps disabled credentials until a replacement authenticates successfully. Previously, the disabled credential was hard-deleted before the new login attempt, leaving users without fallback if the re-login failed. Now the credential is retained and only removed after the new authentication completes successfully.
+
+- Fix SDK prompt abort during admission leaving durable row as "accepted" with turn=uncertain. When aborting a prompt while it's being admitted (after acceptance but before execution starts), the row is now properly settled as "stopped" instead of remaining uncertain.
+
+- Shared root TUI sessions now allow `setTemporaryModel` with `--model`/`--mpreset` startup overrides by routing them through shared admission (#7856)
+- Move Session tool (`move_session`) now works in shared sessions by allowing mutations during exclusive cwd transitions (#7856)
+
+- `SessionManager.moveTo` rewrites the header cwd and recreates the transcript at the new location again; #7858 had dropped that rewrite (#7860).
+
+- **Broker generation recovery** (#7879): Sessions with failed initial broker registrations now properly re-register with successor brokers when broker generation changes. The notification bus properly handles attachment transitions, and session-ready publication IDs are scoped by generation to prevent duplicate publications. The fix ensures the notification state machine transitions cleanly when a broker generation changes after initial registration failure.
+
+- The Keenable `web_search` provider now treats a response whose `results` rows are all unusable (null rows or rows without a URL) as a provider failure, so the fallback chain runs instead of returning an empty answer. `results: []` is still a no-hit answer.
+
+- MCP OAuth authorization-code exchange refuses a cleartext public token endpoint.
+- MCP dispatch refuses a stored credential whose bound token endpoint is not HTTPS and not loopback.
+
+- Planning-only phases now fail closed for Node/Bun module-preload flags (`-r`, `--require`, `--import`, `--loader`, `--experimental-loader`, `--preload`) in every detached, attached, equals, and quote-concatenated spelling, instead of scanning the one-liner while an unscanned preload module ran first.
+
+- Shift+Enter keeps inserting a newline after the first message in terminals that reset keyboard modes at a shell prompt, such as Tern. Rendered user messages no longer carry OSC 133 shell-prompt marks, which told the terminal gjc had exited and made it drop the Kitty keyboard flags.
+
+- Choosing an OAuth account or AUTO in `/login` no longer crashes GJC with an unhandled rejection when the session refuses the credential write (for example a shared session that refuses the publication); the selector stays open and shows the error so you can retry or pick another row.
+
+- `gjc accounts prefer` can order the accounts of one login that holds an OAuth row per organization (same email and account id). It used to refuse with "no unique email or account id"; it now stores `org:<organization-id>`, and `auth.credentialPreferences` accepts that entry. The entry matches the organization id only, never a display name. This also works when credentials come from an auth broker.
+
+- On Windows with CJK ANSI code page, bash tool output with one invalid UTF-8 byte no longer permanently switches to ACP decoding for the rest of the stream. Each line is now independently decoded, so an encoding error on one line no longer corrupts later valid UTF-8 lines (#7861).
+
+- The Telegram notification daemon now keeps at most 4,096 completed cleanup receipts, evicting the oldest first. Completed receipts were never removed, so a long-lived install grew `telegram-presentation-state.json` without bound and rewrote the whole file on every session removal. Pending and failed receipts are kept, and a state file written before this bound shrinks on the next daemon start.
+
+- Restore Telegram notifications when a session reconnects within its grace window without replaying its identity header.
+
+- Reject Telegram topic recovery when another session claims the same topic during a concurrent registry update, preventing notifications from being sent outside the topic.
+
+- Reading retired branch history during TTSR recovery now preserves the selected branch cursor when a cold read falls back to full transcript hydration, including an explicitly reset root cursor. If the selected entry is missing from the transcript, recovery fails instead of switching subsequent writes to the physical tail's branch.
+
+- A TTSR interrupt in a shared session now retries the turn with its reminder instead of leaving the turn aborted with "TTSR recovery was refused because this session entered shared mode". The reminder is saved through the shared session path before the retry changes live history. Only a typed rejected outcome that proves the append did not commit permits retrying with the reminder in memory. A stale outcome stops the retry and closes the session because later shared writes cannot commit until it is reopened. An unknown or unclassified persistence failure also stops the retry and closes the live session, preventing later prompts from duplicating a possibly committed reminder. The warning includes the attempted entry ID when available. Reconciliation on reopening remains separate. A memory-only retry consumes all of its rules, including carried per-tool claims, in the live manager to prevent a repeatMode once interrupt loop, but writes no durable consumption marker, so the rules remain eligible after reopening.
+- A TTSR retry that is aborted while its reminder is being saved still classifies the save result. A stale or uncertain save closes the session as it does without an abort. A rejected save releases the retry's claims, so its per-tool reminders become eligible again. A committed reminder is added to live history and marked as injected at its saved checkpoint if live history is unchanged since the save started. If a newer prompt has changed live history, the session is closed with a reopen notice instead, and reopening restores the saved reminder once.
+- In discard mode, the retry reminder now contains each settled or earlier retry reminder from the discarded turn once, and the saved entry and the live message use the same content and rule set. A reminder folded into a tool result from an earlier assistant turn of the same prompt stays in retained history, so the retry neither carries it again nor re-marks its checkpoint. The saved entry records the message count it was injected at, so reopening a session whose separate injection marker is missing restores that after-gap checkpoint instead of restarting the gap. A newer saved reminder also updates an older checkpoint for the same rule. Recovery reads custom reminders on the active persisted branch, including reminders before a compaction's keep boundary, without putting their text back into Agent context. Inactive sibling branches do not consume rules or advance the counter. Live-only reminders still provide consumption evidence for in-memory sessions and rejected publication. Entries without valid rule metadata are ignored; a rule without a saved checkpoint only fills a missing consumption record at the recovered current count.
+
 ## [0.21.1] - 2026-11-17
 
 ### Added
