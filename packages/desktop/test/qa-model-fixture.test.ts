@@ -601,7 +601,7 @@ test("fixture observation reads exact old/revised/continuation leaves without pr
 	expect(fixture.release(1)).toBe(true);
 	await first;
 	const original = frames
-		.flatMap(frame => frame.type === "session" && frame.session.id === session.id ? frame.session.messages : [])
+		.flatMap(frame => (frame.type === "session" && frame.session.id === session.id ? frame.session.messages : []))
 		.find(message => message.role === "user" && message.text === "original fixture branch");
 	if (!original?.entryId) throw new Error("Missing persisted original prompt");
 	await call("prompt", { sessionId: session.id, text: "original branch continuation" });
@@ -619,11 +619,12 @@ test("fixture observation reads exact old/revised/continuation leaves without pr
 	const control = (await Bun.file(path.join(layout.root, "session-observers", `${old.sdkSessionId}.json`)).json()) as {
 		baseUrl: string;
 	};
-	const request = (headers: Record<string, string>, body = "{}") => fetch(`${control.baseUrl}/observe`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", ...headers },
-		body,
-	});
+	const request = (headers: Record<string, string>, body = "{}") =>
+		fetch(`${control.baseUrl}/observe`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...headers },
+			body,
+		});
 	expect((await request({ "X-Desktop-QA-Fixture": "wrong" })).status).toBe(403);
 	expect(
 		(await request({ "X-Desktop-QA-Fixture": fixture.providerToken, Origin: "http://127.0.0.1:1420" })).status,

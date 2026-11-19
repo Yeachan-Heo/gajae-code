@@ -3748,7 +3748,11 @@ export class DesktopHost {
 			// would report success and an unknown name would spend a provider turn.
 			return { consumed: false, refused: true, output: DESKTOP_UNAVAILABLE };
 		// Commands mutate the same session as prompts, so they take the same lock.
-		return this.#exclusive(live, settleView => this.#runCommand(live, text, requestId, settleView, alreadyBegun), true);
+		return this.#exclusive(
+			live,
+			settleView => this.#runCommand(live, text, requestId, settleView, alreadyBegun),
+			true,
+		);
 	}
 	async #runCommand(
 		live: LiveSession,

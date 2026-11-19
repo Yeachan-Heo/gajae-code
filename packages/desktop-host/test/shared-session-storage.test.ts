@@ -9,9 +9,9 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
-	captureSessionView,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
+	captureSessionView,
 	createAgentSession,
 	getSessionMessageEntryId,
 	restoreSessionView,
@@ -384,7 +384,10 @@ test("persisted view shape and catalog or actual SDK identity mismatches are rej
 		{ ...saved, authority: true },
 		{ ...saved, sessionId: crypto.randomUUID() },
 	]) {
-		await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify({ ...catalog, sessions: [{ ...row, view }] }));
+		await Bun.write(
+			path.join(h.dataDir, "catalog.json"),
+			JSON.stringify({ ...catalog, sessions: [{ ...row, view }] }),
+		);
 		await expect(h.restart()).rejects.toThrow();
 		const persisted = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
 		expect(persisted.sessions[0].view).toEqual(view);

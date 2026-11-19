@@ -171,7 +171,10 @@ async function launchFinalView({
 					: {}),
 				model,
 				extensions: onSessionStart
-					? [...extensions, extension => extension.on("session_start", (_event, context) => onSessionStart(context))]
+					? [
+							...extensions,
+							extension => extension.on("session_start", (_event, context) => onSessionStart(context)),
+						]
 					: extensions,
 				systemPrompt: ["Test"],
 				toolNames: [],

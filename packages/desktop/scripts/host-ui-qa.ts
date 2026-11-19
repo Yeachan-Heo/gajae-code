@@ -407,7 +407,11 @@ try {
 			...(sessionId
 				? {
 						session: await observeFixtureSession(
-							fixtureLayout(ownedRoot), fixture.baseUrl, fixture.providerToken, sessionId, host.pid,
+							fixtureLayout(ownedRoot),
+							fixture.baseUrl,
+							fixture.providerToken,
+							sessionId,
+							host.pid,
 						),
 					}
 				: {}),
@@ -554,8 +558,10 @@ try {
 					if (url.pathname === "/fixture/host-status" || url.pathname === "/fixture/cold-restart") {
 						const value = JSON.parse(text) as { sessionId?: unknown };
 						if (
-							!value || Object.keys(value).length !== 1 ||
-							typeof value.sessionId !== "string" || !/^[a-f0-9-]{36}$/.test(value.sessionId)
+							!value ||
+							Object.keys(value).length !== 1 ||
+							typeof value.sessionId !== "string" ||
+							!/^[a-f0-9-]{36}$/.test(value.sessionId)
 						)
 							return reply("Invalid fixture session control", 400);
 						if (url.pathname === "/fixture/host-status")
@@ -581,12 +587,14 @@ try {
 							await hostDiagnostics?.wait(1000);
 							gateControl = undefined;
 							await launchHost();
-							return reply(JSON.stringify({
-								before,
-								after: await hostStatus(),
-								terminated: { pid: previous.pid, exitCode, signal: previous.signalCode },
-								requiresBootstrap: true,
-							}));
+							return reply(
+								JSON.stringify({
+									before,
+									after: await hostStatus(),
+									terminated: { pid: previous.pid, exitCode, signal: previous.signalCode },
+									requiresBootstrap: true,
+								}),
+							);
 						} catch (error) {
 							if (killed) {
 								process.exitCode = 1;

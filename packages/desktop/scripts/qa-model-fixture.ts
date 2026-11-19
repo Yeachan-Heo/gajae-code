@@ -330,9 +330,8 @@ export async function observeFixtureSession(
 	const session = catalog.sessions.find(entry => entry.id === catalogSessionId);
 	if (!session || !catalog.projects.some(entry => entry.id === session.projectId && entry.path === layout.project))
 		throw new Error("Unknown fixture session");
-	const transcriptRoot = session.scope === "managed"
-		? path.join(layout.agentDir, "sessions")
-		: path.join(layout.dataDir, "sessions");
+	const transcriptRoot =
+		session.scope === "managed" ? path.join(layout.agentDir, "sessions") : path.join(layout.dataDir, "sessions");
 	const transcriptFile = path.resolve(transcriptRoot, session.file);
 	if (
 		!transcriptFile.startsWith(`${transcriptRoot}${path.sep}`) ||

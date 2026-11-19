@@ -1,11 +1,6 @@
 import { expect, test } from "bun:test";
 import * as path from "node:path";
-import type {
-	DesktopFrame,
-	DesktopMethod,
-	DesktopSession,
-	DesktopSnapshot,
-} from "@gajae-code/desktop-host/protocol";
+import type { DesktopFrame, DesktopMethod, DesktopSession, DesktopSnapshot } from "@gajae-code/desktop-host/protocol";
 import type { FixtureSessionObservation, FixtureSnapshot } from "../scripts/qa-model-fixture";
 
 interface WrapperConfig {
@@ -96,12 +91,13 @@ async function wrapper() {
 		const query = new URLSearchParams({ token: config.token, client: crypto.randomUUID() });
 		const origin = "http://127.0.0.1:1420";
 		const route = (name: string) => `${config.serverUrl}${name}?${query}`;
-		const post = (name: string, body: unknown) => fetch(route(name), {
-			method: "POST",
-			headers: { Origin: origin, "Content-Type": "application/json" },
-			body: JSON.stringify(body),
-			signal: AbortSignal.timeout(45000),
-		});
+		const post = (name: string, body: unknown) =>
+			fetch(route(name), {
+				method: "POST",
+				headers: { Origin: origin, "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+				signal: AbortSignal.timeout(45000),
+			});
 		const frames: DesktopFrame[] = [];
 		const connect = async () => {
 			const events = await fetch(route("/events"), { headers: { Origin: origin }, signal: connection.signal });
@@ -169,13 +165,26 @@ test("authenticated fixture cold restart replaces the host process on the same o
 	try {
 		const sessionId = crypto.randomUUID();
 		expect((await qa.post("/fixture/cold-restart", { sessionId })).status).toBe(409);
-		expect((await fetch(qa.route("/fixture/cold-restart"), { headers: { Origin: "http://127.0.0.1:1420" } })).status).toBe(405);
-		expect((await fetch(qa.route("/fixture/cold-restart"), {
-			method: "POST", headers: { Origin: "http://external.invalid", "Content-Type": "application/json" }, body: "{}",
-		})).status).toBe(403);
-		expect((await fetch(`${qa.config.serverUrl}/fixture/cold-restart`, {
-			method: "POST", headers: { Origin: "http://127.0.0.1:1420" },
-		})).status).toBe(401);
+		expect(
+			(await fetch(qa.route("/fixture/cold-restart"), { headers: { Origin: "http://127.0.0.1:1420" } })).status,
+		).toBe(405);
+		expect(
+			(
+				await fetch(qa.route("/fixture/cold-restart"), {
+					method: "POST",
+					headers: { Origin: "http://external.invalid", "Content-Type": "application/json" },
+					body: "{}",
+				})
+			).status,
+		).toBe(403);
+		expect(
+			(
+				await fetch(`${qa.config.serverUrl}/fixture/cold-restart`, {
+					method: "POST",
+					headers: { Origin: "http://127.0.0.1:1420" },
+				})
+			).status,
+		).toBe(401);
 		await qa.connect();
 		for (const extra of [{ root: "/tmp/nonowned" }, { dataDir: "/tmp/nonowned" }, { key: "real-secret" }])
 			expect((await qa.post("/fixture/cold-restart", { sessionId, ...extra })).status).toBe(400);
@@ -191,7 +200,7 @@ test("authenticated fixture cold restart replaces the host process on the same o
 		void firstTurn.catch(() => {});
 		const firstDeadline = Date.now() + 30000;
 		while (true) {
-			const snapshot = await (await qa.post("/fixture/status", {})).json() as FixtureSnapshot;
+			const snapshot = (await (await qa.post("/fixture/status", {})).json()) as FixtureSnapshot;
 			if (snapshot.requests.length === 1) break;
 			if (Date.now() > firstDeadline) throw new Error("No pre-restart provider request");
 			await Bun.sleep(10);
@@ -203,7 +212,7 @@ test("authenticated fixture cold restart replaces the host process on the same o
 		expect(before.session?.selectedLeafId).not.toBe(initial.session?.selectedLeafId);
 		const restarted = await qa.post("/fixture/cold-restart", { sessionId: seeded.id });
 		expect(restarted.status).toBe(200);
-		const receipt = await restarted.json() as {
+		const receipt = (await restarted.json()) as {
 			before: HostStatus;
 			after: HostStatus;
 			terminated: { pid: number; signal: string; exitCode: number };
@@ -233,7 +242,7 @@ test("authenticated fixture cold restart replaces the host process on the same o
 		let fixture: FixtureSnapshot | undefined;
 		const deadline = Date.now() + 30000;
 		do {
-			fixture = await (await qa.post("/fixture/status", {})).json() as FixtureSnapshot;
+			fixture = (await (await qa.post("/fixture/status", {})).json()) as FixtureSnapshot;
 			if (fixture.requests.length === 2) break;
 			await Bun.sleep(10);
 		} while (Date.now() <= deadline);

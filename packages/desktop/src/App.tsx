@@ -1163,8 +1163,12 @@ export default function App() {
 					.find(item => item.dataset.transcriptMessage === position.anchor?.id)
 					?.querySelector<HTMLElement>(".message");
 				if (anchor && anchor.getBoundingClientRect().height > 0)
-					top = node.scrollTop + anchor.getBoundingClientRect().top
-						- node.getBoundingClientRect().top - node.clientTop - position.anchor.offset;
+					top =
+						node.scrollTop +
+						anchor.getBoundingClientRect().top -
+						node.getBoundingClientRect().top -
+						node.clientTop -
+						position.anchor.offset;
 			}
 			if (Math.abs(node.scrollTop - top) > 0.5) node.scrollTop = top;
 			appliedTop = node.scrollTop;
@@ -1192,13 +1196,17 @@ export default function App() {
 				// A shrink can clamp scrollTop before ResizeObserver runs. Growth cannot
 				// clamp it upward, so retain a reader's upward movement even when streamed
 				// content arrives before the browser delivers that scroll event.
-				const upwardDuringGrowth = node.scrollTop < appliedTop && node.scrollHeight > contentHeight
-					&& node.clientHeight === viewportHeight && node.clientWidth === viewportWidth;
-				if (!upwardDuringGrowth && (
-					node.scrollHeight !== contentHeight ||
-					node.clientHeight !== viewportHeight ||
-					node.clientWidth !== viewportWidth
-				)) {
+				const upwardDuringGrowth =
+					node.scrollTop < appliedTop &&
+					node.scrollHeight > contentHeight &&
+					node.clientHeight === viewportHeight &&
+					node.clientWidth === viewportWidth;
+				if (
+					!upwardDuringGrowth &&
+					(node.scrollHeight !== contentHeight ||
+						node.clientHeight !== viewportHeight ||
+						node.clientWidth !== viewportWidth)
+				) {
 					schedule();
 					return;
 				}
