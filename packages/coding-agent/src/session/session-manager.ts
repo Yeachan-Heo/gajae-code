@@ -17895,7 +17895,7 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return undefined;
 		const fail = (): SessionEntry | undefined => {
-			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			this.#ensurePublicationHotView(true);
 			return this.#byId.get(id);
 		};
 		const index = this.#findColdEntryIndex(id);
@@ -18207,8 +18207,7 @@ export class SessionManager {
 			this.destination.kind === "managed" ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
 	}
 
-	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
-		const leafId = this.#leafId;
+	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime, leafId: string | null): void {
 		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
 		const transcriptSize = this.#storage.statSync(this.#sessionFile).size;
 		if (transcriptSize > eagerHydrationMaxBytes())
@@ -18258,30 +18257,33 @@ export class SessionManager {
 		this.#ensurePublicationHotView();
 	}
 
-	#ensureFullHotViewFromCommitted(): void {
+	#ensureFullHotViewFromCommitted(leafId: string | null, authoritativeOnly: boolean): void {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return;
-		const leafId = this.#leafId;
+		if (authoritativeOnly) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime, leafId);
+			return;
+		}
 		if (this.#sessionFile && this.#storage.statSync(this.#sessionFile).size > eagerHydrationMaxBytes())
 			throw new Error("cold_sidecar_rebuild_required_for_bounded_transcript");
 		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
-			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			this.#hydrateAuthoritativeTranscriptSync(runtime, leafId);
 			return;
 		}
 		if (this.#sessionFile && this.#statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
-			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			this.#hydrateAuthoritativeTranscriptSync(runtime, leafId);
 			return;
 		}
 		let records: Array<ColdEntryIndex & { id: string }>;
 		try {
 			records = this.#readAllColdEntryIndexes();
 		} catch {
-			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			this.#hydrateAuthoritativeTranscriptSync(runtime, leafId);
 			return;
 		}
 		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
 		if (!header) {
-			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			this.#hydrateAuthoritativeTranscriptSync(runtime, leafId);
 			return;
 		}
 		try {
@@ -18318,7 +18320,7 @@ export class SessionManager {
 			this.#commitResidentTextStoreTransition(transition, false);
 			this.#clearColdRuntimeAfterHydration(runtime);
 		} catch {
-			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			this.#hydrateAuthoritativeTranscriptSync(runtime, leafId);
 		}
 	}
 
@@ -19015,17 +19017,26 @@ export class SessionManager {
 	}
 
 	/** Cold indexes contain committed entries, not a frozen manager's staged suffix. */
-	#ensurePublicationHotView(): void {
+	#ensurePublicationHotView(authoritativeOnly = false): void {
 		if (!this.#sidecarRuntime?.enabled || this.#heldPublicationEntries.size === 0) {
-			this.#ensureFullHotViewFromCommitted();
+			this.#ensureFullHotViewFromCommitted(this.#leafId, authoritativeOnly);
 			return;
 		}
 		const leafId = this.#leafId;
 		const labelsById = this.#labelsById;
 		const usageStatistics = this.#usageStatistics;
 		const heldSources = this.#fileEntries.filter(entry => this.#heldPublicationEntries.has(entry.id));
+		// The committed transition can validate only the ancestor on disk.
+		// Restore the exact staged selection after reattaching the held entries.
+		let committedLeaf = leafId;
+		let remaining = heldSources.length;
+		while (committedLeaf !== null && this.#heldPublicationEntries.has(committedLeaf)) {
+			const entry = this.#byId.get(committedLeaf);
+			if (!entry || --remaining < 0) throw new Error("cold_transcript_selected_leaf_missing");
+			committedLeaf = entry.parentId;
+		}
 		const held = materializeResidentEntriesSync(heldSources, this.#residentBlobStores(), "throw");
-		this.#ensureFullHotViewFromCommitted();
+		this.#ensureFullHotViewFromCommitted(committedLeaf, authoritativeOnly);
 		for (let index = 0; index < held.length; index++) {
 			const entry = held[index]!;
 			if (entry.type === "session" || this.#byId.has(entry.id)) continue;

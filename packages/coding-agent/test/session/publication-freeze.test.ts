@@ -284,7 +284,10 @@ describe("manager-local reversible publication freeze", () => {
 		expect(fs.readFileSync(file, "utf8").split("\n")).toContain(preparedJson!);
 	});
 
-	it("keeps held resident references and the cursor intact across cold-view materialization", async () => {
+	it.each([
+		"export",
+		"missing entry lookup",
+	] as const)("keeps held resident references and the cursor intact across cold-view materialization by %s", async operation => {
 		const { manager, storage, file } = await fixture();
 		manager.appendMessage({ role: "user", content: "cold ".repeat(40_000), timestamp: 2 });
 		const kept = manager.appendMessage({ role: "user", content: "kept", timestamp: 3 });
@@ -299,6 +302,7 @@ describe("manager-local reversible publication freeze", () => {
 		try {
 			first = manager.appendMessage({ role: "user", content: "held ".repeat(24_000), timestamp: 4 });
 			second = manager.appendCustomEntry("last", {});
+			if (operation === "missing entry lookup") expect(manager.getEntry("absent-entry")).toBeUndefined();
 			const entries = manager.getEntriesForExport();
 			expect(entries.slice(-2).map(entry => entry.id)).toEqual([first, second]);
 			expect(manager.getLeafId()).toBe(second);
