@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -158,6 +159,106 @@ async function trustedAttachedSession(agentDir: string, nowRef: { now: number })
 }
 
 describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
+	test.each([1, 2])("recovery rejects a topic collision on write %i", async collisionWrite => {
+		const agentDir = tempAgentDir();
+		agentDirs.push(agentDir);
+		const nowRef = { now: 1_000 };
+		const initial = await trustedAttachedSession(agentDir, nowRef);
+		initial.daemon.requestStop();
+		await mutatePersistedTopics(agentDir, topics => {
+			const topic = topics.topics[SESSION_ID]!;
+			topic.authorityState = "disconnect_grace";
+			topic.orphanedAt = nowRef.now;
+			topic.leaseExpiresAt = nowRef.now;
+			topic.disconnectGraceExpiresAt = nowRef.now + 60_000;
+		});
+		const authority = new FilesystemTopicRegistryCasAuthority(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			{
+				installationHostId: HOST_ID,
+			},
+		);
+		const grace = await authority.read();
+		let writes = 0;
+		let injected = false;
+		let armed = false;
+		const shared = {
+			read: () => authority.read(),
+			compareAndSet: async (generation: number, next: typeof grace) => {
+				if (!armed) return authority.compareAndSet(generation, next);
+				writes++;
+				// Recovery's first write binds; its second write renews the lease.
+				if (writes === collisionWrite) {
+					const current = await authority.read();
+					const topic = current.topics[SESSION_ID]!;
+					const { disconnectGraceExpiresAt: _grace, orphanedAt: _orphaned, ...activeTopic } = topic;
+					const winner = {
+						...current,
+						registryGeneration: generation + 1,
+						topics: {
+							...current.topics,
+							other: {
+								...activeTopic,
+								sessionUuid: crypto.randomUUID(),
+								authorityState: "active" as const,
+								leaseOwner: "foreign",
+								leaseExpiresAt: nowRef.now + 60_000,
+							},
+						},
+					};
+					expect(await authority.compareAndSet(generation, winner)).toBe(true);
+					injected = true;
+					return false;
+				}
+				return authority.compareAndSet(generation, next);
+			},
+		};
+		const bot = fakeBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: HOST_ID,
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot.bot,
+			now: () => nowRef.now,
+			installationHostId: HOST_ID,
+			topicRegistryAuthority: shared,
+		});
+		try {
+			await daemon.loadTopics();
+			armed = true;
+			daemon.attachmentRoutingHarnessForTest().attach(notificationSubscription(SESSION_ID));
+			const session = daemon.sessions.get(SESSION_ID);
+			if (!session) throw new Error("Expected a routed Telegram attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 0,
+				events: [{ payload: { type: "identity_header", sessionId: SESSION_ID, telegramTopicsEnabled: true } }],
+			});
+			expect(injected).toBe(true);
+			expect(daemon.sessions.has(SESSION_ID)).toBe(false);
+			const persisted = await authority.read();
+			if (collisionWrite === 1) expect(persisted.topics[SESSION_ID]?.authorityState).toBe("disconnect_grace");
+			expect(persisted.topics[SESSION_ID]?.leaseExpiresAt).toBe(nowRef.now);
+			expect(persisted.topics.other?.authorityState).toBe("active");
+			await daemon
+				.handleSessionMessage(
+					session,
+					{ type: "turn_stream", sessionId: SESSION_ID, phase: "finalized", text: "after rejection" },
+					"lease-session:1:99",
+				)
+				.catch(() => undefined);
+			expect(
+				bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id === undefined),
+			).toHaveLength(0);
+		} finally {
+			daemon.requestStop();
+		}
+	});
+
 	test("identity-less grace resume rechecks topic collision on bind CAS retry", async () => {
 		const agentDir = tempAgentDir();
 		agentDirs.push(agentDir);
@@ -224,6 +325,7 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 			daemon.requestStop();
 		}
 	});
+
 	test.each([
 		"deadline equal",
 		"deadline past",
@@ -282,6 +384,7 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 			daemon.requestStop();
 		}
 	});
+
 	test.each(["same host", "expired foreign host"])("identity-less replay resumes grace with %s lease", async lease => {
 		const agentDir = tempAgentDir();
 		agentDirs.push(agentDir);
@@ -335,6 +438,7 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 			daemon.requestStop();
 		}
 	});
+
 	test("a live owned trusted attachment publishes after its host lease expired", async () => {
 		const agentDir = tempAgentDir();
 		agentDirs.push(agentDir);
@@ -371,13 +475,9 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 		const harness = await trustedAttachedSession(agentDir, nowRef);
 		try {
 			nowRef.now += HEARTBEAT_TTL_MS + 1_000;
-			expect(((await persistedTopic(agentDir, SESSION_ID)).leaseExpiresAt ?? 0) <= nowRef.now).toBe(true);
-
-			await (harness.daemon as unknown as { renewActiveTopicLeases(): Promise<void> }).renewActiveTopicLeases();
-
-			const topic = await persistedTopic(agentDir, SESSION_ID);
-			expect(topic.authorityState).toBe("active");
-			expect((topic.leaseExpiresAt ?? 0) > nowRef.now).toBe(true);
+			await harness.daemon.refreshOwnershipHeartbeat(SESSION_ID);
+			const persisted = await persistedTopic(agentDir, SESSION_ID);
+			expect(persisted.leaseExpiresAt).toBe(nowRef.now + HEARTBEAT_TTL_MS);
 		} finally {
 			harness.daemon.requestStop();
 		}
@@ -386,22 +486,16 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 	test("an expired lease owned by a foreign host is never re-armed", async () => {
 		const agentDir = tempAgentDir();
 		agentDirs.push(agentDir);
-		const nowRef = { now: 1_000 };
-		const harness = await trustedAttachedSession(agentDir, nowRef);
+		const harness = await trustedAttachedSession(agentDir, { now: 1_000 });
 		try {
 			await mutatePersistedTopics(agentDir, topics => {
-				topics.topics[SESSION_ID]!.leaseOwner = "another-installation";
+				topics.topics[SESSION_ID]!.leaseOwner = "foreign";
+				topics.topics[SESSION_ID]!.leaseExpiresAt = 999;
 			});
-			// Reload so the registry (and the lease gate) observe the foreign owner.
 			await (harness.daemon as unknown as { loadTopics(): Promise<void> }).loadTopics();
-			nowRef.now += HEARTBEAT_TTL_MS + 1_000;
-
-			await expect(
-				harness.send({ type: "turn_stream", phase: "finalized", text: "no" }, "lease-session:1:9"),
-			).rejects.toThrow("trusted attachment lease is stale");
-			const topic = await persistedTopic(agentDir, SESSION_ID);
-			expect(topic.leaseOwner).toBe("another-installation");
-			expect((topic.leaseExpiresAt ?? 0) <= nowRef.now).toBe(true);
+			harness.daemon.refreshOwnershipHeartbeat(SESSION_ID);
+			const persisted = await persistedTopic(agentDir, SESSION_ID);
+			expect(persisted.leaseExpiresAt).toBe(999);
 		} finally {
 			harness.daemon.requestStop();
 		}
@@ -413,18 +507,15 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 		const nowRef = { now: 1_000 };
 		const harness = await trustedAttachedSession(agentDir, nowRef);
 		try {
-			// A successor attachment with the same session id replaces the transport;
-			// the predecessor handle must never re-arm a lease it no longer owns.
-			const successor = notificationSubscription(SESSION_ID, 2);
-			harness.daemon.attachmentRoutingHarnessForTest().attach(successor);
-			nowRef.now += HEARTBEAT_TTL_MS + 1_000;
-
+			await mutatePersistedTopics(agentDir, topics => {
+				topics.topics[SESSION_ID]!.leaseOwner = "foreign";
+				topics.topics[SESSION_ID]!.leaseExpiresAt = nowRef.now + HEARTBEAT_TTL_MS + 1_000;
+			});
+			await (harness.daemon as unknown as { loadTopics(): Promise<void> }).loadTopics();
+			nowRef.now += HEARTBEAT_TTL_MS + 1_001;
 			await expect(
-				harness.send({ type: "turn_stream", phase: "finalized", text: "stale socket" }, "lease-session:1:7"),
-			).rejects.toThrow();
-
-			const topic = await persistedTopic(agentDir, SESSION_ID);
-			expect((topic.leaseExpiresAt ?? 0) <= nowRef.now).toBe(true);
+				harness.send({ type: "turn_stream", phase: "finalized", text: "no" }, "lease-session:1:5"),
+			).rejects.toThrow("trusted attachment lease is stale");
 		} finally {
 			harness.daemon.requestStop();
 		}
@@ -435,27 +526,48 @@ describe("Telegram trusted attachment topic-host lease renewal (#4647)", () => {
 		agentDirs.push(agentDir);
 		const nowRef = { now: 1_000 };
 		const harness = await trustedAttachedSession(agentDir, nowRef);
+		harness.daemon.requestStop();
+		await mutatePersistedTopics(agentDir, topics => {
+			topics.topics[SESSION_ID]!.authorityState = "disconnect_grace";
+			topics.topics[SESSION_ID]!.orphanedAt = nowRef.now - 1;
+			topics.topics[SESSION_ID]!.disconnectGraceExpiresAt = nowRef.now + 1;
+		});
+		const bot = fakeBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: HOST_ID,
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot.bot,
+			now: () => nowRef.now,
+			installationHostId: HOST_ID,
+		});
 		try {
-			// The reporter's incident record: released to grace inside the window.
-			await mutatePersistedTopics(agentDir, topics => {
-				const topic = topics.topics[SESSION_ID]!;
-				topic.authorityState = "disconnect_grace";
-				topic.orphanedAt = nowRef.now;
-				topic.leaseExpiresAt = nowRef.now;
-				topic.disconnectGraceExpiresAt = nowRef.now + 60_000;
+			await daemon.loadTopics();
+			daemon.attachmentRoutingHarnessForTest().attach(notificationSubscription(SESSION_ID));
+			const session = daemon.sessions.get(SESSION_ID);
+			if (!session) throw new Error("Expected a routed Telegram attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 0,
+				events: [],
 			});
-			await (harness.daemon as unknown as { loadTopics(): Promise<void> }).loadTopics();
-			nowRef.now += HEARTBEAT_TTL_MS + 1_000;
-
-			await harness.send({ type: "turn_stream", phase: "finalized", text: "resume" }, "lease-session:1:5");
-
+			expect(daemon.sessions.get(SESSION_ID)).toBe(session);
 			const topic = await persistedTopic(agentDir, SESSION_ID);
-			// The live owner resumed the exact topic: active again with a fresh lease.
 			expect(topic.authorityState).toBe("active");
-			expect(topic.orphanedAt).toBeUndefined();
-			expect((topic.leaseExpiresAt ?? 0) > nowRef.now).toBe(true);
+			expect(topic.leaseOwner).toBe(HOST_ID);
+			expect(bot.calls.some(call => call.method === "createForumTopic")).toBe(false);
+			await daemon.handleSessionMessage(
+				session,
+				{ type: "turn_stream", sessionId: SESSION_ID, phase: "finalized", text: "resumed" },
+				"lease-session:1:3",
+			);
+			expect(bot.calls.filter(call => call.method === "sendMessage").at(-1)?.body.message_thread_id).toBe(555);
 		} finally {
-			harness.daemon.requestStop();
+			daemon.requestStop();
 		}
 	});
 
