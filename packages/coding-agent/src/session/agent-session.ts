@@ -15327,14 +15327,15 @@ export class AgentSession {
 			(catalog
 				? catalog.isCurrent()
 				: validToolNames.every((name, index) => this.#toolRegistry.get(name) === tools[index]));
-		const promoteCatalog = () => {
+		const promoteCatalog = (publishesPrompt: boolean) => {
 			if (!catalog) return;
 			// Keep the live map identity shared with the SDK's tool contexts.
 			this.#toolRegistry.clear();
 			for (const [name, tool] of registry) this.#toolRegistry.set(name, tool);
 			this.#mandatoryMCPToolNames = mandatory;
 			this.#setDiscoverableMCPTools(discoverable);
-			this.#reserveBaseSystemPromptGeneration();
+			// Replacing equivalent tool objects does not supersede an independent prompt rebuild.
+			if (publishesPrompt) this.#reserveBaseSystemPromptGeneration();
 		};
 		const onToolsPublished = () => {
 			options?.fence?.onToolsApplied();
@@ -15387,7 +15388,7 @@ export class AgentSession {
 				this.#resolveEffectiveDiscoveryMode() === "all" &&
 				!this.#selectedMCPToolNamesMatch(previousSelectedDiscoveredBuiltinToolNames, selectedBuiltinNames);
 			const promote = () => {
-				promoteCatalog();
+				promoteCatalog(builtPrompt !== undefined);
 				if (builtPrompt) {
 					this.#baseSystemPrompt = builtPrompt;
 					this.agent.setSystemPrompt(builtPrompt);
@@ -15503,7 +15504,7 @@ export class AgentSession {
 			assertControlMutationAllowed();
 			this.sessionManager.appendMCPToolSelection(explicitMCPNamesToPersist);
 		}
-		promoteCatalog();
+		promoteCatalog(builtPrompt !== undefined);
 		if (builtPrompt) {
 			this.#baseSystemPrompt = builtPrompt;
 			this.agent.setSystemPrompt(builtPrompt);

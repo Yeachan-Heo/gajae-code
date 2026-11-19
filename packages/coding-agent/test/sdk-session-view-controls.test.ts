@@ -1418,6 +1418,36 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
+	it("keeps an independent prompt rebuild across an equivalent MCP replacement", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const previousTool = session.agent.state.tools[0];
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let builds = 0;
+		rebuild = async () => {
+			if (++builds === 1) {
+				entered.resolve();
+				await release.promise;
+			}
+			return { systemPrompt: ["independent refresh"] };
+		};
+		const pending = session.refreshBaseSystemPrompt();
+		try {
+			await entered.promise;
+			await session.refreshMCPTools([{ ...lookupTool }], { persistMCPSelection: false });
+			expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+			expect(session.agent.state.tools[0]).not.toBe(previousTool);
+			expect(builds).toBe(1);
+			release.resolve();
+			await pending;
+			expect(session.systemPrompt).toEqual(["independent refresh"]);
+		} finally {
+			release.resolve();
+			await pending;
+		}
+	});
+
 	it("rejects in-place history mutation instead of overwriting it", async () => {
 		const { old } = await seedMcpBranches();
 		const entered = Promise.withResolvers<void>();
