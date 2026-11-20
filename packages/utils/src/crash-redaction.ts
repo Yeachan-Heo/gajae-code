@@ -62,7 +62,7 @@ function createCredentialRedactionRules(keyLabels: string, camelSimpleSuffixes: 
 	const camelAssignmentPrefix = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:${camelKeyPattern})(?:\\*["'\x60]?\s*[=:]\s*))`;
 	const whitespaceFollowingFieldPattern = String.raw`[ \t]+(?:${keyLabels}|(?<!(?:^|[^A-Za-z0-9_.=:-])${CREDENTIAL_COMPOUND_FIELD_PREFIX}[ \t])[A-Za-z][A-Za-z0-9_.-]{0,127})[ \t]*[=:]`;
 	const followingFieldPattern = String.raw`(?:[,;][ \t]*[A-Za-z][A-Za-z0-9_. \t-]{0,127}[ \t]*[=:]|${whitespaceFollowingFieldPattern})`;
-	const unquotedValuePatternBody = String.raw`(?:(?!\\+n|\\+r\\+n|${followingFieldPattern})(?:\\[^\r\n]|[^\s"'\x60}\]]))(?:(?!\\+n|\\+r\\+n|${followingFieldPattern})(?:\\[^\r\n]|[^\r\n"'}\]]))*`;
+	const unquotedValuePatternBody = String.raw`(?:(?!\+n|\+r\+n|${followingFieldPattern})(?:\\[^\r\n]|[^\s"'\x60}\][{]))(?:(?!\+n|\+r\+n|${followingFieldPattern})(?:\\[^\r\n]|[^\r\n"'}\][{]))*`;
 	const valuePatternBody = String.raw`(?:(\\+")((?:\\[^\r\n]|[^"\\\r\n])*?)(\\+")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[^\r\n]|[^"\\\r\n])*)(")${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+')((?:\\[^\r\n]|[^'\\\r\n])*?)(\\+')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[^\r\n]|[^'\\\r\n])*)(')${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\x60)((?:\\[^\r\n]|[^\x60\\\r\n])*)(\x60)${CREDENTIAL_QUOTED_ADJACENT_SUFFIX_PATTERN}${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${unquotedValuePatternBody}))`;
 	return {
 		keySuffix: new RegExp(`^${keyPattern}$`, "i"),
@@ -293,6 +293,9 @@ function defaultPlaceholderHook(_matchedText: string, placeholder: string): stri
  * This ensures line count and structure are preserved for diff scrubbing.
  */
 function linePreservingPlaceholderHook(matchedText: string, placeholder: string): string {
+	const isDebug = matchedText.includes("secret") || matchedText.includes("canary");
+	if (isDebug)
+		console.error("[HOOK] matchedText:", JSON.stringify(matchedText), "lines:", matchedText.split("\n").length);
 	const lines = matchedText.split("\n");
 	if (lines.length === 1) {
 		// Single line: use placeholder
@@ -302,13 +305,25 @@ function linePreservingPlaceholderHook(matchedText: string, placeholder: string)
 	// Multi-line: preserve structure
 	const result: string[] = [];
 
-	// First line: keep verbatim if only brackets/whitespace, else use placeholder
+	// First line: keep verbatim if only brackets/whitespace, or if it ends with an opening bracket
 	const firstLine = lines[0];
+	if (isDebug)
+		console.error(
+			"[HOOK] firstLine:",
+			JSON.stringify(firstLine),
+			"matches bracket pattern:",
+			/[\[{][ \t]*$/.test(firstLine),
+		);
 	if (/^[\s\[\]{},]*$/.test(firstLine)) {
 		// Only brackets/whitespace/commas: keep as-is
 		result.push(firstLine);
+	} else if (/[\[{][ \t]*$/.test(firstLine)) {
+		// Ends with an opening bracket: preserve the line as-is to maintain bracket structure
+		if (isDebug) console.error("[HOOK] preserving bracket line");
+		result.push(firstLine);
 	} else {
 		// Has content: use placeholder
+		if (isDebug) console.error("[HOOK] replacing with placeholder");
 		result.push(placeholder);
 	}
 
@@ -338,7 +353,9 @@ function linePreservingPlaceholderHook(matchedText: string, placeholder: string)
 		);
 	}
 
-	return result.join("\n");
+	const returnValue = result.join("\n");
+	if (isDebug) console.error("[HOOK] returning:", JSON.stringify(returnValue));
+	return returnValue;
 }
 
 /**
@@ -391,19 +408,26 @@ export function redactCrashSecretsPreservingLines(text: string): string {
  * Internal version of redactCrashSecretsWithRules that preserves line counts.
  */
 function redactCrashSecretsWithRulesPreservingLines(text: string, rules: CredentialRedactionRules): string {
+	const isDebug = text.includes("secret");
 	// Redact folded headers first (already works line-by-line)
 	let redacted = redactFoldedHeaders(text, rules);
+	if (isDebug) console.error("[PRESERVE] after redactFoldedHeaders:", JSON.stringify(redacted.slice(0, 100)));
 	// Then container redaction with line-preserving hook
 	redacted = redactCredentialContainers(redacted, rules, linePreservingPlaceholderHook);
+	if (isDebug) console.error("[PRESERVE] after redactCredentialContainers:", JSON.stringify(redacted.slice(0, 100)));
 	// Block scalar bodies (already works line-by-line, preserving structure)
 	redacted = redactYamlBlockScalars(redacted, rules);
+	if (isDebug) console.error("[PRESERVE] after redactYamlBlockScalars:", JSON.stringify(redacted.slice(0, 100)));
 
 	// All remaining replaces use the line-preserving wrapper
+	const before1 = redacted;
 	redacted = replacePreservingLines(
 		redacted,
 		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
 		"«redacted-auth»",
 	);
+	if (isDebug && before1.includes("[") && !redacted.includes("["))
+		console.error("[PRESERVE] Bearer pattern removed bracket");
 	redacted = replacePreservingLines(
 		redacted,
 		/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
@@ -463,7 +487,10 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 			rules.escapedBacktickUnclosedPattern,
 			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
 		);
+		const before_valuePattern = redacted;
 		redacted = replacePreservingLines(redacted, rules.valuePattern, redactCredentialValue);
+		if (isDebug && before_valuePattern.includes("[") && !redacted.includes("["))
+			console.error("[PRESERVE] valuePattern removed bracket:", JSON.stringify(redacted.slice(0, 100)));
 	}
 	if (rules.camelAssignmentCandidatePattern.test(redacted)) {
 		redacted = replacePreservingLines(
@@ -494,6 +521,7 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 		/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{0,39}[/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g,
 		"«redacted-aws-key»",
 	);
+	if (isDebug) console.error("[PRESERVE] final return:", JSON.stringify(redacted.slice(0, 100)));
 	return redacted;
 }
 
@@ -841,9 +869,13 @@ function redactCredentialContainersWithPattern(
 	assignment: RegExp,
 	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
 ): string {
+	const isDebugPattern = text.includes("secret") || text.includes("redacted");
+	if (isDebugPattern) console.error("[PATTERN] Starting with text:", JSON.stringify(text.slice(0, 100)));
 	let output = "";
 	let copiedUntil = 0;
+	let matchCount = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
+		matchCount++;
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
 
@@ -873,12 +905,29 @@ function redactCredentialContainersWithPattern(
 		}
 		// Use hook to generate placeholder, handling multi-line content appropriately
 		const containerContent = text.slice(containerStart, containerEnd);
+		const isDebugSub = containerContent.includes("canary");
+		if (isDebugSub)
+			console.error(
+				"[SUB] containerStart:",
+				containerStart,
+				"containerEnd:",
+				containerEnd,
+				"beforeText:",
+				JSON.stringify(text.slice(copiedUntil, containerStart)),
+				"containerContent:",
+				JSON.stringify(containerContent),
+			);
 		const redactedPlaceholder = placeholderHook(containerContent, "«redacted»");
+		if (isDebugSub) console.error("[SUB] redactedPlaceholder:", JSON.stringify(redactedPlaceholder));
 		output += `${text.slice(copiedUntil, containerStart)}${redactedPlaceholder}`;
+		if (isDebugSub) console.error("[SUB] output so far:", JSON.stringify(output));
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}
-	return copiedUntil === 0 ? text : output + text.slice(copiedUntil);
+	const finalOutput = copiedUntil === 0 ? text : output + text.slice(copiedUntil);
+	if (isDebugPattern)
+		console.error("[PATTERN] matchCount:", matchCount, "finalOutput:", JSON.stringify(finalOutput.slice(0, 100)));
+	return finalOutput;
 }
 
 type EscapedQuoteDelimiter = { delimiter: "'" | '"' | "`"; backslashCount: number };

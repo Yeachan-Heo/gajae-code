@@ -548,8 +548,14 @@ function redactAccumulatedContentWithState(
 	// Join projections with newlines and redact them using line-preserving variant
 	const oldProjectionOriginal = oldProjectionLines.length === 0 ? "" : oldProjectionLines.join("\n");
 	const newProjectionOriginal = newProjectionLines.length === 0 ? "" : newProjectionLines.join("\n");
+	if (newProjectionOriginal.includes("secret")) {
+		console.error("[SCRUBBER] newProjectionOriginal:", JSON.stringify(newProjectionOriginal));
+	}
 	const oldProjectionRedacted = redactCrashSecretsPreservingLines(oldProjectionOriginal);
 	const newProjectionRedacted = redactCrashSecretsPreservingLines(newProjectionOriginal);
+	if (newProjectionOriginal.includes("secret")) {
+		console.error("[SCRUBBER] newProjectionRedacted:", JSON.stringify(newProjectionRedacted));
+	}
 
 	// Split back to lines by newline, but handle empty projections
 	const oldRedactedLines = oldProjectionRedacted === "" ? [] : oldProjectionRedacted.split("\n");
