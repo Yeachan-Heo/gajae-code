@@ -16,6 +16,9 @@ import type { BotApi } from "../src/sdk/bus/telegram-daemon";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { renderThreadedFrame, type ThreadedSend } from "../src/sdk/bus/threaded-render";
 import { TopicRegistry } from "../src/sdk/bus/topic-registry";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 // ===========================================================================
 // Pure helpers
@@ -308,7 +311,7 @@ describe("renderThreadedFrame draft marker (finalAnswer contract unchanged)", ()
 // ===========================================================================
 
 function tempAgentDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-rich-draft-test-"));
+	return trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-rich-draft-test-"));
 }
 
 function draftSettings(agentDir: string): Settings {

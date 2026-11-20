@@ -16,9 +16,12 @@ import { AgentDirSessionLifecycleClient } from "../src/sdk/lifecycle/broker-clie
 import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 async function makeTempRoot(prefix: string): Promise<string> {
-	return await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+	return await trackedTemp.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
 async function removeTempRoot(root: string): Promise<void> {

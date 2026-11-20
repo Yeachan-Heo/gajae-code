@@ -16,6 +16,9 @@ import {
 	releaseChatDaemonOwnership,
 } from "../src/sdk/bus/chat-daemon-control";
 import { setPrivateAgentDir, tempAgentDir } from "./helpers/daemon-control-fixture";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 function testChatProcessReference(signalRoot: (pid: number, value: NodeJS.Signals) => void) {
 	return (pid: number) => ({
@@ -26,7 +29,7 @@ function testChatProcessReference(signalRoot: (pid: number, value: NodeJS.Signal
 
 describe("ChatDaemonController ownership safety", () => {
 	test("does not signal a reused PID incarnation", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -77,7 +80,7 @@ describe("ChatDaemonController ownership safety", () => {
 		["slack", "EPERM", "operation not permitted"],
 		["slack", undefined, "probe authority unavailable"],
 	] as const)("treats %s %s liveness probes as an existing chat daemon owner", async (kind, code, message) => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const providerSettings =
 			kind === "discord"
 				? {
@@ -144,7 +147,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("refuses Darwin default TERM/KILL without opening the native numeric-PID signal path", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -189,7 +192,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("signals a stable chat reference when a numeric PID is reused immediately before TERM", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -255,7 +258,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("releases chat ownership only with live exact PID and incarnation provenance", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		const state = {
@@ -323,7 +326,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("settles repeated exact ownership releases deterministically within the existing bounded test contract", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		const state = {
@@ -363,7 +366,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("reports a live PID with a disconnected provider as stale", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -407,7 +410,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("attaches to a matching live owner without restarting it", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -455,7 +458,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("waits for a compatible mid-startup owner to become healthy instead of failing", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -510,7 +513,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("fails a compatible owner that never becomes healthy within the wait", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -560,7 +563,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("does not replace a live daemon with a different identity", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -611,7 +614,7 @@ describe("ChatDaemonController ownership safety", () => {
 	});
 
 	test("does not signal after the owner changes before TERM", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -710,7 +713,7 @@ describe("ChatDaemonController ownership safety", () => {
 		}
 
 		test("never spawns a complete provider whose durable desired intent is off", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const settings = configuredSettings(agentDir);
 			settings.set(`notifications.${kind}.enabled`, false);
 			let spawns = 0;
@@ -728,7 +731,7 @@ describe("ChatDaemonController ownership safety", () => {
 		});
 
 		test("acknowledges an update-recovery restart while globally disabled without spawning delivery", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const settings = configuredSettings(agentDir);
 			settings.set("notifications.enabled", false);
 			let spawns = 0;
@@ -750,7 +753,7 @@ describe("ChatDaemonController ownership safety", () => {
 			["legacy", undefined, "owner_spawned", "stale"],
 			["newer", chatDaemonGeneration(kind) + 1, "attached", "running"],
 		] as const)("%s generation replaces only compatible physical owners", async (_name, generation, expected, health) => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(
@@ -808,7 +811,7 @@ describe("ChatDaemonController ownership safety", () => {
 		});
 
 		test("attaches when a newer-generation owner becomes healthy during the wait", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			const state = {
@@ -850,7 +853,7 @@ describe("ChatDaemonController ownership safety", () => {
 			["generation", "1"],
 			["stoppedAt", "truthy-nonnumeric"],
 		] as const)("fails closed for malformed live state field: %s", async (field, value) => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			const state = {
@@ -888,7 +891,7 @@ describe("ChatDaemonController ownership safety", () => {
 		});
 
 		test("recovers only a dead pre-upgrade unavailable owner and replaces its lock", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(
@@ -943,7 +946,7 @@ describe("ChatDaemonController ownership safety", () => {
 		});
 
 		test("fails closed for a live pre-upgrade unavailable owner with ambiguous provenance", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			const legacyState = {
@@ -976,7 +979,7 @@ describe("ChatDaemonController ownership safety", () => {
 		});
 
 		test("fails closed without signaling a malformed generation", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(
@@ -1011,7 +1014,7 @@ describe("ChatDaemonController ownership safety", () => {
 			["non-number", "1", identity()],
 			["different identity", chatDaemonGeneration(kind), "other-identity"],
 		] as const)("fails closed for every public operation: %s", async (_name, generation, stateIdentity) => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(
@@ -1053,7 +1056,7 @@ describe("ChatDaemonController ownership safety", () => {
 			["ensure after dead different identity", "ensure", chatDaemonGeneration(kind), "other-identity", false],
 			["reload after stopped different identity", "reload", chatDaemonGeneration(kind), "other-identity", true],
 		] as const)("spawns fresh for %s persisted state", async (_name, action, generation, stateIdentity, stopped) => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(
@@ -1108,7 +1111,7 @@ describe("ChatDaemonController ownership safety", () => {
 			["lower", chatDaemonGeneration(kind) - 1, "stop"],
 			["lower", chatDaemonGeneration(kind) - 1, "reload"],
 		] as const)("signals matching unhealthy legacy owners for %s %s", async (_name, generation, action) => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(
@@ -1168,7 +1171,7 @@ describe("ChatDaemonController ownership safety", () => {
 			"stop",
 			"reload",
 		] as const)("refuses %s of a live newer owner without changing its state", async action => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			const state = {
@@ -1205,7 +1208,7 @@ describe("ChatDaemonController ownership safety", () => {
 		});
 
 		test("refuses replacement when the captured generation changes before TERM", async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const paths = chatDaemonPaths(agentDir, kind);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			const state = {
@@ -1247,7 +1250,7 @@ describe("ChatDaemonController ownership safety", () => {
 
 describe("Chat daemon owner-lock publication", () => {
 	test("a paused owner publisher cannot reclaim or overwrite a published contender", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -1293,7 +1296,7 @@ describe("Chat daemon owner-lock publication", () => {
 	});
 
 	test("fails closed without immutable process-incarnation authority", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		expect(
 			await acquireChatDaemonOwnership({
@@ -1311,7 +1314,7 @@ describe("Chat daemon owner-lock publication", () => {
 	});
 
 	test("recovers a dead recorded owner lock", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "slack");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 2_147_483_647, incarnation: "old", createdAt: 1 }));
@@ -1342,7 +1345,7 @@ describe("Chat daemon owner-lock publication", () => {
 	});
 
 	test("recovers a crashed reclaim owner with a reused PID incarnation", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		const crashedOwner = { pid: 91, incarnation: "linux:12348", createdAt: 1 };
@@ -1369,7 +1372,7 @@ describe("Chat daemon owner-lock publication", () => {
 	});
 
 	test("a completed reclaimer cannot delete a successor owner lock", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		const stale = JSON.stringify({ pid: 91, incarnation: "linux:stale", createdAt: 1 });
@@ -1404,7 +1407,7 @@ describe("Chat daemon owner-lock publication", () => {
 	});
 
 	test("does not steal a fresh reclaim lock owned by a live incarnation", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "slack");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 82, incarnation: "darwin:1700000000:999999", createdAt: 1 }));
@@ -1432,7 +1435,7 @@ describe("Chat daemon owner-lock publication", () => {
 });
 
 test("configured chat providers auto-start while incomplete providers do not", async () => {
-	const agentDir = tempAgentDir();
+	const agentDir = tempAgentDir(trackedTemp);
 	const configured = setPrivateAgentDir(
 		Settings.isolated({
 			"notifications.enabled": true,
@@ -1477,7 +1480,7 @@ test("configured chat providers auto-start while incomplete providers do not", a
 	expect(spawns).toBe(1);
 	const incomplete = setPrivateAgentDir(
 		Settings.isolated({ "notifications.enabled": true, "notifications.slack.botToken": "bot" }) as Settings,
-		tempAgentDir(),
+		tempAgentDir(trackedTemp),
 	);
 	expect(
 		await ensureSlackDaemon(incomplete, {
@@ -1513,7 +1516,7 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 		["EPERM", "operation not permitted"],
 		[undefined, "probe authority unavailable"],
 	] as const)("retains launcher ownership when the default probe returns %s", async (code, message) => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeChatDaemonConfig(agentDir);
 		const kill = spyOn(process, "kill").mockImplementation(() => {
 			const error = new Error(message) as NodeJS.ErrnoException;
@@ -1537,7 +1540,7 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 	});
 
 	test("returns before constructing the runtime when the default launcher probe returns ESRCH", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeChatDaemonConfig(agentDir);
 		const kill = spyOn(process, "kill").mockImplementation(() => {
 			throw Object.assign(new Error("no such process"), { code: "ESRCH" });
@@ -1557,7 +1560,7 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 	});
 
 	test("returns cleanly without constructing a desired-off provider runtime", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		fs.writeFileSync(
 			path.join(agentDir, "config.yml"),
 			[
@@ -1583,7 +1586,7 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 	});
 
 	test("does not start the transport when its initial heartbeat renewal fails", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeChatDaemonConfig(agentDir);
 		let started = 0;
 		let stopped = 0;
@@ -1603,7 +1606,7 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 	});
 
 	test("stops before serving when its initial heartbeat renewal rejects", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeChatDaemonConfig(agentDir);
 		let started = 0;
 		let stopped = 0;
@@ -1631,7 +1634,7 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 		expectedTerminalError?: string,
 		stopError?: string,
 	): Promise<void> {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeChatDaemonConfig(agentDir);
 		let intervalCallback: (() => void) | undefined;
 		const started = Promise.withResolvers<void>();
@@ -1815,7 +1818,7 @@ describe("runChatDaemonInternal retires when notifications are disabled", () => 
 		["discord", "provider-disabled"],
 		["discord", "global-disabled"],
 	] as const)("%s owner retires after the config becomes %s", async (kind, variant) => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeConfig(agentDir, kind, "enabled");
 		const harness = await startWorker(agentDir, kind, `${kind}-${variant}`);
 		await harness.tick();
@@ -1843,7 +1846,7 @@ describe("runChatDaemonInternal retires when notifications are disabled", () => 
 	});
 
 	test("keeps serving through unreadable config and isolated disabled reads", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		writeConfig(agentDir, "slack", "enabled");
 		const harness = await startWorker(agentDir, "slack", "transient");
 

@@ -43,6 +43,9 @@ import {
 } from "../src/sdk/bus/telegram-daemon-control";
 import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 import { setPrivateAgentDir, tempAgentDir } from "./helpers/daemon-control-fixture";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const BOT_TOKEN = "123456:secret-token";
 function testProcessReference(
@@ -194,7 +197,7 @@ describe("daemon runtime detection", () => {
 
 describe("static built-in controller map", () => {
 	test("createBuiltInDaemonControllers exposes every built-in kind", () => {
-		const s = settings(tempAgentDir());
+		const s = settings(tempAgentDir(trackedTemp));
 		const map = createBuiltInDaemonControllers(s);
 		expect(Object.keys(map)).toEqual(["telegram", "discord", "slack"]);
 		expect(map.telegram).toBeInstanceOf(TelegramDaemonController);
@@ -203,7 +206,7 @@ describe("static built-in controller map", () => {
 	});
 
 	test("selectDaemonControllers defaults to Telegram, selects all kinds, and rejects unknown kinds", () => {
-		const s = settings(tempAgentDir());
+		const s = settings(tempAgentDir(trackedTemp));
 		expect(selectDaemonControllers(s, undefined, false)).toHaveLength(1);
 		expect(selectDaemonControllers(s, ["telegram"], false)).toHaveLength(1);
 		expect(selectDaemonControllers(s, undefined, true).map(controller => controller.kind)).toEqual([
@@ -370,7 +373,7 @@ describe("daemon operator contract", () => {
 
 describe("control request helpers", () => {
 	test("write/read/clear roundtrip is owner-scoped", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		await writeTelegramControlRequest(s, {
 			version: 1,
@@ -395,7 +398,7 @@ describe("control request helpers", () => {
 
 describe("TelegramDaemonController.status", () => {
 	test("reports not_configured when token/chat missing", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(Settings.isolated({}) as Settings, agentDir);
 		const status = await new TelegramDaemonController(s).status();
 		expect(status.configured).toBe(false);
@@ -403,7 +406,7 @@ describe("TelegramDaemonController.status", () => {
 	});
 
 	test("reports not_configured for blank Telegram credentials even when another adapter is configured", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -421,7 +424,7 @@ describe("TelegramDaemonController.status", () => {
 	});
 
 	test("reports running for a fresh live owner and stopped for a dead one", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -442,7 +445,7 @@ describe("TelegramDaemonController.status", () => {
 
 describe("Telegram daemon PID provenance fencing", () => {
 	test("refuses stop and forced reload when a live PID has a reused or unavailable incarnation", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		for (const incarnation of ["linux:101", undefined] as const) {
 			writeState(agentDir, freshState());
@@ -466,7 +469,7 @@ describe("TelegramDaemonController.reload", () => {
 		"lock-mismatch",
 		"stale-heartbeat",
 	])("rejects %s legacy migration sidecar evidence without signaling or spawning", async evidenceKind => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const paths = daemonPaths(agentDir);
 		const pid = process.pid;
@@ -524,7 +527,7 @@ describe("TelegramDaemonController.reload", () => {
 		const reference = defaultProcessReference(process.pid, "win32");
 		expect(reference).toMatchObject({ termination: "hard" });
 
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState({ generation: DAEMON_GENERATION - 1 });
 		writeState(agentDir, state);
@@ -562,7 +565,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("hard Windows authority stops after the daemon honors the request", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -588,7 +591,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("hard Windows authority gives a captured owner extended cooperative grace", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -617,7 +620,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("hard Windows non-force stop succeeds when the owner dies after twenty seconds", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -643,7 +646,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("hard Windows force waits the extended grace before killing a never-exiting owner", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -675,7 +678,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("POSIX cooperative termination keeps the eight-second default", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -701,7 +704,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("hard Windows authority clears an ignored cooperative request without force", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState({ generation: DAEMON_GENERATION - 1 });
 		writeState(agentDir, state);
@@ -724,7 +727,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("hard Windows authority force-kills only the unchanged owner", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState({ generation: DAEMON_GENERATION - 1 });
 		writeState(agentDir, state);
@@ -753,7 +756,7 @@ describe("TelegramDaemonController.reload", () => {
 		["an immediately preceding generation", { generation: DAEMON_GENERATION - 1 }],
 		["a fully-provenanced generation-absent predecessor", { generation: undefined }],
 	] as const)("cooperatively stops %s and spawns a fresh one", async (_description, predecessor) => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState(predecessor);
 		writeState(agentDir, state);
@@ -802,7 +805,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("reload accepts a successor only when its PID incarnation still matches", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const predecessor = freshState({ generation: DAEMON_GENERATION - 1 });
 		writeState(agentDir, predecessor);
@@ -833,7 +836,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("escalates to SIGKILL when the old owner ignores SIGTERM", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -865,7 +868,7 @@ describe("TelegramDaemonController.reload", () => {
 		expect(signals.some(([, sig]) => sig === "SIGKILL")).toBe(true);
 	});
 	test("reloadForGenerationUpgrade force-escalates to SIGKILL for an unresponsive old owner (no explicit --force)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -900,7 +903,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("does not escalate or kill when ownership changes mid-wait", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -934,7 +937,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("without --force, an unresponsive old daemon is not killed or replaced", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -961,7 +964,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("keeps configured credentials out of stale-owner status and reload failure evidence", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		let now = 1_000;
 		writeState(agentDir, freshState({ startedAt: now, heartbeatAt: now }));
@@ -986,7 +989,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("never spawns while the captured old pid is still alive (stale changed-owner)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState());
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1017,7 +1020,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("spawns the fresh owner only after the old pid is confirmed dead (no poll overlap)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -1063,7 +1066,7 @@ describe("TelegramDaemonController.reload", () => {
 	});
 
 	test("reload with no running daemon spawns a fresh one (spawnIfStopped default)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const spawns: Array<{ command: string; args: string[] }> = [];
 		let childPid: number | undefined;
@@ -1086,7 +1089,7 @@ describe("TelegramDaemonController.reload", () => {
 		expect(spawns).toHaveLength(1);
 	});
 	test("reloads a physically-live matching owner whose heartbeat is stale (hung owner)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		// Physically alive (pid 999) but heartbeat far past the TTL: status is "stale",
 		// not "running". A forced reload must still cooperatively signal and replace it.
@@ -1124,7 +1127,7 @@ describe("TelegramDaemonController.reload", () => {
 		expect(spawns).toHaveLength(1);
 	});
 	test("reload without --force refuses a stale-heartbeat live owner (no signal)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState({ heartbeatAt: Date.now() - 60 * 60_000 }));
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1154,7 +1157,7 @@ describe("TelegramDaemonController.reload", () => {
 
 describe("renewDaemonHeartbeat steal-lock contention", () => {
 	test("recovers when the steal lock is briefly held then released (bind-vs-heartbeat race)", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const owner = freshState({ heartbeatAt: 1 });
 		writeState(agentDir, owner);
@@ -1185,7 +1188,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	});
 
 	test("binds a child heartbeat only through its matching provisional acquisition", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const provisional = freshState({ ownershipPhase: "provisional", pid: 4242, incarnation: "linux:102" });
 		writeState(agentDir, provisional);
@@ -1207,7 +1210,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	});
 
 	test("reports failure when the steal lock stays held even if state is unchanged", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState({ heartbeatAt: 1 }));
 		const paths = daemonPaths(agentDir);
@@ -1229,7 +1232,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	});
 
 	test("reports ownership loss when the steal lock is held and ownership changed", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState({ ownerId: "successor", acquisitionId: "successor" }));
 		const paths = daemonPaths(agentDir);
@@ -1250,7 +1253,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 
 describe("cooperative handoff when the captured owner exits before the recheck", () => {
 	test("stop succeeds when the owner exits between the control request and the signal recheck", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState());
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1276,7 +1279,7 @@ describe("cooperative handoff when the captured owner exits before the recheck",
 	});
 
 	test("reload spawns the replacement when the owner exits before the signal recheck", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState();
 		writeState(agentDir, state);
@@ -1320,7 +1323,7 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 		["different generation", () => freshState({ generation: DAEMON_GENERATION + 1 })],
 	] as const) {
 		test(`does not SIGTERM after a ${name} mutation`, async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const s = settings(agentDir);
 			writeState(agentDir, freshState());
 			fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1343,7 +1346,7 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 	}
 
 	test("does not SIGKILL after an acquisition mutation during the graceful wait", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState());
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1373,7 +1376,7 @@ describe.each([
 	["win32", "windows:100", "windows:101"],
 ] as const)("stable injected %s root-only process signaling", (platform, incarnation, successor) => {
 	test("never signals a PID successor or uses tree/process-group helpers", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState({ incarnation });
 		writeState(agentDir, state);
@@ -1427,7 +1430,7 @@ describe("Darwin default daemon signaling", () => {
 		}
 	});
 	test("Telegram refuses Darwin TERM/KILL without opening the native numeric-PID signal path", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		const state = freshState({ incarnation: "darwin:999:1" });
 		writeState(agentDir, state);
@@ -1447,7 +1450,7 @@ describe("Darwin default daemon signaling", () => {
 describe("TelegramDaemonController provisional launcher signal fencing", () => {
 	for (const action of ["stop", "reload"] as const) {
 		test(`${action} never signals a live generation-4 provisional launcher`, async () => {
-			const agentDir = tempAgentDir();
+			const agentDir = tempAgentDir(trackedTemp);
 			const s = settings(agentDir);
 			writeState(agentDir, freshState({ ownershipPhase: "provisional" }));
 			fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1469,7 +1472,7 @@ describe("TelegramDaemonController provisional launcher signal fencing", () => {
 
 describe("TelegramDaemonController.stop", () => {
 	test("stops a running owner without spawning a replacement", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState());
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
@@ -1494,7 +1497,7 @@ describe("TelegramDaemonController.stop", () => {
 	});
 
 	test("signals and proves death for a live matching legacy owner without spawning", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const s = settings(agentDir);
 		writeState(agentDir, freshState({ generation: DAEMON_GENERATION - 1 }));
 		const alive = new Set<number>([999]);
@@ -1915,7 +1918,7 @@ describe("runDaemonCommand", () => {
 
 describe("cli registration", () => {
 	test("registered daemon dispatch serves inert command-local public help", () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const stateDir = path.join(agentDir, "uninitialized");
 		try {
 			for (const action of [undefined, "restart"]) {
@@ -1974,7 +1977,7 @@ describe("cli registration", () => {
 	}
 
 	test("registered daemon dispatch returns statuses for each selected provider", () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		try {
 			for (const kind of ["telegram", "slack"] as const) {
 				const result = Bun.spawnSync(
@@ -2000,7 +2003,7 @@ describe("cli registration", () => {
 	}, 15_000);
 
 	test("private daemon environment preserves inherited external profile settings", async () => {
-		const root = tempAgentDir();
+		const root = tempAgentDir(trackedTemp);
 		const home = path.join(root, "private-home");
 		const externalProfile = path.join(root, "external-profile");
 		const privateSource = path.join(home, ".gjc", "settings.json");
@@ -2177,7 +2180,7 @@ describe("canonical processIncarnation daemon lock identity", () => {
 	});
 
 	test("does not reclaim a live owner with ambiguous legacy Darwin provenance", async () => {
-		const agentDir = tempAgentDir();
+		const agentDir = tempAgentDir(trackedTemp);
 		const paths = chatDaemonPaths(agentDir, "discord");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		// A complete legacy state (only generation absent) with non-canonical

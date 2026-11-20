@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PlanRequest, planTmuxOwnerIsolationSync } from "../../src/gjc-runtime/tmux-owner-isolation";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
 import { readSessionState } from "../../src/harness-control-plane/storage";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
 import { createHarnessCliEnvWithFixtureBroker, type HarnessCliBrokerFixture } from "./cli-workspace-env";
+
+const trackedTemp = trackTempDirs();
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -221,8 +224,8 @@ async function retireLiveFixtureOwner(): Promise<void> {
 
 beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
-	root = await mkdtemp(path.join(tmpdir(), "h"));
-	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
+	root = await trackedTemp.mkdtemp(path.join(tmpdir(), "h"));
+	workspace = await trackedTemp.mkdtemp(path.join(tmpdir(), "hw"));
 	cliEnv = await createHarnessCliEnvWithFixtureBroker(repoRoot, root);
 	tmuxCommand = await createFakeTmuxBin(root);
 
