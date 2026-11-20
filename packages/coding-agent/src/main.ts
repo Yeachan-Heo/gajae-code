@@ -1400,18 +1400,12 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			const source = await SessionManager.open(
-				forkSource,
-				sessionDestination(),
-				undefined,
-				migrationPolicy,
-				sessionMemoryMode,
-			);
-			if (source.isFilesystemConfined() !== (parsed.confine === true)) {
-				await source.close();
+			// Inspect the source read-only: opening it would create a missing path
+			// as an ordinary transcript before the scope check could reject it.
+			const sourceScope = SessionManager.inspectTranscriptScope(path.resolve(forkSource));
+			if (!sourceScope || sourceScope.confined !== (parsed.confine === true)) {
 				throw new SessionNotFoundError(forkSource);
 			}
-			await source.close();
 			return await SessionManager.forkFrom(
 				forkSource,
 				cwd,

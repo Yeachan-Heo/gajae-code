@@ -519,10 +519,7 @@ export async function openLifecycleSessionManager(
 				sessionManager = opened.manager;
 				await revalidateLifecycleTranscript(snapshot.identity);
 			} else {
-				const sourceHeader = JSON.parse(
-					(await fs.readFile(snapshot.sourcePath, "utf8")).split(/\r?\n/, 1)[0] ?? "{}",
-				) as { filesystemScope?: unknown };
-				const sourceConfined = sourceHeader.filesystemScope === "cwd";
+				// forkFromCaptured inherits the source's confinement from the captured header.
 				const forked = await SessionManager.forkFromCaptured(
 					snapshot,
 					cwd,
@@ -530,7 +527,6 @@ export async function openLifecycleSessionManager(
 					migrationPolicy,
 					lifecycleSettings.get("sessionMemory.mode"),
 					request.sourceEntryId,
-					sourceConfined,
 				);
 				if (forked.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host forked it.");

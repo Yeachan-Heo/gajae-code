@@ -58,6 +58,22 @@ describe("--confine session selection", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("inspects a fork source scope without creating a missing transcript", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "confine-inspect-"));
+		const missing = path.join(dir, "missing.jsonl");
+		const confined = path.join(dir, "confined.jsonl");
+		const ordinary = path.join(dir, "ordinary.jsonl");
+		writeTranscript(confined, "confined-session", dir, true);
+		writeTranscript(ordinary, "ordinary-session", dir, false);
+		try {
+			expect(SessionManager.inspectTranscriptScope(missing)).toBeUndefined();
+			await expect(fs.stat(missing)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(SessionManager.inspectTranscriptScope(confined)).toEqual({ confined: true });
+			expect(SessionManager.inspectTranscriptScope(ordinary)).toEqual({ confined: false });
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("keeps confinement when a confined transcript is resumed by id", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "confine-resume-id-"));
 		const created = SessionManager.create(dir, SessionManager.explicitDestination(dir), undefined, true);
@@ -176,7 +192,6 @@ describe("confinement escapes", () => {
 				"copy-retain",
 				"shadow",
 				undefined,
-				true,
 			);
 			if (forked.kind !== "forked") throw new Error(forked.reason);
 			expect(forked.manager.isFilesystemConfined()).toBe(true);

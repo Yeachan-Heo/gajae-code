@@ -23362,8 +23362,11 @@ export class SessionManager {
 				: undefined);
 		if (!identity) return false;
 		applyHeaderPatch(sourceHeader, headerPatch);
+		// A fork inherits the source's confinement from the header it already parsed,
+		// so callers never re-read the transcript just to learn its scope.
+		if (sourceHeader.filesystemScope === "cwd") this.filesystemScope = "cwd";
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
-		if (sourceHeader.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
+		if (this.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return false;
@@ -23563,8 +23566,11 @@ export class SessionManager {
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
 		applyHeaderPatch(sourceHeader, headerPatch);
+		// A fork inherits the source's confinement from the header it already parsed,
+		// so callers never re-read the transcript just to learn its scope.
+		if (sourceHeader.filesystemScope === "cwd") this.filesystemScope = "cwd";
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
-		if (sourceHeader.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
+		if (this.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return undefined;
@@ -23744,8 +23750,9 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		if (sourceHeader?.filesystemScope === "cwd") manager.filesystemScope = "cwd";
 		const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
-		if (sourceHeader?.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
+		if (manager.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 		fresh.header.title = sourceHeader?.title;
 		fresh.header.titleSource = sourceHeader?.titleSource;
 		const transition = manager.#prepareResidentTextStoreTransition(
@@ -24950,11 +24957,39 @@ export class SessionManager {
 	}
 
 	/**
+	 * Read the filesystem scope recorded in an existing transcript header without
+	 * opening it for writing or creating it. Only the first line is decoded.
+	 * Returns `undefined` when the transcript cannot be captured (missing,
+	 * oversized, or malformed).
+	 */
+	static inspectTranscriptScope(
+		filePath: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): { confined: boolean } | undefined {
+		const captured = SessionManager.captureTranscriptStrict(filePath, storage);
+		if (captured.kind !== "captured") return undefined;
+		try {
+			let header: unknown;
+			captured.snapshot.forEachLine(line => {
+				header = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line));
+				return false;
+			});
+			if (!isRecord(header) || header.type !== "session") return undefined;
+			return { confined: header.filesystemScope === "cwd" };
+		} catch {
+			return undefined;
+		} finally {
+			captured.snapshot.close();
+		}
+	}
+
+	/**
 	 * Fork strictly from captured source bytes. The source pathname is used only to
 	 * revalidate captured authority before destination initialization and transcript
 	 * persistence; destination history always comes from the captured bytes.
 	 * sourceEntryId selects an inclusive root-to-entry path; null selects no history.
 	 * Undefined preserves the complete transcript, including inactive branches.
+	 * The fork inherits the source header's filesystem scope.
 	 */
 	static async forkFromCaptured(
 		snapshot: CapturedSessionTranscriptSnapshot,
@@ -24963,7 +24998,6 @@ export class SessionManager {
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		sourceEntryId?: string | null,
-		confined = false,
 	): Promise<StrictSessionForkResult> {
 		if (
 			sourceEntryId !== undefined &&
@@ -24994,7 +25028,6 @@ export class SessionManager {
 				snapshot.storage,
 				destination,
 				false,
-				confined ? "cwd" : undefined,
 			);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			if (
@@ -25123,20 +25156,13 @@ export class SessionManager {
 		let privateStagingPublished = false;
 
 		try {
-			manager = new SessionManager(
-				cwd,
-				privateStagingDir ?? dir,
-				true,
-				snapshot.storage,
-				forkDestination,
-				false,
-				confined ? "cwd" : undefined,
-			);
+			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination, false);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
+			if (sourceHeader?.filesystemScope === "cwd") manager.filesystemScope = "cwd";
 			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
-			if (sourceHeader?.filesystemScope === "cwd" || confined) fresh.header.filesystemScope = "cwd";
+			if (manager.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 			fresh.header.title = sourceHeader?.title;
 			fresh.header.titleSource = sourceHeader?.titleSource;
 			forkEntries[0] = fresh.header;
