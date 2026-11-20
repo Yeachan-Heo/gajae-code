@@ -488,7 +488,7 @@ test("gc reports a refused owner record as a collection error", async () => {
 	expect(collected.records).toEqual([]);
 });
 
-test("gc handles transient owner-record refusal with successful retry", async () => {
+test("gc reports owner-record read refusal as an error without retry", async () => {
 	const tempDir = await createTempDir();
 	const lockDir = path.join(tempDir, "state.json.lock");
 	const infoPath = path.join(lockDir, "info");
@@ -501,31 +501,25 @@ test("gc handles transient owner-record refusal with successful retry", async ()
 	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
 		if (samePath(String(target), infoPath)) {
 			attempt++;
-			if (attempt === 1) {
-				// First attempt: transient EPERM (simulating another process deleting the lock)
-				const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
-					code: "EPERM",
-				});
-				throw err;
-			}
-			// Second attempt: succeeds
+			// First attempt: transient EPERM (simulating another process deleting the lock)
+			const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+				code: "EPERM",
+			});
+			throw err;
 		}
 		return realOpenSync(target, flags, mode);
 	}) as typeof fsSync.openSync);
 
 	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
 
-	expect(collected.errors).toEqual([]);
-	expect(collected.records).toHaveLength(1);
-	expect(collected.records[0]).toMatchObject({
-		store: "file_locks",
-		id: lockDir,
-		path: lockDir,
-		pid: 12345,
-	});
+	// Without retry, GC reports the refusal as an error immediately
+	expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+	expect(collected.records).toEqual([]);
+	// Verify that only one attempt was made, not retried
+	expect(attempt).toBe(1);
 });
 
-test("gc handles transient owner-record refusal that persists through early retries", async () => {
+test("gc reports owner-record read errors as collection errors, not retried", async () => {
 	const tempDir = await createTempDir();
 	const lockDir = path.join(tempDir, "state.json.lock");
 	const infoPath = path.join(lockDir, "info");
@@ -538,31 +532,22 @@ test("gc handles transient owner-record refusal that persists through early retr
 	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
 		if (samePath(String(target), infoPath)) {
 			attempt++;
-			// Simulate a concurrent removal: fail on attempts 1-3, succeed on attempt 4.
-			// This covers the timing window where both early reads can fail even though the
-			// refusal eventually clears.
-			if (attempt >= 1 && attempt <= 3) {
-				const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
-					code: "EPERM",
-				});
-				throw err;
-			}
-			// Attempt 4+: succeeds (simulating retirement completing)
+			// Persistent EPERM on every attempt: simulating a lock that is inaccessible
+			const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+				code: "EPERM",
+			});
+			throw err;
 		}
 		return realOpenSync(target, flags, mode);
 	}) as typeof fsSync.openSync);
 
 	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
 
-	// With backoff, the GC eventually succeeds after transient refusals clear.
-	expect(collected.errors).toEqual([]);
-	expect(collected.records).toHaveLength(1);
-	expect(collected.records[0]).toMatchObject({
-		store: "file_locks",
-		id: lockDir,
-		path: lockDir,
-		pid: 12345,
-	});
+	// Without retry logic, the first refusal is reported as an error immediately
+	expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+	expect(collected.records).toEqual([]);
+	// Verify that only one attempt was made, not retried
+	expect(attempt).toBe(1);
 });
 
 test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as an error on every pass", async () => {
@@ -622,7 +607,8 @@ test("gc does not list a lock's removal transition", async () => {
 	];
 	for (const transition of transitions) {
 		await fs.mkdir(transition);
-		await fs.writeFile(path.join(transition, "info"), JSON.stringify({ pid: 12345, timestamp: Date.now() }));
+		// Create a .owner file as a sibling to mark this as a verified removal transition
+		await fs.writeFile(`${transition}.owner`, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
 	}
 	const realReaddir = fs.readdir;
 	vi.spyOn(fs, "readdir").mockImplementation((async (target: string, options?: undefined) => {
