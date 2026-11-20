@@ -871,7 +871,7 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 			});
 
-			it("[MUST FAIL] deep nesting perf test: 10k-deep structure under 200ms", () => {
+			it("deep nesting perf test: 10k-deep structure under 200ms", () => {
 				// Test that bracket tracking is O(n) and not O(n²) with deep nesting
 				// Build a diff with 10k nested brackets
 				const lines = [HEADER[0], ...HEADER.slice(1)];
