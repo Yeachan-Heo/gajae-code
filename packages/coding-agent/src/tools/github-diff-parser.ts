@@ -153,11 +153,11 @@ export function scrubUnifiedDiff(unifiedDiff: string): string {
 			result.push(line);
 			i += 1;
 		} else if (line.startsWith("@@")) {
-			// Found a hunk header. Process the entire hunk with state tracking.
-			const hunkResult = redactHunk(lines, i, hunkState);
-			result.push(...hunkResult.redactedLines);
-			i = hunkResult.nextIndex;
-			hunkState = hunkResult.state;
+			// Found a hunk header. Collect all hunks for this file until the next file or EOF.
+			const hunksResult = redactAllHunksInFile(lines, i, hunkState);
+			result.push(...hunksResult.redactedLines);
+			i = hunksResult.nextIndex;
+			hunkState = hunksResult.state;
 		} else {
 			// Regular content line - redact it
 			const redactedLine = redactDiffLine(line);
@@ -363,140 +363,127 @@ interface HunkResult {
 }
 
 /**
- * Process a hunk starting at hunkHeaderIndex.
- * Returns the redacted lines, the index to continue from, and updated state.
- *
- * Implements multi-line credential redaction by:
- * 1. Collecting the logical content (treating old/new as equivalent for redaction)
- * 2. Redacting the accumulated content to identify credentials
- * 3. Projecting redactions back onto individual diff lines
- * 4. Tracking credential state across hunk boundaries
- * 5. Scrubbing optional source-derived context in hunk headers
- * 6. Preserving no-newline markers in correct order
+ * Process all hunks in a file, building file-wide projections so containers can span hunks.
+ * Collects all hunks between here and the next file/EOF, then redacts them as a unit.
  */
-function redactHunk(
+function redactAllHunksInFile(
 	lines: string[],
-	hunkHeaderIndex: number,
-	inputState: HunkState = { inCredentialValue: false, bracketDepth: 0, bracketStack: [], inPemBlock: false },
-): HunkResult {
-	const headerLine = lines[hunkHeaderIndex];
-	const match = headerLine.match(HUNK_HEADER_RE);
+	startHunkIndex: number,
+	inputState: HunkState,
+): { redactedLines: string[]; nextIndex: number; state: HunkState } {
+	const hunks: Array<{ headerIndex: number; header: string; lineInfos: LineInfo[] }> = [];
+	let i = startHunkIndex;
 
-	if (!match) {
-		// Invalid hunk header, pass through
-		return {
-			redactedLines: [headerLine],
-			nextIndex: hunkHeaderIndex + 1,
-			state: inputState,
-		};
-	}
+	// Collect all consecutive hunks until we hit a file boundary or EOF
+	while (i < lines.length && lines[i].startsWith("@@")) {
+		const headerIndex = i;
+		const headerLine = lines[i];
+		const match = headerLine.match(HUNK_HEADER_RE);
 
-	// Extract hunk header parts: hunk metadata and optional source-derived context
-	const hunkHeaderCore = match[1];
-	const optionalContext = match[2];
-
-	// Scrub the optional context (source-derived section) which may contain credentials.
-	// This includes hunk context suffix like function name which could have credential values.
-	let scrubbedHeaderLine: string;
-	if (optionalContext !== undefined) {
-		// There was a space separator in the original; preserve it even if context is empty
-		const scrubbedContext = redactCrashSecrets(optionalContext);
-		scrubbedHeaderLine = `${hunkHeaderCore} ${scrubbedContext}`;
-	} else {
-		// No space separator in the original
-		scrubbedHeaderLine = hunkHeaderCore;
-	}
-
-	// Parse the line counts from the core header
-	const coreMatch = hunkHeaderCore.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$/);
-	if (!coreMatch) {
-		return {
-			redactedLines: [scrubbedHeaderLine],
-			nextIndex: hunkHeaderIndex + 1,
-			state: inputState,
-		};
-	}
-
-	const oldCount = Number.parseInt(coreMatch[2] || "1", 10);
-	const newCount = Number.parseInt(coreMatch[4] || "1", 10);
-
-	const result: string[] = [scrubbedHeaderLine];
-	let i = hunkHeaderIndex + 1;
-	let oldLines = 0;
-	let newLines = 0;
-
-	// Collect line info for credential redaction with context
-	const lineInfos: LineInfo[] = [];
-
-	// Process lines until we've seen all oldCount + newCount lines
-	while (i < lines.length && (oldLines < oldCount || newLines < newCount)) {
-		const line = lines[i];
-
-		if (line.length === 0) {
-			// Empty line in hunk (counts as context)
-			lineInfos.push({ prefix: " ", content: "", index: i });
-			oldLines += 1;
-			newLines += 1;
+		if (!match) {
+			// Invalid hunk header, skip
 			i += 1;
-		} else {
-			const prefix = line[0];
+			continue;
+		}
 
-			if (prefix === " ") {
-				// Context line
-				const lineInfo: LineInfo = { prefix: " ", content: line.slice(1), index: i };
+		const hunkHeaderCore = match[1];
+		const optionalContext = match[2];
+		const scrubbedHeaderLine =
+			optionalContext !== undefined ? `${hunkHeaderCore} ${redactCrashSecrets(optionalContext)}` : hunkHeaderCore;
+
+		const coreMatch = hunkHeaderCore.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$/);
+		if (!coreMatch) {
+			i += 1;
+			continue;
+		}
+
+		const oldCount = Number.parseInt(coreMatch[2] || "1", 10);
+		const newCount = Number.parseInt(coreMatch[4] || "1", 10);
+
+		const lineInfos: LineInfo[] = [];
+		i += 1;
+		let oldLines = 0;
+		let newLines = 0;
+
+		// Collect lines for this hunk
+		while (i < lines.length && (oldLines < oldCount || newLines < newCount)) {
+			const line = lines[i];
+
+			if (line.length === 0) {
+				lineInfos.push({ prefix: " ", content: "", index: i });
 				oldLines += 1;
 				newLines += 1;
-				i += 1;
-				// Check if next line is a no-newline marker
-				if (i < lines.length && lines[i] === "\\ No newline at end of file") {
-					lineInfo.noNewlineMarker = true;
-					i += 1;
-				}
-				lineInfos.push(lineInfo);
-			} else if (prefix === "-") {
-				// Deleted line - treat as context for credential detection
-				const lineInfo: LineInfo = { prefix: "-", content: line.slice(1), index: i };
-				oldLines += 1;
-				i += 1;
-				// Check if next line is a no-newline marker
-				if (i < lines.length && lines[i] === "\\ No newline at end of file") {
-					lineInfo.noNewlineMarker = true;
-					i += 1;
-				}
-				lineInfos.push(lineInfo);
-			} else if (prefix === "+") {
-				// Added line - treat as context for credential detection
-				const lineInfo: LineInfo = { prefix: "+", content: line.slice(1), index: i };
-				newLines += 1;
-				i += 1;
-				// Check if next line is a no-newline marker
-				if (i < lines.length && lines[i] === "\\ No newline at end of file") {
-					lineInfo.noNewlineMarker = true;
-					i += 1;
-				}
-				lineInfos.push(lineInfo);
-			} else if (prefix === "\\") {
-				// Unexpected no-newline marker at this position, skip
 				i += 1;
 			} else {
-				// Unexpected prefix, could be next hunk or file header
-				break;
+				const prefix = line[0];
+
+				if (prefix === " ") {
+					const lineInfo: LineInfo = { prefix: " ", content: line.slice(1), index: i };
+					oldLines += 1;
+					newLines += 1;
+					i += 1;
+					if (i < lines.length && lines[i] === "\\ No newline at end of file") {
+						lineInfo.noNewlineMarker = true;
+						i += 1;
+					}
+					lineInfos.push(lineInfo);
+				} else if (prefix === "-") {
+					const lineInfo: LineInfo = { prefix: "-", content: line.slice(1), index: i };
+					oldLines += 1;
+					i += 1;
+					if (i < lines.length && lines[i] === "\\ No newline at end of file") {
+						lineInfo.noNewlineMarker = true;
+						i += 1;
+					}
+					lineInfos.push(lineInfo);
+				} else if (prefix === "+") {
+					const lineInfo: LineInfo = { prefix: "+", content: line.slice(1), index: i };
+					newLines += 1;
+					i += 1;
+					if (i < lines.length && lines[i] === "\\ No newline at end of file") {
+						lineInfo.noNewlineMarker = true;
+						i += 1;
+					}
+					lineInfos.push(lineInfo);
+				} else if (prefix === "\\") {
+					i += 1;
+				} else {
+					// Hit next hunk or file boundary
+					break;
+				}
 			}
 		}
+
+		hunks.push({ headerIndex, header: scrubbedHeaderLine, lineInfos });
 	}
 
-	// Redact accumulated content while preserving diff structure and tracking state
+	// Now build file-wide projections across all hunks
+	const allLineInfos: LineInfo[] = [];
+	for (const hunk of hunks) {
+		allLineInfos.push(...hunk.lineInfos);
+	}
+
 	const { redactedLines: redactedInfos, state: outputState } = redactAccumulatedContentWithState(
-		lineInfos,
+		allLineInfos,
 		inputState,
 	);
 
-	// Add redacted lines to result, restoring no-newline markers at their original positions
-	for (const info of redactedInfos) {
-		result.push(info.prefix + info.content);
-		// Emit no-newline marker immediately after the line it describes
-		if (info.noNewlineMarker) {
-			result.push("\\ No newline at end of file");
+	// Map redacted lines back to individual hunks
+	const result: string[] = [];
+	let redactedIndex = 0;
+
+	for (const hunk of hunks) {
+		result.push(hunk.header);
+
+		for (const info of hunk.lineInfos) {
+			if (redactedIndex < redactedInfos.length) {
+				const redactedInfo = redactedInfos[redactedIndex];
+				result.push(redactedInfo.prefix + redactedInfo.content);
+				if (redactedInfo.noNewlineMarker) {
+					result.push("\\ No newline at end of file");
+				}
+				redactedIndex += 1;
+			}
 		}
 	}
 
@@ -548,14 +535,8 @@ function redactAccumulatedContentWithState(
 	// Join projections with newlines and redact them using line-preserving variant
 	const oldProjectionOriginal = oldProjectionLines.length === 0 ? "" : oldProjectionLines.join("\n");
 	const newProjectionOriginal = newProjectionLines.length === 0 ? "" : newProjectionLines.join("\n");
-	if (newProjectionOriginal.includes("secret")) {
-		console.error("[SCRUBBER] newProjectionOriginal:", JSON.stringify(newProjectionOriginal));
-	}
 	const oldProjectionRedacted = redactCrashSecretsPreservingLines(oldProjectionOriginal);
 	const newProjectionRedacted = redactCrashSecretsPreservingLines(newProjectionOriginal);
-	if (newProjectionOriginal.includes("secret")) {
-		console.error("[SCRUBBER] newProjectionRedacted:", JSON.stringify(newProjectionRedacted));
-	}
 
 	// Split back to lines by newline, but handle empty projections
 	const oldRedactedLines = oldProjectionRedacted === "" ? [] : oldProjectionRedacted.split("\n");
@@ -625,12 +606,77 @@ function redactAccumulatedContentWithState(
 		result.push({ ...info, content: redactedContent });
 	}
 
-	// Update state based on bracket tracking across both projections
-	// This persists credential container state across hunk boundaries within the same file
+	// Update state based on bracket tracking and post-process redacted lines for incomplete containers
+	// This persists credential container state across hunk boundaries within the same file.
+	// Track brackets in the ORIGINAL projection content (before redaction) so we see
+	// actual brackets, not placeholders. The goal is to know whether we're inside a
+	// container at the end of this hunk, which determines redaction in the next hunk.
+	// Since projections can be asymmetric (old side opens container, new side doesn't),
+	// we track the old-side state which carries forward to the next hunk.
 	const outputState: HunkState = { ...inputState };
+	let oldBracketDepth = inputState.bracketDepth; // Track bracket depth as we process old-side lines
+	let newBracketDepth = inputState.bracketDepth; // Also track new-side separately for asymmetric containers
 
-	// Count brackets in redacted old projection to track container state
-	for (const line of oldRedactedLines) {
+	// Also redact lines that are inside incomplete containers
+	// (containers opened in previous hunks or opened in this hunk but not closed)
+	// We track bracket depth separately for each projection since they can be asymmetric
+	for (let i = 0; i < lineInfos.length; i += 1) {
+		const info = result[i]; // The corresponding redacted line info
+		const originalInfo = lineInfos[i];
+		const prefix = originalInfo.prefix;
+
+		// Handle context and deleted lines (old-side projection)
+		if (prefix === " " || prefix === "-") {
+			const oldIdx = oldProjectionIndices.indexOf(i);
+			if (oldIdx >= 0) {
+				const originalContent = oldProjectionLines[oldIdx];
+
+				// If we're inside a container at the start of this line, redact it
+				if (oldBracketDepth > 0 && info.content !== "" && !info.content.includes("«redacted")) {
+					info.content = "«redacted»";
+				}
+
+				// Update bracket depth for next line
+				for (const char of originalContent) {
+					if (char === "[" || char === "{") {
+						oldBracketDepth += 1;
+					} else if ((char === "]" || char === "}") && oldBracketDepth > 0) {
+						oldBracketDepth -= 1;
+					}
+				}
+			}
+		}
+
+		// Handle added lines (new-side projection)
+		if (prefix === " " || prefix === "+") {
+			const newIdx = newProjectionIndices.indexOf(i);
+			if (newIdx >= 0) {
+				const originalContent = newProjectionLines[newIdx];
+
+				// If we're inside a container at the start of this line, redact it
+				if (newBracketDepth > 0 && info.content !== "" && !info.content.includes("«redacted")) {
+					info.content = "«redacted»";
+				}
+
+				// Update bracket depth for next line
+				for (const char of originalContent) {
+					if (char === "[" || char === "{") {
+						newBracketDepth += 1;
+					} else if ((char === "]" || char === "}") && newBracketDepth > 0) {
+						newBracketDepth -= 1;
+					}
+				}
+			}
+		}
+	}
+
+	// Update output state based on final old-side bracket depth
+	// (the old side's state carries forward to the next hunk)
+	outputState.bracketStack = [...inputState.bracketStack];
+	outputState.bracketDepth = oldBracketDepth; // Use the old-side bracket depth
+
+	// Count brackets in ORIGINAL old projection to track container state
+	for (const line of oldProjectionLines) {
 		for (const char of line) {
 			if (char === "[") {
 				outputState.bracketStack.push("[");
