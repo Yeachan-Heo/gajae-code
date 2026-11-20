@@ -4864,7 +4864,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** @internal Test-only method to refresh ownership heartbeat for all active topics. */
-	async refreshOwnershipHeartbeat(sessionId: string): Promise<void> {
+	async refreshOwnershipHeartbeat(_sessionId: string): Promise<void> {
 		// Calls renewActiveTopicLeases which iterates all sessions and re-arms expired leases.
 		// sessionId is for test instrumentation only; the method renews all sessions.
 		await this.renewActiveTopicLeases();
