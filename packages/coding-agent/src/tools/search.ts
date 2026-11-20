@@ -396,6 +396,18 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								}))
 							: (multiTargets ?? []);
 						for (const target of targets) {
+							throwIfSearchCancelled();
+							// Calculate remaining timeout for this target and create a fresh signal
+							// to avoid reusing the original combinedSignal across multiple grep calls.
+							// issue #7892: multi-path grep hangs in SDK session host when signals are
+							// reused across multiple native grep calls.
+							const remainingMs = Math.max(0, deadlineAt - Date.now());
+							if (remainingMs <= 0) throw new Error("Aborted: Timeout");
+							// Create a fresh signal for each target to prevent signal reuse issues.
+							// This avoids potential deadlocks when the same signal is shared across
+							// multiple native grep invocations in SDK session host mode.
+							const targetTimeoutSignal = AbortSignal.timeout(remainingMs);
+							const targetSignal = signal ? AbortSignal.any([signal, targetTimeoutSignal]) : targetTimeoutSignal;
 							const targetResult = await grep(
 								{
 									pattern: normalizedPattern,
@@ -411,8 +423,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
-									signal: combinedSignal,
-									timeoutMs,
+									signal: targetSignal,
+									timeoutMs: remainingMs,
 								},
 								undefined,
 							);

@@ -1023,3 +1023,35 @@ test("a pending release cannot capture identity after its initial capture fails"
 	expect(await Bun.file(path.join(lock, "info")).text()).toBe(originalInfo);
 	expect(await fs.exists(lock)).toBe(true);
 });
+
+test("a dead remover record that another process is deleting is retried as contention, not a changed owner", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { ownerHostId: "local-host", retries: 2, retryDelayMs: 1 });
+	// A previous generation's remover died after its tree was retired; only its record remains.
+	await fs.mkdir(transition);
+	await record(transition, {
+		pid: 2147483646,
+		timestamp: Date.now(),
+		owner_token: "dead-prior-remover",
+		owner_host_id: "local-host",
+	});
+	await fs.rm(transition, { recursive: true });
+	const recordPath = `${transition}.owner`;
+	const realLstat = fs.lstat.bind(fs);
+	let recordLstats = 0;
+	let refusals = 0;
+	// Each release attempt reads the record (first lstat), then removes it (second lstat).
+	// Windows refuses the removal-side stat while another process is deleting the record.
+	vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+		if (String(target) === recordPath && ++recordLstats % 2 === 0 && refusals < 2) {
+			refusals++;
+			throw Object.assign(new Error(`EPERM: operation not permitted, lstat '${recordPath}'`), { code: "EPERM" });
+		}
+		return realLstat(target, options as never);
+	}) as typeof fs.lstat);
+
+	await expect(release()).resolves.toBeUndefined();
+	expect(refusals).toBe(2);
+	expect(await fs.exists(lock)).toBe(false);
+	expect(await fs.exists(recordPath)).toBe(false);
+});

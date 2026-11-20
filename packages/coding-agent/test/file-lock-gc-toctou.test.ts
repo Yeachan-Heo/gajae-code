@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -512,14 +513,14 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		await withFileLock(
 			lockedFile,
 			async () => {
-				const realOpen = fs.open;
-				vi.spyOn(fs, "open").mockImplementation((async (target, flags, mode) => {
+				const realOpenSync = fsSync.openSync;
+				vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
 					if (!deniedInfoRead && String(target) === lockInfoPath) {
 						deniedInfoRead = true;
 						throw Object.assign(new Error("metadata temporarily locked"), { code: "EPERM" });
 					}
-					return await realOpen(target, flags, mode);
-				}) as typeof fs.open);
+					return realOpenSync(target, flags, mode);
+				}) as typeof fsSync.openSync);
 				contender = withFileLock(
 					lockedFile,
 					async () => {
@@ -2486,7 +2487,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		const attempt = withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
 		await expect(attempt).rejects.toMatchObject({
 			code: "acquire_timeout",
-			removalFailure: { outcome: "error", code: "EACCES" },
+			removalFailure: { outcome: "error", code: "sharing_violation" },
 		});
 		await expect(attempt).rejects.toThrow(/Failed to remove file lock tree: sharing_violation/);
 	});
@@ -2598,5 +2599,75 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped");
+	});
+});
+
+describe("fileLocksGcAdapter.prune owner-record refusal", () => {
+	const hostPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+
+	afterEach(() => {
+		if (hostPlatform) Object.defineProperty(process, "platform", hostPlatform);
+	});
+
+	async function lockWithRefusedInfo(platform: NodeJS.Platform, code: string) {
+		const base = await makeTemp();
+		const spoolDir = path.join(base, "spool");
+		const lockDir = path.join(spoolDir, "refused.lock");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: 1000 });
+		const infoPath = path.join(lockDir, "info");
+		const realOpenSync = fsSync.openSync;
+		vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+			if (String(target) === infoPath) throw Object.assign(new Error(`${code}: open '${infoPath}'`), { code });
+			return realOpenSync(target, flags, mode);
+		}) as typeof fsSync.openSync);
+		Object.defineProperty(process, "platform", { ...hostPlatform, value: platform });
+		return { lockDir, ctx: ctxWith(spoolDir, () => ({ status: "dead" })) };
+	}
+
+	test("on Windows a persistent owner record refusal is reported as a GC error, not silently treated as changing", async () => {
+		const { lockDir, ctx } = await lockWithRefusedInfo("win32", "EPERM");
+
+		// Persistent EPERM on retry indicates an ACL denial, not transient lock motion.
+		// This should be reported as an error so gc exits non-zero, not silently kept.
+		await expect(fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx)).rejects.toMatchObject({
+			code: "EPERM",
+		});
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("on Windows a transient owner record refusal on first read but success on retry is treated as changing", async () => {
+		const base = await makeTemp();
+		const spoolDir = path.join(base, "spool");
+		const lockDir = path.join(spoolDir, "transient.lock");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: 1000 });
+		const infoPath = path.join(lockDir, "info");
+		const realOpenSync = fsSync.openSync;
+		let attempts = 0;
+
+		// Mock to fail on first attempt, succeed on retry (simulating transient lock motion)
+		vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+			if (String(target) === infoPath) {
+				attempts++;
+				if (attempts === 1) {
+					throw Object.assign(new Error(`EPERM: open '${infoPath}'`), { code: "EPERM" });
+				}
+			}
+			return realOpenSync(target, flags, mode);
+		}) as typeof fsSync.openSync);
+
+		Object.defineProperty(process, "platform", { ...hostPlatform, value: "win32" });
+		const ctx = ctxWith(spoolDir, () => ({ status: "dead" }));
+		const outcome = await fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx);
+
+		// Transient failure (succeeds on retry) allows the lock to be read and removed
+		expect(outcome).toEqual({ removed: true });
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("on POSIX a refused owner record is a real permission failure, not a changing lock", async () => {
+		const { lockDir, ctx } = await lockWithRefusedInfo("linux", "EACCES");
+
+		await expect(fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx)).rejects.toMatchObject({ code: "EACCES" });
+		expect(await fs.exists(lockDir)).toBe(true);
 	});
 });
