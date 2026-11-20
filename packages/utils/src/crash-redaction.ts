@@ -478,17 +478,26 @@ function redactCredentialValue(
 	return `${prefix}«redacted»`;
 }
 
-function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
+function redactCredentialContainers(
+	text: string,
+	rules: CredentialRedactionRules,
+	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
+): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
 	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
 	const camelAssignment = new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g");
 	return redactCredentialContainersWithPattern(
-		redactCredentialContainersWithPattern(text, assignment),
+		redactCredentialContainersWithPattern(text, assignment, placeholderHook),
 		camelAssignment,
+		placeholderHook,
 	);
 }
 
-function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
+function redactCredentialContainersWithPattern(
+	text: string,
+	assignment: RegExp,
+	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
+): string {
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
@@ -506,7 +515,8 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 			assignment.lastIndex = containerEnd;
 			continue;
 		}
-		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+		const placeholder = placeholderHook(container, "«redacted»");
+		output += `${text.slice(copiedUntil, containerStart)}${placeholder}`;
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}
