@@ -941,7 +941,7 @@ type LockInfoObservation = { bytes: string; state: LockInfoPathState };
  * verdict about the owner; the record is changing under the observer, which must observe
  * again. On POSIX these codes are real permission failures.
  */
-export function isLockInfoChangingError(error: unknown): boolean {
+function isLockInfoChangingError(error: unknown): boolean {
 	if (process.platform !== "win32") return false;
 	const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
 	return code === "EPERM" || code === "EACCES" || code === "EBUSY" || code === "EBADF";

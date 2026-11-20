@@ -17,11 +17,9 @@ import type {
 } from "../gjc-runtime/gc-runtime";
 import { gcPidStatusLabel } from "../gjc-runtime/gc-runtime";
 import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
-import type { FileLockGcObservation } from "./file-lock";
 import {
 	fileLockStagingOwnerPid,
 	inspectFileLockStagingDir,
-	isLockInfoChangingError,
 	readFileLockObservationForGc,
 	removeFileLockDirForGc,
 } from "./file-lock";
@@ -95,25 +93,7 @@ async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRec
 			reason: staging.reason,
 		};
 	}
-	let observation: FileLockGcObservation | null | undefined;
-	try {
-		observation = await readFileLockObservationForGc(lockDir);
-	} catch (error) {
-		if (isLockInfoChangingError(error)) {
-			return {
-				store: "file_locks",
-				id: lockDir,
-				path: lockDir,
-				pid_status: "unknown",
-				status: "file_lock_info_changing",
-				stale: false,
-				removable: false,
-				action: "none",
-				reason: "file_lock_info_changing_retry_later",
-			};
-		}
-		throw error;
-	}
+	const observation = await readFileLockObservationForGc(lockDir);
 	const info = observation?.info;
 	if (!info) return keptMalformedRecord(lockDir);
 	if (info.owner_host_id !== undefined) {
@@ -262,15 +242,7 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 				return { removed: false, error: errorMessage(error) };
 			}
 		}
-		let observation: FileLockGcObservation | null | undefined;
-		try {
-			observation = await readFileLockObservationForGc(lockDir);
-		} catch (error) {
-			if (isLockInfoChangingError(error)) {
-				return { removed: false, skipped: "file_lock_info_changing_retry_later" };
-			}
-			return { removed: false, error: errorMessage(error) };
-		}
+		const observation = await readFileLockObservationForGc(lockDir);
 		const info = observation?.info;
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
 		if (info.owner_host_id !== undefined) {
