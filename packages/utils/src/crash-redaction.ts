@@ -109,7 +109,7 @@ const V1_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
 	CREDENTIAL_CAMEL_SIMPLE_SUFFIXES_V1,
 );
 const COOKIE_VALUE_PATTERN =
-	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+	/(?:(?<![A-Za-z0-9_-])|(?<=\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?[ \t]*[:=][ \t]*)((?:(?!\+n|\+r\+n)[^\r\n])*)/gi;
 // Cap key inspection; YAML permits the chomping and indentation indicators in either order.
 const YAML_BLOCK_SCALAR_HEADER_PATTERN =
 	/^([ \t]*(?:-[ \t]+)?)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*(?:[ \t]+(?:&[^ \t\r\n]{1,128}|![^ \t\r\n]{1,128}))*[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
@@ -433,6 +433,7 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 		"$1$2«redacted-url-credential»@",
 	);
 	redacted = replacePreservingLines(redacted, /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	const isDebugLocal = text.includes("Cookie:");
 	redacted = replacePreservingLines(redacted, COOKIE_VALUE_PATTERN, (_match: string, prefix: string, value: string) =>
 		parseCredentialYamlBlockScalarHeader(_match) === undefined
 			? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
