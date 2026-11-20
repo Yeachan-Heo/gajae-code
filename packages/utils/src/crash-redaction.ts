@@ -271,6 +271,77 @@ export function redactCrashSecretsV1(text: string): string {
 }
 
 /**
+ * Hook for handling placeholder generation with awareness of multi-line content.
+ * Returns the placeholder for matched text, potentially with line structure preservation.
+ */
+type PlaceholderHook = (matchedText: string, placeholder: string) => string;
+
+/**
+ * Default placeholder hook: returns the placeholder unchanged (byte-identical for single-line).
+ */
+function defaultPlaceholderHook(_matchedText: string, placeholder: string): string {
+	return placeholder;
+}
+
+/**
+ * Line-preserving placeholder hook.
+ * For multi-line matches, preserves line structure by:
+ * 1. Keeping first line verbatim if it's only brackets/whitespace, else use placeholder
+ * 2. For continuation lines: leading whitespace + placeholder + trailing [\ s\]\}\),;]*
+ *    or keep verbatim if only brackets/whitespace/commas
+ *
+ * This ensures line count and structure are preserved for diff scrubbing.
+ */
+function linePreservingPlaceholderHook(matchedText: string, placeholder: string): string {
+	const lines = matchedText.split("\n");
+	if (lines.length === 1) {
+		// Single line: use placeholder
+		return placeholder;
+	}
+
+	// Multi-line: preserve structure
+	const result: string[] = [];
+
+	// First line: keep verbatim if only brackets/whitespace, else use placeholder
+	const firstLine = lines[0];
+	if (/^[\s\[\]{},]*$/.test(firstLine)) {
+		// Only brackets/whitespace/commas: keep as-is
+		result.push(firstLine);
+	} else {
+		// Has content: use placeholder
+		result.push(placeholder);
+	}
+
+	// Continuation lines: leading whitespace + placeholder + trailing bracket/punct, or keep verbatim
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^[\s\[\]{},;)]*$/.test(line)) {
+			// Only brackets/whitespace/commas/semicolons/parens: keep as-is
+			result.push(line);
+		} else {
+			// Extract leading whitespace and trailing punctuation
+			const leadingMatch = line.match(/^(\s*)/);
+			const leadingWs = leadingMatch ? leadingMatch[1] : "";
+
+			// Extract trailing run of \s\]\}\),;
+			const trailingMatch = line.match(/([\s\]\}\),;]*)$/);
+			const trailingPunct = trailingMatch ? trailingMatch[1] : "";
+
+			result.push(leadingWs + placeholder + trailingPunct);
+		}
+	}
+
+	// Verify line count matches
+	if (result.length !== lines.length) {
+		throw new Error(
+			`Line count mismatch in linePreservingPlaceholderHook: original ${lines.length}, result ${result.length}`,
+		);
+	}
+
+	return result.join("\n");
+}
+
+/**
  * Wrapper around replaceAll that preserves newline counts in matched text.
  * When a match containing N newlines is replaced, adds (N - replacedNewlines) extra newlines.
  * This ensures line count is preserved when redacting multi-line content.
@@ -305,12 +376,11 @@ function replacePreservingLines(
 }
 
 /**
- * Like redactCrashSecrets, but preserves line count by adding newlines after placeholders
- * to match the original line count. This is essential for diff scrubbing where projections
- * rely on exact line counts.
+ * Like redactCrashSecrets, but preserves line count using line-aware placeholder hooks.
+ * This is essential for diff scrubbing where projections rely on exact line counts.
  *
- * Uses the same redaction rules as redactCrashSecrets, but post-processes replacements
- * to preserve the number of newlines in matched text.
+ * Uses the same redaction rules as redactCrashSecrets, but applies a line-preserving
+ * placeholder hook to multi-line credential containers.
  */
 export function redactCrashSecretsPreservingLines(text: string): string {
 	// Use the current rules (not V1)
@@ -321,12 +391,12 @@ export function redactCrashSecretsPreservingLines(text: string): string {
  * Internal version of redactCrashSecretsWithRules that preserves line counts.
  */
 function redactCrashSecretsWithRulesPreservingLines(text: string, rules: CredentialRedactionRules): string {
-	// Redact folded headers first
-	let redacted = redactFoldedHeadersPreservingLines(text, rules);
-	// Then container redaction
-	redacted = redactCredentialContainersPreservingLines(redacted, rules);
-	// Block scalar bodies
-	redacted = redactYamlBlockScalarsPreservingLines(redacted, rules);
+	// Redact folded headers first (already works line-by-line)
+	let redacted = redactFoldedHeaders(text, rules);
+	// Then container redaction with line-preserving hook
+	redacted = redactCredentialContainers(redacted, rules, linePreservingPlaceholderHook);
+	// Block scalar bodies (already works line-by-line, preserving structure)
+	redacted = redactYamlBlockScalars(redacted, rules);
 
 	// All remaining replaces use the line-preserving wrapper
 	redacted = replacePreservingLines(
@@ -410,7 +480,7 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 	}
 	redacted = replacePreservingLines(
 		redacted,
-		/(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		/(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;\}\]]{8,}/gi,
 		"$1«redacted»",
 	);
 	redacted = replacePreservingLines(
@@ -424,50 +494,6 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 		"«redacted-aws-key»",
 	);
 	return redacted;
-}
-
-/**
- * redactFoldedHeaders preserving line count.
- */
-function redactFoldedHeadersPreservingLines(text: string, rules: CredentialRedactionRules): string {
-	// First, do the normal redaction
-	const redacted = redactFoldedHeaders(text, rules);
-	// Since redactFoldedHeaders already works line-by-line, it shouldn't change line count
-	// But we apply the wrapper just to be safe
-	return redacted;
-}
-
-/**
- * redactCredentialContainers preserving line count.
- */
-function redactCredentialContainersPreservingLines(text: string, rules: CredentialRedactionRules): string {
-	// Container redaction can span multiple lines, so we need to preserve them
-	// Use the original function which handles container state across lines
-	const originalRedacted = redactCredentialContainers(text, rules);
-	// Compare line counts and add newlines if needed
-	const originalLines = text.split("\n").length;
-	const redactedLines = originalRedacted.split("\n").length;
-	if (redactedLines < originalLines) {
-		// Add empty lines at the end
-		return originalRedacted + "\n".repeat(originalLines - redactedLines);
-	}
-	return originalRedacted;
-}
-
-/**
- * redactYamlBlockScalars preserving line count.
- */
-function redactYamlBlockScalarsPreservingLines(text: string, rules: CredentialRedactionRules): string {
-	// YAML block scalars can span multiple lines
-	const originalRedacted = redactYamlBlockScalars(text, rules);
-	// Compare line counts and add newlines if needed
-	const originalLines = text.split("\n").length;
-	const redactedLines = originalRedacted.split("\n").length;
-	if (redactedLines < originalLines) {
-		// Add empty lines at the end
-		return originalRedacted + "\n".repeat(originalLines - redactedLines);
-	}
-	return originalRedacted;
 }
 
 /**
@@ -794,17 +820,26 @@ function redactCredentialValue(
 	return `${prefix}«redacted»`;
 }
 
-function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
+function redactCredentialContainers(
+	text: string,
+	rules: CredentialRedactionRules,
+	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
+): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
 	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
 	const camelAssignment = new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g");
 	return redactCredentialContainersWithPattern(
-		redactCredentialContainersWithPattern(text, assignment),
+		redactCredentialContainersWithPattern(text, assignment, placeholderHook),
 		camelAssignment,
+		placeholderHook,
 	);
 }
 
-function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
+function redactCredentialContainersWithPattern(
+	text: string,
+	assignment: RegExp,
+	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
+): string {
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
@@ -817,10 +852,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 		// Check if this is a standalone bracket on its own line (folded header structure)
 		// If the bracket is indented and on its own line, skip container redaction
 		const beforeBracket = text.slice(Math.max(0, containerStart - 50), containerStart);
-		if (
-			(bracketChar === "[" || bracketChar === "{") &&
-			beforeBracket.match(/\n\s+$/)
-		) {
+		if ((bracketChar === "[" || bracketChar === "{") && beforeBracket.match(/\n\s+$/)) {
 			// Bracket is on indented line; likely folded header structure, skip it
 			assignment.lastIndex = containerStart + 1;
 			continue;
@@ -831,14 +863,17 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
 		const container = text.slice(containerStart, containerEnd);
 		if (
-			container.endsWith("]")
-			&& REDACTION_PLACEHOLDER_PATTERN.test(container)
-			&& REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))
+			container.endsWith("]") &&
+			REDACTION_PLACEHOLDER_PATTERN.test(container) &&
+			REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))
 		) {
 			assignment.lastIndex = containerEnd;
 			continue;
 		}
-		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+		// Use hook to generate placeholder, handling multi-line content appropriately
+		const containerContent = text.slice(containerStart, containerEnd);
+		const redactedPlaceholder = placeholderHook(containerContent, "«redacted»");
+		output += `${text.slice(copiedUntil, containerStart)}${redactedPlaceholder}`;
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}
