@@ -26,6 +26,9 @@ import {
 	verifyGuideAdvisoryText,
 	verifyGuideManifest,
 } from "../src/sdk/guides/verify";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const TEST_PRIVATE_DER_HEX =
 	"302e020100300506032b6570042204204306f7f7259c18c9dc325fd3e8eb915e3bb81f9b1425e97aa0d62dc1e4a73cb1";
@@ -59,7 +62,7 @@ function makeManifest(overrides: Partial<GuideManifestV1> & { guides: GuideEntry
 }
 
 async function tempAgentDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-guides-"));
+	const dir = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-guides-"));
 	return dir;
 }
 
