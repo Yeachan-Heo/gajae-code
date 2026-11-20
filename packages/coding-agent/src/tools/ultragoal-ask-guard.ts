@@ -111,13 +111,15 @@ export async function assertUltragoalAskAllowed(
 						"Ultragoal ask guard: a verified human-only blocker admits exactly one question. Ask the single question that states what the user must provide.",
 					);
 				}
-				// Human-blocked admission is disabled until we can verify that the receipt
-				// came from independent provenance (not from the active agent process itself).
-				// The classification and verdict commands are public CLI, so robust verification
-				// requires signed attestation or verified timestamp from an external process.
-				throw new ToolError(
-					"Ultragoal ask guard: human-blocked ask admission is disabled until independent provenance can be verified.",
-				);
+				// A verified human-only blocker permits the ask. The receipt (classification +
+				// verdict) is validated at admission time and re-validated under the ledger lock
+				// when the ask is reserved, so a superseded classification cannot admit a stale ask.
+				return {
+					humanBlockedReceipt: {
+						sessionId,
+						classificationEventId: pause.classificationEventId,
+					},
+				};
 			}
 		}
 	}

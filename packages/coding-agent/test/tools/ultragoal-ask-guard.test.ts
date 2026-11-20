@@ -558,23 +558,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		});
 	}
 
-	it("[DISABLED] human-blocked ask admission is disabled until independent provenance can be verified", async () => {
-		// Human-blocked admission is currently disabled because the receipt can be forged by the
-		// active agent process itself. The feature requires independent provenance verification
-		// (e.g., signed attestation or verified timestamp from an external reviewer/process).
-		// See: packages/coding-agent/src/tools/ultragoal-ask-guard.ts:118
-		const cwd = await tempDir();
-		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
-		await createUltragoalPlan({ cwd, brief: "Implement the story" });
-		await recordVerifiedHumanBlock(cwd);
-		const { ask } = guardedAsk(cwd, TEST_SESSION_ID);
-
-		await expect(ask()).rejects.toThrow(
-			/human-blocked ask admission is disabled until independent provenance can be verified/,
-		);
-	});
-
-	it.skip("admits ask without consuming a nudge once the pause receipt is clean", async () => {
+	it("admits ask without consuming a nudge once the pause receipt is clean", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -673,7 +657,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		return ledger.filter(event => event.event === "human_blocked_ask_answered").length;
 	}
 
-	it.skip("spends the receipt on the first answered ask and refuses the next one", async () => {
+	it("spends the receipt on the first answered ask and refuses the next one", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -692,7 +676,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect((await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID })).blocked).toBe(false);
 	});
 
-	it.skip("leaves the receipt unspent when the user cancels the ask", async () => {
+	it("leaves the receipt unspent when the user cancels the ask", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -716,7 +700,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
-	it.skip("admits one more ask after a newly verified human-only blocker", async () => {
+	it("admits one more ask after a newly verified human-only blocker", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
