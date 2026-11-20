@@ -601,6 +601,18 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 			now: deps.now,
 			stopCause: daemon.getStopCause(),
 		});
+	// Register unhandled rejection handler before owner-state to ensure stop cause
+	// is set deterministically when postmortem cleanup runs. The process-wide postmortem
+	// handler may invoke cleanup before the unhandledRejection listener is called, so
+	// we set the stop cause synchronously here when Reason.UNHANDLED_REJECTION is observed.
+	const unregisterUnhandledRejectionPostmortem = postmortem.register(
+		"telegram-daemon:unhandled-rejection",
+		(reason: postmortem.Reason) => {
+			if (reason === postmortem.Reason.UNHANDLED_REJECTION) {
+				daemon.requestStop("unhandled_rejection");
+			}
+		},
+	);
 	const unregisterPostmortem = postmortem.register("telegram-daemon:owner-state", async () => {
 		await recordOwnerStopped();
 	});
@@ -657,6 +669,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		process.off("SIGTERM", onSignal);
 		process.off("SIGINT", onSignal);
 		process.off("unhandledRejection", onUnhandledRejection);
+		unregisterUnhandledRejectionPostmortem();
 		unregisterPostmortem();
 		await recordOwnerStopped();
 	}
