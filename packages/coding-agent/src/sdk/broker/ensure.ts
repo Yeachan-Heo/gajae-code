@@ -1867,7 +1867,9 @@ async function ensureBrokerOnce(
 						reason:
 							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
-						lockRefused: trustedStartupExitRecord?.reason === "startup-lock-refused",
+						lockRefused:
+							trustedStartupExitRecord?.reason === "startup-lock-refused" ||
+							trustedMarker?.reason?.startsWith("Broker lock") === true,
 					})
 				: discoveryError
 					? discoveryError
