@@ -506,3 +506,30 @@ test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as 
 		await Bun.$`icacls ${infoPath} /remove:d ${user}`.quiet();
 	}
 });
+
+// A retiring owner deletes `<lock>.removing` while GC walks its parent, and Windows refuses
+// to list it meanwhile (reproduced by file-lock-windows-stress). It never holds a lock.
+test("gc does not list a lock's removal transition", async () => {
+	const tempDir = await createTempDir();
+	const transitions = [
+		path.join(tempDir, "state.json.lock.removing"),
+		path.join(tempDir, `.gjc-lock-${"a".repeat(64)}.removing`),
+	];
+	for (const transition of transitions) {
+		await fs.mkdir(transition);
+		await fs.writeFile(path.join(transition, "info"), JSON.stringify({ pid: 12345, timestamp: Date.now() }));
+	}
+	const realReaddir = fs.readdir;
+	vi.spyOn(fs, "readdir").mockImplementation((async (target: string, options?: undefined) => {
+		if (transitions.some(transition => samePath(String(target), transition)))
+			throw Object.assign(new Error(`EPERM: operation not permitted, scandir '${String(target)}'`), {
+				code: "EPERM",
+			});
+		return realReaddir(target, options);
+	}) as typeof fs.readdir);
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	expect(collected.errors).toEqual([]);
+	expect(collected.records).toEqual([]);
+});

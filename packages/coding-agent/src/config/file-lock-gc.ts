@@ -20,6 +20,7 @@ import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
 import {
 	fileLockStagingOwnerPid,
 	inspectFileLockStagingDir,
+	isFileLockRemovalTransitionName,
 	readFileLockObservationForGc,
 	removeFileLockDirForGc,
 } from "./file-lock";
@@ -182,7 +183,8 @@ async function walkForLockDirs(
 			await walkForLockDirs(path.join(dir, entry), MAX_WALK_DEPTH - 1, state, lockDirs, errors, maxWalkEntries);
 			continue;
 		}
-		if (PRUNED_DIR_NAMES.has(entry)) continue;
+		// Windows refuses to list a transition while its owner deletes it (EPERM scandir).
+		if (PRUNED_DIR_NAMES.has(entry) || isFileLockRemovalTransitionName(entry)) continue;
 		await walkForLockDirs(path.join(dir, entry), depth + 1, state, lockDirs, errors, maxWalkEntries);
 	}
 }
