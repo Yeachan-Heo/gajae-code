@@ -109,7 +109,7 @@ const V1_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
 	CREDENTIAL_CAMEL_SIMPLE_SUFFIXES_V1,
 );
 const COOKIE_VALUE_PATTERN =
-	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+	/(?:(?<![A-Za-z0-9_-])|(?<=\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?[ \t]*[:=][ \t]*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
 // Cap key inspection; YAML permits the chomping and indentation indicators in either order.
 const YAML_BLOCK_SCALAR_HEADER_PATTERN =
 	/^([ \t]*(?:-[ \t]+)?)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*(?:[ \t]+(?:&[^ \t\r\n]{1,128}|![^ \t\r\n]{1,128}))*[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
@@ -654,10 +654,10 @@ function linePreservingPlaceholderHook(matchedText: string, placeholder: string)
 
 	// First line: keep verbatim if only brackets/whitespace, or if it ends with an opening bracket
 	const firstLine = lines[0];
-	if (/^[\s\[\]{},]*$/.test(firstLine)) {
+	if (/^[\s[\]{},]*$/.test(firstLine)) {
 		// Only brackets/whitespace/commas: keep as-is
 		result.push(firstLine);
-	} else if (/[\[{][ \t]*$/.test(firstLine)) {
+	} else if (/[[{][ \t]*$/.test(firstLine)) {
 		// Ends with an opening bracket: preserve the line as-is to maintain bracket structure
 		result.push(firstLine);
 	} else {
@@ -668,7 +668,7 @@ function linePreservingPlaceholderHook(matchedText: string, placeholder: string)
 	// Continuation lines: leading whitespace + placeholder + trailing bracket/punct, or keep verbatim
 	for (let i = 1; i < lines.length; i++) {
 		const line = lines[i];
-		if (/^[\s\[\]{},;)]*$/.test(line)) {
+		if (/^[\s[\]{},;)]*$/.test(line)) {
 			// Only brackets/whitespace/commas/semicolons/parens: keep as-is
 			result.push(line);
 		} else {
@@ -677,7 +677,7 @@ function linePreservingPlaceholderHook(matchedText: string, placeholder: string)
 			const leadingWs = leadingMatch ? leadingMatch[1] : "";
 
 			// Extract trailing run of \s\]\}\),;
-			const trailingMatch = line.match(/([\s\]\}\),;]*)$/);
+			const trailingMatch = line.match(/([\s\]}),;]*)$/);
 			const trailingPunct = trailingMatch ? trailingMatch[1] : "";
 
 			result.push(leadingWs + placeholder + trailingPunct);
@@ -837,7 +837,7 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 	}
 	redacted = replacePreservingLines(
 		redacted,
-		/(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;\}\]]{8,}/gi,
+		/(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
 		"$1«redacted»",
 	);
 	redacted = replacePreservingLines(
