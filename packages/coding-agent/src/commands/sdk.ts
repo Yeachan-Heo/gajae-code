@@ -1981,6 +1981,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		timeoutMs?: number,
 		blockingLockPath?: string,
 		refusalCode?: BrokerLockRefusalCode,
+		spawnAttemptNonce?: string,
 	): BrokerStartupExitRecord & Record<string, unknown> => ({
 		version: 1,
 		reason,
@@ -1995,6 +1996,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		writtenAt: Date.now(),
 		...(blockingLockPath === undefined ? {} : { blockingLockPath }),
 		...(refusalCode === undefined ? {} : { refusalCode }),
+		...(spawnAttemptNonce === undefined ? {} : { spawnAttemptNonce }),
 	});
 	const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
 		const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
@@ -2037,13 +2039,22 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		timeoutMs?: number,
 		blockingLockPath?: string,
 		refusalCode?: BrokerLockRefusalCode,
+		spawnAttemptNonce?: string,
 	): Promise<boolean> => {
 		// The first startup exit cause owns both the persisted reason and the process exit code.
 		if (startupExitTask) return startupExitReason === reason ? startupExitTask : Promise.resolve(false);
 		if (startupExitRequested) return Promise.resolve(false);
 		startupExitRequested = true;
 		startupExitReason = reason;
-		const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs, blockingLockPath, refusalCode);
+		const exitRecord = makeStartupExitRecord(
+			reason,
+			exitCode,
+			signal,
+			timeoutMs,
+			blockingLockPath,
+			refusalCode,
+			spawnAttemptNonce,
+		);
 		const message =
 			reason === "startup-lock-blocked" && blockingLockPath
 				? `SDK broker startup blocked by retained removal transition ${blockingLockPath}.`
@@ -2378,7 +2389,16 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		} else if (error instanceof BrokerLockRefusedError) {
 			// A live, foreign-host or host-unqualified broker.lock is never displaced; the
 			// typed record lets the spawning client report the refusal instead of a bare exit.
-			await exitDuringStartup("startup-lock-refused", 1, null, undefined, error.lockPath, error.code);
+			const spawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
+			await exitDuringStartup(
+				"startup-lock-refused",
+				1,
+				null,
+				undefined,
+				error.lockPath,
+				error.code,
+				spawnAttemptNonce,
+			);
 		}
 		if (broker) {
 			try {
@@ -2391,6 +2411,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		// durable marker is the only channel the caller has to see why start()
 		// failed instead of a bare exit code (#3963).
 		const startupFailureIncarnation = processIncarnation(process.pid);
+		const spawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 		const markerWritten = await writeBrokerStartupFailureMarkerBounded(agentDir, {
 			reason: error instanceof Error ? error.message : String(error),
 			exitCode: 1,
@@ -2398,6 +2419,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			pid: process.pid,
 			...(startupFailureIncarnation === undefined ? {} : { incarnation: startupFailureIncarnation }),
 			...(error instanceof BrokerLockRefusedError ? { lockRefusalCode: error.code } : {}),
+			...(spawnAttemptNonce === undefined ? {} : { spawnAttemptNonce }),
 		});
 		logger.error("sdk broker: startup failed", {
 			reason: "startup-failure",
@@ -2442,12 +2464,14 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		// Record why so a caller polling for a winner that never appears can
 		// diagnose the loss instead of seeing only a bare exit code.
 		const losingIncarnation = processIncarnation(process.pid);
+		const losingSpawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 		await writeBrokerStartupFailureMarkerBounded(agentDir, {
 			reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
 			exitCode: publicBrokerRun ? 1 : 0,
 			signal: null,
 			pid: process.pid,
 			...(losingIncarnation === undefined ? {} : { incarnation: losingIncarnation }),
+			...(losingSpawnAttemptNonce === undefined ? {} : { spawnAttemptNonce: losingSpawnAttemptNonce }),
 		});
 		unregisterPostmortem();
 		if (publicBrokerRun) failPublicBrokerRun(agentDir);

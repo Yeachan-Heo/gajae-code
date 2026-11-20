@@ -29,6 +29,12 @@ export interface BrokerStartupFailureMarker {
 	pid: number;
 	/** Kernel-derived identity for the exact process incarnation that wrote the marker. */
 	incarnation: string;
+	/**
+	 * Nonce generated per spawn attempt to bind refusal records to this specific spawn.
+	 * Prevents false attribution when a foreign broker with a colliding PID writes a
+	 * marker in a shared agent directory.
+	 */
+	spawnAttemptNonce?: string;
 }
 
 const BROKER_STARTUP_FAILURE_FILE = "broker.startup-failure.json";
@@ -116,10 +122,11 @@ export type BrokerStartupFailure = {
 	pid: number;
 	incarnation?: string;
 	lockRefusalCode?: BrokerLockRefusalCode;
+	spawnAttemptNonce?: string;
 };
 
 function boundedMarker(failure: BrokerStartupFailure, incarnation: string): BrokerStartupFailureMarker {
-	const { reason, exitCode, signal, pid, lockRefusalCode } = failure;
+	const { reason, exitCode, signal, pid, lockRefusalCode, spawnAttemptNonce } = failure;
 	return {
 		version: 2,
 		...boundedFailureDetails(reason),
@@ -129,6 +136,7 @@ function boundedMarker(failure: BrokerStartupFailure, incarnation: string): Brok
 		writtenAt: Date.now(),
 		pid,
 		incarnation,
+		...(spawnAttemptNonce === undefined ? {} : { spawnAttemptNonce }),
 	};
 }
 
@@ -197,7 +205,8 @@ export async function readBrokerStartupFailureMarker(
 			!Number.isInteger(marker.pid) ||
 			marker.pid <= 0 ||
 			typeof marker.incarnation !== "string" ||
-			marker.incarnation.length === 0
+			marker.incarnation.length === 0 ||
+			(marker.spawnAttemptNonce !== undefined && typeof marker.spawnAttemptNonce !== "string")
 		)
 			return undefined;
 		return marker as BrokerStartupFailureMarker;

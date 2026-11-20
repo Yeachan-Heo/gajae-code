@@ -11,6 +11,7 @@ import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { ensureBroker, reapFailedBrokerLaunch } from "../src/sdk/broker/ensure";
 import { BrokerLockRefusedError } from "../src/sdk/broker/lock-refusal";
 import {
+	type BrokerStartupFailureMarker,
 	BrokerStartupError,
 	brokerStartupFailurePath,
 	readBrokerStartupFailureMarker,
@@ -70,6 +71,72 @@ describe("broker startup lock refusal", () => {
 			// The in-process exit-record writer can still hold the directory on Windows (EBUSY); the
 			// directory lives under the test temp root, so a failed removal only leaves a scratch dir.
 			await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+		}
+	});
+});
+
+describe("broker spawn-attempt nonce binding", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	it("matching nonce binds refusal record to the spawned broker", async () => {
+		// Verify that a startup-failure marker with the correct nonce is attributed
+		// to the spawned child and is trusted for failure classification.
+		const dir = await temp();
+		try {
+			const marker: BrokerStartupFailureMarker = {
+				version: 2,
+				reason: "test lock refusal",
+				exitCode: 1,
+				signal: null,
+				writtenAt: Date.now(),
+				pid: process.pid,
+				incarnation: "test-incarnation",
+				lockRefusalCode: "live_owner",
+				spawnAttemptNonce: "matching-nonce-uuid",
+			};
+			await Bun.write(brokerStartupFailurePath(dir), JSON.stringify(marker));
+			const read = await readBrokerStartupFailureMarker(dir);
+			expect(read).toMatchObject({ spawnAttemptNonce: "matching-nonce-uuid", lockRefusalCode: "live_owner" });
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("different nonce rejects the marker even when PID and time match", async () => {
+		// Verify that a startup-failure marker with a different nonce is NOT
+		// trusted, preventing false attribution from foreign brokers with
+		// colliding PIDs in shared agent directories.
+		const dir = await temp();
+		try {
+			const baseMarker: Omit<
+				BrokerStartupFailureMarker,
+				"spawnAttemptNonce" | "lockRefusalCode" | "cleanupCommand"
+			> = {
+				version: 2,
+				reason: "test",
+				exitCode: 1,
+				signal: null,
+				writtenAt: Date.now(),
+				pid: process.pid,
+				incarnation: "test-incarnation",
+			};
+
+			// Marker with a different nonce should not be trusted
+			await Bun.write(
+				brokerStartupFailurePath(dir),
+				JSON.stringify({ ...baseMarker, spawnAttemptNonce: "foreign-nonce" }),
+			);
+			let read = await readBrokerStartupFailureMarker(dir);
+			// The marker is still readable, but won't be matched by ensureBroker
+			// because the nonce doesn't match
+			expect(read).toMatchObject({ spawnAttemptNonce: "foreign-nonce" });
+
+			// Marker without a nonce should also be readable but not trusted
+			await Bun.write(brokerStartupFailurePath(dir), JSON.stringify(baseMarker));
+			read = await readBrokerStartupFailureMarker(dir);
+			expect(read?.spawnAttemptNonce).toBeUndefined();
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 });

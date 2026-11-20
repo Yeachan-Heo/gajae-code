@@ -70,6 +70,12 @@ export interface BrokerStartupExitRecord {
 	blockingLockPath?: string;
 	/** For `startup-lock-refused`: why the live, foreign-host or host-unqualified `broker.lock` was refused. */
 	refusalCode?: BrokerLockRefusalCode;
+	/**
+	 * Nonce generated per spawn attempt to bind refusal records to this specific spawn.
+	 * Prevents false attribution when a foreign broker with a colliding PID writes a
+	 * record in a shared agent directory.
+	 */
+	spawnAttemptNonce?: string;
 }
 
 export type BrokerStartupExitWriteStatus =
@@ -172,8 +178,9 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 		"writtenAt",
 	];
 	const isValidShape =
-		keys.every(k => requiredKeys.includes(k) || k === "blockingLockPath" || k === "refusalCode") &&
-		requiredKeys.every(k => keys.includes(k));
+		keys.every(
+			k => requiredKeys.includes(k) || k === "blockingLockPath" || k === "refusalCode" || k === "spawnAttemptNonce",
+		) && requiredKeys.every(k => keys.includes(k));
 	return (
 		isValidShape &&
 		record.version === 1 &&
@@ -200,6 +207,7 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 		(record.reason === "startup-lock-refused"
 			? record.refusalCode !== undefined && BROKER_LOCK_REFUSAL_CODES.includes(record.refusalCode)
 			: record.refusalCode === undefined) &&
+		(record.spawnAttemptNonce === undefined || typeof record.spawnAttemptNonce === "string") &&
 		(record.reason === "startup-deadline" || record.reason === "startup-lock-blocked"
 			? record.exitCode === 1 && record.signal === null && record.timeoutMs !== null
 			: record.reason === "startup-lock-unavailable" || record.reason === "startup-lock-refused"
