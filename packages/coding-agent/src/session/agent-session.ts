@@ -17721,7 +17721,17 @@ export class AgentSession {
 	 * The legacy form throws inline as before. The shared form publishes in the background:
 	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
 	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
-	 * `onCommitted` fires only when the entry is durable.
+	 *
+	 * On the shared path `onCommitted` fires only after the entry committed, so it means the
+	 * entry is durable. On the legacy path it fires right after `SessionManager.appendMessage`,
+	 * which only admits the entry: `_persist` deliberately returns before writing a transcript
+	 * until the session is ensured on disk or holds its first assistant entry. A legacy
+	 * callback therefore means "recorded in this session's graph", not "durable after a reload".
+	 *
+	 * On the shared path the callback runs after the durable write, so its failure is neither
+	 * a refusal nor a reason to publish again. It is reported through the operator-notice seam and the
+	 * structured log, and the callback-bearing task is tracked: leaving it unobserved would
+	 * turn a throwing callback into an unhandled rejection after a successful append.
 	 */
 	#publishMessageInBackground(
 		label: string,
@@ -17733,11 +17743,39 @@ export class AgentSession {
 			onCommitted?.();
 			return Promise.resolve({ committed: true });
 		}
-		return this.#publishInBackground(label, () => this.sessionManager.appendMessageSharingSession(message)).then(
-			result => {
-				if (result.committed) onCommitted?.();
+		const publication = this.#publishInBackground(label, () =>
+			this.sessionManager.appendMessageSharingSession(message),
+		);
+		return this.#trackBackgroundPublication(
+			publication.then(result => {
+				if (result.committed) {
+					try {
+						onCommitted?.();
+					} catch (error) {
+						this.#reportBackgroundFollowUpFailure(label, error);
+					}
+				}
 				return result;
-			},
+			}),
+		);
+	}
+
+	/**
+	 * Report a completion callback that threw after its entry was already durable.
+	 *
+	 * The entry is saved and must not be published again, so this is neither a refusal nor
+	 * an uncertainty: the operator only needs to know the follow-up step did not run.
+	 */
+	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
+		logger.warn("A durable shared publication's completion callback failed", {
+			operation,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		if (this.#isDisposed) return;
+		this.emitNotice(
+			"warning",
+			`Saved the ${operation} to this session, but its completion step failed.`,
+			"session-publication",
 		);
 	}
 
@@ -33608,8 +33646,12 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortBash() still cancels all Bash executions.
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is persisted: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it. Only a shared-transaction session guarantees
+	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
+	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
+	 *   so it does not by itself prove the entry survives a reload.
 	 */
 	async executeBash(
 		command: string,
@@ -33778,8 +33820,12 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortEval() still cancels all Python executions.
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is persisted: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it. Only a shared-transaction session guarantees
+	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
+	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
+	 *   so it does not by itself prove the entry survives a reload.
 	 */
 	async executePython(
 		code: string,
@@ -33930,7 +33976,11 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			void this.#publishMessageInBackground("python result", pythonMessage);
+			// `onPersisted` is the durability signal: a shared append may be refused or end
+			// with an unknown outcome, and reporting success before the entry is committed
+			// would promise a reload survival that never happened (#7815). A legacy session
+			// has no such guarantee: it fires the callback after the in-memory append.
+			void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -33938,7 +33988,6 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
-			options?.onPersisted?.();
 		}
 	}
 
