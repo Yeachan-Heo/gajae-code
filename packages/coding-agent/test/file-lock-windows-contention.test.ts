@@ -462,37 +462,47 @@ test("publication rollback exhaustion under persistent access_denied reports acc
 	expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).pid).toBe(process.pid);
 });
 
-test("GC treats persistent EPERM on lock info as error, not transient changing", async () => {
+// GC never classifies a refused `info` read as lock motion: a reader-side refusal was not
+// observed under real multi-process churn, and an ACL-denied record refuses every pass.
+// Treating it as "changing" kept the lock and let `gjc gc` exit successfully.
+function gcContext(cwd: string): GcContext {
+	return { cwd, env: {}, force: false, probe: () => ({ status: "keep" }) };
+}
+
+test("gc reports a refused owner record as a collection error", async () => {
 	const tempDir = await createTempDir();
 	const lockDir = path.join(tempDir, "state.json.lock");
 	const infoPath = path.join(lockDir, "info");
 	await fs.mkdir(lockDir);
 	await fs.writeFile(infoPath, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
-
 	const realOpenSync = fsSync.openSync;
-	// Mock openSync to persistently deny access to the info file
 	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
-		if (samePath(String(target), infoPath)) {
-			throw Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
-				code: "EPERM",
-			});
-		}
+		if (samePath(String(target), infoPath))
+			throw Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), { code: "EPERM" });
 		return realOpenSync(target, flags, mode);
 	}) as typeof fsSync.openSync);
 
-	const ctx: GcContext = {
-		cwd: tempDir,
-		env: {},
-		force: false,
-		probe: () => ({ status: "keep" }),
-	};
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
 
-	// GC collection should report the persistent error, not treat it as "changing"
-	const collected = await collectFileLocksForGc(ctx, { roots: [tempDir] });
-	vi.restoreAllMocks();
+	expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+	expect(collected.records).toEqual([]);
+});
 
-	// Error should be recorded in errors array
-	expect(collected.errors.length).toBeGreaterThan(0);
-	const permError = collected.errors.find(e => e.message.includes("EPERM"));
-	expect(permError).toBeDefined();
+test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as an error on every pass", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
+	const user = os.userInfo().username;
+	await Bun.$`icacls ${infoPath} /deny ${`${user}:(R)`}`.quiet();
+	try {
+		for (let pass = 0; pass < 2; pass++) {
+			const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+			expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+			expect(collected.records).toEqual([]);
+		}
+	} finally {
+		await Bun.$`icacls ${infoPath} /remove:d ${user}`.quiet();
+	}
 });
