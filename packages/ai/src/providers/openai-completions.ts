@@ -647,6 +647,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let strictFallbackErrorMessage: string | undefined;
 			let effectiveServiceTier: ServiceTier | undefined;
 			let effectiveToolChoice: unknown; // Captured from buildParams for use in DSML recovery filtering
+			let submittedToolNames = new Set<string>();
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
@@ -667,6 +668,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					params = replacementPayload as typeof params;
 				}
 				effectiveToolChoice = (params as Record<string, unknown>).tool_choice ?? builtEffectiveToolChoice;
+				submittedToolNames = new Set(
+					(Array.isArray(params.tools) ? params.tools : []).flatMap(tool =>
+						tool?.type === "function" && typeof tool.function?.name === "string" ? [tool.function.name] : [],
+					),
+				);
 				// Capture the service tier for use in cost calculations
 				effectiveServiceTier = (params as Record<string, unknown>).service_tier as ServiceTier | undefined;
 				output.serviceTier = parseResolvedServiceTier(effectiveServiceTier);
@@ -1065,7 +1071,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				'<|DSML| invoke name="_i" string="true">',
 			];
 			const checkMalformedVenice =
-				model.provider === "venice" && /deepseek/i.test(model.id) && !!context.tools?.length;
+				model.provider === "venice" &&
+				/deepseek/i.test(model.id) &&
+				submittedToolNames.size > 0 &&
+				extractToolChoiceLevel(effectiveToolChoice).requestLevel !== "none" &&
+				requestedToolChoiceLevel(options?.toolChoice).requestedLevel !== "none";
 			let malformedVeniceTail = "";
 			let malformedVeniceCall = false;
 			const filterMalformedVenice = (delta: string): string => {
@@ -1473,7 +1483,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const offeredToolNames = new Set((context.tools ?? []).map(tool => tool.name));
 				const allowedRecoveredCalls = recoveredCalls.filter(
 					({ call }) =>
-						!rejectAll && offeredToolNames.has(call.name) && allowedNames.every(name => call.name === name),
+						!rejectAll &&
+						!call.incomplete &&
+						offeredToolNames.has(call.name) &&
+						submittedToolNames.has(call.name) &&
+						allowedNames.every(name => call.name === name),
 				);
 
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
@@ -1554,8 +1568,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			output.errorMessage = strictFallbackErrorMessage;
 			if (
 				malformedVeniceCall &&
-				extractToolChoiceLevel(effectiveToolChoice).requestLevel !== "none" &&
-				requestedToolChoiceLevel(options?.toolChoice).requestedLevel !== "none" &&
 				(output.stopReason === "stop" || output.stopReason === "toolUse") &&
 				countStructuredCalls() === 0
 			) {

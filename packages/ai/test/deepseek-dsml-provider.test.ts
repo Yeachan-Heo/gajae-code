@@ -174,6 +174,15 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).toBe(example);
 	});
 
+	it("preserves the whole wrapperless answer when tools are forbidden", async () => {
+		const content =
+			'Before <｜DSML｜ invoke name="_i" string="true">sample</｜DSML｜ parameter><｜DSML｜ parameter name="command" string="true">sample</｜DSML｜ parameter> After';
+		const result = await response([{ content }], { toolChoice: "none" }, offeredTools, "venice");
+		expect(result.stopReason).toBe("stop");
+		expect(tools(result)).toEqual([]);
+		expect(text(result)).toBe(content);
+	});
+
 	it("reports a malformed wrapperless invocation rather than silently ending the turn", async () => {
 		const result = await response(
 			[
@@ -205,13 +214,17 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).toBe("BeforeAfter");
 	});
 
-	it("does not expose an executable call for a parameter close with no parameter open", async () => {
-		const result = await response([
-			{
-				content: `${wrapperStart}<｜DSML｜invoke name="read"></｜DSML｜parameter></｜DSML｜invoke>${wrapperEnd}`,
-			},
-		]);
-		expect(tools(result).filter(call => !call.incompleteArguments)).toHaveLength(0);
+	it("does not publish malformed recovered calls in content or streaming events", async () => {
+		const emitted: string[] = [];
+		const result = await response(
+			[{ content: `${wrapperStart}<｜DSML｜invoke name="read"></｜DSML｜parameter></｜DSML｜invoke>${wrapperEnd}` }],
+			{},
+			offeredTools,
+			model.provider,
+			name => emitted.push(name),
+		);
+		expect(tools(result)).toEqual([]);
+		expect(emitted).toEqual([]);
 	});
 
 	it("does not expose an executable call when invoke closes with its parameter still open", async () => {
@@ -317,6 +330,21 @@ describe("DeepSeek DSML provider streaming", () => {
 		]);
 		// Should have 2 calls: one structured (suppressing one recovered) and one unmatched recovered
 		expect(tools(result)).toHaveLength(2);
+	});
+
+	it("recovers only tools present in the final submitted list", async () => {
+		const result = await response(
+			[{ content: `${wrapperStart}${invocationStart}sample${invocationEnd}${wrapperEnd}` }],
+			{
+				onPayload(payload) {
+					return {
+						...(payload as object),
+						tools: [{ type: "function", function: { name: "write", parameters: {} } }],
+					};
+				},
+			},
+		);
+		expect(tools(result)).toEqual([]);
 	});
 
 	it("honors tool choice changed in place by onPayload", async () => {
