@@ -810,14 +810,30 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
 		const containerStart = assignment.lastIndex;
 		if (containerStart < copiedUntil) continue;
+
+		// Get the character at the container start position
+		const bracketChar = text[containerStart];
+
+		// Check if this is a standalone bracket on its own line (folded header structure)
+		// If the bracket is indented and on its own line, skip container redaction
+		const beforeBracket = text.slice(Math.max(0, containerStart - 50), containerStart);
+		if (
+			(bracketChar === "[" || bracketChar === "{") &&
+			beforeBracket.match(/\n\s+$/)
+		) {
+			// Bracket is on indented line; likely folded header structure, skip it
+			assignment.lastIndex = containerStart + 1;
+			continue;
+		}
+
 		const containerEnd = findCredentialContainerEnd(text, containerStart);
 		// `[REDACTED_TOKEN]` from an earlier pass is bracketed but is a placeholder, not a
 		// container — only when a field boundary follows, so nothing can trail it unscrubbed.
 		const container = text.slice(containerStart, containerEnd);
 		if (
-			container.endsWith("]") &&
-			REDACTION_PLACEHOLDER_PATTERN.test(container) &&
-			REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))
+			container.endsWith("]")
+			&& REDACTION_PLACEHOLDER_PATTERN.test(container)
+			&& REDACTION_PLACEHOLDER_BOUNDARY_PATTERN.test(text.slice(containerEnd))
 		) {
 			assignment.lastIndex = containerEnd;
 			continue;
