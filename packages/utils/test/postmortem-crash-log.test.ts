@@ -1382,6 +1382,22 @@ here`;
 				expect(preserving).toBe(original);
 			}
 		});
+
+		it("preserves opening bracket in multi-line JSON container", () => {
+			const input = `{"secret": [
+  "old-side-secret-canary-123"
+]
+}`;
+			const redacted = redactCrashSecretsPreservingLines(input);
+			// Line count preserved
+			expect(redacted.split("\n")).toHaveLength(input.split("\n").length);
+			// Opening bracket preserved on first line
+			expect(redacted).toContain('{"secret": [');
+			// Secret value redacted
+			expect(redacted).not.toContain("old-side-secret-canary-123");
+			// Closing bracket preserved
+			expect(redacted).toContain("]\n}");
+		});
 	});
 });
 

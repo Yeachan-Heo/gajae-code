@@ -475,6 +475,11 @@ function redactCredentialValue(
 	if (unclosedBacktickQuoted !== undefined && unclosedBacktickOpen !== undefined) {
 		return `${prefix}${unclosedBacktickOpen}«redacted»`;
 	}
+	// Skip bare opening brackets at end of line (structural, not a credential value).
+	// This can occur in preserving-line mode where container brackets are preserved on separate lines.
+	if (/^[\[\{]\s*$/.test(value)) {
+		return _match;
+	}
 	return `${prefix}«redacted»`;
 }
 
