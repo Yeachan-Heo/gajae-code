@@ -55,6 +55,7 @@ async function response(
 	deltas: Delta[],
 	options: Omit<OpenAICompletionsOptions, "apiKey"> = {},
 	offered: typeof offeredTools = offeredTools,
+	provider = model.provider,
 ): Promise<AssistantMessage> {
 	const events = [...deltas, {}].map((delta, index) => ({
 		id: "chatcmpl-dsml",
@@ -69,11 +70,11 @@ async function response(
 		{ preconnect: originalFetch.preconnect },
 	);
 	const result = await streamOpenAICompletions(
-		model,
+		{ ...model, provider },
 		{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }], tools: offered },
 		{ apiKey: "test", ...options },
 	).result();
-	expect(result.stopReason).not.toBe("error");
+	if (provider === model.provider) expect(result.stopReason).not.toBe("error");
 	return result;
 }
 
@@ -142,6 +143,21 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(tools(result)[0].id).toBe("call_structured");
 		expect(tools(result)[0].arguments).toEqual({ path: "src/index.ts" });
 		expect(text(result)).toBe("");
+	});
+
+	it("reports a malformed wrapperless invocation rather than silently ending the turn", async () => {
+		const result = await response(
+			[
+				{ content: "Checking.\n<｜DS" },
+				{ content: 'ML｜ invoke name="_i" string="true">probe</｜DSML｜ parameter>' },
+			],
+			{},
+			offeredTools,
+			"venice",
+		);
+		expect(tools(result).filter(call => !call.incompleteArguments)).toHaveLength(0);
+		expect(result.stopReason).toBe("error");
+		expect(text(result)).not.toContain("DSML");
 	});
 
 	it("does not expose an executable call for a parameter close with no parameter open", async () => {

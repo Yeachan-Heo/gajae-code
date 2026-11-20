@@ -7,3 +7,4 @@
 - A recovered DSML call that the model issued before a distinct structured call is marked incomplete instead of being emitted after it, so tool execution order never inverts (for example a read running before the write that preceded it).
 - Malformed DSML invocations are marked incomplete and are not executed. This covers an invocation closed with a parameter still open, a nested parameter, a JSON-typed value that does not parse, unknown DSML markup inside an argument, payload text outside any parameter, a parameter close with no parameter open, and a DSML tag that never terminates.
 - An unterminated DSML tag no longer hides the rest of the response: text outside a tool call is released after a bounded hold.
+- Venice DeepSeek responses containing a malformed wrapperless argument tag are rejected when no tool call was emitted. The agent retries that completion once in sessions without managed fallback.

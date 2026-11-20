@@ -1062,6 +1062,30 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (stripped && (stripped === flushable || stripped.trim().length > 0)) appendTextDelta(stripped);
 			};
 
+			// Venice can emit an argument label as a wrapperless invocation. This
+			// is not a tool name and must never enter the DSML recovery parser.
+			const malformedVeniceTags = [
+				'<｜DSML｜ invoke name="_i" string="true">',
+				'<|DSML| invoke name="_i" string="true">',
+			];
+			const checkMalformedVenice =
+				model.provider === "venice" && /deepseek/i.test(model.id) && !!context.tools?.length;
+			let malformedVeniceTail = "";
+			let malformedVeniceCall = false;
+			const filterMalformedVenice = (delta: string): string => {
+				if (!checkMalformedVenice || !delta) return delta;
+				if (malformedVeniceCall) return "";
+				const text = malformedVeniceTail + delta;
+				const marker = findFirstTag(text, malformedVeniceTags);
+				if (marker) {
+					malformedVeniceCall = true;
+					malformedVeniceTail = "";
+					return text.slice(0, marker.index);
+				}
+				malformedVeniceTail = getTrailingPartialTag(text, malformedVeniceTags);
+				return text.slice(0, text.length - malformedVeniceTail.length);
+			};
+
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
 			const dsmlHealer =
 				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens
@@ -1205,7 +1229,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									markProviderSafetyStop("Provider returned a safety refusal");
 								}
 							}
-							const normalizedDeltaText = normalizeStreamingContentText(choice.delta.content);
+							const normalizedDeltaText = filterMalformedVenice(
+								normalizeStreamingContentText(choice.delta.content),
+							);
 							if (normalizedDeltaText.length > 0) {
 								if (!firstTokenTime) firstTokenTime = Date.now();
 								if (parseMiniMaxThinkTags) {
@@ -1367,6 +1393,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// than be reclassified as a decode loop (#5627 r4, commit c2aa25d30).
 			// No abort either — the stream has already ended, so aborting would set
 			// `repetitionSelfAbort` for nothing.
+			if (malformedVeniceTail) {
+				const clean = dsmlHealer ? dsmlHealer.feed(malformedVeniceTail) : malformedVeniceTail;
+				if (clean) appendTextDelta(clean);
+			}
 			for (const [guard, channel] of [
 				[textRepetitionGuard, "text"],
 				[thinkingRepetitionGuard, "thinking"],
@@ -1488,7 +1518,15 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			output.errorMessage = strictFallbackErrorMessage;
-			if (isEmptyOpenAICompletionsResponse(output, hasExplicitUsageReport, hasNonzeroUsageEvidence)) {
+			if (
+				malformedVeniceCall &&
+				(output.stopReason === "stop" || output.stopReason === "toolUse") &&
+				countStructuredCalls() === 0
+			) {
+				output.stopReason = "error";
+				output.errorCode = "venice_deepseek_malformed_tool_call";
+				output.errorMessage = "Venice DeepSeek returned malformed tool-call markup without a structured tool call.";
+			} else if (isEmptyOpenAICompletionsResponse(output, hasExplicitUsageReport, hasNonzeroUsageEvidence)) {
 				output.stopReason = "error";
 				output.errorMessage = OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE;
 				output.transportFailure = {
