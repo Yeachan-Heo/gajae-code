@@ -24,7 +24,7 @@ function oauth(email: string, accountId: string, organizationId?: string) {
 		expires: Date.now() + 3_600_000,
 		email,
 		accountId,
-		...(organizationId ? { organizationId, organizationName: organizationId } : {}),
+		...(organizationId ? { organizationId, organizationName: `${organizationId} Team` } : {}),
 	};
 }
 
@@ -157,9 +157,9 @@ describe("gjc accounts prefer", () => {
 	);
 
 	it(
-		"stores organization ids for one login in several organizations, read back as those rows",
+		"stores organization ids even when selected by display name, read back as those rows",
 		async () => {
-			const result = await preferJson(["org:org-b", `id:${ids[2]}=90`]);
+			const result = await preferJson(["org:org-b Team", `id:${ids[2]}=90`]);
 
 			const entries = ["org:org-b", { "org:org-a": 90 }];
 			expect(result).toEqual({ ok: true, provider: "anthropic", preferences: entries } as never);
@@ -178,6 +178,72 @@ describe("gjc accounts prefer", () => {
 			} finally {
 				storage.close();
 			}
+		},
+		CLI_TIMEOUT_MS,
+	);
+
+	it.each([
+		[
+			"uses an organization id shared only with a disabled row",
+			oauth("other@example.com", "acct-other", "org-b"),
+			3,
+			"org:org-b",
+			{ kind: "org", value: "org-b" },
+		],
+		[
+			"uses an account id instead of an email shared with a disabled row",
+			oauth("cheap@example.com", "acct-other", "org-other"),
+			0,
+			"account:acct-cheap",
+			{ kind: "account", value: "acct-cheap" },
+		],
+	] as const)(
+		"%s",
+		async (_label, disabledCredential, targetIndex, written, selector) => {
+			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+			try {
+				const rows = store.upsertAuthCredentialForProvider("anthropic", disabledCredential);
+				const disabledId = rows.find(row => !ids.includes(row.id))!.id;
+				store.deleteAuthCredential(disabledId, "disabled in test");
+				expect(store.listCredentialInventory("anthropic").find(row => row.id === disabledId)?.disabled).toBe(true);
+			} finally {
+				store.close();
+			}
+			const targetId = ids[targetIndex];
+
+			const result = await preferJson([`id:${targetId}`]);
+
+			expect(result).toMatchObject({ ok: true, provider: "anthropic", preferences: [written] });
+			expect(await writtenPreferences()).toEqual({ anthropic: [written] });
+			const [preference] = (await resolveStartupAuthConfig(agentDir)).credentialPreferences.anthropic ?? [];
+			expect(preference?.selector).toEqual(selector);
+			const storage = await discoverAuthStorage(agentDir);
+			try {
+				expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+				expect(storage.resolveOAuthPinTarget("anthropic", preference!.selector).credentialId).toBe(targetId);
+			} finally {
+				storage.close();
+			}
+		},
+		CLI_TIMEOUT_MS,
+	);
+
+	it(
+		"refuses a disabled row by id and writes nothing, even after a valid selector",
+		async () => {
+			const disabledId = ids[1];
+			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+			try {
+				store.deleteAuthCredential(disabledId, "disabled in test");
+			} finally {
+				store.close();
+			}
+
+			const result = await preferJson(["cheap@example.com", `id:${disabledId}`]);
+
+			expect(result.ok).toBe(false);
+			expect(result.error?.message).toContain(`id:${disabledId}`);
+			expect(await writtenPreferences()).toBeUndefined();
 		},
 		CLI_TIMEOUT_MS,
 	);
@@ -218,7 +284,7 @@ describe("gjc accounts prefer", () => {
 	);
 
 	it(
-		"stores organization ids through an auth broker, whose inventory carries the identity fields",
+		"stores and resolves organization ids through an auth broker with a disabled sibling",
 		async () => {
 			const brokerDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-accounts-prefer-broker-"));
 			const brokerStore = await SqliteAuthCredentialStore.open(path.join(brokerDir, "agent.db"));
@@ -235,7 +301,22 @@ describe("gjc accounts prefer", () => {
 					"anthropic",
 					oauth("team@example.com", "acct-team", "broker-b"),
 				);
+				brokerStore.upsertAuthCredentialForProvider(
+					"anthropic",
+					oauth("other@example.com", "acct-other", "broker-b"),
+				);
+				const brokerRows = brokerStore.listCredentialInventory("anthropic");
+				const disabledId = brokerRows.find(row => row.email === "other@example.com")!.id;
+				const brokerAId = brokerRows.find(row => row.organizationId === "broker-a")!.id;
+				const brokerBId = brokerRows.find(row => row.organizationId === "broker-b" && row.id !== disabledId)!.id;
+				brokerStore.deleteAuthCredential(disabledId, "disabled in test");
 				await brokerStorage.reload();
+				expect(brokerStorage.listCredentialInventory("anthropic").find(row => row.id === disabledId)).toMatchObject(
+					{
+						disabled: true,
+						organizationId: "broker-b",
+					},
+				);
 				handle = startAuthBroker({
 					storage: brokerStorage,
 					bind: "127.0.0.1:0",
@@ -251,6 +332,23 @@ describe("gjc accounts prefer", () => {
 				const entries = ["org:broker-b", { "org:broker-a": 90 }];
 				expect(result).toEqual({ ok: true, provider: "anthropic", preferences: entries } as never);
 				expect(await writtenPreferences()).toEqual({ anthropic: entries });
+				const startupAuth = await resolveStartupAuthConfig(agentDir);
+				const storage = await discoverAuthStorage(agentDir, startupAuth);
+				try {
+					const disabledRow = storage.listCredentialInventory("anthropic").find(row => row.id === disabledId);
+					expect(disabledRow).toMatchObject({ disabled: true, credentialKind: "oauth" });
+					// The broker gives disabled rows metadata only, not the identity fields used for preferences.
+					expect(disabledRow?.organizationId).toBeUndefined();
+					expect(disabledRow?.email).toBeUndefined();
+					expect(disabledRow?.accountId).toBeUndefined();
+					expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+					const preferences = startupAuth.credentialPreferences.anthropic ?? [];
+					expect(
+						preferences.map(({ selector }) => storage.resolveOAuthPinTarget("anthropic", selector).credentialId),
+					).toEqual([brokerBId, brokerAId]);
+				} finally {
+					storage.close();
+				}
 			} finally {
 				if (savedUrl === undefined) delete process.env.GJC_AUTH_BROKER_URL;
 				else process.env.GJC_AUTH_BROKER_URL = savedUrl;
