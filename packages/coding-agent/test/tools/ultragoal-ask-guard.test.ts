@@ -719,7 +719,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(2);
 	});
 
-	it.skip("does not reopen ask when only the pause verdict is recorded again", async () => {
+	it("does not reopen ask when only the pause verdict is recorded again", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -748,7 +748,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(select).toHaveBeenCalledTimes(1);
 	});
 
-	it.skip("admits only one of two asks issued in parallel", async () => {
+	it("admits only one of two asks issued in parallel", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -784,7 +784,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await ledgerFile.text()).toBe(ledgerBefore);
 	});
 
-	it.skip("keeps the admission closed when the answer cannot be recorded", async () => {
+	it("keeps the admission closed when the answer cannot be recorded", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -811,7 +811,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(select).toHaveBeenCalledTimes(1);
 	});
 
-	it.skip("keeps the admission spent on disk when the answer cannot be recorded", async () => {
+	it("keeps the admission spent on disk when the answer cannot be recorded", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -837,7 +837,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(pause.askSpent).toBe(true);
 	});
 
-	it.skip("refuses to open the question when the reservation cannot be recorded", async () => {
+	it("refuses to open the question when the reservation cannot be recorded", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -868,7 +868,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		return { sessionId: TEST_SESSION_ID, classificationEventId: pause.classificationEventId! };
 	}
 
-	it.skip("holds plan writes behind the reservation recheck", async () => {
+	it("holds plan writes behind the reservation recheck", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -899,7 +899,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(planWritten).toBe(true);
 	});
 
-	it.skip("refuses a human-blocked ask without an interactive UI", async () => {
+	it("refuses a human-blocked ask without an interactive UI", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -914,7 +914,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(ledger.some(event => event.event === "human_blocked_ask_reserved")).toBe(false);
 	});
 
-	it.skip("refuses to reserve a receipt superseded by a newer classification after the guard ran", async () => {
+	it("refuses to reserve a receipt superseded by a newer classification after the guard ran", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -935,7 +935,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(ledger.some(event => event.event === "human_blocked_ask_reserved")).toBe(false);
 	});
 
-	it.skip("reserves a receipt that still names the current verified blocker", async () => {
+	it("reserves a receipt that still names the current verified blocker", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -951,7 +951,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await reserve()).toBe(false);
 	});
 
-	it.skip("keeps the admission open when the ask timeout auto-selects an answer", async () => {
+	it("keeps the admission open when the ask timeout auto-selects an answer", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -988,7 +988,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
-	it.skip("keeps the admission open when the user asks about the choices instead of answering", async () => {
+	it("keeps the admission open when the user asks about the choices instead of answering", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1029,7 +1029,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
-	it.skip("spends the receipt through the session tool wrapper as well", async () => {
+	it("spends the receipt through the session tool wrapper as well", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1054,7 +1054,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	// The reservation must check and commit atomically with the plan generation.
 	// Without the fix, a concurrent plan modification could make the receipt stale
 	// between the check and the reservation append.
-	it.skip("[Issue 1] records successful reservation when receipt is current", async () => {
+	it("[Issue 1] records successful reservation when receipt is current", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1077,7 +1077,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	// Issue 2: Enforce one-question settlement for custom ask tools
 	// Only the built-in AskTool should be admitted for human-blocked asks.
 	// Custom tools named "ask" should be rejected.
-	it.skip("refuses admission for custom ask tools to prevent bypass of settlement accounting", async () => {
+	it("refuses admission for custom ask tools to prevent bypass of settlement accounting", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1111,7 +1111,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	});
 
 	// Regression test for P2 finding #1: timeout result not 'User selected' and admission retryable
-	it.skip("[P2 #1] does not record timeout auto-selection as a human answer", async () => {
+	it("[P2 #1] does not record timeout auto-selection as a human answer", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1155,7 +1155,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	});
 
 	// Regression test for P2 finding #2: marker-write failure keeps the reservation committed
-	it.skip("[P2 #2] keeps reservation durable when activity marker write fails", async () => {
+	it("[P2 #2] keeps reservation durable when activity marker write fails", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1194,7 +1194,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	});
 
 	// Regression test for P2 finding #3: SDK/remote answer cannot settle a human-blocked ask
-	it.skip("[P2 #3] does not allow SDK/remote settlement of human-blocked asks", async () => {
+	it("[P2 #3] does not allow SDK/remote settlement of human-blocked asks", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1220,7 +1220,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 	});
 
 	// Regression test for P2 finding #4: custom tool with old Symbol.for marker is not built-in
-	it.skip("[P2 #4] rejects custom tool even when it sets the old Symbol.for marker", async () => {
+	it("[P2 #4] rejects custom tool even when it sets the old Symbol.for marker", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1290,7 +1290,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		} as unknown as AgentToolContext;
 	}
 
-	it.skip("admits the built-in ask behind the registry's lazy facade", async () => {
+	it("admits the built-in ask behind the registry's lazy facade", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1311,7 +1311,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
-	it.skip("refuses a lazy facade whose implementation is not the built-in ask", async () => {
+	it("refuses a lazy facade whose implementation is not the built-in ask", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1331,7 +1331,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
-	it.skip("refuses a tool that names a built-in ask as its implementation", async () => {
+	it("refuses a tool that names a built-in ask as its implementation", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1355,7 +1355,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
-	it.skip("refuses an AskTool subclass that replaces execute", async () => {
+	it("refuses an AskTool subclass that replaces execute", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1383,7 +1383,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
-	it.skip("answers a human-blocked ask on the attended UI only", async () => {
+	it("answers a human-blocked ask on the attended UI only", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1415,7 +1415,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
-	it.skip("reports a timeout as no answer and records no interview round for it", async () => {
+	it("reports a timeout as no answer and records no interview round for it", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -1457,7 +1457,7 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		}
 	});
 
-	it.skip("settles the ask on the rows that were written when their audit entry fails", async () => {
+	it("settles the ask on the rows that were written when their audit entry fails", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
