@@ -36,6 +36,7 @@ import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type Context,
 	type FetchImpl,
 	type Message,
@@ -830,48 +831,46 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!block) return Math.max(0, output.content.length - 1);
 				return output.content.indexOf(block);
 			};
+			type BlockEvent = Extract<AssistantMessageEvent, { contentIndex: number }>;
+			let deferredBlockEvents: Array<{ event: BlockEvent; block: AssistantMessage["content"][number] }> | undefined;
+			const publishBlockEvent = (event: BlockEvent): void => {
+				const block = output.content[event.contentIndex];
+				if (deferredBlockEvents && block) deferredBlockEvents.push({ event, block });
+				else stream.push(event);
+			};
 			const finishCurrentBlock = (block: OpenAIStreamBlock | undefined): void => {
 				if (!block) return;
 				const contentIndex = blockIndex(block);
 				if (contentIndex < 0) return;
 				if (block.type === "text") {
-					stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+					publishBlockEvent({ type: "text_end", contentIndex, content: block.text, partial: output });
 					return;
 				}
 				if (block.type === "thinking") {
-					stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+					publishBlockEvent({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
 					return;
 				}
 				block.arguments = parseStreamingJson(block.partialArgs);
 				captureUnicodeEscapeEvidence(block, block.partialArgs ?? "");
 				delete (block as { partialArgs?: string }).partialArgs;
-				stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+				publishBlockEvent({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
 			};
-			const appendText = (
-				message: AssistantMessage,
-				eventStream: AssistantMessageEventStream,
-				text: string,
-			): void => {
+			const appendText = (message: AssistantMessage, text: string): void => {
 				if (currentBlock?.type !== "text") {
 					finishCurrentBlock(currentBlock);
 					currentBlock = { type: "text", text: "" };
 					message.content.push(currentBlock);
-					eventStream.push({ type: "text_start", contentIndex: blockIndex(currentBlock), partial: message });
+					publishBlockEvent({ type: "text_start", contentIndex: blockIndex(currentBlock), partial: message });
 				}
 				currentBlock.text += text;
-				eventStream.push({
+				publishBlockEvent({
 					type: "text_delta",
 					contentIndex: blockIndex(currentBlock),
 					delta: text,
 					partial: message,
 				});
 			};
-			const appendThinking = (
-				message: AssistantMessage,
-				eventStream: AssistantMessageEventStream,
-				thinking: string,
-				signature?: string,
-			): void => {
+			const appendThinking = (message: AssistantMessage, thinking: string, signature?: string): void => {
 				if (
 					currentBlock?.type !== "thinking" ||
 					(signature !== undefined && currentBlock.thinkingSignature !== signature)
@@ -879,7 +878,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					finishCurrentBlock(currentBlock);
 					currentBlock = { type: "thinking", thinking: "", thinkingSignature: signature };
 					message.content.push(currentBlock);
-					eventStream.push({
+					publishBlockEvent({
 						type: "thinking_start",
 						contentIndex: blockIndex(currentBlock),
 						partial: message,
@@ -889,7 +888,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					currentBlock.thinkingSignature = signature;
 				}
 				currentBlock.thinking += thinking;
-				eventStream.push({
+				publishBlockEvent({
 					type: "thinking_delta",
 					contentIndex: blockIndex(currentBlock),
 					delta: thinking,
@@ -998,12 +997,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
 				const emit = feedRepetitionGuard(textRepetitionGuard, text, "text");
-				if (emit) appendText(output, stream, emit);
+				if (emit) appendText(output, emit);
 			};
 			const emitThinkingText = (thinking: string, signature?: string) => {
 				if (!thinking) return;
 				const emit = feedRepetitionGuard(thinkingRepetitionGuard, thinking, "thinking");
-				if (emit) appendThinking(output, stream, emit, signature);
+				if (emit) appendThinking(output, emit, signature);
 			};
 			const appendThinkingDelta = (thinking: string, signature?: string) => {
 				if (!thinking) return;
@@ -1099,7 +1098,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const recoveredCalls: { call: HealedToolCall; structuredBefore: number }[] = [];
 			const countStructuredCalls = (): number => output.content.filter(block => block.type === "toolCall").length;
 			let healedToolCallEmitted = false;
-			const emitHealedToolCall = (call: HealedToolCall, conflicting = false): void => {
+			const emitHealedToolCall = (call: HealedToolCall, before?: ToolCall): void => {
 				finishCurrentBlock(currentBlock);
 				const block: ToolCall & { partialArgs: string } = {
 					type: "toolCall",
@@ -1112,9 +1111,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (call.incomplete) {
 					block.incompleteArguments = true;
 					block.incompleteArgumentsReason = "malformed";
-				} else if (conflicting) {
-					block.incompleteArguments = true;
-					block.incompleteArgumentsReason = "conflicting";
 				}
 				// The healer already normalized `call.arguments`, decoding any escapes away,
 				// so the signal has to come from its pre-round-trip sample of the raw payload.
@@ -1125,9 +1121,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					}
 				}
 				currentBlock = block;
-				output.content.push(block);
-				stream.push({ type: "toolcall_start", contentIndex: blockIndex(block), partial: output });
-				stream.push({
+				const beforeIndex = before ? output.content.indexOf(before) : -1;
+				if (beforeIndex >= 0) output.content.splice(beforeIndex, 0, block);
+				else output.content.push(block);
+				publishBlockEvent({ type: "toolcall_start", contentIndex: blockIndex(block), partial: output });
+				publishBlockEvent({
 					type: "toolcall_delta",
 					contentIndex: blockIndex(block),
 					delta: call.arguments,
@@ -1144,7 +1142,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 			const collectHealedToolCalls = (): void => {
 				const structuredBefore = countStructuredCalls();
-				for (const call of dsmlHealer?.drainCompleted() ?? []) recoveredCalls.push({ call, structuredBefore });
+				for (const call of dsmlHealer?.drainCompleted() ?? []) {
+					// A later structured call may be the same call. Hold only the
+					// unresolved suffix so published content indices never change.
+					deferredBlockEvents ??= [];
+					recoveredCalls.push({ call, structuredBefore });
+				}
 			};
 			let providerSafetyStop = false;
 			let hasExplicitUsageReport = false;
@@ -1301,7 +1304,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 											partialArgs: "",
 										};
 										output.content.push(currentBlock);
-										stream.push({
+										publishBlockEvent({
 											type: "toolcall_start",
 											contentIndex: blockIndex(currentBlock),
 											partial: output,
@@ -1317,7 +1320,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 											currentBlock.partialArgs += toolCall.function.arguments;
 											currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
 										}
-										stream.push({
+										publishBlockEvent({
 											type: "toolcall_delta",
 											contentIndex: blockIndex(currentBlock),
 											delta,
@@ -1476,11 +1479,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 						continue;
 					}
 
-					// Content order is execution order. A recovered call that preceded a
-					// structured call would now run after it, so a later read could observe
-					// state from before an earlier write. Already-streamed content indices
-					// cannot be renumbered, so the out-of-order call fails closed instead.
-					emitHealedToolCall(call, structuredCalls.length > structuredBefore);
+					emitHealedToolCall(call, structuredCalls[structuredBefore]);
 				}
 			}
 
@@ -1493,6 +1492,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			finishCurrentBlock(currentBlock);
+			if (deferredBlockEvents) {
+				const finalIndices = new Map(output.content.map((block, index) => [block, index] as const));
+				const orderedEvents = deferredBlockEvents
+					.map(({ event, block }) => ({ ...event, contentIndex: finalIndices.get(block) ?? event.contentIndex }))
+					.sort((a, b) => a.contentIndex - b.contentIndex);
+				for (const event of orderedEvents) stream.push(event);
+			}
 
 			// A repetition abort usually surfaces as a throw from the stream
 			// iterator, but a host that had already buffered the rest of the

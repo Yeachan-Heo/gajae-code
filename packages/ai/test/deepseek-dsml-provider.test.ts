@@ -56,6 +56,7 @@ async function response(
 	options: Omit<OpenAICompletionsOptions, "apiKey"> = {},
 	offered: typeof offeredTools = offeredTools,
 	provider = model.provider,
+	observeToolEnd?: (name: string, index: number) => void,
 ): Promise<AssistantMessage> {
 	const events = [...deltas, {}].map((delta, index) => ({
 		id: "chatcmpl-dsml",
@@ -69,11 +70,17 @@ async function response(
 		async () => new Response(payload, { headers: { "content-type": "text/event-stream" } }),
 		{ preconnect: originalFetch.preconnect },
 	);
-	const result = await streamOpenAICompletions(
+	const stream = streamOpenAICompletions(
 		{ ...model, provider },
 		{ messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }], tools: offered },
 		{ apiKey: "test", ...options },
-	).result();
+	);
+	if (observeToolEnd) {
+		for await (const event of stream) {
+			if (event.type === "toolcall_end") observeToolEnd(event.toolCall.name, event.contentIndex);
+		}
+	}
+	const result = await stream.result();
 	if (provider === model.provider) expect(result.stopReason).not.toBe("error");
 	return result;
 }
@@ -237,16 +244,25 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(callsByName.read).toBeDefined();
 	});
 
-	it("does not let a recovered call that preceded a distinct structured call run after it", async () => {
+	it("keeps an earlier distinct recovered call executable before a structured call", async () => {
 		const write =
 			wrapperStart +
 			'<｜DSML｜invoke name="write"><｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter></｜DSML｜invoke>' +
 			wrapperEnd;
-		const result = await response([{ content: write }, { tool_calls: structured('{"path":"out.txt"}') }]);
+		const events: Array<[string, number]> = [];
+		const result = await response(
+			[{ content: write }, { tool_calls: structured('{"path":"out.txt"}') }],
+			{},
+			offeredTools,
+			model.provider,
+			(name, index) => events.push([name, index]),
+		);
 		const executable = tools(result).filter(call => !call.incompleteArguments);
-		expect(executable.map(call => call.name)).toEqual(["read"]);
-		const blocked = tools(result).find(call => call.name === "write");
-		expect(blocked?.incompleteArgumentsReason).toBe("conflicting");
+		expect(executable.map(call => call.name)).toEqual(["write", "read"]);
+		expect(events).toEqual([
+			["write", 0],
+			["read", 1],
+		]);
 	});
 
 	it("keeps a recovered call executable when it follows every structured call", async () => {
