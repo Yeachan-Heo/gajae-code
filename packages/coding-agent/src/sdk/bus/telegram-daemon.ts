@@ -171,6 +171,7 @@ export type TelegramDaemonStopCause =
 	| "ownership_loss"
 	| "startup_failed"
 	| "unexpected_exception"
+	| "unhandled_rejection"
 	| "postmortem";
 
 export function isTelegramDaemonStopCause(value: unknown): value is TelegramDaemonStopCause {
@@ -182,6 +183,7 @@ export function isTelegramDaemonStopCause(value: unknown): value is TelegramDaem
 		case "ownership_loss":
 		case "startup_failed":
 		case "unexpected_exception":
+		case "unhandled_rejection":
 		case "postmortem":
 			return true;
 		default:

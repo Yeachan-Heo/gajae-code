@@ -37,7 +37,7 @@ import {
 
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
-	requestStop(reason?: "reload" | "signal" | "stop"): void;
+	requestStop(reason?: "reload" | "signal" | "stop" | "unhandled_rejection"): void;
 	prepareDoctorRestart?(): void;
 	cancelDoctorRestart?(): void;
 	doctorOccupancy?(): {
@@ -584,6 +584,11 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	//
 	// `finally` covers a returning or throwing run(); the postmortem hook covers
 	// the fatal paths that call `process.exit()` without unwinding this frame.
+	const onUnhandledRejection = (reason: unknown): void => {
+		daemon.requestStop("unhandled_rejection");
+		logger.warn(`notifications: unhandled rejection: ${String(reason instanceof Error ? reason.message : reason)}`);
+	};
+	process.on("unhandledRejection", onUnhandledRejection);
 	const recordOwnerStopped = (): Promise<boolean> =>
 		markDaemonOwnerStopped({
 			settings: settings as Settings,
@@ -647,6 +652,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		unschedule(watchdog);
 		process.off("SIGTERM", onSignal);
 		process.off("SIGINT", onSignal);
+		process.off("unhandledRejection", onUnhandledRejection);
 		unregisterPostmortem();
 		await recordOwnerStopped();
 	}
