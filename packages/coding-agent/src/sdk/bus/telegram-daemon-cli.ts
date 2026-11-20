@@ -26,6 +26,7 @@ import {
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
 	type TelegramDaemonOptions,
+	type TelegramDaemonStopCause,
 	TelegramNotificationDaemon,
 } from "./telegram-daemon";
 import {
@@ -38,6 +39,7 @@ import {
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
 	requestStop(reason?: "reload" | "signal" | "stop" | "unhandled_rejection"): void;
+	getStopCause(): TelegramDaemonStopCause | undefined;
 	prepareDoctorRestart?(): void;
 	cancelDoctorRestart?(): void;
 	doctorOccupancy?(): {
@@ -596,6 +598,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 			acquisitionId: ownerId,
 			pid: deps.processPid ?? process.pid,
 			now: deps.now,
+			stopCause: daemon.getStopCause(),
 		});
 	const unregisterPostmortem = postmortem.register("telegram-daemon:owner-state", async () => {
 		await recordOwnerStopped();

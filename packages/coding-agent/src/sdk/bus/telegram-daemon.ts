@@ -2976,6 +2976,7 @@ export async function markDaemonOwnerStopped(input: {
 	pidIncarnation?: (pid: number) => string | undefined;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
+	stopCause?: TelegramDaemonStopCause;
 }): Promise<boolean> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
@@ -2997,7 +2998,8 @@ export async function markDaemonOwnerStopped(input: {
 			return false;
 		const lock = await readOwnershipLock(fsImpl, paths.lock);
 		if (!ownershipLockMatchesState(lock, state)) return false;
-		const stopCause = state.stopCause ?? "postmortem";
+		const stopCause =
+			state.stopCause ?? (isTelegramDaemonStopCause(input.stopCause) ? input.stopCause : "postmortem");
 		await writeJsonAtomic(fsImpl, paths.state, {
 			...state,
 			stoppedAt: (input.now ?? Date.now)(),
@@ -4826,6 +4828,11 @@ export class TelegramNotificationDaemon {
 		this.running = false;
 	}
 
+	/** Read the daemon's recorded stop cause, if any. Only valid after requestStop has been called. */
+	getStopCause(): TelegramDaemonStopCause | undefined {
+		return this.#stopCause;
+	}
+
 	/** Doctor reservation hook: stop admitting new provider work without killing the owner. Synchronous fence; returns a real acknowledgement. */
 	prepareDoctorRestart(): boolean {
 		this.effects.closeAdmission();
@@ -4866,7 +4873,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** @internal Test-only method to refresh ownership heartbeat for all active topics. */
-	async refreshOwnershipHeartbeat(sessionId: string): Promise<void> {
+	async refreshOwnershipHeartbeat(_sessionId: string): Promise<void> {
 		// Calls renewActiveTopicLeases which iterates all sessions and re-arms expired leases.
 		// sessionId is for test instrumentation only; the method renews all sessions.
 		await this.renewActiveTopicLeases();
