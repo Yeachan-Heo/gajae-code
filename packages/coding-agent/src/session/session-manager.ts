@@ -18560,6 +18560,20 @@ export class SessionManager {
 		const legacyArtifactsRoot = path.basename(sessionFile.slice(0, -6));
 		const legacyLocalRoot = path.posix.join(legacyArtifactsRoot, "local");
 		return {
+			hasLegacySourceSync: () => {
+				// A cwd move removes the old artifacts tree before this manager's
+				// session file and store switch to the destination; the copied legacy
+				// tree is not probed there, so the async gate must stay in charge.
+				if (this.#cwdTransitionOwner !== undefined) return true;
+				try {
+					// Same precondition as capture() -> captureTree().
+					store.assertBound();
+					fs.lstatSync(path.join(store.dir, legacyLocalRoot));
+					return true;
+				} catch (error) {
+					return !isEnoent(error);
+				}
+			},
 			capture: async () => {
 				let snapshot: native.NativeDirectoryTreeSnapshot;
 				const captureLegacyLocal = (): native.NativeDirectoryTreeSnapshot => store.captureTree(legacyLocalRoot);

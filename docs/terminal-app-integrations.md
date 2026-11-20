@@ -7,7 +7,7 @@ different levels of support.
 | Host | Support | How GJC is driven | Setup |
 | --- | --- | --- | --- |
 | [Paseo](https://paseo.sh) | ★★★★★ | ACP provider (`gjc acp`), managed by GJC's own installer | [`gjc setup paseo`](#paseo) |
-| [Orca](https://onorca.dev) | ★★★★☆ | Custom CLI agent — Orca launches `gjc` in a worktree terminal | [manual, one field](#orca) |
+| [Orca](https://onorca.dev) | ★★★☆☆ | Override a built-in agent's command with `gjc`, or run `gjc` directly in the worktree terminal | [manual workaround](#orca) |
 | [T3 Code](https://t3.codes) | ★★★☆☆ (experimental) | No built-in GJC harness upstream yet; drive GJC beside it | [read this first](#t3-code) |
 
 Ratings describe how much of GJC's surface the host actually reaches — model/mode pickers, permission
@@ -178,11 +178,9 @@ Deeper reading: [ACP local development loop](./acp-local-development.md) ·
 each in its own git worktree, with diff review, a mobile companion, and SSH/remote worktrees. Its agent
 picker "just launches a process in a terminal", so **any** CLI agent works — including `gjc`.
 
-GJC is not (yet) in Orca's preconfigured agent list, so you add it once as a custom agent. The
-upstream registry entry is proposed in [stablyai/orca#15025](https://github.com/stablyai/orca/pull/15025); until it lands, use the custom
-agent below.
+GJC is not (yet) in Orca's preconfigured agent list. Custom agent registration — adding a new agent from **Settings → Agents** — is not yet supported upstream ([stablyai/orca#36718](https://github.com/stablyai/orca/issues/36718)); however, you can still use GJC in Orca today by overriding a built-in agent's command.
 
-### Setup
+### Setup (workaround)
 
 1. Install and authenticate GJC on the machine Orca runs agents on:
 
@@ -194,28 +192,29 @@ agent below.
 
    To pick a newer installer, change `v0.15.3` to the release tag you want (see [docs/install.md](install.md)).
 
-2. In Orca, open **Settings → Agents** and add a custom agent:
+2. In Orca, open **Settings → Agents** and select a built-in agent (e.g., "Claude"):
 
-   | Field | Value |
-   | --- | --- |
-   | Name | `Gajae Code` |
-   | Command | `gjc` |
-   | Arguments | *(empty — bare `gjc` starts the TUI in the worktree cwd)* |
+   - Click the override **Command** field
+   - Replace the default command with `gjc`
+   - Leave arguments empty
+   - **Save**
 
-3. Create a worktree, pick **Gajae Code** in the agent combobox, and start prompting.
+   Orca will now launch `gjc` instead of that built-in agent when you create a worktree.
+
+3. Create a worktree and pick the overridden agent in the agent combobox — GJC will start in the worktree terminal.
+
+**Alternative:** If you prefer not to override a built-in agent, open a worktree terminal and run `gjc` directly (or in a nested tmux/zsh session for escape handling).
 
 Orca pre-fills a permission-bypass flag for agents that expose one. **GJC has none by design** — leave
 the argument list empty. GJC's own approval gates (`bash`, `eval`, destructive file operations, workflow
 approvals) stay in force inside the worktree, which is the point: the worktree is disposable, the
 approval record is not.
 
-### What you get, and what you do not
+### Status and limitations
 
-- **You get:** true parallelism across worktrees, Orca's diff viewer and AI-diff annotation, terminal
-  splits, the mobile companion, and SSH worktrees — all with GJC running as the agent.
-- **You do not get (yet):** Orca's deep-integration features that require per-agent adapters — usage /
-  rate-limit tracking, account hot-swap, agent hooks, and native status. Those need Gajae Code in Orca's
-  built-in registry ([PR](https://github.com/stablyai/orca/pull/15025)).
+- **You get:** GJC in a worktree terminal with Orca's diff viewer, terminal splits, and mobile companion.
+- **You do not get:** Deep integration features that require a built-in registry entry — usage / rate-limit tracking, account hot-swap, agent lifecycle hooks, and native status display. Those features need GJC in Orca's built-in agent catalog ([stablyai/orca#15025](https://github.com/stablyai/orca/pull/15025), still pending upstream).
+- **Current limitation:** Custom agent registration ([stablyai/orca#36718](https://github.com/stablyai/orca/issues/36718)) is not yet supported, so the workaround above reuses an existing built-in agent's config entry with an overridden command. This will change once custom agents are supported.
 
 ### Driving several GJC worktrees at once
 
