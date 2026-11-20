@@ -1089,7 +1089,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
 			const dsmlHealer =
 				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens
-					? new DsmlToolCallHealer(`dsml_${randomUUID().replace(/-/g, "").slice(0, 24)}`)
+					? new DsmlToolCallHealer(`dsml_${randomUUID().replace(/-/g, "").slice(0, 24)}`, checkMalformedVenice)
 					: undefined;
 			// Structured calls can follow leaked markup, so reconcile recovered calls
 			// only after the entire response has arrived.

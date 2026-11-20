@@ -331,6 +331,7 @@ export class DsmlToolCallHealer {
 	#pendingArguments: string[] = [];
 	#nextId = 1;
 	readonly #idPrefix: string;
+	readonly #stripOrphanParameterClose: boolean;
 	readonly #completed: HealedToolCall[] = [];
 
 	/**
@@ -338,8 +339,9 @@ export class DsmlToolCallHealer {
 	 * consumers index tool calls by id, so two turns both starting at `dsml_1`
 	 * would overwrite each other.
 	 */
-	constructor(idPrefix = "dsml") {
+	constructor(idPrefix = "dsml", stripOrphanParameterClose = false) {
 		this.#idPrefix = idPrefix;
+		this.#stripOrphanParameterClose = stripOrphanParameterClose;
 	}
 
 	/**
@@ -418,7 +420,13 @@ export class DsmlToolCallHealer {
 					// Outside the function-calls wrapper, DSML markup is prose (for example
 					// quoted by the model) and stays visible text.
 					if (!this.#inWrapper && tag.kind !== "wrapper") {
-						clean += this.#buffer.slice(this.#offset, this.#offset + tag.length);
+						const rawTag = this.#buffer.slice(this.#offset, this.#offset + tag.length);
+						if (
+							!this.#stripOrphanParameterClose ||
+							(rawTag !== "</｜DSML｜ parameter>" && rawTag !== "</|DSML| parameter>")
+						) {
+							clean += rawTag;
+						}
 						this.#offset += tag.length;
 						continue;
 					}

@@ -160,6 +160,20 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).not.toContain("DSML");
 	});
 
+	it("strips an orphan parameter closing tag split across Venice chunks", async () => {
+		const result = await response(
+			[
+				{ content: "Before</｜DS" },
+				{ content: "ML｜ parameter>After", tool_calls: structured('{"path":"synthetic"}') },
+			],
+			{},
+			offeredTools,
+			"venice",
+		);
+		expect(tools(result)).toHaveLength(1);
+		expect(text(result)).toBe("BeforeAfter");
+	});
+
 	it("does not expose an executable call for a parameter close with no parameter open", async () => {
 		const result = await response([
 			{
