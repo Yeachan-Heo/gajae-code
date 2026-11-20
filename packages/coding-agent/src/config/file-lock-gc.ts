@@ -77,13 +77,25 @@ function keptMalformedRecord(lockDir: string): GcRecord {
 /**
  * Windows refuses to open or stat `<lock>/info` while its owner is retiring it. That is a
  * lock in motion, not a malformed or dead one: keep it and look again on a later pass.
+ * However, persistent ACL denials (EPERM/EACCES that stay denied on retry) indicate
+ * a real failure, not transient lock motion. Retry once to distinguish transient from persistent.
+ * If the info file exists but is still inaccessible after retry, the access denial is permanent.
  */
 async function observeLockForGc(lockDir: string): Promise<FileLockGcObservation | null | "changing"> {
 	try {
 		return await readFileLockObservationForGc(lockDir);
 	} catch (error) {
-		if (isLockInfoChangingError(error)) return "changing";
-		throw error;
+		if (!isLockInfoChangingError(error)) throw error;
+
+		// Retry once to distinguish transient denial (lock is being retired) from persistent ACL denial.
+		await Bun.sleep(1);
+		try {
+			return await readFileLockObservationForGc(lockDir);
+		} catch (retryError) {
+			// If retry fails with a transient code, it's persistent ACL denial, not transient lock motion.
+			// Forward any error (whether transient code or different error) as a GC error.
+			throw retryError;
+		}
 	}
 }
 

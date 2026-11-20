@@ -2624,12 +2624,44 @@ describe("fileLocksGcAdapter.prune owner-record refusal", () => {
 		return { lockDir, ctx: ctxWith(spoolDir, () => ({ status: "dead" })) };
 	}
 
-	test("on Windows an owner record refused mid-removal keeps the lock for a later pass", async () => {
+	test("on Windows a persistent owner record refusal is reported as a GC error, not silently treated as changing", async () => {
 		const { lockDir, ctx } = await lockWithRefusedInfo("win32", "EPERM");
+
+		// Persistent EPERM on retry indicates an ACL denial, not transient lock motion.
+		// This should be reported as an error so gc exits non-zero, not silently kept.
+		await expect(fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx)).rejects.toMatchObject({
+			code: "EPERM",
+		});
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("on Windows a transient owner record refusal on first read but success on retry is treated as changing", async () => {
+		const base = await makeTemp();
+		const spoolDir = path.join(base, "spool");
+		const lockDir = path.join(spoolDir, "transient.lock");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: 1000 });
+		const infoPath = path.join(lockDir, "info");
+		const realOpenSync = fsSync.openSync;
+		let attempts = 0;
+
+		// Mock to fail on first attempt, succeed on retry (simulating transient lock motion)
+		vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+			if (String(target) === infoPath) {
+				attempts++;
+				if (attempts === 1) {
+					throw Object.assign(new Error(`EPERM: open '${infoPath}'`), { code: "EPERM" });
+				}
+			}
+			return realOpenSync(target, flags, mode);
+		}) as typeof fsSync.openSync);
+
+		Object.defineProperty(process, "platform", { ...hostPlatform, value: "win32" });
+		const ctx = ctxWith(spoolDir, () => ({ status: "dead" }));
 		const outcome = await fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctx);
 
-		expect(outcome).toEqual({ removed: false, skipped: "file_lock_info_changing" });
-		expect(await fs.exists(lockDir)).toBe(true);
+		// Transient failure (succeeds on retry) allows the lock to be read and removed
+		expect(outcome).toEqual({ removed: true });
+		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
 	test("on POSIX a refused owner record is a real permission failure, not a changing lock", async () => {

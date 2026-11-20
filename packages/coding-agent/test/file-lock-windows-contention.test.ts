@@ -12,6 +12,8 @@ import {
 	FileLockTestHooks,
 	withFileLock,
 } from "@gajae-code/coding-agent/config/file-lock";
+import { collectFileLocksForGc } from "@gajae-code/coding-agent/config/file-lock-gc";
+import type { GcContext } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import {
 	exactRemoveDirectoryTree,
 	exactRestore,
@@ -458,4 +460,39 @@ test("publication rollback exhaustion under persistent access_denied reports acc
 	expect(restoreAttempts).toBe(FILE_LOCK_ROLLBACK_RETRY_ATTEMPTS);
 	// Fail closed: the published generation is kept, never deleted by path.
 	expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).pid).toBe(process.pid);
+});
+
+test("GC treats persistent EPERM on lock info as error, not transient changing", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
+
+	const realOpenSync = fsSync.openSync;
+	// Mock openSync to persistently deny access to the info file
+	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+		if (samePath(String(target), infoPath)) {
+			throw Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+				code: "EPERM",
+			});
+		}
+		return realOpenSync(target, flags, mode);
+	}) as typeof fsSync.openSync);
+
+	const ctx: GcContext = {
+		cwd: tempDir,
+		env: {},
+		force: false,
+		probe: () => ({ status: "keep" }),
+	};
+
+	// GC collection should report the persistent error, not treat it as "changing"
+	const collected = await collectFileLocksForGc(ctx, { roots: [tempDir] });
+	vi.restoreAllMocks();
+
+	// Error should be recorded in errors array
+	expect(collected.errors.length).toBeGreaterThan(0);
+	const permError = collected.errors.find(e => e.message.includes("EPERM"));
+	expect(permError).toBeDefined();
 });
