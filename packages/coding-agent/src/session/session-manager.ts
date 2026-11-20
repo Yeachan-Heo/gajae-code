@@ -2003,7 +2003,11 @@ export type SharedTitleOutcome =
  * persistence - and the caller has to reopen. `committed` means the entry is on disk.
  * `unknown` preserves the original attempted ID across publication and lease-release
  * failures; reconcile it against the transcript before retrying. `rejected` proves
- * no append was committed. Lock acquisition failures before staging still throw.
+ * no append was committed. Lock acquisition, admission, and staging all happen before an
+ * ID is attempted, so a throw proves no ID was attempted and a caller may classify it as
+ * not persisted. Every outcome that carries an attempted ID is non-throwing and is one of
+ * `committed`, `rejected`, `stale`, or `unknown`, where `unknown` means durability could
+ * not be determined. Callers must not treat a throw as a possibly-persisted entry.
  */
 export type SharedEntriesAppendOutcome =
 	| { readonly kind: "committed"; readonly ids: readonly string[] }
@@ -2023,6 +2027,19 @@ export type SharedAppendOutcome =
 				| "unsupported_transcript";
 	  }
 	| { readonly kind: "rejected"; readonly error: unknown };
+
+/**
+ * What reconciliation proved about an `unknown` shared append.
+ *
+ * `committed` means the attempted entry is durably in the transcript. `absent` means
+ * neither the transcript nor the resident graph holds it, so a retry cannot duplicate it.
+ * `unresolved` means the entry may already be durable and the transcript could not be
+ * read to decide; such an entry must not be resubmitted blindly.
+ */
+export type SharedAppendReconciliation =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unresolved"; readonly id: string; readonly error: unknown };
 
 /**
  * What a writable open did about pending migration.
@@ -7973,6 +7990,18 @@ export class SessionManager {
 	#sessionId: string = "";
 	#committedIdentityGeneration = 0;
 	#committedIdentity: { id: string; file: string | undefined } | undefined;
+	/**
+	 * Monotonic incarnation of the logical transcript lineage this manager is writing.
+	 *
+	 * A verified storage relocation re-roots `#sessionFile` without adopting another
+	 * transcript, so it preserves this value; re-selecting the transcript already written is
+	 * a no-op. Every committed identity change (adoption through `setSessionFile`, a new
+	 * session, a branch switch, a cwd move) advances it. It is a counter rather than a
+	 * session-id/path pair because that pair is reconstructible: a transcript that returns to
+	 * a path the predecessor once wrote would compare equal again, and a cwd move that keeps
+	 * both the id and the basename would never advance at all.
+	 */
+	#transcriptLineageIncarnation = 0;
 	#titleMutationRevision = 0;
 	#titleMutationTail: Promise<void> = Promise.resolve();
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
@@ -8181,7 +8210,6 @@ export class SessionManager {
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
 	#managedTranscriptRelocationResolver: (() => ArtifactManager) | undefined;
 	#managedTranscriptRelocationResolverToken: symbol | undefined;
-	#managedTranscriptRelocationFileOrigin: string | undefined;
 	#managedTranscriptRelocationParentArtifacts: ArtifactManager | undefined;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
@@ -12924,6 +12952,9 @@ export class SessionManager {
 		else this.#managedPersistExpectedIdentity = undefined;
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
+		// Set only when the metadata patch failed while the already-published destination is kept.
+		// Wrapped so a thrown `undefined` still counts as a retained-destination outcome.
+		let retainedMetadataFailure: { error: unknown } | undefined;
 		try {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
@@ -12936,6 +12967,7 @@ export class SessionManager {
 			}
 		} catch (error) {
 			residentTransition?.dispose();
+			residentTransition = undefined;
 			await this.#closePersistWriter().catch(() => {});
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
@@ -12982,10 +13014,36 @@ export class SessionManager {
 			// back over the source after a metadata failure.
 			this.#managedTranscriptStoreCache = null;
 			this.#headerExportRevision++;
-			await this.#runAfterMoveListeners(moveDetails);
-			throw error;
+			retainedMetadataFailure = { error };
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
+
+		// The move is adopted whenever the committed cwd ended in the destination: a successful
+		// metadata patch is not the only such outcome, because a failed one keeps the already-
+		// published destination instead of moving it back. An adopted destination must advance the
+		// incarnation, since state queued against the predecessor location must not publish into it;
+		// only a rolled-back attempt restored every field, and only it keeps the predecessor lineage
+		// current. Reading the outcome back from that state instead of flagging the success path
+		// means a retention outcome cannot skip the commit and a restore outcome cannot inherit it.
+		// Cwd alone is the sufficient and correct signal: the same-cwd no-op returns before
+		// publication and every restoring path puts the predecessor cwd back before throwing, so a
+		// committed cwd naming the destination can only mean this attempt adopted it. The transcript
+		// path is deliberately not part of the test -- a non-persisting manager commits the cwd
+		// transition without ever assigning a destination session file, and gating on that
+		// assignment would leave its committed move on the predecessor incarnation. The recorded
+		// identity then follows the new path without an identity change: a cwd move adopts no other
+		// transcript, so the next no-op re-selection must not read as one.
+		if (this.cwd === resolvedCwd) {
+			this.#transcriptLineageIncarnation++;
+			this.#rebaseCommittedIdentity();
+		}
+
+		if (retainedMetadataFailure) {
+			// Every surface still rebinds to the adopted destination before the durability failure is
+			// reported; a failed metadata patch is not a reason to skip the rebinding.
+			await this.#runAfterMoveListeners(moveDetails);
+			throw retainedMetadataFailure.error;
+		}
 
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
@@ -13192,7 +13250,7 @@ export class SessionManager {
 	#capturePersistenceInputToken(): PersistenceInputToken {
 		return {
 			sessionFile: this.#sessionFile ?? "",
-			lifecycleId: `${this.#sessionId}@${this.#managedTranscriptRelocationFileOrigin ?? this.#sessionFile ?? ""}`,
+			lifecycleId: this.getTranscriptLineageId(),
 			entryRevision: this.#entryRevision,
 			headerRevision: this.#headerExportRevision,
 			residentBlobRevision: this.#residentBlobRevision,
@@ -13506,7 +13564,6 @@ export class SessionManager {
 	#clearManagedTranscriptRelocationResolver(): void {
 		this.#managedTranscriptRelocationResolver = undefined;
 		this.#managedTranscriptRelocationResolverToken = undefined;
-		this.#managedTranscriptRelocationFileOrigin = undefined;
 		this.#managedTranscriptRelocationParentArtifacts = undefined;
 	}
 
@@ -13586,10 +13643,13 @@ export class SessionManager {
 			// pins descriptor/path state that cannot be retargeted without rebuilding.
 			if (this.#managedSidecarCacheStore) this.#managedSidecarCacheSessionFile = nextSessionFile;
 			this.#boundedReadStorageProxy = undefined;
-			this.#managedTranscriptRelocationFileOrigin ??= currentSessionFile;
 			this.destination = nextDestination;
 			this.sessionDir = nextDirectory;
 			this.#sessionFile = nextSessionFile;
+			// The relocation moves this same transcript; it adopts nothing, so the recorded identity
+			// follows the path without advancing either authority. Leaving the predecessor path here
+			// would make the next no-op re-selection report an identity change.
+			this.#rebaseCommittedIdentity();
 			this.#managedTranscriptStoreCache = { directory: nextDirectory, store: nextStore };
 			this.#managedPersistExpectedIdentity = { ...destinationTranscript.identity };
 			this.#managedRangeExpectedDescriptor = {
@@ -18119,6 +18179,46 @@ export class SessionManager {
 		const previous = this.#committedIdentity ?? { id: previousId, file: previousFile };
 		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) this.#committedIdentityGeneration++;
 		this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
+		// Advance the lineage from the caller's pre-change state, never from `#committedIdentity`:
+		// a verified relocation moves the file without committing an identity change, so the
+		// recorded pair is deliberately stale there and comparing against it would report an
+		// advance for a re-selection that changed nothing. Callers capture the lineage before an
+		// adoption, so this must keep naming the predecessor until the adoption actually commits.
+		if (previousId !== this.#sessionId || previousFile !== this.#sessionFile) this.#transcriptLineageIncarnation++;
+	}
+
+	/**
+	 * Record a committed path move that adopts no other transcript.
+	 *
+	 * A verified relocation and a committed cwd move both re-root this transcript without
+	 * changing its logical identity, so neither advances {@link getSessionIdentityGeneration}.
+	 * The recorded pair still has to follow the new path: leaving the predecessor path behind
+	 * would make the next no-op re-selection of the current file look like an identity change
+	 * and retire live observers for nothing. The transcript lineage deliberately does not move
+	 * here either — the relocation case preserves it, and the cwd-move caller advances it
+	 * explicitly.
+	 */
+	#rebaseCommittedIdentity(): void {
+		if (this.#committedIdentity) this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
+	}
+
+	/**
+	 * Identity of the transcript lineage this manager is writing, as an opaque incarnation.
+	 *
+	 * A verified same-owner storage relocation of the same transcript preserves this value:
+	 * the file is the same logical transcript reached through a re-rooted artifact directory,
+	 * so state queued against the old path still belongs to it. A committed identity change
+	 * (`setSessionFile` adoption of another transcript, a new session, a branch switch, a cwd
+	 * move) advances it, because queued state captured before the change belongs to the
+	 * predecessor. Re-selecting the transcript the manager already writes is not a change.
+	 * Callers that must distinguish relocation from adoption compare this value instead of
+	 * {@link getSessionFile}.
+	 *
+	 * The value is an incarnation counter, not a derived identity: it cannot be reconstructed
+	 * from the session id or the path, so two different transcripts can never compare equal.
+	 */
+	getTranscriptLineageId(): string {
+		return `transcript-incarnation:${this.#transcriptLineageIncarnation}`;
 	}
 
 	getSessionId(): string {
@@ -19608,17 +19708,9 @@ export class SessionManager {
 				return retainUnknown(error);
 			}
 			if (result.kind === "committed") {
-				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-				if (header) {
-					applyHeaderPatch(header, patch);
-					this.#headerExportRevision++;
-				}
-				this.#sessionName = sanitized;
-				this.#titleSource = source;
-				if (receipt) {
-					this.#managedPersistExpectedIdentity = receipt.identity;
-					this.#openCommittedDigest = receipt.identity.sha256;
-				}
+				// Latch before any bookkeeping: the adoption is durable from here on, and a
+				// later throwing step must not leave the safety bar unset.
+				//
 				// The snapshot branch imported only the header. Rewrite authority stays barred
 				// only when the transcript already held a state this manager never committed:
 				// renaming a transcript this manager wrote itself keeps full authority.
@@ -19631,6 +19723,17 @@ export class SessionManager {
 				// `#managedPersistExpectedIdentity` on a non-committed title outcome.
 				if (predecessorIdentity && predecessorIdentity.sha256 !== priorCommittedDigest)
 					this.#latchSharedRewriteBar(sessionId);
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header) {
+					applyHeaderPatch(header, patch);
+					this.#headerExportRevision++;
+				}
+				this.#sessionName = sanitized;
+				this.#titleSource = source;
+				if (receipt) {
+					this.#managedPersistExpectedIdentity = receipt.identity;
+					this.#openCommittedDigest = receipt.identity.sha256;
+				}
 				if (!this.#flushed) {
 					this.#flushed = true;
 					this.#ensuredOnDisk = true;
@@ -20559,7 +20662,19 @@ export class SessionManager {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 
-	/** Additive legacy appends are safe once a control publication's transaction has settled. */
+	/**
+	 * Admission for an additive legacy append.
+	 *
+	 * The append bar is refusal policy, not the safety guarantee, so a one-shot control
+	 * publication that scopes its own admission does not bar later appends. Once a
+	 * canonical shared publication arms the permanent bar, every additive legacy append
+	 * of this logical session refuses here, before any graph mutation, with
+	 * {@link SharedSessionMutationUnsupportedError}. The check is reached from the live
+	 * write funnels only — {@link #appendEntry} for entry appends and
+	 * {@link appendMessage} for messages — plus {@link appendSessionRecap}, which plans
+	 * before it writes. Callers that must stay durable publish through the
+	 * `*SharingSession` methods instead.
+	 */
 	assertLegacyAppendAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, false);
 	}
@@ -21171,6 +21286,51 @@ export class SessionManager {
 		if (!file || !this.#storage.existsSync(file))
 			return { kind: "unknown", id, error: new Error("durability_unproven") };
 		return { kind: "committed", id };
+	}
+
+	/**
+	 * Decide an `unknown` shared append before anyone retries or reports it.
+	 *
+	 * `unknown` is not "not persisted": the entry can be committed before the failure that
+	 * produced the outcome (post-write snapshot verification, transaction release, a
+	 * superseded publication), and it can still be resident here unpublished. A blind retry
+	 * can therefore duplicate it, and a failure report can be wrong.
+	 *
+	 * `absent` is only returned once both the committed transcript and this manager's
+	 * resident graph are known not to hold the entry. Any read or publish failure after that
+	 * point is `unresolved`, which callers must hold rather than resubmit.
+	 */
+	async reconcileUnknownSharedAppend(id: string, error: unknown): Promise<SharedAppendReconciliation> {
+		const durable = (candidate: CommittedTranscriptRead): boolean =>
+			candidate.kind === "snapshot" &&
+			candidate.snapshot.sessionId === this.#sessionId &&
+			candidate.snapshot.entryIds.includes(id);
+		let read: CommittedTranscriptRead;
+		try {
+			read = await this.captureCommittedSnapshot();
+		} catch (cause) {
+			return { kind: "unresolved", id, error: cause };
+		}
+		if (durable(read)) return { kind: "committed", id };
+		if (this.#byId.has(id)) {
+			// The entry was staged in this process but its publication was not proven.
+			// Publish the pending bytes and re-verify; never append it a second time.
+			try {
+				await this.flush();
+			} catch (cause) {
+				return { kind: "unresolved", id, error: cause };
+			}
+			let after: CommittedTranscriptRead;
+			try {
+				after = await this.captureCommittedSnapshot();
+			} catch (cause) {
+				return { kind: "unresolved", id, error: cause };
+			}
+			return durable(after) ? { kind: "committed", id } : { kind: "unresolved", id, error };
+		}
+		if (read.kind === "absent") return { kind: "absent" };
+		if (read.kind === "snapshot" && read.snapshot.sessionId === this.#sessionId) return { kind: "absent" };
+		return { kind: "unresolved", id, error };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
