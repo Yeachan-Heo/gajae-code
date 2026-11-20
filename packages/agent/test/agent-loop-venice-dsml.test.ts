@@ -30,7 +30,7 @@ const streamFn: StreamFn = (_model, context, options) =>
 	streamOpenAICompletions(model, context, { ...options, apiKey: "test" });
 
 async function run(deltas: Record<string, unknown>[][]) {
-	const requests: Array<{ messages: { role: string }[] }> = [];
+	const requests: Array<{ messages: { role: string }[]; tool_choice?: string }> = [];
 	let executions = 0;
 	global.fetch = Object.assign(
 		async (_input: unknown, init?: RequestInit) => {
@@ -88,6 +88,9 @@ describe("Venice DeepSeek malformed DSML recovery", () => {
 		const result = await run([[malformed], [structured], [{ content: "done" }]]);
 		expect(result.requests).toHaveLength(3);
 		expect(result.requests[1].messages).toEqual(result.requests[0].messages);
+		expect(result.requests[0].tool_choice).not.toBe("required");
+		expect(result.requests[1].tool_choice).toBe("required");
+		expect(result.requests[2].tool_choice).not.toBe("required");
 		expect(result.executions).toBe(1);
 		expect(result.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});

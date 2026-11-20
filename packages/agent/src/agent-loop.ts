@@ -4147,9 +4147,13 @@ async function runLoopBody(
 			const wasEscapedNonAsciiRecoveryAttempt = recoveryAttempt?.kind === "escaped-nonascii";
 			try {
 				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
-					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
-					escapedNonAsciiToolChoice = config.getToolChoice?.();
-					escapedNonAsciiToolChoiceCaptured = true;
+					if (!escapedNonAsciiToolChoiceCaptured) {
+						escapedNonAsciiToolChoice = config.getToolChoice?.();
+						escapedNonAsciiToolChoiceCaptured = true;
+					}
+					if (retriedMalformedVeniceCall && (!escapedNonAsciiToolChoice || escapedNonAsciiToolChoice === "auto")) {
+						return "required";
+					}
 					return escapedNonAsciiToolChoice;
 				};
 				const attemptConfig = attemptTransaction
@@ -4296,6 +4300,7 @@ async function runLoopBody(
 			if (
 				!retriedMalformedVeniceCall &&
 				!config.fallbackManaged &&
+				escapedNonAsciiToolChoice !== "none" &&
 				!loopSignal.aborted &&
 				message.provider === "venice" &&
 				message.stopReason === "error" &&
