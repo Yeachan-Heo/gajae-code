@@ -786,7 +786,7 @@ describe("unified diff scrubber", () => {
 		});
 
 		describe("required failing tests for redesign", () => {
-			it("[MUST FAIL] replacement hunk with different multi-line secrets on old and new sides", () => {
+			it("replacement hunk with different multi-line container secrets on each side", () => {
 				// A replacement hunk where old side has multi-line credential with different secret than new side
 				// Both should be redacted independently - no cross-side contamination
 				const diff = [
@@ -815,7 +815,7 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 			});
 
-			it("[MUST FAIL] folded Authorization header with ordinary space continuation", () => {
+			it("folded Authorization header followed by space-indented value continuation", () => {
 				// Authorization header followed by indented continuation on next line with space-prefix
 				// The continuation should be redacted as part of the header value
 				const diff = [
@@ -842,7 +842,7 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 			});
 
-			it("[MUST FAIL] asymmetric open container spanning two hunks", () => {
+			it("asymmetric open container with secrets spanning multiple hunks", () => {
 				// A container opened on old side in hunk 1 with a secret inside
 				// Should persist as "open" state across hunk boundary
 				// Second hunk should maintain credential redaction on that side
