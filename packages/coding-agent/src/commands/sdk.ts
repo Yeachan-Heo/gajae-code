@@ -63,7 +63,7 @@ import {
 import { type BrokerLockRefusalCode, BrokerLockRefusedError } from "../sdk/broker/lock-refusal";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
-import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
+import { type BrokerStartupFailure, writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
@@ -148,7 +148,7 @@ const BROKER_STARTUP_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
 
 async function writeBrokerStartupFailureMarkerBounded(
 	agentDir: string,
-	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
+	failure: BrokerStartupFailure,
 ): Promise<boolean> {
 	const settled = Promise.withResolvers<boolean>();
 	const abortController = new AbortController();
@@ -2397,6 +2397,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			signal: null,
 			pid: process.pid,
 			...(startupFailureIncarnation === undefined ? {} : { incarnation: startupFailureIncarnation }),
+			...(error instanceof BrokerLockRefusedError ? { lockRefusalCode: error.code } : {}),
 		});
 		logger.error("sdk broker: startup failed", {
 			reason: "startup-failure",

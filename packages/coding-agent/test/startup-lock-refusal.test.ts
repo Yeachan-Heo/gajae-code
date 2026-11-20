@@ -6,11 +6,15 @@ import { Process } from "@gajae-code/natives";
 import { renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import Sdk from "../src/commands/sdk";
 import { Broker } from "../src/sdk/broker/broker";
-import { readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
+import { brokerStartupExitRecordPath, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { ensureBroker, reapFailedBrokerLaunch } from "../src/sdk/broker/ensure";
 import { BrokerLockRefusedError } from "../src/sdk/broker/lock-refusal";
-import { BrokerStartupError } from "../src/sdk/broker/startup-failure";
+import {
+	BrokerStartupError,
+	brokerStartupFailurePath,
+	readBrokerStartupFailureMarker,
+} from "../src/sdk/broker/startup-failure";
 import { brokerLockRefusalFailure } from "../src/sdk/cli/session-cli";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-lock-refusal-"));
@@ -55,6 +59,7 @@ describe("broker startup lock refusal", () => {
 				signal: null,
 				timeoutMs: null,
 			});
+			expect(await readBrokerStartupFailureMarker(dir)).toMatchObject({ lockRefusalCode: "live_owner" });
 			const output = stderr.chunks.join("");
 			expect(output).toContain(`Lock: ${lockPath}`);
 			expect(output).toContain("Code: live_owner");
@@ -65,6 +70,50 @@ describe("broker startup lock refusal", () => {
 			// The in-process exit-record writer can still hold the directory on Windows (EBUSY); the
 			// directory lives under the test temp root, so a failed removal only leaves a scratch dir.
 			await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+		}
+	});
+});
+
+describe("broker startup-failure marker refusal field", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	it("is absent for a broker.lock failure that is not a refusal", async () => {
+		const dir = await temp();
+		vi.spyOn(Broker.prototype, "start").mockRejectedValue(
+			new Error(`Broker lock quarantine namespace is saturated for ${path.join(dir, "sdk", "broker.lock")}`),
+		);
+		vi.spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+		vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			await expect(new Sdk(["broker-internal", "--agent-dir", dir], {} as never).run()).rejects.toThrow(
+				"quarantine namespace is saturated",
+			);
+			const marker = await readBrokerStartupFailureMarker(dir);
+			expect(marker?.reason).toContain("quarantine namespace is saturated");
+			expect(marker?.lockRefusalCode).toBeUndefined();
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+		}
+	});
+
+	it("rejects a marker whose refusal code is not a known code", async () => {
+		const dir = await temp();
+		try {
+			const marker = {
+				version: 2,
+				reason: "refused",
+				exitCode: 1,
+				signal: null,
+				writtenAt: Date.now(),
+				pid: process.pid,
+				incarnation: "i",
+			};
+			await Bun.write(brokerStartupFailurePath(dir), JSON.stringify({ ...marker, lockRefusalCode: "stale" }));
+			expect(await readBrokerStartupFailureMarker(dir)).toBeUndefined();
+			await Bun.write(brokerStartupFailurePath(dir), JSON.stringify({ ...marker, lockRefusalCode: "foreign_host" }));
+			expect(await readBrokerStartupFailureMarker(dir)).toMatchObject({ lockRefusalCode: "foreign_host" });
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 });
@@ -105,13 +154,20 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			});
 			expect(rendered.envelope.error.code).toBe("broker_unavailable");
 			expect(rendered.envelope.diagnostics?.map(diagnostic => diagnostic.code)).toEqual(["lock_refused"]);
-			// Guidance mentions running the broker in foreground but does not pass argv (avoid unsafe retry).
+			// The owner still holds broker.lock: no step may run a broker-contacting command
+			// (`sdk session list` autostarts the broker), so every step is inert guidance.
 			expect(
 				rendered.envelope.error.nextSteps.some(step =>
 					step.description.includes("Run the broker in the foreground"),
 				),
 			).toBe(true);
 			expect(rendered.envelope.error.nextSteps.every(step => step.argv === undefined)).toBe(true);
+			const brokerRun = await renderPublicCommandFailure(failure, {
+				command: ["sdk", "broker", "run"],
+				json: true,
+				agentDir: dir,
+			});
+			expect(brokerRun.envelope.error.nextSteps.map(step => step.argv)).toEqual([undefined]);
 			// Fixed diagnostics only: neither the broker's text nor the lock path is echoed.
 			expect(rendered.stdout).not.toContain("raw broker text");
 			expect(rendered.stdout).not.toContain(lockPath);
@@ -158,6 +214,34 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			expect(startup.lockRefused).toBe(true);
 			expect(brokerLockRefusalFailure(failure)).toBeDefined();
 			expect(await Bun.file(path.join(lock, "owner.json")).json()).toMatchObject({ ownerId: "legacy-owner" });
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("keeps the typed refusal when the broker can only persist its startup-failure marker", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		const incarnation = brokerProcessIncarnation(process.pid);
+		await Bun.write(
+			path.join(lock, "owner.json"),
+			JSON.stringify({ version: 1, ownerId: "legacy-owner", pid: process.pid, incarnation }),
+		);
+		// A non-empty directory at the startup-exit record path survives the pre-spawn clear and
+		// makes the broker's exit-record publication fail, so only the marker reaches the client.
+		const exitRecordPath = brokerStartupExitRecordPath(dir);
+		await fs.mkdir(exitRecordPath, { recursive: true });
+		await Bun.write(path.join(exitRecordPath, "occupant"), "");
+		try {
+			const failure = await ensureBroker({ agentDir: dir }).then(
+				() => undefined,
+				(rejection: unknown) => rejection,
+			);
+			expect(await readBrokerStartupExitRecord(dir)).toBeUndefined();
+			expect(failure).toBeInstanceOf(BrokerStartupError);
+			expect((failure as BrokerStartupError).lockRefused).toBe(true);
+			expect(brokerLockRefusalFailure(failure)).toBeDefined();
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}

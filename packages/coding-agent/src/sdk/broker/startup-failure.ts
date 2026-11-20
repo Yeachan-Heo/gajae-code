@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { BROKER_LOCK_REFUSAL_CODES, type BrokerLockRefusalCode } from "./lock-refusal";
 import { processIncarnation } from "./process-incarnation";
 
 export interface BrokerStartupFailureMarker {
@@ -9,6 +10,11 @@ export interface BrokerStartupFailureMarker {
 	reason: string;
 	/** Validated manual lock cleanup command, stored separately when it cannot fit in `reason`. */
 	cleanupCommand?: string;
+	/**
+	 * Set only when startup failed with a `BrokerLockRefusedError`. It carries the refusal
+	 * when the typed startup-exit record could not be published.
+	 */
+	lockRefusalCode?: BrokerLockRefusalCode;
 	exitCode: number | null;
 	signal: string | null;
 	writtenAt: number;
@@ -103,17 +109,21 @@ export function brokerStartupFailureCleanupTargetsLock(
 	return decodeFileLockCleanupCommand(marker.reason.slice(COMPACT_FILE_LOCK_CLEANUP_GUIDANCE.length)) === lockPath;
 }
 
-function boundedMarker(
-	reason: string,
-	exitCode: number | null,
-	signal: string | null,
-	pid: number,
-	incarnation: string,
-): BrokerStartupFailureMarker {
-	const boundedFailure = boundedFailureDetails(reason);
+export type BrokerStartupFailure = {
+	reason: string;
+	exitCode: number | null;
+	signal: string | null;
+	pid: number;
+	incarnation?: string;
+	lockRefusalCode?: BrokerLockRefusalCode;
+};
+
+function boundedMarker(failure: BrokerStartupFailure, incarnation: string): BrokerStartupFailureMarker {
+	const { reason, exitCode, signal, pid, lockRefusalCode } = failure;
 	return {
 		version: 2,
-		...boundedFailure,
+		...boundedFailureDetails(reason),
+		...(lockRefusalCode === undefined ? {} : { lockRefusalCode }),
 		exitCode,
 		signal,
 		writtenAt: Date.now(),
@@ -130,7 +140,7 @@ function boundedMarker(
  */
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
-	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
+	failure: BrokerStartupFailure,
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	let tempPath: string | undefined;
@@ -144,10 +154,7 @@ export async function writeBrokerStartupFailureMarker(
 		if (signal?.aborted) return false;
 
 		tempPath = path.join(markerDirectory, `.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`);
-		await Bun.write(
-			tempPath,
-			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid, incarnation)),
-		);
+		await Bun.write(tempPath, JSON.stringify(boundedMarker(failure, incarnation)));
 		if (signal?.aborted) return false;
 
 		// There must be no async gap between the cancellation check and publication:
@@ -182,6 +189,7 @@ export async function readBrokerStartupFailureMarker(
 				(typeof marker.cleanupCommand !== "string" ||
 					marker.reason !== COMPACT_FILE_LOCK_CLEANUP_GUIDANCE ||
 					decodeFileLockCleanupCommand(marker.cleanupCommand) === undefined)) ||
+			(marker.lockRefusalCode !== undefined && !BROKER_LOCK_REFUSAL_CODES.includes(marker.lockRefusalCode)) ||
 			(marker.exitCode !== null && typeof marker.exitCode !== "number") ||
 			(marker.signal !== null && typeof marker.signal !== "string") ||
 			typeof marker.writtenAt !== "number" ||
@@ -217,7 +225,7 @@ export class BrokerStartupError extends Error {
 	readonly signal: string | null;
 	readonly reason: string;
 	readonly stderrExcerpt?: string;
-	/** The broker's trusted startup-exit record says it refused an existing `broker.lock`. */
+	/** The broker's trusted startup-exit record or marker says it refused an existing `broker.lock`. */
 	readonly lockRefused: boolean;
 
 	constructor(fields: {

@@ -364,7 +364,11 @@ export function classifyPublicCommandFailure(
 	if (!usage) {
 		if (kind === "broker_restarting")
 			nextSteps.push(step("Wait for the existing restart to finish, then inspect status; do not restart again."));
+		const session = references.find(ref => ref.kind === "sessionId");
+		const operation = references.find(ref => ref.kind === "operationRef");
 		if (kind === "broker_unavailable" && input.diagnostics?.includes("lock_refused")) {
+			// The refused owner still holds broker.lock. Every broker-contacting step (session list
+			// autostarts the broker) would only be refused again, so the guidance stays inert.
 			if (canonical[0] === "sdk" && canonical[1] === "broker" && canonical[2] === "run")
 				nextSteps.push(
 					step(
@@ -377,10 +381,7 @@ export function classifyPublicCommandFailure(
 						"Run the broker in the foreground with `gjc sdk broker run` to print the blocking lock, its code and the recovery step. The lock is never reclaimed from a live, foreign-host or host-unqualified owner. Resolve the owner first.",
 					),
 				);
-		}
-		const session = references.find(ref => ref.kind === "sessionId");
-		const operation = references.find(ref => ref.kind === "operationRef");
-		if (canonical[0] === "sdk" && canonical[1] === "broker" && canonical[2] === "attest-spawn-anchors") {
+		} else if (canonical[0] === "sdk" && canonical[1] === "broker" && canonical[2] === "attest-spawn-anchors") {
 			// Offline repair: any broker-contacting step (session list autostarts the broker) could
 			// load an uncertain attestation or mint a replacement identity key, so only inert guidance.
 			nextSteps.push(
@@ -412,11 +413,7 @@ export function classifyPublicCommandFailure(
 					["sdk", "session", "status", session.value, operation.value],
 				),
 			);
-		} else if (
-			canonical[0] === "sdk" &&
-			kind !== "authorization_denied" &&
-			!input.diagnostics?.includes("lock_refused")
-		) {
+		} else if (canonical[0] === "sdk" && kind !== "authorization_denied") {
 			nextSteps.push(
 				step("Inspect existing session state before deciding whether another operation is safe.", [
 					"sdk",
