@@ -160,6 +160,16 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	 */
 	readonly materialize = async (): Promise<AgentTool<any, any, any>> => await this.#get();
 
+	/**
+	 * The implementation a facade dispatches to, loaded if needed; any other value
+	 * is returned unchanged. The private brand decides what a facade is, so a
+	 * look-alike cannot name an implementation it does not run, which the
+	 * overridable `materialize` property could.
+	 */
+	static async implementationOf(tool: unknown): Promise<unknown> {
+		return typeof tool === "object" && tool !== null && #loadGeneration in tool ? await tool.#get() : tool;
+	}
+
 	get name(): string {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
 	}
