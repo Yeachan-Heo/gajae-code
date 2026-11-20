@@ -4564,5 +4564,45 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			expect(terminal.stopReason).toBe("error");
 			expect(terminal.content.filter(block => block.type === "toolCall")).toHaveLength(2);
 		});
+
+		it("keeps provider-executed markers on both terminals when a consumer aborts after acceptance", async () => {
+			const mock = createMockModel();
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => providerRun(mock, 1, "done"),
+			});
+			// A stream guard (TTSR) aborts while the accepted attempt's updates are delivered.
+			// Its publication is acknowledged later, after the provider already finished.
+			let aborted = false;
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type !== "message_update" || aborted) return undefined;
+				aborted = true;
+				return Bun.sleep(5).then(() => agent.abort());
+			});
+			const terminals: AssistantMessage[] = [];
+			agent.subscribe(event => {
+				if ((event.type === "message_end" || event.type === "turn_end") && event.message.role === "assistant")
+					terminals.push(event.message as AssistantMessage);
+			});
+
+			let accepted = 0;
+			await agent.prompt("run", {
+				fallbackManaged: true,
+				// The provider itself succeeded: the abort came from a consumer afterwards.
+				onManagedAttemptAccepted: () => {
+					accepted++;
+				},
+			});
+			await agent.waitForIdle();
+
+			expect(accepted).toBe(1);
+			expect(terminals).toHaveLength(2);
+			for (const terminal of terminals) {
+				expect(terminal.stopReason).toBe("aborted");
+				const calls = terminal.content.filter(block => block.type === "toolCall");
+				expect(calls).toHaveLength(1);
+				expect((calls[0] as { [kProviderResolvedToolCall]?: true })[kProviderResolvedToolCall]).toBe(true);
+			}
+		});
 	});
 });

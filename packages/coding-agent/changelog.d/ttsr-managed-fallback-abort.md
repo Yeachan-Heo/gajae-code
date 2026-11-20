@@ -1,0 +1,3 @@
+### Fixed
+
+- A TTSR rule with `interruptMode: "tool-only"` now interrupts a tool call once when a published tool-argument delta matches and the role default is a managed model fallback chain. Previously the staged attempt was published only after the provider finished, so the abort arrived after the message ended with `toolUse`: the tool was entered and then aborted, and every replayed delta fired the rule again (7 to 10 triggers for one call). The accepted attempt now waits for its published events, ends `aborted` when a subscriber aborted during that delivery, and TTSR checks each assistant stream at most once after it interrupts it, including when a slow `message_start` extension hook delays the next stream's start handling.
