@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -142,7 +142,17 @@ describe("broker spawn-attempt nonce binding", () => {
 });
 
 describe("broker startup-failure marker refusal field", () => {
-	afterEach(() => vi.restoreAllMocks());
+	const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+	afterEach(() => {
+		vi.restoreAllMocks();
+		if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+		else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
+	});
+
+	beforeEach(() => {
+		// Tests that spawn a real broker need autostart enabled, not attach-only
+		delete process.env.GJC_SDK_BROKER_AUTOSTART;
+	});
 
 	it("is absent for a broker.lock failure that is not a refusal", async () => {
 		const dir = await temp();
@@ -268,6 +278,8 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			path.join(lock, "owner.json"),
 			JSON.stringify({ version: 1, ownerId: "legacy-owner", pid: process.pid, incarnation }),
 		);
+		const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+		delete process.env.GJC_SDK_BROKER_AUTOSTART;
 		try {
 			const failure = await ensureBroker({ agentDir: dir }).then(
 				() => undefined,
@@ -282,6 +294,8 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			expect(brokerLockRefusalFailure(failure)).toBeDefined();
 			expect(await Bun.file(path.join(lock, "owner.json")).json()).toMatchObject({ ownerId: "legacy-owner" });
 		} finally {
+			if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+			else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 60_000);
@@ -300,6 +314,8 @@ describe("broker lock refusal in the public SDK envelope", () => {
 		const exitRecordPath = brokerStartupExitRecordPath(dir);
 		await fs.mkdir(exitRecordPath, { recursive: true });
 		await Bun.write(path.join(exitRecordPath, "occupant"), "");
+		const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+		delete process.env.GJC_SDK_BROKER_AUTOSTART;
 		try {
 			const failure = await ensureBroker({ agentDir: dir }).then(
 				() => undefined,
@@ -310,6 +326,8 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			expect((failure as BrokerStartupError).lockRefused).toBe(true);
 			expect(brokerLockRefusalFailure(failure)).toBeDefined();
 		} finally {
+			if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+			else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 60_000);
