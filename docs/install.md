@@ -169,7 +169,12 @@ gjc --version
 
 A stale Bash command hash can retain the Bun shim even when `type -a gjc` lists the standalone binary first. Clearing that hash can activate the standalone binary without any PATH edit. Only if resolution still selects another install should you check aliases/functions and ensure the standalone directory precedes the shim directory on PATH. On PowerShell, inspect `Get-Command gjc -All` and `where.exe gjc`, and invoke the printed binary path with `& 'path/to/gjc.exe'`. No shim removal is required.
 
-## Optional macOS community app
+## Optional macOS community app (deprecated)
+
+> **Deprecated.** Gajae Code App (<https://github.com/devswha/gajae-code-app>) is no longer
+> maintained: the last release is v2.0.0-beta.20 (2026-09-25), its in-app updater can stall
+> indefinitely, and its bundled SDK is out of date. Answer **No** to the offer below, or set
+> `GJC_NO_COMMUNITY_APP=1`.
 
 After a successful macOS binary install or update, GJC may offer:
 
