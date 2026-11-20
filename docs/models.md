@@ -954,9 +954,10 @@ When `GJC_AUTH_BROKER_URL` (or `auth.broker.url`) is set, the local SQLite crede
 
 ⚠️ **Important:** Google reportedly suspends accounts that use Gemini subscription OAuth through third-party clients like this one. If you are using the `google-gemini-cli` provider with OAuth login (`gjc auth-broker login google-gemini-cli` or `/login google-gemini-cli`), consider using one of these alternatives instead:
 
-- **Google API key** (`google-gemini-cli` provider with `--api-key`): Direct API authentication without OAuth
+- **Google Cloud API key** (`google` provider): Direct API authentication without OAuth
 - **Google Vertex AI** (`google-vertex` provider): Use your own Google Cloud project credentials
-- **Google Cloud API key** (`google` provider): Another direct API authentication option
+
+⚠️ **Note on `--api-key` with `google-gemini-cli`:** The `--api-key` option for `google-gemini-cli` expects JSON credentials (token + projectId), not a plain API key. Use the `google` or `google-vertex` providers instead for API key authentication.
 
 Using these alternatives avoids the risk of account suspension. The OAuth flow for `google-gemini-cli` will show this warning before proceeding.
 
