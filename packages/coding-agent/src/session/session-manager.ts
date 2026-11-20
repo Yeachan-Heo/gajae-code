@@ -508,6 +508,14 @@ class PreparedResidentStoreTransition {
 		return this.#index;
 	}
 
+	preserveSelectedLeaf(leafId: string | null): void {
+		if (leafId !== null && !this.index.byId.has(leafId)) {
+			this.dispose();
+			throw new Error("cold_transcript_selected_leaf_missing");
+		}
+		this.#index = { ...this.index, leafId };
+	}
+
 	releaseReferences(): void {
 		if (this.#active) throw new Error("resident_transition_still_active");
 		this.#entries = undefined;
@@ -12473,6 +12481,7 @@ export class SessionManager {
 	}
 
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
+		// assertLegacyMutationAllowed now allows moves within exclusive transitions (#7856)
 		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
@@ -12579,7 +12588,6 @@ export class SessionManager {
 			this.destination !== previousDestination
 		)
 			throw new Error("Session cwd move admission changed during validation; retry after it settles.");
-		this.assertLegacyMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
@@ -12597,7 +12605,6 @@ export class SessionManager {
 		const hadPersistedSession = this.#ensuredOnDisk;
 		try {
 			await this.#runBeforeMoveListeners(moveDetails);
-			this.assertLegacyMutationAllowed("move session");
 		} catch (error) {
 			await this.#runMoveAbortListeners(moveDetails);
 			throw error;
@@ -12609,7 +12616,6 @@ export class SessionManager {
 			// Close the persist writer before moving files
 			try {
 				await this.#closePersistWriter();
-				this.assertLegacyMutationAllowed("move session");
 			} catch (error) {
 				await this.#runMoveAbortListeners(moveDetails);
 				throw error;
@@ -16372,6 +16378,7 @@ export class SessionManager {
 	}
 
 	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
+		const leafId = this.#leafId;
 		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
 		const transcriptSize = this.#storage.statSync(this.#sessionFile).size;
 		if (transcriptSize > eagerHydrationMaxBytes())
@@ -16407,6 +16414,7 @@ export class SessionManager {
 			},
 			"memory-fallback",
 		);
+		transition.preserveSelectedLeaf(leafId);
 		this.#commitResidentTextStoreTransition(transition, false);
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
@@ -16419,6 +16427,7 @@ export class SessionManager {
 	#ensureFullHotView(): void {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return;
+		const leafId = this.#leafId;
 		if (this.#sessionFile && this.#storage.statSync(this.#sessionFile).size > eagerHydrationMaxBytes())
 			throw new Error("cold_sidecar_rebuild_required_for_bounded_transcript");
 		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
@@ -16471,6 +16480,7 @@ export class SessionManager {
 				},
 				"memory-fallback",
 			);
+			transition.preserveSelectedLeaf(leafId);
 			this.#commitResidentTextStoreTransition(transition, false);
 			this.#clearColdRuntimeAfterHydration(runtime);
 		} catch {
@@ -18499,6 +18509,20 @@ export class SessionManager {
 		const legacyArtifactsRoot = path.basename(sessionFile.slice(0, -6));
 		const legacyLocalRoot = path.posix.join(legacyArtifactsRoot, "local");
 		return {
+			hasLegacySourceSync: () => {
+				// A cwd move removes the old artifacts tree before this manager's
+				// session file and store switch to the destination; the copied legacy
+				// tree is not probed there, so the async gate must stay in charge.
+				if (this.#cwdTransitionOwner !== undefined) return true;
+				try {
+					// Same precondition as capture() -> captureTree().
+					store.assertBound();
+					fs.lstatSync(path.join(store.dir, legacyLocalRoot));
+					return true;
+				} catch (error) {
+					return !isEnoent(error);
+				}
+			},
 			capture: async () => {
 				let snapshot: native.NativeDirectoryTreeSnapshot;
 				const captureLegacyLocal = (): native.NativeDirectoryTreeSnapshot => store.captureTree(legacyLocalRoot);

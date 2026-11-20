@@ -319,3 +319,134 @@ describe("ordered credential preferences", () => {
 		expect(await storage.getApiKey("anthropic", "runtime-wins")).toBe(token(PERSONAL));
 	});
 });
+
+describe("organization preferences for one login in several organizations", () => {
+	const TEAM = "team@example.test";
+	const usageByOrganization = new Map<string, UsageReport>();
+
+	function orgOAuth(organizationId: string, organizationName = organizationId): OAuthCredential {
+		return {
+			type: "oauth",
+			access: `token-${organizationId}`,
+			refresh: `refresh-${organizationId}`,
+			expires: Date.now() + HOUR_MS,
+			email: TEAM,
+			accountId: "acct-team",
+			organizationId,
+			organizationName,
+		};
+	}
+
+	function setOrgUsage(organizationId: string, shortUsed: number, longUsed: number): void {
+		usageByOrganization.set(organizationId, {
+			provider: "anthropic",
+			fetchedAt: Date.now(),
+			limits: [
+				limit("anthropic:5h", "anthropic", 5 * HOUR_MS, shortUsed),
+				limit("anthropic:7d", "anthropic", 7 * DAY_MS, longUsed),
+			],
+		});
+	}
+
+	function preferOrg(value: string): ConfiguredCredentialPreference {
+		return { selector: { kind: "org", value } };
+	}
+
+	async function createOrgStorage(
+		preferences: readonly ConfiguredCredentialPreference[] | undefined,
+		credentials: readonly OAuthCredential[] = [orgOAuth("org-personal"), orgOAuth("org-kb")],
+	): Promise<AuthStorage> {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		openStores.push(store);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: () => ({
+				id: "anthropic",
+				async fetchUsage(params) {
+					const organizationId = params.credential.organizationId;
+					return organizationId ? (usageByOrganization.get(organizationId) ?? null) : null;
+				},
+			}),
+			...(preferences ? { credentialPreferences: { anthropic: preferences } } : {}),
+		});
+		await storage.set("anthropic", [...credentials]);
+		return storage;
+	}
+
+	afterEach(() => usageByOrganization.clear());
+
+	test("the listed organization is used ahead of a less-used organization of the same login", async () => {
+		setOrgUsage("org-personal", 0.1, 0.1);
+		setOrgUsage("org-kb", 0.8, 0.5);
+
+		expect(await (await createOrgStorage(undefined)).getApiKey("anthropic", "unlisted")).toBe("token-org-personal");
+		const storage = await createOrgStorage([preferOrg("org-kb"), preferOrg("org-personal")]);
+		expect(await storage.getApiKey("anthropic", "listed")).toBe("token-org-kb");
+	});
+
+	test("a rate-limited first organization moves selection to the second", async () => {
+		setOrgUsage("org-personal", 0.1, 0.1);
+		setOrgUsage("org-kb", 1, 0.5);
+		const storage = await createOrgStorage([preferOrg("org-kb"), preferOrg("org-personal")]);
+
+		expect(await storage.getApiKey("anthropic", "kb-exhausted")).toBe("token-org-personal");
+	});
+
+	test("a quota failure during a session moves to the next listed organization", async () => {
+		setOrgUsage("org-personal", 0.1, 0.1);
+		setOrgUsage("org-kb", 0.5, 0.5);
+		const storage = await createOrgStorage([preferOrg("org-kb"), preferOrg("org-personal")]);
+
+		expect(await storage.getApiKey("anthropic", "quota-org")).toBe("token-org-kb");
+		expect(await storage.markUsageLimitReached("anthropic", "quota-org", { retryAfterMs: 60_000 })).toMatchObject({
+			state: "marked",
+		});
+		expect(await storage.getApiKey("anthropic", "quota-org")).toBe("token-org-personal");
+	});
+
+	function otherLogin(organizationId: string): OAuthCredential {
+		return {
+			...orgOAuth(organizationId),
+			access: `token-other-${organizationId}`,
+			refresh: `refresh-other-${organizationId}`,
+			email: "other@example.test",
+			accountId: "acct-other",
+		};
+	}
+
+	test("an organization held by two stored rows designates nothing and the next entry still applies", async () => {
+		setOrgUsage("org-kb", 0.1, 0.1);
+		setOrgUsage("org-personal", 0.6, 0.6);
+		const storage = await createOrgStorage(
+			[preferOrg("org-kb"), preferOrg("org-personal")],
+			[orgOAuth("org-kb"), otherLogin("org-kb"), orgOAuth("org-personal")],
+		);
+
+		expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+		// Normal ranking would pick an org-kb row (10% used); the list skips the ambiguous entry and applies org-personal.
+		expect(await storage.getApiKey("anthropic", "ambiguous-org")).toBe("token-org-personal");
+	});
+
+	test("an organization id never matches another organization's display name", async () => {
+		setOrgUsage("org-other", 0.1, 0.1);
+		setOrgUsage("org-personal", 0.6, 0.6);
+		// The listed org-kb row was removed; another organization happens to be named "org-kb".
+		const storage = await createOrgStorage(
+			[preferOrg("org-kb"), preferOrg("org-personal")],
+			[orgOAuth("org-other", "org-kb"), orgOAuth("org-personal")],
+		);
+
+		expect(await storage.getApiKey("anthropic", "no-retarget")).toBe("token-org-personal");
+	});
+
+	test("an organization entry and an account entry naming the same row are reported as duplicates", async () => {
+		const storage = await createOrgStorage(
+			[preferOrg("ORG-KB"), { selector: { kind: "account", value: "acct-other" } }],
+			[otherLogin("org-kb"), orgOAuth("org-personal")],
+		);
+		const kbRow = storage.listCredentialInventory("anthropic").find(row => row.organizationId === "org-kb");
+
+		expect(storage.findDuplicateCredentialPreferences()).toEqual([
+			{ provider: "anthropic", credentialId: kbRow!.id },
+		]);
+	});
+});

@@ -131,6 +131,37 @@ describe("Keenable web search provider", () => {
 		});
 	});
 
+	it.each([
+		["a null row", [null]],
+		[
+			"rows without URLs",
+			[
+				{ title: "No URL", snippet: "dropped" },
+				{ title: "Empty URL", url: "" },
+			],
+		],
+		["a non-string URL", [{ title: "Numeric URL", url: 42 }]],
+	])("rejects a nonempty results array with %s as a malformed provider error", async (_label, results) => {
+		using _hook = hookFetch(() => Response.json({ results }));
+
+		const error = await searchKeenable(makeParams("unusable rows")).catch(err => err);
+		expect(error).toBeInstanceOf(SearchProviderError);
+		expect(error).toMatchObject({
+			provider: "keenable",
+			status: 502,
+			message: "Keenable API returned malformed response body (no result has a URL)",
+		});
+	});
+
+	it("keeps usable rows when some rows are unusable", async () => {
+		using _hook = hookFetch(() =>
+			Response.json({ results: [null, { title: "No URL" }, { title: "Kept", url: "https://example.com/kept" }] }),
+		);
+
+		const response = await searchKeenable(makeParams("mixed rows"));
+		expect(response.sources).toEqual([{ title: "Kept", url: "https://example.com/kept", snippet: undefined }]);
+	});
+
 	it("clamps result counts and maps recency to an exact published_after timestamp", () => {
 		// Non-midnight on purpose: a date-only cutoff would widen the window to 00:00 UTC.
 		const now = new Date("2026-10-23T12:34:56.789Z");

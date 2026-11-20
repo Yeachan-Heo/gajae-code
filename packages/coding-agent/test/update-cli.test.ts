@@ -1982,7 +1982,13 @@ describe("update-cli binary replacement", () => {
 		}
 	});
 
-	it("keeps refusing a different candidate once the recorded target has drifted from its baseline", async () => {
+	async function driftedRecordFixture(): Promise<{
+		dir: string;
+		targetPath: string;
+		staleStage: string;
+		nextStage: string;
+		backupName: string;
+	}> {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.exe");
 		const staleStage = path.join(dir, "gjc.new.stale.exe");
@@ -2003,10 +2009,18 @@ describe("update-cli binary replacement", () => {
 				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
 			}),
 		);
-		// The installed bytes no longer match the recorded baseline: a promotion may
-		// have reached the target, so the transaction must stay pinned.
+		const record = await readActivationRecord(targetPath);
+		if (record.status !== "valid") throw new Error("fixture record must be valid");
+		// The installed bytes no longer match the recorded baseline.
 		await writeFixtureFile(targetPath, "changed binary");
 		await writeFixtureFile(nextStage, "new binary");
+		return { dir, targetPath, staleStage, nextStage, backupName: record.record.backupName };
+	}
+
+	it("keeps refusing a drifted record once its promotion retired the old target to the backup name", async () => {
+		const { dir, targetPath, nextStage, backupName } = await driftedRecordFixture();
+		// Retained replacement retires the old target to backupName first: a promotion may have reached the target.
+		await writeFixtureFile(path.join(dir, backupName), "old binary");
 
 		await expect(
 			replaceBinaryFixture({
@@ -2018,6 +2032,176 @@ describe("update-cli binary replacement", () => {
 			}),
 		).rejects.toThrow("activation_transaction_requires_reconciliation");
 		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	it("keeps refusing a drifted record whose staged candidate has left its recorded path", async () => {
+		const { dir, targetPath, staleStage, nextStage } = await driftedRecordFixture();
+		await fs.rm(staleStage);
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	it("keeps refusing a drifted record whose staged candidate at the recorded path was changed", async () => {
+		const { dir, targetPath, staleStage, nextStage } = await driftedRecordFixture();
+		await writeFixtureFile(staleStage, "tampered");
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	// The no-baseline guard is enforced twice: `!record.baseline.exists` and
+	// `!record.targetIdentity` (buildActivationRecord rejects a record with both).
+	// Removing either guard alone leaves the other holding, so this test fails only
+	// when both are removed.
+	it("keeps refusing a first-install record after a binary appeared outside the transaction", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const staleStage = path.join(dir, "gjc.new.stale.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		await writeFixtureFile(staleStage, "stale binary");
+		const stale = (await snapshotRegularFile(staleStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile(
+			buildActivationRecord({
+				targetPath,
+				originalTargetAbsent: true,
+				parentIdentity: parent,
+				stagingPath: staleStage,
+				stagingIdentity: stale.identity,
+				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
+			}),
+		);
+		await writeFixtureFile(targetPath, "reinstalled binary");
+		await writeFixtureFile(nextStage, "new binary");
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("reinstalled binary");
+	});
+
+	it("recovers an update interrupted before promotion after the installer replaced the target", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const firstStage = path.join(dir, `gjc.new.${crypto.randomUUID()}.exe`);
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(firstStage, "new binary");
+
+		// A real update whose promotion is denied leaves a pending_activation record.
+		const replaceSpy = vi
+			.spyOn(native, "exactReplaceRetained")
+			.mockReturnValueOnce({ ok: false, code: "access_denied", windowsErrorCode: "0xC0000022" });
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: firstStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("access_denied");
+		} finally {
+			replaceSpy.mockRestore();
+		}
+		const pending = await readActivationRecord(targetPath);
+		expect(pending.status === "valid" && pending.record.phase).toBe("pending_activation");
+
+		// install.ps1 swaps the target by rename, then the user updates to a newer release.
+		const installed = path.join(dir, `gjc.install.${crypto.randomUUID()}.exe`);
+		await writeFixtureFile(installed, "reinstalled binary");
+		await fs.rename(targetPath, path.join(dir, "gjc.exe.previous"));
+		await fs.rename(installed, targetPath);
+		const nextStage = path.join(dir, `gjc.new.${crypto.randomUUID()}.exe`);
+		await writeFixtureFile(nextStage, "newer binary");
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath: path.join(dir, "gjc.exe.bak.next"),
+			expectedVersion: "15.1.9",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.9", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("newer binary");
+		expect(await Bun.file(path.join(dir, "gjc.exe.bak.next")).text()).toBe("reinstalled binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status === "valid" && record.record.phase).toBe("verified");
+	});
+
+	it("supersedes a never-promoted record after the target was reinstalled from outside", async () => {
+		const { dir, targetPath, nextStage } = await driftedRecordFixture();
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath: path.join(dir, "gjc.exe.bak"),
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status).toBe("valid");
+		if (record.status === "valid") {
+			expect(record.record.phase).toBe("verified");
+			expect(record.record.candidate.version).toBe("15.1.8");
+		}
+	});
+
+	it.each(["15.1.7", "15.1.8"])("recovers after a rename-based reinstall for candidate %s", async version => {
+		const { dir, targetPath, nextStage } = await driftedRecordFixture();
+		const retryStage = path.join(dir, `gjc.new.${crypto.randomUUID()}.exe`);
+		await writeFixtureFile(retryStage, "stale binary");
+		const before = (await snapshotRegularFile(targetPath))!;
+		const replacement = path.join(dir, "reinstalled.exe");
+		await writeFixtureFile(replacement, "reinstalled binary");
+		await fs.rename(targetPath, path.join(dir, "external-original.exe"));
+		await fs.rename(replacement, targetPath);
+		expect((await snapshotRegularFile(targetPath))!.identity.ino).not.toBe(before.identity.ino);
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: version === "15.1.7" ? retryStage : nextStage,
+			backupPath: path.join(dir, "gjc.exe.bak.next"),
+			expectedVersion: version,
+			verifyInstalledVersion: async () => ({ ok: true, actual: version, path: targetPath }),
+		});
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe(version === "15.1.7" ? "stale binary" : "new binary");
+		expect(await Bun.file(path.join(dir, "gjc.exe.bak.next")).text()).toBe("reinstalled binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status).toBe("valid");
+		if (record.status === "valid") {
+			expect(record.record.phase).toBe("verified");
+			expect(record.record.candidate.version).toBe(version);
+		}
 	});
 
 	it("reports a denied promotion and reuses its pending stage without leaving a duplicate", async () => {

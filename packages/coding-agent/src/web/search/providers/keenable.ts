@@ -47,7 +47,8 @@ interface KeenableSearchResult {
 }
 
 interface KeenableSearchResponse {
-	results: KeenableSearchResult[];
+	/** Rows are unvalidated; `toSource` keeps the usable ones. */
+	results: unknown[];
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -67,7 +68,23 @@ function parseSearchResponse(value: unknown): KeenableSearchResponse {
 	const record = asRecord(value);
 	if (!record || Array.isArray(record)) malformedResponse("expected a JSON object");
 	if (!Array.isArray(record.results)) malformedResponse("results must be an array");
-	return { results: record.results as KeenableSearchResult[] };
+	return { results: record.results };
+}
+
+/** Map one result row to a source, or null when the row has no URL to cite. */
+function toSource(row: unknown): SearchSource | null {
+	const result = asRecord(row) as KeenableSearchResult | null;
+	if (!result || typeof result.url !== "string" || result.url.length === 0) return null;
+	const title = typeof result.title === "string" ? result.title.trim() : "";
+	const snippet = typeof result.snippet === "string" ? result.snippet.replace(/\s+/g, " ").trim() : "";
+	const publishedDate = typeof result.published_at === "string" ? result.published_at : undefined;
+	return {
+		title: title || result.url,
+		url: result.url,
+		snippet: snippet || undefined,
+		publishedDate,
+		ageSeconds: dateToAgeSeconds(publishedDate),
+	};
 }
 
 function getErrorMessage(value: unknown): string | null {
@@ -119,16 +136,16 @@ export function buildRequestBody(params: KeenableSearchParams, now: Date = new D
 }
 
 async function callKeenableSearch(
-	apiKey: string | null,
+	credential: string | null,
 	params: KeenableSearchParams,
 ): Promise<KeenableSearchResponse> {
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
 		"X-Keenable-Title": KEENABLE_APP_TITLE,
 	};
-	if (apiKey) headers["X-API-Key"] = apiKey;
+	if (credential) headers["X-API-Key"] = credential;
 
-	const response = await fetch(apiKey ? KEENABLE_SEARCH_URL : KEENABLE_PUBLIC_SEARCH_URL, {
+	const response = await fetch(credential ? KEENABLE_SEARCH_URL : KEENABLE_PUBLIC_SEARCH_URL, {
 		method: "POST",
 		headers,
 		body: JSON.stringify(buildRequestBody(params)),
@@ -171,19 +188,13 @@ export async function searchKeenable(params: SearchParams): Promise<SearchRespon
 	const numResults = clampNumResults(keenableParams.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
 	const response = await callKeenableSearch(apiKey, keenableParams);
 	const sources: SearchSource[] = [];
-
-	for (const result of response.results) {
-		if (!result?.url) continue;
-		const snippet = result.snippet?.replace(/\s+/g, " ").trim();
-		const publishedDate = typeof result.published_at === "string" ? result.published_at : undefined;
-		sources.push({
-			title: result.title?.trim() || result.url,
-			url: result.url,
-			snippet: snippet || undefined,
-			publishedDate,
-			ageSeconds: dateToAgeSeconds(publishedDate),
-		});
+	for (const row of response.results) {
+		const source = toSource(row);
+		if (source) sources.push(source);
 	}
+	// A nonempty array with nothing citable is as broken as a missing one: throw so
+	// the fallback chain runs. `results: []` stays a valid no-hit answer.
+	if (response.results.length > 0 && sources.length === 0) malformedResponse("no result has a URL");
 
 	return {
 		provider: "keenable",

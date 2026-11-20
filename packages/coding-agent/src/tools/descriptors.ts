@@ -18,7 +18,7 @@ import {
 	taskParametersForSession,
 } from "./session-descriptions";
 import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 
 export interface ToolDescriptorMetadata {
 	readonly name: string;
@@ -272,6 +272,9 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 
 	readonly execute: AgentTool<any, any, any>["execute"] = async (...args) => {
 		const tool = await this.#get();
+		// Lazy loading can await; a call cancelled meanwhile must not start the tool.
+		const signal = args[2];
+		if (signal?.aborted) throw new ToolAbortError();
 		return tool.execute.call(tool, ...args);
 	};
 }

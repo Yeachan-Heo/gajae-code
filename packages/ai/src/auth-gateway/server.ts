@@ -675,9 +675,16 @@ async function markManagedGatewayCredentialFailure(
 		if (trigger.class === "auth") {
 			await storage.invalidateCredentialMatching(model.provider, apiKey, signal);
 		} else if (trigger.class === "quota" || trigger.class === "rate_limit") {
-			await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
-				retryAfterMs: trigger.retryAfterMs,
-			});
+			// A concurrency-limited (too_many_concurrent_requests) failure does not indicate
+			// the credential is rate-limited or unhealthy; it only means the account hit the
+			// concurrent request ceiling. Skip credential backoff for concurrency-limited
+			// failures so the same credential can be retried after a brief wait via the
+			// managed fallback controller, without being biased away by usage-limit backoff.
+			if (!trigger.concurrencyLimited) {
+				await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
+					retryAfterMs: trigger.retryAfterMs,
+				});
+			}
 		} else if (trigger.class === "credential") {
 			// An account-specific model rejection leaves the account usable for
 			// other models, so the backoff is scoped to the rejected model.

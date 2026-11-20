@@ -609,6 +609,39 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		await expect(fs.stat(original)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("refuses a directory restore before mutation while a peer holds a child open, then completes", async () => {
+		// NTFS refuses to rename a directory while any handle is open on a file inside it,
+		// even one opened with FILE_SHARE_DELETE. A lock waiter reading `<lock>/info` holds
+		// exactly such a handle, which is why file-lock publication rollback retries this
+		// pre-mutation refusal instead of failing on the first attempt.
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-lock-pending");
+		const original = path.join(root, "session.lock");
+		await fs.mkdir(detached);
+		await fs.writeFile(path.join(detached, "info"), "owner");
+		const stat = await fs.stat(detached, { bigint: true });
+		const identity = {
+			...(await parentIdentity(detached)),
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			directory: true,
+		};
+
+		const reader = await fs.open(path.join(detached, "info"), "r");
+		try {
+			expect(exactRestore(detached, original, identity)).toEqual({ ok: false, code: "access_denied" });
+			expect(await fs.readFile(path.join(detached, "info"), "utf8")).toBe("owner");
+			await expect(fs.stat(original)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await reader.close();
+		}
+
+		expect(exactRestore(detached, original, identity)).toEqual({ ok: true });
+		expect(await fs.readFile(path.join(original, "info"), "utf8")).toBe("owner");
+	});
+
 	it("rejects exact tree removal when a child gains a foreign hard link", async () => {
 		const root = await temporaryDirectory();
 		const tree = path.join(root, "tree");
@@ -692,6 +725,38 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 			await writer.close();
 		}
 	});
+	it("reports a lock detach blocked by an open child handle as access_denied and succeeds after close", async () => {
+		// NTFS refuses to rename a directory with STATUS_ACCESS_DENIED while any
+		// handle is open on a child, even one that shares read, write, and delete.
+		// File-lock release detaches `<lock>` this way while waiters read
+		// `<lock>/info`; the denial is contention, not an owner mismatch.
+		const root = await temporaryDirectory();
+		const lock = path.join(root, "state.lock");
+		const info = path.join(lock, "info");
+		await fs.mkdir(lock);
+		await fs.writeFile(info, "owner record");
+		const snapshot = snapshotDirectoryTree(lock);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+		const parent = await fs.stat(root, { bigint: true });
+		const parentIdentity = { dev: parent.dev, ino: parent.ino };
+
+		const reader = await fs.open(info, "r");
+		try {
+			const blocked = exactRemoveDirectoryTree(lock, snapshot.snapshot, parentIdentity, true);
+			expect(blocked).toMatchObject({ ok: false, code: "access_denied" });
+			expect(blocked.detachedPath).toBeUndefined();
+			expect(await fs.readFile(info, "utf8")).toBe("owner record");
+		} finally {
+			await reader.close();
+		}
+
+		const detachedPath = `${lock}.removing`;
+		expect(exactRemoveDirectoryTree(lock, snapshot.snapshot, parentIdentity, true)).toEqual({
+			ok: true,
+			detachedPath,
+		});
+		expect(await fs.readFile(path.join(detachedPath, "info"), "utf8")).toBe("owner record");
+	});
 	it("rejects a replaced ancestor junction during exact restore and retains detached content", async () => {
 		const root = await temporaryDirectory();
 		const managed = path.join(root, "managed");
@@ -768,6 +833,28 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		} finally {
 			await runIcacls(directory, "/setowner", user);
 		}
+	});
+	it("keeps owner_mismatch for a denied owner-only open while other operations report access_denied", async () => {
+		// Another user's owner-only directory denies this user's traversal and
+		// READ_CONTROL opens. Managed-session repair routing and the tmux
+		// foreign-owner skip read that denial as `owner_mismatch`; every other
+		// path-identity operation reports the same NTSTATUS as `access_denied`.
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const root = await temporaryDirectory();
+		const guarded = path.join(root, "guarded");
+		const target = path.join(guarded, "managed");
+		await fs.mkdir(target, { recursive: true });
+
+		await runIcacls(guarded, "/deny", `${user}:(X)`);
+		try {
+			expect(verifyOwnerOnlyPathSecurity(target, "directory")).toEqual({ ok: false, code: "owner_mismatch" });
+			expect(applyOwnerOnlyPathSecurity(target, "directory")).toEqual({ ok: false, code: "owner_mismatch" });
+			expect(snapshotDirectoryTree(target)).toEqual({ ok: false, code: "access_denied" });
+		} finally {
+			await runIcacls(guarded, "/remove:d", user);
+		}
+		expect(snapshotDirectoryTree(target).ok).toBe(true);
 	});
 	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
 		const root = await temporaryDirectory();

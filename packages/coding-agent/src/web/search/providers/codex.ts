@@ -24,7 +24,7 @@ const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
 // Reviewed search candidates, additionally filtered by current account discovery.
 // Upstream Codex web-search metadata informs this policy, not bundle presence.
-const DEFAULT_MODEL_PREFERENCES = ["gpt-6.1-sol", "gpt-6-luna"];
+const DEFAULT_MODEL_PREFERENCES = ["gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-luna"];
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";

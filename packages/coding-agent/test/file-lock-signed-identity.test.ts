@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from "bun:test";
 import type { BigIntStats } from "node:fs";
+import * as fsSync from "node:fs";
 import { renameSync, rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -95,22 +96,31 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 		const stat = await realLstat(target, options);
 		return typeof stat.ino === "bigint" ? transformStat(String(target), stat as BigIntStats) : stat;
 	}) as typeof fs.lstat);
-	const realOpen = fs.open;
-	vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
-		const handle = await realOpen(target, flags, mode);
+	// Owner records are read through one synchronous open/fstat/read/close sequence;
+	// map each info descriptor back to its path so fstat sees the fixture identity.
+	const realOpenSync = fsSync.openSync;
+	const realCloseSync = fsSync.closeSync;
+	const realFstatSync = fsSync.fstatSync as (fd: number, options?: fsSync.StatOptions) => fsSync.Stats | BigIntStats;
+	const infoDescriptors = new Map<number, string>();
+	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+		const fd = realOpenSync(target, flags, mode);
 		const matchesInfo =
 			sameFixturePath(String(target), path.join(lock, "info")) ||
 			sameFixturePath(String(target), path.join(cleanupLock, "info"));
 		pathObservations.push(`open ${String(target)} info=${matchesInfo}`);
-		if (matchesInfo) {
-			const realStat = handle.stat.bind(handle);
-			vi.spyOn(handle, "stat").mockImplementation((async options => {
-				const stat = await realStat(options);
-				return typeof stat.ino === "bigint" ? transformStat(String(target), stat as BigIntStats) : stat;
-			}) as typeof handle.stat);
-		}
-		return handle;
-	});
+		if (matchesInfo) infoDescriptors.set(fd, String(target));
+		else infoDescriptors.delete(fd);
+		return fd;
+	}) as typeof fsSync.openSync);
+	vi.spyOn(fsSync, "closeSync").mockImplementation(((fd: number) => {
+		infoDescriptors.delete(fd);
+		realCloseSync(fd);
+	}) as typeof fsSync.closeSync);
+	vi.spyOn(fsSync, "fstatSync").mockImplementation(((fd: number, options?: fsSync.StatOptions) => {
+		const stat = realFstatSync(fd, options);
+		const target = infoDescriptors.get(fd);
+		return target !== undefined && typeof stat.ino === "bigint" ? transformStat(target, stat as BigIntStats) : stat;
+	}) as typeof fsSync.fstatSync);
 	const nativeSnapshot = (snapshot: NativeDirectoryTreeSnapshot): NativeDirectoryTreeSnapshot => {
 		// Canonicalize IDs the same way production code does when comparing identities
 		const canonicalRootId = canonicalLockFileId(BigInt.asIntN(64, ROOT_ID));

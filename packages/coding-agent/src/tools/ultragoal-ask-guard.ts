@@ -8,13 +8,11 @@ import {
 } from "../gjc-runtime/ultragoal-guard";
 import { isBuiltinAskTool } from "./ask";
 import { LazyAgentTool } from "./descriptors";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 
-/**
- * The wrappers this module built. A property on the tool could be set by the
- * tool itself, and a tool that claims to be guarded would be returned unwrapped.
- */
-const guardedTools = new WeakSet<object>();
+// A wrapper marker must never land on the target: a second guard pass would then
+// treat the raw tool as guarded and hand it back without the cancellation fence.
+const guardedAskTools = new WeakSet<AgentTool>();
 
 export interface UltragoalAskGuardContext {
 	/**
@@ -135,7 +133,7 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 	getSessionAgentDir: () => string | undefined = () => undefined,
 ): T {
 	if (tool.name !== "ask") return tool;
-	if (guardedTools.has(tool)) return tool;
+	if (guardedAskTools.has(tool)) return tool;
 	const wrapped = new Proxy(tool, {
 		get(target, prop) {
 			if (prop !== "execute") return Reflect.get(target, prop);
@@ -156,10 +154,13 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 					);
 				}
 
+				// The guard awaits; do not start the ask if the call was cancelled.
+				const signal = args[2] as AbortSignal | undefined;
+				if (signal?.aborted) throw new ToolAbortError();
 				return Reflect.apply(target.execute, target, args);
 			};
 		},
-	});
-	guardedTools.add(wrapped);
-	return wrapped;
+	}) as T;
+	guardedAskTools.add(wrapped);
+	return wrapped as T;
 }

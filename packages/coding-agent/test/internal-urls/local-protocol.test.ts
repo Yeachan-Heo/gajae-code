@@ -102,6 +102,7 @@ it("migrates opaque managed legacy topology, retires exactly once, and verifies 
 		LocalProtocolHandler.setOverride({
 			getSessionId: () => sessionId,
 			getManagedLegacyLocalMigrationSource: () => ({
+				hasLegacySourceSync: () => true,
 				capture: async () => {
 					captures++;
 					return {
@@ -144,6 +145,7 @@ it("coalesces concurrent managed migration for the same local root", async () =>
 		const options = {
 			getSessionId: () => sessionId,
 			getManagedLegacyLocalMigrationSource: () => ({
+				hasLegacySourceSync: () => true,
 				capture: async () => {
 					captures++;
 					captureStarted.resolve();
@@ -173,6 +175,7 @@ it("rolls back a sorted managed partial install and retries the same identity", 
 		const options = {
 			getSessionId: () => sessionId,
 			getManagedLegacyLocalMigrationSource: () => ({
+				hasLegacySourceSync: () => true,
 				capture: async () => ({
 					snapshot,
 					entries: [
@@ -222,6 +225,7 @@ it("fails closed for real managed payloads above the 64 MiB safe size without wr
 		const options = {
 			getSessionId: () => sessionId,
 			getManagedLegacyLocalMigrationSource: () => ({
+				hasLegacySourceSync: () => true,
 				capture: async () => ({
 					snapshot,
 					entries: [
@@ -924,6 +928,106 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
+	it("accepts a settled marker the sync resolver wrote while the async gate was capturing", async () => {
+		const sessionId = `sync-wins-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			const marker = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+			const options = {
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+				getManagedLegacyLocalMigrationSource: () => ({
+					hasLegacySourceSync: () => false,
+					capture: async () => {
+						resolveLocalUrlToPath("local://note.txt", options);
+						return null;
+					},
+					retire: () => {},
+				}),
+			};
+
+			await initializeLocalRoot(options);
+			expect(await fs.readFile(marker, "utf8")).toBe("absent\n");
+		});
+	});
+
+	it("validates a marker that appears while the async gate is capturing with the no-follow reader", async () => {
+		const sessionId = `sync-nonregular-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			const marker = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+			const options = {
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+				getManagedLegacyLocalMigrationSource: () => ({
+					hasLegacySourceSync: () => true,
+					capture: async () => {
+						await fs.mkdir(marker);
+						return null;
+					},
+					retire: () => {},
+				}),
+			};
+
+			await expect(initializeLocalRoot(options)).rejects.toThrow("Unsafe legacy local:// migration source");
+		});
+	});
+
+	it("settles an absent marker on first sync resolution only when the managed legacy source reports its tree absent", async () => {
+		const sessionId = `fresh-sync-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			let legacyPresent = true;
+			let captures = 0;
+			const options = {
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+				getManagedLegacyLocalMigrationSource: () => ({
+					hasLegacySourceSync: () => legacyPresent,
+					capture: async () => {
+						captures++;
+						return null;
+					},
+					retire: () => {},
+				}),
+			};
+			const marker = path.join(localRoot, ".gjc-local-legacy-migrated-v1");
+
+			expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow(
+				"local:// legacy migration must complete before path resolution",
+			);
+			await expect(fs.readFile(marker, "utf8")).rejects.toThrow();
+
+			legacyPresent = false;
+			expect(resolveLocalUrlToPath("local://note.txt", options)).toBe(path.join(localRoot, "note.txt"));
+			expect(await fs.readFile(marker, "utf8")).toBe("absent\n");
+			expect(captures).toBe(0);
+		});
+	});
+
+	it("leaves no marker-less root behind when sync resolution waits on a pending legacy migration", async () => {
+		const sessionId = `pending-no-root-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async localRoot => {
+			await fs.rm(localRoot, { recursive: true, force: true });
+			const options = {
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+				getManagedLegacyLocalMigrationSource: () => ({
+					hasLegacySourceSync: () => true,
+					capture: async () => null,
+					retire: () => {},
+				}),
+			};
+
+			expect(() => resolveLocalUrlToPath("local://note.txt", options)).toThrow(
+				"local:// legacy migration must complete before path resolution",
+			);
+			// local-root GC prunes only marker-only roots, so a root created by a refused
+			// resolution would persist forever.
+			await expect(fs.lstat(localRoot)).rejects.toThrow();
+
+			await initializeLocalRoot(options);
+			expect(resolveLocalUrlToPath("local://note.txt", options)).toBe(path.join(localRoot, "note.txt"));
+		});
+	});
+
 	it("re-creates a removed managed root once its legacy migration settled", async () => {
 		const sessionId = `removed-root-${crypto.randomUUID()}`;
 		await withLocalRoot(sessionId, async localRoot => {
@@ -932,6 +1036,7 @@ describe("LocalProtocolHandler", () => {
 				getSessionId: () => sessionId,
 				isManagedDestination: () => true,
 				getManagedLegacyLocalMigrationSource: () => ({
+					hasLegacySourceSync: () => true,
 					capture: async () => {
 						captures++;
 						return null;
@@ -960,6 +1065,7 @@ describe("LocalProtocolHandler", () => {
 				getSessionId: () => sessionId,
 				isManagedDestination: () => true,
 				getManagedLegacyLocalMigrationSource: () => ({
+					hasLegacySourceSync: () => true,
 					capture: async () => {
 						captures++;
 						return {
@@ -1040,7 +1146,7 @@ import * as path from "node:path";
 const options = {
 	getSessionId: () => "parent-removed",
 	isManagedDestination: () => true,
-	getManagedLegacyLocalMigrationSource: () => ({ capture: async () => null, retire: () => {} }),
+	getManagedLegacyLocalMigrationSource: () => ({ hasLegacySourceSync: () => true, capture: async () => null, retire: () => {} }),
 };
 const root = path.join(os.tmpdir(), "gjc-local", "parent-removed");
 await initializeLocalRoot(options);

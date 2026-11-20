@@ -4530,6 +4530,8 @@ async function runLoopBody(
 			}
 
 			// One provider invocation is committed before any tool can run.
+			// The provider outcome decides fallback acceptance; a later consumer abort does not.
+			const providerAccepted = message.stopReason !== "error" && message.stopReason !== "aborted";
 			if (escapedToolTransaction) {
 				const acceptedMessage = escapedToolTransaction.acceptedAssistantSnapshot(message);
 				const contextIndex = currentContext.messages.lastIndexOf(message);
@@ -4556,6 +4558,29 @@ async function runLoopBody(
 				}
 				escapedToolTransaction.replacePendingAssistantMessage(message);
 				escapedToolTransaction.flush();
+			} else if (attemptTransaction) {
+				// A managed attempt stages every update until it is accepted, so stream
+				// guards (TTSR, streaming edit guards) first see the updates here, after
+				// the provider already finished. Publish and drain them before the
+				// terminal message so an abort they raise still marks this message
+				// aborted and keeps its tool calls from executing, as an unmanaged
+				// stream would.
+				attemptTransaction.flushNonTerminal();
+				if (providerAccepted) {
+					// Only an acknowledging consumer is awaited, and the wait ends on abort.
+					await drainPublishedEvents();
+					if (loopSignal.aborted) {
+						message.stopReason = "aborted";
+						// The staged terminal snapshots still say the provider outcome; publish a
+						// detached aborted copy so the dispatched message stays private to the loop,
+						// keeping the markers of calls the provider already executed.
+						attemptTransaction.replacePendingAssistantMessage({
+							...structuredClone({ ...message, content: [] }),
+							content: cloneContentPreservingProviderResolved(message.content),
+						});
+					}
+				}
+				attemptTransaction.flush();
 			} else {
 				transaction?.flush();
 			}
@@ -4564,7 +4589,7 @@ async function runLoopBody(
 			if (config.canonicalEventAcknowledgment) {
 				await drainPublishedEvents();
 			}
-			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			if (config.fallbackManaged && providerAccepted) {
 				await config.onManagedAttemptAccepted?.();
 			}
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
