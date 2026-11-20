@@ -166,12 +166,21 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).toBe('The marker is `<｜DSML｜ invoke name="_i" string="true">`. Keep this sentence.');
 	});
 
+	it("preserves a complete quoted wrapperless example", async () => {
+		const example =
+			'For example: `<｜DSML｜ invoke name="_i" string="true">probe</｜DSML｜ parameter>`. Keep this sentence.';
+		const result = await response([{ content: example }], {}, offeredTools, "venice");
+		expect(result.stopReason).toBe("stop");
+		expect(text(result)).toBe(example);
+	});
+
 	it("reports a malformed wrapperless invocation rather than silently ending the turn", async () => {
 		const result = await response(
 			[
 				{ content: "Checking.\n<｜DS" },
 				{ content: 'ML｜ invoke name="_i" string="true">probe</｜DS' },
 				{ content: "ML｜ parameter>" },
+				{ content: '<｜DSML｜ parameter name="command" string="true">sample</｜DSML｜ parameter>' },
 			],
 			{},
 			offeredTools,
@@ -308,6 +317,18 @@ describe("DeepSeek DSML provider streaming", () => {
 		]);
 		// Should have 2 calls: one structured (suppressing one recovered) and one unmatched recovered
 		expect(tools(result)).toHaveLength(2);
+	});
+
+	it("honors tool choice changed in place by onPayload", async () => {
+		const result = await response(
+			[{ content: `${wrapperStart}${invocationStart}sample${invocationEnd}${wrapperEnd}` }],
+			{
+				onPayload(payload) {
+					(payload as { tool_choice?: string }).tool_choice = "none";
+				},
+			},
+		);
+		expect(tools(result)).toHaveLength(0);
 	});
 
 	it("drops recovered calls the request's tool choice forbids", async () => {

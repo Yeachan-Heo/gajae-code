@@ -332,6 +332,7 @@ export class DsmlToolCallHealer {
 	#nextId = 1;
 	readonly #idPrefix: string;
 	readonly #stripOrphanParameterClose: boolean;
+	#literalParameterClose: string | undefined;
 	readonly #completed: HealedToolCall[] = [];
 
 	/**
@@ -421,7 +422,15 @@ export class DsmlToolCallHealer {
 					// quoted by the model) and stays visible text.
 					if (!this.#inWrapper && tag.kind !== "wrapper") {
 						const rawTag = this.#buffer.slice(this.#offset, this.#offset + tag.length);
+						if (rawTag === '<｜DSML｜ invoke name="_i" string="true">') {
+							this.#literalParameterClose = "</｜DSML｜ parameter>";
+						} else if (rawTag === '<|DSML| invoke name="_i" string="true">') {
+							this.#literalParameterClose = "</|DSML| parameter>";
+						}
+						const literalClose = rawTag === this.#literalParameterClose;
+						if (literalClose) this.#literalParameterClose = undefined;
 						if (
+							literalClose ||
 							!this.#stripOrphanParameterClose ||
 							(rawTag !== "</｜DSML｜ parameter>" && rawTag !== "</|DSML| parameter>")
 						) {

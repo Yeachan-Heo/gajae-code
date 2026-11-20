@@ -4301,6 +4301,9 @@ async function runLoopBody(
 			if (
 				!retriedMalformedVeniceCall &&
 				!config.fallbackManaged &&
+				escapedToolTransaction &&
+				!escapedToolTransaction.committed &&
+				!escapedToolTransaction.rejected &&
 				(escapedNonAsciiToolChoice ?? config.toolChoice) !== "none" &&
 				!loopSignal.aborted &&
 				message.provider === "venice" &&
@@ -4310,6 +4313,7 @@ async function runLoopBody(
 				currentContext.messages.at(-1) === message
 			) {
 				retriedMalformedVeniceCall = true;
+				escapedToolTransaction.discard();
 				currentContext.messages.pop();
 				continue;
 			}
@@ -5326,7 +5330,11 @@ async function streamAssistantResponse(
 								// tool arguments. Publication does not accept or execute tools:
 								// terminal validation and the consumer drain still precede dispatch.
 								// A published escaped call is rejected rather than silently resampled.
-								provisionalToolTransaction?.commitCallbacksAndUpdates();
+								// Venice DeepSeek can reject a text-bearing attempt at EOF. Keep it
+								// staged until that decision; the transaction's size cap still applies.
+								if (!(config.model.provider === "venice" && /deepseek/i.test(config.model.id))) {
+									provisionalToolTransaction?.commitCallbacksAndUpdates();
+								}
 							}
 							break;
 

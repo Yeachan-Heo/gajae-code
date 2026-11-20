@@ -656,8 +656,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					effectiveToolChoice: builtEffectiveToolChoice,
 				} = buildParams(model, context, options, baseUrl, effectiveToolStrictModeOverride);
 				let params = builtParams;
-				// Capture the effective tool_choice from buildParams for use in DSML recovery filtering
-				effectiveToolChoice = builtEffectiveToolChoice;
 				appliedToolStrictMode = toolStrictMode;
 				const replacementPayload = await options?.onPayload?.(
 					params,
@@ -667,9 +665,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				);
 				if (replacementPayload !== undefined) {
 					params = replacementPayload as typeof params;
-					// Update effectiveToolChoice from the final params after onPayload replacement
-					effectiveToolChoice = (params as Record<string, unknown>).tool_choice as unknown;
 				}
+				effectiveToolChoice = (params as Record<string, unknown>).tool_choice ?? builtEffectiveToolChoice;
 				// Capture the service tier for use in cost calculations
 				effectiveServiceTier = (params as Record<string, unknown>).service_tier as ServiceTier | undefined;
 				output.serviceTier = parseResolvedServiceTier(effectiveServiceTier);
@@ -1083,21 +1080,27 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					marker = findFirstTag(remaining, malformedVeniceTags)
 				) {
 					const candidate = remaining.slice(marker.index + marker.tag.length);
-					// A bare opener can be quoted prose. Require a nonempty parameter
-					// value and the mismatched parameter closer before discarding it.
+					// A standalone _i example is ambiguous. The observed broken payload
+					// continues with a separate command parameter after the mismatched close.
 					const closer = marker.tag.startsWith("<｜") ? "</｜DSML｜ parameter>" : "</|DSML| parameter>";
+					const nextParameter = marker.tag.startsWith("<｜")
+						? '<｜DSML｜ parameter name="command"'
+						: '<|DSML| parameter name="command"';
 					const closeIndex = candidate.indexOf(closer);
 					const value = closeIndex < 0 ? "" : candidate.slice(0, closeIndex);
-					if (closeIndex <= 4096 && value.trim() && !/[<`]/.test(value)) {
+					const suffix = closeIndex < 0 ? "" : candidate.slice(closeIndex + closer.length).trimStart();
+					const hasValue = closeIndex >= 0 && closeIndex <= 4096 && !!value.trim() && !/[<`]/.test(value);
+					if (hasValue && suffix.startsWith(nextParameter)) {
 						malformedVeniceCall = true;
 						malformedVeniceTail = "";
 						return clean + remaining.slice(0, marker.index);
 					}
 					const partialCloser = getTrailingPartialTag(candidate, [closer]);
 					if (
-						closeIndex < 0 &&
-						candidate.length <= 4096 + closer.length &&
-						!/[<`]/.test(candidate.slice(0, candidate.length - partialCloser.length))
+						(closeIndex < 0 &&
+							candidate.length <= 4096 + closer.length &&
+							!/[<`]/.test(candidate.slice(0, candidate.length - partialCloser.length))) ||
+						(hasValue && candidate.length <= 8192 && nextParameter.startsWith(suffix))
 					) {
 						malformedVeniceTail = remaining.slice(marker.index);
 						return clean + remaining.slice(0, marker.index);
@@ -1551,6 +1554,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			output.errorMessage = strictFallbackErrorMessage;
 			if (
 				malformedVeniceCall &&
+				extractToolChoiceLevel(effectiveToolChoice).requestLevel !== "none" &&
+				requestedToolChoiceLevel(options?.toolChoice).requestedLevel !== "none" &&
 				(output.stopReason === "stop" || output.stopReason === "toolUse") &&
 				countStructuredCalls() === 0
 			) {

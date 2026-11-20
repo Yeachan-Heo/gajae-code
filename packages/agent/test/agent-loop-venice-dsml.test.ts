@@ -22,7 +22,10 @@ const model: Model<"openai-completions"> = {
 	contextWindow: 128000,
 	maxTokens: 8192,
 };
-const malformed = { content: '<｜DSML｜ invoke name="_i" string="true">probe</｜DSML｜ parameter>' };
+const malformed = {
+	content:
+		'Rejected draft.\n<｜DSML｜ invoke name="_i" string="true">probe</｜DSML｜ parameter><｜DSML｜ parameter name="command" string="true">sample</｜DSML｜ parameter>',
+};
 const structured = {
 	tool_calls: [{ index: 0, id: "call_real", type: "function", function: { name: "probe", arguments: "{}" } }],
 };
@@ -80,10 +83,13 @@ async function run(
 		undefined,
 		streamFn,
 	);
-	for await (const _ of stream) {
-		/* drain */
+	const published: string[] = [];
+	for await (const event of stream) {
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			for (const block of event.message.content) if (block.type === "text") published.push(block.text);
+		}
 	}
-	return { requests, executions, messages: await stream.result() };
+	return { requests, executions, published, messages: await stream.result() };
 }
 
 describe("Venice DeepSeek malformed DSML recovery", () => {
@@ -95,6 +101,7 @@ describe("Venice DeepSeek malformed DSML recovery", () => {
 		expect(result.requests[1].tool_choice).toBe("required");
 		expect(result.requests[2].tool_choice).not.toBe("required");
 		expect(result.executions).toBe(1);
+		expect(result.published).toEqual(["done"]);
 		expect(result.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 	it("does not retry or dispatch when the static tool choice is none", async () => {
