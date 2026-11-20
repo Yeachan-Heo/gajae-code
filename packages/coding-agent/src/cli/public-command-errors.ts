@@ -412,7 +412,11 @@ export function classifyPublicCommandFailure(
 					["sdk", "session", "status", session.value, operation.value],
 				),
 			);
-		} else if (canonical[0] === "sdk" && kind !== "authorization_denied") {
+		} else if (
+			canonical[0] === "sdk" &&
+			kind !== "authorization_denied" &&
+			!input.diagnostics?.includes("lock_refused")
+		) {
 			nextSteps.push(
 				step("Inspect existing session state before deciding whether another operation is safe.", [
 					"sdk",
