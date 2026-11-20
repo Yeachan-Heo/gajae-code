@@ -950,6 +950,16 @@ When `GJC_AUTH_BROKER_URL` (or `auth.broker.url`) is set, the local SQLite crede
 
 `AuthStorage.setConfigApiKey` lets a `models.yml` `apiKey` win over a broker-resolved OAuth token without overriding a runtime `--api-key`. See [`auth-broker-gateway.md`](./auth-broker-gateway.md) for the full broker / gateway design and env surface (`GJC_AUTH_BROKER_URL`, `GJC_AUTH_BROKER_TOKEN`, `auth.broker.url`, `auth.broker.token`).
 
+### Google account suspension risk for Gemini CLI OAuth
+
+⚠️ **Important:** Google reportedly suspends accounts that use Gemini subscription OAuth through third-party clients like this one. If you are using the `google-gemini-cli` provider with OAuth login (`gjc auth-broker login google-gemini-cli` or `/login google-gemini-cli`), consider using one of these alternatives instead:
+
+- **Google API key** (`google-gemini-cli` provider with `--api-key`): Direct API authentication without OAuth
+- **Google Vertex AI** (`google-vertex` provider): Use your own Google Cloud project credentials
+- **Google Cloud API key** (`google` provider): Another direct API authentication option
+
+Using these alternatives avoids the risk of account suspension. The OAuth flow for `google-gemini-cli` will show this warning before proceeding.
+
 ## Model availability vs all models
 
 - `getAll()` returns the loaded model registry (built-in + merged custom + discovered).

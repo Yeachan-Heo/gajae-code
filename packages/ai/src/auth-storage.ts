@@ -4331,6 +4331,9 @@ export class AuthStorage {
 				break;
 			}
 			case "google-gemini-cli": {
+				ctrl.onProgress?.(
+					"⚠️  WARNING: Google may suspend accounts using Gemini subscription OAuth through third-party clients like this one. Consider using the Google API key (--api-key) or Vertex AI as alternatives to avoid account suspension risk.",
+				);
 				const { loginGeminiCli } = await import("./utils/oauth/google-gemini-cli");
 				credentials = await loginGeminiCli({
 					...ctrl,
