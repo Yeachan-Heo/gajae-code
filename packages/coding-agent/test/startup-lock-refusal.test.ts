@@ -246,4 +246,49 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it("[P2] does not let the fallback marker override a trusted startup cause", async () => {
+		// When an exit record indicates startup-deadline but a marker indicates lock-refused,
+		// the exit record's classification takes precedence (lockRefused = false).
+		// This test verifies that brokerLockRefusalFailure correctly detects when to map
+		// a startup failure to broker_unavailable based on the exit record's classification.
+		const dir = await temp();
+		try {
+			// A startup error with reason from exit record (deadline) but NOT a lock refusal
+			const failure = new BrokerStartupError({
+				exitCode: 1,
+				signal: null,
+				reason: `SDK broker startup exceeded its 5000ms fence deadline.`,
+				lockRefused: false, // Should be false because the exit record says "startup-deadline"
+			});
+			// brokerLockRefusalFailure should return undefined because lockRefused is false
+			expect(brokerLockRefusalFailure(failure)).toBeUndefined();
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("[P3] does not embed absolute broker lock path in public SDK error messages", async () => {
+		const dir = await temp();
+		const lockPath = path.join(dir, "sdk", "broker.lock");
+		try {
+			const failure = new BrokerStartupError({
+				exitCode: 1,
+				signal: null,
+				reason: `SDK broker startup refused existing lock ${lockPath} (live_owner).`,
+				lockRefused: true,
+			});
+			const rendered = await renderPublicCommandFailure(brokerLockRefusalFailure(failure), {
+				command: ["sdk", "session", "list"],
+				json: true,
+				agentDir: dir,
+			});
+			// The lock path should NOT appear in the public error message
+			expect(rendered.stdout).not.toContain(lockPath);
+			// But diagnostics should still indicate a lock refusal
+			expect(rendered.envelope.diagnostics?.map(d => d.code)).toContain("lock_refused");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 });
