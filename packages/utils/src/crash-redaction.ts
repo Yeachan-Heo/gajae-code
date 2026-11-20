@@ -709,12 +709,15 @@ function replacePreservingLines(
 	replacement: string | ((...args: any[]) => string),
 ): string {
 	if (typeof replacement === "string") {
-		// String replacement: simpler case
-		return text.replace(pattern, match => {
+		// String replacement with capture group expansion
+		return text.replace(pattern, (...args) => {
+			const match = args[0];
 			const originalNewlines = (match.match(/\n/g) || []).length;
-			const replacedNewlines = (replacement.match(/\n/g) || []).length;
+			// Expand capture groups in the replacement string
+			const expanded = match.replace(new RegExp(pattern.source, pattern.flags.replace(/g/g, "")), replacement);
+			const replacedNewlines = (expanded.match(/\n/g) || []).length;
 			const extraNewlines = "\n".repeat(Math.max(0, originalNewlines - replacedNewlines));
-			return replacement + extraNewlines;
+			return expanded + extraNewlines;
 		});
 	}
 
@@ -753,7 +756,6 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 	redacted = redactYamlBlockScalars(redacted, rules);
 
 	// All remaining replaces use the line-preserving wrapper
-	const before1 = redacted;
 	redacted = replacePreservingLines(
 		redacted,
 		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
@@ -817,7 +819,6 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 			rules.escapedBacktickUnclosedPattern,
 			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
 		);
-		const before_valuePattern = redacted;
 		redacted = replacePreservingLines(redacted, rules.valuePattern, redactCredentialValue);
 	}
 	if (rules.camelAssignmentCandidatePattern.test(redacted)) {
@@ -901,7 +902,7 @@ function redactFoldedHeaders(text: string, rules: CredentialRedactionRules): str
 						// Check if this line opens a container (bracket)
 						if (content.trim() === "[" || content.trim() === "{") {
 							// This line opens a container; preserve the line and redact contents
-							const openBracket = content[0];
+							const openBracket = content.trim()[0];
 							const closeBracket = openBracket === "[" ? "]" : "}";
 							output.push(continuationLine);
 							i += 1;
@@ -939,8 +940,8 @@ function redactFoldedHeaders(text: string, rules: CredentialRedactionRules): str
 						}
 
 						// Not a bracket: redact the continuation line content, preserving diff prefix and indent
-						if (indent.length >= 2 || !content.trim()) {
-							// Significantly indented or empty: redact it
+						if (indent.length >= 1 || !content.trim()) {
+							// Any non-zero indentation or empty: redact it
 							output.push(`${diffPrefix}${indent}«redacted»`);
 							i += 1;
 						} else {
