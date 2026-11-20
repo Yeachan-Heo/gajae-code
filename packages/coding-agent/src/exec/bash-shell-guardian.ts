@@ -68,9 +68,7 @@ export function extendOwnedDarwinAncestry<T extends { uniqueId: bigint; parentUn
 export function authenticateOwnershipRecord(
 	line: string,
 	ledgerToken: string,
-	processBindings: Pick<typeof NativeProcess, "fromPid" | "observe"> = (
-		require("@gajae-code/natives") as NativeProcessBindings
-	).Process,
+	processBindings?: Pick<typeof NativeProcess, "fromPid" | "observe">,
 ): { processRef?: NativeProcess; darwinUniqueId?: bigint; pending?: true } | undefined {
 	const record = parseOwnershipRecord(line);
 	if (!record) return undefined;
@@ -85,7 +83,8 @@ export function authenticateOwnershipRecord(
 		return undefined;
 	}
 	if (received.byteLength !== expected.byteLength || !timingSafeEqual(received, expected)) return undefined;
-	const owned = processBindings.fromPid(record.pid);
+	const nativeBindings = processBindings || (require("@gajae-code/natives") as NativeProcessBindings).Process;
+	const owned = nativeBindings.fromPid(record.pid);
 	const darwinUniqueId = record.darwinUniqueId ? { darwinUniqueId: BigInt(record.darwinUniqueId) } : {};
 	if (owned?.incarnation === record.incarnation) return { processRef: owned, ...darwinUniqueId };
 	if (!owned) {
@@ -93,7 +92,7 @@ export function authenticateOwnershipRecord(
 		// authority fromPid needs while observe still reads it. Only a confirmed absence or a
 		// different incarnation settles the record; an unknown result, or this same incarnation
 		// we cannot hold a reference to, keeps it pending so the caller retries on the next scan.
-		const observed = processBindings.observe(record.pid);
+		const observed = nativeBindings.observe(record.pid);
 		if (
 			observed.status === "unknown" ||
 			(observed.status === "present" && observed.incarnation === record.incarnation)
