@@ -11,8 +11,8 @@ import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { ensureBroker, reapFailedBrokerLaunch } from "../src/sdk/broker/ensure";
 import { BrokerLockRefusedError } from "../src/sdk/broker/lock-refusal";
 import {
-	type BrokerStartupFailureMarker,
 	BrokerStartupError,
+	type BrokerStartupFailureMarker,
 	brokerStartupFailurePath,
 	readBrokerStartupFailureMarker,
 } from "../src/sdk/broker/startup-failure";
