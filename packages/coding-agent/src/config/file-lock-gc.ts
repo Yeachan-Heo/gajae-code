@@ -21,6 +21,7 @@ import {
 	fileLockStagingOwnerPid,
 	inspectFileLockStagingDir,
 	isFileLockRemovalTransitionName,
+	isLockInfoChangingError,
 	readFileLockObservationForGc,
 	removeFileLockDirForGc,
 } from "./file-lock";
@@ -28,6 +29,23 @@ import {
 const MAX_WALK_DEPTH = 6;
 /** Default per-root walk budget. Truncation is a warning, not a hard error. */
 export const FILE_LOCK_GC_MAX_WALK_ENTRIES = 20_000;
+
+/**
+ * Bounded single retry for Windows transient owner-record refusals during GC discovery.
+ * On POSIX, transient errors are real failures and are reported immediately.
+ */
+async function readFileLockObservationForGcWithRetry(
+	lockDir: string,
+): Promise<Awaited<ReturnType<typeof readFileLockObservationForGc>>> {
+	try {
+		return await readFileLockObservationForGc(lockDir);
+	} catch (error) {
+		if (!isLockInfoChangingError(error)) throw error;
+		// Windows transient: another process is deleting the lock.
+		// Retry once to observe the final state.
+		return await readFileLockObservationForGc(lockDir);
+	}
+}
 
 // High-cardinality, lock-free subtrees we never descend into. `.lock` dirs are
 // created next to config files, never inside these.
@@ -94,7 +112,7 @@ async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRec
 			reason: staging.reason,
 		};
 	}
-	const observation = await readFileLockObservationForGc(lockDir);
+	const observation = await readFileLockObservationForGcWithRetry(lockDir);
 	const info = observation?.info;
 	if (!info) return keptMalformedRecord(lockDir);
 	if (info.owner_host_id !== undefined) {
@@ -244,7 +262,7 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 				return { removed: false, error: errorMessage(error) };
 			}
 		}
-		const observation = await readFileLockObservationForGc(lockDir);
+		const observation = await readFileLockObservationForGcWithRetry(lockDir);
 		const info = observation?.info;
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
 		if (info.owner_host_id !== undefined) {

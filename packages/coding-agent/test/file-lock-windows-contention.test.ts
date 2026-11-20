@@ -488,6 +488,43 @@ test("gc reports a refused owner record as a collection error", async () => {
 	expect(collected.records).toEqual([]);
 });
 
+test("gc handles transient owner-record refusal with successful retry", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	const timestamp = Date.now();
+	const info = { pid: 12345, timestamp };
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify(info));
+	const realOpenSync = fsSync.openSync;
+	let attempt = 0;
+	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+		if (samePath(String(target), infoPath)) {
+			attempt++;
+			if (attempt === 1) {
+				// First attempt: transient EPERM (simulating another process deleting the lock)
+				const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+					code: "EPERM",
+				});
+				throw err;
+			}
+			// Second attempt: succeeds
+		}
+		return realOpenSync(target, flags, mode);
+	}) as typeof fsSync.openSync);
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	expect(collected.errors).toEqual([]);
+	expect(collected.records).toHaveLength(1);
+	expect(collected.records[0]).toMatchObject({
+		store: "file_locks",
+		id: lockDir,
+		path: lockDir,
+		pid: 12345,
+	});
+});
+
 test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as an error on every pass", async () => {
 	const tempDir = await createTempDir();
 	const lockDir = path.join(tempDir, "state.json.lock");
