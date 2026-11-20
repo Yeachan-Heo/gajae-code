@@ -37,6 +37,28 @@ describe("doctor broker restart protocol", () => {
 		await expect(readBrokerRestartIntent(dir)).rejects.toThrow("Malformed broker restart intent.");
 	});
 
+	it("reads an intent cleared while it is being observed as absent", async () => {
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-intent-"));
+		await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
+		const file = brokerRestartIntentPath(dir);
+		await fs.writeFile(
+			file,
+			JSON.stringify({ requestId: "cleared", lease: "lease", expiresAt: Date.now() + 60_000, phase: "committed" }),
+		);
+		// The authorized successor clears the intent between the reader's open and its
+		// lexical revalidation, as it did under the long-index-transaction poll below.
+		const realLstat = fs.lstat;
+		const lstat = spyOn(fs, "lstat").mockImplementation((async (target: string, options?: undefined) => {
+			if (target === file) await fs.unlink(file);
+			return realLstat(target, options);
+		}) as typeof fs.lstat);
+		try {
+			expect(await readBrokerRestartIntent(dir)).toBeNull();
+		} finally {
+			lstat.mockRestore();
+		}
+	});
+
 	it("prepares and commits an idle owner with exact identity, and the durable intent survives lock removal", async () => {
 		const { dir, broker, discovery } = await fixture();
 		const requestId = "doctor-idle";
