@@ -1,6 +1,8 @@
 import { getAgentDir, VERSION } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { BrokerLockRefusedError } from "../broker/lock-refusal";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { BrokerStartupError } from "../broker/startup-failure";
 import { bounded, SdkClientError } from "../client/client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
@@ -125,6 +127,19 @@ function asString(args: Arguments, name: string): string | null {
 }
 
 function resultError(error: unknown): { ok: false; error: { code: string; message: string; path?: string } } {
+	// Map lock refusal errors to safe code/message without paths or stderr excerpts.
+	if (error instanceof BrokerLockRefusedError) {
+		return {
+			ok: false,
+			error: { code: "broker_unavailable", message: "SDK broker startup refused existing lock (live owner)." },
+		};
+	}
+	if (error instanceof BrokerStartupError && error.lockRefused) {
+		return {
+			ok: false,
+			error: { code: "broker_unavailable", message: "SDK broker startup refused existing lock (live owner)." },
+		};
+	}
 	if (error instanceof SessionRouterError) return { ok: false, error: { code: error.phase, message: error.message } };
 	if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 	return {
