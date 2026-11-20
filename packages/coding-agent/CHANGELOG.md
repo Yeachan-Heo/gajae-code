@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the optional macOS community app install offer.
+
 ## [0.21.0] - 2026-11-16
 
 ### Added

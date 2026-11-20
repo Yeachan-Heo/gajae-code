@@ -49,7 +49,6 @@ import {
 	toNativeIdentity,
 	updateActivationRecordFile,
 } from "./install-activation";
-import { COMMUNITY_APP_REPOSITORY, offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -1895,7 +1894,6 @@ export interface UpdateCommandDependencies {
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
 	platform?: NodeJS.Platform;
-	offerMacosCommunityApp?: typeof offerMacosCommunityApp;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
@@ -1904,23 +1902,6 @@ export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
 export type PostUpdateRecoverySupportCheck = (runtimePath: string) => Promise<boolean>;
 export type LegacyRecoveryDaemonKinds = () => Promise<NotificationProvider[]>;
 
-async function offerCommunityAppAfterUpdate(deps: UpdateCommandDependencies): Promise<void> {
-	const platform = deps.platform ?? process.platform;
-	if (platform !== "darwin") return;
-	try {
-		await (deps.offerMacosCommunityApp ?? offerMacosCommunityApp)({
-			platform,
-			log: message => {
-				process.stderr.write(`${message}\n`);
-			},
-		});
-	} catch (error) {
-		const reason = sanitizeVerificationOutput(error instanceof Error ? error.message : String(error));
-		process.stderr.write(
-			`Optional community app offer failed: ${reason ?? "unknown error"}. GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}\n`,
-		);
-	}
-}
 
 /**
  * A complete, non-quarantined provider with provider-level desired intent is a
@@ -2245,7 +2226,6 @@ export async function runUpdateCommand(
 			}
 			record("update_install_started", { channel, installMethod: target.method });
 			record("update_install_completed", { channel, result: "installed", installMethod: target.method });
-			await offerCommunityAppAfterUpdate(deps);
 			return;
 		}
 	}
@@ -2299,7 +2279,6 @@ export async function runUpdateCommand(
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
 	record("update_install_completed", { channel, result: "installed", installMethod: target.method });
-	await offerCommunityAppAfterUpdate(deps);
 }
 
 /**
