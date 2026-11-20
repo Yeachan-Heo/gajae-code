@@ -171,6 +171,7 @@ export type TelegramDaemonStopCause =
 	| "ownership_loss"
 	| "startup_failed"
 	| "unexpected_exception"
+	| "unhandled_rejection"
 	| "postmortem";
 
 export function isTelegramDaemonStopCause(value: unknown): value is TelegramDaemonStopCause {
@@ -182,6 +183,7 @@ export function isTelegramDaemonStopCause(value: unknown): value is TelegramDaem
 		case "ownership_loss":
 		case "startup_failed":
 		case "unexpected_exception":
+		case "unhandled_rejection":
 		case "postmortem":
 			return true;
 		default:
@@ -2974,6 +2976,7 @@ export async function markDaemonOwnerStopped(input: {
 	pidIncarnation?: (pid: number) => string | undefined;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
+	stopCause?: TelegramDaemonStopCause;
 }): Promise<boolean> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
@@ -2995,7 +2998,8 @@ export async function markDaemonOwnerStopped(input: {
 			return false;
 		const lock = await readOwnershipLock(fsImpl, paths.lock);
 		if (!ownershipLockMatchesState(lock, state)) return false;
-		const stopCause = state.stopCause ?? "postmortem";
+		const stopCause =
+			state.stopCause ?? (isTelegramDaemonStopCause(input.stopCause) ? input.stopCause : "postmortem");
 		await writeJsonAtomic(fsImpl, paths.state, {
 			...state,
 			stoppedAt: (input.now ?? Date.now)(),
@@ -4822,6 +4826,11 @@ export class TelegramNotificationDaemon {
 		}
 		this.runtime.requestStop();
 		this.running = false;
+	}
+
+	/** Read the daemon's recorded stop cause, if any. Only valid after requestStop has been called. */
+	getStopCause(): TelegramDaemonStopCause | undefined {
+		return this.#stopCause;
 	}
 
 	/** Doctor reservation hook: stop admitting new provider work without killing the owner. Synchronous fence; returns a real acknowledgement. */

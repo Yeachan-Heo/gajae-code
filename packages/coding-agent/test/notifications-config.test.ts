@@ -43,6 +43,8 @@ import {
 	daemonPaths,
 	ensureTelegramDaemonRunning,
 	renewDaemonHeartbeat,
+	type TelegramDaemonOptions,
+	type TelegramDaemonStopCause,
 } from "../src/sdk/bus/telegram-daemon";
 import {
 	createLightweightDaemonSettings,
@@ -627,11 +629,14 @@ describe("notifications config", () => {
 				if (index === 0) {
 					let daemonConstructed = false;
 					class UnexpectedDaemon {
-						constructor() {
+						constructor(_opts: TelegramDaemonOptions) {
 							daemonConstructed = true;
 						}
 						async run(): Promise<void> {}
 						requestStop(): void {}
+						getStopCause(): TelegramDaemonStopCause | undefined {
+							return undefined;
+						}
 					}
 					await expect(
 						runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
