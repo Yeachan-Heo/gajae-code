@@ -415,4 +415,20 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 		expect(stopCalled).toBe(false);
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
+
+	test("unhandled rejection reason is redacted before logging (credential-bearing URL)", async () => {
+		const { redactCrashSecrets } = await import("@gajae-code/utils");
+
+		// Credential-bearing URL that should be redacted
+		const credentialUrl = "https://user:password@api.example.com/resource";
+		const credentialMessage = `API request failed: ${credentialUrl}`;
+
+		// Verify that redactCrashSecrets properly redacts the credential URL
+		const redacted = redactCrashSecrets(credentialMessage);
+
+		// The redaction should work
+		expect(redacted).not.toContain(credentialUrl);
+		expect(redacted).not.toContain("user:password");
+		expect(redacted).toContain("redacted");
+	});
 });

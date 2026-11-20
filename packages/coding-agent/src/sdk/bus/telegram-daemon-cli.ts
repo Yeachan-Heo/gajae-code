@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logger, postmortem } from "@gajae-code/utils";
+import { logger, postmortem, redactCrashSecrets } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
@@ -588,7 +588,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	// the fatal paths that call `process.exit()` without unwinding this frame.
 	const onUnhandledRejection = (reason: unknown): void => {
 		daemon.requestStop("unhandled_rejection");
-		logger.warn(`notifications: unhandled rejection: ${String(reason instanceof Error ? reason.message : reason)}`);
+		const redacted = redactCrashSecrets(String(reason instanceof Error ? reason.message : reason));
+		logger.warn(`notifications: unhandled rejection: ${redacted}`);
 	};
 	process.on("unhandledRejection", onUnhandledRejection);
 	const recordOwnerStopped = (): Promise<boolean> =>
