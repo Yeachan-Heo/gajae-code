@@ -51,7 +51,9 @@ import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { readBrokerDiscovery } from "../../sdk/broker/discovery";
 import { ensureBroker } from "../../sdk/broker/ensure";
+import { BrokerLockRefusedError } from "../../sdk/broker/lock-refusal";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
+import { BrokerStartupError } from "../../sdk/broker/startup-failure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
@@ -3525,8 +3527,18 @@ export class AcpAgent implements Agent {
 			}
 			return object(result) ?? {};
 		} catch (error) {
-			const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
-			const message = error instanceof Error ? error.message : String(error);
+			let code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
+			let message = error instanceof Error ? error.message : String(error);
+
+			// Redact lock paths from broker startup refusal errors to prevent exposing local paths in ACP responses
+			if (error instanceof BrokerStartupError && error.lockRefused) {
+				code = "broker_unavailable";
+				message = "SDK broker startup refused existing lock (live owner).";
+			} else if (error instanceof BrokerLockRefusedError) {
+				code = "broker_unavailable";
+				message = "SDK broker startup refused existing lock (live owner).";
+			}
+
 			return { ok: false, error: { code, message } };
 		}
 	}

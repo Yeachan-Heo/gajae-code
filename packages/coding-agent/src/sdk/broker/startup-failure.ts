@@ -236,6 +236,16 @@ export class BrokerStartupError extends Error {
 	readonly stderrExcerpt?: string;
 	/** The broker's trusted startup-exit record or marker says it refused an existing `broker.lock`. */
 	readonly lockRefused: boolean;
+	/**
+	 * Detailed reason including lock paths and cleanup guidance, available only for local CLI output.
+	 * API-facing responses should use `reason` instead, which is path-free.
+	 */
+	readonly detailedReason?: string;
+	/**
+	 * Full stderr excerpt for local CLI output. API-facing responses should not expose this.
+	 * Only populated for lock refusal errors; otherwise stderrExcerpt is used.
+	 */
+	readonly detailedStderr?: string;
 
 	constructor(fields: {
 		exitCode: number | null;
@@ -243,15 +253,22 @@ export class BrokerStartupError extends Error {
 		reason: string;
 		stderrExcerpt?: string;
 		lockRefused?: boolean;
+		detailedReason?: string;
+		detailedStderr?: string;
 	}) {
+		const isLockRefusal = fields.lockRefused ?? false;
+		// For lock refusal errors, don't include stderr in the API-facing error message
+		const messageStderr = isLockRefusal ? undefined : fields.stderrExcerpt;
 		super(
-			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${fields.stderrExcerpt ? ` Broker stderr: ${fields.stderrExcerpt}` : ""}`,
+			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${messageStderr ? ` Broker stderr: ${messageStderr}` : ""}`,
 		);
 		this.name = "BrokerStartupError";
 		this.exitCode = fields.exitCode;
 		this.signal = fields.signal;
 		this.reason = fields.reason;
 		this.stderrExcerpt = fields.stderrExcerpt;
-		this.lockRefused = fields.lockRefused ?? false;
+		this.lockRefused = isLockRefusal;
+		this.detailedReason = fields.detailedReason;
+		this.detailedStderr = fields.detailedStderr;
 	}
 }

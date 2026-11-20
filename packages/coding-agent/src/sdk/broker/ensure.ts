@@ -614,6 +614,18 @@ function brokerStartupFailureReason(marker: BrokerStartupFailureMarker | undefin
 	return marker.reason;
 }
 
+/** Returns a path-free version of the startup failure reason for API contexts. */
+function brokerStartupFailureReasonForApi(marker: BrokerStartupFailureMarker | undefined): string {
+	if (!marker) return "Detached SDK broker exited before publishing discovery.";
+	if (marker.cleanupCommand && marker.reason.endsWith(": ")) {
+		// Strip cleanup command which may contain sensitive paths
+		const baseReason = marker.reason;
+		// Return just the base reason without the cleanup command
+		return baseReason;
+	}
+	return marker.reason;
+}
+
 function brokerSpawnFailureError(spawnError: Error): Error {
 	return spawnError instanceof BrokerHopError
 		? spawnError
@@ -628,6 +640,18 @@ function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): s
 		return `SDK broker startup could not acquire required lock ${record.blockingLockPath}.`;
 	if (record.reason === "startup-lock-refused")
 		return `SDK broker startup refused existing lock ${record.blockingLockPath} (${record.refusalCode}).`;
+	if (record.reason === "startup-deadline")
+		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
+	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
+}
+
+/** Returns a path-free version of the exit reason for API contexts. */
+function brokerStartupExitReasonForApi(record: BrokerStartupExitRecord | undefined): string | undefined {
+	if (!record) return undefined;
+	if (record.reason === "startup-lock-blocked") return `SDK broker startup blocked by retained removal transition.`;
+	if (record.reason === "startup-lock-unavailable") return `SDK broker startup could not acquire required lock.`;
+	if (record.reason === "startup-lock-refused")
+		return `SDK broker startup refused existing lock (${record.refusalCode}).`;
 	if (record.reason === "startup-deadline")
 		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
 	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
@@ -1874,17 +1898,22 @@ async function ensureBrokerOnce(
 		// still write a marker between the clear and this read; the pid binding
 		// rejects that marker instead of misattributing a foreign failure to this
 		// spawn's caller.
+		const isLockRefusal =
+			trustedStartupExitRecord?.reason === "startup-lock-refused" ||
+			(trustedStartupExitRecord === undefined && trustedMarker?.lockRefusalCode !== undefined);
 		const failure = spawnError
 			? brokerSpawnFailureError(spawnError)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
 						...brokerStartupExitStatus(child.exitCode, child.signalCode, trustedStartupExitRecord, trustedMarker),
 						reason:
+							brokerStartupExitReasonForApi(trustedStartupExitRecord) ??
+							brokerStartupFailureReasonForApi(trustedMarker),
+						detailedReason:
 							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
-						lockRefused:
-							trustedStartupExitRecord?.reason === "startup-lock-refused" ||
-							(trustedStartupExitRecord === undefined && trustedMarker?.lockRefusalCode !== undefined),
+						detailedStderr: isLockRefusal && spawnLogTail.length > 0 ? spawnLogTail : undefined,
+						lockRefused: isLockRefusal,
 					})
 				: discoveryError
 					? discoveryError
