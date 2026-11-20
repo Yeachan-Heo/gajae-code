@@ -2,13 +2,14 @@ import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger, redactCrashSecrets } from "@gajae-code/utils";
+import { logger, postmortem, redactCrashSecrets } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import {
 	DAEMON_GENERATION,
 	type DaemonState,
+	markDaemonOwnerStopped,
 	SERVING_EPOCH,
 	type TelegramDaemonOptions,
 	type TelegramDaemonStopCause,
@@ -431,36 +432,81 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 	});
 
 	test("postmortem handler sets unhandled rejection stop cause before owner-state callback", async () => {
-		// Verify that the postmortem handler for unhandled rejection sets the stop cause
-		// deterministically before the owner-state callback runs. This ensures that when
-		// an unhandled rejection occurs, getStopCause() returns "unhandled_rejection"
-		// rather than undefined when the owner-state callback reads it.
-		//
-		// Since this test runs synchronously and doesn't trigger a real process exit,
-		// we verify that the daemon's requestStop mechanism works correctly by ensuring
-		// getStopCause returns the expected value.
+		// Register the actual postmortem callbacks and verify that they run in the correct
+		// order: unhandled-rejection callback first (sets stop cause), then owner-state
+		// callback (reads and persists stop cause). This test ensures that when an
+		// unhandled rejection occurs, the persisted daemon state records
+		// stopCause: "unhandled_rejection".
 		const agentDir = tempAgentDir();
+		const ownerId = `test-owner-${Math.random().toString(36).slice(2)}`;
+		const incarnation = "test-incarnation";
+		const pid = process.pid;
 
 		try {
-			// Create a mock daemon-like object to verify requestStop sets the cause
+			// Initialize daemon state file and lock using the same helper as other tests
+			writeReadyState(agentDir, pid, incarnation, ownerId);
+
+			// Create a daemon-like object that tracks stop cause
 			let recordedStopCause: TelegramDaemonStopCause | undefined;
-			const mockDaemon = {
+			const daemon = {
 				getStopCause(): TelegramDaemonStopCause | undefined {
 					return recordedStopCause;
 				},
 				requestStop(reason?: "reload" | "signal" | "stop" | "unhandled_rejection"): void {
-					if (reason === "unhandled_rejection") {
-						recordedStopCause = "unhandled_rejection";
+					if (reason) {
+						recordedStopCause = reason;
 					}
 				},
 			};
 
-			// Simulate what the daemon's postmortem handler does:
-			// When Reason.UNHANDLED_REJECTION is passed, it should call requestStop
-			mockDaemon.requestStop("unhandled_rejection");
+			const testSettings = settings(agentDir);
 
-			// Verify that the stop cause is now set correctly
-			expect(mockDaemon.getStopCause()).toBe("unhandled_rejection");
+			// Register owner-state callback first so it runs LAST in reverse registration order
+			// Register owner-state callback first so it runs LAST in reverse registration order
+			const callbackOrder: string[] = [];
+			let stopCauseWhenOwnerStateCalled: TelegramDaemonStopCause | undefined;
+			const unregisterOwnerState = postmortem.register("telegram-daemon:owner-state", async () => {
+				callbackOrder.push("owner-state");
+				// Capture the stop cause at the moment this callback runs
+				stopCauseWhenOwnerStateCalled = daemon.getStopCause();
+				await markDaemonOwnerStopped({
+					settings: testSettings,
+					ownerId,
+					acquisitionId: ownerId,
+					pid,
+					generation: DAEMON_GENERATION,
+					// Return the same incarnation we used in writeReadyState
+					pidIncarnation: () => incarnation,
+					stopCause: daemon.getStopCause(),
+				});
+			});
+
+			// Register unhandled-rejection callback second so it runs FIRST in reverse registration order
+			const unregisterUnhandledRejection = postmortem.register(
+				"telegram-daemon:unhandled-rejection",
+				(reason: postmortem.Reason) => {
+					callbackOrder.push("unhandled-rejection");
+					if (reason === postmortem.Reason.UNHANDLED_REJECTION) {
+						daemon.requestStop("unhandled_rejection");
+					}
+				},
+			);
+
+			try {
+				// Trigger cleanup with UNHANDLED_REJECTION reason
+				await postmortem.cleanupWithReasonForTest(postmortem.Reason.UNHANDLED_REJECTION);
+
+				// Verify callbacks ran in the correct order: unhandled-rejection first, then owner-state
+				expect(callbackOrder).toEqual(["unhandled-rejection", "owner-state"]);
+				// Verify the stop cause was set BEFORE the owner-state callback ran
+				// This ensures the unhandled-rejection callback ran first and set it synchronously
+				expect(stopCauseWhenOwnerStateCalled).toBe("unhandled_rejection");
+				// Verify the final recorded stop cause
+				expect(recordedStopCause).toBe("unhandled_rejection");
+			} finally {
+				unregisterOwnerState();
+				unregisterUnhandledRejection();
+			}
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
