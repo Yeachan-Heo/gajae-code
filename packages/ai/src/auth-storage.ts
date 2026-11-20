@@ -4432,6 +4432,24 @@ export class AuthStorage {
 				// IMPORTANT: Emit BEFORE calling login function to surface warning before OAuth URL is generated.
 				this.#emitOAuthWarning({ provider, message: warningMessage });
 				ctrl.onProgress?.(warningMessage);
+				// Require explicit confirmation before proceeding with OAuth.
+				if (ctrl.onConfirmWarning) {
+					// SDK path: use the dedicated confirmation callback
+					const confirmed = await ctrl.onConfirmWarning({ provider, message: warningMessage });
+					if (!confirmed) {
+						throw new Error("OAuth authorization was declined by user");
+					}
+				} else if (ctrl.onPrompt) {
+					// CLI/TUI path: use onPrompt to get explicit confirmation
+					const answer = await ctrl.onPrompt({
+						message: "Continue with Gemini CLI OAuth authorization? (yes/no)",
+						allowEmpty: false,
+					});
+					const confirmed = /^(yes|y)$/i.test(answer);
+					if (!confirmed) {
+						throw new Error("OAuth authorization was declined by user");
+					}
+				}
 				const { loginGeminiCli } = await import("./utils/oauth/google-gemini-cli");
 				credentials = await loginGeminiCli({
 					...ctrl,

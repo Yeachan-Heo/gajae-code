@@ -45,7 +45,7 @@ describe("AuthStorage gemini-cli OAuth warning", () => {
 		const onProgressMessages: string[] = [];
 		const controller = {
 			onAuth: () => {},
-			onPrompt: async () => "",
+			onPrompt: async () => "yes",
 			onProgress: (message: string) => {
 				onProgressMessages.push(message);
 			},
@@ -77,7 +77,7 @@ describe("AuthStorage gemini-cli OAuth warning", () => {
 		let callCount = 0;
 		const controller = {
 			onAuth: () => {},
-			onPrompt: async () => "",
+			onPrompt: async () => "yes",
 			onProgress: () => {
 				callCount += 1;
 			},
@@ -104,7 +104,7 @@ describe("AuthStorage gemini-cli OAuth warning", () => {
 
 		const controller = {
 			onAuth: () => {},
-			onPrompt: async () => "",
+			onPrompt: async () => "yes",
 			onProgress: () => {},
 		};
 
@@ -144,7 +144,7 @@ describe("AuthStorage gemini-cli OAuth warning", () => {
 		try {
 			const controller = {
 				onAuth: () => {},
-				onPrompt: async () => "",
+				onPrompt: async () => "yes",
 			};
 
 			await authStorage.login("google-gemini-cli", controller);
@@ -181,7 +181,7 @@ describe("AuthStorage gemini-cli OAuth warning", () => {
 			// SDK path: no onProgress callback provided
 			const controller = {
 				onAuth: () => {},
-				onPrompt: async () => "",
+				onPrompt: async () => "yes",
 				// No onProgress callback - SDK consumer relies on event subscription
 			};
 
