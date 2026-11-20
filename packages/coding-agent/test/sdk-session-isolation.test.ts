@@ -158,6 +158,51 @@ describe("createAgentSession session storage isolation", () => {
 		}
 	}, 20_000);
 
+	it("rejects a direct switch between ordinary and confined transcripts before changing state", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-confine-switch-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+
+		const persist = async (confined: boolean, content: string): Promise<string> => {
+			const manager = SessionManager.create(cwd, destination, undefined, confined);
+			manager.appendMessage({ role: "user", content, timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const file = manager.getSessionFile();
+			if (!file || !fs.existsSync(file)) throw new Error("Expected persisted session path");
+			await manager.close();
+			return file;
+		};
+		const ordinaryFile = await persist(false, "ordinary");
+		const confinedFile = await persist(true, "confined");
+
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: await SessionManager.open(ordinaryFile, destination),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		try {
+			await expect(session.switchSession(confinedFile)).rejects.toThrow(
+				/Cannot switch between confined and unconfined sessions/,
+			);
+			expect(path.resolve(session.sessionManager.getSessionFile()!)).toBe(path.resolve(ordinaryFile));
+			expect(session.sessionManager.isFilesystemConfined()).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("migrates a switched managed session's legacy local:// root before resolution (#2925)", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-switch-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

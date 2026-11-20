@@ -35150,6 +35150,19 @@ export class AgentSession {
 					return false;
 				}
 			}
+			// Tool wrappers were built for the current scope, so a switch must not
+			// cross between confined and ordinary transcripts. Checked before any
+			// session state changes, so a rejected switch needs no rollback.
+			if (fs.existsSync(sessionPath)) {
+				const currentConfined = this.sessionManager.isFilesystemConfined();
+				const target = SessionManager.inspectTranscriptScope(sessionPath);
+				if (!target) throw new Error(`Could not read the filesystem scope of session ${sessionPath}`);
+				if (target.confined !== currentConfined) {
+					throw new Error(
+						`Cannot switch between confined and unconfined sessions: current is ${currentConfined ? "confined" : "unconfined"}, target is ${target.confined ? "confined" : "unconfined"}`,
+					);
+				}
+			}
 			options?.onTransitionMutationStarted?.();
 
 			// A conventional same-path reload can replace the logical identity.
@@ -35293,39 +35306,6 @@ export class AgentSession {
 					: undefined;
 				if (conventionalRetirement && !conventionalRetirement.canCommit())
 					throw new Error("Session MCP reset ownership changed before session switch load");
-
-				// Validate filesystem scope matches between current and target sessions (finding 3)
-				if (switchingToDifferentSession) {
-					const currentConfined = this.sessionManager.isFilesystemConfined();
-					const captured = SessionManager.captureTranscriptStrict(sessionPath);
-					if (captured.kind === "captured") {
-						try {
-							let targetScope: string | undefined;
-							let firstLine = true;
-							captured.snapshot.forEachLine((line: Uint8Array) => {
-								if (firstLine) {
-									try {
-										const json = JSON.parse(new TextDecoder().decode(line)) as { filesystemScope?: string };
-										targetScope = json.filesystemScope;
-									} catch (e) {
-										// Ignore JSON parse errors, scope will be undefined
-									}
-									firstLine = false;
-									return false; // Stop after first line
-								}
-							});
-							const targetConfined = targetScope === "cwd";
-							if (currentConfined !== targetConfined) {
-								throw new Error(
-									`Cannot switch between confined and unconfined sessions: ` +
-										`current is ${currentConfined ? "confined" : "unconfined"}, target is ${targetConfined ? "confined" : "unconfined"}`,
-							);
-						}
-					} finally {
-						captured.snapshot.close();
-					}
-				}
-			}
 
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
