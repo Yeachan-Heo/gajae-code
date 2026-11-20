@@ -97,16 +97,12 @@ describe("AuthorizationControls SDK warning confirmation", () => {
 
 		const authUrls: string[] = [];
 		loginGeminiCliSpy.mockImplementationOnce(async (ctrl: any) => {
-			// Record if onAuth was called (which indicates OAuth URL was shown)
+			// Invoke onAuth to simulate the real OAuth flow
 			if (ctrl.onAuth) {
-				return new Promise(resolve => {
-					// Don't call onAuth until confirmation is given via onConfirmWarning
-					authUrls.push("called");
-					resolve({
-						access: "test-access-token",
-						refresh: "test-refresh-token",
-						expires: Date.now() + 3600000,
-					});
+				authUrls.push("oauth-url-shown");
+				ctrl.onAuth({
+					url: "https://example.com/oauth",
+					instructions: "Please authorize",
 				});
 			}
 			return {
@@ -145,6 +141,9 @@ describe("AuthorizationControls SDK warning confirmation", () => {
 
 		// OAuth should now proceed
 		await new Promise(r => setTimeout(r, 100));
+
+		// Assert that onAuth was called (indicating OAuth URL was shown)
+		expect(authUrls).toContain("oauth-url-shown");
 
 		await authControls.close();
 	});
@@ -223,5 +222,46 @@ describe("AuthorizationControls SDK warning confirmation", () => {
 		await new Promise(r => setTimeout(r, 50));
 
 		await authControls.close();
+	});
+
+	it("includes full warning in onPrompt message for CLI/TUI callers without onConfirmWarning", async () => {
+		if (!store || !authStorage) throw new Error("test setup failed");
+
+		let capturedPromptMessage = "";
+		loginGeminiCliSpy.mockImplementationOnce(async (ctrl: any) => {
+			if (ctrl.onAuth) {
+				ctrl.onAuth({
+					url: "https://example.com/oauth",
+					instructions: "Please authorize",
+				});
+			}
+			return {
+				access: "test-access-token",
+				refresh: "test-refresh-token",
+				expires: Date.now() + 3600000,
+			};
+		});
+
+		// Test the onPrompt path directly with auth storage (simulating CLI/TUI caller)
+		const onPromptMock = vi.fn(async (prompt: any) => {
+			capturedPromptMessage = prompt.message;
+			return "yes";
+		});
+
+		// Call the OAuth login flow with only onPrompt, no onConfirmWarning
+		// This tests the fallback path for CLI/TUI callers
+		await authStorage!.login("google-gemini-cli", {
+			onAuth: () => {}, // Required but not tested here
+			onPrompt: onPromptMock,
+			// Intentionally NOT providing onConfirmWarning to test the fallback path
+		});
+
+		// Assert that onPrompt was called
+		expect(onPromptMock).toHaveBeenCalled();
+
+		// Assert that the prompt message contains the warning text
+		expect(capturedPromptMessage).toContain("account suspension");
+		expect(capturedPromptMessage).toContain("WARNING");
+		expect(capturedPromptMessage).toContain("Continue with Gemini CLI OAuth authorization");
 	});
 });

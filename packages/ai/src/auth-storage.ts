@@ -4442,7 +4442,7 @@ export class AuthStorage {
 				} else if (ctrl.onPrompt) {
 					// CLI/TUI path: use onPrompt to get explicit confirmation
 					const answer = await ctrl.onPrompt({
-						message: "Continue with Gemini CLI OAuth authorization? (yes/no)",
+						message: `${warningMessage}\n\nContinue with Gemini CLI OAuth authorization? (yes/no)`,
 						allowEmpty: false,
 					});
 					const confirmed = /^(yes|y)$/i.test(answer);
