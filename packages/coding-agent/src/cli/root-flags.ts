@@ -60,7 +60,7 @@ export const ROOT_LAUNCH_FLAGS = {
 	}),
 	"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
 	confine: Flags.boolean({
-		description: "Confine the session to its cwd and descendants, and store it separately from ordinary sessions",
+		description: "Confine the session to its cwd and descendants; only --confine resume and continue select it",
 	}),
 	models: Flags.string({ description: "Comma-separated model patterns for Alt+N cycling" }),
 	"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
