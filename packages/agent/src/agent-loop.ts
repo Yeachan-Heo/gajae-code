@@ -4151,7 +4151,8 @@ async function runLoopBody(
 						escapedNonAsciiToolChoice = config.getToolChoice?.();
 						escapedNonAsciiToolChoiceCaptured = true;
 					}
-					if (retriedMalformedVeniceCall && (!escapedNonAsciiToolChoice || escapedNonAsciiToolChoice === "auto")) {
+					const effectiveChoice = escapedNonAsciiToolChoice ?? config.toolChoice;
+					if (retriedMalformedVeniceCall && (!effectiveChoice || effectiveChoice === "auto")) {
 						return "required";
 					}
 					return escapedNonAsciiToolChoice;
@@ -4300,7 +4301,7 @@ async function runLoopBody(
 			if (
 				!retriedMalformedVeniceCall &&
 				!config.fallbackManaged &&
-				escapedNonAsciiToolChoice !== "none" &&
+				(escapedNonAsciiToolChoice ?? config.toolChoice) !== "none" &&
 				!loopSignal.aborted &&
 				message.provider === "venice" &&
 				message.stopReason === "error" &&

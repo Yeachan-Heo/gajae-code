@@ -152,11 +152,26 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).toBe("");
 	});
 
+	it("preserves a quoted wrapperless opener without a matching parameter close", async () => {
+		const result = await response(
+			[
+				{ content: "The marker is `<｜DS" },
+				{ content: 'ML｜ invoke name="_i" string="true">`. Keep this sentence.' },
+			],
+			{},
+			offeredTools,
+			"venice",
+		);
+		expect(result.stopReason).toBe("stop");
+		expect(text(result)).toBe('The marker is `<｜DSML｜ invoke name="_i" string="true">`. Keep this sentence.');
+	});
+
 	it("reports a malformed wrapperless invocation rather than silently ending the turn", async () => {
 		const result = await response(
 			[
 				{ content: "Checking.\n<｜DS" },
-				{ content: 'ML｜ invoke name="_i" string="true">probe</｜DSML｜ parameter>' },
+				{ content: 'ML｜ invoke name="_i" string="true">probe</｜DS' },
+				{ content: "ML｜ parameter>" },
 			],
 			{},
 			offeredTools,

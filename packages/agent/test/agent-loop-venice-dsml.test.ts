@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, StreamFn } from "@gajae-code/agent-core/types";
+import type { AgentContext, AgentLoopConfig, StreamFn } from "@gajae-code/agent-core/types";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import type { Model } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
@@ -29,8 +29,11 @@ const structured = {
 const streamFn: StreamFn = (_model, context, options) =>
 	streamOpenAICompletions(model, context, { ...options, apiKey: "test" });
 
-async function run(deltas: Record<string, unknown>[][]) {
-	const requests: Array<{ messages: { role: string }[]; tool_choice?: string }> = [];
+async function run(
+	deltas: Record<string, unknown>[][],
+	config: Pick<AgentLoopConfig, "toolChoice" | "getToolChoice"> = {},
+) {
+	const requests: Array<{ messages: { role: string }[]; tool_choice?: unknown }> = [];
 	let executions = 0;
 	global.fetch = Object.assign(
 		async (_input: unknown, init?: RequestInit) => {
@@ -73,7 +76,7 @@ async function run(deltas: Record<string, unknown>[][]) {
 	const stream = agentLoop(
 		[createUserMessage("look up the value")],
 		context,
-		{ model, convertToLlm: identityConverter },
+		{ model, convertToLlm: identityConverter, ...config },
 		undefined,
 		streamFn,
 	);
@@ -93,6 +96,17 @@ describe("Venice DeepSeek malformed DSML recovery", () => {
 		expect(result.requests[2].tool_choice).not.toBe("required");
 		expect(result.executions).toBe(1);
 		expect(result.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+	it("does not retry or dispatch when the static tool choice is none", async () => {
+		const result = await run([[malformed], [structured], [{ content: "done" }]], { toolChoice: "none" });
+		expect(result.requests.map(request => request.tool_choice)).toEqual(["none"]);
+		expect(result.executions).toBe(0);
+	});
+	it("preserves a static named tool choice on retry", async () => {
+		const result = await run([[malformed], [malformed]], { toolChoice: { type: "tool", name: "probe" } });
+		expect(result.requests).toHaveLength(2);
+		expect(result.requests[0].tool_choice).toEqual({ type: "function", function: { name: "probe" } });
+		expect(result.requests[1].tool_choice).toEqual(result.requests[0].tool_choice);
 	});
 	it("stops after a second malformed response", async () => {
 		const result = await run([[malformed], [malformed]]);

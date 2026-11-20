@@ -1075,14 +1075,39 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!checkMalformedVenice || !delta) return delta;
 				if (malformedVeniceCall) return "";
 				const text = malformedVeniceTail + delta;
-				const marker = findFirstTag(text, malformedVeniceTags);
-				if (marker) {
-					malformedVeniceCall = true;
-					malformedVeniceTail = "";
-					return text.slice(0, marker.index);
+				let remaining = text;
+				let clean = "";
+				for (
+					let marker = findFirstTag(remaining, malformedVeniceTags);
+					marker;
+					marker = findFirstTag(remaining, malformedVeniceTags)
+				) {
+					const candidate = remaining.slice(marker.index + marker.tag.length);
+					// A bare opener can be quoted prose. Require a nonempty parameter
+					// value and the mismatched parameter closer before discarding it.
+					const closer = marker.tag.startsWith("<｜") ? "</｜DSML｜ parameter>" : "</|DSML| parameter>";
+					const closeIndex = candidate.indexOf(closer);
+					const value = closeIndex < 0 ? "" : candidate.slice(0, closeIndex);
+					if (closeIndex <= 4096 && value.trim() && !/[<`]/.test(value)) {
+						malformedVeniceCall = true;
+						malformedVeniceTail = "";
+						return clean + remaining.slice(0, marker.index);
+					}
+					const partialCloser = getTrailingPartialTag(candidate, [closer]);
+					if (
+						closeIndex < 0 &&
+						candidate.length <= 4096 + closer.length &&
+						!/[<`]/.test(candidate.slice(0, candidate.length - partialCloser.length))
+					) {
+						malformedVeniceTail = remaining.slice(marker.index);
+						return clean + remaining.slice(0, marker.index);
+					}
+					const next = marker.index + marker.tag.length;
+					clean += remaining.slice(0, next);
+					remaining = remaining.slice(next);
 				}
-				malformedVeniceTail = getTrailingPartialTag(text, malformedVeniceTags);
-				return text.slice(0, text.length - malformedVeniceTail.length);
+				malformedVeniceTail = getTrailingPartialTag(remaining, malformedVeniceTags);
+				return clean + remaining.slice(0, remaining.length - malformedVeniceTail.length);
 			};
 
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
