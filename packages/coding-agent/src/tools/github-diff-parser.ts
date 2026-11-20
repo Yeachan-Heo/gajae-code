@@ -513,6 +513,7 @@ function redactHunk(
  * 2. Run redactCrashSecretsPreservingLines on each projection independently
  * 3. Map redacted lines back by index (line counts are guaranteed to match)
  * 4. For context lines, use the old-side redacted content (should be same on both sides)
+ * 5. Track and return updated state for cross-hunk credential containers
  */
 function redactAccumulatedContentWithState(
 	lineInfos: LineInfo[],
@@ -618,7 +619,46 @@ function redactAccumulatedContentWithState(
 		result.push({ ...info, content: redactedContent });
 	}
 
-	// No longer need to track cross-hunk state since line counts are preserved
-	// Cross-hunk containers would require per-file projections (future work)
-	return { redactedLines: result, state: inputState };
+	// Update state based on bracket tracking across both projections
+	// This persists credential container state across hunk boundaries within the same file
+	const outputState: HunkState = { ...inputState };
+
+	// Count brackets in redacted old projection to track container state
+	for (const line of oldRedactedLines) {
+		for (const char of line) {
+			if (char === "[") {
+				outputState.bracketStack.push("[");
+				outputState.bracketDepth += 1;
+				outputState.inCredentialValue = true;
+			} else if (char === "{") {
+				outputState.bracketStack.push("{");
+				outputState.bracketDepth += 1;
+				outputState.inCredentialValue = true;
+			} else if (char === "]") {
+				if (
+					outputState.bracketStack.length > 0 &&
+					outputState.bracketStack[outputState.bracketStack.length - 1] === "["
+				) {
+					outputState.bracketStack.pop();
+					outputState.bracketDepth = Math.max(0, outputState.bracketDepth - 1);
+					if (outputState.bracketDepth === 0) {
+						outputState.inCredentialValue = false;
+					}
+				}
+			} else if (char === "}") {
+				if (
+					outputState.bracketStack.length > 0 &&
+					outputState.bracketStack[outputState.bracketStack.length - 1] === "{"
+				) {
+					outputState.bracketStack.pop();
+					outputState.bracketDepth = Math.max(0, outputState.bracketDepth - 1);
+					if (outputState.bracketDepth === 0) {
+						outputState.inCredentialValue = false;
+					}
+				}
+			}
+		}
+	}
+
+	return { redactedLines: result, state: outputState };
 }

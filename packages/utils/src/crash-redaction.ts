@@ -274,6 +274,9 @@ export function redactCrashSecretsV1(text: string): string {
  * Wrapper around replaceAll that preserves newline counts in matched text.
  * When a match containing N newlines is replaced, adds (N - replacedNewlines) extra newlines.
  * This ensures line count is preserved when redacting multi-line content.
+ *
+ * For multi-line matches, redacts each line in the match separately to ensure each line
+ * of a multi-line credential is redacted (not just the first line + blank lines).
  */
 function replacePreservingLines(
 	text: string,
@@ -509,16 +512,61 @@ function redactFoldedHeaders(text: string, rules: CredentialRedactionRules): str
 				while (i < lines.length) {
 					const continuationLine = lines[i];
 
-					// Check if this line is significantly indented (at least 2 spaces after diff prefix)
-					// This distinguishes folded value continuations from structural elements
-					const continuationMatch = continuationLine.match(/^([+-]?)(\s{2,})(.*)$/);
+					// Check if this line is indented or is an opening bracket (which starts a container)
+					const continuationMatch = continuationLine.match(/^([+-]?)(\s+)(.*)$/);
 					if (continuationMatch) {
-						const [, diffPrefix, indent] = continuationMatch;
-						// Redact the continuation line content, preserving diff prefix and indent
-						output.push(`${diffPrefix}${indent}«redacted»`);
-						i += 1;
+						const [, diffPrefix, indent, content] = continuationMatch;
+						// Check if this line opens a container (bracket)
+						if (content.trim() === "[" || content.trim() === "{") {
+							// This line opens a container; preserve the line and redact contents
+							const openBracket = content[0];
+							const closeBracket = openBracket === "[" ? "]" : "}";
+							output.push(continuationLine);
+							i += 1;
+
+							// Redact all lines inside the container until we find the closing bracket
+							let bracketDepth = 1;
+							while (i < lines.length && bracketDepth > 0) {
+								const containerLine = lines[i];
+								const containerMatch = containerLine.match(/^([+-]?)(.*)$/);
+								if (!containerMatch) {
+									i += 1;
+									continue;
+								}
+
+								const [, containerDiffPrefix, containerContent] = containerMatch;
+								// Count brackets to track nesting
+								for (const char of containerContent) {
+									if (char === openBracket) {
+										bracketDepth += 1;
+									} else if (char === closeBracket) {
+										bracketDepth -= 1;
+									}
+								}
+
+								if (bracketDepth > 0) {
+									// Inside the container: redact the content
+									output.push(`${containerDiffPrefix}  «redacted»`);
+								} else {
+									// Closing bracket line: preserve it
+									output.push(containerLine);
+								}
+								i += 1;
+							}
+							continue;
+						}
+
+						// Not a bracket: redact the continuation line content, preserving diff prefix and indent
+						if (indent.length >= 2 || !content.trim()) {
+							// Significantly indented or empty: redact it
+							output.push(`${diffPrefix}${indent}«redacted»`);
+							i += 1;
+						} else {
+							// Only 1 space indentation and not empty: stop folded header processing
+							break;
+						}
 					} else {
-						// Not sufficiently indented or end of input: stop folded header processing
+						// Not indented or end of input: stop folded header processing
 						break;
 					}
 				}
