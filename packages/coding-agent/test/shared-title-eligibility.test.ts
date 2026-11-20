@@ -455,6 +455,9 @@ describe("shared publication admission split", () => {
 
 	it("keeps a refused deferred command result queued and withholds onPersisted", async () => {
 		const f = await fixture();
+		// Keep both prompts off the real provider: the retry flush persists before the
+		// credential preflight, so a buggy first-prompt fallback must also fail here.
+		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
 		// Bun's spyOn cannot patch accessors; shadow the prototype getter so the result defers.
 		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
 		const persisted = vi.fn();
@@ -473,12 +476,14 @@ describe("shared publication admission split", () => {
 			expect.stringContaining("Could not save the deferred command result to this session"),
 			"session-publication",
 		);
-		// The entry stayed queued: the next prompt's flush persists it and fires the callback.
+		// The entry stayed queued: the next prompt's flush persists it and fires the callback
+		// before the credential preflight rejects.
 		refused.mockRestore();
-		await f.session.prompt("retry flush").catch(() => {});
+		await expect(f.session.prompt("retry flush")).rejects.toThrow("No credentials found for anthropic.");
 		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
 		await f.manager.flush();
-		expect(await Bun.file(f.file).text()).toContain("deferred output");
+		expect((await Bun.file(f.file).text()).split("deferred output")).toHaveLength(2);
 	});
 
 	it("never re-queues an unknown deferred command result and closes with its receipt", async () => {
@@ -515,6 +520,9 @@ describe("shared publication admission split", () => {
 
 	it("does not retry a deferred result whose onPersisted callback throws", async () => {
 		const f = await fixture();
+		// The first prompt's flush failure must not fall through to a provider, and the
+		// retry prompt deliberately stops at the credential preflight.
+		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
 		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
 		const persisted = vi.fn(() => {
 			throw new Error("deferred callback exploded");
@@ -527,8 +535,9 @@ describe("shared publication admission split", () => {
 		expect(persisted).toHaveBeenCalledTimes(1);
 		// The row was already durable, so the callback failure is reported but never requeued.
 		expect(f.session.hasPendingBashMessages).toBe(false);
-		await f.session.prompt("retry flush").catch(() => {});
+		await expect(f.session.prompt("retry flush")).rejects.toThrow("No credentials found for anthropic.");
 		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
 		await f.manager.flush();
 		expect((await Bun.file(f.file).text()).split("deferred callback output")).toHaveLength(2);
 	});
@@ -639,6 +648,50 @@ describe("shared publication admission split", () => {
 				},
 			}),
 		).toThrow("legacy callback exploded");
+	});
+
+	it("reserves the queued continuation before a throwing legacy Python callback", async () => {
+		const f = await fixture({ sharedAppend: false });
+		// Queue directly on the agent: the session's own follow-up path would schedule
+		// delivery itself and hide whether this callback path reserved the continuation.
+		f.session.agent.followUp(user("queued legacy follow-up"));
+		const continueQueued = vi.spyOn(f.session.agent, "continueQueuedMessages").mockResolvedValue(undefined);
+		const continueAll = vi.spyOn(f.session.agent, "continue").mockResolvedValue(undefined);
+		let callbackSaw: { appended: boolean; hasPostPromptWork: boolean } | undefined;
+		const sentinel = new Error("legacy queued callback exploded");
+		let thrown: unknown;
+		try {
+			f.session.recordPythonResult("print('legacy-queued-throw')", shellResult("python legacy queued throw"), {
+				onPersisted: () => {
+					// Record instead of asserting: an assertion throw here would replace the sentinel
+					// whose exact identity the legacy append/callback boundary must preserve.
+					callbackSaw = {
+						appended: f.manager
+							.getEntries()
+							.some(
+								entry =>
+									entry.type === "message" &&
+									entry.message.role === "pythonExecution" &&
+									entry.message.code === "print('legacy-queued-throw')",
+							),
+						hasPostPromptWork: f.session.hasPostPromptWork,
+					};
+					throw sentinel;
+				},
+			});
+		} catch (error) {
+			thrown = error;
+		}
+		// Ordering contract: append -> continuation reservation -> callback with the
+		// same inline throw, so the queued delivery survives the callback failure.
+		expect(thrown).toBe(sentinel);
+		expect(callbackSaw).toEqual({ appended: true, hasPostPromptWork: true });
+		expect(continueQueued).not.toHaveBeenCalled();
+		expect(continueAll).not.toHaveBeenCalled();
+
+		await f.session.waitForIdle();
+		expect(continueQueued).toHaveBeenCalledTimes(1);
+		expect(continueAll).not.toHaveBeenCalled();
 	});
 
 	it("observes a throwing completion callback instead of rejecting unhandled", async () => {

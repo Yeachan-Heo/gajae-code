@@ -17728,10 +17728,10 @@ export class AgentSession {
 	 * until the session is ensured on disk or holds its first assistant entry. A legacy
 	 * callback therefore means "recorded in this session's graph", not "durable after a reload".
 	 *
-	 * On the shared path the callback runs after the durable write, so its failure is neither
-	 * a refusal nor a reason to publish again. It is reported through the operator-notice seam and the
-	 * structured log, and the callback-bearing task is tracked: leaving it unobserved would
-	 * turn a throwing callback into an unhandled rejection after a successful append.
+	 * On the shared path the callback runs after the durable write. A synchronous throw is
+	 * reported through the operator-notice seam and structured log, not treated as a refusal
+	 * or a reason to publish again. The task tracks callback invocation only; callbacks must
+	 * be synchronous and their return values are ignored.
 	 */
 	#publishMessageInBackground(
 		label: string,
@@ -33652,6 +33652,7 @@ export class AgentSession {
 	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
 	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
 	 *   so it does not by itself prove the entry survives a reload.
+	 *   This is a synchronous notification; return values (including promises) are ignored.
 	 */
 	async executeBash(
 		command: string,
@@ -33826,6 +33827,7 @@ export class AgentSession {
 	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
 	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
 	 *   so it does not by itself prove the entry survives a reload.
+	 *   This is a synchronous notification; return values (including promises) are ignored.
 	 */
 	async executePython(
 		code: string,
@@ -33976,11 +33978,12 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			// `onPersisted` is the durability signal: a shared append may be refused or end
-			// with an unknown outcome, and reporting success before the entry is committed
-			// would promise a reload survival that never happened (#7815). A legacy session
-			// has no such guarantee: it fires the callback after the in-memory append.
-			void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
+			const shared = this.#usesSharedSessionPublication();
+			if (shared) {
+				void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
+			} else {
+				this.sessionManager.appendMessage(pythonMessage);
+			}
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -33988,6 +33991,8 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
+			// Reserve queued work before invoking the legacy callback, which may throw inline.
+			if (!shared) options?.onPersisted?.();
 		}
 	}
 
