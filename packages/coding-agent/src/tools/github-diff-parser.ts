@@ -617,22 +617,41 @@ function redactAccumulatedContentWithState(
 	let oldBracketDepth = inputState.bracketDepth; // Track bracket depth as we process old-side lines
 	let newBracketDepth = inputState.bracketDepth; // Also track new-side separately for asymmetric containers
 
+	// Helper to check if a line looks like it's part of a data structure (JSON/YAML key-value pairs)
+	// vs. plain text comment or label. Lines with quotes or colons are likely structure data.
+	const looksLikeStructureData = (content: string): boolean => {
+		// Check if line starts with a quote (JSON string) or looks like a JSON key
+		if (/^\s*["']/.test(content)) return true;
+		// Check if line contains a colon followed by whitespace or bracket (YAML/JSON key-value)
+		if (/:(?:\s|$|\{|\[)/.test(content)) return true;
+		return false;
+	};
+
 	// Also redact lines that are inside incomplete containers
 	// (containers opened in previous hunks or opened in this hunk but not closed)
 	// We track bracket depth separately for each projection since they can be asymmetric
+	// Asymmetric containers: if old side is deeper, redact new side too for safety
 	for (let i = 0; i < lineInfos.length; i += 1) {
 		const info = result[i]; // The corresponding redacted line info
 		const originalInfo = lineInfos[i];
 		const prefix = originalInfo.prefix;
 
-		// Handle context and deleted lines (old-side projection)
-		if (prefix === " " || prefix === "-") {
+		// Handle deleted lines only (old-side projection)
+		// Context lines are shared and have already been processed by redactCrashSecretsPreservingLines.
+		// Only deleted lines (which appear only on the old side) may need redaction
+		// if the opening bracket was on a previous hunk's deleted line.
+		if (prefix === "-") {
 			const oldIdx = oldProjectionIndices.indexOf(i);
 			if (oldIdx >= 0) {
 				const originalContent = oldProjectionLines[oldIdx];
 
+				// Check if this line is only structural (brackets, whitespace, etc.)
+				// Don't redact purely structural lines - they're important for preserving format
+				const isOnlyStructure = /^[\s[\]{},:.]*$/.test(info.content);
+
 				// If we're inside a container at the start of this line, redact it
-				if (oldBracketDepth > 0 && info.content !== "" && !info.content.includes("«redacted")) {
+				// But skip purely structural lines
+				if (oldBracketDepth > 0 && info.content !== "" && !isOnlyStructure && !info.content.includes("«redacted")) {
 					info.content = "«redacted»";
 				}
 
@@ -647,14 +666,75 @@ function redactAccumulatedContentWithState(
 			}
 		}
 
-		// Handle added lines (new-side projection)
-		if (prefix === " " || prefix === "+") {
+		// Handle context lines (old-side projection) - track bracket depth and selectively redact
+		// Redact lines that look like they're part of a data structure (JSON/YAML), but keep plain text
+		if (prefix === " ") {
+			const oldIdx = oldProjectionIndices.indexOf(i);
+			const newIdx = newProjectionIndices.indexOf(i);
+			if (oldIdx >= 0) {
+				const originalContent = oldProjectionLines[oldIdx];
+				const isOnlyStructure = /^[\s[\]{},:.]*$/.test(info.content);
+				const isStructureData = looksLikeStructureData(info.content);
+
+				// Redact if inside container AND (looks like structure data OR doesn't look like plain text)
+				// BUT preserve lines that are only whitespace and structure, or plain text words
+				if (
+					oldBracketDepth > 0 &&
+					info.content !== "" &&
+					!isOnlyStructure &&
+					isStructureData &&
+					!info.content.includes("«redacted")
+				) {
+					info.content = "«redacted»";
+				}
+
+				// Update bracket depth for next line
+				for (const char of originalContent) {
+					if (char === "[" || char === "{") {
+						oldBracketDepth += 1;
+					} else if ((char === "]" || char === "}") && oldBracketDepth > 0) {
+						oldBracketDepth -= 1;
+					}
+				}
+			}
+			if (newIdx >= 0) {
+				const originalContent = newProjectionLines[newIdx];
+
+				// Also update bracket depth for new-side projection
+				for (const char of originalContent) {
+					if (char === "[" || char === "{") {
+						newBracketDepth += 1;
+					} else if ((char === "]" || char === "}") && newBracketDepth > 0) {
+						newBracketDepth -= 1;
+					}
+				}
+			}
+		}
+
+		// Handle added lines only (new-side projection)
+		// Context lines are shared and have already been processed by redactCrashSecretsPreservingLines.
+		// Only added lines (which appear only on the new side) may need redaction
+		// if the opening bracket was on a previous hunk's added line.
+		// Also redact if oldBracketDepth > newBracketDepth (asymmetric container).
+		if (prefix === "+") {
 			const newIdx = newProjectionIndices.indexOf(i);
 			if (newIdx >= 0) {
 				const originalContent = newProjectionLines[newIdx];
 
-				// If we're inside a container at the start of this line, redact it
-				if (newBracketDepth > 0 && info.content !== "" && !info.content.includes("«redacted")) {
+				// Check if this line is only structural (brackets, whitespace, etc.)
+				// Don't redact purely structural lines - they're important for preserving format
+				const isOnlyStructure = /^[\s[\]{},:.]*$/.test(info.content);
+
+				// Redact if:
+				// 1. We're inside a container on the new side, OR
+				// 2. We're in an asymmetric container (old side deeper than new side)
+				// But skip purely structural lines
+				if (
+					(newBracketDepth > 0 || oldBracketDepth > newBracketDepth) &&
+					info.content !== "" &&
+					!isOnlyStructure &&
+					!info.content.includes("«redacted")
+				) {
 					info.content = "«redacted»";
 				}
 
