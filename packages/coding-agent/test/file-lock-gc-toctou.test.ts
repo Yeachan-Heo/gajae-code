@@ -2601,3 +2601,25 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(lockError.message).not.toContain("could not be reaped");
 	});
 });
+
+describe("file lock GC transient owner-record refusals (#7907)", () => {
+	test("GC collection handles lock records without crashing", async () => {
+		const root = await makeTemp();
+		const filePath = path.join(root, "config.json");
+		const lockDir = `${filePath}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+
+		const ctx: GcContext = {
+			probe: () => ({ status: "dead" }),
+			force: false,
+			env: process.env,
+			cwd: root,
+		};
+
+		// Collection should succeed without crashing
+		const result = await fileLocksGcAdapter.collect(ctx);
+		expect(result).toBeDefined();
+		expect(Array.isArray(result.errors)).toBe(true);
+		expect(Array.isArray(result.records)).toBe(true);
+	});
+});
