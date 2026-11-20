@@ -30,10 +30,13 @@ describe("AuthorizationControls SDK warning confirmation", () => {
 			credentialSessionId: "test-cred-session-id",
 			sessionManager: {
 				getSessionId: () => "test-manager-session-id",
+				getSessionIdentityGeneration: () => 1,
 			} as any,
 			modelRegistry: {
 				authStorage: authStorage!,
 				refresh: async () => {},
+				getAuthStorageOwner: () => ({}),
+				getAll: () => [],
 			} as any,
 			registerToolSessionCleanup: () => () => {},
 			registerToolSessionTransitionCleanup: () => () => {},
