@@ -105,7 +105,13 @@ describe("broker lock refusal in the public SDK envelope", () => {
 			});
 			expect(rendered.envelope.error.code).toBe("broker_unavailable");
 			expect(rendered.envelope.diagnostics?.map(diagnostic => diagnostic.code)).toEqual(["lock_refused"]);
-			expect(rendered.envelope.error.nextSteps.some(step => step.argv?.join(" ") === "sdk broker run")).toBe(true);
+			// Guidance mentions running the broker in foreground but does not pass argv (avoid unsafe retry).
+			expect(
+				rendered.envelope.error.nextSteps.some(step =>
+					step.description.includes("Run the broker in the foreground"),
+				),
+			).toBe(true);
+			expect(rendered.envelope.error.nextSteps.every(step => step.argv === undefined)).toBe(true);
 			// Fixed diagnostics only: neither the broker's text nor the lock path is echoed.
 			expect(rendered.stdout).not.toContain("raw broker text");
 			expect(rendered.stdout).not.toContain(lockPath);
