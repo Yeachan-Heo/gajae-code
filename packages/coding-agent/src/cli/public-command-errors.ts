@@ -368,13 +368,13 @@ export function classifyPublicCommandFailure(
 			if (canonical[0] === "sdk" && canonical[1] === "broker" && canonical[2] === "run")
 				nextSteps.push(
 					step(
-						"Follow the lock, code and recovery step printed on stderr, then run the broker again. It reclaims no lock that is held by a live, foreign-host or host-unqualified owner.",
+						"Follow the lock, code and recovery step printed on stderr. The lock is never reclaimed from a live, foreign-host or host-unqualified owner. After the owner stops or the host qualifies, you can retry the broker.",
 					),
 				);
 			else
 				nextSteps.push(
 					step(
-						"Run the broker in the foreground to print the blocking lock, its code and the recovery step. It reclaims no lock that is held by a live, foreign-host or host-unqualified owner.",
+						"Run the broker in the foreground to print the blocking lock, its code and the recovery step. The lock is never reclaimed from a live, foreign-host or host-unqualified owner. After the owner stops or the host qualifies, you can retry.",
 						["sdk", "broker", "run"],
 					),
 				);

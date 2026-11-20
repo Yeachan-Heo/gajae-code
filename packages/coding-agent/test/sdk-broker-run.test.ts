@@ -229,5 +229,6 @@ it("exits 1 through the public failure boundary when an existing broker lock is 
 	expect(stderr).toContain("lock_refused");
 	// The command is already `broker run`: it must not tell the operator to run itself.
 	expect(stderr).not.toContain("Run the broker in the foreground");
+	expect(stderr).not.toContain("run the broker again");
 	expect(await Bun.file(path.join(lock, "owner.json")).json()).toMatchObject({ ownerId: "legacy-owner" });
 }, 90_000);
