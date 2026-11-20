@@ -4913,6 +4913,15 @@ export class AgentSession {
 	 */
 	#nestedToolScopes = new Map<string, NestedToolScope>();
 	#ttsrAbortPending = false;
+	/**
+	 * Assistant stream sequence, advanced synchronously when an assistant message_start is
+	 * admitted. Each message_update is stamped with its stream at admission, so a TTSR
+	 * interrupt can suppress exactly the rest of its own stream even when update handlers
+	 * run after the next stream has started.
+	 */
+	#assistantStreamSequence = 0;
+	#assistantStreamByUpdate = new WeakMap<object, number>();
+	#ttsrInterruptedStream: number | undefined = undefined;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
@@ -8510,6 +8519,8 @@ export class AgentSession {
 		}
 		// A new run means the conversation is moving on: no pending recap may commit.
 		if (event.type === "agent_start") this.#cancelPendingSessionRecap();
+		if (event.type === "message_start" && event.message.role === "assistant") this.#assistantStreamSequence++;
+		else if (event.type === "message_update") this.#assistantStreamByUpdate.set(event, this.#assistantStreamSequence);
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
@@ -9467,7 +9478,16 @@ export class AgentSession {
 		}
 
 		// TTSR: Check for pattern matches on assistant text/thinking and tool argument deltas
-		if (event.type === "message_update" && this.#ttsrManager?.hasRules()) {
+		// A stream interrupt owns the rest of its assistant stream: later deltas (in flight
+		// before the abort lands, or replayed when a managed fallback attempt is accepted)
+		// must not re-trigger rules or schedule another retry. Any other stream, including
+		// a newer prompt's while a stale retry is still pending, is checked normally.
+		const ttsrStream = event.type === "message_update" ? this.#assistantStreamByUpdate.get(event) : undefined;
+		if (
+			event.type === "message_update" &&
+			(ttsrStream === undefined || ttsrStream !== this.#ttsrInterruptedStream) &&
+			this.#ttsrManager?.hasRules()
+		) {
 			const assistantEvent = event.assistantMessageEvent;
 			let matchContext: TtsrMatchContext | undefined;
 
@@ -9483,6 +9503,7 @@ export class AgentSession {
 				const matches = this.#ttsrManager.checkDelta(assistantEvent.delta, matchContext);
 				const timestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
 				if (matches.length > 0 && this.#handleTtsrMatches(matches, matchContext, timestamp, activePromptHandle)) {
+					if (ttsrStream !== undefined) this.#ttsrInterruptedStream = ttsrStream;
 					return;
 				}
 			}
