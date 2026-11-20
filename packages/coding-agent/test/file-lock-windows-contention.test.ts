@@ -525,6 +525,46 @@ test("gc handles transient owner-record refusal with successful retry", async ()
 	});
 });
 
+test("gc handles transient owner-record refusal that persists through early retries", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	const timestamp = Date.now();
+	const info = { pid: 12345, timestamp };
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify(info));
+	const realOpenSync = fsSync.openSync;
+	let attempt = 0;
+	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+		if (samePath(String(target), infoPath)) {
+			attempt++;
+			// Simulate a concurrent removal: fail on attempts 1-3, succeed on attempt 4.
+			// This covers the timing window where both early reads can fail even though the
+			// refusal eventually clears.
+			if (attempt >= 1 && attempt <= 3) {
+				const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+					code: "EPERM",
+				});
+				throw err;
+			}
+			// Attempt 4+: succeeds (simulating retirement completing)
+		}
+		return realOpenSync(target, flags, mode);
+	}) as typeof fsSync.openSync);
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	// With backoff, the GC eventually succeeds after transient refusals clear.
+	expect(collected.errors).toEqual([]);
+	expect(collected.records).toHaveLength(1);
+	expect(collected.records[0]).toMatchObject({
+		store: "file_locks",
+		id: lockDir,
+		path: lockDir,
+		pid: 12345,
+	});
+});
+
 test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as an error on every pass", async () => {
 	const tempDir = await createTempDir();
 	const lockDir = path.join(tempDir, "state.json.lock");
@@ -542,6 +582,34 @@ test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as 
 	} finally {
 		await Bun.$`icacls ${infoPath} /remove:d ${user}`.quiet();
 	}
+});
+
+// A plain directory with the lock suffix should not be pruned from the walk just because
+// its name matches the transition pattern. GC must verify lock evidence before treating it
+// as a lock directory to skip.
+test("gc does not skip an ordinary directory that happens to match the lock suffix pattern", async () => {
+	const tempDir = await createTempDir();
+	// Create a plain directory with the transition suffix pattern, but no lock info.
+	const ordinaryDir = path.join(tempDir, `.gjc-lock-${"b".repeat(64)}.removing`);
+	await fs.mkdir(ordinaryDir);
+	// Place a valid lock nested inside this ordinary directory.
+	const nestedLock = path.join(ordinaryDir, "config.json.lock");
+	const nestedInfo = path.join(nestedLock, "info");
+	const timestamp = Date.now();
+	await fs.mkdir(nestedLock);
+	await fs.writeFile(nestedInfo, JSON.stringify({ pid: 12345, timestamp }));
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	// GC should discover the nested lock because the parent is not a verified transition.
+	expect(collected.errors).toEqual([]);
+	expect(collected.records).toHaveLength(1);
+	expect(collected.records[0]).toMatchObject({
+		store: "file_locks",
+		id: nestedLock,
+		path: nestedLock,
+		pid: 12345,
+	});
 });
 
 // A retiring owner deletes `<lock>.removing` while GC walks its parent, and Windows refuses

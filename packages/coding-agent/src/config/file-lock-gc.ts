@@ -30,21 +30,36 @@ const MAX_WALK_DEPTH = 6;
 /** Default per-root walk budget. Truncation is a warning, not a hard error. */
 export const FILE_LOCK_GC_MAX_WALK_ENTRIES = 20_000;
 
+/** Default retry attempts for transient owner-record refusals. Covers concurrent removal races. */
+const GC_TRANSIENT_REFUSAL_ATTEMPTS = 5;
+const GC_TRANSIENT_REFUSAL_DELAY_MS = 20;
+
 /**
- * Bounded single retry for Windows transient owner-record refusals during GC discovery.
+ * Bounded retry window for Windows transient owner-record refusals during GC discovery.
  * On POSIX, transient errors are real failures and are reported immediately.
+ * On Windows, retries with bounded backoff (a few attempts with small delays) accommodate
+ * concurrent lock retirement: the first read can fail while the owner process is still
+ * deleting, but subsequent retries can observe the final state once retirement completes.
  */
 async function readFileLockObservationForGcWithRetry(
 	lockDir: string,
 ): Promise<Awaited<ReturnType<typeof readFileLockObservationForGc>>> {
-	try {
-		return await readFileLockObservationForGc(lockDir);
-	} catch (error) {
-		if (!isLockInfoChangingError(error)) throw error;
-		// Windows transient: another process is deleting the lock.
-		// Retry once to observe the final state.
-		return await readFileLockObservationForGc(lockDir);
+	let lastError: unknown;
+	for (let attempt = 0; attempt < GC_TRANSIENT_REFUSAL_ATTEMPTS; attempt++) {
+		try {
+			return await readFileLockObservationForGc(lockDir);
+		} catch (error) {
+			if (!isLockInfoChangingError(error)) throw error;
+			lastError = error;
+			// Windows transient: another process is deleting the lock.
+			// Retry with bounded delay before reporting as persistent failure.
+			if (attempt < GC_TRANSIENT_REFUSAL_ATTEMPTS - 1) {
+				await Bun.sleep(GC_TRANSIENT_REFUSAL_DELAY_MS);
+			}
+		}
 	}
+	// All retry attempts exhausted; throw the last error.
+	throw lastError;
 }
 
 // High-cardinality, lock-free subtrees we never descend into. `.lock` dirs are
@@ -202,7 +217,23 @@ async function walkForLockDirs(
 			continue;
 		}
 		// Windows refuses to list a transition while its owner deletes it (EPERM scandir).
-		if (PRUNED_DIR_NAMES.has(entry) || isFileLockRemovalTransitionName(entry)) continue;
+		if (PRUNED_DIR_NAMES.has(entry)) continue;
+		// Skip only verified removal transitions (those containing lock info or identity markers),
+		// not ordinary directories that happen to match the transition suffix pattern.
+		if (isFileLockRemovalTransitionName(entry)) {
+			const fullPath = path.join(dir, entry);
+			try {
+				// Check for positive transition evidence: an info or identity file exists.
+				await fs.lstat(path.join(fullPath, "info"));
+				continue; // It's a verified transition; skip it.
+			} catch (error) {
+				if (!isEnoent(error)) {
+					// Real error (not missing); report it.
+					errors.push({ store: "file_locks", scope: fullPath, message: errorMessage(error) });
+				}
+				// Either missing or error: treat as not a verified transition; continue walking.
+			}
+		}
 		await walkForLockDirs(path.join(dir, entry), depth + 1, state, lockDirs, errors, maxWalkEntries);
 	}
 }
