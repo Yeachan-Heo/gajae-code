@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, transcriptReplayContent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
-import { TempDir } from "@gajae-code/utils";
+import type { TempDir } from "@gajae-code/utils";
 import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import packageJson from "../../package.json" with { type: "json" };
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
@@ -12,6 +12,9 @@ import {
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(60_000);
 
@@ -114,7 +117,7 @@ describe("ACP transcript replay degradation", () => {
 	let authorityOptions: ExactSessionAuthorityOptions;
 
 	beforeEach(async () => {
-		tempDir = TempDir.createSync("@acp-transcript-replay-");
+		tempDir = trackedTemp.tempDirSync("@acp-transcript-replay-");
 		connectionAbort = new AbortController();
 		transcriptItems = [];
 		transcriptSecondPageFailure = undefined;

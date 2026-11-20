@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { planTmuxOwnerIsolation } from "../src/gjc-runtime/tmux-owner-isolation";
@@ -9,6 +9,9 @@ import {
 	createHarnessCliEnvWithFixtureBroker,
 	type HarnessCliBrokerFixture,
 } from "./harness-control-plane/cli-workspace-env";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -198,8 +201,8 @@ async function retireLiveFixtureOwner(): Promise<void> {
 }
 
 beforeEach(async () => {
-	root = await mkdtemp(path.join(tmpdir(), "harness-tmux-owner-"));
-	workspace = await mkdtemp(path.join(tmpdir(), "harness-tmux-workspace-"));
+	root = await trackedTemp.mkdtemp(path.join(tmpdir(), "harness-tmux-owner-"));
+	workspace = await trackedTemp.mkdtemp(path.join(tmpdir(), "harness-tmux-workspace-"));
 	cliEnv = await createHarnessCliEnvWithFixtureBroker(repoRoot, root);
 });
 
@@ -290,7 +293,7 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 
 	it("refuses a linked owner lifecycle root before planning or writing through it", async () => {
 		const seam = await createScopedHarnessSeam();
-		const outside = await mkdtemp(path.join(tmpdir(), "harness-tmux-outside-"));
+		const outside = await trackedTemp.mkdtemp(path.join(tmpdir(), "harness-tmux-outside-"));
 		try {
 			await mkdir(path.join(root, sessionId), { recursive: true });
 			await symlink(outside, path.join(root, sessionId, "owner-lifecycle"));

@@ -15,6 +15,9 @@ import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extens
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 import { closeSocket } from "./helpers/close-socket";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -246,7 +249,7 @@ async function acceptPrompt(
 		settings?: (cwd: string) => Settings;
 	} = {},
 ): Promise<BusSession> {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
 	dirs.push(cwd);
 	await options.prepareCwd?.(cwd);
 	const sessionId = `sdk-bus-deadline-${label}-${Date.now()}`;
