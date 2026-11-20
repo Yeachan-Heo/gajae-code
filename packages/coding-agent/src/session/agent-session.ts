@@ -17769,7 +17769,7 @@ export class AgentSession {
 	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
 		logger.warn("A durable shared publication's completion callback failed", {
 			operation,
-			error: error instanceof Error ? error.message : String(error),
+			error: safeErrorDescription(error),
 		});
 		if (this.#isDisposed) return;
 		this.emitNotice(

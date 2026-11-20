@@ -602,10 +602,12 @@ describe("shared publication admission split", () => {
 		});
 		const persisted = vi.fn();
 		f.session.recordPythonResult("print('shared')", shellResult("python shared output"), { onPersisted: persisted });
-		await entered.promise;
-		expect(persisted).not.toHaveBeenCalled();
-
-		gate.resolve();
+		try {
+			await entered.promise;
+			expect(persisted).not.toHaveBeenCalled();
+		} finally {
+			gate.resolve();
+		}
 		await f.session.awaitSessionSettlement();
 		expect(persisted).toHaveBeenCalledTimes(1);
 		await f.manager.flush();
@@ -723,6 +725,37 @@ describe("shared publication admission split", () => {
 			process.off("unhandledRejection", onUnhandled);
 		}
 		expect(unhandled).toEqual([]);
+	});
+
+	it("warns and saves one row when a shared completion callback throws a non-coercible value", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const notice = vi.fn();
+		const unsubscribe = f.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "session-publication") notice(event);
+		});
+		const output = "non-coercible callback output";
+		const persisted = vi.fn(() => {
+			throw Object.create(null);
+		});
+		try {
+			f.session.recordBashResult("echo non-coercible", shellResult(output), { onPersisted: persisted });
+			await f.session.awaitSessionSettlement();
+			expect(persisted).toHaveBeenCalledTimes(1);
+			const rows = (await Bun.file(f.file).text()).split("\n");
+			expect(rows.filter(row => row.includes(output))).toHaveLength(1);
+			expect(notice).toHaveBeenCalledTimes(1);
+			expect(notice).toHaveBeenCalledWith({
+				type: "notice",
+				level: "warning",
+				message: "Saved the bash result to this session, but its completion step failed.",
+				source: "session-publication",
+			});
+		} finally {
+			unsubscribe();
+		}
 	});
 
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
