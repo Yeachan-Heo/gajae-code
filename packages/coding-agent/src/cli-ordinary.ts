@@ -4,7 +4,7 @@
  * bash-shell worker protocol) plus the unchanged ordinary routing order:
  * bash-shell workers -> darwin malloc re-exec -> internal smoke -> tmux owner
  * isolation -> managed-owner supervisor/admission/recovery -> broker hop ->
- * private sdk stderr drainer -> public family dispatch -> community app -> doctor worker /
+ * private sdk stderr drainer -> public family dispatch -> doctor worker /
  * probe / cli -> full registry. `cli.ts` imports it lazily, only after argv has
  * been proven not to be a `sdk diagnostics` observation. */
 
