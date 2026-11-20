@@ -11,6 +11,7 @@ import {
 	type DaemonState,
 	SERVING_EPOCH,
 	type TelegramDaemonOptions,
+	type TelegramDaemonStopCause,
 } from "../src/sdk/bus/telegram-daemon";
 import {
 	createDaemonControlHooks,
@@ -124,6 +125,9 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 					requestStop(): void {
 						stopCalled = true;
 					}
+					getStopCause(): TelegramDaemonStopCause | undefined {
+						return undefined;
+					}
 					async run(): Promise<void> {
 						await runPromise;
 					}
@@ -175,6 +179,9 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 					requestStop(): void {
 						stopCalled = true;
 						resolveRun();
+					}
+					getStopCause(): TelegramDaemonStopCause | undefined {
+						return undefined;
 					}
 					async run(): Promise<void> {
 						await runPromise;
@@ -228,6 +235,9 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 						}
 					}
 					requestStop(): void {}
+					getStopCause(): TelegramDaemonStopCause | undefined {
+						return undefined;
+					}
 					async run(): Promise<void> {}
 				} as never,
 			});
@@ -289,6 +299,9 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 					requestStop(): void {
 						stopCalled = true;
 						resolveRun();
+					}
+					getStopCause(): TelegramDaemonStopCause | undefined {
+						return undefined;
 					}
 					async run(): Promise<void> {
 						await daemonRun;
@@ -378,6 +391,9 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 			DaemonImpl: class {
 				requestStop(): void {
 					stopCalled = true;
+				}
+				getStopCause(): TelegramDaemonStopCause | undefined {
+					return undefined;
 				}
 				async run(): Promise<void> {
 					await runPromise;
