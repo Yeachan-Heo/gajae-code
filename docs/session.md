@@ -583,7 +583,7 @@ Metadata extraction reads only a prefix (`readTextPrefix(..., 4096)`) where poss
 In a confined session:
 
 - `read`, `write`, `edit`, and `search`/`find` reject a path whose real target is outside the session root.
-- File reads, writes, and patch deletes/directory creation go through descriptor-pinned native helpers (`confinedOpenRead`, `confinedWriteFileAtomic`, `confinedUnlink`, `confinedMkdirAll`). They open the root once and walk every component with `openat(..., O_NOFOLLOW)`, so a parent swapped for a symlink after the path check fails the operation instead of redirecting it. Writes stage a sibling temp through the pinned parent and publish with `renameat`.
+- File reads, writes, and patch deletes/directory creation go through descriptor-pinned native helpers (`confinedOpenRead`, `confinedWriteFileAtomic`, `confinedUnlink`, `confinedMkdirAll`). The root's directory identity (device and inode) is pinned on first use; each helper opens the root, rejects a descriptor whose identity no longer matches, and walks every component with `openat(..., O_NOFOLLOW)`, so a parent swapped for a symlink after the path check fails the operation instead of redirecting it. Writes stage a sibling temp through the pinned parent and publish with `renameat`.
 - The shell runs under macOS `sandbox-exec` rooted at the session directory. The shell snapshot is not created or loaded for a confined command, because it sources the user's rc file in a separate, unsandboxed shell. Other platforms fail closed.
 - Search and find walkers, browser, and debugger targets are path-checked before use; they are not descriptor-pinned.
 

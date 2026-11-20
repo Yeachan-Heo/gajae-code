@@ -4,43 +4,33 @@ import path from "node:path";
 import { confinedMkdirAll, confinedOpenRead, confinedUnlink, confinedWriteFileAtomic } from "@gajae-code/natives";
 import { pathIsWithin } from "@gajae-code/utils";
 
-/**
- * Cache for pinned root identities.
- * Maps the input root path to its canonical realpath and inode/device pair.
- * This prevents TOCTOU attacks where a concurrent process replaces the root
- * path with a symlink after validation but before the operation.
- */
-const pinnedRoots = new Map<string, { realPath: string; ino: bigint; dev: bigint }>();
+interface PinnedRoot {
+	/** Canonical path of the root when it was pinned. */
+	realPath: string;
+	/** `"<dev>:<ino>"` of that directory, checked by the native helpers on the opened root descriptor. */
+	id: string;
+}
 
 /**
- * Get the canonical realpath of a root and validate it hasn't been replaced.
- * On first call, caches the realpath and inode. On subsequent calls,
- * verifies the inode hasn't changed (would indicate a path swap).
+ * Root identities pinned on first use, keyed by the session's root path.
+ *
+ * Every native operation reopens `realPath` and compares the opened
+ * descriptor against `id`, so a root renamed away or replaced (by a
+ * directory or a symlink) after pinning fails the operation instead of
+ * becoming the walk origin.
  */
-async function getPinnedRootPath(root: string): Promise<string> {
-	const resolvedInput = path.resolve(root);
-	let pinned = pinnedRoots.get(resolvedInput);
+const pinnedRoots = new Map<string, PinnedRoot>();
 
-	if (!pinned) {
-		const realPath = await fs.realpath(root).catch(() => path.resolve(root));
-		const stat = await fs.stat(realPath);
-		pinned = { realPath, ino: BigInt(stat.ino), dev: BigInt(stat.dev) };
-		pinnedRoots.set(resolvedInput, pinned);
-	} else {
-		// Verify the pinned identity hasn't been replaced
-		try {
-			const currentStat = await fs.stat(pinned.realPath);
-			if (BigInt(currentStat.ino) !== pinned.ino || BigInt(currentStat.dev) !== pinned.dev) {
-				throw new Error(`Root identity changed: ${pinned.realPath}`);
-			}
-		} catch (err) {
-			// If we can't stat it, it's been deleted/replaced - clear the cache
-			pinnedRoots.delete(resolvedInput);
-			throw err;
-		}
-	}
-
-	return pinned.realPath;
+async function pinRoot(root: string): Promise<PinnedRoot> {
+	const key = path.resolve(root);
+	const cached = pinnedRoots.get(key);
+	if (cached) return cached;
+	const realPath = await fs.realpath(key);
+	const stat = await fs.stat(realPath, { bigint: true });
+	if (!stat.isDirectory()) throw new Error(`Confined session root is not a directory: ${realPath}`);
+	const pinned = { realPath, id: `${stat.dev}:${stat.ino}` };
+	pinnedRoots.set(key, pinned);
+	return pinned;
 }
 
 /**
@@ -80,21 +70,26 @@ async function nearestExistingPath(candidate: string): Promise<string> {
 interface ConfinedTarget {
 	/** Canonical session root. */
 	realRoot: string;
+	/** Pinned identity of `realRoot`. */
+	rootId: string;
 	/** Symlink-free path of the target relative to `realRoot`, or `undefined` when it escapes. */
 	relative: string | undefined;
 }
 
 async function resolveConfinedTarget(root: string, candidate: string): Promise<ConfinedTarget> {
-	const [realRoot, existing] = await Promise.all([getPinnedRootPath(root), nearestExistingPath(candidate)]);
+	const [{ realPath: realRoot, id: rootId }, existing] = await Promise.all([
+		pinRoot(root),
+		nearestExistingPath(candidate),
+	]);
 	const stat = await fs.lstat(existing);
 	const realCandidate = stat.isSymbolicLink()
 		? await fs.realpath(existing).catch(() => undefined)
 		: await fs.realpath(existing);
-	if (!realCandidate) return { realRoot, relative: undefined };
+	if (!realCandidate) return { realRoot, rootId, relative: undefined };
 	const suffix = path.relative(existing, path.resolve(candidate));
 	const resolved = suffix ? path.resolve(realCandidate, suffix) : realCandidate;
-	if (resolved !== realRoot && !pathIsWithin(realRoot, resolved)) return { realRoot, relative: undefined };
-	return { realRoot, relative: path.relative(realRoot, resolved) };
+	if (resolved !== realRoot && !pathIsWithin(realRoot, resolved)) return { realRoot, rootId, relative: undefined };
+	return { realRoot, rootId, relative: path.relative(realRoot, resolved) };
 }
 
 /**
@@ -103,7 +98,7 @@ async function resolveConfinedTarget(root: string, candidate: string): Promise<C
  * so unlinking a symlink will remove the symlink itself, not its target.
  */
 async function resolveConfinedTargetForDelete(root: string, candidate: string): Promise<ConfinedTarget> {
-	const realRoot = await getPinnedRootPath(root);
+	const { realPath: realRoot, id: rootId } = await pinRoot(root);
 	const resolvedCandidate = path.resolve(candidate);
 
 	// For deletion, we validate that the parent directory is inside the root
@@ -121,7 +116,7 @@ async function resolveConfinedTargetForDelete(root: string, candidate: string): 
 			const nearest = await nearestExistingPath(parent).catch(() => realRoot);
 			const nearestReal = await fs.realpath(nearest).catch(() => path.resolve(nearest));
 			if (!pathIsWithin(realRoot, nearestReal)) {
-				return { realRoot, relative: undefined };
+				return { realRoot, rootId, relative: undefined };
 			}
 			existingParent = nearest;
 		} else {
@@ -130,15 +125,15 @@ async function resolveConfinedTargetForDelete(root: string, candidate: string): 
 	}
 
 	const parentReal = await fs.realpath(existingParent).catch(() => path.resolve(existingParent));
-	if (!pathIsWithin(realRoot, parentReal)) return { realRoot, relative: undefined };
+	if (!pathIsWithin(realRoot, parentReal)) return { realRoot, rootId, relative: undefined };
 
 	// Construct the full resolved path without following the final symlink
 	const resolvedPath = path.join(parentReal, basename);
 	if (resolvedPath !== realRoot && !pathIsWithin(realRoot, resolvedPath)) {
-		return { realRoot, relative: undefined };
+		return { realRoot, rootId, relative: undefined };
 	}
 
-	return { realRoot, relative: path.relative(realRoot, resolvedPath) };
+	return { realRoot, rootId, relative: path.relative(realRoot, resolvedPath) };
 }
 
 /** True when `candidate` resolves, through symlinks, outside `root`. */
@@ -182,7 +177,7 @@ function mapNativeError(root: string, candidate: string, error: unknown): Error 
 async function requireConfinedTarget(root: string, candidate: string): Promise<ConfinedTarget & { relative: string }> {
 	const target = await resolveConfinedTarget(root, candidate);
 	if (target.relative === undefined) throw escapeError(root, candidate);
-	return { realRoot: target.realRoot, relative: target.relative };
+	return { ...target, relative: target.relative };
 }
 
 /** Open an existing regular file through descriptors pinned beneath `root`. */
@@ -190,7 +185,7 @@ export async function openFileInsideWorkspace(root: string, candidate: string): 
 	const target = await requireConfinedTarget(root, candidate);
 	let fd: number;
 	try {
-		fd = confinedOpenRead(target.realRoot, target.relative);
+		fd = confinedOpenRead(target.realRoot, target.rootId, target.relative);
 	} catch (error) {
 		throw mapNativeError(root, candidate, error);
 	}
@@ -224,7 +219,7 @@ export async function writeFileInsideWorkspace(
 	const target = await requireConfinedTarget(root, candidate);
 	const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
 	try {
-		confinedWriteFileAtomic(target.realRoot, target.relative, bytes, true);
+		confinedWriteFileAtomic(target.realRoot, target.rootId, target.relative, bytes, true);
 	} catch (error) {
 		throw mapNativeError(root, candidate, error);
 	}
@@ -234,7 +229,7 @@ export async function unlinkInsideWorkspace(root: string, candidate: string): Pr
 	const target = await resolveConfinedTargetForDelete(root, candidate);
 	if (target.relative === undefined) throw escapeError(root, candidate);
 	try {
-		confinedUnlink(target.realRoot, target.relative);
+		confinedUnlink(target.realRoot, target.rootId, target.relative);
 	} catch (error) {
 		throw mapNativeError(root, candidate, error);
 	}
@@ -243,7 +238,7 @@ export async function unlinkInsideWorkspace(root: string, candidate: string): Pr
 export async function mkdirInsideWorkspace(root: string, candidate: string): Promise<void> {
 	const target = await requireConfinedTarget(root, candidate);
 	try {
-		confinedMkdirAll(target.realRoot, target.relative);
+		confinedMkdirAll(target.realRoot, target.rootId, target.relative);
 	} catch (error) {
 		throw mapNativeError(root, candidate, error);
 	}

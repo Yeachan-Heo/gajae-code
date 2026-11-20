@@ -1028,19 +1028,25 @@ export interface ComputerScreenshot {
  * Create `relative` and any missing ancestors beneath `root` without following
  * a symlink at any component.
  */
-export declare function confinedMkdirAll(root: string, relative: string): void
+export declare function confinedMkdirAll(root: string, rootId: string, relative: string): void
 
 /**
  * Open `relative` beneath `root` for reading and return an owned descriptor.
+ *
+ * `root_id` is the `"<dev>:<ino>"` identity pinned for `root`; every helper
+ * rejects an opened root descriptor whose identity differs.
  *
  * `relative` must be a normalized relative path with no `..` component. A
  * symlink at any component below `root` is rejected. The caller owns the
  * returned descriptor and must close it.
  */
-export declare function confinedOpenRead(root: string, relative: string): number
+export declare function confinedOpenRead(root: string, rootId: string, relative: string): number
 
-/** Remove the file `relative` beneath `root` through the pinned parent descriptor. */
-export declare function confinedUnlink(root: string, relative: string): void
+/**
+ * Remove the file `relative` beneath `root` through the pinned parent
+ * descriptor.
+ */
+export declare function confinedUnlink(root: string, rootId: string, relative: string): void
 
 /**
  * Atomically replace or create `relative` beneath `root` with `data`.
@@ -1051,7 +1057,7 @@ export declare function confinedUnlink(root: string, relative: string): void
  * mode. A symlinked, hard-linked, or non-regular target is rejected. Missing
  * parent directories are created only when `create_parents` is set.
  */
-export declare function confinedWriteFileAtomic(root: string, relative: string, data: Buffer, createParents: boolean): void
+export declare function confinedWriteFileAtomic(root: string, rootId: string, relative: string, data: Buffer, createParents: boolean): void
 
 /** A context line (before or after a match). */
 export interface ContextLine {

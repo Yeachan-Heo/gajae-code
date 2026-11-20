@@ -3,7 +3,9 @@
 //! A pathname check followed by a pathname open is a TOCTOU window: a process
 //! inside the root can swap a parent directory for a symlink that points
 //! outside it after the check and before the open. These helpers never resolve
-//! a pathname below the root. They open the root once, then walk every
+//! a pathname below the root. They open the root once, check that the opened
+//! descriptor is the directory identity (`"<dev>:<ino>"`) the caller pinned
+//! when the session started, then walk every
 //! component with `openat(..., O_NOFOLLOW)`. The final read or write uses
 //! descriptors from that walk, so a symlink anywhere below the root fails the
 //! operation instead of redirecting it.
@@ -18,18 +20,21 @@ use napi_derive::napi;
 
 /// Open `relative` beneath `root` for reading and return an owned descriptor.
 ///
+/// `root_id` is the `"<dev>:<ino>"` identity pinned for `root`; every helper
+/// rejects an opened root descriptor whose identity differs.
+///
 /// `relative` must be a normalized relative path with no `..` component. A
 /// symlink at any component below `root` is rejected. The caller owns the
 /// returned descriptor and must close it.
 #[napi]
-pub fn confined_open_read(root: String, relative: String) -> Result<i32> {
+pub fn confined_open_read(root: String, root_id: String, relative: String) -> Result<i32> {
 	#[cfg(unix)]
 	{
-		unix::open_read(&root, &relative).map_err(unix::to_napi)
+		unix::open_read(&root, &root_id, &relative).map_err(unix::to_napi)
 	}
 	#[cfg(not(unix))]
 	{
-		let _ = (root, relative);
+		let _ = (root, root_id, relative);
 		Err(Error::from_reason("confine:unsupported: confined file access requires a Unix host"))
 	}
 }
@@ -44,17 +49,18 @@ pub fn confined_open_read(root: String, relative: String) -> Result<i32> {
 #[napi]
 pub fn confined_write_file_atomic(
 	root: String,
+	root_id: String,
 	relative: String,
 	data: Buffer,
 	create_parents: bool,
 ) -> Result<()> {
 	#[cfg(unix)]
 	{
-		unix::write_atomic(&root, &relative, &data, create_parents).map_err(unix::to_napi)
+		unix::write_atomic(&root, &root_id, &relative, &data, create_parents).map_err(unix::to_napi)
 	}
 	#[cfg(not(unix))]
 	{
-		let _ = (root, relative, data, create_parents);
+		let _ = (root, root_id, relative, data, create_parents);
 		Err(Error::from_reason("confine:unsupported: confined file access requires a Unix host"))
 	}
 }
@@ -62,14 +68,14 @@ pub fn confined_write_file_atomic(
 /// Remove the file `relative` beneath `root` through the pinned parent
 /// descriptor.
 #[napi]
-pub fn confined_unlink(root: String, relative: String) -> Result<()> {
+pub fn confined_unlink(root: String, root_id: String, relative: String) -> Result<()> {
 	#[cfg(unix)]
 	{
-		unix::unlink(&root, &relative).map_err(unix::to_napi)
+		unix::unlink(&root, &root_id, &relative).map_err(unix::to_napi)
 	}
 	#[cfg(not(unix))]
 	{
-		let _ = (root, relative);
+		let _ = (root, root_id, relative);
 		Err(Error::from_reason("confine:unsupported: confined file access requires a Unix host"))
 	}
 }
@@ -77,14 +83,14 @@ pub fn confined_unlink(root: String, relative: String) -> Result<()> {
 /// Create `relative` and any missing ancestors beneath `root` without following
 /// a symlink at any component.
 #[napi]
-pub fn confined_mkdir_all(root: String, relative: String) -> Result<()> {
+pub fn confined_mkdir_all(root: String, root_id: String, relative: String) -> Result<()> {
 	#[cfg(unix)]
 	{
-		unix::mkdir_all(&root, &relative).map_err(unix::to_napi)
+		unix::mkdir_all(&root, &root_id, &relative).map_err(unix::to_napi)
 	}
 	#[cfg(not(unix))]
 	{
-		let _ = (root, relative);
+		let _ = (root, root_id, relative);
 		Err(Error::from_reason("confine:unsupported: confined file access requires a Unix host"))
 	}
 }
@@ -225,17 +231,37 @@ mod unix {
 		st.st_mode & libc::S_IFMT
 	}
 
-	fn open_root(root: &str) -> Result<Fd, ConfineError> {
+	/// Parse the `"<dev>:<ino>"` identity the caller pinned for the root.
+	fn parse_root_id(root_id: &str) -> Result<(u64, u64), ConfineError> {
+		let (dev, ino) = root_id.split_once(':').ok_or(ConfineError::Escape)?;
+		let dev = dev.parse::<u64>().map_err(|_| ConfineError::Escape)?;
+		let ino = ino.parse::<u64>().map_err(|_| ConfineError::Escape)?;
+		Ok((dev, ino))
+	}
+
+	fn open_root(root: &str, root_id: &str) -> Result<Fd, ConfineError> {
+		let (expected_dev, expected_ino) = parse_root_id(root_id)?;
 		let root = CString::new(root.as_bytes()).map_err(|_| ConfineError::Escape)?;
-		// The root is the session's own cwd, fixed at launch. It is opened by
-		// pathname once; everything below it is resolved through descriptors.
+		// The root is opened by pathname, so the pathname may name a different
+		// directory than the one pinned when the session started. The identity
+		// is compared on the opened descriptor itself; a root replaced before
+		// or during this open fails instead of becoming the walk origin.
 		// SAFETY: root is NUL-terminated and the flags request a directory descriptor.
 		let fd =
 			unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
 		if fd < 0 {
 			return Err(last_os_error());
 		}
-		Ok(Fd(fd))
+		let opened = Fd(fd);
+		if stat_identity(&fstat(&opened)?) != (expected_dev, expected_ino) {
+			return Err(ConfineError::Escape);
+		}
+		Ok(opened)
+	}
+
+	#[allow(clippy::unnecessary_cast, reason = "libc stat field widths differ between Unix targets")]
+	const fn stat_identity(st: &libc::stat) -> (u64, u64) {
+		(st.st_dev as u64, st.st_ino as u64)
 	}
 
 	fn open_dir_at(dir: &Fd, name: &CString) -> Result<Fd, ConfineError> {
@@ -304,9 +330,9 @@ mod unix {
 		Ok((names, leaf))
 	}
 
-	pub fn open_read(root: &str, relative: &str) -> Result<i32, ConfineError> {
+	pub fn open_read(root: &str, root_id: &str, relative: &str) -> Result<i32, ConfineError> {
 		let (parents, leaf) = split_leaf(relative)?;
-		let dir = walk_parents(open_root(root)?, &parents, false)?;
+		let dir = walk_parents(open_root(root, root_id)?, &parents, false)?;
 		let st = lstat_at(&dir, &leaf)?;
 		match file_type(&st) {
 			libc::S_IFREG => {},
@@ -345,9 +371,9 @@ mod unix {
 		Ok(opened.into_raw())
 	}
 
-	pub fn unlink(root: &str, relative: &str) -> Result<(), ConfineError> {
+	pub fn unlink(root: &str, root_id: &str, relative: &str) -> Result<(), ConfineError> {
 		let (parents, leaf) = split_leaf(relative)?;
-		let dir = walk_parents(open_root(root)?, &parents, false)?;
+		let dir = walk_parents(open_root(root, root_id)?, &parents, false)?;
 		if file_type(&lstat_at(&dir, &leaf)?) == libc::S_IFDIR {
 			return Err(ConfineError::IsDirectory);
 		}
@@ -359,8 +385,8 @@ mod unix {
 		Ok(())
 	}
 
-	pub fn mkdir_all(root: &str, relative: &str) -> Result<(), ConfineError> {
-		walk_parents(open_root(root)?, &components(relative)?, true).map(drop)
+	pub fn mkdir_all(root: &str, root_id: &str, relative: &str) -> Result<(), ConfineError> {
+		walk_parents(open_root(root, root_id)?, &components(relative)?, true).map(drop)
 	}
 
 	fn temp_name(leaf: &CString) -> Result<CString, ConfineError> {
@@ -450,12 +476,13 @@ mod unix {
 
 	pub fn write_atomic(
 		root: &str,
+		root_id: &str,
 		relative: &str,
 		data: &[u8],
 		create_parents: bool,
 	) -> Result<(), ConfineError> {
 		let (parents, leaf) = split_leaf(relative)?;
-		let dir = walk_parents(open_root(root)?, &parents, create_parents)?;
+		let dir = walk_parents(open_root(root, root_id)?, &parents, create_parents)?;
 		let existing = existing_target(&dir, &leaf)?;
 		let mode = existing
 			.as_ref()

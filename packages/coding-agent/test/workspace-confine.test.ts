@@ -7,6 +7,7 @@ import fc from "fast-check";
 import { confineSandboxProfile, sandboxedShellCommand } from "../src/tools/confine-sandbox";
 import {
 	directoryEscapesWorkspace,
+	mkdirInsideWorkspace,
 	openFileInsideWorkspace,
 	pathEscapesWorkspace,
 	readFileInsideWorkspace,
@@ -14,6 +15,11 @@ import {
 	unlinkInsideWorkspace,
 	writeFileInsideWorkspace,
 } from "../src/tools/workspace-confine";
+
+async function rootIdentity(dir: string): Promise<string> {
+	const stat = await fs.stat(dir, { bigint: true });
+	return `${stat.dev}:${stat.ino}`;
+}
 
 describe("--confine path boundary", () => {
 	it("accepts the root and a descendant, and rejects a parent", () => {
@@ -251,17 +257,18 @@ describe("--confine path boundary", () => {
 		await fs.writeFile(path.join(outside, "secret.txt"), "hidden\n");
 		await fs.symlink(outside, path.join(root, "sub"));
 		const realRoot = await fs.realpath(root);
+		const rootId = await rootIdentity(realRoot);
 		try {
-			expect(() => confinedOpenRead(realRoot, "sub/secret.txt")).toThrow(/confine:escape/);
-			expect(() => confinedWriteFileAtomic(realRoot, "sub/secret.txt", Buffer.from("overwritten\n"), true)).toThrow(
+			expect(() => confinedOpenRead(realRoot, rootId, "sub/secret.txt")).toThrow(/confine:escape/);
+			expect(() =>
+				confinedWriteFileAtomic(realRoot, rootId, "sub/secret.txt", Buffer.from("overwritten\n"), true),
+			).toThrow(/confine:escape/);
+			expect(() => confinedWriteFileAtomic(realRoot, rootId, "sub/new.txt", Buffer.from("new\n"), true)).toThrow(
 				/confine:escape/,
 			);
-			expect(() => confinedWriteFileAtomic(realRoot, "sub/new.txt", Buffer.from("new\n"), true)).toThrow(
-				/confine:escape/,
-			);
-			expect(() => confinedUnlink(realRoot, "sub/secret.txt")).toThrow(/confine:escape/);
-			expect(() => confinedMkdirAll(realRoot, "sub/created")).toThrow(/confine:escape/);
-			expect(() => confinedOpenRead(realRoot, "../outside/secret.txt")).toThrow(/confine:escape/);
+			expect(() => confinedUnlink(realRoot, rootId, "sub/secret.txt")).toThrow(/confine:escape/);
+			expect(() => confinedMkdirAll(realRoot, rootId, "sub/created")).toThrow(/confine:escape/);
+			expect(() => confinedOpenRead(realRoot, rootId, "../outside/secret.txt")).toThrow(/confine:escape/);
 			expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("hidden\n");
 			expect((await fs.readdir(outside)).sort()).toEqual(["secret.txt"]);
 		} finally {
@@ -274,11 +281,14 @@ describe("--confine path boundary", () => {
 		const root = path.join(parent, "repo");
 		await fs.mkdir(root);
 		const realRoot = await fs.realpath(root);
+		const rootId = await rootIdentity(realRoot);
 		await fs.writeFile(path.join(root, "target.txt"), "inside\n");
 		await fs.symlink(path.join(root, "target.txt"), path.join(root, "link.txt"));
 		try {
-			expect(() => confinedOpenRead(realRoot, "link.txt")).toThrow(/confine:escape/);
-			expect(() => confinedWriteFileAtomic(realRoot, "link.txt", Buffer.from("x"), false)).toThrow(/confine:escape/);
+			expect(() => confinedOpenRead(realRoot, rootId, "link.txt")).toThrow(/confine:escape/);
+			expect(() => confinedWriteFileAtomic(realRoot, rootId, "link.txt", Buffer.from("x"), false)).toThrow(
+				/confine:escape/,
+			);
 			expect(await fs.readFile(path.join(root, "target.txt"), "utf8")).toBe("inside\n");
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
@@ -317,48 +327,88 @@ describe("--confine path boundary", () => {
 		}
 	});
 
-	it("[P1] Root identity remains stable across multiple operations", async () => {
+	it("rejects a root renamed away and replaced by an outside symlink after pinning", async () => {
 		if (process.platform === "win32") return;
-		// Finding 1: The root path should be pinned and not re-resolved on each operation,
-		// to prevent TOCTOU attacks where the root path is replaced with a symlink.
-		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-root-pinned-"));
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-root-symlink-"));
 		const root = path.join(parent, "repo");
+		const moved = path.join(parent, "repo-moved");
 		const outside = path.join(parent, "outside");
 		await fs.mkdir(root);
 		await fs.mkdir(outside);
 		await fs.writeFile(path.join(outside, "secret.txt"), "secret\n");
-
 		try {
-			// Write a file inside the root
+			// The first operation pins the root identity.
 			await writeFileInsideWorkspace(root, path.join(root, "file1.txt"), "content1\n");
-			expect(await fs.readFile(path.join(root, "file1.txt"), "utf8")).toBe("content1\n");
-
-			// Replace the root with a symlink to outside (simulating TOCTOU attack)
-			// This would normally allow accessing files outside the root if realRoot wasn't pinned
-			const rootBackup = path.join(parent, "repo-backup");
-			await fs.rename(root, rootBackup);
+			await fs.rename(root, moved);
 			await fs.symlink(outside, root);
 
-			// Try to write another file - this should fail because the root identity was replaced
-			// If root-pinning is working, this operation on the original path should not use the new symlink
-			const write2Path = path.join(root, "file2.txt");
-			try {
-				await writeFileInsideWorkspace(root, write2Path, "content2\n");
-				// If we get here, check whether file2.txt was created in outside or in rootBackup
-				const inOutside = await fs
-					.lstat(path.join(outside, "file2.txt"))
-					.then(() => true)
-					.catch(() => false);
-				const inBackup = await fs
-					.lstat(path.join(rootBackup, "file2.txt"))
-					.then(() => true)
-					.catch(() => false);
-				// Either way, the write should fail or use the original pinned root, not follow the symlink
-				expect(inOutside || inBackup).toBe(true);
-			} catch (error) {
-				// Expected: the write should fail because we tried to use a modified root
-				expect((error as any).message).toMatch(/outside|confine/);
-			}
+			await expect(writeFileInsideWorkspace(root, path.join(root, "file2.txt"), "content2\n")).rejects.toThrow(
+				/outside the confined session root/,
+			);
+			await expect(readFileInsideWorkspace(root, path.join(root, "secret.txt"))).rejects.toThrow(
+				/outside the confined session root/,
+			);
+			await expect(unlinkInsideWorkspace(root, path.join(root, "secret.txt"))).rejects.toThrow(
+				/outside the confined session root/,
+			);
+			expect((await fs.readdir(outside)).sort()).toEqual(["secret.txt"]);
+			expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("secret\n");
+			expect((await fs.readdir(moved)).sort()).toEqual(["file1.txt"]);
+		} finally {
+			await fs.rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a root replaced by a different directory at the same path after pinning", async () => {
+		if (process.platform === "win32") return;
+		// The replacement passes every pathname check: it is a real directory at
+		// the pinned canonical path. Only the native descriptor identity check
+		// can tell it apart from the pinned root.
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-root-replaced-"));
+		const root = path.join(parent, "repo");
+		const moved = path.join(parent, "repo-moved");
+		await fs.mkdir(root);
+		try {
+			await writeFileInsideWorkspace(root, path.join(root, "file1.txt"), "content1\n");
+			await fs.rename(root, moved);
+			await fs.mkdir(root);
+			await fs.writeFile(path.join(root, "planted.txt"), "planted\n");
+
+			await expect(writeFileInsideWorkspace(root, path.join(root, "file2.txt"), "content2\n")).rejects.toThrow(
+				/outside the confined session root/,
+			);
+			await expect(readFileInsideWorkspace(root, path.join(root, "planted.txt"))).rejects.toThrow(
+				/outside the confined session root/,
+			);
+			await expect(mkdirInsideWorkspace(root, path.join(root, "made"))).rejects.toThrow(
+				/outside the confined session root/,
+			);
+			expect((await fs.readdir(root)).sort()).toEqual(["planted.txt"]);
+			expect((await fs.readdir(moved)).sort()).toEqual(["file1.txt"]);
+		} finally {
+			await fs.rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a native operation whose root descriptor does not match the pinned identity", async () => {
+		if (process.platform === "win32") return;
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "confine-root-id-"));
+		const root = path.join(parent, "repo");
+		const other = path.join(parent, "other");
+		await fs.mkdir(root);
+		await fs.mkdir(other);
+		await fs.writeFile(path.join(root, "file.txt"), "inside\n");
+		const realRoot = await fs.realpath(root);
+		const otherId = await rootIdentity(await fs.realpath(other));
+		try {
+			expect(() => confinedOpenRead(realRoot, otherId, "file.txt")).toThrow(/confine:escape/);
+			expect(() => confinedWriteFileAtomic(realRoot, otherId, "new.txt", Buffer.from("x"), true)).toThrow(
+				/confine:escape/,
+			);
+			expect(() => confinedUnlink(realRoot, otherId, "file.txt")).toThrow(/confine:escape/);
+			expect(() => confinedMkdirAll(realRoot, otherId, "made")).toThrow(/confine:escape/);
+			expect(() => confinedOpenRead(realRoot, "not-an-identity", "file.txt")).toThrow(/confine:escape/);
+			expect((await fs.readdir(root)).sort()).toEqual(["file.txt"]);
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
