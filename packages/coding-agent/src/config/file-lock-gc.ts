@@ -18,8 +18,10 @@ import type {
 import { gcPidStatusLabel } from "../gjc-runtime/gc-runtime";
 import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
 import {
+	type FileLockGcObservation,
 	fileLockStagingOwnerPid,
 	inspectFileLockStagingDir,
+	isLockInfoChangingError,
 	readFileLockObservationForGc,
 	removeFileLockDirForGc,
 } from "./file-lock";
@@ -72,6 +74,31 @@ function keptMalformedRecord(lockDir: string): GcRecord {
 	};
 }
 
+/**
+ * Windows refuses to open or stat `<lock>/info` while its owner is retiring it. That is a
+ * lock in motion, not a malformed or dead one: keep it and look again on a later pass.
+ * However, persistent ACL denials (EPERM/EACCES that stay denied on retry) indicate
+ * a real failure, not transient lock motion. Retry once to distinguish transient from persistent.
+ * If the info file exists but is still inaccessible after retry, the access denial is permanent.
+ */
+async function observeLockForGc(lockDir: string): Promise<FileLockGcObservation | null | "changing"> {
+	try {
+		return await readFileLockObservationForGc(lockDir);
+	} catch (error) {
+		if (!isLockInfoChangingError(error)) throw error;
+
+		// Retry once to distinguish transient denial (lock is being retired) from persistent ACL denial.
+		await Bun.sleep(1);
+		try {
+			return await readFileLockObservationForGc(lockDir);
+		} catch (retryError) {
+			// If retry fails with a transient code, it's persistent ACL denial, not transient lock motion.
+			// Forward any error (whether transient code or different error) as a GC error.
+			throw retryError;
+		}
+	}
+}
+
 function stagingOwnerStatus(ctx: GcContext, pid: number): "alive" | "dead" | "unknown" {
 	const status = gcPidStatusLabel(ctx.probe(pid));
 	return status === "eperm" ? "unknown" : status;
@@ -93,7 +120,20 @@ async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRec
 			reason: staging.reason,
 		};
 	}
-	const observation = await readFileLockObservationForGc(lockDir);
+	const observation = await observeLockForGc(lockDir);
+	if (observation === "changing") {
+		return {
+			store: "file_locks",
+			id: lockDir,
+			path: lockDir,
+			pid_status: "none",
+			status: "changing",
+			stale: false,
+			removable: false,
+			action: "none",
+			reason: "file_lock_info_changing",
+		};
+	}
 	const info = observation?.info;
 	if (!info) return keptMalformedRecord(lockDir);
 	if (info.owner_host_id !== undefined) {
@@ -242,7 +282,8 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 				return { removed: false, error: errorMessage(error) };
 			}
 		}
-		const observation = await readFileLockObservationForGc(lockDir);
+		const observation = await observeLockForGc(lockDir);
+		if (observation === "changing") return { removed: false, skipped: "file_lock_info_changing" };
 		const info = observation?.info;
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
 		if (info.owner_host_id !== undefined) {
