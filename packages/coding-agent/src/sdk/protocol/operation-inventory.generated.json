@@ -3888,6 +3888,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:getSdkCommandContextForTests",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "test-only SDK command context accessor for testing SDK extension behavior, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:setCoordinatorRuntimeStateFileForTests",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
