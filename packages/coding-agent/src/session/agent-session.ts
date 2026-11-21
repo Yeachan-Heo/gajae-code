@@ -508,6 +508,7 @@ import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd, runWithWorkspaceConfine } from "../tools/path-utils";
+import { WorkspaceConfinement } from "../tools/workspace-confine";
 import { closePendingAsks } from "../tools/pending-asks";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
@@ -15327,7 +15328,7 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) =>
-					runWithWorkspaceConfine(this.sessionManager.getCwd(), () =>
+					runWithWorkspaceConfine(WorkspaceConfinement.forRoot(this.sessionManager.getCwd()), () =>
 						target.execute(toolCallId, args as never, signal, onUpdate, ctx),
 					);
 			},

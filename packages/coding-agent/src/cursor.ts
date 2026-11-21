@@ -25,7 +25,8 @@ import {
 import { sanitizeText } from "@gajae-code/utils";
 import { assertDeleteInsideWorkspace } from "./cursor-delete-path";
 import { cursorMcpDispatchName } from "./cursor-mcp-name";
-import { getActiveWorkspaceConfineRoot, resolveToCwd, runWithWorkspaceConfine } from "./tools/path-utils";
+import { getActiveWorkspaceConfinement, resolveToCwd, runWithWorkspaceConfine } from "./tools/path-utils";
+import { WorkspaceConfinement } from "./tools/workspace-confine";
 
 /**
  * Emitter for events this bridge produces.
@@ -84,8 +85,9 @@ function isCursorExecAdmissionClosedError(error: unknown): boolean {
 	);
 }
 function confineCursorCall<T>(options: CursorExecBridgeOptions, fn: () => T): T {
-	const root = options.filesystemRoot?.() ?? getActiveWorkspaceConfineRoot();
-	return root ? runWithWorkspaceConfine(root, fn) : fn();
+	const root = options.filesystemRoot?.();
+	const confinement = root ? WorkspaceConfinement.forRoot(root) : getActiveWorkspaceConfinement();
+	return confinement ? runWithWorkspaceConfine(confinement, fn) : fn();
 }
 
 async function executeTool(

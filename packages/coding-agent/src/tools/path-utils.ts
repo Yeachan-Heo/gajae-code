@@ -7,86 +7,87 @@ import { isEnoent } from "@gajae-code/utils/fs-error";
 import { InternalUrlRouter } from "../internal-urls";
 import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
-import {
-	mkdirInsideWorkspace,
-	pathEscapesWorkspace,
-	readFileInsideWorkspace,
-	realpathEscapesWorkspace,
-	unlinkInsideWorkspace,
-	writeFileInsideWorkspace,
-} from "./workspace-confine";
+import type { WorkspaceConfinement } from "./workspace-confine";
 
-const workspaceConfineRoot = new AsyncLocalStorage<string>();
+/**
+ * The confinement of the session whose tool call is running, if any.
+ *
+ * AgentSession wraps each tool execution of a confined session in
+ * {@link runWithWorkspaceConfine}, so tool code does not thread the instance
+ * through every signature. Outside that scope (ordinary sessions) the helpers
+ * below fall through to plain filesystem calls.
+ */
+const activeConfinement = new AsyncLocalStorage<WorkspaceConfinement>();
 
-/** Run tool path resolution confined to `root` for this execution. */
-export function runWithWorkspaceConfine<T>(root: string, fn: () => T): T {
-	return workspaceConfineRoot.run(root, fn);
+/** Run `fn` with `confinement` as the active boundary for every helper below. */
+export function runWithWorkspaceConfine<T>(confinement: WorkspaceConfinement, fn: () => T): T {
+	return activeConfinement.run(confinement, fn);
 }
 
-export function getActiveWorkspaceConfineRoot(): string | undefined {
-	return workspaceConfineRoot.getStore();
+/** The active session boundary, or `undefined` for an ordinary session. */
+export function getActiveWorkspaceConfinement(): WorkspaceConfinement | undefined {
+	return activeConfinement.getStore();
 }
 
 function assertInsideActiveWorkspace(resolved: string, original: string): void {
-	const root = workspaceConfineRoot.getStore();
-	if (!root || !pathEscapesWorkspace(root, resolved)) return;
+	const confinement = activeConfinement.getStore();
+	if (!confinement?.escapes(resolved)) return;
 	throw new ToolError(
-		`Path escapes the confined session root (${root}): ${original}. This session can only use its cwd and descendants.`,
+		`Path escapes the confined session root (${confinement.root}): ${original}. This session can only use its cwd and descendants.`,
 	);
 }
 
 /** Reject a lexically admitted path whose real target leaves the confined root. */
 export async function assertRealpathInsideActiveWorkspace(resolved: string): Promise<void> {
-	const root = workspaceConfineRoot.getStore();
-	if (!root) return;
-	if (await realpathEscapesWorkspace(root, resolved)) {
-		throw new ToolError(
-			`Path resolves outside the confined session root (${root}): ${resolved}. This session can only use its cwd and descendants.`,
-		);
-	}
+	const confinement = activeConfinement.getStore();
+	if (!confinement || !(await confinement.realpathEscapes(resolved))) return;
+	throw new ToolError(
+		`Path resolves outside the confined session root (${confinement.root}): ${resolved}. This session can only use its cwd and descendants.`,
+	);
 }
-/** Read a confined file through a descriptor-pinned walk. Ordinary sessions use Bun.file. */
+
+/** Read a file as text; confined sessions read through the pinned walk. */
 export async function readFileTextInsideActiveWorkspace(absolutePath: string): Promise<string> {
-	const root = workspaceConfineRoot.getStore();
-	if (!root) return Bun.file(absolutePath).text();
-	return (await readFileInsideWorkspace(root, absolutePath)).toString("utf8");
+	const confinement = activeConfinement.getStore();
+	if (!confinement) return Bun.file(absolutePath).text();
+	return (await confinement.readFile(absolutePath)).toString("utf8");
 }
 
-/** Read confined bytes through a descriptor-pinned walk. Ordinary sessions use fs.readFile. */
+/** Read a file's bytes; confined sessions read through the pinned walk. */
 export async function readFileBytesInsideActiveWorkspace(absolutePath: string): Promise<Uint8Array> {
-	const root = workspaceConfineRoot.getStore();
-	if (!root) return fs.promises.readFile(absolutePath);
-	return readFileInsideWorkspace(root, absolutePath);
+	const confinement = activeConfinement.getStore();
+	if (!confinement) return fs.promises.readFile(absolutePath);
+	return confinement.readFile(absolutePath);
 }
 
-/** Atomically replace a confined file through a descriptor-pinned walk. Ordinary sessions use Bun.write. */
+/** Replace a file; confined sessions publish atomically through the pinned walk. */
 export async function writeFileTextInsideActiveWorkspace(absolutePath: string, content: string): Promise<void> {
-	const root = workspaceConfineRoot.getStore();
-	if (!root) {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) {
 		await Bun.write(absolutePath, content);
 		return;
 	}
-	await writeFileInsideWorkspace(root, absolutePath, content);
+	await confinement.writeFile(absolutePath, content);
 }
 
-/** Remove a confined file through a descriptor-pinned walk. Ordinary sessions use fs.unlink. */
+/** Remove a file; confined sessions unlink through the pinned walk. */
 export async function unlinkInsideActiveWorkspace(absolutePath: string): Promise<void> {
-	const root = workspaceConfineRoot.getStore();
-	if (!root) {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) {
 		await fs.promises.unlink(absolutePath);
 		return;
 	}
-	await unlinkInsideWorkspace(root, absolutePath);
+	await confinement.unlink(absolutePath);
 }
 
-/** Create a confined directory tree through a descriptor-pinned walk. Ordinary sessions use fs.mkdir. */
+/** Create a directory tree; confined sessions create it through the pinned walk. */
 export async function mkdirInsideActiveWorkspace(absolutePath: string): Promise<void> {
-	const root = workspaceConfineRoot.getStore();
-	if (!root) {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) {
 		await fs.promises.mkdir(absolutePath, { recursive: true });
 		return;
 	}
-	await mkdirInsideWorkspace(root, absolutePath);
+	await confinement.mkdir(absolutePath);
 }
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;

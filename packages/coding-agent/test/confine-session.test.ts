@@ -7,11 +7,12 @@ import { writethroughNoop } from "../src/lsp";
 import { sessionMatchesConfinement } from "../src/session/session-confinement";
 import { SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
 import {
-	getActiveWorkspaceConfineRoot,
+	getActiveWorkspaceConfinement,
 	readFileTextInsideActiveWorkspace,
 	runWithWorkspaceConfine,
 	writeFileTextInsideActiveWorkspace,
 } from "../src/tools/path-utils";
+import { WorkspaceConfinement } from "../src/tools/workspace-confine";
 
 function writeTranscript(file: string, id: string, cwd: string, confined: boolean, padding = ""): void {
 	const header = {
@@ -213,8 +214,8 @@ describe("confinement escapes", () => {
 		await fs.writeFile(path.join(root, "inside.txt"), "inside\n");
 		await fs.symlink(outside, linked);
 		try {
-			await runWithWorkspaceConfine(root, async () => {
-				expect(getActiveWorkspaceConfineRoot()).toBe(root);
+			await runWithWorkspaceConfine(WorkspaceConfinement.forRoot(root), async () => {
+				expect(getActiveWorkspaceConfinement()?.root).toBe(root);
 				await expect(readFileTextInsideActiveWorkspace(linked)).rejects.toThrow(/outside/);
 				await expect(writeFileTextInsideActiveWorkspace(linked, "changed\n")).rejects.toThrow(/outside/);
 				expect(await readFileTextInsideActiveWorkspace(path.join(root, "inside.txt"))).toBe("inside\n");
@@ -234,7 +235,7 @@ describe("confinement escapes", () => {
 		await fs.writeFile(path.join(root, "inside.txt"), "before\n");
 		await fs.symlink(outside, path.join(root, "linked"));
 		try {
-			await runWithWorkspaceConfine(root, async () => {
+			await runWithWorkspaceConfine(WorkspaceConfinement.forRoot(root), async () => {
 				await writethroughNoop(
 					path.join(root, "inside.txt"),
 					"after\n",

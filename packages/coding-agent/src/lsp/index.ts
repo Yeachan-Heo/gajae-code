@@ -7,10 +7,9 @@ import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { FileWriteNotPublishedError, writeFileAtomically } from "../tools/atomic-file-write";
-import { formatPathRelativeToCwd, getActiveWorkspaceConfineRoot, resolveToCwd } from "../tools/path-utils";
+import { formatPathRelativeToCwd, getActiveWorkspaceConfinement, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
-import { writeFileInsideWorkspace } from "../tools/workspace-confine";
 import {
 	ensureFileOpen,
 	getActiveClients,
@@ -769,9 +768,9 @@ export async function writethroughNoop(
  * after the tool's path check cannot redirect the write outside that root.
  */
 async function publishWritethroughContent(dst: string, content: string, file?: BunFile): Promise<void> {
-	const confineRoot = getActiveWorkspaceConfineRoot();
-	if (confineRoot !== undefined) {
-		await writeFileInsideWorkspace(confineRoot, dst, content);
+	const confinement = getActiveWorkspaceConfinement();
+	if (confinement) {
+		await confinement.writeFile(dst, content);
 		return;
 	}
 	if (file !== undefined) await file.write(content);

@@ -5,16 +5,7 @@ import * as path from "node:path";
 import { confinedMkdirAll, confinedOpenRead, confinedUnlink, confinedWriteFileAtomic } from "@gajae-code/natives";
 import fc from "fast-check";
 import { confineSandboxProfile, sandboxedShellCommand } from "../src/tools/confine-sandbox";
-import {
-	directoryEscapesWorkspace,
-	mkdirInsideWorkspace,
-	openFileInsideWorkspace,
-	pathEscapesWorkspace,
-	readFileInsideWorkspace,
-	realpathEscapesWorkspace,
-	unlinkInsideWorkspace,
-	writeFileInsideWorkspace,
-} from "../src/tools/workspace-confine";
+import { directoryEscapesWorkspace, pathEscapesWorkspace, WorkspaceConfinement } from "../src/tools/workspace-confine";
 
 async function rootIdentity(dir: string): Promise<string> {
 	const stat = await fs.stat(dir, { bigint: true });
@@ -49,7 +40,7 @@ describe("--confine path boundary", () => {
 		const linked = path.join(root, "link");
 		await fs.mkdir(root);
 		await fs.symlink(outside, linked);
-		await expect(realpathEscapesWorkspace(root, linked)).resolves.toBe(true);
+		await expect(WorkspaceConfinement.forRoot(root).realpathEscapes(linked)).resolves.toBe(true);
 		await fs.rm(parent, { recursive: true, force: true });
 	});
 	it("admits the root and descendants, and rejects parents and sibling prefixes", () => {
@@ -104,9 +95,15 @@ describe("--confine path boundary", () => {
 		await fs.mkdir(outside);
 		await fs.writeFile(path.join(outside, "secret.txt"), "hidden");
 		await fs.symlink(outside, linked);
-		await expect(realpathEscapesWorkspace(root, path.join(linked, "secret.txt"))).resolves.toBe(true);
-		await expect(realpathEscapesWorkspace(root, path.join(linked, "new.txt"))).resolves.toBe(true);
-		await expect(realpathEscapesWorkspace(root, path.join(root, "visible.txt"))).resolves.toBe(false);
+		await expect(WorkspaceConfinement.forRoot(root).realpathEscapes(path.join(linked, "secret.txt"))).resolves.toBe(
+			true,
+		);
+		await expect(WorkspaceConfinement.forRoot(root).realpathEscapes(path.join(linked, "new.txt"))).resolves.toBe(
+			true,
+		);
+		await expect(WorkspaceConfinement.forRoot(root).realpathEscapes(path.join(root, "visible.txt"))).resolves.toBe(
+			false,
+		);
 		await fs.rm(parent, { recursive: true, force: true });
 	});
 	it("denies a parent path, a dotdot path, and a symlink from inside the sandboxed process", async () => {
@@ -199,12 +196,14 @@ describe("--confine path boundary", () => {
 		await fs.writeFile(path.join(root, "visible.txt"), "visible");
 		await fs.writeFile(outside, "hidden");
 		await fs.symlink(outside, linked);
-		const visible = await openFileInsideWorkspace(root, path.join(root, "visible.txt"));
+		const visible = await WorkspaceConfinement.forRoot(root).openFile(path.join(root, "visible.txt"));
 		expect(await visible.readFile("utf8")).toBe("visible");
 		await visible.close();
-		await expect(openFileInsideWorkspace(root, linked)).rejects.toThrow(/outside/);
-		await expect(readFileInsideWorkspace(root, linked)).rejects.toThrow(/outside/);
-		expect(await readFileInsideWorkspace(root, path.join(root, "visible.txt"))).toEqual(Buffer.from("visible"));
+		await expect(WorkspaceConfinement.forRoot(root).openFile(linked)).rejects.toThrow(/outside/);
+		await expect(WorkspaceConfinement.forRoot(root).readFile(linked)).rejects.toThrow(/outside/);
+		expect(await WorkspaceConfinement.forRoot(root).readFile(path.join(root, "visible.txt"))).toEqual(
+			Buffer.from("visible"),
+		);
 		await fs.rm(parent, { recursive: true, force: true });
 	});
 	it("replaces an existing in-root file, keeps its mode, and creates a nested new file", async () => {
@@ -216,11 +215,11 @@ describe("--confine path boundary", () => {
 		await fs.writeFile(existing, "before\n");
 		await fs.chmod(existing, 0o640);
 		try {
-			await writeFileInsideWorkspace(root, existing, "after\n");
+			await WorkspaceConfinement.forRoot(root).writeFile(existing, "after\n");
 			expect(await fs.readFile(existing, "utf8")).toBe("after\n");
 			expect((await fs.stat(existing)).mode & 0o777).toBe(0o640);
 			const nested = path.join(root, "a", "b", "new.txt");
-			await writeFileInsideWorkspace(root, nested, "new\n");
+			await WorkspaceConfinement.forRoot(root).writeFile(nested, "new\n");
 			expect(await fs.readFile(nested, "utf8")).toBe("new\n");
 			expect((await fs.readdir(root)).sort()).toEqual(["a", "existing.txt"]);
 		} finally {
@@ -235,9 +234,9 @@ describe("--confine path boundary", () => {
 		await fs.writeFile(path.join(root, "real", "file.txt"), "inside\n");
 		await fs.symlink(path.join(root, "real"), path.join(root, "alias"));
 		try {
-			const read = await readFileInsideWorkspace(root, path.join(root, "alias", "file.txt"));
+			const read = await WorkspaceConfinement.forRoot(root).readFile(path.join(root, "alias", "file.txt"));
 			expect(read.toString()).toBe("inside\n");
-			await writeFileInsideWorkspace(root, path.join(root, "alias", "file.txt"), "changed\n");
+			await WorkspaceConfinement.forRoot(root).writeFile(path.join(root, "alias", "file.txt"), "changed\n");
 			expect(await fs.readFile(path.join(root, "real", "file.txt"), "utf8")).toBe("changed\n");
 			expect((await fs.lstat(path.join(root, "alias"))).isSymbolicLink()).toBe(true);
 		} finally {
@@ -309,7 +308,7 @@ describe("--confine path boundary", () => {
 		await fs.writeFile(target, "target content\n");
 		await fs.symlink(target, link);
 		try {
-			await unlinkInsideWorkspace(root, link);
+			await WorkspaceConfinement.forRoot(root).unlink(link);
 			// After deletion, the symlink should be gone but the target should still exist
 			const linkExists = await fs
 				.lstat(link)
@@ -338,17 +337,17 @@ describe("--confine path boundary", () => {
 		await fs.writeFile(path.join(outside, "secret.txt"), "secret\n");
 		try {
 			// The first operation pins the root identity.
-			await writeFileInsideWorkspace(root, path.join(root, "file1.txt"), "content1\n");
+			await WorkspaceConfinement.forRoot(root).writeFile(path.join(root, "file1.txt"), "content1\n");
 			await fs.rename(root, moved);
 			await fs.symlink(outside, root);
 
-			await expect(writeFileInsideWorkspace(root, path.join(root, "file2.txt"), "content2\n")).rejects.toThrow(
+			await expect(
+				WorkspaceConfinement.forRoot(root).writeFile(path.join(root, "file2.txt"), "content2\n"),
+			).rejects.toThrow(/outside the confined session root/);
+			await expect(WorkspaceConfinement.forRoot(root).readFile(path.join(root, "secret.txt"))).rejects.toThrow(
 				/outside the confined session root/,
 			);
-			await expect(readFileInsideWorkspace(root, path.join(root, "secret.txt"))).rejects.toThrow(
-				/outside the confined session root/,
-			);
-			await expect(unlinkInsideWorkspace(root, path.join(root, "secret.txt"))).rejects.toThrow(
+			await expect(WorkspaceConfinement.forRoot(root).unlink(path.join(root, "secret.txt"))).rejects.toThrow(
 				/outside the confined session root/,
 			);
 			expect((await fs.readdir(outside)).sort()).toEqual(["secret.txt"]);
@@ -369,18 +368,18 @@ describe("--confine path boundary", () => {
 		const moved = path.join(parent, "repo-moved");
 		await fs.mkdir(root);
 		try {
-			await writeFileInsideWorkspace(root, path.join(root, "file1.txt"), "content1\n");
+			await WorkspaceConfinement.forRoot(root).writeFile(path.join(root, "file1.txt"), "content1\n");
 			await fs.rename(root, moved);
 			await fs.mkdir(root);
 			await fs.writeFile(path.join(root, "planted.txt"), "planted\n");
 
-			await expect(writeFileInsideWorkspace(root, path.join(root, "file2.txt"), "content2\n")).rejects.toThrow(
+			await expect(
+				WorkspaceConfinement.forRoot(root).writeFile(path.join(root, "file2.txt"), "content2\n"),
+			).rejects.toThrow(/outside the confined session root/);
+			await expect(WorkspaceConfinement.forRoot(root).readFile(path.join(root, "planted.txt"))).rejects.toThrow(
 				/outside the confined session root/,
 			);
-			await expect(readFileInsideWorkspace(root, path.join(root, "planted.txt"))).rejects.toThrow(
-				/outside the confined session root/,
-			);
-			await expect(mkdirInsideWorkspace(root, path.join(root, "made"))).rejects.toThrow(
+			await expect(WorkspaceConfinement.forRoot(root).mkdir(path.join(root, "made"))).rejects.toThrow(
 				/outside the confined session root/,
 			);
 			expect((await fs.readdir(root)).sort()).toEqual(["planted.txt"]);

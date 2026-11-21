@@ -72,7 +72,7 @@ import {
 	assertRealpathInsideActiveWorkspace,
 	expandPath,
 	formatPathRelativeToCwd,
-	getActiveWorkspaceConfineRoot,
+	getActiveWorkspaceConfinement,
 	resolveReadPath,
 	splitInternalUrlSel,
 	splitPathAndSel,
@@ -103,7 +103,6 @@ import {
 } from "./sqlite-reader";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
-import { openFileInsideWorkspace, readFileInsideWorkspace } from "./workspace-confine";
 
 type NativeReadBindings = Pick<typeof import("@gajae-code/natives"), "glob" | "summarizeCode">;
 let nativeReadBindingsLoad: Promise<NativeReadBindings> | undefined;
@@ -523,15 +522,15 @@ function expandRangeWithContext(
 }
 
 async function readConfinedText(filePath: string): Promise<string> {
-	const root = getActiveWorkspaceConfineRoot();
-	if (!root) return Bun.file(filePath).text();
-	return (await readFileInsideWorkspace(root, filePath)).toString("utf8");
+	const confinement = getActiveWorkspaceConfinement();
+	if (!confinement) return Bun.file(filePath).text();
+	return (await confinement.readFile(filePath)).toString("utf8");
 }
 
 async function openReadHandle(filePath: string): Promise<fs.FileHandle> {
-	const root = getActiveWorkspaceConfineRoot();
-	if (!root) return fs.open(filePath, "r");
-	return openFileInsideWorkspace(root, filePath);
+	const confinement = getActiveWorkspaceConfinement();
+	if (!confinement) return fs.open(filePath, "r");
+	return confinement.openFile(filePath);
 }
 
 export async function streamLinesFromFile(

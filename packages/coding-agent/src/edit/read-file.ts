@@ -7,8 +7,7 @@
 
 import * as fsSync from "node:fs";
 import { isEnoent } from "@gajae-code/utils";
-import { getActiveWorkspaceConfineRoot, readFileTextInsideActiveWorkspace } from "../tools/path-utils";
-import { readFileInsideWorkspace } from "../tools/workspace-confine";
+import { getActiveWorkspaceConfinement, readFileTextInsideActiveWorkspace } from "../tools/path-utils";
 import { isNotebookPath, readEditableNotebookText, serializeEditedNotebookText } from "./notebook";
 
 /**
@@ -21,13 +20,11 @@ export const MAX_EDIT_FILE_BYTES = 8 * 1024 * 1024;
 const UTF8_BOM = [0xef, 0xbb, 0xbf] as const;
 
 async function fileHasUtf8Bom(absolutePath: string): Promise<boolean> {
-	const root = getActiveWorkspaceConfineRoot();
-	if (root) {
-		// In a confined workspace, use descriptor-pinned I/O to prevent TOCTOU attacks
-		const buffer = await readFileInsideWorkspace(root, absolutePath);
+	const confinement = getActiveWorkspaceConfinement();
+	if (confinement) {
+		const buffer = await confinement.readFile(absolutePath);
 		return buffer.length >= UTF8_BOM.length && UTF8_BOM.every((byte, index) => buffer[index] === byte);
 	}
-	// Ordinary sessions can use direct file open
 	const handle = await fsSync.promises.open(absolutePath, "r");
 	try {
 		const bytes = Buffer.alloc(UTF8_BOM.length);

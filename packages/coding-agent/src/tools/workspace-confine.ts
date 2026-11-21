@@ -4,52 +4,203 @@ import path from "node:path";
 import { confinedMkdirAll, confinedOpenRead, confinedUnlink, confinedWriteFileAtomic } from "@gajae-code/natives";
 import { pathIsWithin } from "@gajae-code/utils";
 
-interface PinnedRoot {
-	/** Canonical path of the root when it was pinned. */
-	realPath: string;
-	/** `"<dev>:<ino>"` of that directory, checked by the native helpers on the opened root descriptor. */
-	id: string;
-}
-
-/**
- * Root identities pinned on first use, keyed by the session's root path.
- *
- * Every native operation reopens `realPath` and compares the opened
- * descriptor against `id`, so a root renamed away or replaced (by a
- * directory or a symlink) after pinning fails the operation instead of
- * becoming the walk origin.
- */
-const pinnedRoots = new Map<string, PinnedRoot>();
-
-async function pinRoot(root: string): Promise<PinnedRoot> {
-	const key = path.resolve(root);
-	const cached = pinnedRoots.get(key);
-	if (cached) return cached;
-	const realPath = await fs.realpath(key);
-	const stat = await fs.stat(realPath, { bigint: true });
-	if (!stat.isDirectory()) throw new Error(`Confined session root is not a directory: ${realPath}`);
-	const pinned = { realPath, id: `${stat.dev}:${stat.ino}` };
-	pinnedRoots.set(key, pinned);
-	return pinned;
-}
-
-/**
- * Confinement for a session opened with `--confine`.
- *
- * Existing paths are checked after symlink resolution. A path that does not
- * exist yet is checked at its nearest existing ancestor, so creating
- * `root/link/new` is rejected when `link` points outside the root.
- *
- * Those checks only decide which path to ask for. The file operations below
- * never resolve that path again: the native helpers open the root once and
- * walk every component with `openat(..., O_NOFOLLOW)`, then read or write
- * through the resulting descriptors. A parent swapped for a symlink between
- * the check and the operation fails the operation instead of redirecting it.
- */
+/** Lexical containment: true when `candidate` is neither `root` nor beneath it. No filesystem access. */
 export function pathEscapesWorkspace(root: string, candidate: string): boolean {
 	const resolvedRoot = path.resolve(root);
 	const resolvedCandidate = path.resolve(candidate);
 	return resolvedCandidate !== resolvedRoot && !pathIsWithin(resolvedRoot, resolvedCandidate);
+}
+
+/** `root` as the native helpers see it: its canonical path and the directory identity pinned for it. */
+interface PinnedRoot {
+	realPath: string;
+	/** `"<dev>:<ino>"`; the native helpers compare it with `fstat` on the root descriptor they open. */
+	id: string;
+}
+
+/** A target admitted beneath the root, expressed relative to the pinned canonical root. */
+interface ConfinedTarget {
+	root: PinnedRoot;
+	/** Symlink-free path relative to `root.realPath`. */
+	relative: string;
+}
+
+const NATIVE_REASON_CODES: Record<string, string> = {
+	not_found: "ENOENT",
+	is_directory: "EISDIR",
+	not_directory: "ENOTDIR",
+	permission_denied: "EACCES",
+	read_only: "EROFS",
+};
+
+/**
+ * The filesystem boundary of a session opened with `gjc --confine`.
+ *
+ * Rule: while a session is confined, every file read, write, delete, and
+ * mkdir a tool performs goes through one of these methods. Callers reach the
+ * session's instance through the `...InsideActiveWorkspace` helpers in
+ * `path-utils.ts`; they do not re-implement the checks.
+ *
+ * Each operation has two stages:
+ *
+ * 1. Path admission (TypeScript). The candidate is resolved through symlinks;
+ *    a path that does not exist yet is resolved at its nearest existing
+ *    ancestor, so creating `root/link/new` is rejected when `link` points
+ *    outside. This only decides which relative path to ask for.
+ * 2. Pinned access (native, `crates/pi-natives/src/confine_fs.rs`). The
+ *    helper opens the root, checks that the descriptor is the directory
+ *    pinned here, and walks every component with `openat(..., O_NOFOLLOW)`.
+ *    A root or parent swapped after stage 1 fails the operation instead of
+ *    redirecting it.
+ *
+ * The root's identity is pinned on the first operation and kept for the
+ * lifetime of the instance. {@link WorkspaceConfinement.forRoot} hands out
+ * one instance per root for the whole process, so every tool call of a
+ * session checks against the same pin.
+ */
+export class WorkspaceConfinement {
+	static readonly #byRoot = new Map<string, WorkspaceConfinement>();
+
+	/** The process-wide boundary for `root`; created and pinned on first use. */
+	static forRoot(root: string): WorkspaceConfinement {
+		const resolved = path.resolve(root);
+		let confinement = WorkspaceConfinement.#byRoot.get(resolved);
+		if (!confinement) {
+			confinement = new WorkspaceConfinement(resolved);
+			WorkspaceConfinement.#byRoot.set(resolved, confinement);
+		}
+		return confinement;
+	}
+
+	readonly root: string;
+	#pinned: Promise<PinnedRoot> | undefined;
+
+	private constructor(root: string) {
+		this.root = root;
+	}
+
+	/** Lexical check only; use {@link realpathEscapes} before touching the path. */
+	escapes(candidate: string): boolean {
+		return pathEscapesWorkspace(this.root, candidate);
+	}
+
+	/** True when `candidate` resolves, through symlinks, outside the root. */
+	async realpathEscapes(candidate: string): Promise<boolean> {
+		return (await this.#resolve(candidate, true)) === undefined;
+	}
+
+	/** Open an existing regular file for reading through the pinned walk. */
+	async openFile(candidate: string): Promise<fs.FileHandle> {
+		const target = await this.#require(candidate, true);
+		const fd = this.#native(candidate, () => confinedOpenRead(target.root.realPath, target.root.id, target.relative));
+		try {
+			// Opening /dev/fd/N duplicates the already-open file; it does not walk
+			// the original pathname again.
+			return await fs.open(`/dev/fd/${fd}`, "r");
+		} finally {
+			fsSync.closeSync(fd);
+		}
+	}
+
+	async readFile(candidate: string): Promise<Buffer> {
+		const handle = await this.openFile(candidate);
+		try {
+			return Buffer.from(await handle.readFile());
+		} finally {
+			await handle.close();
+		}
+	}
+
+	/** Atomically replace or create a file; missing parents are created through the same walk. */
+	async writeFile(candidate: string, content: string | Uint8Array): Promise<void> {
+		const target = await this.#require(candidate, true);
+		const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+		this.#native(candidate, () =>
+			confinedWriteFileAtomic(target.root.realPath, target.root.id, target.relative, bytes, true),
+		);
+	}
+
+	/** Remove a file. A final symlink is removed itself; its target is untouched. */
+	async unlink(candidate: string): Promise<void> {
+		const target = await this.#require(candidate, false);
+		this.#native(candidate, () => confinedUnlink(target.root.realPath, target.root.id, target.relative));
+	}
+
+	/** Create a directory and any missing ancestors. */
+	async mkdir(candidate: string): Promise<void> {
+		const target = await this.#require(candidate, true);
+		this.#native(candidate, () => confinedMkdirAll(target.root.realPath, target.root.id, target.relative));
+	}
+
+	#pin(): Promise<PinnedRoot> {
+		this.#pinned ??= (async () => {
+			const realPath = await fs.realpath(this.root);
+			const stat = await fs.stat(realPath, { bigint: true });
+			if (!stat.isDirectory()) throw new Error(`Confined session root is not a directory: ${realPath}`);
+			return { realPath, id: `${stat.dev}:${stat.ino}` };
+		})();
+		return this.#pinned;
+	}
+
+	/**
+	 * Stage 1: admit `candidate` and express it relative to the pinned root,
+	 * or return `undefined` when it escapes. With `followFinal` false the last
+	 * component is kept as written (only its parent is resolved), so unlinking
+	 * a symlink names the link rather than its target.
+	 */
+	async #resolve(candidate: string, followFinal: boolean): Promise<ConfinedTarget | undefined> {
+		const absolute = path.resolve(candidate);
+		if (!followFinal) {
+			const parent = await this.#resolve(path.dirname(absolute), true);
+			if (!parent) return undefined;
+			const relative = path.join(parent.relative, path.basename(absolute));
+			return relative === "" || relative.startsWith("..") ? undefined : { root: parent.root, relative };
+		}
+		const [root, existing] = await Promise.all([this.#pin(), nearestExistingPath(absolute)]);
+		const isLink = (await fs.lstat(existing)).isSymbolicLink();
+		// A dangling symlink has no real target to admit.
+		const realExisting = isLink ? await fs.realpath(existing).catch(() => undefined) : await fs.realpath(existing);
+		if (!realExisting) return undefined;
+		const missingSuffix = path.relative(existing, absolute);
+		const resolved = missingSuffix ? path.resolve(realExisting, missingSuffix) : realExisting;
+		if (resolved !== root.realPath && !pathIsWithin(root.realPath, resolved)) return undefined;
+		return { root, relative: path.relative(root.realPath, resolved) };
+	}
+
+	async #require(candidate: string, followFinal: boolean): Promise<ConfinedTarget> {
+		const target = await this.#resolve(candidate, followFinal);
+		if (!target) throw this.#escapeError(candidate);
+		return target;
+	}
+
+	/** Stage 2: run a native helper and map its `confine:<reason>` error onto an fs-style error. */
+	#native<T>(candidate: string, operation: () => T): T {
+		try {
+			return operation();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const match = /^confine:([a-z_]+): (.*)$/s.exec(message);
+			if (!match) throw error;
+			const [, reason, detail] = match;
+			if (reason === "escape") throw this.#escapeError(candidate, error);
+			const mapped = new Error(`${detail}: ${candidate}`, { cause: error }) as NodeJS.ErrnoException;
+			const code = NATIVE_REASON_CODES[reason];
+			if (code) mapped.code = code;
+			throw mapped;
+		}
+	}
+
+	#escapeError(candidate: string, cause?: unknown): Error {
+		return new Error(
+			`Path resolves outside the confined session root (${this.root}): ${candidate}`,
+			cause === undefined ? undefined : { cause },
+		);
+	}
+}
+
+/** For callers that hold only a root path, e.g. a task child validating its cwd against the parent's root. */
+export function directoryEscapesWorkspace(root: string, candidate: string): Promise<boolean> {
+	return WorkspaceConfinement.forRoot(root).realpathEscapes(candidate);
 }
 
 async function nearestExistingPath(candidate: string): Promise<string> {
@@ -64,182 +215,5 @@ async function nearestExistingPath(candidate: string): Promise<string> {
 			if (!missing || parent === current) throw error;
 			current = parent;
 		}
-	}
-}
-
-interface ConfinedTarget {
-	/** Canonical session root. */
-	realRoot: string;
-	/** Pinned identity of `realRoot`. */
-	rootId: string;
-	/** Symlink-free path of the target relative to `realRoot`, or `undefined` when it escapes. */
-	relative: string | undefined;
-}
-
-async function resolveConfinedTarget(root: string, candidate: string): Promise<ConfinedTarget> {
-	const [{ realPath: realRoot, id: rootId }, existing] = await Promise.all([
-		pinRoot(root),
-		nearestExistingPath(candidate),
-	]);
-	const stat = await fs.lstat(existing);
-	const realCandidate = stat.isSymbolicLink()
-		? await fs.realpath(existing).catch(() => undefined)
-		: await fs.realpath(existing);
-	if (!realCandidate) return { realRoot, rootId, relative: undefined };
-	const suffix = path.relative(existing, path.resolve(candidate));
-	const resolved = suffix ? path.resolve(realCandidate, suffix) : realCandidate;
-	if (resolved !== realRoot && !pathIsWithin(realRoot, resolved)) return { realRoot, rootId, relative: undefined };
-	return { realRoot, rootId, relative: path.relative(realRoot, resolved) };
-}
-
-/**
- * Resolve a target for deletion, preserving final-symlink semantics.
- * Unlike resolveConfinedTarget, this does not follow the final symlink component,
- * so unlinking a symlink will remove the symlink itself, not its target.
- */
-async function resolveConfinedTargetForDelete(root: string, candidate: string): Promise<ConfinedTarget> {
-	const { realPath: realRoot, id: rootId } = await pinRoot(root);
-	const resolvedCandidate = path.resolve(candidate);
-
-	// For deletion, we validate that the parent directory is inside the root
-	// and that the target (without following the final symlink) is inside the root.
-	const parent = path.dirname(resolvedCandidate);
-	const basename = path.basename(resolvedCandidate);
-
-	// Check if the parent directory exists and is inside the root
-	let existingParent = parent;
-	try {
-		await fs.lstat(existingParent);
-	} catch (err) {
-		// Parent doesn't exist - check the nearest existing parent
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-			const nearest = await nearestExistingPath(parent).catch(() => realRoot);
-			const nearestReal = await fs.realpath(nearest).catch(() => path.resolve(nearest));
-			if (!pathIsWithin(realRoot, nearestReal)) {
-				return { realRoot, rootId, relative: undefined };
-			}
-			existingParent = nearest;
-		} else {
-			throw err;
-		}
-	}
-
-	const parentReal = await fs.realpath(existingParent).catch(() => path.resolve(existingParent));
-	if (!pathIsWithin(realRoot, parentReal)) return { realRoot, rootId, relative: undefined };
-
-	// Construct the full resolved path without following the final symlink
-	const resolvedPath = path.join(parentReal, basename);
-	if (resolvedPath !== realRoot && !pathIsWithin(realRoot, resolvedPath)) {
-		return { realRoot, rootId, relative: undefined };
-	}
-
-	return { realRoot, rootId, relative: path.relative(realRoot, resolvedPath) };
-}
-
-/** True when `candidate` resolves, through symlinks, outside `root`. */
-export async function realpathEscapesWorkspace(root: string, candidate: string): Promise<boolean> {
-	return (await resolveConfinedTarget(root, candidate)).relative === undefined;
-}
-
-/** realpath confinement for a directory the process is about to use as cwd. */
-export async function directoryEscapesWorkspace(root: string, candidate: string): Promise<boolean> {
-	return realpathEscapesWorkspace(root, candidate);
-}
-
-function escapeError(root: string, candidate: string, cause?: unknown): Error {
-	return new Error(
-		`Path resolves outside the confined session root (${root}): ${candidate}`,
-		cause === undefined ? undefined : { cause },
-	);
-}
-
-const NATIVE_REASON_CODES: Record<string, string> = {
-	not_found: "ENOENT",
-	is_directory: "EISDIR",
-	not_directory: "ENOTDIR",
-	permission_denied: "EACCES",
-	read_only: "EROFS",
-};
-
-/** Map a `confine:<reason>: ...` native error onto the error shape fs callers expect. */
-function mapNativeError(root: string, candidate: string, error: unknown): Error {
-	const message = error instanceof Error ? error.message : String(error);
-	const match = /^confine:([a-z_]+): (.*)$/s.exec(message);
-	if (!match) return error instanceof Error ? error : new Error(message);
-	const [, reason, detail] = match;
-	if (reason === "escape") return escapeError(root, candidate, error);
-	const code = NATIVE_REASON_CODES[reason];
-	const mapped = new Error(`${detail}: ${candidate}`, { cause: error }) as NodeJS.ErrnoException;
-	if (code) mapped.code = code;
-	return mapped;
-}
-
-async function requireConfinedTarget(root: string, candidate: string): Promise<ConfinedTarget & { relative: string }> {
-	const target = await resolveConfinedTarget(root, candidate);
-	if (target.relative === undefined) throw escapeError(root, candidate);
-	return { ...target, relative: target.relative };
-}
-
-/** Open an existing regular file through descriptors pinned beneath `root`. */
-export async function openFileInsideWorkspace(root: string, candidate: string): Promise<fs.FileHandle> {
-	const target = await requireConfinedTarget(root, candidate);
-	let fd: number;
-	try {
-		fd = confinedOpenRead(target.realRoot, target.rootId, target.relative);
-	} catch (error) {
-		throw mapNativeError(root, candidate, error);
-	}
-	try {
-		// Opening /dev/fd/N duplicates the already-open file; it does not walk
-		// the original pathname again.
-		return await fs.open(`/dev/fd/${fd}`, "r");
-	} finally {
-		fsSync.closeSync(fd);
-	}
-}
-
-export async function readFileInsideWorkspace(root: string, candidate: string): Promise<Buffer> {
-	const handle = await openFileInsideWorkspace(root, candidate);
-	try {
-		return Buffer.from(await handle.readFile());
-	} finally {
-		await handle.close();
-	}
-}
-
-/**
- * Atomically replace or create `candidate` beneath `root`. Missing parent
- * directories are created through the same pinned walk.
- */
-export async function writeFileInsideWorkspace(
-	root: string,
-	candidate: string,
-	content: string | Uint8Array,
-): Promise<void> {
-	const target = await requireConfinedTarget(root, candidate);
-	const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
-	try {
-		confinedWriteFileAtomic(target.realRoot, target.rootId, target.relative, bytes, true);
-	} catch (error) {
-		throw mapNativeError(root, candidate, error);
-	}
-}
-
-export async function unlinkInsideWorkspace(root: string, candidate: string): Promise<void> {
-	const target = await resolveConfinedTargetForDelete(root, candidate);
-	if (target.relative === undefined) throw escapeError(root, candidate);
-	try {
-		confinedUnlink(target.realRoot, target.rootId, target.relative);
-	} catch (error) {
-		throw mapNativeError(root, candidate, error);
-	}
-}
-
-export async function mkdirInsideWorkspace(root: string, candidate: string): Promise<void> {
-	const target = await requireConfinedTarget(root, candidate);
-	try {
-		confinedMkdirAll(target.realRoot, target.rootId, target.relative);
-	} catch (error) {
-		throw mapNativeError(root, candidate, error);
 	}
 }

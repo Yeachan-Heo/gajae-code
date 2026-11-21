@@ -31,7 +31,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 import { CursorExecHandlers } from "../src/cursor";
-import { getActiveWorkspaceConfineRoot } from "../src/tools/path-utils";
+import { getActiveWorkspaceConfinement } from "../src/tools/path-utils";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -460,7 +460,7 @@ describe("CursorExecHandlers modern Pi writes", () => {
 		const readTool = {
 			...makeTool("read"),
 			execute: async () => {
-				calls.push(getActiveWorkspaceConfineRoot() ?? "none");
+				calls.push(getActiveWorkspaceConfinement()?.root ?? "none");
 				return { content: [{ type: "text" as const, text: "lines" }], details: {} };
 			},
 		} as unknown as AgentTool;
