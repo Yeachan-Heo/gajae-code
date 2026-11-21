@@ -8470,6 +8470,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_oauth_refresh_leases_expires ON oauth_refresh_leases(expires_at);
+			CREATE TABLE IF NOT EXISTS auth_broker_local_providers (
+				provider TEXT PRIMARY KEY,
+				created_at INTEGER NOT NULL
+			);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {
@@ -9171,6 +9175,43 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#upsertCacheStmt.run(key, value, expiresAtSec);
 		} catch {
 			// Ignore cache set failures
+		}
+	}
+
+	/**
+	 * List providers that the broker stores but does not serve (and thus are kept
+	 * locally in agent.db). Maintained by {@link markBrokerLocalProvider} and
+	 * {@link unmarkBrokerLocalProvider}.
+	 */
+	listBrokerLocalProviders(): string[] {
+		try {
+			const rows = this.#db
+				.query<{ provider: string }, []>("SELECT provider FROM auth_broker_local_providers")
+				.all();
+			return rows.map(row => row.provider);
+		} catch {
+			return [];
+		}
+	}
+
+	/** Record `provider` in {@link listBrokerLocalProviders}; a no-op when already listed. */
+	markBrokerLocalProvider(provider: string): void {
+		try {
+			const now = Math.floor(Date.now() / 1000);
+			this.#db
+				.query("INSERT OR IGNORE INTO auth_broker_local_providers (provider, created_at) VALUES (?, ?)")
+				.run(provider, now);
+		} catch {
+			// Ignore marking failures
+		}
+	}
+
+	/** Drop `provider` from {@link listBrokerLocalProviders}, so its next login tries the broker again. */
+	unmarkBrokerLocalProvider(provider: string): void {
+		try {
+			this.#db.query("DELETE FROM auth_broker_local_providers WHERE provider = ?").run(provider);
+		} catch {
+			// Ignore unmarking failures
 		}
 	}
 
