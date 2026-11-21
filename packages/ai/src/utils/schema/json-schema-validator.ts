@@ -124,7 +124,7 @@ function decodePointerToken(token: string): string {
 
 /** RFC 6901 token decode: `~1` → `/`, `~0` → `~`. */
 
-function resolveLocalRef(root: unknown, ref: string): unknown | undefined {
+export function resolveLocalRef(root: unknown, ref: string): unknown | undefined {
 	if (ref === "#") return root;
 	if (!ref.startsWith("#/")) return undefined;
 	let current: unknown = root;
@@ -572,6 +572,35 @@ export function validateJsonSchemaValue(schema: unknown, value: unknown): JsonSc
 	return { success, issues };
 }
 
+/**
+ * Validate a schema against a value with a custom root schema.
+ * This is used for $ref resolution when validating branches or already-resolved schemas.
+ * The root schema is kept constant through all $ref resolutions, allowing chained refs to work correctly.
+ */
+export function validateJsonSchemaValueWithRoot(
+	schema: unknown,
+	value: unknown,
+	root: unknown,
+): JsonSchemaValidationResult {
+	const issues: JsonSchemaValidationIssue[] = [];
+	const success = validateSchemaNode(
+		schema,
+		value,
+		[],
+		{ root, seenPairs: new Set(), objectIds: new WeakMap(), nextObjectId: { value: 0 }, refDepth: 0 },
+		issues,
+	);
+	return { success, issues };
+}
+
 export function isJsonSchemaValueValid(schema: unknown, value: unknown): boolean {
 	return validateJsonSchemaValue(schema, value).success;
+}
+
+/**
+ * Check if a schema accepts a value with a custom root schema.
+ * The root schema is kept constant through all $ref resolutions.
+ */
+export function isJsonSchemaValueValidWithRoot(schema: unknown, value: unknown, root: unknown): boolean {
+	return validateJsonSchemaValueWithRoot(schema, value, root).success;
 }
