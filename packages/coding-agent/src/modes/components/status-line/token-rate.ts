@@ -8,6 +8,7 @@ type AssistantLikeMessage = {
 	role: "assistant";
 	timestamp: number;
 	duration?: number;
+	ttft?: number;
 	usage: AssistantUsage;
 };
 
@@ -15,6 +16,7 @@ type MaybeAssistantMessage = {
 	role?: string;
 	timestamp?: number;
 	duration?: number;
+	ttft?: number;
 	usage?: {
 		output?: number;
 	};
@@ -57,9 +59,18 @@ export function calculateTokensPerSecond(
 				? nowMs - assistant.timestamp
 				: null;
 
-	if (resolvedDurationMs === null || resolvedDurationMs < MIN_DURATION_MS) return null;
+	if (resolvedDurationMs === null) return null;
 
-	const tokensPerSecond = (outputTokens * 1000) / resolvedDurationMs;
+	// Measure generation speed, not end-to-end latency: exclude time to first
+	// token (queueing + prefill), which dominates on large contexts.
+	const ttft = assistant.ttft;
+	const generationMs =
+		typeof ttft === "number" && Number.isFinite(ttft) && ttft >= 0 && ttft < resolvedDurationMs
+			? resolvedDurationMs - ttft
+			: resolvedDurationMs;
+	if (generationMs < MIN_DURATION_MS) return null;
+
+	const tokensPerSecond = (outputTokens * 1000) / generationMs;
 	if (!Number.isFinite(tokensPerSecond) || tokensPerSecond <= 0) return null;
 
 	return tokensPerSecond;
