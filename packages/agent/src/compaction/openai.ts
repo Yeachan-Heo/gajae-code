@@ -62,7 +62,6 @@ export interface OpenAiRemoteCompactionRequest {
 	input: Array<Record<string, unknown>>;
 	instructions?: string;
 	prompt_cache_key?: string;
-	[key: string]: unknown;
 }
 
 export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {}
@@ -530,11 +529,11 @@ export async function requestOpenAiRemoteCompaction(
 		...(model.headers ?? {}),
 	};
 
-	// codex-rs routes `/responses/compact` through `build_responses_request`:
-	// instructions always ride as a leading input item with the base-instructions tag.
-	// (non-codex providers ignore moveCodexInstructionsToInput for instructions fields)
-	if (model.provider === "openai-codex" || model.provider === "openai") {
-		moveCodexInstructionsToInput(request as any);
+	// codex-rs routes `/responses/compact` through `build_responses_request`, so on the
+	// ChatGPT Codex backend the instructions ride as a tagged leading input item. The
+	// public OpenAI API keeps the documented top-level `instructions` field.
+	if (model.provider === "openai-codex") {
+		moveCodexInstructionsToInput(request);
 	}
 
 	// OpenAI code backend endpoints require additional auth headers

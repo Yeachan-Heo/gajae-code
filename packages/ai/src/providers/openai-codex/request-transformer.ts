@@ -147,7 +147,13 @@ const CODEX_BASE_INSTRUCTIONS_KIND = "model.base_instructions";
  * resumed sessions; without one the id is omitted. Empty instructions are
  * dropped, matching codex-rs.
  */
-export function moveCodexInstructionsToInput(body: RequestBody): void {
+export interface CodexInstructionsCarrier {
+	instructions?: unknown;
+	prompt_cache_key?: unknown;
+	input?: unknown;
+}
+
+export function moveCodexInstructionsToInput(body: CodexInstructionsCarrier): void {
 	const text = body.instructions;
 	delete body.instructions;
 	if (typeof text !== "string" || text.length === 0) return;

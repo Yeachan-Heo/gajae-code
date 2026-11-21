@@ -146,18 +146,7 @@ describe("remote compaction input trimming", () => {
 			"compact",
 		);
 
-		// First item should be base instructions message (from moving instructions to input)
-		const baseInstructionsItem = requestInput?.[0];
-		expect(baseInstructionsItem?.role).toBe("developer");
-		expect((baseInstructionsItem as any)?.internal_chat_message_metadata_passthrough?.content_item_kinds).toContain("model.base_instructions");
-		
-		// Other developer messages from input should be trimmed
-		const otherDeveloperMessages = requestInput?.filter(
-			(item, idx) => idx > 0 && item.type === "message" && item.role === "developer"
-		) ?? [];
-		expect(otherDeveloperMessages).toHaveLength(0);
-		
-		// User messages should still be present
+		expect(requestInput?.some(item => item.type === "message" && item.role === "developer")).toBe(false);
 		expect(requestInput?.some(item => item.type === "message" && item.role === "user")).toBe(true);
 	});
 
@@ -355,45 +344,45 @@ describe("remote compaction invalid_prompt termination (issue #2282)", () => {
 		expect(fetchCalls).toBe(1);
 		// The outgoing request was neutralized (the repair) before it was sent.
 		expect(sentBody).toBeDefined();
-		expect(sentBody).not.toContain("<​|channel|>");
-		expect(sentBody).not.toContain("<​|message|>");
+		expect(sentBody).not.toContain("<|channel|>");
+		expect(sentBody).not.toContain("<|message|>");
 		expect(sentBody).toContain("<\u200b|channel|>");
 	});
 });
 
-describe("Codex instructions as base-instructions developer message", () => {
-	test("moves instructions to input array with model.base_instructions metadata", async () => {
-		let requestBody: { instructions?: unknown; input?: unknown } | undefined;
+describe("remote compaction base instructions placement", () => {
+	async function captureCompactionBody(provider: "openai" | "openai-codex"): Promise<Record<string, unknown>> {
+		let body: Record<string, unknown> | undefined;
 		using _hook = hookFetch(async (_input, init) => {
-			requestBody = JSON.parse(String(init?.body)) as { instructions?: unknown; input?: unknown };
-			return Response.json({
-				output: [{ type: "compaction_summary", summary: "compact" }],
-			});
+			body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return Response.json({ output: [{ type: "compaction_summary", summary: "compact" }] });
 		});
-
 		await requestOpenAiRemoteCompaction(
-			makeOpenAiModel(),
+			makeOpenAiModel({ provider }),
 			"test-key",
 			[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
-			"You are a helpful assistant.",
+			"Base instructions.",
 		);
+		if (!body) throw new Error("compaction request was not sent");
+		return body;
+	}
 
-		// instructions field should be removed
-		expect(requestBody?.instructions).toBeUndefined();
+	test("openai-codex sends instructions as a leading model.base_instructions developer message", async () => {
+		const body = await captureCompactionBody("openai-codex");
+		expect(body.instructions).toBeUndefined();
+		const [first] = body.input as Array<Record<string, unknown>>;
+		expect(first).toMatchObject({
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: "Base instructions." }],
+			internal_chat_message_metadata_passthrough: { content_item_kinds: ["model.base_instructions"] },
+		});
+	});
 
-		// First item in input should be the base instructions message
-		const input = requestBody?.input as Array<Record<string, unknown>> | undefined;
-		expect(Array.isArray(input)).toBe(true);
-		const baseInstructions = input?.[0];
-		expect(baseInstructions?.type).toBe("message");
-		expect(baseInstructions?.role).toBe("developer");
-		// id is optional when there's no prompt_cache_key
-		if (typeof baseInstructions?.id === "string") {
-			expect(baseInstructions.id).toMatch(/^msg_[0-9a-f-]{36}$/);
-		}
-		const metadata = (baseInstructions as any)?.internal_chat_message_metadata_passthrough;
-		expect(metadata?.content_item_kinds).toContain("model.base_instructions");
-		const content = JSON.stringify(baseInstructions?.content);
-		expect(content).toContain("You are a helpful assistant.");
+	test("public openai keeps the top-level instructions field", async () => {
+		const body = await captureCompactionBody("openai");
+		expect(body.instructions).toBe("Base instructions.");
+		const input = body.input as Array<Record<string, unknown>>;
+		expect(input.some(item => item.role === "developer")).toBe(false);
 	});
 });
