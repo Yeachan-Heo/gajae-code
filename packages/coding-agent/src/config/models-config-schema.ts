@@ -135,6 +135,7 @@ const ModelDefinitionSchema = z
 			.enum([
 				"openai-completions",
 				"openai-responses",
+				"meta-muse-responses",
 				"openai-codex-responses",
 				"azure-openai-responses",
 				"anthropic-messages",
@@ -271,6 +272,7 @@ const ProviderConfigSchema = z
 			.enum([
 				"openai-completions",
 				"openai-responses",
+				"meta-muse-responses",
 				"openai-codex-responses",
 				"azure-openai-responses",
 				"anthropic-messages",
