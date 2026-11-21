@@ -1240,5 +1240,302 @@ describe("Tool argument coercion", () => {
 		it("drops a null the property schema rejects", () => {
 			expect(validateToolArguments(tool, call({ id: "1", label: null, note: "x" }))).toEqual({ id: "1", note: "x" });
 		});
+
+		it("distinguishes string 'null' sentinel from JSON null", () => {
+			// String "null" is an LLM sentinel meaning "omit this field"
+			const result = validateToolArguments(tool, call({ id: "1", note: "null", assignee: null }));
+			// String "null" should be deleted (it's a sentinel)
+			// JSON null should be preserved (schema accepts it)
+			expect(result).toEqual({ id: "1", assignee: null });
+		});
+
+		it("preserves JSON null for nullable optional with no default", () => {
+			const result = validateToolArguments(tool, call({ id: "1", note: null }));
+			expect(result).toEqual({ id: "1", note: null });
+		});
+	});
+
+	describe("nullable optional with default value", () => {
+		const tool: Tool = {
+			name: "update_field",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					status: {
+						type: ["string", "null"],
+						default: "pending",
+					},
+					tags: {
+						type: "array",
+						items: { type: "string" },
+						default: [],
+					},
+				},
+				required: ["id"],
+			},
+		};
+		const call = (args: Record<string, unknown>): ToolCall => ({
+			type: "toolCall",
+			id: "call-default",
+			name: tool.name,
+			arguments: args,
+		});
+
+		it("preserves explicit JSON null instead of applying default", () => {
+			// Issue 1: If schema accepts null, preserve the explicit null
+			// Don't apply the default
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("deletes non-nullable optional fields with null", () => {
+			// For non-nullable optional fields that receive null, delete the field
+			const nonNullableTool: Tool = {
+				name: "update_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: {
+							type: "string",
+							default: "pending",
+						},
+					},
+					required: ["id"],
+				},
+			};
+			const nonNullableCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-default",
+				name: nonNullableTool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(nonNullableTool, nonNullableCall({ id: "1", status: null }));
+			// For non-nullable optional, the field is deleted (not defaulted)
+			expect(result).toEqual({ id: "1" });
+		});
+
+		it("applies default for required non-nullable fields with null", () => {
+			// For required fields that don't accept null, apply default
+			const requiredNonNullTool: Tool = {
+				name: "update_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: {
+							type: "string",
+							default: "pending",
+						},
+					},
+					required: ["id", "status"],
+				},
+			};
+			const requiredNonNullCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-default",
+				name: requiredNonNullTool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(requiredNonNullTool, requiredNonNullCall({ id: "1", status: null }));
+			// For required non-nullable, apply default
+			expect(result).toEqual({ id: "1", status: "pending" });
+		});
+
+		it("preserves JSON null for required nullable field even with default", () => {
+			const requiredTool: Tool = {
+				name: "update_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: {
+							type: ["string", "null"],
+							default: "pending",
+						},
+					},
+					required: ["id", "status"],
+				},
+			};
+			const requiredCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-default",
+				name: requiredTool.name,
+				arguments: args,
+			});
+			// When schema accepts null, preserve it even if field is required and has default
+			const result = validateToolArguments(requiredTool, requiredCall({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+	});
+
+	describe("nullable optional with local $ref", () => {
+		const tool: Tool = {
+			name: "update_ref_field",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					status: { $ref: "#/$defs/nullableStatus" },
+				},
+				required: ["id"],
+				$defs: {
+					nullableStatus: {
+						type: ["string", "null"],
+					},
+				},
+			},
+		};
+		const call = (args: Record<string, unknown>): ToolCall => ({
+			type: "toolCall",
+			id: "call-ref",
+			name: tool.name,
+			arguments: args,
+		});
+
+		it("preserves null through local $ref resolution", () => {
+			// Issue 3: Ensure $ref is resolved correctly for null validation
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("removes null for non-accepting $ref", () => {
+			const nonNullTool: Tool = {
+				name: "update_ref_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/nonNullStatus" },
+					},
+					required: ["id"],
+					$defs: {
+						nonNullStatus: {
+							type: "string",
+						},
+					},
+				},
+			};
+			const nonNullCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-ref",
+				name: nonNullTool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(nonNullTool, nonNullCall({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1" });
+		});
+	});
+
+	describe("nullable normalization invariants (property-based)", () => {
+		it("preserves accepted null across anyOf schema variants", () => {
+			const tool: Tool = {
+				name: "test_anyof",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						// anyOf variant of nullable
+						value: { anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }] },
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-anyof",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", value: null }));
+			expect(result).toEqual({ id: "1", value: null });
+		});
+
+		it("preserves accepted null across oneOf schema variants", () => {
+			const tool: Tool = {
+				name: "test_oneof",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						// oneOf variant of nullable
+						value: { oneOf: [{ type: "string" }, { type: "null" }] },
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-oneof",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", value: null }));
+			expect(result).toEqual({ id: "1", value: null });
+		});
+
+		it("removes rejected null across array elements", () => {
+			const tool: Tool = {
+				name: "test_array_null",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						tags: {
+							type: "array",
+							items: { type: "string" },
+						},
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-array",
+				name: tool.name,
+				arguments: args,
+			});
+			// Arrays don't have optional property processing, they're handled separately
+			const result = validateToolArguments(tool, call({ id: "1", tags: ["a", "b"] }));
+			expect(result).toEqual({ id: "1", tags: ["a", "b"] });
+		});
+
+		it("preserves null in nested objects with nullable properties", () => {
+			const tool: Tool = {
+				name: "test_nested",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						metadata: {
+							type: "object",
+							properties: {
+								tag: { type: ["string", "null"] },
+							},
+						},
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-nested",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", metadata: { tag: null } }));
+			expect(result).toEqual({ id: "1", metadata: { tag: null } });
+		});
 	});
 });

@@ -124,7 +124,7 @@ function decodePointerToken(token: string): string {
 
 /** RFC 6901 token decode: `~1` → `/`, `~0` → `~`. */
 
-function resolveLocalRef(root: unknown, ref: string): unknown | undefined {
+export function resolveLocalRef(root: unknown, ref: string): unknown | undefined {
 	if (ref === "#") return root;
 	if (!ref.startsWith("#/")) return undefined;
 	let current: unknown = root;
