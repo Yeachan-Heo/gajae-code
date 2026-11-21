@@ -83,12 +83,19 @@ import {
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
 import { compactGrammarDefinition } from "./grammar";
-import { CODEX_BASE_URL, getCodexAccountId, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "./openai-codex/constants";
+import {
+	CODEX_BASE_URL,
+	codexRoutingHint,
+	getCodexAccountId,
+	OPENAI_HEADER_VALUES,
+	OPENAI_HEADERS,
+} from "./openai-codex/constants";
 import {
 	type CodexRequestOptions,
 	type InputItem,
 	type RequestBody,
 	transformRequestBody,
+	withCodexRoutingFieldsFirst,
 } from "./openai-codex/request-transformer";
 import { parseCodexError } from "./openai-codex/response-handler";
 import { normalizeOpenAIResponsesPromptCacheKey } from "./openai-responses";
@@ -1126,6 +1133,7 @@ async function openCodexWebSocketTransport(
 		requestContext.transformedBody.prompt_cache_key,
 		"websocket",
 		websocketState,
+		{ model: requestContext.transformedBody.model, service_tier: requestContext.transformedBody.service_tier },
 	);
 	const requestBodyForState = structuredCloneJSON(requestContext.transformedBody);
 	logCodexDebug("codex websocket request", {
@@ -2988,6 +2996,7 @@ export async function prewarmOpenAICodexResponses(
 		promptCacheKey,
 		"websocket",
 		state,
+		{ model: model.id, service_tier: undefined },
 	);
 	const connectionPromise = logger.time(
 		"prewarmCodex:establishWs",
@@ -3320,6 +3329,11 @@ interface CodexWebSocketConnectionOptions {
 	onHandshakeHeaders?: (headers: Headers) => void;
 }
 
+/** Request body fields to exclude from websocket chaining; ultrafast uses a separate serving path. */
+const CODEX_CHAIN_TOP_LEVEL_EXCLUDE_MAP = {
+	service_tier: true,
+} as const;
+
 class CodexWebSocketConnection {
 	#url: string;
 	#headers: Record<string, string>;
@@ -3355,6 +3369,10 @@ class CodexWebSocketConnection {
 
 	matchesAuth(headers: Record<string, string>): boolean {
 		return this.#headers.authorization === headers.authorization;
+	}
+
+	matchesRoutingHint(headers: Record<string, string>): boolean {
+		return this.#headers[OPENAI_HEADERS.ROUTING_HINT] === headers[OPENAI_HEADERS.ROUTING_HINT];
 	}
 
 	close(reason = "done"): void {
@@ -3506,7 +3524,7 @@ class CodexWebSocketConnection {
 
 		try {
 			onStreamCreated?.();
-			this.#socket.send(JSON.stringify(request));
+			this.#socket.send(JSON.stringify(withCodexRoutingFieldsFirst(request)));
 			let sawFirstProgress = false;
 			const startedAt = Date.now();
 			let lastProgressAt = startedAt;
@@ -3618,13 +3636,19 @@ async function getOrCreateCodexWebSocketConnection(
 ): Promise<CodexWebSocketConnection> {
 	const headerRecord = headersToRecord(headers);
 	if (state.connection?.isOpen()) {
-		if (state.connection.matchesAuth(headerRecord) && !state.connection.isStale()) {
+		if (!state.connection.matchesAuth(headerRecord)) {
+			state.connection.close("token-refresh");
+			resetCodexWebSocketAppendState(state);
+		} else if (!state.connection.matchesRoutingHint(headerRecord)) {
+			state.connection.close("routing-change");
+			resetCodexWebSocketAppendState(state);
+		} else if (!state.connection.isStale()) {
 			logger.time("codexWs:reuseOpenSocket");
 			return state.connection;
+		} else {
+			state.connection.close("stale-reuse");
+			resetCodexWebSocketAppendState(state);
 		}
-		const closeReason = state.connection.isStale() ? "stale-reuse" : "token-refresh";
-		state.connection.close(closeReason);
-		resetCodexWebSocketAppendState(state);
 	}
 	state.connection?.close("reconnect");
 	resetCodexWebSocketAppendState(state);
@@ -3653,7 +3677,10 @@ async function openCodexSseEventStream(
 	fetchOverride?: FetchImpl,
 	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries" | "onStreamCreated">,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
-	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state);
+	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state, {
+		model: body.model,
+		service_tier: body.service_tier,
+	});
 	logCodexDebug("codex request", {
 		url,
 		model: body.model,
@@ -3728,6 +3755,7 @@ function createCodexHeaders(
 	promptCacheKey?: string,
 	transport: CodexTransport = "sse",
 	state?: CodexWebSocketSessionState,
+	routedRequest?: Pick<RequestBody, "model" | "service_tier">,
 ): Headers {
 	const headers = new Headers(initHeaders ?? {});
 	headers.delete("x-api-key");
@@ -3746,6 +3774,14 @@ function createCodexHeaders(
 	headers.set(OPENAI_HEADERS.BETA, betaHeader);
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 	headers.set("User-Agent", getCodexUserAgent());
+	if (routedRequest?.model) {
+		headers.set(
+			OPENAI_HEADERS.ROUTING_HINT,
+			codexRoutingHint(routedRequest.model, routedRequest.service_tier as string | null | undefined),
+		);
+	} else {
+		headers.delete(OPENAI_HEADERS.ROUTING_HINT);
+	}
 	if (promptCacheKey) {
 		headers.set(OPENAI_HEADERS.SESSION_ID, promptCacheKey);
 		headers.set("x-client-request-id", promptCacheKey);
