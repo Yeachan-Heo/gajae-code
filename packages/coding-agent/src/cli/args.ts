@@ -66,6 +66,11 @@ export interface Args {
 	version?: boolean;
 	mode?: Mode;
 	noSession?: boolean;
+	/**
+	 * Confine this session to its cwd and descendants, and keep its transcript in a
+	 * separate store that ordinary --continue/--resume cannot open.
+	 */
+	confine?: boolean;
 	sessionDir?: string;
 	providerSessionId?: string;
 	fork?: string;
@@ -294,6 +299,8 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			result.providerSessionId = takeFlagValue(args, i++, "--provider-session-id");
 		} else if (arg === "--no-session") {
 			result.noSession = true;
+		} else if (arg === "--confine") {
+			result.confine = true;
 		} else if (arg === "--session-dir") {
 			result.sessionDir = takeFlagValue(args, i++, "--session-dir");
 		} else if (arg === "--models") {

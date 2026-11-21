@@ -520,6 +520,7 @@ export async function openLifecycleSessionManager(
 				sessionManager = opened.manager;
 				await revalidateLifecycleTranscript(snapshot.identity);
 			} else {
+				// forkFromCaptured inherits the source's confinement from the captured header.
 				const forked = await SessionManager.forkFromCaptured(
 					snapshot,
 					cwd,

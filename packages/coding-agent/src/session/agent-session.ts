@@ -507,7 +507,8 @@ import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
-import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
+import { normalizeLocalScheme, resolveReadPath, resolveToCwd, runWithWorkspaceConfine } from "../tools/path-utils";
+import { WorkspaceConfinement } from "../tools/workspace-confine";
 import { closePendingAsks } from "../tools/pending-asks";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
@@ -15315,6 +15316,25 @@ export class AgentSession {
 			},
 		}) as T;
 	}
+	#wrapToolForWorkspaceConfine<T extends AgentTool>(tool: T): T {
+		if (!this.sessionManager.isFilesystemConfined()) return tool;
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: never,
+				) =>
+					runWithWorkspaceConfine(WorkspaceConfinement.forRoot(this.sessionManager.getCwd()), () =>
+						target.execute(toolCallId, args as never, signal, onUpdate, ctx),
+					);
+			},
+		}) as T;
+	}
+
 
 	/**
 	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
@@ -15376,14 +15396,16 @@ export class AgentSession {
 		if (cached) return cached as T;
 		wrappersByVersion?.clear();
 		const innerTool = tool instanceof ExtensionToolWrapper ? tool.getInnerTool() : tool;
-		const guarded = this.#wrapToolForCwdTransitionFence(
-			this.#wrapToolForWorkflowMutationGuard(
-				this.#wrapToolForAcpPermission(
-					guardToolForUltragoalAsk(
-						innerTool,
-						() => this.sessionManager.getCwd(),
-						() => ({ sessionId: this.sessionManager.getSessionId() }),
-						() => this.getSessionAgentDir(),
+		const guarded = this.#wrapToolForWorkspaceConfine(
+			this.#wrapToolForCwdTransitionFence(
+				this.#wrapToolForWorkflowMutationGuard(
+					this.#wrapToolForAcpPermission(
+						guardToolForUltragoalAsk(
+							innerTool,
+							() => this.sessionManager.getCwd(),
+							() => ({ sessionId: this.sessionManager.getSessionId() }),
+							() => this.getSessionAgentDir(),
+						),
 					),
 				),
 			),
@@ -22855,6 +22877,7 @@ export class AgentSession {
 					undefined,
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
+					previousManager.isFilesystemConfined(),
 				);
 				let exactRetirement: PreparedExactMcpRetirement | undefined;
 				let adopted = false;
@@ -35203,6 +35226,19 @@ export class AgentSession {
 					return false;
 				}
 			}
+			// Tool wrappers were built for the current scope, so a switch must not
+			// cross between confined and ordinary transcripts. Checked before any
+			// session state changes, so a rejected switch needs no rollback.
+			if (fs.existsSync(sessionPath)) {
+				const currentConfined = this.sessionManager.isFilesystemConfined();
+				const target = SessionManager.inspectTranscriptScope(sessionPath);
+				if (!target) throw new Error(`Could not read the filesystem scope of session ${sessionPath}`);
+				if (target.confined !== currentConfined) {
+					throw new Error(
+						`Cannot switch between confined and unconfined sessions: current is ${currentConfined ? "confined" : "unconfined"}, target is ${target.confined ? "confined" : "unconfined"}`,
+					);
+				}
+			}
 			options?.onTransitionMutationStarted?.();
 
 			// A conventional same-path reload can replace the logical identity.
@@ -35346,6 +35382,7 @@ export class AgentSession {
 					: undefined;
 				if (conventionalRetirement && !conventionalRetirement.canCommit())
 					throw new Error("Session MCP reset ownership changed before session switch load");
+
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});

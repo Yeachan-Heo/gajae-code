@@ -28,7 +28,11 @@ import {
 } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { type OutputMeta, outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd } from "./path-utils";
+import {
+	assertRealpathInsideActiveWorkspace,
+	formatPathRelativeToCwd,
+	readFileTextInsideActiveWorkspace,
+} from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "./plan-mode-guard";
 import {
 	formatDiagnostics,
@@ -251,9 +255,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			archiveSubPath: normalizeArchiveWriteSubPath(fallbackCandidate.subPath),
 			exists: false,
 		};
+		await assertRealpathInsideActiveWorkspace(fallback.absolutePath);
 
 		for (const candidate of candidates) {
 			const absolutePath = resolvePlanPath(this.session, candidate.archivePath);
+			await assertRealpathInsideActiveWorkspace(absolutePath);
 			try {
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
@@ -365,11 +371,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			key: fallbackTarget.key,
 			exists: false,
 		};
+		await assertRealpathInsideActiveWorkspace(fallback.absolutePath);
 
 		let sawExistingNonSqlite = false;
 		for (const candidate of candidates) {
 			const target = parseSqliteWriteTarget(candidate.subPath, candidate.queryString);
 			const absolutePath = resolvePlanPath(this.session, candidate.sqlitePath);
+			await assertRealpathInsideActiveWorkspace(absolutePath);
 			try {
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
@@ -507,8 +515,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			throw new ToolError(`Conflict #${entry.id} target '${entry.displayPath}' no longer exists.`);
 		}
 
+		// The conflict was registered by an earlier call; the path may have been
+		// swapped since. Re-check it here and read through the confined helper,
+		// whose writethrough counterpart publishes through the same pinned walk.
+		await assertRealpathInsideActiveWorkspace(absolutePath);
 		const expanded = expandContentTokens(replacementContent, entry);
-		const originalText = await Bun.file(absolutePath).text();
+		const originalText = await readFileTextInsideActiveWorkspace(absolutePath);
 		const newContent = spliceConflict(originalText, entry, expanded);
 
 		const batchRequest = getLspBatchRequest(context?.toolCall);
@@ -773,6 +785,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			enforcePlanModeWrite(this.session, path, { op: "create" });
 			const absolutePath = resolvePlanPath(this.session, path);
+			await assertRealpathInsideActiveWorkspace(absolutePath);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
 			// Check if file exists and is auto-generated before overwriting

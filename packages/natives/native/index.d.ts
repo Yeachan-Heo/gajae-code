@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -1023,6 +1024,41 @@ export interface ComputerScreenshot {
   /** Process-local opaque capture id. */
   captureId: number
 }
+
+/**
+ * Create `relative` and any missing ancestors beneath `root` without following
+ * a symlink at any component.
+ */
+export declare function confinedMkdirAll(root: string, rootId: string, relative: string): void
+
+/**
+ * Open `relative` beneath `root` for reading and return an owned descriptor.
+ *
+ * `root_id` is the `"<dev>:<ino>"` identity pinned for `root`; every helper
+ * rejects an opened root descriptor whose identity differs.
+ *
+ * `relative` must be a normalized relative path with no `..` component. A
+ * symlink at any component below `root` is rejected. The caller owns the
+ * returned descriptor and must close it.
+ */
+export declare function confinedOpenRead(root: string, rootId: string, relative: string): number
+
+/**
+ * Remove the file `relative` beneath `root` through the pinned parent
+ * descriptor.
+ */
+export declare function confinedUnlink(root: string, rootId: string, relative: string): void
+
+/**
+ * Atomically replace or create `relative` beneath `root` with `data`.
+ *
+ * The bytes are staged in an exclusively created sibling temp file opened
+ * through the pinned parent descriptor, synced, and published with
+ * `renameat` against that same descriptor. An existing target keeps its
+ * mode. A symlinked, hard-linked, or non-regular target is rejected. Missing
+ * parent directories are created only when `create_parents` is set.
+ */
+export declare function confinedWriteFileAtomic(root: string, rootId: string, relative: string, data: Buffer, createParents: boolean): void
 
 /** A context line (before or after a match). */
 export interface ContextLine {

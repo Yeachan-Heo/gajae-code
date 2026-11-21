@@ -24,6 +24,7 @@ import type { ToolSession } from ".";
 import { applyListLimit } from "./list-limit";
 import { formatFullOutputReference, type OutputMeta } from "./output-meta";
 import {
+	assertRealpathInsideActiveWorkspace,
 	formatPathRelativeToCwd,
 	hasGlobPathChars,
 	normalizePathLikeInput,
@@ -217,6 +218,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			const hasGlob = multiPattern ? true : (parsedPattern?.hasGlob ?? false);
 			const globPattern = multiPattern?.globPattern ?? parsedPattern?.globPattern ?? "**/*";
 			const searchPath = resolveToCwd(multiPattern?.basePath ?? parsedPattern?.basePath ?? ".", this.session.cwd);
+			await assertRealpathInsideActiveWorkspace(searchPath);
 			const scopePath = multiPattern?.scopePath ?? formatScopePath(searchPath);
 
 			if (searchPath === "/") {

@@ -3147,6 +3147,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			get cwd() {
 				return sessionManager.getCwd();
 			},
+			get filesystemRoot() {
+				return sessionManager.isFilesystemConfined() ? sessionManager.getCwd() : undefined;
+			},
 			hasUI: options.hasUI ?? false,
 			profileAuthority,
 			workflowGateEligible: true,
@@ -5129,6 +5132,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
 			createEventEmitter: () => agent.createExternalEventEmitterForCurrentRun(),
+			filesystemRoot: () => (sessionManager.isFilesystemConfined() ? sessionManager.getCwd() : undefined),
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
@@ -5199,8 +5203,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				: undefined;
 
 			const browserBackend = resolveBrowserBackend(settings);
+			const confinementNotice = sessionManager.isFilesystemConfined()
+				? [
+						"This session is confined to its current working directory and descendants.",
+						"Do not read, write, search, or run commands against a parent directory or any other path outside that root.",
+						"On macOS the shell process is sandboxed to that root, so command text cannot read or write outside it either.",
+					].join(" ")
+				: undefined;
 			const appendPrompt =
-				[memoryInstructions, browserBackend.developerInstructions].filter(Boolean).join("\n\n") || undefined;
+				[memoryInstructions, browserBackend.developerInstructions, confinementNotice]
+					.filter(Boolean)
+					.join("\n\n") || undefined;
 			let pluginSystemAppendices = "";
 			try {
 				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd() });

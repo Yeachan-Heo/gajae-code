@@ -22,6 +22,7 @@ import {
 	type TerminalArtifactPublisher,
 	truncateHeadBytes,
 } from "../session/streaming-output";
+import { sandboxedShellCommand } from "../tools/confine-sandbox";
 import { formatArtifactReference, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { IsolatedShell } from "./isolated-shell";
@@ -376,6 +377,11 @@ export interface BashExecutorOptions {
 	ignoreShellPrefix?: boolean;
 	/** Skip sourced shell snapshots. Used by constrained read-only shells. */
 	disableShellSnapshot?: boolean;
+	/**
+	 * Run the command inside a process sandbox rooted at this directory.
+	 * The command text cannot leave the root; only macOS provides this boundary.
+	 */
+	sandboxRoot?: string;
 }
 
 export interface BashResult {
@@ -530,17 +536,25 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const shellEnv = stripProjectSpawnHooks({ ...configEnv });
 	const lifecycleUnsetEnv = scrubInheritedLifecycleRequest(shellEnv, options?.env, options?.unsetEnv);
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
+	// Apply command prefix if configured and allowed for this execution. A confined
+	// command is wrapped (and sandbox availability validated) before any other
+	// shell startup work runs.
+	const prefixedCommand = configuredPrefix ? `${configuredPrefix} ${command}` : command;
+	const finalCommand = options?.sandboxRoot
+		? sandboxedShellCommand(prefixedCommand, options.sandboxRoot)
+		: prefixedCommand;
+	// Snapshot generation sources the user's rc file in a separate, unsandboxed
+	// shell, and the sandboxed inner shell would not inherit it anyway. A confined
+	// command therefore never creates or loads a snapshot.
 	const snapshotPath =
-		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
+		!options?.disableShellSnapshot && !options?.sandboxRoot && shell.includes("bash")
+			? await getOrCreateSnapshot(shell, shellEnv)
+			: null;
 
 	const minimizer = buildMinimizerOptions(resolveTrustedShellMinimizer(settings));
 
 	const commandCwd = await resolveShellCwd(options?.cwd);
 	const commandEnv = options?.env ? { ...NON_INTERACTIVE_ENV, ...options.env } : NON_INTERACTIVE_ENV;
-
-	// Apply command prefix if configured and allowed for this execution.
-	const prefixedCommand = configuredPrefix ? `${configuredPrefix} ${command}` : command;
-	const finalCommand = prefixedCommand;
 
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({

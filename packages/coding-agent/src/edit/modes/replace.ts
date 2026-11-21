@@ -12,6 +12,7 @@ import type { ToolSession } from "../../tools";
 import { assertEditableFile, assertEditableFileContent } from "../../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
+import { assertRealpathInsideActiveWorkspace } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { ToolError } from "../../tools/tool-errors";
 import { generateDiffString, replaceText } from "../diff";
@@ -637,6 +638,7 @@ export async function executeReplaceSingle(
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
+	await assertRealpathInsideActiveWorkspace(absolutePath);
 	await assertEditableFile(absolutePath, path, session.settings);
 	return withEditPathMutation([absolutePath], () =>
 		executeReplaceSingleUnderLock({
@@ -775,6 +777,7 @@ export async function executeReplaceEntries(
 			}
 		}
 		const absolutePath = resolvePlanPath(session, path);
+		await assertRealpathInsideActiveWorkspace(absolutePath);
 		return await withEditPathMutation([absolutePath], () =>
 			executeReplaceEntriesUnderLock({ ...options, absolutePath }),
 		);

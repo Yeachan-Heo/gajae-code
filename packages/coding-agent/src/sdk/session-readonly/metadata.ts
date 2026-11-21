@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import type { Message, TextContent } from "@gajae-code/ai/core";
+import { type FilesystemScope, parseFilesystemScope } from "../../session/session-confinement";
 import {
 	CURRENT_SESSION_VERSION,
 	type HeaderPatchRecord,
@@ -19,6 +20,8 @@ export interface SessionMetadata {
 	starred: boolean;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
+	/** Present only for sessions launched with --confine. */
+	filesystemScope?: FilesystemScope;
 	created: Date;
 	modified: Date;
 	messageCount: number;
@@ -312,6 +315,7 @@ export interface SessionListHeader {
 	starred?: boolean;
 	parentSession?: string;
 	timestamp?: string;
+	filesystemScope?: FilesystemScope;
 }
 
 function parseSessionListHeader(
@@ -334,6 +338,7 @@ function parseSessionListHeader(
 			starred: typeof parsedHeader.starred === "boolean" ? parsedHeader.starred : inlineStarred,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
 			timestamp: typeof parsedHeader.timestamp === "string" ? parsedHeader.timestamp : undefined,
+			filesystemScope: parseFilesystemScope(parsedHeader.filesystemScope),
 		};
 	}
 	if (extractStringProperty(firstLine, "type") !== "session") return undefined;
@@ -349,6 +354,7 @@ function parseSessionListHeader(
 		starredPatchVersion,
 		parentSession: extractStringProperty(firstLine, "parentSession"),
 		timestamp: extractStringProperty(firstLine, "timestamp"),
+		filesystemScope: parseFilesystemScope(extractStringProperty(firstLine, "filesystemScope")),
 	};
 }
 
@@ -405,6 +411,7 @@ async function collectSessionFromFile(
 			title: header.title ?? shortSummary,
 			starred: header.starred === true,
 			parentSessionPath: header.parentSession,
+			...(header.filesystemScope ? { filesystemScope: header.filesystemScope } : {}),
 			created: new Date(header.timestamp ?? ""),
 			modified: stats.mtime,
 			messageCount,

@@ -82,6 +82,7 @@ import {
 	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { sessionMatchesConfinement } from "../../session/session-confinement";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -2388,7 +2389,9 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
+		const sessions = (await this.ctx.sessionManager.listForResumePickerReadOnly()).filter(session =>
+			sessionMatchesConfinement(session, this.ctx.sessionManager.isFilesystemConfined()),
+		);
 		if (this.ctx.isStopped?.()) return;
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
