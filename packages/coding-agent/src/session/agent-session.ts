@@ -13124,6 +13124,11 @@ export class AgentSession {
 		this.#disposeTimeoutMs = Math.max(0, timeoutMs);
 	}
 
+	/** Get the SDK command context for testing SDK extension behavior. */
+	getSdkCommandContextForTests(): ExtensionCommandContext {
+		return this.#createCommandContext();
+	}
+
 	/** Bind coordinator runtime-state persistence to this session in tests. */
 	setCoordinatorRuntimeStateFileForTests(stateFile: string): void {
 		if (!path.isAbsolute(stateFile)) {
