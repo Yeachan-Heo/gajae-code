@@ -373,6 +373,45 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		return this.#broker.refreshMCPOAuthCredential?.(credentialId, credential, client, signal) ?? credential;
 	}
 
+	async disableAuthCredentialRemote?(
+		credentialId: number,
+		disabledCause: string,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<boolean> {
+		// Route disable by row ownership: broker rows through the remote hook,
+		// local credentials are disabled locally.
+		if (isLocalId(credentialId)) {
+			// Local credentials are disabled in the local store, not through the broker.
+			this.#local.deleteAuthCredential(-credentialId, disabledCause);
+			return true;
+		}
+		return this.#broker.disableAuthCredentialRemote?.(credentialId, disabledCause, signal, expectedRevision) ?? false;
+	}
+
+	async markCredentialSuspect?(credentialId: number, opts?: { signal?: AbortSignal }): Promise<void> {
+		// Route suspect marking by row ownership: broker rows through the remote hook,
+		// local credentials remain unchanged (suspect marking is a broker concept).
+		if (isLocalId(credentialId)) {
+			// Local credentials are not marked suspect through the broker.
+			return;
+		}
+		return this.#broker.markCredentialSuspect?.(credentialId, opts);
+	}
+
+	async getUsageReport?(
+		provider: import("../types").Provider,
+		credential: import("../auth-storage").OAuthCredential,
+		signal?: AbortSignal,
+	): Promise<import("../usage").UsageReport | null> {
+		// Local providers do not have usage reports from the broker.
+		// Only broker-served providers have usage data.
+		if (this.#localProviders.has(provider)) {
+			return null;
+		}
+		return this.#broker.getUsageReport?.(provider, credential, signal) ?? null;
+	}
+
 	fetchUsageReports(signal?: AbortSignal): Promise<import("../usage").UsageReport[] | null> {
 		return this.#broker.fetchUsageReports?.(signal) ?? Promise.resolve(null);
 	}
