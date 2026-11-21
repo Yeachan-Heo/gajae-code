@@ -273,7 +273,12 @@ import {
 	type SessionRecapInput,
 	toRecapLineageEntry,
 } from "./recap";
-import { sessionMatchesConfinement } from "./session-confinement";
+import {
+	type FilesystemScope,
+	isConfinedScope,
+	parseFilesystemScope,
+	sessionMatchesConfinement,
+} from "./session-confinement";
 import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
@@ -316,7 +321,7 @@ export interface SessionHeader extends MutableSessionHeaderFields {
 	 * descendants. Absent on ordinary sessions. The marker is durable: a confined
 	 * transcript can only be resumed with the same launch flag.
 	 */
-	filesystemScope?: "cwd";
+	filesystemScope?: FilesystemScope;
 }
 
 /**
@@ -8290,7 +8295,7 @@ export class SessionManager {
 		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
 		skipEnsureSessionDir = false,
-		private filesystemScope?: "cwd",
+		private filesystemScope?: FilesystemScope,
 	) {
 		this.#storage = new Proxy(storage, {
 			get: (target, property, receiver) => {
@@ -10618,7 +10623,7 @@ export class SessionManager {
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
-		this.filesystemScope = header.filesystemScope === "cwd" ? "cwd" : undefined;
+		this.filesystemScope = parseFilesystemScope(header.filesystemScope);
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#flushed = true;
@@ -10847,7 +10852,7 @@ export class SessionManager {
 				this.#sessionId = sessionId;
 				this.#sessionName = header?.title;
 				this.#titleSource = header?.titleSource;
-				this.filesystemScope = header?.filesystemScope === "cwd" ? "cwd" : undefined;
+				this.filesystemScope = parseFilesystemScope(header?.filesystemScope);
 				this.#needsFullRewriteOnNextPersist = migrationApplied;
 				this.#managedPersistExpectedIdentity = expectedIdentity;
 				this.#artifactManager = null;
@@ -12561,7 +12566,7 @@ export class SessionManager {
 				const revalidatedCwd = await fs.promises.realpath(path.resolve(newCwd));
 				const namedIdentity = await fs.promises.lstat(revalidatedCwd, { bigint: true });
 				if (
-					this.filesystemScope === "cwd" &&
+					this.isFilesystemConfined() &&
 					revalidatedCwd !== path.resolve(this.cwd) &&
 					!pathIsWithin(path.resolve(this.cwd), revalidatedCwd)
 				) {
@@ -18129,7 +18134,16 @@ export class SessionManager {
 		return this.cwd;
 	}
 	isFilesystemConfined(): boolean {
-		return this.filesystemScope === "cwd";
+		return this.filesystemScope !== undefined;
+	}
+
+	/**
+	 * A fork keeps its source's confinement. Call before building the fork's
+	 * fresh header, which copies this manager's scope; callers never re-read
+	 * the transcript just to learn its scope.
+	 */
+	#inheritForkScope(sourceHeader: SessionHeader | undefined): void {
+		if (isConfinedScope(sourceHeader)) this.filesystemScope = "cwd";
 	}
 
 	/** Mark a new session as cwd-confined before its header is written. */
@@ -23376,11 +23390,8 @@ export class SessionManager {
 				: undefined);
 		if (!identity) return false;
 		applyHeaderPatch(sourceHeader, headerPatch);
-		// A fork inherits the source's confinement from the header it already parsed,
-		// so callers never re-read the transcript just to learn its scope.
-		if (sourceHeader.filesystemScope === "cwd") this.filesystemScope = "cwd";
+		this.#inheritForkScope(sourceHeader);
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
-		if (this.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return false;
@@ -23580,11 +23591,8 @@ export class SessionManager {
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
 		applyHeaderPatch(sourceHeader, headerPatch);
-		// A fork inherits the source's confinement from the header it already parsed,
-		// so callers never re-read the transcript just to learn its scope.
-		if (sourceHeader.filesystemScope === "cwd") this.filesystemScope = "cwd";
+		this.#inheritForkScope(sourceHeader);
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
-		if (this.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return undefined;
@@ -23764,9 +23772,8 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
-		if (sourceHeader?.filesystemScope === "cwd") manager.filesystemScope = "cwd";
+		manager.#inheritForkScope(sourceHeader);
 		const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
-		if (manager.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 		fresh.header.title = sourceHeader?.title;
 		fresh.header.titleSource = sourceHeader?.titleSource;
 		const transition = manager.#prepareResidentTextStoreTransition(
@@ -24400,7 +24407,7 @@ export class SessionManager {
 					storage,
 					destination,
 					false,
-					header.filesystemScope === "cwd" ? "cwd" : undefined,
+					parseFilesystemScope(header.filesystemScope),
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				await manager.#hydrateExistingSession(
@@ -24692,7 +24699,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: SessionMemoryMode = "shadow",
-		filesystemScope?: "cwd",
+		filesystemScope?: FilesystemScope,
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -24732,7 +24739,7 @@ export class SessionManager {
 						| undefined;
 					if (!header) throw new Error("source_changed");
 					const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : header.cwd || getProjectDir();
-					if (filesystemScope === "cwd" && !boundedManager.isFilesystemConfined()) {
+					if (filesystemScope && !boundedManager.isFilesystemConfined()) {
 						boundedManager.confineToCwd();
 					}
 					if (cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd))
@@ -24827,7 +24834,7 @@ export class SessionManager {
 				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
 			} else {
 				const fresh = manager.#freshSessionState(undefined, resolved);
-				if (filesystemScope === "cwd") manager.confineToCwd();
+				if (filesystemScope) manager.confineToCwd();
 				const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 				manager.#applyFreshSessionMetadata(fresh);
 				manager.#commitResidentTextStoreTransition(transition);
@@ -24989,7 +24996,7 @@ export class SessionManager {
 				return false;
 			});
 			if (!isRecord(header) || header.type !== "session") return undefined;
-			return { confined: header.filesystemScope === "cwd" };
+			return { confined: isConfinedScope(header) };
 		} catch {
 			return undefined;
 		} finally {
@@ -25174,9 +25181,8 @@ export class SessionManager {
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
-			if (sourceHeader?.filesystemScope === "cwd") manager.filesystemScope = "cwd";
+			manager.#inheritForkScope(sourceHeader);
 			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
-			if (manager.filesystemScope === "cwd") fresh.header.filesystemScope = "cwd";
 			fresh.header.title = sourceHeader?.title;
 			fresh.header.titleSource = sourceHeader?.titleSource;
 			forkEntries[0] = fresh.header;
