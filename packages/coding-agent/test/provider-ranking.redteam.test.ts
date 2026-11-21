@@ -318,6 +318,7 @@ describe("/provider preset CLI surface", () => {
 			"alibaba-token-plan",
 			"minimax",
 			"minimax-cn",
+			"aigrow",
 			"cheaper-inference",
 			"cloudgpu",
 			"ionet",
