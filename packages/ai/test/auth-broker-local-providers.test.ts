@@ -16,6 +16,7 @@ import {
 
 const TOKEN = "test-bearer";
 const UNSERVED = "test-unserved-provider";
+const TEST_BROKER_AUTHORITY = "test-broker-authority";
 
 describe("HybridAuthCredentialStore and broker-local providers", () => {
 	let tempDir = "";
@@ -45,7 +46,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 	test("listBrokerLocalProviders returns empty list initially", async () => {
 		const local = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		try {
-			expect(local.listBrokerLocalProviders()).toEqual([]);
+			expect(local.listBrokerLocalProviders(TEST_BROKER_AUTHORITY)).toEqual([]);
 		} finally {
 			local.close();
 		}
@@ -54,8 +55,8 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 	test("markBrokerLocalProvider adds provider to list", async () => {
 		const local = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		try {
-			local.markBrokerLocalProvider(UNSERVED);
-			expect(local.listBrokerLocalProviders()).toEqual([UNSERVED]);
+			local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
+			expect(local.listBrokerLocalProviders(TEST_BROKER_AUTHORITY)).toEqual([UNSERVED]);
 		} finally {
 			local.close();
 		}
@@ -64,10 +65,10 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 	test("unmarkBrokerLocalProvider removes provider from list", async () => {
 		const local = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		try {
-			local.markBrokerLocalProvider(UNSERVED);
-			expect(local.listBrokerLocalProviders()).toEqual([UNSERVED]);
-			local.unmarkBrokerLocalProvider(UNSERVED);
-			expect(local.listBrokerLocalProviders()).toEqual([]);
+			local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
+			expect(local.listBrokerLocalProviders(TEST_BROKER_AUTHORITY)).toEqual([UNSERVED]);
+			local.unmarkBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
+			expect(local.listBrokerLocalProviders(TEST_BROKER_AUTHORITY)).toEqual([]);
 		} finally {
 			local.close();
 		}
@@ -78,7 +79,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		{
 			const local = await SqliteAuthCredentialStore.open(dbPath);
 			try {
-				local.markBrokerLocalProvider(UNSERVED);
+				local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
 			} finally {
 				local.close();
 			}
@@ -87,7 +88,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		{
 			const local = await SqliteAuthCredentialStore.open(dbPath);
 			try {
-				expect(local.listBrokerLocalProviders()).toEqual([UNSERVED]);
+				expect(local.listBrokerLocalProviders(TEST_BROKER_AUTHORITY)).toEqual([UNSERVED]);
 			} finally {
 				local.close();
 			}
@@ -98,7 +99,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		const dbPath = path.join(tempDir, "agent.db");
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
-			local.markBrokerLocalProvider(UNSERVED);
+			local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
 		} finally {
 			local.close();
 		}
@@ -116,6 +117,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 			const hybrid = new HybridAuthCredentialStore({
 				broker,
 				local: local2,
+				brokerAuthority: TEST_BROKER_AUTHORITY,
 			});
 			try {
 				// HybridAuthCredentialStore should have loaded the broker-local provider from the database
@@ -142,7 +144,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		});
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
-			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			const hybrid = new HybridAuthCredentialStore({ broker, local, brokerAuthority: TEST_BROKER_AUTHORITY });
 			try {
 				// Upload a credential for an unserved provider
 				const result = await hybrid.upsertAuthCredentialRemote(UNSERVED, credential);
@@ -174,7 +176,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		});
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
-			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			const hybrid = new HybridAuthCredentialStore({ broker, local, brokerAuthority: TEST_BROKER_AUTHORITY });
 			try {
 				// Verify the hook exists
 				expect(hybrid.upsertAuthCredentialRemoteIfAbsent).toBeDefined();
@@ -215,7 +217,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		});
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
-			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			const hybrid = new HybridAuthCredentialStore({ broker, local, brokerAuthority: TEST_BROKER_AUTHORITY });
 			try {
 				// Store a local OAuth credential
 				await hybrid.upsertAuthCredentialRemote(UNSERVED, oauthCred);
@@ -270,10 +272,14 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
-			const hybrid = new HybridAuthCredentialStore({ broker: brokerMock, local });
+			const hybrid = new HybridAuthCredentialStore({
+				broker: brokerMock,
+				local,
+				brokerAuthority: TEST_BROKER_AUTHORITY,
+			});
 			try {
 				// Store a credential for an unserved provider
-				local.markBrokerLocalProvider(UNSERVED);
+				local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
 				local.upsertAuthCredentialForProvider(UNSERVED, credential);
 
 				// Verify the credential is stored locally
@@ -292,7 +298,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 				// Provider should still be marked as local
 				const freshLocal = await SqliteAuthCredentialStore.open(dbPath);
 				try {
-					expect(freshLocal.listBrokerLocalProviders()).toContain(UNSERVED);
+					expect(freshLocal.listBrokerLocalProviders(TEST_BROKER_AUTHORITY)).toContain(UNSERVED);
 					// Credential should still exist locally (not deleted due to error)
 					expect(freshLocal.listAuthCredentials(UNSERVED)).toHaveLength(1);
 				} finally {
@@ -321,9 +327,9 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
 			// Mark provider as local to simulate broker not serving it
-			local.markBrokerLocalProvider(UNSERVED);
+			local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
 
-			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			const hybrid = new HybridAuthCredentialStore({ broker, local, brokerAuthority: TEST_BROKER_AUTHORITY });
 			try {
 				// Store a credential for a local provider
 				await hybrid.upsertAuthCredentialRemote(UNSERVED, credential);
@@ -368,7 +374,7 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		});
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
-			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			const hybrid = new HybridAuthCredentialStore({ broker, local, brokerAuthority: TEST_BROKER_AUTHORITY });
 			try {
 				// Try to get removal targets for a broker provider - should return empty
 				const targets = hybrid.listCredentialRemovalTargets(brokerProvider);
@@ -405,9 +411,9 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		const local = await SqliteAuthCredentialStore.open(dbPath);
 		try {
 			// Mark provider as local
-			local.markBrokerLocalProvider(UNSERVED);
+			local.markBrokerLocalProvider(TEST_BROKER_AUTHORITY, UNSERVED);
 
-			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			const hybrid = new HybridAuthCredentialStore({ broker, local, brokerAuthority: TEST_BROKER_AUTHORITY });
 			try {
 				// Store an OAuth credential for the local provider
 				local.upsertAuthCredentialForProvider(UNSERVED, oauthCred);

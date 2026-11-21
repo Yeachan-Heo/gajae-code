@@ -7934,7 +7934,11 @@ export class AuthStorage {
 			const stale: OAuthCredential = { ...target.credential, expires: 0 };
 			let refreshed: RefreshedOAuthCredentials;
 			const remoteRefresh = this.#store.refreshMCPOAuthCredential?.bind(this.#store);
-			if (target.credential.mcpBinding && remoteRefresh) {
+			// P4: Gate forced MCP refresh by store ownership, not just method presence.
+			// Hybrid stores use ownsOAuthRefresh to claim broker rows and decline local rows.
+			// A local MCP-bound credential should reach its local token endpoint, not retain expired tokens.
+			const storeOwnsMCPRefresh = remoteRefresh && (this.#store.ownsOAuthRefresh?.(id) ?? !!remoteRefresh);
+			if (target.credential.mcpBinding && storeOwnsMCPRefresh) {
 				// Remote (broker) stores refresh MCP-bound rows server-side; the
 				// server runs the guarded local path against its own row.
 				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
@@ -8482,8 +8486,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			);
 			CREATE INDEX IF NOT EXISTS idx_oauth_refresh_leases_expires ON oauth_refresh_leases(expires_at);
 			CREATE TABLE IF NOT EXISTS auth_broker_local_providers (
-				provider TEXT PRIMARY KEY,
-				created_at INTEGER NOT NULL
+				broker_authority TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (broker_authority, provider)
 			);
 			CREATE TABLE IF NOT EXISTS auth_broker_pending_revocations (
 				broker_authority TEXT NOT NULL,
@@ -9199,25 +9205,49 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	/**
 	 * List providers that the broker stores but does not serve (and thus are kept
-	 * locally in agent.db). Maintained by {@link markBrokerLocalProvider} and
-	 * {@link unmarkBrokerLocalProvider}.
+	 * locally in agent.db) for a specific broker authority.
+	 * Maintained by {@link markBrokerLocalProvider} and {@link unmarkBrokerLocalProvider}.
 	 */
-	listBrokerLocalProviders(): string[] {
-		const rows = this.#db.query<{ provider: string }, []>("SELECT provider FROM auth_broker_local_providers").all();
+	listBrokerLocalProviders(brokerAuthority?: string): string[] {
+		if (!brokerAuthority) return [];
+		const rows = this.#db
+			.query<{ provider: string }, [string]>(
+				"SELECT provider FROM auth_broker_local_providers WHERE broker_authority = ?",
+			)
+			.all(brokerAuthority);
 		return rows.map(row => row.provider);
 	}
 
-	/** Record `provider` in {@link listBrokerLocalProviders}; a no-op when already listed. */
-	markBrokerLocalProvider(provider: string): void {
+	/** Record `provider` in {@link listBrokerLocalProviders} for a specific broker authority; a no-op when already listed. */
+	markBrokerLocalProvider(brokerAuthority: string, provider: string): void {
 		const now = Math.floor(Date.now() / 1000);
 		this.#db
-			.query("INSERT OR IGNORE INTO auth_broker_local_providers (provider, created_at) VALUES (?, ?)")
-			.run(provider, now);
+			.query(
+				"INSERT OR IGNORE INTO auth_broker_local_providers (broker_authority, provider, created_at) VALUES (?, ?, ?)",
+			)
+			.run(brokerAuthority, provider, now);
 	}
 
-	/** Drop `provider` from {@link listBrokerLocalProviders}, so its next login tries the broker again. */
-	unmarkBrokerLocalProvider(provider: string): void {
-		this.#db.query("DELETE FROM auth_broker_local_providers WHERE provider = ?").run(provider);
+	/** Drop `provider` from {@link listBrokerLocalProviders} for a specific broker authority, so its next login tries the broker again. */
+	unmarkBrokerLocalProvider(brokerAuthority: string, provider: string): void {
+		this.#db
+			.query("DELETE FROM auth_broker_local_providers WHERE broker_authority = ? AND provider = ?")
+			.run(brokerAuthority, provider);
+	}
+
+	/** Drop `provider` marker only if it has no remaining credentials, atomically in one transaction. Returns false if marker was deleted, true if rows remain. */
+	unmarkBrokerLocalProviderIfEmpty(brokerAuthority: string, provider: string): boolean {
+		const stillHasRows =
+			this.#db
+				.query<{ count: number }, [string]>(
+					"SELECT COUNT(*) as count FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL",
+				)
+				.get(provider)?.count ?? 0;
+		if (stillHasRows > 0) return true;
+		this.#db
+			.query("DELETE FROM auth_broker_local_providers WHERE broker_authority = ? AND provider = ?")
+			.run(brokerAuthority, provider);
+		return false;
 	}
 
 	/** Record a pending revocation for a broker credential that failed to disable. */

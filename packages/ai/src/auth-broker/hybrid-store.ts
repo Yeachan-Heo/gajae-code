@@ -67,12 +67,12 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 			opts.brokerAuthority ??
 			(opts.broker.client ? createHash("sha256").update(opts.broker.client.baseUrl).digest("hex") : undefined);
 		// Read authoritative routing from database; this will propagate errors if the database is inaccessible
-		this.#localProviders = new Set(opts.local.listBrokerLocalProviders());
+		this.#localProviders = new Set(opts.local.listBrokerLocalProviders(this.#brokerAuthority));
 	}
 
 	/** Re-read authoritative routing from the database rather than using the constructor-time cache. */
 	#refreshLocalProviders(): void {
-		this.#localProviders = new Set(this.#local.listBrokerLocalProviders());
+		this.#localProviders = new Set(this.#local.listBrokerLocalProviders(this.#brokerAuthority));
 	}
 
 	close(): void {
@@ -89,11 +89,18 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				await this.#broker.disableCredentialsById([brokerCredentialId], "auth-broker-no-serve");
 				this.#local.deletePendingRevocation(this.#brokerAuthority, provider, brokerCredentialId);
 			} catch (error) {
-				logger.warn("Failed to retry pending revocation for broker credential", {
-					provider,
-					brokerCredentialId,
-					error: String(error),
-				});
+				// P2-2: Treat broker 404 (confirmed absent) as completed (idempotent),
+				// while retrying transport/5xx failures.
+				if (error instanceof Error && error.message?.includes("404")) {
+					// Credential already disabled on broker side; delete pending record
+					this.#local.deletePendingRevocation(this.#brokerAuthority, provider, brokerCredentialId);
+				} else {
+					logger.warn("Failed to retry pending revocation for broker credential; will retry later", {
+						provider,
+						brokerCredentialId,
+						error: String(error),
+					});
+				}
 			}
 		}
 	}
@@ -174,10 +181,12 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.replaceAuthCredentialsRemote(provider, credentials);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					// P2-3: Commit local fallback credential AND ownership marker before disabling broker copy
+					// P1: Journal broker revocations BEFORE writing local fallback and marking provider local.
+					// This ensures if the process crashes after revocation is journaled but before the credential
+					// is written, the revocation will be retried at startup, avoiding orphaned unserved credentials.
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					this.#keepLocal(provider);
 					this.#local.replaceAuthCredentialsForProvider(provider, credentials);
-					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return this.listAuthCredentials(provider);
 				}
 				throw error;
@@ -193,10 +202,12 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.upsertAuthCredentialRemote(provider, credential);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					// P2-3: Commit local fallback credential AND ownership marker before disabling broker copy
+					// P1: Journal broker revocations BEFORE writing local fallback and marking provider local.
+					// This ensures if the process crashes after revocation is journaled but before the credential
+					// is written, the revocation will be retried at startup, avoiding orphaned unserved credentials.
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					this.#keepLocal(provider);
 					this.#local.upsertAuthCredentialForProvider(provider, credential);
-					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return this.listAuthCredentials(provider);
 				}
 				throw error;
@@ -540,17 +551,25 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		logger.warn("Auth broker does not serve this provider's logins; keeping them in the local agent.db", {
 			provider,
 		});
-		// P2-5: Errors propagate; re-read authoritative routing from database
-		this.#local.markBrokerLocalProvider(provider);
-		this.#refreshLocalProviders();
+		// P5: Scope fallback routing by broker authority so credentials that fell back under broker A
+		// do not get returned in broker B's session sharing the same agent.db.
+		if (this.#brokerAuthority) {
+			this.#local.markBrokerLocalProvider(this.#brokerAuthority, provider);
+			this.#refreshLocalProviders();
+		}
 	}
 
 	/** After a logout, send `provider`'s next login to the broker once no local login is left. */
 	#returnToBrokerIfEmpty(provider: string): void {
-		if (this.#local.listAuthCredentials(provider).length > 0) return;
-		// P2-5: Errors propagate; re-read authoritative routing from database
-		this.#local.unmarkBrokerLocalProvider(provider);
-		this.#refreshLocalProviders();
+		if (!this.#brokerAuthority) return;
+		// P3: Check if rows remain and unmark provider atomically in one transaction.
+		// This prevents a race where another instance writes a credential after we check
+		// but before we delete the marker, leaving fresh instances routing to broker instead of local.
+		const stillHasRows = this.#local.unmarkBrokerLocalProviderIfEmpty?.(this.#brokerAuthority, provider);
+		if (stillHasRows === false) {
+			// Marker was deleted successfully; refresh the cache
+			this.#refreshLocalProviders();
+		}
 	}
 
 	/** Disable credentials that were accepted by the broker but not served back (unserved). */
