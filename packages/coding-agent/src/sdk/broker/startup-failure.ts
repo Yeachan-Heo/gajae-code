@@ -236,6 +236,8 @@ export class BrokerStartupError extends Error {
 	readonly stderrExcerpt?: string;
 	/** The broker's trusted startup-exit record or marker says it refused an existing `broker.lock`. */
 	readonly lockRefused: boolean;
+	/** The specific reason why the lock was refused, when available. */
+	readonly refusalCode?: BrokerLockRefusalCode;
 	/**
 	 * Detailed reason including lock paths and cleanup guidance, available only for local CLI output.
 	 * API-facing responses should use `reason` instead, which is path-free.
@@ -253,10 +255,11 @@ export class BrokerStartupError extends Error {
 		reason: string;
 		stderrExcerpt?: string;
 		lockRefused?: boolean;
+		refusalCode?: BrokerLockRefusalCode;
 		detailedReason?: string;
 		detailedStderr?: string;
 	}) {
-		const isLockRefusal = fields.lockRefused ?? false;
+		const isLockRefusal = fields.lockRefused ?? fields.refusalCode !== undefined;
 		// For lock refusal errors, don't include stderr in the API-facing error message
 		const messageStderr = isLockRefusal ? undefined : fields.stderrExcerpt;
 		super(
@@ -268,6 +271,7 @@ export class BrokerStartupError extends Error {
 		this.reason = fields.reason;
 		this.stderrExcerpt = fields.stderrExcerpt;
 		this.lockRefused = isLockRefusal;
+		this.refusalCode = fields.refusalCode;
 		this.detailedReason = fields.detailedReason;
 		this.detailedStderr = fields.detailedStderr;
 	}

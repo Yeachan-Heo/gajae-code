@@ -1901,6 +1901,10 @@ async function ensureBrokerOnce(
 		const isLockRefusal =
 			trustedStartupExitRecord?.reason === "startup-lock-refused" ||
 			(trustedStartupExitRecord === undefined && trustedMarker?.lockRefusalCode !== undefined);
+		const refusalCode =
+			trustedStartupExitRecord?.reason === "startup-lock-refused"
+				? trustedStartupExitRecord.refusalCode
+				: trustedMarker?.lockRefusalCode;
 		const failure = spawnError
 			? brokerSpawnFailureError(spawnError)
 			: exitedBeforeDiscovery
@@ -1914,6 +1918,7 @@ async function ensureBrokerOnce(
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
 						detailedStderr: isLockRefusal && spawnLogTail.length > 0 ? spawnLogTail : undefined,
 						lockRefused: isLockRefusal,
+						refusalCode,
 					})
 				: discoveryError
 					? discoveryError

@@ -3536,13 +3536,16 @@ export class AcpAgent implements Agent {
 			if (normalized.refusalCode !== undefined) {
 				code = "broker_unavailable";
 				message = normalized.cleanupUnverified
-					? brokerLockRefusalApiMessage(normalized.refusalCode) + " Spawned broker cleanup was not verified."
+					? `${brokerLockRefusalApiMessage(normalized.refusalCode)} Spawned broker cleanup was not verified.`
 					: brokerLockRefusalApiMessage(normalized.refusalCode);
 			} else if (normalized.primaryError instanceof BrokerStartupError && normalized.primaryError.lockRefused) {
 				code = "broker_unavailable";
-				message = normalized.cleanupUnverified
-					? "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified). Spawned broker cleanup was not verified."
+				const refusalMsg = normalized.primaryError.refusalCode
+					? brokerLockRefusalApiMessage(normalized.primaryError.refusalCode)
 					: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+				message = normalized.cleanupUnverified
+					? `${refusalMsg} Spawned broker cleanup was not verified.`
+					: refusalMsg;
 			}
 
 			return { ok: false, error: { code, message } };

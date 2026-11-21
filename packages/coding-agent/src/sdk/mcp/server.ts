@@ -142,13 +142,16 @@ function resultError(error: unknown): { ok: false; error: { code: string; messag
 		};
 	}
 	if (normalized.primaryError instanceof BrokerStartupError && normalized.primaryError.lockRefused) {
+		const refusalMsg = normalized.primaryError.refusalCode
+			? brokerLockRefusalApiMessage(normalized.primaryError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
 		return {
 			ok: false,
 			error: {
 				code: "broker_unavailable",
 				message: normalized.cleanupUnverified
-					? "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified). Spawned broker cleanup was not verified."
-					: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).",
+					? `${refusalMsg} Spawned broker cleanup was not verified.`
+					: refusalMsg,
 			},
 		};
 	}

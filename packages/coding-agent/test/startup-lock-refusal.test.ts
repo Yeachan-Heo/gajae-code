@@ -9,7 +9,11 @@ import { Broker } from "../src/sdk/broker/broker";
 import { brokerStartupExitRecordPath, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { ensureBroker, reapFailedBrokerLaunch } from "../src/sdk/broker/ensure";
-import { BrokerLockRefusedError } from "../src/sdk/broker/lock-refusal";
+import {
+	BrokerLockRefusedError,
+	brokerLockRefusalApiMessage,
+	normalizeBrokerLockRefusalError,
+} from "../src/sdk/broker/lock-refusal";
 import {
 	BrokerStartupError,
 	type BrokerStartupFailureMarker,
@@ -423,36 +427,63 @@ describe("SDK MCP error redaction for lock refusal", () => {
 });
 
 describe("ACP error redaction for lock refusal", () => {
-	it("redacts lock paths from ACP _gjc/sdk/global error responses for BrokerStartupError with lockRefused=true", async () => {
-		const dir = await temp();
-		const lockPath = path.join(dir, "sdk", "broker.lock");
-		try {
-			const startupError = new BrokerStartupError({
-				exitCode: 1,
-				signal: null,
-				reason: `SDK broker startup refused existing lock ${lockPath} (live_owner).`,
-				stderrExcerpt: `Some broker stderr\nCode: live_owner\nLock: ${lockPath}`,
-				lockRefused: true,
-			});
+	it("uses code-specific messages for each BrokerStartupError refusal code", async () => {
+		// Test live_owner: message should indicate lock is held by a live owner
+		const liveOwnerError = new BrokerStartupError({
+			exitCode: 1,
+			signal: null,
+			reason: "SDK broker startup refused existing lock.",
+			lockRefused: true,
+			refusalCode: "live_owner",
+		});
+		const liveOwnerMsg = liveOwnerError.refusalCode
+			? brokerLockRefusalApiMessage(liveOwnerError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+		expect(liveOwnerMsg).toBe("SDK broker startup refused existing lock, held by a live owner.");
 
-			// Simulate ACP error handling: when a BrokerStartupError with lockRefused=true is caught,
-			// it should be converted to a broker_unavailable error without exposing the lock path
-			const redactedCode = startupError.lockRefused ? "broker_unavailable" : startupError.code;
-			const redactedMessage = startupError.lockRefused
-				? "SDK broker startup refused existing lock (live owner)."
-				: startupError.message;
+		// Test host_unqualified: message should indicate liveness cannot be verified
+		const hostUnqualifiedError = new BrokerStartupError({
+			exitCode: 1,
+			signal: null,
+			reason: "SDK broker startup refused existing lock.",
+			lockRefused: true,
+			refusalCode: "host_unqualified",
+		});
+		const hostUnqualifiedMsg = hostUnqualifiedError.refusalCode
+			? brokerLockRefusalApiMessage(hostUnqualifiedError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+		expect(hostUnqualifiedMsg).toBe(
+			"SDK broker startup refused existing lock, held by an owner whose liveness cannot be verified.",
+		);
 
-			// Verify the redacted message doesn't contain the lock path
-			expect(redactedMessage).not.toContain(lockPath);
-			expect(redactedMessage).not.toContain("Broker stderr");
-			expect(redactedCode).toBe("broker_unavailable");
+		// Test foreign_host: message should indicate liveness cannot be verified
+		const foreignHostError = new BrokerStartupError({
+			exitCode: 1,
+			signal: null,
+			reason: "SDK broker startup refused existing lock.",
+			lockRefused: true,
+			refusalCode: "foreign_host",
+		});
+		const foreignHostMsg = foreignHostError.refusalCode
+			? brokerLockRefusalApiMessage(foreignHostError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+		expect(foreignHostMsg).toBe(
+			"SDK broker startup refused existing lock, held by an owner whose liveness cannot be verified.",
+		);
 
-			// Verify the original error still has the full details
-			expect(startupError.message).toContain(lockPath);
-			expect(startupError.reason).toContain(lockPath);
-		} finally {
-			await fs.rm(dir, { recursive: true, force: true });
-		}
+		// Test without refusal code: should fall back to generic message
+		const noCodeError = new BrokerStartupError({
+			exitCode: 1,
+			signal: null,
+			reason: "SDK broker startup refused existing lock.",
+			lockRefused: true,
+		});
+		const noCodeMsg = noCodeError.refusalCode
+			? brokerLockRefusalApiMessage(noCodeError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+		expect(noCodeMsg).toBe(
+			"SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).",
+		);
 	});
 
 	it("redacts lock paths from ACP error responses for BrokerLockRefusedError", async () => {
@@ -479,6 +510,46 @@ describe("ACP error redaction for lock refusal", () => {
 			expect(refusal.lockPath).toBe(lockPath);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses code-specific messages when BrokerStartupError refusal code is available", async () => {
+		// Simulate ACP adapter behavior with normalizeBrokerLockRefusalError
+		// Test each refusal code generates the correct message
+		const codes: Array<{ code: "live_owner" | "host_unqualified" | "foreign_host"; expectedContains: string }> = [
+			{ code: "live_owner", expectedContains: "held by a live owner" },
+			{ code: "host_unqualified", expectedContains: "liveness cannot be verified" },
+			{ code: "foreign_host", expectedContains: "liveness cannot be verified" },
+		];
+
+		for (const { code, expectedContains } of codes) {
+			const error = new BrokerStartupError({
+				exitCode: 1,
+				signal: null,
+				reason: "SDK broker startup refused existing lock.",
+				lockRefused: true,
+				refusalCode: code,
+			});
+
+			// Simulate what the adapter does with normalizeBrokerLockRefusalError
+			const normalized = normalizeBrokerLockRefusalError(error);
+
+			// When refusalCode is not available from normalizeBrokerLockRefusalError (since it only extracts from BrokerLockRefusedError),
+			// the adapter checks for BrokerStartupError with lockRefused and uses the error's refusalCode directly
+			let message: string;
+			if (normalized.refusalCode !== undefined) {
+				message = brokerLockRefusalApiMessage(normalized.refusalCode);
+			} else if (normalized.primaryError instanceof BrokerStartupError && normalized.primaryError.lockRefused) {
+				// This is what the adapters do - use refusalCode from the BrokerStartupError if available
+				message = normalized.primaryError.refusalCode
+					? brokerLockRefusalApiMessage(normalized.primaryError.refusalCode)
+					: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+			} else {
+				message = "Unexpected error";
+			}
+
+			expect(message).toContain(expectedContains);
+			expect(message).not.toContain("/"); // No paths
 		}
 	});
 });
