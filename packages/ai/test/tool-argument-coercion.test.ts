@@ -1434,6 +1434,122 @@ describe("Tool argument coercion", () => {
 		});
 	});
 
+	describe("chained local $ref resolution", () => {
+		it("preserves null through 2-hop chained $refs", () => {
+			// A -> B -> final type accepting null
+			const tool: Tool = {
+				name: "chained_2hop",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { type: ["string", "null"] },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-2hop",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("removes null through 2-hop chained $refs when final type rejects null", () => {
+			// A -> B -> final type NOT accepting null
+			const tool: Tool = {
+				name: "chained_2hop_nonull",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { type: "string" },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-2hop-nonull",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1" });
+		});
+
+		it("preserves null through 3-hop chained $refs", () => {
+			// A -> B -> C -> final type accepting null
+			const tool: Tool = {
+				name: "chained_3hop",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { $ref: "#/$defs/refC" },
+						refC: { type: ["string", "null"] },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-3hop",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("removes null through 3-hop chained $refs when final type rejects null", () => {
+			// A -> B -> C -> final type NOT accepting null
+			const tool: Tool = {
+				name: "chained_3hop_nonull",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { $ref: "#/$defs/refC" },
+						refC: { type: "string" },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-3hop-nonull",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1" });
+		});
+	});
+
 	describe("nullable normalization invariants (property-based)", () => {
 		it("preserves accepted null across anyOf schema variants", () => {
 			const tool: Tool = {

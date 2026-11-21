@@ -30,8 +30,8 @@ import type { RawArgumentRejectionCode, RawArgumentRejectionDetail, Tool, ToolCa
 import { upgradeJsonSchemaTo202012 } from "./schema/draft";
 import {
 	isJsonSchemaValueValid,
+	isJsonSchemaValueValidWithRoot,
 	type JsonSchemaValidationIssue,
-	resolveLocalRef,
 	validateJsonSchemaValue,
 } from "./schema/json-schema-validator";
 import { isZodSchema, zodToWireSchema } from "./schema/wire";
@@ -558,35 +558,20 @@ function deleteAtSegment(node: unknown, segments: string[], depth: number): unkn
  * @param rootSchema Optional root schema for resolving $ref pointers
  */
 function branchMatchesSchema(branch: unknown, value: unknown, rootSchema?: unknown): boolean {
-	// If a rootSchema is provided and the branch contains a $ref, we need to resolve it
-	// against the root schema before validation
-	if (rootSchema && typeof branch === "object" && branch !== null) {
-		const branchObj = branch as Record<string, unknown>;
-		if (typeof branchObj.$ref === "string") {
-			const resolved = resolveLocalRef(rootSchema, branchObj.$ref);
-			if (resolved) {
-				return isJsonSchemaValueValid(resolved, value);
-			}
-		}
+	if (rootSchema) {
+		// Keep the root schema context through $ref resolution so chained refs work correctly
+		return isJsonSchemaValueValidWithRoot(branch, value, rootSchema);
 	}
 	return isJsonSchemaValueValid(branch, value);
 }
 
 /**
  * Check if a schema accepts a given value, with support for $ref resolution.
- * If rootSchema is provided, it will be used to resolve $ref pointers.
+ * If rootSchema is provided, it will be used to resolve $ref pointers through chained refs.
  */
 function isSchemaValueValidWithRoot(schema: unknown, value: unknown, rootSchema: unknown): boolean {
-	if (typeof schema === "object" && schema !== null) {
-		const schemaObj = schema as Record<string, unknown>;
-		if (typeof schemaObj.$ref === "string") {
-			const resolved = resolveLocalRef(rootSchema, schemaObj.$ref);
-			if (resolved) {
-				return isJsonSchemaValueValid(resolved, value);
-			}
-		}
-	}
-	return isJsonSchemaValueValid(schema, value);
+	// Keep the root schema context through $ref resolution so chained refs work correctly
+	return isJsonSchemaValueValidWithRoot(schema, value, rootSchema);
 }
 
 function normalizeOptionalNullsForSchema(
