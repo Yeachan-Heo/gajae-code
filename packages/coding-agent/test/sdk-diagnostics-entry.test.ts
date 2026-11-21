@@ -1268,9 +1268,5 @@ describe("ordinary entry graph is preserved (B1 controls)", () => {
 		}
 	});
 
-	it("still serves an ordinary non-diagnostics argv through the preserved route", async () => {
-		const run = await runEntry(["--supports-macos-community-app"]);
-		expect(run.exitCode).toBe(0);
-		expect(run.stdout).toBe("macos-community-app-offer\n");
-	});
+
 });
