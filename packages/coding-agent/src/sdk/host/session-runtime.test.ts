@@ -784,6 +784,29 @@ describe("SDK goal snapshot lifecycle", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	test("does not restore goal accounting baseline when resuming without goal tool", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-no-tool-"));
+		try {
+			const sessionId = "session-with-goal-no-tool";
+			const goalEntry = goalModeEntry(sessionId, 50);
+
+			// Simulate resumed session with active goal in the branch.
+			// When goal tool is available, queryGoalState should return the goal.
+			const resumedState = await queryGoalState(
+				extensionContext(sessionId, cwd, { branch: [goalEntry] }),
+				sessionId,
+			);
+
+			// Goal should be restored when goal tool is available
+			expect(resumedState).toMatchObject({
+				enabled: true,
+				goal: { status: "active", tokensUsed: 50 },
+			});
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
 
 test("preserves an agent failure code in host prompt reconciliation", async () => {
