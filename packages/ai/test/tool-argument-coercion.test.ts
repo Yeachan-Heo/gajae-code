@@ -1857,5 +1857,85 @@ describe("Tool argument coercion", () => {
 				{ numRuns: 50 },
 			);
 		});
+
+		it("enforces sibling constraints when $ref is present (property-based)", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 1 }).chain(strategy =>
+						fc
+							.record({
+								testNull: fc.boolean(),
+							})
+							.map(({ testNull }) => ({ strategy, testNull })),
+					),
+					config => {
+						// Strategy 0: $ref to union + sibling type constraint
+						// Strategy 1: $ref to union + sibling enum constraint
+						let propertySchema: Record<string, unknown>;
+
+						if (config.strategy === 0) {
+							// $ref accepts string|number, but sibling type:string further constrains
+							propertySchema = {
+								$ref: "#/$defs/StringOrNumber",
+								type: "string",
+							};
+						} else {
+							// $ref accepts string|boolean, but sibling enum constrains to ["a", "b"]
+							propertySchema = {
+								$ref: "#/$defs/StringOrBoolean",
+								enum: ["a", "b"],
+							};
+						}
+
+						const tool: Tool = {
+							name: "sibling_constraint_test",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									value: propertySchema,
+								},
+								required: ["id"],
+								$defs: {
+									StringOrNumber: { type: ["string", "number"] },
+									StringOrBoolean: { type: ["string", "boolean"] },
+								},
+							},
+						};
+
+						if (config.testNull) {
+							// Test with null: should be rejected due to sibling constraints
+							const toolCall: ToolCall = {
+								type: "toolCall",
+								id: `call-sibling-null-${config.strategy}`,
+								name: tool.name,
+								arguments: { id: "test", value: null },
+							};
+
+							const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+							// Sibling constraints should reject null
+							expect("value" in result).toBe(false);
+						} else {
+							// Test with valid value: should be accepted
+							const value = config.strategy === 0 ? "hello" : "a";
+							const toolCall: ToolCall = {
+								type: "toolCall",
+								id: `call-sibling-valid-${config.strategy}`,
+								name: tool.name,
+								arguments: { id: "test", value },
+							};
+
+							const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+							// Valid values should be preserved
+							expect(result.value).toBe(value);
+						}
+					},
+				),
+				{ numRuns: 50 },
+			);
+		});
 	});
 });

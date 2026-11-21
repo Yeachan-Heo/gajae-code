@@ -167,6 +167,7 @@ function validateSchemaNode(
 		return false;
 	}
 
+	let valid = true;
 	const ref = schema.$ref;
 	if (typeof ref === "string") {
 		const resolved = resolveLocalRef(ctx.root, ref);
@@ -194,12 +195,10 @@ function validateSchemaNode(
 		const ok = validateSchemaNode(resolved, value, path, ctx, issues);
 		if (pairKey !== undefined) ctx.seenPairs.delete(pairKey);
 		else ctx.refDepth -= 1;
-		return ok;
+		valid = ok && valid;
+		// Note: $ref does not short-circuit; sibling keywords are evaluated conjunctively.
 	}
 
-	if (value === null && schema.nullable === true) return true;
-
-	let valid = true;
 	const types = schemaTypes(schema);
 	if (types.length > 0 && !types.some(type => matchesJsonSchemaType(value, type))) {
 		pushIssue(issues, path, `expected ${types.join(" or ")}, received ${typeOfJsonValue(value)}`, {

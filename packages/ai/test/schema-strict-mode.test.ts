@@ -814,6 +814,73 @@ describe("json-schema validator unsupported-keyword regressions", () => {
 		const schema = { $ref: "#/definitions/A0", definitions };
 		expect(isJsonSchemaValueValid(schema, "not-a-number")).toBe(false);
 	});
+
+	it("applies $ref AND sibling type constraint conjunctively: rejects null when ref accepts string|null but sibling says type:string", () => {
+		const schema = {
+			$ref: "#/definitions/StringOrNull",
+			type: "string",
+			definitions: {
+				StringOrNull: { type: ["string", "null"] },
+			},
+		};
+		// The reference accepts string|null, but the sibling type:string constraint should reject null
+		expect(isJsonSchemaValueValid(schema, "hello")).toBe(true);
+		expect(isJsonSchemaValueValid(schema, null)).toBe(false);
+	});
+
+	it("applies $ref AND sibling enum constraint conjunctively", () => {
+		const schema = {
+			$ref: "#/definitions/StringOrNumber",
+			enum: ["a", "b"],
+			definitions: {
+				StringOrNumber: { type: ["string", "number"] },
+			},
+		};
+		// The reference accepts string|number, but enum constrains to ["a", "b"]
+		expect(isJsonSchemaValueValid(schema, "a")).toBe(true);
+		expect(isJsonSchemaValueValid(schema, "c")).toBe(false);
+		expect(isJsonSchemaValueValid(schema, 42)).toBe(false);
+	});
+
+	it("applies $ref AND sibling const constraint conjunctively", () => {
+		const schema = {
+			$ref: "#/definitions/StringOrBoolean",
+			const: "exact",
+			definitions: {
+				StringOrBoolean: { type: ["string", "boolean"] },
+			},
+		};
+		// The reference accepts string|boolean, but const constrains to "exact"
+		expect(isJsonSchemaValueValid(schema, "exact")).toBe(true);
+		expect(isJsonSchemaValueValid(schema, "other")).toBe(false);
+		expect(isJsonSchemaValueValid(schema, true)).toBe(false);
+	});
+
+	it("preserves existing $ref behavior when no sibling constraints conflict", () => {
+		const schema = {
+			$ref: "#/definitions/StringType",
+			definitions: {
+				StringType: { type: "string" },
+			},
+		};
+		// Without conflicting sibling constraints, $ref validation should work as before
+		expect(isJsonSchemaValueValid(schema, "hello")).toBe(true);
+		expect(isJsonSchemaValueValid(schema, 42)).toBe(false);
+	});
+
+	it("applies $ref AND sibling pattern constraint to strings", () => {
+		const schema = {
+			$ref: "#/definitions/StringType",
+			pattern: "^[a-z]+$",
+			definitions: {
+				StringType: { type: "string" },
+			},
+		};
+		// The reference accepts any string, but sibling pattern constrains to lowercase letters
+		expect(isJsonSchemaValueValid(schema, "abc")).toBe(true);
+		expect(isJsonSchemaValueValid(schema, "ABC")).toBe(false);
+		expect(isJsonSchemaValueValid(schema, "123")).toBe(false);
+	});
 });
 
 describe("meta-validator conditional keywords", () => {
