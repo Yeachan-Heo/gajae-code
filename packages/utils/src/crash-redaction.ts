@@ -109,7 +109,7 @@ const V1_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
 	CREDENTIAL_CAMEL_SIMPLE_SUFFIXES_V1,
 );
 const COOKIE_VALUE_PATTERN =
-	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+	/(?:(?<![A-Za-z0-9_-])|(?<=\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?[ \t]*[:=][ \t]*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
 // Cap key inspection; YAML permits the chomping and indentation indicators in either order.
 const YAML_BLOCK_SCALAR_HEADER_PATTERN =
 	/^([ \t]*(?:-[ \t]+)?)(?:"([^"\r\n]{1,128})"|'([^'\r\n]{1,128})'|([A-Za-z0-9][A-Za-z0-9_. \t-]{0,127}?))[ \t]*:[ \t]*(?:[ \t]+(?:&[^ \t\r\n]{1,128}|![^ \t\r\n]{1,128}))*[ \t]*([|>](?:[1-9][+-]?|[+-][1-9]?)?)(?:[ \t]+#.*|[ \t]*)$/;
@@ -475,20 +475,34 @@ function redactCredentialValue(
 	if (unclosedBacktickQuoted !== undefined && unclosedBacktickOpen !== undefined) {
 		return `${prefix}${unclosedBacktickOpen}«redacted»`;
 	}
+	// Skip bare opening brackets at end of line (structural, not a credential value).
+	// This can occur in preserving-line mode where container brackets are preserved on separate lines.
+	if (/^[\[\{]\s*$/.test(value)) {
+		return _match;
+	}
 	return `${prefix}«redacted»`;
 }
 
-function redactCredentialContainers(text: string, rules: CredentialRedactionRules): string {
+function redactCredentialContainers(
+	text: string,
+	rules: CredentialRedactionRules,
+	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
+): string {
 	if (!rules.containerCandidatePattern.test(text)) return text;
 	const assignment = new RegExp(String.raw`${rules.assignmentPrefix}(?=[\[{])`, "gi");
 	const camelAssignment = new RegExp(String.raw`${rules.camelAssignmentPrefix}(?=[\[{])`, "g");
 	return redactCredentialContainersWithPattern(
-		redactCredentialContainersWithPattern(text, assignment),
+		redactCredentialContainersWithPattern(text, assignment, placeholderHook),
 		camelAssignment,
+		placeholderHook,
 	);
 }
 
-function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
+function redactCredentialContainersWithPattern(
+	text: string,
+	assignment: RegExp,
+	placeholderHook: PlaceholderHook = defaultPlaceholderHook,
+): string {
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
@@ -506,7 +520,8 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 			assignment.lastIndex = containerEnd;
 			continue;
 		}
-		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+		const placeholder = placeholderHook(container, "«redacted»");
+		output += `${text.slice(copiedUntil, containerStart)}${placeholder}`;
 		copiedUntil = containerEnd;
 		assignment.lastIndex = containerEnd;
 	}
@@ -609,3 +624,348 @@ export const CRASH_REDACTION_MARKERS: readonly string[] = [
 	"«redacted-url-credential»",
 	"«redacted»",
 ];
+
+/**
+ * Hook for handling placeholder generation with awareness of multi-line content.
+ * Returns the placeholder for matched text, potentially with line structure preservation.
+ */
+type PlaceholderHook = (matchedText: string, placeholder: string) => string;
+
+/**
+ * Default placeholder hook: returns the placeholder unchanged (byte-identical for single-line).
+ */
+function defaultPlaceholderHook(_matchedText: string, placeholder: string): string {
+	return placeholder;
+}
+
+/**
+ * Line-preserving placeholder hook.
+ * For multi-line matches, preserves line structure by:
+ * 1. Keeping first line verbatim if it's only brackets/whitespace, else use placeholder
+ * 2. For continuation lines: leading whitespace + placeholder + trailing [\ s\]\}\),;]*
+ *    or keep verbatim if only brackets/whitespace/commas
+ *
+ * This ensures line count and structure are preserved for diff scrubbing.
+ */
+function linePreservingPlaceholderHook(matchedText: string, placeholder: string): string {
+	const lines = matchedText.split("\n");
+	if (lines.length === 1) {
+		// Single line: use placeholder
+		return placeholder;
+	}
+
+	// Multi-line: preserve structure
+	const result: string[] = [];
+
+	// First line: keep verbatim if only brackets/whitespace, or if it ends with an opening bracket
+	const firstLine = lines[0];
+	if (/^[\s[\]{},]*$/.test(firstLine)) {
+		// Only brackets/whitespace/commas: keep as-is
+		result.push(firstLine);
+	} else if (/[[{][ \t]*$/.test(firstLine)) {
+		// Ends with an opening bracket: preserve the line as-is to maintain bracket structure
+		result.push(firstLine);
+	} else {
+		// Has content: use placeholder
+		result.push(placeholder);
+	}
+
+	// Continuation lines: leading whitespace + placeholder + trailing bracket/punct, or keep verbatim
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (/^[\s[\]{},;)]*$/.test(line)) {
+			// Only brackets/whitespace/commas/semicolons/parens: keep as-is
+			result.push(line);
+		} else {
+			// Extract leading whitespace and trailing punctuation
+			const leadingMatch = line.match(/^(\s*)/);
+			const leadingWs = leadingMatch ? leadingMatch[1] : "";
+
+			// Extract trailing run of \s\]\}\),;
+			const trailingMatch = line.match(/([\s\]}),;]*)$/);
+			const trailingPunct = trailingMatch ? trailingMatch[1] : "";
+
+			result.push(leadingWs + placeholder + trailingPunct);
+		}
+	}
+
+	// Verify line count matches
+	if (result.length !== lines.length) {
+		throw new Error(
+			`Line count mismatch in linePreservingPlaceholderHook: original ${lines.length}, result ${result.length}`,
+		);
+	}
+
+	const returnValue = result.join("\n");
+	return returnValue;
+}
+
+/**
+ * Wrapper around replaceAll that preserves newline counts in matched text.
+ * When a match containing N newlines is replaced, adds (N - replacedNewlines) extra newlines.
+ * This ensures line count is preserved when redacting multi-line content.
+ *
+ * For multi-line matches, redacts each line in the match separately to ensure each line
+ * of a multi-line credential is redacted (not just the first line + blank lines).
+ */
+function replacePreservingLines(
+	text: string,
+	pattern: RegExp,
+	replacement: string | ((...args: any[]) => string),
+): string {
+	if (typeof replacement === "string") {
+		// String replacement with capture group expansion
+		return text.replace(pattern, (...args) => {
+			const match = args[0];
+			const originalNewlines = (match.match(/\n/g) || []).length;
+			// Expand capture groups in the replacement string
+			const expanded = match.replace(new RegExp(pattern.source, pattern.flags.replace(/g/g, "")), replacement);
+			const replacedNewlines = (expanded.match(/\n/g) || []).length;
+			const extraNewlines = "\n".repeat(Math.max(0, originalNewlines - replacedNewlines));
+			return expanded + extraNewlines;
+		});
+	}
+
+	// Function replacement: need to track the matched text and count its newlines
+	return text.replace(pattern, (...args) => {
+		const match = args[0];
+		const originalNewlines = (match.match(/\n/g) || []).length;
+		const replacedText = replacement(...args);
+		const replacedNewlines = (replacedText.match(/\n/g) || []).length;
+		const extraNewlines = "\n".repeat(Math.max(0, originalNewlines - replacedNewlines));
+		return replacedText + extraNewlines;
+	});
+}
+
+/**
+ * Like redactCrashSecrets, but preserves line count using line-aware placeholder hooks.
+ * This is essential for diff scrubbing where projections rely on exact line counts.
+ *
+ * Uses the same redaction rules as redactCrashSecrets, but applies a line-preserving
+ * placeholder hook to multi-line credential containers.
+ */
+export function redactCrashSecretsPreservingLines(text: string): string {
+	// Use the current rules (not V1)
+	return redactCrashSecretsWithRulesPreservingLines(text, CURRENT_CREDENTIAL_REDACTION_RULES);
+}
+
+/**
+ * Internal version of redactCrashSecretsWithRules that preserves line counts.
+ */
+function redactCrashSecretsWithRulesPreservingLines(text: string, rules: CredentialRedactionRules): string {
+	// Redact folded headers first (already works line-by-line)
+	let redacted = redactFoldedHeaders(text, rules);
+	// Then container redaction with line-preserving hook
+	redacted = redactCredentialContainers(redacted, rules, linePreservingPlaceholderHook);
+	// Block scalar bodies (already works line-by-line, preserving structure)
+	redacted = redactYamlBlockScalars(redacted, rules);
+
+	// All remaining replaces use the line-preserving wrapper
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+		"«redacted-auth»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+		"«redacted-jwt»",
+	);
+	redacted = replacePreservingLines(redacted, /\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
+	redacted = replacePreservingLines(redacted, /\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, "«redacted-github-token»");
+	redacted = replacePreservingLines(redacted, /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "«redacted-github-token»");
+	redacted = replacePreservingLines(redacted, /\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "«redacted-slack-token»");
+	redacted = replacePreservingLines(redacted, /\bnpm_[A-Za-z0-9]{20,}\b/g, "«redacted-npm-token»");
+	redacted = replacePreservingLines(redacted, /\bglpat-[A-Za-z0-9_-]{20,}\b/g, "«redacted-gitlab-token»");
+	redacted = replacePreservingLines(redacted, /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, "«redacted-api-key»");
+	redacted = replacePreservingLines(redacted, /\bhf_[A-Za-z0-9]{20,}\b/g, "«redacted-api-key»");
+	redacted = replacePreservingLines(
+		redacted,
+		/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+		"«redacted-private-key»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g,
+		"«redacted-google-api-key»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(^|[^A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]*@/gi,
+		"$1$2«redacted-url-credential»@",
+	);
+	redacted = replacePreservingLines(redacted, /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	redacted = replacePreservingLines(redacted, COOKIE_VALUE_PATTERN, (_match: string, prefix: string, value: string) =>
+		parseCredentialYamlBlockScalarHeader(_match) === undefined
+			? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
+			: _match,
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		rules.authValuePattern,
+		(_match, prefix: string) => `${prefix}«redacted»`,
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
+		(_match: string, prefix: string) =>
+			parseCredentialYamlBlockScalarHeader(_match) === undefined ? `${prefix}«redacted»` : _match,
+	);
+
+	if (rules.assignmentCandidatePattern.test(redacted)) {
+		redacted = replacePreservingLines(
+			redacted,
+			rules.escapedBacktickValuePattern,
+			(_match: string, prefix: string, open: string, _value: string, close: string) =>
+				`${prefix}${open}«redacted»${close}`,
+		);
+		redacted = replacePreservingLines(
+			redacted,
+			rules.escapedBacktickUnclosedPattern,
+			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
+		);
+		redacted = replacePreservingLines(redacted, rules.valuePattern, redactCredentialValue);
+	}
+	if (rules.camelAssignmentCandidatePattern.test(redacted)) {
+		redacted = replacePreservingLines(
+			redacted,
+			rules.camelEscapedBacktickValuePattern,
+			(_match: string, prefix: string, open: string, _value: string, close: string) =>
+				`${prefix}${open}«redacted»${close}`,
+		);
+		redacted = replacePreservingLines(
+			redacted,
+			rules.camelEscapedBacktickUnclosedPattern,
+			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
+		);
+		redacted = replacePreservingLines(redacted, rules.camelValuePattern, redactCredentialValue);
+	}
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_])(["']?session(?:id|[_-]id)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		"$1«redacted»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9_%])(session(?:id|[_-]id)%3[Dd])[A-Za-z0-9._~%-]{8,}/gi,
+		"$1«redacted»",
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{0,39}[/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g,
+		"«redacted-aws-key»",
+	);
+	return redacted;
+}
+
+/**
+ * Redact indented continuation lines following credential headers.
+ * Handles folded headers like:
+ *   Authorization: Bearer
+ *     token-value-here
+ *   next-line
+ *
+ * Headers that end with a credential keyword followed by optional whitespace
+ * but no value should have their indented continuation lines redacted.
+ */
+function redactFoldedHeaders(text: string, rules: CredentialRedactionRules): string {
+	const output: string[] = [];
+	const lines = text.split("\n");
+	let i = 0;
+
+	while (i < lines.length) {
+		const line = lines[i];
+
+		// Check if this line is a credential header with no value on the same line
+		// Pattern: optional whitespace + credential key + optional whitespace + colon + optional whitespace + end of line
+		// Or with leading diff marker: +/- + optional whitespace + credential key + colon + optional whitespace + end
+		const prefixMatch = line.match(/^([+-]?\s*)(.+?)\s*:\s*$/);
+		if (prefixMatch) {
+			const [, , headerContent] = prefixMatch;
+			const trimmedHeader = headerContent.trim();
+
+			// Check if header content ends with a credential keyword
+			if (
+				isCredentialKeyWithRules(trimmedHeader, rules) ||
+				trimmedHeader.match(
+					/(?:auth|authorization|cookie|token|password|secret)(?:\s+(?:Bearer|Basic|Token))?\s*$/i,
+				)
+			) {
+				// This is a credential header with no value on the same line
+				// Emit the header line as-is
+				output.push(line);
+				i += 1;
+
+				// Redact all following indented lines until we hit a non-indented line
+				while (i < lines.length) {
+					const continuationLine = lines[i];
+
+					// Check if this line is indented or is an opening bracket (which starts a container)
+					const continuationMatch = continuationLine.match(/^([+-]?)(\s+)(.*)$/);
+					if (continuationMatch) {
+						const [, diffPrefix, indent, content] = continuationMatch;
+						// Check if this line opens a container (bracket)
+						if (content.trim() === "[" || content.trim() === "{") {
+							// This line opens a container; preserve the line and redact contents
+							const openBracket = content.trim()[0];
+							const closeBracket = openBracket === "[" ? "]" : "}";
+							output.push(continuationLine);
+							i += 1;
+
+							// Redact all lines inside the container until we find the closing bracket
+							let bracketDepth = 1;
+							while (i < lines.length && bracketDepth > 0) {
+								const containerLine = lines[i];
+								const containerMatch = containerLine.match(/^([+-]?)(.*)$/);
+								if (!containerMatch) {
+									i += 1;
+									continue;
+								}
+
+								const [, containerDiffPrefix, containerContent] = containerMatch;
+								// Count brackets to track nesting
+								for (const char of containerContent) {
+									if (char === openBracket) {
+										bracketDepth += 1;
+									} else if (char === closeBracket) {
+										bracketDepth -= 1;
+									}
+								}
+
+								if (bracketDepth > 0) {
+									// Inside the container: redact the content
+									output.push(`${containerDiffPrefix}  «redacted»`);
+								} else {
+									// Closing bracket line: preserve it
+									output.push(containerLine);
+								}
+								i += 1;
+							}
+							continue;
+						}
+
+						// Not a bracket: redact the continuation line content, preserving diff prefix and indent
+						if (indent.length >= 1 || !content.trim()) {
+							// Any non-zero indentation or empty: redact it
+							output.push(`${diffPrefix}${indent}«redacted»`);
+							i += 1;
+						} else {
+							// Only 1 space indentation and not empty: stop folded header processing
+							break;
+						}
+					} else {
+						// Not indented or end of input: stop folded header processing
+						break;
+					}
+				}
+				continue;
+			}
+		}
+
+		// Not a credential header with no value: pass through unchanged
+		output.push(line);
+		i += 1;
+	}
+
+	return output.join("\n");
+}

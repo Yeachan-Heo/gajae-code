@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { computeHandledErrorFingerprint, NO_APP_FRAME } from "../src/crash-fingerprint";
-import { isCredentialKey, redactCrashSecrets } from "../src/crash-redaction";
+import { isCredentialKey, redactCrashSecrets, redactCrashSecretsPreservingLines } from "../src/crash-redaction";
 import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash, recordHandledError } from "../src/postmortem";
 
 const trackedTempDirs: string[] = [];
@@ -1310,6 +1310,94 @@ after=keep`;
 		const bogus = path.join(fileAsParent, "nested", "gjc-crash.log");
 		const result = recordFatalCrash("Uncaught Exception", new Error("x"), { path: bogus });
 		expect(result).toBeUndefined();
+	});
+
+	describe("redactCrashSecretsPreservingLines", () => {
+		it("preserves line count for single-line replacements", () => {
+			const input = "password=secret token=another-secret";
+			const redacted = redactCrashSecretsPreservingLines(input);
+			expect(redacted.split("\n")).toHaveLength(input.split("\n").length);
+			expect(redacted).not.toContain("secret");
+			expect(redacted).not.toContain("another-secret");
+		});
+
+		it("preserves line count for multi-line PEM block redaction", () => {
+			const pemBlock = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQE
+FAOCBKcwggSjAgEAAoIBAQC+W2onQVt
+-----END PRIVATE KEY-----`;
+			const originalLines = pemBlock.split("\n").length;
+			const redacted = redactCrashSecretsPreservingLines(pemBlock);
+			const redactedLines = redacted.split("\n").length;
+			expect(redactedLines).toBe(originalLines);
+			expect(redacted).not.toContain("BEGIN PRIVATE KEY");
+			expect(redacted).toContain("«redacted-private-key»");
+		});
+
+		it("preserves line count for multi-line JSON credential redaction", () => {
+			const input = `{
+  "credentials": {
+    "token": "secret123",
+    "key": "keyvalue"
+  },
+  "other": "value"
+}`;
+			const originalLines = input.split("\n").length;
+			const redacted = redactCrashSecretsPreservingLines(input);
+			const redactedLines = redacted.split("\n").length;
+			expect(redactedLines).toBe(originalLines);
+			// JSON structure should be preserved
+			expect(redacted).toContain("{");
+			expect(redacted).toContain("}");
+		});
+
+		it("preserves line count for folded header redaction", () => {
+			const input = `Authorization:
+  Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+  .eyJzdWIiOiIxMjM0NTY3ODkwIn0`;
+			const originalLines = input.split("\n").length;
+			const redacted = redactCrashSecretsPreservingLines(input);
+			const redactedLines = redacted.split("\n").length;
+			expect(redactedLines).toBe(originalLines);
+			expect(redacted).not.toContain("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
+		});
+
+		it("preserves line count with unclosed quoted credentials", () => {
+			const input = `password="secret
+more lines
+here`;
+			const originalLines = input.split("\n").length;
+			const redacted = redactCrashSecretsPreservingLines(input);
+			const redactedLines = redacted.split("\n").length;
+			expect(redactedLines).toBe(originalLines);
+			expect(redacted).not.toContain("secret");
+		});
+
+		it("maintains backwards compatibility with original redactCrashSecrets on single-line input", () => {
+			const inputs = ["password=secret", "token=abc123 safe=keep", 'api_key="secret" note=diagnostic'];
+			for (const input of inputs) {
+				const original = redactCrashSecrets(input);
+				const preserving = redactCrashSecretsPreservingLines(input);
+				// Both should produce the same output for single-line input
+				expect(preserving).toBe(original);
+			}
+		});
+
+		it("preserves opening bracket in multi-line JSON container", () => {
+			const input = `{"secret": [
+  "old-side-secret-canary-123"
+]
+}`;
+			const redacted = redactCrashSecretsPreservingLines(input);
+			// Line count preserved
+			expect(redacted.split("\n")).toHaveLength(input.split("\n").length);
+			// Opening bracket preserved on first line
+			expect(redacted).toContain('{"secret": [');
+			// Secret value redacted
+			expect(redacted).not.toContain("old-side-secret-canary-123");
+			// Closing bracket preserved
+			expect(redacted).toContain("]\n}");
+		});
 	});
 });
 

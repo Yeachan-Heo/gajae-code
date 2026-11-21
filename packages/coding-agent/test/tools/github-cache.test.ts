@@ -336,7 +336,7 @@ describe("github-cache db layer", () => {
 		expect(got?.fetchedAt).toBe(2000);
 
 		const db = openDb();
-		const rows = db?.prepare("SELECT COUNT(*) AS c FROM github_view_cache").all() as Array<{ c: number }>;
+		const rows = db?.prepare("SELECT COUNT(*) AS c FROM github_view_cache_v50").all() as Array<{ c: number }>;
 		expect(rows[0].c).toBe(1);
 	});
 
@@ -768,5 +768,240 @@ describe("getOrFetchPr (gh-wired wrapper)", () => {
 		expect(second.status).toBe("fresh");
 		expect(second.rendered).toBe(first.rendered);
 		expect(spy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("Credential scrubbing in cached data", () => {
+	it("[P2] scrubs path fields in cached diff metadata", () => {
+		// Sensitive filenames should be scrubbed from cached file metadata
+		const credentialPath = "src/secret-api-key.json";
+		const normalPath = "src/main.ts";
+
+		const diffPayload = {
+			unified: `diff --git a/${credentialPath} b/${credentialPath}\nindex 1111111..2222222 100644\n--- a/${credentialPath}\n+++ b/${credentialPath}\n@@ -1 @@\n-secret\n+newsecret\n`,
+			files: [
+				{
+					path: credentialPath,
+					oldPath: credentialPath,
+					startOffset: 0,
+					endOffset: 100,
+				},
+				{
+					path: normalPath,
+					startOffset: 100,
+					endOffset: 200,
+				},
+			],
+		};
+
+		putCached({
+			repo: TEST_REPO,
+			kind: "pr-diff" as const,
+			number: 77,
+			includeComments: false,
+			payload: diffPayload,
+			rendered: diffPayload.unified,
+			authKey: TEST_AUTH_KEY,
+		});
+
+		const cached = getCached(TEST_REPO, "pr-diff", 77, false, TEST_AUTH_KEY);
+		expect(cached).not.toBeNull();
+		if (!cached) return;
+
+		// Sensitive filename should NOT appear in cached payload
+		const payloadJson = JSON.stringify(cached.payload);
+		expect(payloadJson).not.toContain("secret-api-key");
+		// The filename pattern should be redacted/replaced
+		expect(payloadJson).not.toContain("/src/secret");
+		// But normal paths should be visible
+		expect(payloadJson).toContain(normalPath);
+	});
+
+	describe("pr-diff cache path scrubbing - false positive prevention", () => {
+		it("does not redact legitimate files in cache", async () => {
+			const diffPayload: Record<string, unknown> = {
+				unified:
+					"diff --git a/src/passport.js b/src/passport.js\nindex 1..2 100644\n--- a/src/passport.js\n+++ b/src/passport.js\n@@ -1,1 +1,1 @@\n const strategy = new LocalStrategy();",
+				files: [
+					{
+						path: "src/passport.js",
+						oldPath: "src/passport.js",
+						changes: 1,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 100,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 100, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// passport.js should NOT be redacted (it's a legitimate library)
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).toContain("passport.js");
+			expect(payloadJson).not.toContain("file-redacted");
+		});
+
+		it("does not redact authorization-service.ts in cache", async () => {
+			const diffPayload: Record<string, unknown> = {
+				unified:
+					"diff --git a/src/authorization-service.ts b/src/authorization-service.ts\nindex 1..2 100644\n--- a/src/authorization-service.ts\n+++ b/src/authorization-service.ts\n@@ -1,1 +1,1 @@\n export class AuthorizationService {}",
+				files: [
+					{
+						path: "src/authorization-service.ts",
+						oldPath: "src/authorization-service.ts",
+						changes: 1,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 101,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 101, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// authorization-service.ts should NOT be redacted
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).toContain("authorization-service.ts");
+			expect(payloadJson).not.toContain("file-redacted");
+		});
+
+		it("DOES redact actual credential files in cache", async () => {
+			const diffPayload: Record<string, unknown> = {
+				unified:
+					'diff --git a/config/secret-api-key.json b/config/secret-api-key.json\nindex 1..2 100644\n--- a/config/secret-api-key.json\n+++ b/config/secret-api-key.json\n@@ -1,1 +1,1 @@\n {\"api\": \"sensitive\"}',
+				files: [
+					{
+						path: "config/secret-api-key.json",
+						oldPath: "config/secret-api-key.json",
+						changes: 1,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 102,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 102, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// secret-api-key.json SHOULD be redacted
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).not.toContain("secret-api-key");
+			expect(payloadJson).toContain("file-redacted");
+		});
+
+		it("[P2] redacts token-shaped paths in cached file metadata", async () => {
+			// GitHub token patterns in filenames should be redacted from both unified diff and file metadata
+			const tokenPath = "src/ghp_abcdefghijklmnopqrstuvwxyz123456789_config.json";
+			const normalPath = "src/main.ts";
+
+			const diffPayload: Record<string, unknown> = {
+				unified: `diff --git a/${tokenPath} b/${tokenPath}\nindex 1111111..2222222 100644\n--- a/${tokenPath}\n+++ b/${tokenPath}\n@@ -1 @@\n-secret\n+newsecret\n`,
+				files: [
+					{
+						path: tokenPath,
+						oldPath: tokenPath,
+						startOffset: 0,
+						endOffset: 100,
+					},
+					{
+						path: normalPath,
+						startOffset: 100,
+						endOffset: 200,
+					},
+				],
+			};
+
+			putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff" as const,
+				number: 103,
+				includeComments: false,
+				payload: diffPayload,
+				rendered: diffPayload.unified as string,
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 103, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			if (!cached) return;
+
+			// Token-shaped path should NOT appear in cached payload (not in diff header or file metadata)
+			const payloadJson = JSON.stringify(cached.payload);
+			expect(payloadJson).not.toContain("ghp_");
+			expect(payloadJson).not.toContain("abcdefghijklmnopqrstuvwxyz123456789");
+			// Normal paths should be visible
+			expect(payloadJson).toContain(normalPath);
+		});
+
+		it("[P2] finding #1: legacy writers cannot contaminate new scrubbed cache table", async () => {
+			// Issue: When upgrading from legacy (v<5) to scrubbed (v50), the same table name
+			// is reused, allowing legacy processes to write unscrubbed rows.
+			// Solution: Use a NEW table name for the scrubbed version (github_view_cache_v50)
+			// Legacy code that knows only about github_view_cache cannot write to the new table.
+
+			const db = openDb();
+			if (!db) {
+				throw new Error("Failed to open cache database");
+			}
+
+			// Verify that the versioned table name is used
+			const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'github%'").all();
+			const tableNames = (tables as Array<{ name: string }>).map(t => t.name);
+
+			// Should have github_view_cache_v50 (the new versioned table)
+			expect(tableNames).toContain("github_view_cache_v50");
+
+			// Should NOT have github_view_cache (the old table that legacy code uses)
+			// This prevents legacy writers from accidentally writing to our new scrubbed table
+			expect(tableNames).not.toContain("github_view_cache");
+
+			// Verify schema version is 50
+			const version = db.query("PRAGMA user_version").get() as { user_version: number };
+			expect(version.user_version).toBe(50);
+
+			// Verify that caching works with the new table
+			const row = {
+				repo: TEST_REPO,
+				kind: "issue" as const,
+				number: 999,
+				includeComments: false,
+				payload: { title: "test" },
+				rendered: "test rendered",
+				authKey: TEST_AUTH_KEY,
+			};
+
+			putCached(row);
+			const cached = getCached(TEST_REPO, "issue", 999, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+			expect(cached?.rendered).toBe("test rendered");
+		});
 	});
 });

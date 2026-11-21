@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getGithubCacheDbPath, logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
+import { scrubUnifiedDiff } from "./github-diff-parser";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -101,13 +102,27 @@ export function openDb(): Database | null {
 		// Migrate any pre-existing table whose key/check constraint predates
 		// the current schema. The cache is regenerable, so we drop rows rather
 		// than running an in-place ALTER dance.
+		// Schema v5: Structural diff scrubbing with quote-aware bracket tracking.
+		// Invalidate all pre-v5 rows as they may contain unscrubbed credentials.
+		// IMPORTANT: Set to a version that prevents legacy writers from using this cache.
+		// If an old process sees version > its max known version, it must not write.
 		const userVersion = (db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
-		if (userVersion !== undefined && userVersion < 4) {
+		if (userVersion !== undefined && userVersion < 5) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
+			db.run("DROP TABLE IF EXISTS github_view_cache_v50");
+		}
+		// If a version higher than our current code sees this, we should also refuse
+		// to continue to prevent schema mismatches
+		const currentVersion = 50; // Update this when cache schema changes
+		if (userVersion !== undefined && userVersion > currentVersion) {
+			throw new Error(
+				`GitHub cache schema v${userVersion} is not supported by this version of gjc. ` +
+					"Please update gjc to work with the cache schema.",
+			);
 		}
 		db.run(`
-			CREATE TABLE IF NOT EXISTS github_view_cache (
+			CREATE TABLE IF NOT EXISTS github_view_cache_v50 (
 				auth_key        TEXT    NOT NULL,
 				repo             TEXT    NOT NULL,
 				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-diff')),
@@ -119,8 +134,8 @@ export function openDb(): Database | null {
 				source_url       TEXT,
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
-			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
-			PRAGMA user_version = 4;
+			CREATE INDEX IF NOT EXISTS idx_github_view_cache_v50_fetched ON github_view_cache_v50(fetched_at);
+			PRAGMA user_version = 50;
 		`);
 		protectDbFiles(dbPath);
 		cachedDb = db;
@@ -139,7 +154,7 @@ export function openDb(): Database | null {
 function evictExpired(db: Database, hardTtlMs: number): void {
 	try {
 		const cutoff = Date.now() - hardTtlMs;
-		db.prepare("DELETE FROM github_view_cache WHERE fetched_at < ?").run(cutoff);
+		db.prepare("DELETE FROM github_view_cache_v50 WHERE fetched_at < ?").run(cutoff);
 	} catch (err) {
 		logger.debug("github cache: eviction failed", { err: String(err) });
 	}
@@ -243,7 +258,7 @@ export function getCached<T = unknown>(
 	try {
 		const row = db
 			.prepare(
-				"SELECT auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
+				"SELECT auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url FROM github_view_cache_v50 WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
 			)
 			.get(authKey, normalizeRepo(repo), kind, number, includeComments ? 1 : 0) as Row | undefined;
 		if (!row) return null;
@@ -283,14 +298,179 @@ export interface PutCachedInput<T = unknown> {
 	fetchedAt?: number;
 }
 
+/**
+ * Recompute file offsets after scrubbing a unified diff.
+ * Scrubbing can change the diff's byte length, invalidating cached offsets.
+ * This function rescans the scrubbed diff to find each file's new byte range.
+ */
+function recomputeFileOffsetsAfterScrubbing(
+	unifiedDiff: string,
+	files: Record<string, unknown>[],
+): Record<string, unknown>[] {
+	if (files.length === 0) return files;
+
+	// Find all "diff --git" line positions in the scrubbed diff
+	const sectionStarts: number[] = [];
+	const re = /^diff --git /gm;
+	let m: RegExpExecArray | null = re.exec(unifiedDiff);
+	while (m !== null) {
+		sectionStarts.push(m.index);
+		if (re.lastIndex === m.index) re.lastIndex += 1;
+		m = re.exec(unifiedDiff);
+	}
+
+	// If we found a different number of sections, return unchanged
+	// (indicates parsing issue; don't corrupt the files array)
+	if (sectionStarts.length !== files.length) {
+		return files;
+	}
+
+	// Update each file's offset
+	const updated: Record<string, unknown>[] = [];
+	for (let i = 0; i < files.length; i += 1) {
+		const file = files[i];
+		const startOffset = sectionStarts[i] ?? 0;
+		const endOffset = sectionStarts[i + 1] ?? unifiedDiff.length;
+		updated.push({
+			...file,
+			startOffset,
+			endOffset,
+		});
+	}
+
+	return updated;
+}
+
+/**
+ * Scrub path fields in file metadata objects.
+ * Filenames from diffs are untrusted and may contain credential-like strings.
+ * Since paths are secondary metadata used only for rendering/labeling, we
+ * redact them by replacing with generic labels when they clearly indicate credentials.
+ *
+ * We only redact path COMPONENTS that clearly indicate credentials,
+ * avoiding false positives like passport.js, keyboard.ts, authorization-service.ts
+ */
+function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unknown>[] {
+	return files.map((file, index) => {
+		const scrubbedFile = { ...file };
+
+		const redactIfCredential = (path: string | undefined): string | undefined => {
+			if (typeof path !== "string") return path;
+
+			// Split path into components and check each one
+			const components = path.split("/");
+			let hasCredentialComponent = false;
+
+			for (const component of components) {
+				// Match keyword-shaped credential patterns:
+				// - secret-key, secret_key, secret.key
+				// - api-key.json, apikey.env
+				// - password.conf, .env.password
+				// But NOT: passport.js, keyboard.ts, authorization-service.ts
+				const credentialPattern =
+					/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
+
+				if (credentialPattern.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+
+				// Also check for GitHub token patterns (ghp_, gho_, ghu_, ghs_, ghr_)
+				// These patterns are also redacted in diff headers
+				if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+
+				// Check for AWS access key patterns (AKIA followed by 16 uppercase alphanumeric)
+				if (/AKIA[0-9A-Z]{16}/i.test(component)) {
+					hasCredentialComponent = true;
+					break;
+				}
+
+				// Check for other token-shaped patterns (hex or base64 tokens)
+				// Only redact if it looks like a hex/base64 token, not a service name
+				const hexTokenMatch = component.match(/[a-f0-9]{20,}|[A-Z0-9]{30,}/i);
+				if (hexTokenMatch) {
+					hasCredentialComponent = true;
+					break;
+				}
+			}
+
+			return hasCredentialComponent ? undefined : path;
+		};
+
+		if (typeof scrubbedFile.path === "string") {
+			const redacted = redactIfCredential(scrubbedFile.path);
+			if (redacted === undefined) {
+				scrubbedFile.path = `file-${index}`;
+			}
+		}
+		if (typeof scrubbedFile.oldPath === "string") {
+			const redacted = redactIfCredential(scrubbedFile.oldPath);
+			if (redacted === undefined) {
+				scrubbedFile.oldPath = `file-${index}.old`;
+			}
+		}
+		return scrubbedFile;
+	});
+}
+
+/**
+ * Scrub sensitive material from cache inputs before storage.
+ * For pr-diff, scrubs the unified diff in both payload and rendered.
+ * For other kinds, scrubs the rendered text using the shared redactor.
+ * After scrubbing, recomputes file offsets to account for byte length changes.
+ */
+function scrubCacheInput<T>(kind: CacheKind, payload: T, rendered: string): { payload: T; rendered: string } {
+	let scrubbedPayload = payload;
+	let scrubbedRendered = rendered;
+
+	if (kind === "pr-diff") {
+		// For diffs, scrub the unified diff text using the structural parser.
+		scrubbedRendered = scrubUnifiedDiff(rendered);
+
+		// Also scrub the payload's unified field if present.
+		const payloadObj = payload as Record<string, unknown>;
+		if (typeof payloadObj.unified === "string") {
+			const scrubbedUnified = scrubUnifiedDiff(payloadObj.unified);
+			let scrubbedFiles = payloadObj.files as Record<string, unknown>[] | undefined;
+
+			// Scrub path metadata and recompute offsets after scrubbing
+			if (Array.isArray(scrubbedFiles) && scrubbedFiles.length > 0) {
+				// First scrub path fields which may contain credentials
+				scrubbedFiles = scrubFileMetadata(scrubbedFiles);
+				// Then recompute offsets, as redaction can change byte positions
+				scrubbedFiles = recomputeFileOffsetsAfterScrubbing(scrubbedUnified, scrubbedFiles);
+			}
+
+			scrubbedPayload = {
+				...payloadObj,
+				unified: scrubbedUnified,
+				files: scrubbedFiles,
+			} as unknown as T;
+		}
+	}
+
+	return { payload: scrubbedPayload, rendered: scrubbedRendered };
+}
+
 export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 	const db = openDb();
 	if (!db) return;
 	try {
 		const fetchedAt = input.fetchedAt ?? Date.now();
-		const payloadJson = JSON.stringify(input.payload);
+
+		// Scrub sensitive material before storage.
+		const { payload: scrubbedPayload, rendered: scrubbedRendered } = scrubCacheInput(
+			input.kind,
+			input.payload as Record<string, unknown>,
+			input.rendered,
+		);
+
+		const payloadJson = JSON.stringify(scrubbedPayload);
 		db.prepare(
-			"INSERT OR REPLACE INTO github_view_cache (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT OR REPLACE INTO github_view_cache_v50 (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(
 			input.authKey ?? DEFAULT_CACHE_AUTH_KEY,
 			normalizeRepo(input.repo),
@@ -299,7 +479,7 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 			input.includeComments ? 1 : 0,
 			fetchedAt,
 			payloadJson,
-			input.rendered,
+			scrubbedRendered,
 			input.sourceUrl ?? null,
 		);
 		protectDbFiles(getGithubCacheDbPath());
@@ -326,15 +506,12 @@ export function invalidate(
 	if (!db) return;
 	try {
 		if (includeComments === undefined) {
-			db.prepare("DELETE FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ?").run(
-				authKey,
-				normalizeRepo(repo),
-				kind,
-				number,
-			);
+			db.prepare(
+				"DELETE FROM github_view_cache_v50 WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ?",
+			).run(authKey, normalizeRepo(repo), kind, number);
 		} else {
 			db.prepare(
-				"DELETE FROM github_view_cache WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
+				"DELETE FROM github_view_cache_v50 WHERE auth_key = ? AND repo = ? AND kind = ? AND number = ? AND include_comments = ?",
 			).run(authKey, normalizeRepo(repo), kind, number, includeComments ? 1 : 0);
 		}
 	} catch (err) {
@@ -347,7 +524,7 @@ export function clearAll(): void {
 	const db = openDb();
 	if (!db) return;
 	try {
-		db.prepare("DELETE FROM github_view_cache").run();
+		db.prepare("DELETE FROM github_view_cache_v50").run();
 	} catch (err) {
 		logger.debug("github cache: clear failed", { err: String(err) });
 	}
