@@ -1333,6 +1333,32 @@ export interface PrepareCompactionOptions {
 	 * keepRecentTokens behavior; larger windows scale the keep window to 30%.
 	 */
 	contextWindow?: number;
+	/**
+	 * Active model for checking if it can replay a trailing remote compaction.
+	 * If provided and a trailing compaction exists, checks whether this model
+	 * can replay the compaction before returning undefined.
+	 */
+	activeModel?: Model;
+}
+
+/**
+ * Whether `model` can replay a remote compaction given its preserveData.
+ * Returns true if the data can be replayed (or if there's no remote compaction data).
+ * Returns false if the model cannot replay the compaction data.
+ */
+function canReplayRemoteCompactionPreserveData(
+	preserveData: Record<string, unknown> | undefined,
+	model: Model,
+): boolean {
+	const openAiData = getPreservedOpenAiRemoteCompactionData(preserveData);
+	if (!openAiData) {
+		// No OpenAI remote compaction data, so any model can replay (there's just a summary)
+		return true;
+	}
+
+	// OpenAI remote compaction data exists, check if this model can replay it
+	// Only OpenAI and openai-codex models can replay OpenAI remote compaction
+	return shouldUseOpenAiRemoteCompaction(model);
 }
 
 /**
@@ -1356,19 +1382,37 @@ export function prepareCompaction(
 	settings: CompactionSettings,
 	options: PrepareCompactionOptions = {},
 ): CompactionPreparation | undefined {
+	let shouldReExpandTrailingCompaction = false;
+	let trailingCompactionIndex = -1;
+
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
-		return undefined;
+		const lastEntry = pathEntries[pathEntries.length - 1] as CompactionEntry;
+		const activeModel = options.activeModel;
+
+		// Return undefined (no re-expansion) only if:
+		// - no active model OR
+		// - active model can replay the compaction
+		const canReplay = activeModel ? canReplayRemoteCompactionPreserveData(lastEntry.preserveData, activeModel) : true;
+		if (!activeModel || canReplay) {
+			return undefined;
+		}
+		// Otherwise, continue with re-expansion (the compaction becomes live again)
+		shouldReExpandTrailingCompaction = true;
+		trailingCompactionIndex = pathEntries.length - 1;
 	}
 
 	let prevCompactionIndex = -1;
-	for (let i = pathEntries.length - 1; i >= 0; i--) {
+	// When re-expanding a trailing compaction, exclude it from the search for the previous compaction
+	const searchEnd = shouldReExpandTrailingCompaction ? trailingCompactionIndex - 1 : pathEntries.length - 1;
+	for (let i = searchEnd; i >= 0; i--) {
 		if (pathEntries[i].type === "compaction") {
 			prevCompactionIndex = i;
 			break;
 		}
 	}
 	const boundaryStart = prevCompactionIndex + 1;
-	const boundaryEnd = pathEntries.length;
+	// When re-expanding a trailing compaction, exclude it from boundaryEnd
+	const boundaryEnd = shouldReExpandTrailingCompaction ? trailingCompactionIndex : pathEntries.length;
 
 	const lastUsage = getLastAssistantUsage(pathEntries);
 	const tokensBefore = lastUsage ? calculateContextTokens(lastUsage) : 0;
