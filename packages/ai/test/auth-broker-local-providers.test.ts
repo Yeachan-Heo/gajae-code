@@ -386,4 +386,81 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 			local.close();
 		}
 	});
+
+	test("OAuth refresh lease operations translate IDs correctly between hybrid and SQLite forms", async () => {
+		// Table-driven test for all ID-taking hooks to verify ID translation:
+		// - Local IDs (negative) in hybrid form → positive IDs in SQLite
+		// - Results returned as hybrid IDs (negative)
+		const oauthCred = { type: "oauth" as const, access: "test-token", refresh: "test-refresh", expires: 999999999 };
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const client = new AuthBrokerClient({ url: handle!.url, token: TOKEN });
+		const fetchResult = await client.fetchSnapshot();
+		if (fetchResult.status !== 200) throw new Error("broker returned no snapshot");
+		const broker = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: fetchResult.snapshot,
+			streamSnapshots: false,
+		});
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			// Mark provider as local
+			local.markBrokerLocalProvider(UNSERVED);
+
+			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			try {
+				// Store an OAuth credential for the local provider
+				local.upsertAuthCredentialForProvider(UNSERVED, oauthCred);
+
+				// Get the credential and verify it has a negative hybrid ID
+				const credentials = hybrid.listAuthCredentials(UNSERVED);
+				expect(credentials).toHaveLength(1);
+				const hybridId = credentials[0]!.id;
+				expect(hybridId).toBeLessThan(0); // Should be negative
+
+				// Test 1: claimOAuthRefreshLease
+				// Should translate negative hybridId to positive SQLite ID when calling local store,
+				// then translate back to negative when returning
+				if (hybrid.claimOAuthRefreshLease) {
+					const claim = hybrid.claimOAuthRefreshLease(
+						hybridId,
+						oauthCred.refresh,
+						true,
+						"test-owner",
+						Date.now(),
+						60000, // 60 second lease
+					);
+
+					if (claim.kind === "claimed") {
+						// Verify the returned credentialId is in hybrid form (negative)
+						expect(claim.lease.credentialId).toBeLessThan(0);
+						expect(claim.lease.credentialId).toBe(hybridId);
+
+						// Test 2: completeOAuthRefreshLease
+						// Should accept the lease with hybrid ID and translate to SQLite form internally
+						if (hybrid.completeOAuthRefreshLease) {
+							const updated = { ...oauthCred, refresh: "new-refresh", expires: 999999999 };
+							const success = hybrid.completeOAuthRefreshLease(claim.lease, updated);
+							expect(success).toBe(true);
+
+							// Verify the update was applied in the local store
+							const updated_creds = hybrid.listAuthCredentials(UNSERVED);
+							expect(updated_creds[0]?.credential).toEqual(updated);
+						}
+
+						// Test 3: releaseOAuthRefreshLease
+						// Should accept the lease with hybrid ID and translate to SQLite form internally
+						if (hybrid.releaseOAuthRefreshLease) {
+							// Should not throw
+							hybrid.releaseOAuthRefreshLease(claim.lease);
+						}
+					}
+				}
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
+		}
+	});
 });

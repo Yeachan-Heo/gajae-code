@@ -1027,9 +1027,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			entries: uploadedEntries,
 		} = await this.#client.uploadCredentialIfAbsent(provider, credential);
 		await this.refreshSnapshot();
-		if (inserted) {
-			await this.#confirmServed(provider, uploadedEntries);
-		}
+		// Check visibility for both newly inserted and existing rows returned by the server.
+		// If returned rows are absent from the refreshed snapshot, the provider is unserved.
+		await this.#confirmServed(provider, uploadedEntries);
 		return { inserted, reason, provider, entries: this.listAuthCredentials(provider) };
 	}
 

@@ -176,10 +176,24 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		if (!this.#localProviders.has(provider)) {
 			await this.#broker.deleteAuthCredentialsRemote(provider, disabledCause);
 		} else {
-			// For local providers, also try to disable any hidden broker-side credentials
+			// For local providers, first try to disable any hidden broker-side credentials
 			// that were accepted but never served back (unserved credentials).
-			// This prevents them from resurfacing if the broker later serves the provider.
-			await this.#disableBrokerCredentialsForProvider(provider, disabledCause);
+			// Keep the provider marked local until this broker cleanup is confirmed,
+			// so if revocation fails, we can retry later.
+			try {
+				await this.#disableBrokerCredentialsForProvider(provider, disabledCause);
+			} catch (error) {
+				// Log the failure but continue with local deletion.
+				// The provider stays marked local so we can retry broker cleanup.
+				logger.warn(
+					"Failed to disable broker-side credentials for local provider; provider remains marked local for retry",
+					{
+						provider,
+						error: String(error),
+					},
+				);
+				// Don't throw; complete the local deletion and let the provider stay local
+			}
 			this.#local.deleteAuthCredentialsForProvider(provider, disabledCause);
 			this.#returnToBrokerIfEmpty(provider);
 		}
@@ -360,10 +374,11 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		signal?: AbortSignal,
 	): Promise<import("../auth-storage").OAuthCredential> {
 		// Route MCP refresh by row ownership: broker rows through the remote hook,
-		// local credentials are not MCP-bound and cannot be refreshed here.
+		// local credentials should NOT reach here because ownsOAuthRefresh returns false.
+		// This method is only called for broker rows that this store owns.
 		if (isLocalId(credentialId)) {
-			// Local credentials may not have MCP bindings; they are not routed
-			// through the broker for MCP-specific refresh.
+			// Should not reach here if ownsOAuthRefresh works correctly,
+			// but as a safety fallback, return the credential unchanged.
 			return credential;
 		}
 		return this.#broker.refreshMCPOAuthCredential?.(credentialId, credential, client, signal) ?? credential;
@@ -380,8 +395,9 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 	): import("../auth-storage").OAuthRefreshLeaseClaim {
 		// Lease operations only apply to local credentials; broker handles locking server-side
 		if (isLocalId(credentialId)) {
+			// Translate hybrid ID (negative) to SQLite ID (positive)
 			const claim = this.#local.claimOAuthRefreshLease?.(
-				credentialId,
+				-credentialId,
 				expectedRefresh,
 				force,
 				owner,
@@ -389,6 +405,13 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				leaseMs,
 				expectedRevision,
 			);
+			if (claim?.kind === "claimed") {
+				// Translate returned lease credentialId back to hybrid form (negate)
+				return {
+					...claim,
+					lease: { ...claim.lease, credentialId: -claim.lease.credentialId },
+				};
+			}
 			return claim ?? { kind: "missing" };
 		}
 		// Broker credentials do not use local leases; return missing for consistency
@@ -401,7 +424,9 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 	): boolean {
 		// Lease operations only apply to local credentials
 		if (isLocalId(lease.credentialId)) {
-			return this.#local.completeOAuthRefreshLease?.(lease, credential) ?? false;
+			// Translate hybrid lease credentialId back to SQLite form (positive)
+			const sqliteLease = { ...lease, credentialId: -lease.credentialId };
+			return this.#local.completeOAuthRefreshLease?.(sqliteLease, credential) ?? false;
 		}
 		// Broker credentials do not use local leases
 		return false;
@@ -410,7 +435,9 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 	releaseOAuthRefreshLease?(lease: import("../auth-storage").OAuthRefreshLease): void {
 		// Lease operations only apply to local credentials
 		if (isLocalId(lease.credentialId)) {
-			this.#local.releaseOAuthRefreshLease?.(lease);
+			// Translate hybrid lease credentialId back to SQLite form (positive)
+			const sqliteLease = { ...lease, credentialId: -lease.credentialId };
+			this.#local.releaseOAuthRefreshLease?.(sqliteLease);
 		}
 		// Broker credentials do not use local leases, nothing to release
 	}

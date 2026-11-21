@@ -100,7 +100,7 @@ export const snapshotCredentialSchema = z.discriminatedUnion("type", [
 
 export const credentialSnapshotEntrySchema = z
 	.object({
-		id: z.number().int(),
+		id: z.number().int().positive(),
 		provider: z.string().min(1),
 		credential: snapshotCredentialSchema,
 		identityKey: z.string().nullable(),
