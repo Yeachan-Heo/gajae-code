@@ -492,10 +492,10 @@ describe("unified diff scrubber", () => {
 				// Issue: Metadata scrubber must match diff-header rules, including space boundaries
 				// Paths like 'src/api secret token.js' have space-separated keywords
 				const diff = [
-					"diff --git a/src/api\ secret\ token.js b/src/api\ secret\ token.js",
+					"diff --git a/src/api\\ secret\\ token.js b/src/api\\ secret\\ token.js",
 					"index 1111111..2222222 100644",
-					"--- a/src/api\ secret\ token.js",
-					"+++ b/src/api\ secret\ token.js",
+					"--- a/src/api\\ secret\\ token.js",
+					"+++ b/src/api\\ secret\\ token.js",
 					"@@ -1,1 +1,1 @@ ",
 					" // token value",
 					"",
@@ -504,7 +504,7 @@ describe("unified diff scrubber", () => {
 				const scrubbed = scrubUnifiedDiff(diff);
 
 				// Space-separated credential keywords should be redacted
-				expect(scrubbed).not.toContain("api\\ secret\\ token");
+				expect(scrubbed).not.toContain("api secret token");
 				expect(scrubbed).toContain("file-redacted");
 			});
 
@@ -952,6 +952,30 @@ describe("unified diff scrubber", () => {
 			// Context lines and structure should be intact
 			expect(scrubbed).toContain('{"secrets": [');
 			expect(scrubbed).toContain(" }");
+		});
+
+		it("[P2] merges redaction conservatively - masks on either side win", () => {
+			// Issue: When only the new projection masks a line, the old projection's
+			// unredacted content was being used for context lines.
+			// Solution: Conservative merge - if either side masks, use the masked version.
+			// Test case: Authorization header appears only on new side of a context line
+			const diff = [
+				...HEADER,
+				"@@ -1,3 +1,3 @@",
+				" Authorization: Bearer old-token-keep",
+				" shared-data",
+				" final-line",
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// Context line must be redacted (old side has unmasked, new side is masked)
+			// Conservative merge means: mask on either side wins
+			expect(scrubbed).not.toContain("old-token-keep");
+			// Other content preserved
+			expect(scrubbed).toContain("shared-data");
+			expect(scrubbed).toContain("final-line");
 		});
 	});
 });

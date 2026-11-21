@@ -370,12 +370,6 @@ interface HunkState {
 	inYamlBlockScalar?: boolean; // Track if we're in a YAML block scalar (terminated by dedent or end of hunk)
 }
 
-interface HunkResult {
-	redactedLines: string[];
-	nextIndex: number;
-	state: HunkState;
-}
-
 /**
  * Process all hunks in a file, building file-wide projections so containers can span hunks.
  * Collects all hunks between here and the next file/EOF, then redacts them as a unit.
@@ -489,7 +483,7 @@ function redactAllHunksInFile(
 	for (const hunk of hunks) {
 		result.push(hunk.header);
 
-		for (const info of hunk.lineInfos) {
+		for (let _i = 0; _i < hunk.lineInfos.length; _i++) {
 			if (redactedIndex < redactedInfos.length) {
 				const redactedInfo = redactedInfos[redactedIndex];
 				result.push(redactedInfo.prefix + redactedInfo.content);
@@ -677,7 +671,7 @@ function redactAccumulatedContentWithState(
 
 				// Check if this line is only structural (brackets, whitespace, etc.)
 				// Don't redact purely structural lines - they're important for preserving format
-				const isOnlyStructure = /^[\s\[\]{},:.]*$/.test(info.content);
+				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 
 				// If we're inside a container at the start of this line, redact it
 				// But skip purely structural lines
@@ -699,7 +693,7 @@ function redactAccumulatedContentWithState(
 			const newIdx = newProjectionIndices.indexOf(i);
 			if (oldIdx >= 0) {
 				const originalContent = oldProjectionLines[oldIdx];
-				const isOnlyStructure = /^[\s\[\]{},:.]*$/.test(info.content);
+				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 				const isStructureData = looksLikeStructureData(info.content);
 
 				// Redact if inside container AND (looks like structure data OR doesn't look like plain text)
@@ -745,7 +739,7 @@ function redactAccumulatedContentWithState(
 
 				// Check if this line is only structural (brackets, whitespace, etc.)
 				// Don't redact purely structural lines - they're important for preserving format
-				const isOnlyStructure = /^[\s\[\]{},:.]*$/.test(info.content);
+				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 
 				// Redact if:
 				// 1. We're inside a container on the new side, OR

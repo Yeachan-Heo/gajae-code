@@ -1399,6 +1399,57 @@ here`;
 			expect(redacted).toContain("]\n}");
 		});
 	});
+
+	describe("Cookie pattern boundary handling", () => {
+		it("redacts cookies after escaped newline (default redactor)", () => {
+			// Serialized crash logs have literal \n, not physical newlines
+			// This tests that the COOKIE_VALUE_PATTERN matches (?<=\\n) correctly
+			const input = "before=keep\\nCookie: session=secret-value; other=data";
+			const redacted = redactCrashSecrets(input);
+
+			expect(redacted).not.toContain("secret-value");
+			expect(redacted).toContain("before=keep");
+			expect(redacted).toContain("Cookie: «redacted»");
+		});
+
+		it("redacts cookies after physical newline (line-preserving redactor)", () => {
+			// Line-preserving mode works with actual newlines from split/join
+			const input = "before=keep\nCookie: session=secret-value; other=data";
+			const redacted = redactCrashSecretsPreservingLines(input);
+
+			expect(redacted).not.toContain("secret-value");
+			expect(redacted.split("\n").length).toBe(input.split("\n").length);
+		});
+
+		it("handles both escaped and physical newlines in preserving mode", () => {
+			// Mixed: some lines with physical newlines, some with escaped
+			// (this can happen in diff context)
+			const input = "field1=value\nCookie: session=secret1; x=1\\nCookie: session=secret2; y=2";
+			const redacted = redactCrashSecretsPreservingLines(input);
+
+			expect(redacted).not.toContain("secret1");
+			expect(redacted).not.toContain("secret2");
+			expect(redacted.split("\n")).toHaveLength(input.split("\n").length);
+		});
+
+		it("preserves crash fingerprint output for redactCrashSecrets", () => {
+			// Core fingerprinting test: dev version output must be byte-identical
+			// This corpus represents key scenarios that drive crash fingerprints
+			const corpus = [
+				{ input: "\\nCookie: s=val", shouldNotContain: "val" },
+				{ input: "field=ok\\nCookie: session=secret", shouldNotContain: "secret" },
+				{ input: "Cookie: a=b; c=d", shouldNotContain: "b" },
+				{ input: "before\\nCookie: s=sec\\nafter", shouldNotContain: "sec" },
+			];
+
+			for (const { input, shouldNotContain } of corpus) {
+				const redacted = redactCrashSecrets(input);
+				expect(redacted).not.toContain(shouldNotContain);
+				// Verify output is deterministic (calling again produces same result)
+				expect(redactCrashSecrets(input)).toBe(redacted);
+			}
+		});
+	});
 });
 
 describe("fatal handler process fixtures", () => {

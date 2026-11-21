@@ -887,7 +887,7 @@ describe("Credential scrubbing in cached data", () => {
 		it("DOES redact actual credential files in cache", async () => {
 			const diffPayload: Record<string, unknown> = {
 				unified:
-					'diff --git a/config/secret-api-key.json b/config/secret-api-key.json\nindex 1..2 100644\n--- a/config/secret-api-key.json\n+++ b/config/secret-api-key.json\n@@ -1,1 +1,1 @@\n {\"api\": \"sensitive\"}',
+					'diff --git a/config/secret-api-key.json b/config/secret-api-key.json\nindex 1..2 100644\n--- a/config/secret-api-key.json\n+++ b/config/secret-api-key.json\n@@ -1,1 +1,1 @@\n {"api": "sensitive"}',
 				files: [
 					{
 						path: "config/secret-api-key.json",
@@ -1060,8 +1060,6 @@ describe("Credential scrubbing in cached data", () => {
 			const versionedFileExists = await fs.stat(expectedVersionedPath).catch(() => null);
 			expect(versionedFileExists).not.toBeNull();
 
-			// Verify no data is in the old unversioned path (which legacy would use)
-			const oldFileExists = await fs.stat(baseDbPath).catch(() => null);
 			// Old file may not exist since v5 uses a separate namespace
 			// This is the desired behavior: v5 readers/writers are isolated
 		});

@@ -108,7 +108,12 @@ const V1_CREDENTIAL_REDACTION_RULES = createCredentialRedactionRules(
 	CREDENTIAL_KEY_LABELS_V1,
 	CREDENTIAL_CAMEL_SIMPLE_SUFFIXES_V1,
 );
+// Match Cookie headers preceded by non-credential-char OR literal escaped newline (serialized form).
+// This pattern is byte-identical to dev for crash fingerprints.
 const COOKIE_VALUE_PATTERN =
+	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?[ \t]*[:=][ \t]*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+// Also match physical newlines for line-preserving mode (where text has actual newline chars)
+const COOKIE_VALUE_PATTERN_PHYSICAL_NEWLINE =
 	/(?:(?<![A-Za-z0-9_-])|(?<=\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookies?[ \t]*[:=][ \t]*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
 // Cap key inspection; YAML permits the chomping and indentation indicators in either order.
 const YAML_BLOCK_SCALAR_HEADER_PATTERN =
@@ -477,7 +482,7 @@ function redactCredentialValue(
 	}
 	// Skip bare opening brackets at end of line (structural, not a credential value).
 	// This can occur in preserving-line mode where container brackets are preserved on separate lines.
-	if (/^[\[\{]\s*$/.test(value)) {
+	if (/^[[{]\s*$/.test(value)) {
 		return _match;
 	}
 	return `${prefix}«redacted»`;
@@ -795,10 +800,19 @@ function redactCrashSecretsWithRulesPreservingLines(text: string, rules: Credent
 		"$1$2«redacted-url-credential»@",
 	);
 	redacted = replacePreservingLines(redacted, /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	// Apply cookie pattern for both escaped newlines (from serialization) and physical newlines
 	redacted = replacePreservingLines(redacted, COOKIE_VALUE_PATTERN, (_match: string, prefix: string, value: string) =>
 		parseCredentialYamlBlockScalarHeader(_match) === undefined
 			? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
 			: _match,
+	);
+	redacted = replacePreservingLines(
+		redacted,
+		COOKIE_VALUE_PATTERN_PHYSICAL_NEWLINE,
+		(_match: string, prefix: string, value: string) =>
+			parseCredentialYamlBlockScalarHeader(_match) === undefined
+				? `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`
+				: _match,
 	);
 	redacted = replacePreservingLines(
 		redacted,
