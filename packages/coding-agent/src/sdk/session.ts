@@ -6195,6 +6195,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							sessionId: providerSessionId,
 							preferWebsockets: preferOpenAICodexWebsockets,
 							providerSessionState: session.providerSessionState,
+							serviceTier: session.serviceTier,
 						});
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
