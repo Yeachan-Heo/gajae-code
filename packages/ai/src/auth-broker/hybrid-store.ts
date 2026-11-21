@@ -192,12 +192,20 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
 					this.#keepLocal(provider);
-					return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+					const result = this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+					return {
+						...result,
+						entries: result.entries.map(toHybridRow),
+					};
 				}
 				throw error;
 			}
 		}
-		return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+		const result = this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+		return {
+			...result,
+			entries: result.entries.map(toHybridRow),
+		};
 	}
 
 	async upsertAuthCredentialRemoteIfAbsent?(
@@ -211,12 +219,20 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				if (error instanceof AuthBrokerUnservedProviderError) {
 					await this.#disableUnservedEntries(error.unservedEntries);
 					this.#keepLocal(provider);
-					return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+					const result = this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+					return {
+						...result,
+						entries: result.entries.map(toHybridRow),
+					};
 				}
 				throw error;
 			}
 		}
-		return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+		const result = this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+		return {
+			...result,
+			entries: result.entries.map(toHybridRow),
+		};
 	}
 
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
@@ -313,16 +329,48 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		expectedRevision?: number,
 	): Promise<import("../utils/oauth/types").OAuthCredentials> {
 		// Route refresh by row ownership: broker rows through the remote hook,
-		// local credentials are handled by AuthStorage's default mechanism
+		// local credentials are handled by AuthStorage's default mechanism.
+		// When a local credential reaches this hook, we must NOT reject it;
+		// instead, we return the credential unchanged to allow AuthStorage's
+		// default refresh mechanisms to operate. This hook only handles broker
+		// credentials that must route through the remote server to avoid exposing
+		// refresh tokens to the client.
 		if (isLocalId(credentialId)) {
-			// Local credentials are not refreshed through this hook; AuthStorage
-			// will fall back to its default refresh mechanism for local credentials
-			return Promise.reject(
-				new Error("Local credentials must be refreshed through AuthStorage's default mechanism"),
-			);
+			// Local credentials are not refreshed here; AuthStorage's default
+			// mechanism will handle them through per-provider OAuth endpoints.
+			// Return the credential unchanged to satisfy the type requirement.
+			// The credential staleness check in AuthStorage will trigger the
+			// actual local refresh if needed.
+			return {
+				access: credential.access,
+				refresh: credential.refresh,
+				expires: credential.expires,
+				accountId: credential.accountId,
+				email: credential.email,
+				projectId: credential.projectId,
+				enterpriseUrl: credential.enterpriseUrl,
+				organizationId: credential.organizationId,
+				organizationName: credential.organizationName,
+			};
 		}
 		// Broker credentials route through the broker's refresh hook
 		return this.#broker.refreshOAuthCredential(provider, credentialId, credential, signal, expectedRevision);
+	}
+
+	async refreshMCPOAuthCredential?(
+		credentialId: number,
+		credential: import("../auth-storage").OAuthCredential,
+		client: import("../auth-storage").MCPOAuthRefreshClient,
+		signal?: AbortSignal,
+	): Promise<import("../auth-storage").OAuthCredential> {
+		// Route MCP refresh by row ownership: broker rows through the remote hook,
+		// local credentials are not MCP-bound and cannot be refreshed here.
+		if (isLocalId(credentialId)) {
+			// Local credentials may not have MCP bindings; they are not routed
+			// through the broker for MCP-specific refresh.
+			return credential;
+		}
+		return this.#broker.refreshMCPOAuthCredential?.(credentialId, credential, client, signal) ?? credential;
 	}
 
 	fetchUsageReports(signal?: AbortSignal): Promise<import("../usage").UsageReport[] | null> {
