@@ -250,11 +250,80 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		return this.#broker.allocateMonotonicSequence(key, expiresAtSec);
 	}
 
-	// Note: refreshOAuthCredential is intentionally not exposed from HybridAuthCredentialStore.
-	// Local credentials can't be refreshed through the broker. Broker credentials that are
-	// visible in the snapshot will be refreshed through the local mechanism, which is correct
-	// because they're read-only on the client anyway. Credentials that disappear from the
-	// snapshot due to unserved transitions are properly handled by the fallback to local storage.
+	listCredentialInventory(provider?: string): import("../auth-storage").CredentialInventoryRecord[] {
+		if (provider !== undefined) {
+			return this.#localProviders.has(provider)
+				? this.#local.listCredentialInventory(provider).map(record => ({
+						...record,
+						id: -record.id,
+					}))
+				: this.#broker.listCredentialInventory(provider);
+		}
+		const records = this.#broker
+			.listCredentialInventory()
+			.filter(record => !this.#localProviders.has(record.provider));
+		for (const local of this.#localProviders) {
+			for (const record of this.#local.listCredentialInventory(local)) {
+				records.push({ ...record, id: -record.id });
+			}
+		}
+		return records;
+	}
+
+	listCredentialRemovalTargets(provider?: string): import("../auth-storage").CredentialRemovalTarget[] {
+		// Hard removal only applies to local providers
+		if (provider !== undefined) {
+			return this.#localProviders.has(provider)
+				? this.#local.listCredentialRemovalTargets(provider).map(target => ({
+						...target,
+						id: -target.id,
+					}))
+				: [];
+		}
+		const targets: import("../auth-storage").CredentialRemovalTarget[] = [];
+		for (const local of this.#localProviders) {
+			for (const target of this.#local.listCredentialRemovalTargets(local)) {
+				targets.push({ ...target, id: -target.id });
+			}
+		}
+		return targets;
+	}
+
+	removeAuthCredentialsHard(
+		provider: string,
+		targets: readonly import("../auth-storage").CredentialRemovalTarget[],
+	): import("../auth-storage").AuthCredentialHardRemovalResult {
+		// Hard removal only applies to local providers; broker rows can only be soft-disabled
+		if (!this.#localProviders.has(provider)) {
+			// Return conflict for broker providers: they cannot be hard-removed
+			return { kind: "conflict", currentIds: targets.map(t => t.id) };
+		}
+		const localTargets: import("../auth-storage").CredentialRemovalTarget[] = targets.map(target => ({
+			...target,
+			id: -target.id,
+		}));
+		return this.#local.removeAuthCredentialsHard(provider, localTargets);
+	}
+
+	async refreshOAuthCredential(
+		provider: import("../types").Provider,
+		credentialId: number,
+		credential: import("../auth-storage").OAuthCredential,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<import("../utils/oauth/types").OAuthCredentials> {
+		// Route refresh by row ownership: broker rows through the remote hook,
+		// local credentials are handled by AuthStorage's default mechanism
+		if (isLocalId(credentialId)) {
+			// Local credentials are not refreshed through this hook; AuthStorage
+			// will fall back to its default refresh mechanism for local credentials
+			return Promise.reject(
+				new Error("Local credentials must be refreshed through AuthStorage's default mechanism"),
+			);
+		}
+		// Broker credentials route through the broker's refresh hook
+		return this.#broker.refreshOAuthCredential(provider, credentialId, credential, signal, expectedRevision);
+	}
 
 	fetchUsageReports(signal?: AbortSignal): Promise<import("../usage").UsageReport[] | null> {
 		return this.#broker.fetchUsageReports?.(signal) ?? Promise.resolve(null);
@@ -286,24 +355,24 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		entries: readonly import("../auth-storage").AuthCredentialSnapshotEntry[] | undefined,
 	): Promise<void> {
 		if (!entries || entries.length === 0) return;
-		// Group entries by provider for efficient batch disable
-		const entriesByProvider = new Map<string, number[]>();
-		for (const entry of entries) {
-			const ids = entriesByProvider.get(entry.provider) ?? [];
-			ids.push(entry.id);
-			entriesByProvider.set(entry.provider, ids);
-		}
-		// Disable via deleteAuthCredentialsRemote for each provider, which handles the batch disable
-		for (const [provider] of entriesByProvider) {
-			try {
-				await this.#broker.deleteAuthCredentialsRemote(provider, "auth-broker-no-serve");
-			} catch (error) {
-				// Log but don't throw - the credentials are already not being served
-				logger.warn("Failed to disable unserved credentials for provider", {
-					provider,
+		// Extract the specific unserved credential IDs and disable them directly.
+		// These IDs were accepted by the broker but are absent from its snapshot,
+		// so they would not be caught by snapshot-based deletion.
+		const unservedIds = entries.map(entry => entry.id);
+		try {
+			await this.#broker.disableCredentialsById(unservedIds, "auth-broker-no-serve");
+		} catch (error) {
+			// Log but do not throw: cleanup is incomplete but the credential is
+			// already stored locally, so backing out would leave it in an inconsistent state.
+			// The unserved IDs remain active upstream and may resurface if the broker
+			// later serves this provider, but local storage protects the credential.
+			logger.warn(
+				"Failed to disable accepted-but-unserved broker credentials; they may resurface if broker serves this provider",
+				{
+					count: unservedIds.length,
 					error: String(error),
-				});
-			}
+				},
+			);
 		}
 	}
 

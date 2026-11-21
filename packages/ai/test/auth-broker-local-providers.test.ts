@@ -305,4 +305,85 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 			local.close();
 		}
 	});
+
+	test("HybridAuthCredentialStore implements inventory and removal for local providers", async () => {
+		const credential: AuthCredential = { type: "api_key", key: "test-key" };
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const client = new AuthBrokerClient({ url: handle!.url, token: TOKEN });
+		const fetchResult = await client.fetchSnapshot();
+		if (fetchResult.status !== 200) throw new Error("broker returned no snapshot");
+		const broker = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: fetchResult.snapshot,
+			streamSnapshots: false,
+		});
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			// Mark provider as local to simulate broker not serving it
+			local.markBrokerLocalProvider(UNSERVED);
+
+			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			try {
+				// Store a credential for a local provider
+				await hybrid.upsertAuthCredentialRemote(UNSERVED, credential);
+
+				// Verify inventory includes the credential
+				const inventory = hybrid.listCredentialInventory(UNSERVED);
+				expect(inventory).toHaveLength(1);
+				// Local IDs are negated in the hybrid store
+				expect(inventory[0]?.id).toBeLessThan(0);
+
+				// Verify removal targets are available for local provider
+				const targets = hybrid.listCredentialRemovalTargets(UNSERVED);
+				expect(targets).toHaveLength(1);
+				expect(targets[0]?.id).toBeLessThan(0);
+
+				// Verify hard removal works
+				const result = hybrid.removeAuthCredentialsHard(UNSERVED, targets);
+				expect(result.kind).toBe("removed");
+
+				// Verify the credential is removed
+				const credentialsAfterRemoval = hybrid.listAuthCredentials(UNSERVED);
+				expect(credentialsAfterRemoval).toHaveLength(0);
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
+		}
+	});
+
+	test("HybridAuthCredentialStore returns conflict for broker provider hard removal", async () => {
+		const brokerProvider = "anthropic"; // This is a broker provider by default
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const client = new AuthBrokerClient({ url: handle!.url, token: TOKEN });
+		const fetchResult = await client.fetchSnapshot();
+		if (fetchResult.status !== 200) throw new Error("broker returned no snapshot");
+		const broker = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: fetchResult.snapshot,
+			streamSnapshots: false,
+		});
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			try {
+				// Try to get removal targets for a broker provider - should return empty
+				const targets = hybrid.listCredentialRemovalTargets(brokerProvider);
+				expect(targets).toHaveLength(0);
+
+				// Try to remove broker provider credentials - should return conflict
+				const dummyTarget = { id: 123, provider: brokerProvider, expectedRevision: 1 };
+				const result = hybrid.removeAuthCredentialsHard(brokerProvider, [dummyTarget]);
+				if (result.kind !== "conflict") throw new Error("Expected conflict");
+				expect(result.currentIds).toContain(123);
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
+		}
+	});
 });

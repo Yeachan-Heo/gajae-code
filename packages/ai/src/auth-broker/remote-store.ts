@@ -990,6 +990,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		await this.refreshSnapshot();
 	}
 
+	/** Disable specific credential IDs directly by id, used when disabling unserved entries. */
+	async disableCredentialsById(ids: readonly number[], disabledCause: string): Promise<void> {
+		for (const id of ids) {
+			await this.#client.disableCredential(id, disabledCause);
+		}
+		await this.refreshSnapshot();
+	}
+
 	/**
 	 * Upsert a single credential through the broker. The broker server is the
 	 * canonical writer — see `POST /v1/credential`. The redacted snapshot
