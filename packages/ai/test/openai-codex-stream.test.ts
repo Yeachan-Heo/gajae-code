@@ -4695,18 +4695,22 @@ describe("openai-codex streaming", () => {
 		expect(sentRequests).toHaveLength(2);
 		expect(sentRequests[0]?.previous_response_id).toBeUndefined();
 		expect(sentRequests[0]?.prompt_cache_key).toBe("ws-delta-session");
-		expect(sentRequests[0]?.instructions).toBe("You are a helpful assistant.");
+		expect(sentRequests[0]?.instructions).toBeUndefined();
 		const initialInput = sentRequests[0]?.input;
 		expect(Array.isArray(initialInput)).toBe(true);
 		const initialItems = initialInput as Array<{ role?: string; content?: unknown }>;
-		expect(initialItems).toHaveLength(2);
-		expect(initialItems[0]?.role).toBe("developer");
-		expect(JSON.stringify(initialItems[0]?.content)).toContain("Use concise answers.");
-		expect(initialItems[1]?.role).toBe("user");
+		expect(initialItems.length).toBeGreaterThanOrEqual(3);
+		const initialDeveloperMessages = initialItems.filter(item => item.role === "developer");
+		expect(initialDeveloperMessages).toHaveLength(2);
+		expect(JSON.stringify(initialDeveloperMessages[0]?.content)).toContain("You are a helpful assistant.");
+		expect(JSON.stringify(initialDeveloperMessages[1]?.content)).toContain("Use concise answers.");
+		const initialUserMessages = initialItems.filter(item => item.role === "user");
+		expect(initialUserMessages.length).toBeGreaterThanOrEqual(1);
+		expect(JSON.stringify(initialUserMessages[0]?.content)).toContain("First question");
 		expect(sentRequests[1]?.type).toBe("response.create");
 		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
 		expect(sentRequests[1]?.prompt_cache_key).toBe("ws-delta-session");
-		expect(sentRequests[1]?.instructions).toBe("You are a helpful assistant.");
+		expect(sentRequests[1]?.instructions).toBeUndefined();
 		const deltaInput = sentRequests[1]?.input;
 		expect(Array.isArray(deltaInput)).toBe(true);
 		const deltaItems = deltaInput as Array<{ role?: string }>;
@@ -4726,6 +4730,77 @@ describe("openai-codex streaming", () => {
 			lastDeltaInputItems: 1,
 			lastPreviousResponseId: "resp_1",
 		});
+	});
+
+	it("sends system prompts as developer messages (for prompt caching)", async () => {
+		const tempDir = trackedTempDir("@pi-codex-system-prompt-caching-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		let capturedRequest: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class CacheTestWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				capturedRequest = JSON.parse(data) as Record<string, unknown>;
+				this.emitCodexResponse({
+					messageId: "msg_1",
+					responseId: "resp_1",
+					text: "Test response",
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = CacheTestWebSocket as unknown as typeof WebSocket;
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-6.2-sol",
+			name: "GPT-6.2 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: ["Primary system prompt", "Secondary system prompt"],
+			messages: [{ role: "user", content: "Test message", timestamp: Date.now() }],
+		};
+
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			sessionId: "cache-test-session",
+			providerSessionState,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+
+		// System prompts should NOT be in the top-level instructions field
+		expect(capturedRequest?.instructions).toBeUndefined();
+
+		// System prompts should be sent as developer messages in the input array
+		const input = capturedRequest?.input as Array<{ role?: string; content?: unknown }> | undefined;
+		expect(Array.isArray(input)).toBe(true);
+		const developerMessages = input?.filter(item => item.role === "developer") ?? [];
+		expect(developerMessages).toHaveLength(2);
+		expect(JSON.stringify(developerMessages[0])).toContain("Primary system prompt");
+		expect(JSON.stringify(developerMessages[1])).toContain("Secondary system prompt");
+		// User message should still be present
+		const userMessages = input?.filter(item => item.role === "user") ?? [];
+		expect(userMessages.length).toBeGreaterThanOrEqual(1);
 	});
 
 	it("resets websocket append state after salvaging a finalized tool call", async () => {
