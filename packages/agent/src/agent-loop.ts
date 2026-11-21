@@ -5574,9 +5574,24 @@ async function executeToolCalls(
 		steeringCheck = (async () => {
 			const steering = await getSteeringMessages();
 			if (steering.length > 0) {
-				steeringMessages = steering;
-				interruptState.triggered = true;
-				steeringAbortController.abort();
+				// Check if all steering messages are IRC-sourced.
+				// If so, defer them to the next tool boundary instead of interrupting immediately.
+				const allIrcSourced = steering.every(msg => {
+					const ircPeer = extractIrcSourceIfPresent(msg);
+					return ircPeer !== undefined;
+				});
+
+				if (allIrcSourced && config.requeueSteeringMessages) {
+					// IRC-sourced steering: defer to next tool boundary
+					// Requeue the messages so they're processed after current tools complete
+					config.requeueSteeringMessages(steering);
+					// Don't interrupt: let tools continue and finish naturally
+				} else {
+					// Real user steering or mixed: interrupt immediately
+					steeringMessages = steering;
+					interruptState.triggered = true;
+					steeringAbortController.abort();
+				}
 			}
 		})().finally(() => {
 			steeringCheck = null;
@@ -5971,7 +5986,8 @@ async function executeToolCalls(
 		const interrupted = interruptState.triggered;
 		if (interrupted) {
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(), true);
+			const steeringSource = steeringMessages ? determineSteeringSource(steeringMessages) : "user";
+			emitToolResult(record, createSkippedToolResult(steeringSource), true);
 		} else {
 			emitToolResult(record, result, isError);
 		}
@@ -6056,7 +6072,9 @@ async function executeToolCalls(
 						toolName: record.toolCall.name,
 						status: "skipped",
 					});
-					emitToolResult(record, createSkippedToolResult(), true);
+					const skipSource =
+						interruptState.triggered && steeringMessages ? determineSteeringSource(steeringMessages) : undefined;
+					emitToolResult(record, createSkippedToolResult(skipSource), true);
 				}
 			});
 		if (reservation?.ok) {
@@ -6109,7 +6127,9 @@ async function executeToolCalls(
 				toolName: record.toolCall.name,
 				status: "skipped",
 			});
-			emitToolResult(record, createSkippedToolResult(), true);
+			const skipSource =
+				interruptState.triggered && steeringMessages ? determineSteeringSource(steeringMessages) : undefined;
+			emitToolResult(record, createSkippedToolResult(skipSource), true);
 		}
 	}
 
@@ -6179,9 +6199,43 @@ function createAbortedToolResult(
 	return toolResultMessage;
 }
 
-function createSkippedToolResult(): AgentToolResult<any> {
+/**
+ * Detect if a message is an IRC-sourced custom message and extract the peer name.
+ * Returns the peer name if IRC-sourced, or undefined for user messages.
+ */
+function extractIrcSourceIfPresent(message: AgentMessage): string | undefined {
+	if (message.role !== "custom") return undefined;
+	const customMsg = message as any; // CustomMessage
+	const customType = customMsg.customType;
+	// IRC custom messages have customType starting with "irc:"
+	if (typeof customType === "string" && (customType === "irc:incoming" || customType === "irc:autoreply")) {
+		const details = customMsg.details as any;
+		if (details && typeof details.from === "string") {
+			return details.from;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Determine the source of steering messages (IRC peer name or "user").
+ * If any message in the batch is IRC-sourced, returns the peer name.
+ * Otherwise returns "user" indicating genuine user steering.
+ */
+function determineSteeringSource(messages: AgentMessage[]): string {
+	for (const msg of messages) {
+		const ircPeer = extractIrcSourceIfPresent(msg);
+		if (ircPeer) {
+			return ircPeer;
+		}
+	}
+	return "user";
+}
+
+function createSkippedToolResult(source?: string): AgentToolResult<any> {
+	const sourceLabel = source === "user" ? "user message" : `incoming IRC message from ${source}`;
 	return {
-		content: [{ type: "text", text: "Skipped due to queued user message." }],
+		content: [{ type: "text", text: `Skipped due to queued ${sourceLabel}.` }],
 		details: {},
 	};
 }
