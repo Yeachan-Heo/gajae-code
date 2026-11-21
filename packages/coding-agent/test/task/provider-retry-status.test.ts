@@ -7,6 +7,7 @@ describe("classifyProviderRetry", () => {
 			"Provider stream timed out while waiting for the first event",
 			"Anthropic stream timed out while waiting for the first event",
 			"Error: Provider stream timed out while waiting for the first event",
+			"OpenAI completions stream timed out while waiting for the first event (elapsed=100001ms request_bytes=2048 endpoint=custom configured_timeout=100000ms; override with retry.streamFirstEventTimeoutMs or PI_STREAM_FIRST_EVENT_TIMEOUT_MS)",
 		]) {
 			expect(classifyProviderRetry(message)).toBe("first_event_timeout");
 		}
