@@ -43,6 +43,7 @@ export * as bus from "./bus";
 export * from "./composer-observation";
 export * from "./diagnostics/observe-broker";
 export * from "./diff-observation";
+export * from "./embedding";
 export * from "./extension-interaction";
 export * as host from "./host";
 export type {

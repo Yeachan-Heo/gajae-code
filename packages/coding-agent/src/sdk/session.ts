@@ -244,7 +244,7 @@ import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
-import { JobObservation } from "./job-observation";
+import { JobObservation, JobObservationError } from "./job-observation";
 import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	isStableSessionApiKeyCredentialType,
@@ -6701,7 +6701,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationManager.getSubagentControlScope() !== observationScope
 				)
 					observationInvalidated = true;
-				if (lifecycle.transitioning) {
+				if (lifecycle.transitioning && !observationSession.isMcpControlActive) {
 					// Observe ownership conflicts even during exclusion: restoring mutable
 					// identities before settlement cannot undo a captured mismatch.
 					observationSuspended = true;
@@ -6720,7 +6720,37 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationSuspended = false;
 				}
 				if (!jobObservation) {
-					const view = new JobObservation(observationManager, resolvedAgentId);
+					// Capture this view's owner, not the mutable renewal state below.
+					const generation = observationGeneration;
+					const sessionManager = observationSessionManager;
+					const sessionId = observationSessionId;
+					const scope = observationScope;
+					const view: JobObservation = new JobObservation(observationManager, resolvedAgentId, () => {
+						const current = observationSession.sessionLifecycle;
+						if (current.disposed) {
+							cleanup();
+							throw new JobObservationError("disposed");
+						}
+						if (
+							current.generation !== generation ||
+							observationSession.sessionManager !== sessionManager ||
+							observationSession.sessionId !== sessionId ||
+							observationManager.getSubagentControlScope() !== scope ||
+							observationInvalidated
+						) {
+							if (jobObservation === view) observationInvalidated = true;
+							cleanup();
+							throw new JobObservationError("stale_generation");
+						}
+						if (current.transitioning) {
+							// MCP keeps the read view alive, never its mutation authority.
+							if (!observationSession.isMcpControlActive) {
+								if (jobObservation === view) observationSuspended = true;
+								cleanup();
+							}
+							throw new JobObservationError("session_transitioning");
+						}
+					});
 					const disposeView = view.dispose.bind(view);
 					const unregisterDisposal = observationSession.registerToolSessionCleanup(() => cleanup());
 					const unregisterTransition = observationSession.registerToolSessionTransitionCleanup(() => cleanup());

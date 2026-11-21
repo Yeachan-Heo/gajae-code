@@ -1,0 +1,77 @@
+import "./environment";
+import { postmortem } from "@gajae-code/utils";
+import { createFrameWriter, createWritableFrameSink } from "./frame-writer";
+import { DesktopHost } from "./host";
+import { registerDesktopProcessShutdown } from "./process-lifecycle";
+import type { DesktopFrame, DesktopRequest } from "./protocol";
+import { serveProtocol } from "./transport";
+
+export async function main(): Promise<void> {
+	// Capture the frame channel before redirecting diagnostics away from stdout.
+	const writeFrame = createWritableFrameSink(process.stdout);
+	process.stdout.write = process.stderr.write.bind(process.stderr);
+	const frames = createFrameWriter({
+		write: writeFrame,
+		onError: error => {
+			// The frame channel is gone; report it and stop pretending to serve.
+			process.stderr.write(`desktop host frame channel failed: ${String(error)}\n`);
+			process.exitCode = 1;
+			// Wake the protocol iterator even if the parent keeps its input pipe open.
+			// Its finally block closes the SDK host and joins in-flight handlers.
+			process.stdin.destroy();
+		},
+	});
+	const emit = (frame: DesktopFrame) => frames.write(frame);
+	const host = new DesktopHost({ emit });
+	// Opt-in request trace for diagnosing a desktop connection. Method names only:
+	// parameters can carry user text or credentials.
+	const traced = {
+		async handle(request: DesktopRequest) {
+			// A synchronous backlog failure can occur while dispatching one chunk.
+			// Do not admit any remaining requests buffered in that same chunk.
+			if (frames.failed) return;
+			if (process.env.GJC_DESKTOP_TRACE === "1") {
+				process.stderr.write(`desktop host request: ${request.method}\n`);
+			}
+			await host.handle(request);
+		},
+		close: () => host.close(),
+	};
+	const drained = Promise.withResolvers<void>();
+	let stopping = false;
+	const unregisterShutdown = registerDesktopProcessShutdown({
+		close: () => {
+			stopping = true;
+			return host.close();
+		},
+		flush: () => drained.promise,
+		onError: () => {
+			process.stderr.write("desktop host shutdown failed\n");
+			process.exitCode = 1;
+		},
+	});
+	try {
+		await serveProtocol(process.stdin, traced, emit);
+	} catch {
+		if (!stopping) {
+			emit({ type: "fatal", error: "Desktop host transport failed" });
+			process.exitCode = 1;
+		}
+	} finally {
+		try {
+			// Frames queued behind a slow parent must reach it before exit.
+			await frames.flush();
+		} finally {
+			drained.resolve();
+			unregisterShutdown();
+		}
+	}
+}
+
+/** Process entrypoints also retire SDK-global workers after session/frame teardown. */
+export async function runDesktopHostProcess(): Promise<void> {
+	await main();
+	await postmortem.quit(Number(process.exitCode ?? 0));
+}
+
+if (import.meta.main) await runDesktopHostProcess();
