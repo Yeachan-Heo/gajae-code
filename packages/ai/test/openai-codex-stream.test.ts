@@ -8671,6 +8671,8 @@ describe("openai-codex streaming", () => {
 		} finally {
 			for (const state of providerSessionState.values()) state.close();
 		}
+	});
+
 	it("strips inherited conversation_id header from caller-supplied headers", async () => {
 		const tempDir = trackedTempDir("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
