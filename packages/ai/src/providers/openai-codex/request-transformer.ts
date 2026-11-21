@@ -255,3 +255,21 @@ export async function transformRequestBody(
 
 	return body;
 }
+
+/** Request fields codex-rs serializes ahead of `input` (`ResponsesApiRequest`, `ResponseCreateWsRequest`). */
+const CODEX_ROUTING_FIELDS = ["type", "model", "stream", "service_tier", "previous_response_id"] as const;
+
+/**
+ * Returns a shallow copy whose routing fields lead in codex-rs order; every
+ * other field trails. This is a no-op when no routing fields are present.
+ */
+export function withCodexRoutingFieldsFirst<T extends object>(body: T): T {
+	const ordered: Record<string, unknown> = {};
+	for (const key of CODEX_ROUTING_FIELDS) {
+		if (Object.hasOwn(body, key)) ordered[key] = (body as Record<string, unknown>)[key];
+	}
+	for (const [key, value] of Object.entries(body)) {
+		if (!Object.hasOwn(ordered, key)) ordered[key] = value;
+	}
+	return ordered as T;
+}
