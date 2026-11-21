@@ -3769,6 +3769,9 @@ function createCodexHeaders(
 		headers.delete("accept");
 		headers.delete("content-type");
 	}
+	// Strip legacy conversation_id header unconditionally, regardless of caller input.
+	// Only session_id should be sent to Codex upstream.
+	headers.delete("conversation_id");
 	return headers;
 }
 

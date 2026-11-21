@@ -1584,6 +1584,9 @@ function buildOpenAIImageHeaders(
 			`${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
 		);
 		if (sessionId) headers.set(OPENAI_HEADERS.SESSION_ID, sessionId);
+		// Strip legacy conversation_id header unconditionally, regardless of caller input.
+		// Only session_id should be sent to Codex upstream.
+		headers.delete("conversation_id");
 	}
 
 	return headers;

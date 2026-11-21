@@ -8671,5 +8671,97 @@ describe("openai-codex streaming", () => {
 		} finally {
 			for (const state of providerSessionState.values()) state.close();
 		}
+	it("strips inherited conversation_id header from caller-supplied headers", async () => {
+		const tempDir = trackedTempDir("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.added",
+				item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+			})}`,
+			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					id: "msg_1",
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text: "Hello" }],
+				},
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: {
+					status: "completed",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 3,
+						total_tokens: 8,
+						input_tokens_details: { cached_tokens: 0 },
+					},
+				},
+			})}`,
+		].join("\n\n")}\n\n`;
+
+		const encoder = new TextEncoder();
+		const stream = new ReadableStream({
+			start(controller) {
+				controller.enqueue(encoder.encode(sse));
+				controller.close();
+			},
+		});
+
+		const callerConversationId = "legacy-conversation-123";
+		const sessionId = "test-session-456";
+		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				const headers = init?.headers instanceof Headers ? init.headers : undefined;
+				// Verify that conversation_id is NOT present, even though it was supplied by the caller
+				expect(headers?.has("conversation_id")).toBe(false);
+				// Verify that session_id IS present
+				expect(headers?.get("session_id")).toBe(sessionId);
+				return new Response(stream, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+			// Caller supplies conversation_id in headers
+			headers: { conversation_id: callerConversationId },
+		};
+
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const streamResult = streamOpenAICodexResponses(model, context, { apiKey: token, sessionId });
+		const result = await streamResult.result();
+		expect(result.content).toContainEqual(expect.objectContaining({ text: "Hello" }));
 	});
 });
