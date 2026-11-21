@@ -2,7 +2,7 @@
  * Shared utilities for Google Generative AI and Google Cloud Code Assist providers.
  */
 
-import { extractHttpStatusFromError, readJsonl, readSseJson } from "@gajae-code/utils";
+import { extractHttpStatusFromError, logger, readJsonl, readSseJson } from "@gajae-code/utils";
 import type { ProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
 import {
 	isProviderSafetyStopAdapterInvocation,
@@ -29,6 +29,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
+import { GeminiHeaderRunDetector } from "../utils/thinking-loop";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
@@ -597,6 +598,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	let firstTokenSeen = false;
 	let providerSafetyStop = false;
+	const geminiHeaderRunDetector = new GeminiHeaderRunDetector();
 
 	const flushCurrent = () => {
 		if (!currentBlock) return;
@@ -633,7 +635,18 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 							delta: part.text,
 							partial: output,
 						});
+						// Feed thinking to Gemini header runaway detector.
+						if (geminiHeaderRunDetector.push(part.text)) {
+							logger.debug(
+								`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupting stream.`,
+							);
+							throw new Error(
+								`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupted to prevent budget exhaustion.`,
+							);
+						}
 					} else {
+						// Reset Gemini header runaway detector when transitioning to visible text.
+						geminiHeaderRunDetector.reset();
 						currentBlock.text += part.text;
 						if (retainTextSignature) {
 							currentBlock.textSignature = retainThoughtSignature(
@@ -651,6 +664,8 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 				}
 
 				if (part.functionCall) {
+					// Reset Gemini header runaway detector when transitioning to tool calls.
+					geminiHeaderRunDetector.reset();
 					if (currentBlock) {
 						flushCurrent();
 						currentBlock = null;
