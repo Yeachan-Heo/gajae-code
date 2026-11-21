@@ -30,6 +30,7 @@ import type { RawArgumentRejectionCode, RawArgumentRejectionDetail, Tool, ToolCa
 import { upgradeJsonSchemaTo202012 } from "./schema/draft";
 import {
 	isJsonSchemaValueValid,
+	isJsonSchemaValueValidWithRoot,
 	type JsonSchemaValidationIssue,
 	validateJsonSchemaValue,
 } from "./schema/json-schema-validator";
@@ -551,20 +552,40 @@ function deleteAtSegment(node: unknown, segments: string[], depth: number): unkn
  * Test a JSON-Schema branch during nullable normalization. Kept deliberately
  * small and synchronous so validation does not need to compile legacy schemas
  * into another schema language.
+ *
+ * @param branch The schema branch to validate against
+ * @param value The value to test
+ * @param rootSchema Optional root schema for resolving $ref pointers
  */
-function branchMatchesSchema(branch: unknown, value: unknown): boolean {
+function branchMatchesSchema(branch: unknown, value: unknown, rootSchema?: unknown): boolean {
+	if (rootSchema) {
+		// Keep the root schema context through $ref resolution so chained refs work correctly
+		return isJsonSchemaValueValidWithRoot(branch, value, rootSchema);
+	}
 	return isJsonSchemaValueValid(branch, value);
+}
+
+/**
+ * Check if a schema accepts a given value, with support for $ref resolution.
+ * If rootSchema is provided, it will be used to resolve $ref pointers through chained refs.
+ */
+function isSchemaValueValidWithRoot(schema: unknown, value: unknown, rootSchema: unknown): boolean {
+	// Keep the root schema context through $ref resolution so chained refs work correctly
+	return isJsonSchemaValueValidWithRoot(schema, value, rootSchema);
 }
 
 function normalizeOptionalNullsForSchema(
 	schema: unknown,
 	value: unknown,
 	isRoot = true,
+	rootSchema?: unknown,
 ): { value: unknown; changed: boolean } {
 	if (value === null || value === undefined) return { value, changed: false };
 	if (schema === null || typeof schema !== "object") return { value, changed: false };
 
 	const schemaObject = schema as Record<string, unknown>;
+
+	const effectiveRootSchema = rootSchema ?? (isRoot ? schema : rootSchema);
 
 	const normalizeAnyOfLike = (keyword: "anyOf" | "oneOf"): { value: unknown; changed: boolean } => {
 		const branches = schemaObject[keyword];
@@ -573,10 +594,10 @@ function normalizeOptionalNullsForSchema(
 		let changedCandidate: { value: unknown; changed: true } | null = null;
 
 		for (const branch of branches) {
-			const normalized = normalizeOptionalNullsForSchema(branch, value, isRoot);
+			const normalized = normalizeOptionalNullsForSchema(branch, value, isRoot, effectiveRootSchema);
 			if (!normalized.changed) continue;
 
-			if (branchMatchesSchema(branch, normalized.value)) {
+			if (branchMatchesSchema(branch, normalized.value, effectiveRootSchema)) {
 				return normalized;
 			}
 
@@ -598,7 +619,7 @@ function normalizeOptionalNullsForSchema(
 		let changed = false;
 		let nextValue: unknown = value;
 		for (const branch of schemaObject.allOf) {
-			const normalized = normalizeOptionalNullsForSchema(branch, nextValue, isRoot);
+			const normalized = normalizeOptionalNullsForSchema(branch, nextValue, isRoot, effectiveRootSchema);
 			if (!normalized.changed) continue;
 			nextValue = normalized.value;
 			changed = true;
@@ -615,7 +636,7 @@ function normalizeOptionalNullsForSchema(
 		let changed = false;
 		let nextValue = value;
 		for (let i = 0; i < value.length; i += 1) {
-			const normalized = normalizeOptionalNullsForSchema(itemSchema, value[i], false);
+			const normalized = normalizeOptionalNullsForSchema(itemSchema, value[i], false, effectiveRootSchema);
 			if (!normalized.changed) continue;
 			if (!changed) {
 				nextValue = [...value];
@@ -649,11 +670,13 @@ function normalizeOptionalNullsForSchema(
 	for (const [key, propertySchema] of Object.entries(properties)) {
 		if (!(key in nextValue)) continue;
 		const currentValue = nextValue[key];
-		const isNullish = currentValue === null || currentValue === "null";
+		const isJsonNull = currentValue === null;
+		const isStringNullSentinel = currentValue === "null";
 
-		// Strip null and the string "null" from optional fields.
-		// The LLM sometimes outputs string "null" to mean "no value".
-		if (isNullish && !required.has(key)) {
+		// Handle the string "null" sentinel first: always remove it for optional fields
+		// since it means "no value", regardless of whether the schema accepts null or strings.
+		// This preserves the LLM intent (output string "null" to mean "omit this field").
+		if (isStringNullSentinel && !required.has(key)) {
 			if (!changed) {
 				nextValue = { ...nextValue };
 				changed = true;
@@ -662,23 +685,39 @@ function normalizeOptionalNullsForSchema(
 			continue;
 		}
 
-		// Substitute the schema-supplied default when a required field arrives
-		// as null/"null". LLMs commonly emit null for "I have nothing to say
-		// here"; if the schema documents a default, honor it instead of
-		// rejecting the whole call. The default is cloned so mutations on the
-		// validated value never bleed back into the schema.
-		if (isNullish && propertySchema && typeof propertySchema === "object") {
-			const propertyObject = propertySchema as Record<string, unknown>;
-			if ("default" in propertyObject) {
+		// Handle JSON null: check if the schema accepts null values.
+		// If the schema does accept null, preserve the explicit null (don't apply defaults).
+		if (isJsonNull) {
+			const acceptsNull = isSchemaValueValidWithRoot(propertySchema, null, effectiveRootSchema);
+			if (acceptsNull) {
+				// Schema accepts null: preserve it and skip further processing
+				continue;
+			}
+			// Schema doesn't accept null.
+			// For optional fields, delete the field.
+			// For required fields, apply the default if available.
+			if (!required.has(key)) {
 				if (!changed) {
 					nextValue = { ...nextValue };
 					changed = true;
 				}
-				nextValue[key] = structuredCloneJSON(propertyObject.default);
+				delete nextValue[key];
 				continue;
 			}
+			// Required field that doesn't accept null: apply default if available
+			if (propertySchema && typeof propertySchema === "object") {
+				const propertyObject = propertySchema as Record<string, unknown>;
+				if ("default" in propertyObject) {
+					if (!changed) {
+						nextValue = { ...nextValue };
+						changed = true;
+					}
+					nextValue[key] = structuredCloneJSON(propertyObject.default);
+					continue;
+				}
+			}
 		}
-		const normalized = normalizeOptionalNullsForSchema(propertySchema, currentValue, false);
+		const normalized = normalizeOptionalNullsForSchema(propertySchema, currentValue, false, effectiveRootSchema);
 		if (!normalized.changed) continue;
 
 		if (!changed) {
