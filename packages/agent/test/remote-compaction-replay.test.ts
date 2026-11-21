@@ -1,20 +1,18 @@
-import { describe, expect, test, beforeAll } from "bun:test";
-let debugLogging = false;
-beforeAll(() => {
-	debugLogging = !!Bun.env.DEBUG;
-});
-import type { AssistantMessage, Model, Usage } from "@gajae-code/ai/types";
-import { getBundledModel } from "@gajae-code/ai/models";
-import {
-	DEFAULT_COMPACTION_SETTINGS,
-	prepareCompaction,
-	canReplayRemoteCompactionFrom,
-} from "@gajae-code/agent-core/compaction/compaction";
-import type { SessionEntry, SessionMessageEntry, CompactionEntry } from "@gajae-code/agent-core/compaction/entries";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "@gajae-code/agent-core/compaction/compaction";
+import type { CompactionEntry, SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
 import {
 	getPreservedOpenAiRemoteCompactionData,
 	withOpenAiRemoteCompactionPreserveData,
 } from "@gajae-code/agent-core/compaction/openai";
+import { getBundledModel } from "@gajae-code/ai/models";
+import type { AssistantMessage, Usage } from "@gajae-code/ai/types";
+
+beforeAll(() => {
+	if (Bun.env.DEBUG) {
+		// Debug logging enabled
+	}
+});
 
 const timestamp = "2026-11-20T00:00:00.000Z";
 const ts = Date.parse(timestamp);
@@ -52,34 +50,12 @@ function longText(id: number): string {
 function buildEntries(lastUsageInput = 50000, turns = 30): SessionEntry[] {
 	const entries: SessionEntry[] = [];
 	for (let i = 0; i < turns; i++) {
-		entries.push(userEntry(`u${i}`, `Query ${i}? ` + longText(i)));
+		entries.push(userEntry(`u${i}`, `Query ${i}? ${longText(i)}`));
 		const isLast = i === turns - 1;
 		entries.push(assistantEntry(`a${i}`, longText(i), isLast ? makeUsage(lastUsageInput) : undefined));
 	}
 	return entries;
 }
-
-describe("canReplayRemoteCompactionFrom", () => {
-	const codex = getBundledModel("openai-codex", "gpt-5.6-sol");
-	const openai = getBundledModel("openai", "gpt-5.4");
-	const claude = getBundledModel("anthropic", "claude-sonnet-4-5");
-
-	if (!codex || !openai || !claude) {
-		throw new Error("Expected built-in models to exist");
-	}
-
-	test("an OpenAI lane's payload replays only on the same provider", () => {
-		expect(canReplayRemoteCompactionFrom(codex, codex)).toBe(true);
-		expect(canReplayRemoteCompactionFrom(codex, openai)).toBe(true); // same provider
-		expect(canReplayRemoteCompactionFrom(codex, claude)).toBe(false); // different provider
-	});
-
-	test("the Anthropic lane's payload replays on any model", () => {
-		expect(canReplayRemoteCompactionFrom(claude, claude)).toBe(true);
-		expect(canReplayRemoteCompactionFrom(claude, codex)).toBe(true);
-		expect(canReplayRemoteCompactionFrom(claude, openai)).toBe(true);
-	});
-});
 
 describe("preserve data extraction", () => {
 	test("extracts OpenAI remote compaction data correctly", () => {

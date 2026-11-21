@@ -1342,22 +1342,6 @@ export interface PrepareCompactionOptions {
 }
 
 /**
- * Whether `reader` can replay the provider-native compaction `compactor` would
- * write. Only the OpenAI Responses lanes store a provider-bound payload; the
- * Anthropic lane and local methods leave a summary any model reads.
- */
-export function canReplayRemoteCompactionFrom(compactor: Model, reader: Model): boolean {
-	// If compactor doesn't use OpenAI remote compaction, any reader can replay (it's just a summary)
-	if (!shouldUseOpenAiRemoteCompaction(compactor)) {
-		return true;
-	}
-
-	// Compactor uses OpenAI remote compaction (openai or openai-codex provider).
-	// Only readers that also use OpenAI remote compaction can replay the encrypted payload.
-	return shouldUseOpenAiRemoteCompaction(reader);
-}
-
-/**
  * Whether `model` can replay a remote compaction given its preserveData.
  * Returns true if the data can be replayed (or if there's no remote compaction data).
  * Returns false if the model cannot replay the compaction data.

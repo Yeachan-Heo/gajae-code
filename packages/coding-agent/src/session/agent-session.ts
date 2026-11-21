@@ -27734,6 +27734,7 @@ export class AgentSession {
 					pathEntries,
 					this.#compactionSettingsForContextPromotion(compactionSettings),
 					{
+						activeModel: this.model,
 						contextWindow: this.model.contextWindow,
 						tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
 					},
@@ -30441,6 +30442,7 @@ export class AgentSession {
 				pathEntries,
 				this.#compactionSettingsForContextPromotion(compactionSettings),
 				{
+					activeModel: this.model,
 					contextWindow: this.model?.contextWindow,
 					tokenCorrectionRatio: overflowRatio !== undefined ? Math.max(1, overflowRatio) : undefined,
 				},
