@@ -238,4 +238,71 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 		expect(error.message).toContain("does not serve");
 		expect(error.provider).toBe("test-provider");
 	});
+
+	test("deleteAuthCredentialsRemote propagates broker deletion errors for local providers", async () => {
+		const credential: AuthCredential = { type: "api_key", key: "test-key" };
+		const dbPath = path.join(tempDir, "agent.db");
+
+		// Create a mock broker that fails on deleteAuthCredentialsRemote
+		const brokerMock = {
+			listAuthCredentials: () => [],
+			updateAuthCredential: () => {},
+			upsertAuthCredentialForProvider: () => [],
+			upsertAuthCredentialForProviderIfAbsent: () => ({ inserted: false, provider: UNSERVED, credential }),
+			upsertAuthCredentialRemote: async () => [],
+			upsertAuthCredentialRemoteIfAbsent: async () => ({ inserted: false, provider: UNSERVED, credential }),
+			deleteAuthCredential: () => {},
+			deleteAuthCredentialsRemote: async () => {
+				throw new Error("Broker service unavailable");
+			},
+			deleteAuthCredentialsForProvider: () => {},
+			getCache: () => null,
+			setCache: () => {},
+			deleteCachePrefix: () => {},
+			cleanExpiredCache: () => {},
+			allocateMonotonicSequence: () => 0,
+			fetchUsageReports: async () => null,
+			prepareForRequest: async () => undefined,
+			refreshSnapshot: async () => {},
+			onSnapshotChanged: () => () => {},
+			close: () => {},
+		} as unknown as RemoteAuthCredentialStore;
+
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			const hybrid = new HybridAuthCredentialStore({ broker: brokerMock, local });
+			try {
+				// Store a credential for an unserved provider
+				local.markBrokerLocalProvider(UNSERVED);
+				local.upsertAuthCredentialForProvider(UNSERVED, credential);
+
+				// Verify the credential is stored locally
+				expect(local.listAuthCredentials(UNSERVED)).toHaveLength(1);
+
+				// Try to delete the credentials - this should fail with the broker error
+				let threwError = false;
+				try {
+					await hybrid.deleteAuthCredentialsRemote(UNSERVED, "logout");
+				} catch (error) {
+					threwError = true;
+					expect(String(error)).toContain("Broker service unavailable");
+				}
+				expect(threwError).toBe(true);
+
+				// Provider should still be marked as local
+				const freshLocal = await SqliteAuthCredentialStore.open(dbPath);
+				try {
+					expect(freshLocal.listBrokerLocalProviders()).toContain(UNSERVED);
+					// Credential should still exist locally (not deleted due to error)
+					expect(freshLocal.listAuthCredentials(UNSERVED)).toHaveLength(1);
+				} finally {
+					freshLocal.close();
+				}
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
+		}
+	});
 });

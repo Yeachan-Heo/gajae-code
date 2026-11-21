@@ -311,16 +311,10 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 	async #disableBrokerCredentialsForProvider(provider: string, disabledCause: string): Promise<void> {
 		// Try to find and disable any credentials for this provider that may still exist on the broker
 		// but are not visible to us (they might be unserved from before).
+		// If this fails, the error propagates and prevents us from deleting local credentials,
+		// ensuring the provider stays marked local until revocation succeeds.
 		if (!this.#broker.deleteAuthCredentialsRemote) return;
-		try {
-			await this.#broker.deleteAuthCredentialsRemote(provider, disabledCause);
-		} catch (error) {
-			// Log but don't throw - this is best-effort cleanup
-			logger.debug("Failed to disable broker credentials for local provider on logout", {
-				provider,
-				error: String(error),
-			});
-		}
+		await this.#broker.deleteAuthCredentialsRemote(provider, disabledCause);
 	}
 
 	onSnapshotChangedListener?: () => void;
