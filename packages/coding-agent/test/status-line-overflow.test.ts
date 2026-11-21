@@ -77,6 +77,7 @@ function createStatusLineSession(sessionName: string) {
 		getCurrentModel: () => undefined,
 		isFastModeEnabled: () => false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		sessionManager: {
 			getSessionName: () => sessionName,
 			getUsageStatistics: () => ({

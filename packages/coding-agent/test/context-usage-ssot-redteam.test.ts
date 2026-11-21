@@ -141,6 +141,7 @@ function createDisplaySession(
 		},
 		isStreaming: false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		getGoalModeState: () => undefined,
 		getContextUsage: () => contextUsage,

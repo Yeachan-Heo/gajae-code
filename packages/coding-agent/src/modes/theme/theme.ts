@@ -142,6 +142,7 @@ export type SymbolKey =
 	| "icon.rewind"
 	| "icon.auto"
 	| "icon.fast"
+	| "icon.ultrafast"
 	| "icon.extensionSkill"
 	| "icon.extensionTool"
 	| "icon.extensionSlashCommand"
@@ -307,6 +308,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.rewind": "↶",
 	"icon.auto": "⟲",
 	"icon.fast": "⚡",
+	"icon.ultrafast": "⚡⚡",
 	"icon.extensionSkill": "✦",
 	"icon.extensionTool": "🛠",
 	"icon.extensionSlashCommand": "⌘",
@@ -546,6 +548,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	// pick: 󰁨 | alt:   
 	"icon.auto": "\u{f0068}",
 	"icon.fast": "\uf0e7",
+	"icon.ultrafast": "\uf0e7\uf0e7",
 	"icon.extensionSkill": "\uf0eb",
 	// pick:  | alt:  
 	"icon.extensionTool": "\uf0ad",
@@ -731,6 +734,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.rewind": "<-",
 	"icon.auto": "[A]",
 	"icon.fast": ">>",
+	"icon.ultrafast": ">>>",
 	"icon.extensionSkill": "SK",
 	"icon.extensionTool": "TL",
 	"icon.extensionSlashCommand": "/",
@@ -1521,6 +1525,7 @@ export class Theme {
 			rewind: this.#symbols["icon.rewind"],
 			auto: this.#symbols["icon.auto"],
 			fast: this.#symbols["icon.fast"],
+			ultrafast: this.#symbols["icon.ultrafast"],
 			extensionSkill: this.#symbols["icon.extensionSkill"],
 			extensionTool: this.#symbols["icon.extensionTool"],
 			extensionSlashCommand: this.#symbols["icon.extensionSlashCommand"],

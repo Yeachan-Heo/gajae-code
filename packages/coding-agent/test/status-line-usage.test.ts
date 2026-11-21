@@ -43,6 +43,7 @@ function makeSession(
 		credentialSessionId: options.credentialSessionId,
 		isStreaming: false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		fetchUsageReports,
 		sessionManager: {
 			getUsageStatistics: () => usageStats,

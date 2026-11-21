@@ -114,7 +114,9 @@ const modelSegment: StatusLineSegment = {
 			content = `${theme.fg("warning", `profile unavailable: ${sanitizeStatusText(unavailableProfile)}`)} ${content}`;
 		}
 
-		if (ctx.session.isFastModeActive() && theme.icon.fast) {
+		if (ctx.session.isUltrafastActive() && theme.icon.ultrafast) {
+			content += ` ${theme.icon.ultrafast}`;
+		} else if (ctx.session.isFastModeActive() && theme.icon.fast) {
 			content += ` ${theme.icon.fast}`;
 		}
 
