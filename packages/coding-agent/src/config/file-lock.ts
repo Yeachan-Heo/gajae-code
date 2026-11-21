@@ -1182,6 +1182,16 @@ function fileLockRemovalTransitionPath(lockPath: string): string {
 	return derivedFileLockPath(lockPath, ".removing");
 }
 
+const HASHED_FILE_LOCK_REMOVAL_TRANSITION_NAME = /^\.gjc-lock-[0-9a-f]{64}\.removing$/u;
+
+/**
+ * @internal Whether a directory name is a lock's removal transition. It holds the retiring
+ * owner's record while that owner deletes it, so it never contains a lock.
+ */
+export function isFileLockRemovalTransitionName(name: string): boolean {
+	return name.endsWith(".lock.removing") || HASHED_FILE_LOCK_REMOVAL_TRANSITION_NAME.test(name);
+}
+
 /** Keep derived siblings bounded without changing the canonical lock identity. */
 function derivedFileLockPath(sourcePath: string, suffix: string): string {
 	const name = path.basename(sourcePath);

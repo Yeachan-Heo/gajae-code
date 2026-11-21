@@ -462,37 +462,165 @@ test("publication rollback exhaustion under persistent access_denied reports acc
 	expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).pid).toBe(process.pid);
 });
 
-test("GC treats persistent EPERM on lock info as error, not transient changing", async () => {
+// GC never classifies a refused `info` read as lock motion: a reader-side refusal was not
+// observed under real multi-process churn, and an ACL-denied record refuses every pass.
+// Treating it as "changing" kept the lock and let `gjc gc` exit successfully.
+function gcContext(cwd: string): GcContext {
+	return { cwd, env: {}, force: false, probe: () => ({ status: "keep" }) };
+}
+
+test("gc reports a refused owner record as a collection error", async () => {
 	const tempDir = await createTempDir();
 	const lockDir = path.join(tempDir, "state.json.lock");
 	const infoPath = path.join(lockDir, "info");
 	await fs.mkdir(lockDir);
 	await fs.writeFile(infoPath, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
-
 	const realOpenSync = fsSync.openSync;
-	// Mock openSync to persistently deny access to the info file
+	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+		if (samePath(String(target), infoPath))
+			throw Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), { code: "EPERM" });
+		return realOpenSync(target, flags, mode);
+	}) as typeof fsSync.openSync);
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+	expect(collected.records).toEqual([]);
+});
+
+test("gc reports owner-record read refusal as an error without retry", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	const timestamp = Date.now();
+	const info = { pid: 12345, timestamp };
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify(info));
+	const realOpenSync = fsSync.openSync;
+	let attempt = 0;
 	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
 		if (samePath(String(target), infoPath)) {
-			throw Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+			attempt++;
+			// First attempt: transient EPERM (simulating another process deleting the lock)
+			const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
 				code: "EPERM",
 			});
+			throw err;
 		}
 		return realOpenSync(target, flags, mode);
 	}) as typeof fsSync.openSync);
 
-	const ctx: GcContext = {
-		cwd: tempDir,
-		env: {},
-		force: false,
-		probe: () => ({ status: "keep" }),
-	};
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
 
-	// GC collection should report the persistent error, not treat it as "changing"
-	const collected = await collectFileLocksForGc(ctx, { roots: [tempDir] });
-	vi.restoreAllMocks();
+	// Without retry, GC reports the refusal as an error immediately
+	expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+	expect(collected.records).toEqual([]);
+	// Verify that only one attempt was made, not retried
+	expect(attempt).toBe(1);
+});
 
-	// Error should be recorded in errors array
-	expect(collected.errors.length).toBeGreaterThan(0);
-	const permError = collected.errors.find(e => e.message.includes("EPERM"));
-	expect(permError).toBeDefined();
+test("gc reports owner-record read errors as collection errors, not retried", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	const timestamp = Date.now();
+	const info = { pid: 12345, timestamp };
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify(info));
+	const realOpenSync = fsSync.openSync;
+	let attempt = 0;
+	vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
+		if (samePath(String(target), infoPath)) {
+			attempt++;
+			// Persistent EPERM on every attempt: simulating a lock that is inaccessible
+			const err = Object.assign(new Error(`EPERM: operation not permitted, open '${String(target)}'`), {
+				code: "EPERM",
+			});
+			throw err;
+		}
+		return realOpenSync(target, flags, mode);
+	}) as typeof fsSync.openSync);
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	// Without retry logic, the first refusal is reported as an error immediately
+	expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+	expect(collected.records).toEqual([]);
+	// Verify that only one attempt was made, not retried
+	expect(attempt).toBe(1);
+});
+
+test.skipIf(hostPlatform !== "win32")("gc reports an ACL-denied owner record as an error on every pass", async () => {
+	const tempDir = await createTempDir();
+	const lockDir = path.join(tempDir, "state.json.lock");
+	const infoPath = path.join(lockDir, "info");
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
+	const user = os.userInfo().username;
+	await Bun.$`icacls ${infoPath} /deny ${`${user}:(R)`}`.quiet();
+	try {
+		for (let pass = 0; pass < 2; pass++) {
+			const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+			expect(collected.errors.map(error => error.message)).toEqual([expect.stringContaining("EPERM")]);
+			expect(collected.records).toEqual([]);
+		}
+	} finally {
+		await Bun.$`icacls ${infoPath} /remove:d ${user}`.quiet();
+	}
+});
+
+// A plain directory with the lock suffix should not be pruned from the walk just because
+// its name matches the transition pattern. GC must verify lock evidence before treating it
+// as a lock directory to skip.
+test("gc does not skip an ordinary directory that happens to match the lock suffix pattern", async () => {
+	const tempDir = await createTempDir();
+	// Create a plain directory with the transition suffix pattern, but no lock info.
+	const ordinaryDir = path.join(tempDir, `.gjc-lock-${"b".repeat(64)}.removing`);
+	await fs.mkdir(ordinaryDir);
+	// Place a valid lock nested inside this ordinary directory.
+	const nestedLock = path.join(ordinaryDir, "config.json.lock");
+	const nestedInfo = path.join(nestedLock, "info");
+	const timestamp = Date.now();
+	await fs.mkdir(nestedLock);
+	await fs.writeFile(nestedInfo, JSON.stringify({ pid: 12345, timestamp }));
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	// GC should discover the nested lock because the parent is not a verified transition.
+	expect(collected.errors).toEqual([]);
+	expect(collected.records).toHaveLength(1);
+	expect(collected.records[0]).toMatchObject({
+		store: "file_locks",
+		id: nestedLock,
+		path: nestedLock,
+		pid: 12345,
+	});
+});
+
+// A retiring owner deletes `<lock>.removing` while GC walks its parent, and Windows refuses
+// to list it meanwhile (reproduced by file-lock-windows-stress). It never holds a lock.
+test("gc does not list a lock's removal transition", async () => {
+	const tempDir = await createTempDir();
+	const transitions = [
+		path.join(tempDir, "state.json.lock.removing"),
+		path.join(tempDir, `.gjc-lock-${"a".repeat(64)}.removing`),
+	];
+	for (const transition of transitions) {
+		await fs.mkdir(transition);
+		// Create a .owner file as a sibling to mark this as a verified removal transition
+		await fs.writeFile(`${transition}.owner`, JSON.stringify({ pid: 12345, timestamp: Date.now() }));
+	}
+	const realReaddir = fs.readdir;
+	vi.spyOn(fs, "readdir").mockImplementation((async (target: string, options?: undefined) => {
+		if (transitions.some(transition => samePath(String(target), transition)))
+			throw Object.assign(new Error(`EPERM: operation not permitted, scandir '${String(target)}'`), {
+				code: "EPERM",
+			});
+		return realReaddir(target, options);
+	}) as typeof fs.readdir);
+
+	const collected = await collectFileLocksForGc(gcContext(tempDir), { roots: [tempDir] });
+
+	expect(collected.errors).toEqual([]);
+	expect(collected.records).toEqual([]);
 });

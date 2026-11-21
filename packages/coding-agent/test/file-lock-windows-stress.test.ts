@@ -4,12 +4,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
+import { collectFileLocksForGc } from "../src/config/file-lock-gc";
+import { gcPidProbe } from "../src/gjc-runtime/gc-runtime";
 
 // Multi-process Windows lock contention. `file-lock-windows-contention.test.ts` injects
 // each native refusal deterministically; this test lets real NTFS produce them. Every
 // contender loops acquire -> append -> release on one lock from its own process, so
 // `<lock>/info` handles, detach renames and owner-record deletions race the way
 // concurrent TUI sessions, the SDK broker and session hosts race in production.
+// Meanwhile this process runs `gjc gc` file-lock collection over the same root, as a
+// `gjc gc` started during that traffic would.
 //
 // Opt-in: it spawns 10 processes for ~20 s. Run with
 //   GJC_TEST_LOCK_STRESS=1 bun test test/file-lock-windows-stress.test.ts
@@ -17,6 +21,8 @@ import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
 // "Failed to roll back file lock published during removal transition: owner_mismatch",
 // "EBADF: bad file descriptor, lstat '<lock>'" and
 // "EPERM: operation not permitted, open '<lock>.removing.owner'".
+// Before GC skipped removal transitions, collection failed with
+// "EPERM: operation not permitted, scandir '<lock>.removing'" on ~0.2% of passes.
 
 const enabled = process.platform === "win32" && process.env.GJC_TEST_LOCK_STRESS === "1";
 const PROCESSES = 10;
@@ -100,6 +106,19 @@ test.skipIf(!enabled)(
 				env: { ...process.env, GJC_CODING_AGENT_DIR: path.join(root, "isolated-agent-dir") },
 			}),
 		);
+		let contending = true;
+		let gcPasses = 0;
+		const gcErrors: string[] = [];
+		const gcLoop = (async () => {
+			while (contending) {
+				const collected = await collectFileLocksForGc(
+					{ cwd: root, env: {}, force: false, probe: gcPidProbe },
+					{ roots: [root] },
+				);
+				gcPasses++;
+				gcErrors.push(...collected.errors.map(error => error.message));
+			}
+		})();
 		const results = await Promise.all(
 			children.map(async child => {
 				const [exitCode, stdout, stderr] = await Promise.all([
@@ -110,6 +129,12 @@ test.skipIf(!enabled)(
 				return { exitCode, stdout, stderr };
 			}),
 		);
+		contending = false;
+		await gcLoop;
+
+		// A concurrent GC pass never fails on a lock that is being acquired or retired.
+		expect(gcErrors).toEqual([]);
+		expect(gcPasses).toBeGreaterThan(0);
 
 		const summaries: ContenderSummary[] = [];
 		for (const { exitCode, stdout, stderr } of results) {
