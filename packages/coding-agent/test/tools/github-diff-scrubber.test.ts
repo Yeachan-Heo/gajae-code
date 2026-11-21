@@ -488,6 +488,26 @@ describe("unified diff scrubber", () => {
 				expect(scrubbed).toContain("file-redacted");
 			});
 
+			it("[P2] redacts paths with space-separated credential keywords", () => {
+				// Issue: Metadata scrubber must match diff-header rules, including space boundaries
+				// Paths like 'src/api secret token.js' have space-separated keywords
+				const diff = [
+					"diff --git a/src/api\ secret\ token.js b/src/api\ secret\ token.js",
+					"index 1111111..2222222 100644",
+					"--- a/src/api\ secret\ token.js",
+					"+++ b/src/api\ secret\ token.js",
+					"@@ -1,1 +1,1 @@ ",
+					" // token value",
+					"",
+				].join("\n");
+
+				const scrubbed = scrubUnifiedDiff(diff);
+
+				// Space-separated credential keywords should be redacted
+				expect(scrubbed).not.toContain("api\\ secret\\ token");
+				expect(scrubbed).toContain("file-redacted");
+			});
+
 			it("[P3] redacts paths repeated in binary-diff summaries", () => {
 				// Binary files line with credential-shaped paths
 				const diff = [
@@ -905,6 +925,33 @@ describe("unified diff scrubber", () => {
 				// Line count preserved
 				expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 			});
+		});
+
+		it("redacts asymmetric closures: context opens, deleted closes, added has opaque value", () => {
+			// P2-1 regression: When a context line opens a credential container,
+			// a deleted-side closing bracket can clear state if old/new aren't tracked independently.
+			// The added-side opaque scalar must still be redacted.
+			const diff = [
+				...HEADER,
+				"@@ -1,4 +1,4 @@",
+				' {"secrets": [', // context opens bracket on old side
+				"-  ],", // deleted closes bracket (old-side bracket depth becomes 0)
+				'+  "asymmetry-canary-secret"],', // added has opaque value inside container (new-side bracket depth > old)
+				" }",
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// Canary must be redacted even though old-side bracket depth would be 0 at this point
+			expect(scrubbed).not.toContain("asymmetry-canary-secret");
+
+			// Line count must be preserved
+			expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+
+			// Context lines and structure should be intact
+			expect(scrubbed).toContain('{"secrets": [');
+			expect(scrubbed).toContain(" }");
 		});
 	});
 });

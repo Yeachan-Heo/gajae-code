@@ -267,6 +267,43 @@ function redactDiffHeaderPath(headerPath: string): string {
 }
 
 /**
+ * Shared credential detector: checks if a path component is credential-shaped.
+ * Used by both diff header scrubbing and metadata redaction to ensure consistent rules.
+ *
+ * Returns true if the component should be redacted; false otherwise.
+ */
+export function isCredentialShapedPathComponent(component: string): boolean {
+	// Check for explicit credential keywords (including when separated by spaces)
+	const credentialKeywordPattern =
+		/(?:^|[-_. ])(?:secret|token|password|api[_-]?key|credential|private[_-]?key|refresh[_-]?token)(?:[-_. ]|$|\.[a-z]+$)/i;
+
+	if (credentialKeywordPattern.test(component)) {
+		return true;
+	}
+
+	// Check for GitHub token patterns (ghp_, gho_, ghu_, etc.)
+	// GitHub tokens have specific prefixes and are followed by 36-40+ hex/alphanumeric characters
+	if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
+		return true;
+	}
+
+	// Check for AWS access key patterns (AKIA followed by 16 uppercase alphanumeric)
+	if (/AKIA[0-9A-Z]{16}/i.test(component)) {
+		return true;
+	}
+
+	// Check for other token-shaped patterns in filenames
+	// Only redact if it looks like a hex/base64 token, not a service name or class name
+	const hexTokenMatch = component.match(/[a-f0-9]{20,}|[A-Z0-9]{30,}/i);
+	if (hexTokenMatch) {
+		// This looks like a hex token or base64 blob in the filename
+		return true;
+	}
+
+	return false;
+}
+
+/**
  * Redact paths in diff headers that may contain credential-shaped filenames.
  * Paths like 'src/secret-api-key.json' should be replaced with generic names.
  *
@@ -281,30 +318,7 @@ function redactPathInDiffHeader(pathSection: string): string {
 	const components = pathSection.split("/");
 
 	for (const component of components) {
-		// Check for explicit credential keywords (including when separated by spaces)
-		const credentialKeywordPattern =
-			/(?:^|[-_. ])(?:secret|token|password|api[_-]?key|credential|private[_-]?key|refresh[_-]?token)(?:[-_. ]|$|\.[a-z]+$)/i;
-
-		if (credentialKeywordPattern.test(component)) {
-			return "file-redacted";
-		}
-
-		// Check for GitHub token patterns (ghp_, gho_, ghu_, etc.)
-		// GitHub tokens have specific prefixes and are followed by 36-40+ hex/alphanumeric characters
-		if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
-			return "file-redacted";
-		}
-
-		// Check for AWS access key patterns (AKIA followed by 16 uppercase alphanumeric)
-		if (/AKIA[0-9A-Z]{16}/i.test(component)) {
-			return "file-redacted";
-		}
-
-		// Check for other token-shaped patterns in filenames
-		// Only redact if it looks like a hex/base64 token, not a service name or class name
-		const hexTokenMatch = component.match(/[a-f0-9]{20,}|[A-Z0-9]{30,}/i);
-		if (hexTokenMatch) {
-			// This looks like a hex token or base64 blob in the filename
+		if (isCredentialShapedPathComponent(component)) {
 			return "file-redacted";
 		}
 	}
@@ -615,6 +629,7 @@ function redactAccumulatedContentWithState(
 	// we track the old-side state which carries forward to the next hunk.
 	const outputState: HunkState = { ...inputState };
 	let oldBracketDepth = inputState.bracketDepth; // Track bracket depth as we process old-side lines
+	const oldBracketStack: string[] = [...inputState.bracketStack]; // Track bracket stack independently for old side
 	let newBracketDepth = inputState.bracketDepth; // Also track new-side separately for asymmetric containers
 
 	// Helper to check if a line looks like it's part of a data structure (JSON/YAML key-value pairs)
@@ -627,9 +642,24 @@ function redactAccumulatedContentWithState(
 		return false;
 	};
 
+	// Helper to update bracket stack based on a character
+	const updateBracketStack = (stack: string[], char: string, depth: number): number => {
+		if (char === "[" || char === "{") {
+			stack.push(char);
+			return depth + 1;
+		} else if (char === "]" && stack.length > 0 && stack[stack.length - 1] === "[") {
+			stack.pop();
+			return Math.max(0, depth - 1);
+		} else if (char === "}" && stack.length > 0 && stack[stack.length - 1] === "{") {
+			stack.pop();
+			return Math.max(0, depth - 1);
+		}
+		return depth;
+	};
+
 	// Also redact lines that are inside incomplete containers
 	// (containers opened in previous hunks or opened in this hunk but not closed)
-	// We track bracket depth separately for each projection since they can be asymmetric
+	// We track bracket depth and stack separately for each projection since they can be asymmetric
 	// Asymmetric containers: if old side is deeper, redact new side too for safety
 	for (let i = 0; i < lineInfos.length; i += 1) {
 		const info = result[i]; // The corresponding redacted line info
@@ -647,7 +677,7 @@ function redactAccumulatedContentWithState(
 
 				// Check if this line is only structural (brackets, whitespace, etc.)
 				// Don't redact purely structural lines - they're important for preserving format
-				const isOnlyStructure = /^[\s[\]{},:.]*$/.test(info.content);
+				const isOnlyStructure = /^[\s\[\]{},:.]*$/.test(info.content);
 
 				// If we're inside a container at the start of this line, redact it
 				// But skip purely structural lines
@@ -655,13 +685,9 @@ function redactAccumulatedContentWithState(
 					info.content = "«redacted»";
 				}
 
-				// Update bracket depth for next line
+				// Update bracket depth and stack for next line, tracking old-side independently
 				for (const char of originalContent) {
-					if (char === "[" || char === "{") {
-						oldBracketDepth += 1;
-					} else if ((char === "]" || char === "}") && oldBracketDepth > 0) {
-						oldBracketDepth -= 1;
-					}
+					oldBracketDepth = updateBracketStack(oldBracketStack, char, oldBracketDepth);
 				}
 			}
 		}
@@ -673,7 +699,7 @@ function redactAccumulatedContentWithState(
 			const newIdx = newProjectionIndices.indexOf(i);
 			if (oldIdx >= 0) {
 				const originalContent = oldProjectionLines[oldIdx];
-				const isOnlyStructure = /^[\s[\]{},:.]*$/.test(info.content);
+				const isOnlyStructure = /^[\s\[\]{},:.]*$/.test(info.content);
 				const isStructureData = looksLikeStructureData(info.content);
 
 				// Redact if inside container AND (looks like structure data OR doesn't look like plain text)
@@ -688,19 +714,15 @@ function redactAccumulatedContentWithState(
 					info.content = "«redacted»";
 				}
 
-				// Update bracket depth for next line
+				// Update bracket depth and stack for old-side
 				for (const char of originalContent) {
-					if (char === "[" || char === "{") {
-						oldBracketDepth += 1;
-					} else if ((char === "]" || char === "}") && oldBracketDepth > 0) {
-						oldBracketDepth -= 1;
-					}
+					oldBracketDepth = updateBracketStack(oldBracketStack, char, oldBracketDepth);
 				}
 			}
 			if (newIdx >= 0) {
 				const originalContent = newProjectionLines[newIdx];
 
-				// Also update bracket depth for new-side projection
+				// Also update bracket depth for new-side projection (tracked separately, not carried forward)
 				for (const char of originalContent) {
 					if (char === "[" || char === "{") {
 						newBracketDepth += 1;
@@ -723,7 +745,7 @@ function redactAccumulatedContentWithState(
 
 				// Check if this line is only structural (brackets, whitespace, etc.)
 				// Don't redact purely structural lines - they're important for preserving format
-				const isOnlyStructure = /^[\s[\]{},:.]*$/.test(info.content);
+				const isOnlyStructure = /^[\s\[\]{},:.]*$/.test(info.content);
 
 				// Redact if:
 				// 1. We're inside a container on the new side, OR
@@ -738,7 +760,7 @@ function redactAccumulatedContentWithState(
 					info.content = "«redacted»";
 				}
 
-				// Update bracket depth for next line
+				// Update bracket depth for next line (new side only, not carried forward)
 				for (const char of originalContent) {
 					if (char === "[" || char === "{") {
 						newBracketDepth += 1;
@@ -750,46 +772,14 @@ function redactAccumulatedContentWithState(
 		}
 	}
 
-	// Update output state based on final old-side bracket depth
+	// Update output state based on final old-side bracket depth and stack
 	// (the old side's state carries forward to the next hunk)
-	outputState.bracketStack = [...inputState.bracketStack];
-	outputState.bracketDepth = oldBracketDepth; // Use the old-side bracket depth
-
-	// Count brackets in ORIGINAL old projection to track container state
-	for (const line of oldProjectionLines) {
-		for (const char of line) {
-			if (char === "[") {
-				outputState.bracketStack.push("[");
-				outputState.bracketDepth += 1;
-				outputState.inCredentialValue = true;
-			} else if (char === "{") {
-				outputState.bracketStack.push("{");
-				outputState.bracketDepth += 1;
-				outputState.inCredentialValue = true;
-			} else if (char === "]") {
-				if (
-					outputState.bracketStack.length > 0 &&
-					outputState.bracketStack[outputState.bracketStack.length - 1] === "["
-				) {
-					outputState.bracketStack.pop();
-					outputState.bracketDepth = Math.max(0, outputState.bracketDepth - 1);
-					if (outputState.bracketDepth === 0) {
-						outputState.inCredentialValue = false;
-					}
-				}
-			} else if (char === "}") {
-				if (
-					outputState.bracketStack.length > 0 &&
-					outputState.bracketStack[outputState.bracketStack.length - 1] === "{"
-				) {
-					outputState.bracketStack.pop();
-					outputState.bracketDepth = Math.max(0, outputState.bracketDepth - 1);
-					if (outputState.bracketDepth === 0) {
-						outputState.inCredentialValue = false;
-					}
-				}
-			}
-		}
+	outputState.bracketStack = oldBracketStack;
+	outputState.bracketDepth = oldBracketDepth;
+	if (oldBracketDepth > 0) {
+		outputState.inCredentialValue = true;
+	} else {
+		outputState.inCredentialValue = false;
 	}
 
 	return { redactedLines: result, state: outputState };

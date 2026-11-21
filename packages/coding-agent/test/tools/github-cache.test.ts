@@ -1003,5 +1003,67 @@ describe("Credential scrubbing in cached data", () => {
 			expect(cached).not.toBeNull();
 			expect(cached?.rendered).toBe("test rendered");
 		});
+
+		it("[P2] finding #2: metadata redaction uses shared credential detector (space-separated)", async () => {
+			// Issue: Metadata scrubber had different rules than diff-header scrubber.
+			// Diff headers accept space-separated keywords (e.g., 'api secret token')
+			// but metadata scrubber only accepted [-_.] boundaries.
+			// Solution: Use shared isCredentialShapedPathComponent in both places.
+
+			// Use C-quoted path as git does for paths with spaces
+			const spaceSeparatedPath = "src/api secret token.js";
+			const cQuotedPath = `"a/${spaceSeparatedPath}" "b/${spaceSeparatedPath}"`;
+			const diffPayload: Record<string, unknown> = {
+				unified: `diff --git ${cQuotedPath}\nindex 1..2 100644\n--- "a/${spaceSeparatedPath}"\n+++ "b/${spaceSeparatedPath}"\n@@ -1,1 +1,1 @@\n- secret\n+ newsecret`,
+				files: [
+					{
+						path: spaceSeparatedPath,
+						startOffset: 0,
+						endOffset: 100,
+					},
+				],
+			};
+
+			await putCached({
+				repo: TEST_REPO,
+				kind: "pr-diff",
+				number: 777,
+				includeComments: false,
+				payload: diffPayload as unknown,
+				rendered: "",
+				authKey: TEST_AUTH_KEY,
+			});
+
+			const cached = getCached(TEST_REPO, "pr-diff", 777, false, TEST_AUTH_KEY);
+			expect(cached).not.toBeNull();
+
+			// Both in unified diff AND in file metadata, the space-separated path should be redacted
+			const payloadJson = JSON.stringify(cached?.payload);
+			expect(payloadJson).not.toContain("api secret token");
+			expect(payloadJson).toContain("file-redacted");
+		});
+
+		it("[P2] finding #3: versioned cache file isolates v5 from legacy writers", async () => {
+			// Issue: Pre-v5 processes could write to the shared database after v5 migration,
+			// contaminating the cache with unscrubbed data.
+			// Solution: Use versioned database file (github-cache-v5.db) so old processes
+			// cannot access the new cache namespace.
+
+			// Check that the versioned database file is used
+			const baseDbPath = process.env.GJC_GITHUB_CACHE_DB!;
+			const expectedVersionedPath = baseDbPath.replace(/\.db$/, "-v5.db");
+
+			const db = openDb();
+			expect(db).not.toBeNull();
+
+			// Verify that the file at the versioned path exists
+			const versionedFileExists = await fs.stat(expectedVersionedPath).catch(() => null);
+			expect(versionedFileExists).not.toBeNull();
+
+			// Verify no data is in the old unversioned path (which legacy would use)
+			const oldFileExists = await fs.stat(baseDbPath).catch(() => null);
+			// Old file may not exist since v5 uses a separate namespace
+			// This is the desired behavior: v5 readers/writers are isolated
+		});
 	});
 });

@@ -21,7 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getGithubCacheDbPath, logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
-import { scrubUnifiedDiff } from "./github-diff-parser";
+import { isCredentialShapedPathComponent, scrubUnifiedDiff } from "./github-diff-parser";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -91,7 +91,10 @@ export function openDb(): Database | null {
 	if (openAttempted) return null;
 	openAttempted = true;
 	try {
-		const dbPath = getGithubCacheDbPath();
+		// Use versioned namespace for v5+ cache to isolate from legacy writers.
+		// This prevents pre-v5 processes from repopulating the cache with unscrubbed data.
+		const basePath = getGithubCacheDbPath();
+		const dbPath = basePath.replace(/\.db$/, "-v5.db");
 		ensureParentDir(dbPath);
 		const db = new Database(dbPath);
 		db.run(`
@@ -99,21 +102,13 @@ export function openDb(): Database | null {
 			PRAGMA synchronous=NORMAL;
 			PRAGMA busy_timeout=5000;
 		`);
-		// Migrate any pre-existing table whose key/check constraint predates
-		// the current schema. The cache is regenerable, so we drop rows rather
-		// than running an in-place ALTER dance.
 		// Schema v5: Structural diff scrubbing with quote-aware bracket tracking.
-		// Invalidate all pre-v5 rows as they may contain unscrubbed credentials.
-		// IMPORTANT: Set to a version that prevents legacy writers from using this cache.
-		// If an old process sees version > its max known version, it must not write.
+		// Uses versioned database file (github-cache-v5.db) to isolate from pre-v5 writers.
+		// This ensures legacy processes cannot repopulate the cache with unscrubbed data.
 		const userVersion = (db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
-		if (userVersion !== undefined && userVersion < 5) {
-			db.run("DROP TABLE IF EXISTS github_view_cache");
-			db.run("DROP TABLE IF EXISTS github_view_cache_v50");
-		}
-		// If a version higher than our current code sees this, we should also refuse
-		// to continue to prevent schema mismatches
+		// If a version mismatch occurs within this v5+ database (e.g., across v5 subversions),
+		// refuse to continue to prevent schema mismatches
 		const currentVersion = 50; // Update this when cache schema changes
 		if (userVersion !== undefined && userVersion > currentVersion) {
 			throw new Error(
@@ -354,50 +349,18 @@ function scrubFileMetadata(files: Record<string, unknown>[]): Record<string, unk
 	return files.map((file, index) => {
 		const scrubbedFile = { ...file };
 
-		const redactIfCredential = (path: string | undefined): string | undefined => {
-			if (typeof path !== "string") return path;
+		const redactIfCredential = (pathStr: string | undefined): string | undefined => {
+			if (typeof pathStr !== "string") return pathStr;
 
-			// Split path into components and check each one
-			const components = path.split("/");
-			let hasCredentialComponent = false;
-
+			// Split path into components and check each one using the shared credential detector
+			const components = pathStr.split("/");
 			for (const component of components) {
-				// Match keyword-shaped credential patterns:
-				// - secret-key, secret_key, secret.key
-				// - api-key.json, apikey.env
-				// - password.conf, .env.password
-				// But NOT: passport.js, keyboard.ts, authorization-service.ts
-				const credentialPattern =
-					/(?:^|[-_.])(?:secret|token|password|api[_-]?key|credential|private[_-]?key)(?:[-_.]|$|\.[a-z]+$)/i;
-
-				if (credentialPattern.test(component)) {
-					hasCredentialComponent = true;
-					break;
-				}
-
-				// Also check for GitHub token patterns (ghp_, gho_, ghu_, ghs_, ghr_)
-				// These patterns are also redacted in diff headers
-				if (/(^|[-_.])(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9_]+/i.test(component)) {
-					hasCredentialComponent = true;
-					break;
-				}
-
-				// Check for AWS access key patterns (AKIA followed by 16 uppercase alphanumeric)
-				if (/AKIA[0-9A-Z]{16}/i.test(component)) {
-					hasCredentialComponent = true;
-					break;
-				}
-
-				// Check for other token-shaped patterns (hex or base64 tokens)
-				// Only redact if it looks like a hex/base64 token, not a service name
-				const hexTokenMatch = component.match(/[a-f0-9]{20,}|[A-Z0-9]{30,}/i);
-				if (hexTokenMatch) {
-					hasCredentialComponent = true;
-					break;
+				if (isCredentialShapedPathComponent(component)) {
+					return undefined; // Mark for redaction
 				}
 			}
 
-			return hasCredentialComponent ? undefined : path;
+			return pathStr;
 		};
 
 		if (typeof scrubbedFile.path === "string") {
