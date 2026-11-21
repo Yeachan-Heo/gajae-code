@@ -57,6 +57,7 @@ function makeSession(overrides: Record<string, unknown> = {}): AgentSession {
 		},
 		isStreaming: false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		getGoalModeState: () => undefined,
 		...overrides,

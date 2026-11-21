@@ -364,6 +364,7 @@ function makeComponent(
 			settings: resolvedSettings,
 			isStreaming: false,
 			isFastModeActive: () => false,
+			isUltrafastActive: () => false,
 			modelRegistry: { isUsingOAuth: () => false },
 			sessionManager: {
 				getUsageStatistics: () => ({

@@ -67,6 +67,7 @@ function makeSession(contextUsage: ContextUsage): AgentSession {
 		},
 		isStreaming: false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		getGoalModeState: () => undefined,
 		// This lightweight session stubs the pinned ContextUsage snapshot contract.

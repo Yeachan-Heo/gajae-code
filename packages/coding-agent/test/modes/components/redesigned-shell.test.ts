@@ -72,6 +72,7 @@ function createFooterSession(
 		getGoalModeState: () => undefined,
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		modelRegistry: { isUsingOAuth: () => false },
 	} as unknown as AgentSession;
 }

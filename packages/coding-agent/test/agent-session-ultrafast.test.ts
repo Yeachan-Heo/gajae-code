@@ -96,6 +96,17 @@ describe("ultrafast session predicate and status-line integration", () => {
 		});
 	}
 
+	it("gates role-model ultrafast badges on model support, not provider name", async () => {
+		const session = createSession(openaiModel(true));
+		await session.setServiceTier("ultrafast");
+		for (const provider of ["openai", "openai-codex"]) {
+			expect(session.isUltrafastForProvider(provider, false)).toBe(false);
+			expect(session.isUltrafastForProvider(provider, true)).toBe(true);
+		}
+		await session.setServiceTier("priority");
+		expect(session.isUltrafastForProvider("openai", true)).toBe(false);
+	});
+
 	it("does not activate ultrafast without a selected model", async () => {
 		const session = createSession(undefined);
 		await session.setServiceTier("ultrafast");

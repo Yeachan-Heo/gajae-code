@@ -30,6 +30,7 @@ function createSession(overrides: SessionOverrides = {}) {
 		getCurrentModel: () => undefined,
 		isFastModeEnabled: () => false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
 		getContextUsage: () => ({ percent, contextWindow: CONTEXT_WINDOW }),
 		getGoalModeState: () => ({ goal: { status: overrides.goalStatus ?? "active", tokensUsed: 12_345 } }),
 		settings: { get: () => false },
@@ -181,6 +182,7 @@ describe("status rail survives very small widths", () => {
 				isStreaming: false,
 				getAsyncJobSnapshot: () => ({ running: [] }),
 				isFastModeActive: () => false,
+				isUltrafastActive: () => false,
 				modelRegistry: { isUsingOAuth: () => false },
 				sessionManager: {
 					getSessionName: () => "NoCtx",

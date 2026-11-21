@@ -26873,14 +26873,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * True when the ultrafast tier is realized as an ultrafast-tier request on the provider's
-	 * wire protocol. This is the pure intent (what the user configured) for the given provider,
-	 * independent of whether the current model's provider matches.
+	 * True when the configured tier resolves to ultrafast for `provider` and the model opts in.
+	 * Providers send ultrafast only for models with `compat.supportsUltrafastTier`; others omit it.
 	 */
 	isUltrafastForProvider(provider?: string, supportsUltrafastTier = false): boolean {
-		const resolved = resolveServiceTier(this.serviceTier, provider);
-		if (resolved !== "ultrafast") return false;
-		return provider === "openai" || provider === "openai-codex" || supportsUltrafastTier;
+		return supportsUltrafastTier && resolveServiceTier(this.serviceTier, provider) === "ultrafast";
 	}
 
 	/**
@@ -26888,9 +26885,7 @@ export class AgentSession {
 	 * See {@link isFastForSubagentProvider} for context.
 	 */
 	isUltrafastForSubagentProvider(provider?: string, supportsUltrafastTier = false): boolean {
-		const resolved = resolveServiceTier(this.#subagentServiceTier(), provider);
-		if (resolved !== "ultrafast") return false;
-		return provider === "openai" || provider === "openai-codex" || supportsUltrafastTier;
+		return supportsUltrafastTier && resolveServiceTier(this.#subagentServiceTier(), provider) === "ultrafast";
 	}
 
 	/**

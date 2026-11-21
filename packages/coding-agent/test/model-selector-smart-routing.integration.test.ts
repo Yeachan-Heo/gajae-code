@@ -131,6 +131,9 @@ function createContext(
 		isFastForProvider: () => false,
 		isFastForSubagentProvider: () => false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
+		isUltrafastForProvider: () => false,
+		isUltrafastForSubagentProvider: () => false,
 	};
 	const ctx = {
 		ui,
