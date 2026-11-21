@@ -1583,10 +1583,7 @@ function buildOpenAIImageHeaders(
 			"User-Agent",
 			`${OPENAI_HEADER_VALUES.ORIGINATOR_CODEX}/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
 		);
-		if (sessionId) {
-			headers.set(OPENAI_HEADERS.CONVERSATION_ID, sessionId);
-			headers.set(OPENAI_HEADERS.SESSION_ID, sessionId);
-		}
+		if (sessionId) headers.set(OPENAI_HEADERS.SESSION_ID, sessionId);
 	}
 
 	return headers;

@@ -4026,7 +4026,7 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).toContain("model_error");
 	});
 
-	it("sets conversation_id/session_id headers and prompt_cache_key when sessionId is provided", async () => {
+	it("sets the session-id header and prompt_cache_key when sessionId is provided", async () => {
 		const tempDir = trackedTempDir("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -4087,9 +4087,10 @@ describe("openai-codex streaming", () => {
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const headers = init?.headers instanceof Headers ? init.headers : undefined;
 				// Verify sessionId is set in headers
-				expect(headers?.get("conversation_id")).toBe(sessionId);
 				expect(headers?.get("session_id")).toBe(sessionId);
 				expect(headers?.get("x-client-request-id")).toBe(sessionId);
+				// Legacy conversation_id header should not be sent
+				expect(headers?.has("conversation_id")).toBe(false);
 
 				// Verify sessionId is set in request body as prompt_cache_key
 				const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
@@ -4225,7 +4226,7 @@ describe("openai-codex streaming", () => {
 		expect(response.errorMessage).toContain("Supported efforts: low, medium, high, xhigh");
 	});
 
-	it("does not set conversation_id/session_id headers when sessionId is not provided", async () => {
+	it("does not set session-id header when sessionId is not provided", async () => {
 		const tempDir = trackedTempDir("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -4277,7 +4278,6 @@ describe("openai-codex streaming", () => {
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const headers = init?.headers instanceof Headers ? init.headers : undefined;
 				// Verify headers are not set when sessionId is not provided
-				expect(headers?.has("conversation_id")).toBe(false);
 				expect(headers?.has("session_id")).toBe(false);
 
 				return new Response(sse, {
