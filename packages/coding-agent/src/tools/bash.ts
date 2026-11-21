@@ -1471,14 +1471,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError(composerPolicy.message);
 		}
 
+		// The session's REQUESTED directory (getSessionAgentDir) takes
+		// precedence over the global Settings singleton, which may belong
+		// to an earlier session. URL checks and the child environment use
+		// this same value.
+		const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
 		const internalUrlOptions: InternalUrlExpansionOptions = {
 			skills: this.session.skills ?? [],
+			// Session-scoped: the rule registry is process-global, so `rule://` must
+			// resolve against this session's own list instead of the last one loaded.
+			rules: this.session.rules,
 			internalRouter: InternalUrlRouter.instance(),
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
 				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,
 			},
+			sessionCwd: this.session.cwd,
+			sessionAgentDir,
 		};
 		command = await expandInternalUrls(command, {
 			...internalUrlOptions,
@@ -1494,7 +1504,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								: await expandInternalUrls(value, {
 										...internalUrlOptions,
 										ensureLocalParentDirs: true,
-										noEscape: true,
+										// An env value is data the executor passes verbatim; the
+										// shell never parses it, so command-text quoting and
+										// nested-expansion guards do not apply, while the
+										// session and path authorization still do.
+										context: "data",
 									}),
 						]),
 					),
@@ -1503,11 +1517,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Spawned workflow commands must resolve the SESSION's agent
 		// profile: the child's getAgentDir() reads GJC_CODING_AGENT_DIR at
 		// module load. Injected per-command (session-scoped), never
-		// mutating the host process; an explicit tool-call env wins. The
-		// session's REQUESTED directory (getSessionAgentDir) takes
-		// precedence over the global Settings singleton, which may belong
-		// to an earlier session.
-		const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
+		// mutating the host process; an explicit tool-call env wins.
 		// An EXPLICIT tool-call env that supplies either supported spelling of
 		// the agent-directory override wins over the session injection: the
 		// child's getAgentDir() prefers GJC_CODING_AGENT_DIR, so injecting it

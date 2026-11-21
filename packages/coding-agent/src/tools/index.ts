@@ -2,6 +2,7 @@ import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AsyncJobManager, FoldReason } from "../async";
+import type { Rule } from "../capability/rule";
 import type { ModelSelectorValue } from "../config/model-selector-value";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
@@ -233,6 +234,12 @@ export interface ToolSession {
 	/** Resolver-owned classification for the session's selected agent directory. */
 	profileAuthority?: "default" | "custom";
 	skills?: Skill[];
+	/**
+	 * Rules loaded for this session. `rule://` expansion resolves against this
+	 * list, never the process-global snapshot another session may have set; an
+	 * absent list therefore resolves no rule rather than borrowing one.
+	 */
+	rules?: readonly Rule[];
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
 	/** Get the active skill prompt's current phase so the skill tool can apply
