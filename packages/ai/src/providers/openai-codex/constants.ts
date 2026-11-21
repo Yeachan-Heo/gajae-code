@@ -9,7 +9,6 @@ export const OPENAI_HEADERS = {
 	ACCOUNT_ID: "chatgpt-account-id",
 	ORIGINATOR: "originator",
 	SESSION_ID: "session_id",
-	CONVERSATION_ID: "conversation_id",
 } as const;
 
 export const OPENAI_HEADER_VALUES = {

@@ -3747,11 +3747,9 @@ function createCodexHeaders(
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 	headers.set("User-Agent", getCodexUserAgent());
 	if (promptCacheKey) {
-		headers.set(OPENAI_HEADERS.CONVERSATION_ID, promptCacheKey);
 		headers.set(OPENAI_HEADERS.SESSION_ID, promptCacheKey);
 		headers.set("x-client-request-id", promptCacheKey);
 	} else {
-		headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
 		headers.delete(OPENAI_HEADERS.SESSION_ID);
 	}
 	if (state?.turnState) {
@@ -3771,6 +3769,9 @@ function createCodexHeaders(
 		headers.delete("accept");
 		headers.delete("content-type");
 	}
+	// Strip legacy conversation_id header unconditionally, regardless of caller input.
+	// Only session_id should be sent to Codex upstream.
+	headers.delete("conversation_id");
 	return headers;
 }
 

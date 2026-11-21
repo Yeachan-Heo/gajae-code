@@ -1061,6 +1061,60 @@ describe("imageGenTool", () => {
 		// Query parameters must be preserved from the proxy URL
 		expect(requestUrl).toBe("https://proxy.example.com/v1/images/edits?api-version=2024-10-21");
 	});
+
+	it("strips inherited conversation_id header from Codex image generation requests", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const callerConversationId = "legacy-conversation-123";
+		const sessionId = "test-session-456";
+		const captured: { headers?: Headers; requestUrl?: string; requestBody?: unknown } = {};
+		const model = {
+			api: "openai-codex-responses" as const,
+			provider: "openai-codex" as const,
+			id: "gpt-image-2",
+			name: "GPT Image 2",
+			baseUrl: "https://chatgpt.com/backend-api",
+			output: ["image"] as const,
+			reasoning: false,
+			input: ["text"] as const,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+			// Caller supplies conversation_id in headers
+			headers: { conversation_id: callerConversationId },
+		} as Model;
+		const jwtPayload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
+		).toString("base64url");
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			captured.requestUrl = input.toString();
+			captured.requestBody = JSON.parse(String(init?.body));
+			if (init?.headers instanceof Headers) {
+				captured.headers = init.headers;
+			}
+			return imageJson(Buffer.from("fake-webp"));
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => sessionId,
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry(
+				{ getApiKey: async () => `header.${jwtPayload}.signature`, getApiKeyForProvider: async () => undefined },
+				[model],
+			),
+			model,
+			settings: makeMockSettings("openai-codex/gpt-image-2"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute("call-codex", { subject: "a circle" }, undefined, ctx);
+		expect(result.details?.images[0]?.mimeType).toBe("image/webp");
+		// Verify conversation_id is NOT in the request headers
+		expect(captured.headers?.has("conversation_id")).toBe(false);
+	});
 });
 
 const ANTIGRAVITY_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";
