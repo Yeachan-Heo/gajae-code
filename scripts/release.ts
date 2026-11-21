@@ -919,13 +919,9 @@ async function cmdRelease(version: string): Promise<void> {
 	if (backmerge.action === "blocked") {
 		console.error(`  Backmerge blocked: ${backmerge.detail}`);
 		console.error(`  v${version} is already published; sync dev by hand:`);
-		console.error(
-			`    git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev +refs/tags/v${version}:refs/remotes/origin/tags/v${version} && git worktree add /tmp/gjc-backmerge origin/dev`,
-		);
-		console.error(
-			`    git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}   # keep v${version}'s version and dev's artifacts map`,
-		);
-		console.error(`    git -C /tmp/gjc-backmerge push origin HEAD:refs/heads/backmerge/${version}`);
+		for (const step of backmergeRecoverySteps(version)) {
+			console.error(`    git ${step.argv.join(" ")}${step.note === undefined ? "" : `   # ${step.note}`}`);
+		}
 		console.error(`    gh pr create --head backmerge/${version} --base dev --title "chore(release): backmerge v${version} into dev"`);
 	} else {
 		console.log(`  ${backmerge.action}: ${backmerge.detail}`);
@@ -973,31 +969,95 @@ async function cmdRelease(version: string): Promise<void> {
  */
 export const BACKMERGE_CONFLICT_PATH = "packages/natives/native/diagnostic-artifact.json";
 
+/** Directory the printed manual backmerge recipe works in. */
+export const BACKMERGE_RECOVERY_WORKTREE = "/tmp/gjc-backmerge";
+
+export interface BackmergeRecoveryStep {
+	/** `git` argv, run from the repository root. */
+	argv: string[];
+	/** Why the step exists, printed to the right of the command. */
+	note?: string;
+}
+
+/**
+ * The manual recovery sequence for a blocked backmerge, in the order a human runs it.
+ *
+ * Printed as instructions and driven directly by the recovery test, so the recipe a
+ * maintainer reads is exactly the sequence that test proves completes the merge. The
+ * merge runs with `--no-commit --no-ff` like the automated path, so a pending merge
+ * commit exists even when `origin/dev` is an ancestor of the release tag and a plain
+ * `git merge` would only fast-forward. The checkout stages the resolution of the one
+ * known conflict; on its own it leaves `HEAD` at pre-merge `dev`, so the commit that
+ * closes the merge is a separate step and the push only ever publishes a real merge
+ * commit.
+ */
+export function backmergeRecoverySteps(
+	version: string,
+	worktree = BACKMERGE_RECOVERY_WORKTREE,
+): BackmergeRecoveryStep[] {
+	const tag = `refs/remotes/origin/tags/v${version}`;
+	return [
+		{
+			argv: [
+				"fetch",
+				"origin",
+				"+refs/heads/main:refs/remotes/origin/main",
+				"+refs/heads/dev:refs/remotes/origin/dev",
+				`+refs/tags/v${version}:${tag}`,
+			],
+		},
+		{ argv: ["worktree", "add", worktree, "origin/dev"] },
+		{
+			argv: ["-C", worktree, "merge", "--no-commit", "--no-ff", tag],
+			note: "as in the automated path: a pending merge commit exists even when a plain merge would fast-forward",
+		},
+		{
+			argv: ["-C", worktree, "checkout", tag, "--", BACKMERGE_CONFLICT_PATH],
+			note: "take the tag's manifest wholesale: its version and its artifacts, never dev's digests",
+		},
+		{
+			argv: ["-C", worktree, "commit", "--no-edit"],
+			note: "completes the merge: the checkout only staged the resolution, so without this commit HEAD is still pre-merge dev and the push below would publish a branch that is not the merge",
+		},
+		{ argv: ["-C", worktree, "push", "origin", `HEAD:refs/heads/backmerge/${version}`] },
+	];
+}
+
 /** Attempts allowed before giving up on a `dev` that keeps moving under the merge. */
 const BACKMERGE_PUSH_ATTEMPTS = 3;
 
 /**
- * Resolve the known diagnostic-artifact backmerge conflict: adopt the released
- * `version` from main and keep the artifacts map from dev. Fails closed when either
- * side lacks the field the resolution depends on.
+ * Why a parsed manifest is not one the backmerge can rely on, or `undefined` when it is:
+ * a string `version`, a string `schema`, and an `artifacts` map. The conflict resolver and
+ * the reopen comparison both depend on exactly these fields, so they share this check;
+ * two notions of validity would let one path open what the other would have rejected.
+ *
+ * This is a shape check on an already-parsed value on purpose. `null`, `{}`, and an object
+ * with no `artifacts` all parse successfully, so no parse-error path can reject them: they
+ * are caught here, and only here.
  */
-export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string): string {
-	const oursManifest = JSON.parse(ours) as Record<string, unknown>;
-	const theirsManifest = JSON.parse(theirs) as { version?: unknown };
-	if (typeof theirsManifest.version !== "string") {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string version on main`);
-	}
-	if (typeof oursManifest.schema !== "string") {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no string schema on dev`);
-	}
-	const artifacts = oursManifest.artifacts;
-	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) {
-		throw new Error(`${BACKMERGE_CONFLICT_PATH} has no artifacts map on dev`);
-	}
-	// Start from dev's manifest so any top-level field the schema gains later survives the
-	// resolution instead of being dropped by a hand-built three-key object.
-	const resolved = { ...oursManifest, version: theirsManifest.version };
-	return `${JSON.stringify(resolved, null, 2)}\n`;
+function diagnosticArtifactManifestProblem(manifest: unknown): string | undefined {
+	if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) return "is not a JSON object";
+	const fields = manifest as Record<string, unknown>;
+	if (typeof fields.version !== "string") return "has no string version";
+	if (typeof fields.schema !== "string") return "has no string schema";
+	const artifacts = fields.artifacts;
+	if (artifacts === null || typeof artifacts !== "object" || Array.isArray(artifacts)) return "has no artifacts map";
+	return undefined;
+}
+
+/**
+ * Resolve the known diagnostic-artifact backmerge conflict by taking the release tag's
+ * manifest wholesale: its `version` and its `artifacts`. A version label may only cover
+ * the bytes that release built, so a digest dev built for another version is dropped
+ * instead of being relabelled under the released version. Fails closed when the released
+ * manifest lacks a field the resolution depends on.
+ */
+export function resolveDiagnosticArtifactBackmerge(released: string): string {
+	const manifest = JSON.parse(released) as Record<string, unknown>;
+	const problem = diagnosticArtifactManifestProblem(manifest);
+	if (problem !== undefined) throw new Error(`${BACKMERGE_CONFLICT_PATH} ${problem} on the release tag`);
+	return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
 export type BackmergeOutcome =
@@ -1048,6 +1108,80 @@ function gitAt(dir: string, args: readonly string[]) {
 	return $`git -C ${dir} -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
 }
 
+/** The manifest text at `rev`, or `undefined` when that revision carries no such file. */
+async function backmergeManifestAt(repoDir: string, rev: string): Promise<string | undefined> {
+	const shown = await gitAt(repoDir, ["show", `${rev}:${BACKMERGE_CONFLICT_PATH}`]).quiet().nothrow();
+	return shown.exitCode === 0 ? shown.stdout.toString() : undefined;
+}
+
+/** JSON with object keys sorted, so a manifest that only reorders keys still compares equal. */
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (value !== null && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+			left < right ? -1 : left > right ? 1 : 0,
+		);
+		return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+/** The `version` a manifest labels itself with, for operator-facing guidance. */
+function manifestVersionLabel(manifest: unknown): string {
+	if (manifest === null || typeof manifest !== "object") return "<no version>";
+	const version = (manifest as Record<string, unknown>).version;
+	return typeof version === "string" ? version : "<no version>";
+}
+
+/**
+ * A branch built by an earlier resolver can carry dev's locally built digests relabelled
+ * under the released version. Reopening it would publish bytes the release never built, and
+ * this script never rewrites a branch that may already carry review fixes, so a manifest
+ * that differs from the tag's fails closed with delete-and-rerun guidance instead.
+ *
+ * Both manifests must be shape-valid before they are compared: equality alone would let a
+ * parseable degenerate manifest — `{}` or `null`, on either side — satisfy the comparison
+ * and reopen a branch that carries no artifacts at all.
+ */
+async function existingBackmergeManifestProblem(
+	repoDir: string,
+	branchRef: string,
+	releaseTag: string,
+	version: string,
+): Promise<string | undefined> {
+	const branch = `backmerge/${version}`;
+	const [onBranch, onTag] = await Promise.all([
+		backmergeManifestAt(repoDir, branchRef),
+		backmergeManifestAt(repoDir, releaseTag),
+	]);
+	if (onTag === undefined) return `the v${version} release tag carries no ${BACKMERGE_CONFLICT_PATH}`;
+	if (onBranch === undefined) return `its ${BACKMERGE_CONFLICT_PATH} is missing`;
+	let tagManifest: unknown;
+	try {
+		tagManifest = JSON.parse(onTag);
+	} catch {
+		return `the v${version} release tag's ${BACKMERGE_CONFLICT_PATH} is not valid JSON`;
+	}
+	// `null` and `{}` reach this point: they are valid JSON, so the shape check below, not
+	// the parse-error path above, is what rejects them.
+	const tagProblem = diagnosticArtifactManifestProblem(tagManifest);
+	if (tagProblem !== undefined) return `the v${version} release tag's ${BACKMERGE_CONFLICT_PATH} ${tagProblem}`;
+	let branchManifest: unknown;
+	try {
+		branchManifest = JSON.parse(onBranch);
+	} catch {
+		return `its ${BACKMERGE_CONFLICT_PATH} cannot be read as JSON; delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
+	}
+	// Same asymmetry as the tag side: a degenerate branch manifest parses, so it is refused
+	// here instead of passing by matching an equally degenerate tag manifest.
+	const branchProblem = diagnosticArtifactManifestProblem(branchManifest);
+	if (branchProblem !== undefined) {
+		return `its ${BACKMERGE_CONFLICT_PATH} ${branchProblem}; delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
+	}
+	if (canonicalJson(branchManifest) === canonicalJson(tagManifest)) return undefined;
+	return `its ${BACKMERGE_CONFLICT_PATH} carries a stale manifest (branch version ${manifestVersionLabel(branchManifest)}, released version ${manifestVersionLabel(tagManifest)}) that does not match the v${version} release tag. Delete the branch and re-run: git push origin --delete ${branch} && bun scripts/release.ts backmerge ${version}`;
+}
+
 async function existingBackmergeBranchProblem(
 	repoDir: string,
 	branchRef: string,
@@ -1074,7 +1208,7 @@ async function existingBackmergeBranchProblem(
 	if (mainBase.exitCode !== 0 || mainBase.stdout.toString().trim() !== releaseCommit) {
 		return `contains main history beyond v${version} or omits the requested release`;
 	}
-	return undefined;
+	return await existingBackmergeManifestProblem(repoDir, branchRef, releaseTag, version);
 }
 
 /**
@@ -1129,7 +1263,7 @@ export async function backmergeReleaseIntoDev(
 				title: `chore(release): backmerge v${version} into dev`,
 				body: `Sync the v${version} release commit from main into dev so this published version is included before a later release merge.
 
-The release consumed its changelog fragments; the history guard admits those deletions because the \`v${version}\` tag records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's version and dev's artifact digests.
+The release consumed its changelog fragments; the history guard admits those deletions because a stable release tag in this range records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's manifest wholesale — its version and its artifact digests — so no digest dev built for another version is relabelled under v${version}.
 
 Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of dev. Merging requires maintainer approval of this exact head.`,
 			});
@@ -1161,9 +1295,8 @@ Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of d
 			if (conflicted.length !== 1 || conflicted[0] !== BACKMERGE_CONFLICT_PATH) {
 				return { action: "blocked", detail: `unexpected conflict: ${conflicted.join(", ") || "unknown"}` };
 			}
-			const ours = await gitAt(dir, ["show", `:2:${BACKMERGE_CONFLICT_PATH}`]).text();
 			const theirs = await gitAt(dir, ["show", `:3:${BACKMERGE_CONFLICT_PATH}`]).text();
-			await Bun.write(path.join(dir, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
+			await Bun.write(path.join(dir, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(theirs));
 			await gitAt(dir, ["add", BACKMERGE_CONFLICT_PATH]).quiet();
 		}
 		await gitAt(dir, [
