@@ -1636,16 +1636,25 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
-		return this.#steeringQueue.pop();
+		const removed = this.#steeringQueue.pop();
+		if (removed !== undefined) {
+			for (const notify of [...this.#steeringWaiters]) notify();
+		}
+		return removed;
 	}
 	removeSteerAt(index: number): AgentMessage | undefined {
 		if (index < 0 || index >= this.#steeringQueue.length) return undefined;
 		const [removed] = this.#steeringQueue.splice(index, 1);
+		for (const notify of [...this.#steeringWaiters]) notify();
 		return removed;
 	}
 
 	moveSteer(fromIndex: number, toIndex: number): boolean {
-		return this.#moveQueuedMessage(this.#steeringQueue, fromIndex, toIndex);
+		const success = this.#moveQueuedMessage(this.#steeringQueue, fromIndex, toIndex);
+		if (success) {
+			for (const notify of [...this.#steeringWaiters]) notify();
+		}
+		return success;
 	}
 
 	/**
@@ -1653,16 +1662,25 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
-		return this.#followUpQueue.pop();
+		const removed = this.#followUpQueue.pop();
+		if (removed !== undefined) {
+			for (const notify of [...this.#followUpWaiters]) notify();
+		}
+		return removed;
 	}
 	removeFollowUpAt(index: number): AgentMessage | undefined {
 		if (index < 0 || index >= this.#followUpQueue.length) return undefined;
 		const [removed] = this.#followUpQueue.splice(index, 1);
+		for (const notify of [...this.#followUpWaiters]) notify();
 		return removed;
 	}
 
 	moveFollowUp(fromIndex: number, toIndex: number): boolean {
-		return this.#moveQueuedMessage(this.#followUpQueue, fromIndex, toIndex);
+		const success = this.#moveQueuedMessage(this.#followUpQueue, fromIndex, toIndex);
+		if (success) {
+			for (const notify of [...this.#followUpWaiters]) notify();
+		}
+		return success;
 	}
 
 	#moveQueuedMessage<T>(queue: T[], fromIndex: number, toIndex: number): boolean {
@@ -1697,6 +1715,13 @@ export class Agent {
 		}
 		const steering = beforeSteering - this.#steeringQueue.length;
 		const followUp = beforeFollowUp - this.#followUpQueue.length;
+		// Notify listeners when queue state changes
+		if (steering > 0) {
+			for (const notify of [...this.#steeringWaiters]) notify();
+		}
+		if (followUp > 0) {
+			for (const notify of [...this.#followUpWaiters]) notify();
+		}
 		return { steering, followUp, total: steering + followUp };
 	}
 
