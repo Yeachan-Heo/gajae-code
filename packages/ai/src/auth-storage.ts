@@ -570,6 +570,14 @@ export interface AuthCredentialStore {
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
 	/**
+	 * Optional ownership predicate for OAuth refresh. When present, `AuthStorage`
+	 * checks this before using the `refreshOAuthCredential` hook. If a credential
+	 * is NOT owned by this store (returns false), the local per-provider refresh
+	 * path is used instead. Hybrid stores use this to claim broker rows (true)
+	 * and decline local rows (false); local stores omit this (implicitly false).
+	 */
+	ownsOAuthRefresh?(credentialId: number): boolean;
+	/**
 	 * Optional store-supplied OAuth refresh. When present, `AuthStorage` uses
 	 * it before the per-provider local refresh path. `RemoteAuthCredentialStore`
 	 * implements this against the broker; SQLite stores leave it undefined.
@@ -6776,11 +6784,14 @@ export class AuthStorage {
 			}
 		};
 
-		// Caller override > store-level hook > local per-provider refresh.
+		// Caller override > store-level hook (if owned) > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
 		// routes refresh through the broker without explicit wiring.
+		// Hybrid stores use `ownsOAuthRefresh` to claim broker rows and decline local rows.
 		const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
-		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
+		const storeOwnsRefresh =
+			credentialId !== undefined ? (this.#store.ownsOAuthRefresh?.(credentialId) ?? !!storeRefresh) : false;
+		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? (storeOwnsRefresh ? storeRefresh : undefined);
 		if (overrideRefresh && credentialId !== undefined) {
 			refreshPromise = overrideRefresh(provider, credentialId, credential, signal, expectedRevision);
 		} else {

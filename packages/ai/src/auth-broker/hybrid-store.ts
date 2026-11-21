@@ -318,7 +318,20 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 			...target,
 			id: -target.id,
 		}));
-		return this.#local.removeAuthCredentialsHard(provider, localTargets);
+		const result = this.#local.removeAuthCredentialsHard(provider, localTargets);
+		// Translate the result IDs back to the hybrid namespace (negate them)
+		if (result.kind === "removed") {
+			this.#returnToBrokerIfEmpty(provider);
+			return { kind: "removed", ids: result.ids.map(id => -id) };
+		} else {
+			return { kind: "conflict", currentIds: result.currentIds.map(id => -id) };
+		}
+	}
+
+	ownsOAuthRefresh(credentialId: number): boolean {
+		// Broker rows (positive IDs) are owned by the broker store.
+		// Local rows (negative IDs) are owned by the local store.
+		return credentialId > 0;
 	}
 
 	async refreshOAuthCredential(
@@ -329,29 +342,12 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		expectedRevision?: number,
 	): Promise<import("../utils/oauth/types").OAuthCredentials> {
 		// Route refresh by row ownership: broker rows through the remote hook,
-		// local credentials are handled by AuthStorage's default mechanism.
-		// When a local credential reaches this hook, we must NOT reject it;
-		// instead, we return the credential unchanged to allow AuthStorage's
-		// default refresh mechanisms to operate. This hook only handles broker
-		// credentials that must route through the remote server to avoid exposing
-		// refresh tokens to the client.
+		// local credentials should NOT reach here because ownsOAuthRefresh returns false.
+		// This method is only called for broker rows that this store owns.
 		if (isLocalId(credentialId)) {
-			// Local credentials are not refreshed here; AuthStorage's default
-			// mechanism will handle them through per-provider OAuth endpoints.
-			// Return the credential unchanged to satisfy the type requirement.
-			// The credential staleness check in AuthStorage will trigger the
-			// actual local refresh if needed.
-			return {
-				access: credential.access,
-				refresh: credential.refresh,
-				expires: credential.expires,
-				accountId: credential.accountId,
-				email: credential.email,
-				projectId: credential.projectId,
-				enterpriseUrl: credential.enterpriseUrl,
-				organizationId: credential.organizationId,
-				organizationName: credential.organizationName,
-			};
+			// Should not reach here if ownsOAuthRefresh works correctly,
+			// but as a safety fallback, return the credential unchanged.
+			return credential;
 		}
 		// Broker credentials route through the broker's refresh hook
 		return this.#broker.refreshOAuthCredential(provider, credentialId, credential, signal, expectedRevision);
@@ -371,6 +367,52 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 			return credential;
 		}
 		return this.#broker.refreshMCPOAuthCredential?.(credentialId, credential, client, signal) ?? credential;
+	}
+
+	claimOAuthRefreshLease?(
+		credentialId: number,
+		expectedRefresh: string,
+		force: boolean,
+		owner: string,
+		nowMs: number,
+		leaseMs: number,
+		expectedRevision?: number,
+	): import("../auth-storage").OAuthRefreshLeaseClaim {
+		// Lease operations only apply to local credentials; broker handles locking server-side
+		if (isLocalId(credentialId)) {
+			const claim = this.#local.claimOAuthRefreshLease?.(
+				credentialId,
+				expectedRefresh,
+				force,
+				owner,
+				nowMs,
+				leaseMs,
+				expectedRevision,
+			);
+			return claim ?? { kind: "missing" };
+		}
+		// Broker credentials do not use local leases; return missing for consistency
+		return { kind: "missing" };
+	}
+
+	completeOAuthRefreshLease?(
+		lease: import("../auth-storage").OAuthRefreshLease,
+		credential: import("../auth-storage").OAuthCredential,
+	): boolean {
+		// Lease operations only apply to local credentials
+		if (isLocalId(lease.credentialId)) {
+			return this.#local.completeOAuthRefreshLease?.(lease, credential) ?? false;
+		}
+		// Broker credentials do not use local leases
+		return false;
+	}
+
+	releaseOAuthRefreshLease?(lease: import("../auth-storage").OAuthRefreshLease): void {
+		// Lease operations only apply to local credentials
+		if (isLocalId(lease.credentialId)) {
+			this.#local.releaseOAuthRefreshLease?.(lease);
+		}
+		// Broker credentials do not use local leases, nothing to release
 	}
 
 	async disableAuthCredentialRemote?(
@@ -416,9 +458,34 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		return this.#broker.fetchUsageReports?.(signal) ?? Promise.resolve(null);
 	}
 
+	fetchUsageReportsForProvider?(
+		provider: import("../types").Provider,
+		signal?: AbortSignal,
+	): Promise<import("../usage").UsageReport[] | null> {
+		// Local providers do not have usage reports from the broker.
+		if (this.#localProviders.has(provider)) {
+			return Promise.resolve(null);
+		}
+		return this.#broker.fetchUsageReportsForProvider?.(provider, signal) ?? Promise.resolve(null);
+	}
+
 	prepareForRequest(credentialId: number, opts?: { signal?: AbortSignal }): Promise<boolean | undefined> {
 		if (isLocalId(credentialId)) return Promise.resolve(false);
 		return this.#broker.prepareForRequest?.(credentialId, opts) ?? Promise.resolve(undefined);
+	}
+
+	async waitForReady?(): Promise<void> {
+		// Ensure broker is ready before reading inventory
+		return this.#broker.waitForReady?.();
+	}
+
+	tryDisableAuthCredentialIfRevision?(id: number, expectedRevision: number, disabledCause: string): boolean {
+		// Revision-based disable only applies to local credentials; broker uses snapshot authority
+		if (isLocalId(id)) {
+			return this.#local.tryDisableAuthCredentialIfRevision?.(-id, expectedRevision, disabledCause) ?? false;
+		}
+		// Broker credentials cannot be revision-disabled locally
+		return false;
 	}
 
 	/** Route `provider` to `agent.db` from now on, in this process and (via the record) every later one. */
