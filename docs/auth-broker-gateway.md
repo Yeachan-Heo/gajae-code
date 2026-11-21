@@ -40,6 +40,8 @@ Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packag
 
 The broker is the only writer of OAuth refresh tokens. Clients (including the gateway itself) load a redacted snapshot in which every `refresh` field has been replaced with `REMOTE_REFRESH_SENTINEL`; when an access token expires the client calls `POST /v1/credential/:id/refresh` and the broker performs the refresh server-side. `RemoteAuthCredentialStore` rejects any local code path that tries to write through it, with an error pointing at `gjc auth-broker login` / `gjc auth-broker logout`.
 
+**Local-fallback exception:** When a broker accepts a credential upload but does not serve the provider back (e.g., a broker version that pauses the provider), the client's `HybridAuthCredentialStore` stores the full OAuth credential including the refresh token in the local SQLite `agent.db` to prevent credential loss. This local fallback is temporary: the credential moves back to broker storage when the next login succeeds after that provider is served again. Users should treat this as a temporary preservation mechanism, not a persistent local store; the broker remains the security boundary for refresh tokens at startup.
+
 ## auth-broker
 
 ### CLI

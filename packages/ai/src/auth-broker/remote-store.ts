@@ -17,6 +17,7 @@ import { getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
+	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	assertMCPOAuthBindingTransportAdmitted,
 	type CachedCredentialHealth,
@@ -62,6 +63,23 @@ export interface CredentialInventoryMetadataState {
 	generation: number;
 	records: readonly CredentialInventoryRecord[];
 	notice?: CachedInventoryNotice;
+}
+
+/**
+ * A broker accepted a credential upload but serves none of the provider's rows
+ * back, as a broker whose version pauses the provider does: the login would be
+ * gone on the next snapshot. {@link HybridAuthCredentialStore} catches it and
+ * keeps the login in the local `agent.db` instead.
+ */
+export class AuthBrokerUnservedProviderError extends Error {
+	readonly provider: string;
+	readonly unservedEntries?: readonly AuthCredentialSnapshotEntry[];
+	constructor(provider: string, unservedEntries?: readonly AuthCredentialSnapshotEntry[]) {
+		super(`The auth broker stored the ${provider} credential but does not serve it back`);
+		this.name = "AuthBrokerUnservedProviderError";
+		this.provider = provider;
+		this.unservedEntries = unservedEntries;
+	}
 }
 
 /**
@@ -972,16 +990,30 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		await this.refreshSnapshot();
 	}
 
+	/** Disable specific credential IDs directly by id, used when disabling unserved entries. */
+	async disableCredentialsById(ids: readonly number[], disabledCause: string): Promise<void> {
+		for (const id of ids) {
+			await this.#client.disableCredential(id, disabledCause);
+		}
+		await this.refreshSnapshot();
+	}
+
 	/**
 	 * Upsert a single credential through the broker. The broker server is the
 	 * canonical writer — see `POST /v1/credential`. The redacted snapshot
 	 * entries returned by the server replace the provider's rows in our local
 	 * snapshot, and the global snapshot is then refreshed in the background so
 	 * any concurrent peer (refresh, generation bump) stays in sync.
+	 *
+	 * If the broker accepts the upload but does not serve the provider (e.g.
+	 * a broker whose version pauses the provider), {@link #confirmServed} re-reads
+	 * the snapshot and throws {@link AuthBrokerUnservedProviderError} when none of
+	 * the uploaded rows come back.
 	 */
 	async upsertAuthCredentialRemote(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]> {
-		await this.#client.uploadCredential(provider, credential);
+		const uploaded = await this.#client.uploadCredential(provider, credential);
 		await this.refreshSnapshot();
+		await this.#confirmServed(provider, uploaded.entries);
 		return this.listAuthCredentials(provider);
 	}
 
@@ -989,8 +1021,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		provider: string,
 		credential: AuthCredential,
 	): Promise<AuthCredentialIfAbsentResult> {
-		const { inserted, reason } = await this.#client.uploadCredentialIfAbsent(provider, credential);
+		const {
+			inserted,
+			reason,
+			entries: uploadedEntries,
+		} = await this.#client.uploadCredentialIfAbsent(provider, credential);
 		await this.refreshSnapshot();
+		if (inserted) {
+			await this.#confirmServed(provider, uploadedEntries);
+		}
 		return { inserted, reason, provider, entries: this.listAuthCredentials(provider) };
 	}
 
@@ -1009,8 +1048,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 		await this.refreshSnapshot();
 		for (const credential of credentials) {
-			await this.#client.uploadCredential(provider, credential);
+			const uploaded = await this.#client.uploadCredential(provider, credential);
 			await this.refreshSnapshot();
+			await this.#confirmServed(provider, uploaded.entries);
 		}
 		this.#maybeRefreshSnapshot("replace");
 		return this.listAuthCredentials(provider);
@@ -1021,6 +1061,24 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (credentials.length === this.#snapshot.credentials.length) return;
 		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
 	}
+
+	/**
+	 * Verify that the broker served the uploaded credentials. The broker snapshot
+	 * has already been refreshed when this is called; we just check whether any of
+	 * the uploaded rows' ids appear in the new snapshot.
+	 *
+	 * If the broker accepted the upload but serves none of the rows back (as a
+	 * broker whose version pauses the provider does), throw
+	 * {@link AuthBrokerUnservedProviderError}. {@link HybridAuthCredentialStore}
+	 * catches it and keeps the login in the local `agent.db` instead.
+	 */
+	async #confirmServed(provider: string, uploaded: readonly AuthCredentialSnapshotEntry[]): Promise<void> {
+		if (uploaded.length === 0) return;
+		const served = new Set(this.#snapshot.credentials.map(entry => entry.id));
+		if (uploaded.some(entry => served.has(entry.id))) return;
+		throw new AuthBrokerUnservedProviderError(provider, uploaded);
+	}
+
 	/**
 	 * Fire-and-forget `refreshSnapshot()` after a write. When the SSE stream is
 	 * active the broker will deliver the new generation push, so the extra GET
