@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AuthCredential } from "../src";
 import {
 	AuthBrokerClient,
 	AuthBrokerUnservedProviderError,
@@ -12,7 +13,6 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
-import type { AuthCredential } from "../src";
 
 const TOKEN = "test-bearer";
 const UNSERVED = "test-unserved-provider";
