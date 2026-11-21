@@ -651,9 +651,10 @@ function normalizeOptionalNullsForSchema(
 		const currentValue = nextValue[key];
 		const isNullish = currentValue === null || currentValue === "null";
 
-		// Strip null and the string "null" from optional fields.
+		// Strip null and the string "null" from optional fields that don't accept null.
 		// The LLM sometimes outputs string "null" to mean "no value".
-		if (isNullish && !required.has(key)) {
+		// But if the schema explicitly allows null (nullable optional), preserve it.
+		if (isNullish && !required.has(key) && !isJsonSchemaValueValid(propertySchema, null)) {
 			if (!changed) {
 				nextValue = { ...nextValue };
 				changed = true;

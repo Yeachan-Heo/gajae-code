@@ -1206,4 +1206,39 @@ describe("Tool argument coercion", () => {
 		expect(message).toContain("Rejected fields:");
 		expect(message).toContain("and 8 more");
 	});
+
+	describe("explicit null on optional properties", () => {
+		const tool: Tool = {
+			name: "update_issue",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					note: { type: ["string", "null"] },
+					assignee: { anyOf: [{ type: "string" }, { type: "null" }] },
+					label: { type: "string" },
+				},
+				required: ["id"],
+			},
+		};
+		const call = (args: Record<string, unknown>): ToolCall => ({
+			type: "toolCall",
+			id: "call-null",
+			name: tool.name,
+			arguments: args,
+		});
+
+		it("keeps a null the property schema accepts", () => {
+			expect(validateToolArguments(tool, call({ id: "1", note: null, assignee: null }))).toEqual({
+				id: "1",
+				note: null,
+				assignee: null,
+			});
+		});
+
+		it("drops a null the property schema rejects", () => {
+			expect(validateToolArguments(tool, call({ id: "1", label: null, note: "x" }))).toEqual({ id: "1", note: "x" });
+		});
+	});
 });
