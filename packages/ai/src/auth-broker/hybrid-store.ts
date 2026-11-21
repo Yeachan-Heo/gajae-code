@@ -178,22 +178,9 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		} else {
 			// For local providers, first try to disable any hidden broker-side credentials
 			// that were accepted but never served back (unserved credentials).
-			// Keep the provider marked local until this broker cleanup is confirmed,
-			// so if revocation fails, we can retry later.
-			try {
-				await this.#disableBrokerCredentialsForProvider(provider, disabledCause);
-			} catch (error) {
-				// Log the failure but continue with local deletion.
-				// The provider stays marked local so we can retry broker cleanup.
-				logger.warn(
-					"Failed to disable broker-side credentials for local provider; provider remains marked local for retry",
-					{
-						provider,
-						error: String(error),
-					},
-				);
-				// Don't throw; complete the local deletion and let the provider stay local
-			}
+			// If this fails, the error propagates and prevents us from deleting local credentials,
+			// ensuring the provider stays marked local until revocation succeeds.
+			await this.#disableBrokerCredentialsForProvider(provider, disabledCause);
 			this.#local.deleteAuthCredentialsForProvider(provider, disabledCause);
 			this.#returnToBrokerIfEmpty(provider);
 		}
