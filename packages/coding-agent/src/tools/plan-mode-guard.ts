@@ -9,11 +9,16 @@ const LOCAL_SCHEME_PREFIX = "local:";
 function resolveRawPath(session: ToolSession, targetPath: string): string {
 	const normalized = normalizeLocalScheme(targetPath);
 	if (normalized.startsWith(LOCAL_SCHEME_PREFIX)) {
-		return resolveLocalUrlToPath(normalized, {
-			getArtifactsDir: session.getArtifactsDir,
-			isManagedDestination: session.isManagedSessionDestination,
-			getSessionId: session.getSessionId,
-		});
+		// The session's own binding, so a write lands in the same root a read of the
+		// same URL resolves against (an explicitly shared root included).
+		return resolveLocalUrlToPath(
+			normalized,
+			session.getLocalProtocolOptions?.() ?? {
+				getArtifactsDir: session.getArtifactsDir,
+				isManagedDestination: session.isManagedSessionDestination,
+				getSessionId: session.getSessionId,
+			},
+		);
 	}
 
 	return resolveToCwd(normalized, session.cwd);

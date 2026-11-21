@@ -3552,6 +3552,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			getArtifactsDir: this.session.getArtifactsDir,
 			getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 			settings: this.session.settings,
+			localProtocolOptions: this.session.getLocalProtocolOptions?.(),
 			signal,
 			mcpManager: this.session.getMcpManager?.(),
 		});

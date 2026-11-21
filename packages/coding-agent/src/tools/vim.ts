@@ -463,9 +463,11 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
+		const getLocalProtocolOptions = () => this.session.getLocalProtocolOptions?.();
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
-			: writethroughNoop;
+			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics, getLocalProtocolOptions })
+			: (dst, content, signal, file) =>
+					writethroughNoop(dst, content, signal, file, undefined, undefined, getLocalProtocolOptions);
 		this.description = prompt.render(vimDescription);
 	}
 
