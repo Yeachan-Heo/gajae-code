@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { RawArgumentValidationResult, Tool, ToolCall } from "@gajae-code/ai/types";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
+import fc from "fast-check";
 import * as z from "zod/v4";
 
 function captureMessage(run: () => void): string {
@@ -1550,7 +1551,7 @@ describe("Tool argument coercion", () => {
 		});
 	});
 
-	describe("nullable normalization invariants (property-based)", () => {
+	describe("nullable normalization invariants (fixed examples)", () => {
 		it("preserves accepted null across anyOf schema variants", () => {
 			const tool: Tool = {
 				name: "test_anyof",
@@ -1652,6 +1653,209 @@ describe("Tool argument coercion", () => {
 			});
 			const result = validateToolArguments(tool, call({ id: "1", metadata: { tag: null } }));
 			expect(result).toEqual({ id: "1", metadata: { tag: null } });
+		});
+	});
+
+	describe("nullable normalization invariants (property-based with fast-check)", () => {
+		it("preserves accepted null across generated nullable schema variants", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 2 }).chain(variant =>
+						fc
+							.record({
+								includeDefault: fc.boolean(),
+							})
+							.map(({ includeDefault }) => ({ variant, includeDefault })),
+					),
+					config => {
+						let propertySchema: Record<string, unknown>;
+
+						// Generate different nullable schema variants
+						switch (config.variant) {
+							case 0: // anyOf variant
+								propertySchema = {
+									anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }],
+								};
+								break;
+							case 1: // oneOf variant
+								propertySchema = {
+									oneOf: [{ type: "string" }, { type: "null" }],
+								};
+								break;
+							case 2: // type array variant
+								propertySchema = { type: ["string", "integer", "null"] };
+								break;
+							default:
+								throw new Error("Invalid variant");
+						}
+
+						if (config.includeDefault) {
+							propertySchema = { ...propertySchema, default: null };
+						}
+
+						const tool: Tool = {
+							name: "test_nullable",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									value: propertySchema,
+								},
+								required: ["id"],
+							},
+						};
+
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `call-${config.variant}`,
+							name: tool.name,
+							arguments: { id: "test", value: null },
+						};
+
+						const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+						// Invariant: accepted null must be preserved
+						expect(result.value).toBe(null);
+					},
+				),
+				{ numRuns: 100 },
+			);
+		});
+
+		it("removes rejected null from non-nullable optional properties", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 2 }).chain(variant =>
+						fc
+							.record({
+								includeDefault: fc.boolean(),
+							})
+							.map(({ includeDefault }) => ({ variant, includeDefault })),
+					),
+					config => {
+						let propertySchema: Record<string, unknown>;
+
+						// Generate non-nullable schema variants
+						switch (config.variant) {
+							case 0: // anyOf without null
+								propertySchema = {
+									anyOf: [{ type: "string" }, { type: "integer" }],
+								};
+								break;
+							case 1: // oneOf without null
+								propertySchema = {
+									oneOf: [{ type: "string" }, { type: "boolean" }],
+								};
+								break;
+							case 2: // type array without null
+								propertySchema = { type: ["string", "integer"] };
+								break;
+							default:
+								throw new Error("Invalid variant");
+						}
+
+						if (config.includeDefault) {
+							propertySchema = { ...propertySchema, default: "fallback" };
+						}
+
+						// Always optional to test null removal behavior
+						const tool: Tool = {
+							name: "test_non_nullable_optional",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									value: propertySchema,
+								},
+								required: ["id"],
+							},
+						};
+
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `call-${config.variant}`,
+							name: tool.name,
+							arguments: { id: "test", value: null },
+						};
+
+						const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+						// Invariant: rejected null should be removed for optional non-nullable properties
+						expect(result).not.toHaveProperty("value");
+					},
+				),
+				{ numRuns: 100 },
+			);
+		});
+
+		it("preserves null in nested objects across generated schema depths", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 1, max: 3 }).chain(depth =>
+						fc
+							.record({
+								includeNullInLeaf: fc.boolean(),
+							})
+							.map(({ includeNullInLeaf }) => ({ depth, includeNullInLeaf })),
+					),
+					config => {
+						// Build nested property schema based on depth
+						const leafSchema = config.includeNullInLeaf ? { type: ["string", "null"] } : { type: "string" };
+
+						let propertySchema: Record<string, unknown> = leafSchema;
+
+						for (let i = 1; i < config.depth; i++) {
+							propertySchema = {
+								type: "object",
+								properties: {
+									nested: propertySchema,
+								},
+							};
+						}
+
+						const tool: Tool = {
+							name: "test_nested_nullable",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									data: propertySchema,
+								},
+								required: ["id"],
+							},
+						};
+
+						// Build nested value based on depth
+						let nestedValue: unknown = null;
+						for (let i = 1; i < config.depth; i++) {
+							nestedValue = { nested: nestedValue };
+						}
+
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `call-nested-${config.depth}`,
+							name: tool.name,
+							arguments: { id: "test", data: nestedValue },
+						};
+
+						const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+						// Invariant: null in nested structures should be preserved if schema allows it
+						if (config.includeNullInLeaf) {
+							// Traverse nested structure to find the leaf
+							let current: unknown = result.data;
+							for (let i = 1; i < config.depth; i++) {
+								current = (current as Record<string, unknown>).nested;
+							}
+							expect(current).toBe(null);
+						}
+					},
+				),
+				{ numRuns: 50 },
+			);
 		});
 	});
 });
