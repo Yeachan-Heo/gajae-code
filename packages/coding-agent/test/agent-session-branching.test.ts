@@ -21,7 +21,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import { Snowflake } from "@gajae-code/utils";
-import { e2eApiKey } from "./utilities";
+import { assistantMsg, e2eApiKey } from "./utilities";
 
 describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () => {
 	let session: AgentSession;
@@ -247,6 +247,110 @@ async function evictOldBranchMessage(sessionManager: SessionManager, marker: str
 	await sessionManager.flush();
 	return oldUserId;
 }
+
+describe("regression #7699: fork selector missing new prompts after branch", () => {
+	it("should include new prompts in getUserMessagesForBranching after branch", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-issue-7699-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		let session: AgentSession | undefined;
+		let authStorage: AuthStorage | undefined;
+		try {
+			const created = await createFidelityAgentSession(tempDir);
+			session = created.session;
+			authStorage = created.authStorage;
+			const { sessionManager } = created;
+
+			// Step 1: Create 3 messages (A, B, C)
+			sessionManager.appendMessage({ role: "user", content: "Prompt A", timestamp: Date.now() });
+			sessionManager.appendMessage(assistantMsg("Response A"));
+
+			const bId = sessionManager.appendMessage({ role: "user", content: "Prompt B", timestamp: Date.now() });
+			sessionManager.appendMessage(assistantMsg("Response B"));
+
+			sessionManager.appendMessage({ role: "user", content: "Prompt C", timestamp: Date.now() });
+			sessionManager.appendMessage(assistantMsg("Response C"));
+
+			// Step 2: Verify initial state
+			let messages = session.getUserMessagesForBranching();
+			expect(messages.length).toBe(3);
+			expect(messages[0].text).toContain("Prompt A");
+			expect(messages[1].text).toContain("Prompt B");
+			expect(messages[2].text).toContain("Prompt C");
+
+			// Step 3: Branch to B
+			// Note: branch(bId) creates a new session that ends at B's parent (Response A),
+			// so the branched session only contains A and Response to A
+			const branchResult = await session.branch(bId);
+			expect(branchResult.cancelled).toBe(false);
+
+			messages = session.getUserMessagesForBranching();
+			// After branching, the leaf is at Response to A, so only A is visible
+			expect(messages.length).toBe(1);
+			expect(messages[0].text).toContain("Prompt A");
+
+			// Step 4: Add new prompts (D, E) after branching
+			const dId = sessionManager.appendMessage({ role: "user", content: "Prompt D", timestamp: Date.now() });
+			sessionManager.appendMessage(assistantMsg("Response D"));
+
+			sessionManager.appendMessage({ role: "user", content: "Prompt E", timestamp: Date.now() });
+
+			// Step 5: Verify new prompts are visible (THIS IS WHERE #7699 MANIFESTS)
+			messages = session.getUserMessagesForBranching();
+			// After adding D and E, they should both be visible in the branched session
+			expect(messages.length).toBe(3);
+			expect(messages[0].text).toContain("Prompt A");
+			expect(messages[1].text).toContain("Prompt D");
+			expect(messages[2].text).toContain("Prompt E");
+
+			// Step 6: Branch again from D and verify
+			// Note: In the branched session, D's parent is Response to A (the leaf before D was added)
+			// So branching to D creates a new session ending at Response to A
+			const secondBranchResult = await session.branch(dId);
+			expect(secondBranchResult.cancelled).toBe(false);
+
+			messages = session.getUserMessagesForBranching();
+			expect(messages.length).toBe(1);
+			expect(messages[0].text).toContain("Prompt A");
+
+			// Step 7: Flush and reopen to verify persistence
+			await sessionManager.flush();
+			const sessionFile = session.sessionFile;
+			expect(sessionFile).toBeDefined();
+
+			await session.dispose();
+
+			const reopenedManager = await SessionManager.open(sessionFile!, tempDir);
+			const reopenedAuth = await AuthStorage.create(path.join(tempDir, "reopen-auth.db"));
+			const reopenedRegistry = new ModelRegistry(reopenedAuth, path.join(tempDir, "reopen-models.yml"));
+
+			const reopenedSession = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: {
+						model: getBundledModel("anthropic", "claude-sonnet-4-5")!,
+						systemPrompt: ["test"],
+						tools: [],
+					},
+				}),
+				sessionManager: reopenedManager,
+				settings: Settings.isolated(),
+				modelRegistry: reopenedRegistry,
+			});
+			reopenedSession.subscribe(() => {});
+
+			const reopenedMessages = reopenedSession.getUserMessagesForBranching();
+			expect(reopenedMessages.length).toBe(1);
+			expect(reopenedMessages[0].text).toContain("Prompt A");
+
+			await reopenedSession.dispose();
+			reopenedAuth.close();
+		} finally {
+			await session?.dispose();
+			authStorage?.close();
+			await removeTempDirWithWindowsRetry(tempDir);
+		}
+	});
+});
 
 describe("successor readiness", () => {
 	it("keeps the predecessor active when branch readiness fails", async () => {
