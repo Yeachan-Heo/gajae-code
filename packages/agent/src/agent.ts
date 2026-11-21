@@ -549,6 +549,7 @@ export class Agent {
 	) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
 	#steeringWaiters = new Set<() => void>();
+	#queueChangeWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
 	#followUpWaiters = new Set<() => void>();
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
@@ -1450,6 +1451,27 @@ export class Agent {
 	}
 
 	/**
+	 * Resolves when the queue state changes (messages removed or reordered), or
+	 * when `signal` aborts. Used by snapshot consumers to observe queue mutations
+	 * without being affected by arrival-only waiter semantics.
+	 */
+	waitForQueueChange(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			this.#queueChangeWaiters.delete(settle);
+			signal.removeEventListener("abort", settle);
+			resolve();
+		};
+		this.#queueChangeWaiters.add(settle);
+		signal.addEventListener("abort", settle, { once: true });
+		return promise;
+	}
+
+	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 *
@@ -1636,16 +1658,25 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
-		return this.#steeringQueue.pop();
+		const removed = this.#steeringQueue.pop();
+		if (removed !== undefined) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return removed;
 	}
 	removeSteerAt(index: number): AgentMessage | undefined {
 		if (index < 0 || index >= this.#steeringQueue.length) return undefined;
 		const [removed] = this.#steeringQueue.splice(index, 1);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return removed;
 	}
 
 	moveSteer(fromIndex: number, toIndex: number): boolean {
-		return this.#moveQueuedMessage(this.#steeringQueue, fromIndex, toIndex);
+		const success = this.#moveQueuedMessage(this.#steeringQueue, fromIndex, toIndex);
+		if (success && fromIndex !== toIndex) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return success;
 	}
 
 	/**
@@ -1653,16 +1684,25 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
-		return this.#followUpQueue.pop();
+		const removed = this.#followUpQueue.pop();
+		if (removed !== undefined) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return removed;
 	}
 	removeFollowUpAt(index: number): AgentMessage | undefined {
 		if (index < 0 || index >= this.#followUpQueue.length) return undefined;
 		const [removed] = this.#followUpQueue.splice(index, 1);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return removed;
 	}
 
 	moveFollowUp(fromIndex: number, toIndex: number): boolean {
-		return this.#moveQueuedMessage(this.#followUpQueue, fromIndex, toIndex);
+		const success = this.#moveQueuedMessage(this.#followUpQueue, fromIndex, toIndex);
+		if (success && fromIndex !== toIndex) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return success;
 	}
 
 	#moveQueuedMessage<T>(queue: T[], fromIndex: number, toIndex: number): boolean {
@@ -1697,6 +1737,10 @@ export class Agent {
 		}
 		const steering = beforeSteering - this.#steeringQueue.length;
 		const followUp = beforeFollowUp - this.#followUpQueue.length;
+		// Notify queue-change listeners when queue state changes
+		if (steering > 0 || followUp > 0) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 		return { steering, followUp, total: steering + followUp };
 	}
 
