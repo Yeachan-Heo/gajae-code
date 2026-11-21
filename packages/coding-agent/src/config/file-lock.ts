@@ -95,7 +95,7 @@ export class FileLockAcquireError extends Error {
 				: "; a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying";
 		const syncHint =
 			publicationFailureCode === "access_denied" && !holderIsLive
-				? "; if this project is inside a cloud-synced folder (OneDrive, Dropbox, Google Drive, iCloud), the sync client may be holding the lock — move the project or exclude it from sync"
+				? "; if this directory is inside a cloud-synced folder (OneDrive, Dropbox, Google Drive, iCloud Drive), the sync client may be holding the lock — move it out of the synced folder or exclude it from sync"
 				: "";
 		super(
 			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail}${publicationDetail} (${lockPath})${contentionGuidance}${syncHint}${cleanupDetail}`,
@@ -206,103 +206,70 @@ type LocalLockState = {
  */
 const localLockStates = new Map<string, LocalLockState>();
 
-/**
- * Tracks whether a cloud-sync warning has been emitted for a lock path.
- * This ensures the warning is emitted only once per process, not per lock acquisition attempt.
- */
+/** Lock paths that already logged the cloud-sync warning in this process. */
 const emittedCloudSyncWarnings = new Set<string>();
 
-/**
- * Detects if a path is inside a known cloud-synced folder.
- * Returns the cloud-sync service name if detected, undefined otherwise.
- */
-function detectCloudSyncPath(filePath: string): "OneDrive" | "Dropbox" | "Google Drive" | "iCloud" | undefined {
-	const normalized = path.normalize(filePath);
-	const home = os.homedir();
+/** Extra access-denied publication attempts granted to locks inside a cloud-synced folder. */
+const CLOUD_SYNC_EXTRA_ACCESS_DENIED_ATTEMPTS = 3;
 
-	if (process.platform === "darwin") {
-		// macOS: ~/Library/Mobile Documents (iCloud)
-		const icloudMobileDocuments = path.join(home, "Library", "Mobile Documents");
-		if (normalized.startsWith(icloudMobileDocuments + path.sep) || normalized === icloudMobileDocuments) {
-			return "iCloud";
-		}
+export type CloudSyncService = "iCloud Drive" | "OneDrive" | "Dropbox" | "Google Drive" | "cloud storage";
 
-		// macOS: ~/Library/CloudStorage/* (various services)
-		const cloudStoragePath = path.join(home, "Library", "CloudStorage");
-		if (normalized.startsWith(cloudStoragePath + path.sep) || normalized === cloudStoragePath) {
-			if (normalized.includes("Dropbox")) return "Dropbox";
-			if (normalized.includes("OneDrive")) return "OneDrive";
-			if (normalized.includes("GoogleDrive")) return "Google Drive";
-			return "OneDrive"; // Default to OneDrive for ~/Library/CloudStorage
-		}
-	} else if (process.platform === "win32") {
-		// Windows: OneDrive environment variables
-		const oneDrive = process.env.OneDrive;
-		const oneDriveCommercial = process.env.OneDriveCommercial;
-		const oneDriveConsumer = process.env.OneDriveConsumer;
+export interface CloudSyncEnvironment {
+	platform: NodeJS.Platform;
+	home: string;
+	env: Record<string, string | undefined>;
+}
 
-		if (oneDrive && (normalized.startsWith(oneDrive + path.sep) || normalized === oneDrive)) {
-			return "OneDrive";
-		}
-		if (
-			oneDriveCommercial &&
-			(normalized.startsWith(oneDriveCommercial + path.sep) || normalized === oneDriveCommercial)
-		) {
-			return "OneDrive";
-		}
-		if (oneDriveConsumer && (normalized.startsWith(oneDriveConsumer + path.sep) || normalized === oneDriveConsumer)) {
-			return "OneDrive";
-		}
-
-		// Windows: Dropbox and Google Drive common locations
-		const dropboxPath = path.join(home, "Dropbox");
-		if (normalized.startsWith(dropboxPath + path.sep) || normalized === dropboxPath) {
-			return "Dropbox";
-		}
-
-		const googleDrivePath = path.join(home, "Google Drive");
-		if (normalized.startsWith(googleDrivePath + path.sep) || normalized === googleDrivePath) {
-			return "Google Drive";
-		}
-
-		// Also check Drive with My
-		const googleDriveMyPath = path.join(home, "My Drive");
-		if (normalized.startsWith(googleDriveMyPath + path.sep) || normalized === googleDriveMyPath) {
-			return "Google Drive";
-		}
-	} else {
-		// Linux: check common Dropbox and Google Drive locations
-		const dropboxPath = path.join(home, "Dropbox");
-		if (normalized.startsWith(dropboxPath + path.sep) || normalized === dropboxPath) {
-			return "Dropbox";
-		}
-
-		const googleDrivePath = path.join(home, "GoogleDrive");
-		if (normalized.startsWith(googleDrivePath + path.sep) || normalized === googleDrivePath) {
-			return "Google Drive";
-		}
-
-		// Also check Drive with My
-		const googleDriveMyPath = path.join(home, "My Drive");
-		if (normalized.startsWith(googleDriveMyPath + path.sep) || normalized === googleDriveMyPath) {
-			return "Google Drive";
-		}
-	}
-
-	return undefined;
+function isWithin(target: string, root: string, caseInsensitive: boolean, pathApi: typeof path.posix): boolean {
+	const a = caseInsensitive ? target.toLowerCase() : target;
+	const b = pathApi.normalize(caseInsensitive ? root.toLowerCase() : root).replace(/[\\/]+$/, "");
+	return a === b || a.startsWith(b + pathApi.sep);
 }
 
 /**
- * Emits a one-time warning when a lock is in a cloud-synced path.
- * Warnings are tracked per path to avoid spam.
+ * Returns the cloud-sync service whose synced folder contains `filePath`, or undefined.
+ * Sync clients (OneDrive, Dropbox, Google Drive, iCloud Drive) briefly hold or re-create
+ * files they upload, which surfaces as transient access-denied lock publication (#6417).
  */
-function emitCloudSyncWarningOnce(lockPath: string, service: "OneDrive" | "Dropbox" | "Google Drive" | "iCloud"): void {
-	if (!emittedCloudSyncWarnings.has(lockPath)) {
-		emittedCloudSyncWarnings.add(lockPath);
-		logger.warn(
-			`File lock is in a ${service}-synced folder: move the project or exclude it from sync to avoid lock contention`,
-		);
+export function detectCloudSyncPath(
+	filePath: string,
+	environment: CloudSyncEnvironment = { platform: process.platform, home: os.homedir(), env: process.env },
+): CloudSyncService | undefined {
+	const { platform, home, env } = environment;
+	const pathApi = platform === "win32" ? path.win32 : path.posix;
+	const caseInsensitive = platform === "win32" || platform === "darwin";
+	const target = pathApi.normalize(caseInsensitive ? filePath.toLowerCase() : filePath);
+	const roots: Array<[string | undefined, CloudSyncService]> = [
+		[env.OneDrive, "OneDrive"],
+		[env.OneDriveCommercial, "OneDrive"],
+		[env.OneDriveConsumer, "OneDrive"],
+		[pathApi.join(home, "Dropbox"), "Dropbox"],
+		[pathApi.join(home, "Google Drive"), "Google Drive"],
+		[pathApi.join(home, "My Drive"), "Google Drive"],
+	];
+	if (platform === "darwin") {
+		roots.push([pathApi.join(home, "Library", "Mobile Documents"), "iCloud Drive"]);
+		const cloudStorage = pathApi.join(home, "Library", "CloudStorage");
+		if (isWithin(target, cloudStorage, caseInsensitive, pathApi)) {
+			const provider = target.slice(cloudStorage.length + 1).split(pathApi.sep)[0] ?? "";
+			if (provider.startsWith("onedrive")) return "OneDrive";
+			if (provider.startsWith("dropbox")) return "Dropbox";
+			if (provider.startsWith("googledrive")) return "Google Drive";
+			return "cloud storage";
+		}
 	}
+	for (const [root, service] of roots) {
+		if (root && isWithin(target, root, caseInsensitive, pathApi)) return service;
+	}
+	return undefined;
+}
+
+function emitCloudSyncWarningOnce(lockPath: string, service: CloudSyncService): void {
+	if (emittedCloudSyncWarnings.has(lockPath)) return;
+	emittedCloudSyncWarnings.add(lockPath);
+	logger.warn(
+		`File lock ${lockPath} is inside a ${service}-synced folder; the sync client can hold lock files and cause lock failures. Move this directory out of the synced folder or exclude it from sync.`,
+	);
 }
 
 const MAX_FILE_LOCK_REMOVAL_RECORD_BYTES = 64 * 1024;
@@ -3912,16 +3879,13 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	let publicationFailureCode: FileLockPublicationFailureCode | undefined;
 	let accessDeniedPublicationAttempts = 0;
 
-	// Detect if path is in a cloud-synced folder and adjust retry budget
+	// Sync clients hold uploaded files briefly, so give access-denied publication a few
+	// more polls inside a synced folder; other paths keep the strict default budget.
 	const cloudSyncService = detectCloudSyncPath(lockPath);
-	const maxAccessDeniedPublicationAttempts = cloudSyncService
-		? MAX_ACCESS_DENIED_PUBLICATION_ACQUISITION_ATTEMPTS + 3 // Allow 5 total attempts for cloud-sync paths
-		: MAX_ACCESS_DENIED_PUBLICATION_ACQUISITION_ATTEMPTS; // Default 2 attempts
-
-	// Emit one-time warning for cloud-synced paths
-	if (cloudSyncService) {
-		emitCloudSyncWarningOnce(lockPath, cloudSyncService);
-	}
+	const maxAccessDeniedPublicationAttempts =
+		MAX_ACCESS_DENIED_PUBLICATION_ACQUISITION_ATTEMPTS +
+		(cloudSyncService ? CLOUD_SYNC_EXTRA_ACCESS_DENIED_ATTEMPTS : 0);
+	if (cloudSyncService) emitCloudSyncWarningOnce(lockPath, cloudSyncService);
 	let attemptsMade = 0;
 	let attemptBudget = opts.retries;
 	let recoveryExtensions = 0;
