@@ -4729,6 +4729,11 @@ describe("openai-codex streaming", () => {
 			lastInputItems: 1,
 			lastDeltaInputItems: 1,
 			lastPreviousResponseId: "resp_1",
+			lastTurn: {
+				request: {
+					canAppendBeforeRequest: true,
+				},
+			},
 		});
 	});
 
@@ -5049,6 +5054,11 @@ describe("openai-codex streaming", () => {
 			lastInputItems: (retryInput as unknown[]).length,
 			lastDeltaInputItems: undefined,
 			lastPreviousResponseId: undefined,
+			lastTurn: {
+				request: {
+					canAppendBeforeRequest: false,
+				},
+			},
 		});
 	});
 
@@ -8573,5 +8583,93 @@ describe("openai-codex streaming", () => {
 		expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
 		expect(events.filter(event => event.type === "toolcall_end")).toHaveLength(1);
 		expect(JSON.stringify(events)).not.toContain("abandoned");
+	});
+
+	it.each([
+		"closed",
+		"idle",
+		"token-refresh",
+	] as const)("replays the full transcript instead of a delta when the websocket reconnects (%s)", async mode => {
+		const tempDir = trackedTempDir("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sockets: MockWebSocket[] = [];
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		class ReconnectWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				sockets.push(this);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				const index = sentRequests.length;
+				this.emitCodexResponse({
+					messageId: `msg_${index}`,
+					responseId: `resp_${index}`,
+					text: `Answer ${index}`,
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+		global.WebSocket = ReconnectWebSocket as unknown as typeof WebSocket;
+		global.fetch = fetchMock as unknown as typeof fetch;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			sessionId: `ws-reconnect-${mode}`,
+			providerSessionState,
+		};
+		const context: Context = {
+			messages: [{ role: "user", content: "Remember the original question", timestamp: Date.now() }],
+		};
+		try {
+			const first = await streamOpenAICodexResponses(model, context, options).result();
+			expect(first.stopReason).toBe("stop");
+			context.messages.push(first, { role: "user", content: "Continue", timestamp: Date.now() + 1 });
+			if (mode === "closed") {
+				sockets[0]!.close();
+			} else if (mode === "idle") {
+				vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+			} else if (mode === "token-refresh") {
+				options.apiKey = options.apiKey.replace("aaa.", "refreshed.");
+			}
+			const observedPayloads: Array<Record<string, unknown>> = [];
+			const second = await streamOpenAICodexResponses(model, context, {
+				...options,
+				onPayload: payload => {
+					observedPayloads.push(structuredClone(payload as Record<string, unknown>));
+					return undefined;
+				},
+			}).result();
+			expect(second.stopReason).toBe("stop");
+			expect(sockets).toHaveLength(2);
+			expect(observedPayloads[0]?.previous_response_id).toBeUndefined();
+			expect(sentRequests[1]?.previous_response_id).toBeUndefined();
+			const replayedInput = JSON.stringify(sentRequests[1]?.input);
+			expect(replayedInput).toContain("Remember the original question");
+			expect(replayedInput).toContain("Continue");
+
+			const statsAfterReconnect = getOpenAICodexWebSocketDebugStats(model, options);
+			expect(statsAfterReconnect?.fullContextRequests).toBe(2);
+			expect(statsAfterReconnect?.deltaRequests).toBe(0);
+			expect(statsAfterReconnect?.lastTurn?.request.canAppendBeforeRequest).toBe(false);
+
+			context.messages.push(second, { role: "user", content: "Follow up", timestamp: Date.now() + 2 });
+			const third = await streamOpenAICodexResponses(model, context, options).result();
+			expect(third.stopReason).toBe("stop");
+			expect(sockets).toHaveLength(2);
+			expect(sentRequests[2]?.previous_response_id).toBe("resp_2");
+			const deltaInput = JSON.stringify(sentRequests[2]?.input);
+			expect(deltaInput).toContain("Follow up");
+			expect(deltaInput).not.toContain("Remember the original question");
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
 	});
 });
