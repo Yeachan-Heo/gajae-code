@@ -1028,7 +1028,9 @@ describe("OpenAI-family first-event timeouts", () => {
 	it("normalizes an Alibaba responses SDK setup timeout as a typed first-event timeout", async () => {
 		vi.useFakeTimers();
 		let fetchAttempts = 0;
-		const delayedFetch = createDelayedFetch(700_000, createOpenAIResponsesSuccessResponse);
+		// The Alibaba 600s first-event floor is below the 900s default idle window,
+		// which the first-event window never undershoots, so setup is bounded at 900s.
+		const delayedFetch = createDelayedFetch(1_000_000, createOpenAIResponsesSuccessResponse);
 		global.fetch = Object.assign(
 			async (input: string | URL | Request, init?: RequestInit) => {
 				fetchAttempts++;
@@ -1042,7 +1044,7 @@ describe("OpenAI-family first-event timeouts", () => {
 			requestMaxRetries: 0,
 		}).result();
 		await flushMicrotasks();
-		vi.advanceTimersByTime(600_000);
+		vi.advanceTimersByTime(900_000);
 		await flushMicrotasks(100);
 		const result = await pending;
 
