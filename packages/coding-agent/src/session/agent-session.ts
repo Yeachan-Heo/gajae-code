@@ -19146,14 +19146,30 @@ export class AgentSession {
 			],
 			clearContext: () => this.clearContext(),
 			shutdown: () => {
-				void this.dispose().catch(error => {
-					if (!isSessionDisposalIncompleteError(error)) {
-						logger.warn("SDK shutdown: session disposal failed", { error: String(error) });
+				(async () => {
+					try {
+						// Wait for bounded disposal with hard outer cap. The dispose() method itself
+						// enforces a deadline (SIGNAL_TEARDOWN_TIMEOUT_MS = 5s) for internal steps,
+						// including browser tab release. Add a hard outer cap beyond that to ensure
+						// shutdown can never hang indefinitely.
+						const hardCapMs = SIGNAL_TEARDOWN_TIMEOUT_MS + 2_000;
+						const shutdownDeadline = new Promise<never>((_, reject) =>
+							setTimeout(
+								() => reject(new Error("SDK shutdown deadline exceeded")),
+								hardCapMs,
+							),
+						);
+						await Promise.race([this.dispose(), shutdownDeadline]);
+					} catch (error) {
+						if (!isSessionDisposalIncompleteError(error)) {
+							logger.warn("SDK shutdown: session disposal failed", { error: String(error) });
+						}
+						// SessionDisposalIncompleteError is expected and logged during dispose.
+						// Proceed with process exit regardless.
+					} finally {
+						process.exit(0);
 					}
-					// SessionDisposalIncompleteError is expected and logged during dispose.
-					// Proceed with process exit regardless.
-				});
-				process.exit(0);
+				})();
 			},
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
 			getContextUsage: () => this.getContextUsage(),
