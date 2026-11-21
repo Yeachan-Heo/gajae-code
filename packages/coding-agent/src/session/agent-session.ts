@@ -13355,7 +13355,11 @@ export class AgentSession {
 		this.#unregisterMovePublicationListener = undefined;
 		this.#unregisterAfterMoveListener?.();
 		this.#unregisterAfterMoveListener = undefined;
-		await awaitDisposeStep("browser tab release", releaseTabsForOwner(this.sessionManager.getSessionId()), true);
+		await awaitDisposeStep(
+			"browser tab release",
+			releaseTabsForOwner(this.sessionManager.getSessionId(), { deadlineAt: this.#disposeDeadline }),
+			true,
+		);
 		const pythonExecutionsSettled = await awaitDisposeStep(
 			"Python execution preparation",
 			this.#prepareEvalExecutionsForDispose(),
@@ -19137,7 +19141,13 @@ export class AgentSession {
 			],
 			clearContext: () => this.clearContext(),
 			shutdown: () => {
-				void this.dispose();
+				void this.dispose().catch(error => {
+					if (!isSessionDisposalIncompleteError(error)) {
+						logger.warn("SDK shutdown: session disposal failed", { error: String(error) });
+					}
+					// SessionDisposalIncompleteError is expected and logged during dispose.
+					// Proceed with process exit regardless.
+				});
 				process.exit(0);
 			},
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
