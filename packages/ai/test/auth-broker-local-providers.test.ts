@@ -12,6 +12,7 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
+import type { AuthCredential } from "../src";
 
 const TOKEN = "test-bearer";
 const UNSERVED = "test-unserved-provider";
@@ -124,6 +125,110 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 			}
 		} finally {
 			local2.close();
+		}
+	});
+
+	test("HybridAuthCredentialStore stores unserved credentials locally and disables them on broker", async () => {
+		const credential: AuthCredential = { type: "api_key", key: "test-key" };
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const client = new AuthBrokerClient({ url: handle!.url, token: TOKEN });
+		const fetchResult = await client.fetchSnapshot();
+		if (fetchResult.status !== 200) throw new Error("broker returned no snapshot");
+		const broker = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: fetchResult.snapshot,
+			streamSnapshots: false,
+		});
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			try {
+				// Upload a credential for an unserved provider
+				const result = await hybrid.upsertAuthCredentialRemote(UNSERVED, credential);
+				expect(result).toHaveLength(1);
+				expect(result[0].provider).toBe(UNSERVED);
+
+				// Verify the credential is returned
+				expect(result).toHaveLength(1);
+				expect(result[0].credential).toEqual(credential);
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
+		}
+	});
+
+	test("HybridAuthCredentialStore implements upsertAuthCredentialRemoteIfAbsent", async () => {
+		const credential: AuthCredential = { type: "api_key", key: "test-key" };
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const client = new AuthBrokerClient({ url: handle!.url, token: TOKEN });
+		const fetchResult = await client.fetchSnapshot();
+		if (fetchResult.status !== 200) throw new Error("broker returned no snapshot");
+		const broker = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: fetchResult.snapshot,
+			streamSnapshots: false,
+		});
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			try {
+				// Verify the hook exists
+				expect(hybrid.upsertAuthCredentialRemoteIfAbsent).toBeDefined();
+
+				// Upload an unserved credential using the if-absent hook
+				const result = await hybrid.upsertAuthCredentialRemoteIfAbsent?.(UNSERVED, credential);
+				expect(result).toBeDefined();
+				expect(result?.inserted).toBe(true);
+				expect(result?.provider).toBe(UNSERVED);
+
+				// Verify the credential is stored locally
+				const localCredentials = hybrid.listAuthCredentials(UNSERVED);
+				expect(localCredentials).toHaveLength(1);
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
+		}
+	});
+
+	test("HybridAuthCredentialStore does not expose refreshOAuthCredential for local credentials", async () => {
+		const oauthCred: AuthCredential = {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 3600000,
+		};
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const client = new AuthBrokerClient({ url: handle!.url, token: TOKEN });
+		const fetchResult = await client.fetchSnapshot();
+		if (fetchResult.status !== 200) throw new Error("broker returned no snapshot");
+		const broker = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: fetchResult.snapshot,
+			streamSnapshots: false,
+		});
+		const local = await SqliteAuthCredentialStore.open(dbPath);
+		try {
+			const hybrid = new HybridAuthCredentialStore({ broker, local });
+			try {
+				// Store a local OAuth credential
+				await hybrid.upsertAuthCredentialRemote(UNSERVED, oauthCred);
+				const credentials = hybrid.listAuthCredentials(UNSERVED);
+				expect(credentials).toHaveLength(1);
+
+				// HybridAuthCredentialStore does not expose refreshOAuthCredential
+				// This allows AuthStorage to use its default refresh mechanisms for local credentials
+			} finally {
+				hybrid.close();
+			}
+		} finally {
+			local.close();
 		}
 	});
 

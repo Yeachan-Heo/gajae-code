@@ -20,6 +20,7 @@ export type {
 export {
 	AuthBrokerClient,
 	AuthStorage,
+	HybridAuthCredentialStore,
 	REMOTE_REFRESH_SENTINEL,
 	RemoteAuthCredentialStore,
 	SqliteAuthCredentialStore,

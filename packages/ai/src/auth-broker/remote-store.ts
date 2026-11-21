@@ -73,10 +73,12 @@ export interface CredentialInventoryMetadataState {
  */
 export class AuthBrokerUnservedProviderError extends Error {
 	readonly provider: string;
-	constructor(provider: string) {
+	readonly unservedEntries?: readonly AuthCredentialSnapshotEntry[];
+	constructor(provider: string, unservedEntries?: readonly AuthCredentialSnapshotEntry[]) {
 		super(`The auth broker stored the ${provider} credential but does not serve it back`);
 		this.name = "AuthBrokerUnservedProviderError";
 		this.provider = provider;
+		this.unservedEntries = unservedEntries;
 	}
 }
 
@@ -1066,7 +1068,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (uploaded.length === 0) return;
 		const served = new Set(this.#snapshot.credentials.map(entry => entry.id));
 		if (uploaded.some(entry => served.has(entry.id))) return;
-		throw new AuthBrokerUnservedProviderError(provider);
+		throw new AuthBrokerUnservedProviderError(provider, uploaded);
 	}
 
 	/**

@@ -21,11 +21,9 @@ import type {
 	AuthCredential,
 	AuthCredentialIfAbsentResult,
 	AuthCredentialStore,
-	OAuthCredential,
 	SqliteAuthCredentialStore,
 	StoredAuthCredential,
 } from "../auth-storage";
-import type { Provider } from "../types";
 import type { RemoteAuthCredentialStore } from "./remote-store";
 import { AuthBrokerUnservedProviderError } from "./remote-store";
 
@@ -144,6 +142,7 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.replaceAuthCredentialsRemote(provider, credentials);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
+					await this.#disableUnservedEntries(error.unservedEntries);
 					this.#keepLocal(provider);
 					this.#local.replaceAuthCredentialsForProvider(provider, credentials);
 					return this.listAuthCredentials(provider);
@@ -161,6 +160,7 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.upsertAuthCredentialRemote(provider, credential);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
+					await this.#disableUnservedEntries(error.unservedEntries);
 					this.#keepLocal(provider);
 					this.#local.upsertAuthCredentialForProvider(provider, credential);
 					return this.listAuthCredentials(provider);
@@ -176,6 +176,10 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		if (!this.#localProviders.has(provider)) {
 			await this.#broker.deleteAuthCredentialsRemote(provider, disabledCause);
 		} else {
+			// For local providers, also try to disable any hidden broker-side credentials
+			// that were accepted but never served back (unserved credentials).
+			// This prevents them from resurfacing if the broker later serves the provider.
+			await this.#disableBrokerCredentialsForProvider(provider, disabledCause);
 			this.#local.deleteAuthCredentialsForProvider(provider, disabledCause);
 			this.#returnToBrokerIfEmpty(provider);
 		}
@@ -196,6 +200,25 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
 	}
 
+	async upsertAuthCredentialRemoteIfAbsent?(
+		provider: string,
+		credential: AuthCredential,
+	): Promise<AuthCredentialIfAbsentResult> {
+		if (!this.#localProviders.has(provider)) {
+			try {
+				return await this.#broker.upsertAuthCredentialRemoteIfAbsent(provider, credential);
+			} catch (error) {
+				if (error instanceof AuthBrokerUnservedProviderError) {
+					await this.#disableUnservedEntries(error.unservedEntries);
+					this.#keepLocal(provider);
+					return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+				}
+				throw error;
+			}
+		}
+		return this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+	}
+
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
 		if (!this.#localProviders.has(provider)) {
 			this.#broker.deleteAuthCredentialsForProvider(provider, disabledCause);
@@ -205,7 +228,7 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
-	getCache(key: string, options?: { includeExpired?: boolean }): string | null {
+	getCache(key: string, _options?: { includeExpired?: boolean }): string | null {
 		return this.#broker.getCache(key);
 	}
 
@@ -227,20 +250,11 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		return this.#broker.allocateMonotonicSequence(key, expiresAtSec);
 	}
 
-	refreshOAuthCredential?(
-		provider: Provider,
-		credentialId: number,
-		credential: OAuthCredential,
-		signal?: AbortSignal,
-	): Promise<import("../utils/oauth/types").OAuthCredentials> {
-		if (isLocalId(credentialId)) {
-			return Promise.reject(new Error("Local credentials cannot be refreshed"));
-		}
-		return (
-			this.#broker.refreshOAuthCredential?.(provider, credentialId, credential, signal) ??
-			Promise.reject(new Error("Refresh not supported"))
-		);
-	}
+	// Note: refreshOAuthCredential is intentionally not exposed from HybridAuthCredentialStore.
+	// Local credentials can't be refreshed through the broker. Broker credentials that are
+	// visible in the snapshot will be refreshed through the local mechanism, which is correct
+	// because they're read-only on the client anyway. Credentials that disappear from the
+	// snapshot due to unserved transitions are properly handled by the fallback to local storage.
 
 	fetchUsageReports(signal?: AbortSignal): Promise<import("../usage").UsageReport[] | null> {
 		return this.#broker.fetchUsageReports?.(signal) ?? Promise.resolve(null);
@@ -265,6 +279,48 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		if (this.#local.listAuthCredentials(provider).length > 0) return;
 		this.#local.unmarkBrokerLocalProvider(provider);
 		this.#localProviders.delete(provider);
+	}
+
+	/** Disable credentials that were accepted by the broker but not served back (unserved). */
+	async #disableUnservedEntries(
+		entries: readonly import("../auth-storage").AuthCredentialSnapshotEntry[] | undefined,
+	): Promise<void> {
+		if (!entries || entries.length === 0) return;
+		// Group entries by provider for efficient batch disable
+		const entriesByProvider = new Map<string, number[]>();
+		for (const entry of entries) {
+			const ids = entriesByProvider.get(entry.provider) ?? [];
+			ids.push(entry.id);
+			entriesByProvider.set(entry.provider, ids);
+		}
+		// Disable via deleteAuthCredentialsRemote for each provider, which handles the batch disable
+		for (const [provider] of entriesByProvider) {
+			try {
+				await this.#broker.deleteAuthCredentialsRemote(provider, "auth-broker-no-serve");
+			} catch (error) {
+				// Log but don't throw - the credentials are already not being served
+				logger.warn("Failed to disable unserved credentials for provider", {
+					provider,
+					error: String(error),
+				});
+			}
+		}
+	}
+
+	/** Disable any broker-side credentials for a local provider before logging out. */
+	async #disableBrokerCredentialsForProvider(provider: string, disabledCause: string): Promise<void> {
+		// Try to find and disable any credentials for this provider that may still exist on the broker
+		// but are not visible to us (they might be unserved from before).
+		if (!this.#broker.deleteAuthCredentialsRemote) return;
+		try {
+			await this.#broker.deleteAuthCredentialsRemote(provider, disabledCause);
+		} catch (error) {
+			// Log but don't throw - this is best-effort cleanup
+			logger.debug("Failed to disable broker credentials for local provider on logout", {
+				provider,
+				error: String(error),
+			});
+		}
 	}
 
 	onSnapshotChangedListener?: () => void;

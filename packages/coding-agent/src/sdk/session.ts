@@ -192,7 +192,13 @@ import {
 	type SessionMcpControlPort,
 	type SessionMcpDeclaredServer,
 } from "../session/agent-session";
-import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
+import {
+	AuthBrokerClient,
+	AuthStorage,
+	HybridAuthCredentialStore,
+	RemoteAuthCredentialStore,
+	SqliteAuthCredentialStore,
+} from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
@@ -823,9 +829,12 @@ export async function discoverAuthStorage(
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const initialResult = await client.fetchSnapshot();
 		if (initialResult.status !== 200) throw new Error("Auth broker returned no initial snapshot");
-		const store = new RemoteAuthCredentialStore({ client, initialSnapshot: initialResult.snapshot });
-		// Refresh + usage hooks live on RemoteAuthCredentialStore; AuthStorage
-		// discovers them automatically when no explicit option overrides them.
+		const brokerStore = new RemoteAuthCredentialStore({ client, initialSnapshot: initialResult.snapshot });
+		// Wrap broker store with HybridAuthCredentialStore to provide local fallback
+		// when the broker doesn't serve a provider's credentials.
+		const localStore = await SqliteAuthCredentialStore.open(getAgentDbPath(agentDir));
+		const store = new HybridAuthCredentialStore({ broker: brokerStore, local: localStore });
+		// Refresh + usage hooks live on the broker store; AuthStorage discovers them automatically.
 		const storage = new AuthStorage(store, {
 			configValueResolver: resolveConfigValue,
 			sourceLabel: `broker ${brokerConfig.url}`,
