@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
-import { type FetchWithRetryOptions, fetchWithRetry } from "../src/fetch-retry";
+import { extractRetryHint, type FetchWithRetryOptions, fetchWithRetry } from "../src/fetch-retry";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -435,5 +435,22 @@ describe("fetchWithRetry", () => {
 		expect(response.status).toBe(200);
 		expect(waitSpy).toHaveBeenCalledTimes(1);
 		expect(waitSpy).toHaveBeenCalledWith(maxTimerDelayMs, { signal: undefined });
+	});
+});
+
+describe("extractRetryHint", () => {
+	it("honors a millisecond quotaResetDelay", () => {
+		// Floor Google's fractional metadata to whole milliseconds.
+		expect(extractRetryHint(undefined, '{"metadata":{"quotaResetDelay":"835.150299ms"}}')).toBe(835);
+	});
+
+	it.each([
+		["30m", 1_800_000],
+		["1h", 3_600_000],
+		["1.5h", 5_400_000],
+		["1h30m", 5_400_000],
+	])("prefers structured quotaResetDelay %s to earlier display text", (quotaResetDelay, expected) => {
+		const body = `Cloud Code Assist API error (429): {"error":{"status":"RESOURCE_EXHAUSTED","message":"Resource exhausted"},"metadata":{"quotaResetDelay":"${quotaResetDelay}"}}`;
+		expect(extractRetryHint(undefined, body)).toBe(expected);
 	});
 });
