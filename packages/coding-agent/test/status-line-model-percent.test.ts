@@ -13,6 +13,7 @@ function makeCtx(overrides: Partial<SegmentContext> = {}): SegmentContext {
 				thinkingLevel: ThinkingLevel.High,
 			},
 			isFastModeActive: () => false,
+			isUltrafastActive: () => false,
 			getUnavailableModelProfile: () => undefined,
 		} as unknown as SegmentContext["session"],
 		width: 120,

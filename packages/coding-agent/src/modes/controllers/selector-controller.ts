@@ -2002,6 +2002,11 @@ export class SelectorController {
 					isFastForSubagentProvider: (provider, supportsServiceTier) =>
 						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
+					isUltrafastForProvider: (provider, supportsUltrafastTier) =>
+						this.ctx.session.isUltrafastForProvider(provider, supportsUltrafastTier),
+					isUltrafastForSubagentProvider: (provider, supportsUltrafastTier) =>
+						this.ctx.session.isUltrafastForSubagentProvider(provider, supportsUltrafastTier),
+					isCurrentModelUltrafastActive: () => this.ctx.session.isUltrafastActive(),
 					smartRoutingPreview: draft => this.previewSmartRouting(draft),
 					smartRoutingDiscardPreview: preview => this.#smartRouting.discardPreview(preview),
 					smartRoutingStateUnknown: () => this.#smartRouting.stateUnknown,

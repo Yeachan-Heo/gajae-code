@@ -5,6 +5,7 @@ import {
 	getSupportedEfforts,
 	type Model,
 	modelSupportsServiceTier,
+	modelSupportsUltrafastTier,
 	modelsAreEqual,
 } from "@gajae-code/ai/core";
 import {
@@ -565,6 +566,9 @@ export class ModelSelectorComponent extends Container {
 	#isFastForProvider: (provider?: string, supportsServiceTier?: boolean) => boolean = () => false;
 	#isFastForSubagentProvider: (provider?: string, supportsServiceTier?: boolean) => boolean = () => false;
 	#isCurrentModelFastModeActive: () => boolean = () => false;
+	#isUltrafastForProvider: (provider?: string, supportsUltrafastTier?: boolean) => boolean = () => false;
+	#isUltrafastForSubagentProvider: (provider?: string, supportsUltrafastTier?: boolean) => boolean = () => false;
+	#isCurrentModelUltrafastActive: () => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
@@ -629,6 +633,9 @@ export class ModelSelectorComponent extends Container {
 			isFastForProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
 			isFastForSubagentProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
 			isCurrentModelFastModeActive?: () => boolean;
+			isUltrafastForProvider?: (provider?: string, supportsUltrafastTier?: boolean) => boolean;
+			isUltrafastForSubagentProvider?: (provider?: string, supportsUltrafastTier?: boolean) => boolean;
+			isCurrentModelUltrafastActive?: () => boolean;
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
@@ -665,6 +672,17 @@ export class ModelSelectorComponent extends Container {
 		this.#configuredDefaultChain = options?.configuredDefaultChain;
 		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
 		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
+		this.#isUltrafastForProvider = options?.isUltrafastForProvider ?? (() => false);
+		this.#isUltrafastForSubagentProvider = options?.isUltrafastForSubagentProvider ?? (() => false);
+		this.#isCurrentModelUltrafastActive =
+			options?.isCurrentModelUltrafastActive ??
+			(() =>
+				this.#currentModel
+					? this.#isUltrafastForProvider(
+							this.#currentModel.provider,
+							modelSupportsUltrafastTier(this.#currentModel),
+						)
+					: false);
 		// Current-model EFFECTIVE fast state. Defaults to intent for the current
 		// model so existing callers/tests keep prior behavior; production wires the
 		// session's effective predicate so an auto-disabled provider shows no glyph.
@@ -2375,15 +2393,21 @@ export class ModelSelectorComponent extends Container {
 					const isSubagentRole = roleInfo.settingsPath === "task.agentModelOverrides";
 					const isCurrentRow = this.#currentModel !== undefined && modelsAreEqual(this.#currentModel, item.model);
 					const supportsServiceTier = modelSupportsServiceTier(assigned.model);
+					const supportsUltrafastTier = modelSupportsUltrafastTier(assigned.model);
+					const roleUltrafast = isSubagentRole
+						? this.#isUltrafastForSubagentProvider(assigned.model.provider, supportsUltrafastTier)
+						: isCurrentRow
+							? this.#isCurrentModelUltrafastActive()
+							: this.#isUltrafastForProvider(assigned.model.provider, supportsUltrafastTier);
 					const roleFast = isSubagentRole
 						? this.#isFastForSubagentProvider(assigned.model.provider, supportsServiceTier)
 						: isCurrentRow
 							? this.#isCurrentModelFastModeActive()
 							: this.#isFastForProvider(assigned.model.provider, supportsServiceTier);
-					if (roleFast && isCurrentRow && !isSubagentRole) {
+					if ((roleUltrafast || roleFast) && isCurrentRow && !isSubagentRole) {
 						currentModelEffectiveGlyphRendered = true;
 					}
-					const fastSuffix = roleFast ? ` ${theme.icon.fast}` : "";
+					const fastSuffix = roleUltrafast ? ` ${theme.icon.ultrafast}` : roleFast ? ` ${theme.icon.fast}` : "";
 					roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}${fastSuffix}`);
 				}
 			}
@@ -2394,10 +2418,13 @@ export class ModelSelectorComponent extends Container {
 			if (
 				!currentModelEffectiveGlyphRendered &&
 				this.#currentModel !== undefined &&
-				modelsAreEqual(this.#currentModel, item.model) &&
-				this.#isCurrentModelFastModeActive()
+				modelsAreEqual(this.#currentModel, item.model)
 			) {
-				roleBadgeTokens.push(theme.icon.fast);
+				if (this.#isCurrentModelUltrafastActive()) {
+					roleBadgeTokens.push(theme.icon.ultrafast);
+				} else if (this.#isCurrentModelFastModeActive()) {
+					roleBadgeTokens.push(theme.icon.fast);
+				}
 			}
 			const billingLabel = this.#billingPathForModel(item.model)?.label;
 			if (billingLabel) roleBadgeTokens.push(theme.fg("warning", `[${billingLabel}]`));

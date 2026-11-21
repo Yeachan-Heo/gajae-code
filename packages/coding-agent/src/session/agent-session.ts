@@ -131,8 +131,10 @@ import {
 	isUsageLimitError,
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
+	modelSupportsUltrafastTier,
 	modelsAreEqual,
 	resolveOAuthStorageProvider,
+	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { clearAnthropicFastModeFallback, normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
@@ -26871,6 +26873,27 @@ export class AgentSession {
 	}
 
 	/**
+	 * True when the ultrafast tier is realized as an ultrafast-tier request on the provider's
+	 * wire protocol. This is the pure intent (what the user configured) for the given provider,
+	 * independent of whether the current model's provider matches.
+	 */
+	isUltrafastForProvider(provider?: string, supportsUltrafastTier = false): boolean {
+		const resolved = resolveServiceTier(this.serviceTier, provider);
+		if (resolved !== "ultrafast") return false;
+		return provider === "openai" || provider === "openai-codex" || supportsUltrafastTier;
+	}
+
+	/**
+	 * Ultrafast for subagent-scoped service tier (e.g. when checking a role model's tier).
+	 * See {@link isFastForSubagentProvider} for context.
+	 */
+	isUltrafastForSubagentProvider(provider?: string, supportsUltrafastTier = false): boolean {
+		const resolved = resolveServiceTier(this.#subagentServiceTier(), provider);
+		if (resolved !== "ultrafast") return false;
+		return provider === "openai" || provider === "openai-codex" || supportsUltrafastTier;
+	}
+
+	/**
 	 * Provider/API-session key used to scope the fast-mode auto-disable marker.
 	 * Mirrors the provider's own per-session `fastModeDisabled` scope (the key in
 	 * {@link #providerSessionState} cleared by `clearAnthropicFastModeFallback`),
@@ -26925,6 +26948,12 @@ export class AgentSession {
 		return (
 			this.isFastForProvider(provider, supportsServiceTier) && !this.#isFastModeAutoDisabledForProvider(provider)
 		);
+	}
+
+	/** True when the current model supports the configured ultrafast service tier. */
+	isUltrafastActive(): boolean {
+		const provider = this.model?.provider;
+		return resolveServiceTier(this.serviceTier, provider) === "ultrafast" && modelSupportsUltrafastTier(this.model);
 	}
 
 	async setServiceTier(serviceTier: ServiceTier | undefined): Promise<void> {
