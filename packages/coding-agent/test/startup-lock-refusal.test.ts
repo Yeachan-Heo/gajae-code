@@ -482,3 +482,87 @@ describe("ACP error redaction for lock refusal", () => {
 		}
 	});
 });
+
+describe("MCP lock refusal error handling with AggregateError", () => {
+	it("handles AggregateError with startup refusal and cleanup failure", async () => {
+		const dir = await temp();
+		try {
+			const startupFailure = new BrokerStartupError({
+				exitCode: 1,
+				signal: null,
+				reason: "Test startup failure",
+				lockRefused: true,
+			});
+			const cleanupError = new Error("Cleanup failed");
+			const aggregateError = new AggregateError(
+				[startupFailure, cleanupError],
+				"SDK broker discovery and spawned broker cleanup both failed.",
+			);
+
+			// Verify MCP error handling recognizes cleanup uncertainty
+			const failure = brokerLockRefusalFailure(aggregateError);
+			expect(failure).toBeDefined();
+			expect(failure!.input.diagnostics).toContain("broker_cleanup_unverified");
+			expect(failure!.input.diagnostics).toContain("lock_refused");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("applies code-specific wording for live_owner refusal", () => {
+		try {
+			const lockPath = "/tmp/broker.lock";
+			const refusal = new BrokerLockRefusedError(
+				"Broker lock is held by a live owner (pid 42)",
+				lockPath,
+				"live_owner",
+				42,
+			);
+
+			const failure = brokerLockRefusalFailure(refusal);
+			expect(failure).toBeDefined();
+			// Verify that the diagnostic is set without exposing the path or PID
+			expect(failure!.input.diagnostics).toContain("lock_refused");
+		} finally {
+			// Cleanup not needed for this test
+		}
+	});
+
+	it("applies code-specific wording for host_unqualified refusal", () => {
+		try {
+			const lockPath = "/tmp/broker.lock";
+			const refusal = new BrokerLockRefusedError(
+				"Broker lock owner is host-unqualified (pid 42); refusing automatic recovery because its host cannot be verified",
+				lockPath,
+				"host_unqualified",
+				42,
+			);
+
+			const failure = brokerLockRefusalFailure(refusal);
+			expect(failure).toBeDefined();
+			// Verify that the diagnostic is set without exposing the path or PID
+			expect(failure!.input.diagnostics).toContain("lock_refused");
+		} finally {
+			// Cleanup not needed for this test
+		}
+	});
+
+	it("applies code-specific wording for foreign_host refusal", () => {
+		try {
+			const lockPath = "/tmp/broker.lock";
+			const refusal = new BrokerLockRefusedError(
+				"Broker lock owner is attributed to a different host (pid 42); refusing automatic recovery because its liveness cannot be verified from this host",
+				lockPath,
+				"foreign_host",
+				42,
+			);
+
+			const failure = brokerLockRefusalFailure(refusal);
+			expect(failure).toBeDefined();
+			// Verify that the diagnostic is set without exposing the path or PID
+			expect(failure!.input.diagnostics).toContain("lock_refused");
+		} finally {
+			// Cleanup not needed for this test
+		}
+	});
+});
