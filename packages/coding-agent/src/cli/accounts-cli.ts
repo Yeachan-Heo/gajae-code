@@ -313,9 +313,11 @@ function parsePreferArgument(raw: string): { account: string; cap: number | unde
 }
 
 /**
- * Portable config text for a resolved OAuth row: its email, else its account id, else its organization id, whichever no
- * other OAuth row of the provider shares (one login signed in to several organizations shares email and account id
- * across those rows). Numeric row ids are never persisted as preferences; a row with no unique value is refused.
+ * Portable config text for a resolved active OAuth row: its email, else its account id, else its organization id.
+ * Email and account id must be unique among OAuth rows that expose those fields, including disabled rows: a later
+ * login could otherwise retarget the preference to the first match. Metadata-only disabled rows from an auth broker
+ * do not expose either field. An organization id only needs to be unique among active OAuth rows, because the runtime
+ * skips the preference if the id becomes ambiguous. Numeric row ids are never persisted.
  * Each candidate text is written only when {@link parsePreferenceAccount} reads it back as the same selector, so a
  * successful write neither fails the next startup nor retargets the row: the email is written bare when that
  * round-trips, else as `email:<address>` (an address such as `account:team@example.com` would otherwise parse as an
@@ -340,7 +342,8 @@ function portablePreferenceAccount(
 	const organizationId = row.organizationId?.trim().toLowerCase();
 	if (
 		organizationId &&
-		oauthRows.filter(other => other.organizationId?.trim().toLowerCase() === organizationId).length === 1
+		oauthRows.filter(other => !other.disabled && other.organizationId?.trim().toLowerCase() === organizationId)
+			.length === 1
 	) {
 		const value = row.organizationId!.trim();
 		const written = `org:${value}`;

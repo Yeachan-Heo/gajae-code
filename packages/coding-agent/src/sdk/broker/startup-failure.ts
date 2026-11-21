@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { BROKER_LOCK_REFUSAL_CODES, type BrokerLockRefusalCode } from "./lock-refusal";
 import { processIncarnation } from "./process-incarnation";
 
 export interface BrokerStartupFailureMarker {
@@ -9,6 +10,11 @@ export interface BrokerStartupFailureMarker {
 	reason: string;
 	/** Validated manual lock cleanup command, stored separately when it cannot fit in `reason`. */
 	cleanupCommand?: string;
+	/**
+	 * Set only when startup failed with a `BrokerLockRefusedError`. It carries the refusal
+	 * when the typed startup-exit record could not be published.
+	 */
+	lockRefusalCode?: BrokerLockRefusalCode;
 	exitCode: number | null;
 	signal: string | null;
 	writtenAt: number;
@@ -23,6 +29,12 @@ export interface BrokerStartupFailureMarker {
 	pid: number;
 	/** Kernel-derived identity for the exact process incarnation that wrote the marker. */
 	incarnation: string;
+	/**
+	 * Nonce generated per spawn attempt to bind refusal records to this specific spawn.
+	 * Prevents false attribution when a foreign broker with a colliding PID writes a
+	 * marker in a shared agent directory.
+	 */
+	spawnAttemptNonce?: string;
 }
 
 const BROKER_STARTUP_FAILURE_FILE = "broker.startup-failure.json";
@@ -103,22 +115,28 @@ export function brokerStartupFailureCleanupTargetsLock(
 	return decodeFileLockCleanupCommand(marker.reason.slice(COMPACT_FILE_LOCK_CLEANUP_GUIDANCE.length)) === lockPath;
 }
 
-function boundedMarker(
-	reason: string,
-	exitCode: number | null,
-	signal: string | null,
-	pid: number,
-	incarnation: string,
-): BrokerStartupFailureMarker {
-	const boundedFailure = boundedFailureDetails(reason);
+export type BrokerStartupFailure = {
+	reason: string;
+	exitCode: number | null;
+	signal: string | null;
+	pid: number;
+	incarnation?: string;
+	lockRefusalCode?: BrokerLockRefusalCode;
+	spawnAttemptNonce?: string;
+};
+
+function boundedMarker(failure: BrokerStartupFailure, incarnation: string): BrokerStartupFailureMarker {
+	const { reason, exitCode, signal, pid, lockRefusalCode, spawnAttemptNonce } = failure;
 	return {
 		version: 2,
-		...boundedFailure,
+		...boundedFailureDetails(reason),
+		...(lockRefusalCode === undefined ? {} : { lockRefusalCode }),
 		exitCode,
 		signal,
 		writtenAt: Date.now(),
 		pid,
 		incarnation,
+		...(spawnAttemptNonce === undefined ? {} : { spawnAttemptNonce }),
 	};
 }
 
@@ -130,7 +148,7 @@ function boundedMarker(
  */
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
-	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
+	failure: BrokerStartupFailure,
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	let tempPath: string | undefined;
@@ -144,10 +162,7 @@ export async function writeBrokerStartupFailureMarker(
 		if (signal?.aborted) return false;
 
 		tempPath = path.join(markerDirectory, `.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`);
-		await Bun.write(
-			tempPath,
-			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid, incarnation)),
-		);
+		await Bun.write(tempPath, JSON.stringify(boundedMarker(failure, incarnation)));
 		if (signal?.aborted) return false;
 
 		// There must be no async gap between the cancellation check and publication:
@@ -182,6 +197,7 @@ export async function readBrokerStartupFailureMarker(
 				(typeof marker.cleanupCommand !== "string" ||
 					marker.reason !== COMPACT_FILE_LOCK_CLEANUP_GUIDANCE ||
 					decodeFileLockCleanupCommand(marker.cleanupCommand) === undefined)) ||
+			(marker.lockRefusalCode !== undefined && !BROKER_LOCK_REFUSAL_CODES.includes(marker.lockRefusalCode)) ||
 			(marker.exitCode !== null && typeof marker.exitCode !== "number") ||
 			(marker.signal !== null && typeof marker.signal !== "string") ||
 			typeof marker.writtenAt !== "number" ||
@@ -189,7 +205,8 @@ export async function readBrokerStartupFailureMarker(
 			!Number.isInteger(marker.pid) ||
 			marker.pid <= 0 ||
 			typeof marker.incarnation !== "string" ||
-			marker.incarnation.length === 0
+			marker.incarnation.length === 0 ||
+			(marker.spawnAttemptNonce !== undefined && typeof marker.spawnAttemptNonce !== "string")
 		)
 			return undefined;
 		return marker as BrokerStartupFailureMarker;
@@ -217,15 +234,45 @@ export class BrokerStartupError extends Error {
 	readonly signal: string | null;
 	readonly reason: string;
 	readonly stderrExcerpt?: string;
+	/** The broker's trusted startup-exit record or marker says it refused an existing `broker.lock`. */
+	readonly lockRefused: boolean;
+	/** The specific reason why the lock was refused, when available. */
+	readonly refusalCode?: BrokerLockRefusalCode;
+	/**
+	 * Detailed reason including lock paths and cleanup guidance, available only for local CLI output.
+	 * API-facing responses should use `reason` instead, which is path-free.
+	 */
+	readonly detailedReason?: string;
+	/**
+	 * Full stderr excerpt for local CLI output. API-facing responses should not expose this.
+	 * Only populated for lock refusal errors; otherwise stderrExcerpt is used.
+	 */
+	readonly detailedStderr?: string;
 
-	constructor(fields: { exitCode: number | null; signal: string | null; reason: string; stderrExcerpt?: string }) {
+	constructor(fields: {
+		exitCode: number | null;
+		signal: string | null;
+		reason: string;
+		stderrExcerpt?: string;
+		lockRefused?: boolean;
+		refusalCode?: BrokerLockRefusalCode;
+		detailedReason?: string;
+		detailedStderr?: string;
+	}) {
+		const isLockRefusal = fields.lockRefused ?? fields.refusalCode !== undefined;
+		// For lock refusal errors, don't include stderr in the API-facing error message
+		const messageStderr = isLockRefusal ? undefined : fields.stderrExcerpt;
 		super(
-			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${fields.stderrExcerpt ? ` Broker stderr: ${fields.stderrExcerpt}` : ""}`,
+			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${messageStderr ? ` Broker stderr: ${messageStderr}` : ""}`,
 		);
 		this.name = "BrokerStartupError";
 		this.exitCode = fields.exitCode;
 		this.signal = fields.signal;
 		this.reason = fields.reason;
 		this.stderrExcerpt = fields.stderrExcerpt;
+		this.lockRefused = isLockRefusal;
+		this.refusalCode = fields.refusalCode;
+		this.detailedReason = fields.detailedReason;
+		this.detailedStderr = fields.detailedStderr;
 	}
 }

@@ -415,7 +415,8 @@ export declare class Process {
    * Unlike [`Self::from_pid`] returning `null` (which conflates a confirmed-
    * dead pid with one that simply could not be queried), this keeps positive
    * OS-reported absence separate from every inconclusive outcome. It never
-   * signals, kills, reaps, waits on, or spawns any process.
+   * signals, kills, reaps, blocks waiting for, or spawns any process. Windows
+   * checks exit state with a zero-timeout wait on its own handle.
    */
   static observe(pid: number): NativeProcessObservation
   /** Operating-system process identifier for this process reference. */
@@ -2489,7 +2490,8 @@ export interface NativePermissionRepairResult {
  * - `"present"` — `incarnation` is the exact kernel-reported identity
  *   evidence.
  * - `"absent"` — the OS positively confirmed no process currently has this
- *   pid.
+ *   pid, or (Windows) that the process has exited while a handle still keeps
+ *   its object queryable.
  * - `"unknown"` — `reasonCode` explains why liveness could not be determined
  *   (e.g. an invalid pid, a permission denial, or a platform limitation); this
  *   is never proof of death.

@@ -3964,6 +3964,7 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the reasoning-content replay
 	// breaker below (DeepSeek "reasoning_content ... must be passed back").
 	let reasoningContentRepairAttempted = false;
+	let retriedMalformedVeniceCall = false;
 	// Consecutive resamples spent on the current turn because its tool arguments
 	// arrived `\uXXXX`-escaped. Reset once a turn gets past the check, so every
 	// turn is judged on its own wire bytes.
@@ -4146,9 +4147,14 @@ async function runLoopBody(
 			const wasEscapedNonAsciiRecoveryAttempt = recoveryAttempt?.kind === "escaped-nonascii";
 			try {
 				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
-					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
-					escapedNonAsciiToolChoice = config.getToolChoice?.();
-					escapedNonAsciiToolChoiceCaptured = true;
+					if (!escapedNonAsciiToolChoiceCaptured) {
+						escapedNonAsciiToolChoice = config.getToolChoice?.();
+						escapedNonAsciiToolChoiceCaptured = true;
+					}
+					const effectiveChoice = escapedNonAsciiToolChoice ?? config.toolChoice;
+					if (retriedMalformedVeniceCall && (!effectiveChoice || effectiveChoice === "auto")) {
+						return "required";
+					}
 					return escapedNonAsciiToolChoice;
 				};
 				const attemptConfig = attemptTransaction
@@ -4290,6 +4296,28 @@ async function runLoopBody(
 					continue;
 				}
 			}
+			// Retry only the rejected completion, never a turn that offered a call
+			// for dispatch. Remove the rejected assistant tail before sending again.
+			if (
+				!retriedMalformedVeniceCall &&
+				!config.fallbackManaged &&
+				escapedToolTransaction &&
+				!escapedToolTransaction.committed &&
+				!escapedToolTransaction.rejected &&
+				(escapedNonAsciiToolChoice ?? config.toolChoice) !== "none" &&
+				!loopSignal.aborted &&
+				message.provider === "venice" &&
+				message.stopReason === "error" &&
+				message.errorCode === "venice_deepseek_malformed_tool_call" &&
+				!message.content.some(block => block.type === "toolCall") &&
+				currentContext.messages.at(-1) === message
+			) {
+				retriedMalformedVeniceCall = true;
+				escapedToolTransaction.discard();
+				currentContext.messages.pop();
+				continue;
+			}
+			retriedMalformedVeniceCall = false;
 			// Session-level invalid_prompt circuit breaker (bounded, neutralize-only).
 			// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is
 			// a deterministic content fault: re-sending the same history re-triggers it,
@@ -5327,7 +5355,11 @@ async function streamAssistantResponse(
 								// tool arguments. Publication does not accept or execute tools:
 								// terminal validation and the consumer drain still precede dispatch.
 								// A published escaped call is rejected rather than silently resampled.
-								provisionalToolTransaction?.commitCallbacksAndUpdates();
+								// Venice DeepSeek can reject a text-bearing attempt at EOF. Keep it
+								// staged until that decision; the transaction's size cap still applies.
+								if (!(config.model.provider === "venice" && /deepseek/i.test(config.model.id))) {
+									provisionalToolTransaction?.commitCallbacksAndUpdates();
+								}
 							}
 							break;
 

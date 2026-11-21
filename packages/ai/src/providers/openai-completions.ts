@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import {
 	$credentialEnv,
@@ -35,6 +36,7 @@ import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type Context,
 	type FetchImpl,
 	type Message,
@@ -89,7 +91,13 @@ import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
-import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSchema } from "../utils/schema";
+import {
+	adaptSchemaForStrict,
+	areJsonValuesEqual,
+	flattenToolRootCombinators,
+	NO_STRICT,
+	toolWireSchema,
+} from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
 	DEFAULT_REPETITION_THRESHOLD,
@@ -98,11 +106,17 @@ import {
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
-import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
+import {
+	DsmlToolCallHealer,
+	type HealedToolCall,
+	modelMayLeakKimiToolCalls,
+	ToolCallHealer,
+} from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
+	requestedToolChoiceLevel,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
 import { ToolFenceStripper } from "../utils/tool-fence-strip";
@@ -633,16 +647,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let disableStrictTools = providerSessionState?.strictToolsDisabled ?? false;
 			let strictFallbackErrorMessage: string | undefined;
 			let effectiveServiceTier: ServiceTier | undefined;
+			let effectiveToolChoice: unknown; // Captured from buildParams for use in DSML recovery filtering
+			let submittedToolNames = new Set<string>();
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const { params: builtParams, toolStrictMode } = buildParams(
-					model,
-					context,
-					options,
-					baseUrl,
-					effectiveToolStrictModeOverride,
-				);
+				const {
+					params: builtParams,
+					toolStrictMode,
+					effectiveToolChoice: builtEffectiveToolChoice,
+				} = buildParams(model, context, options, baseUrl, effectiveToolStrictModeOverride);
 				let params = builtParams;
 				appliedToolStrictMode = toolStrictMode;
 				const replacementPayload = await options?.onPayload?.(
@@ -654,6 +668,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (replacementPayload !== undefined) {
 					params = replacementPayload as typeof params;
 				}
+				effectiveToolChoice = (params as Record<string, unknown>).tool_choice ?? builtEffectiveToolChoice;
+				submittedToolNames = new Set(
+					(Array.isArray(params.tools) ? params.tools : []).flatMap(tool =>
+						tool?.type === "function" && typeof tool.function?.name === "string" ? [tool.function.name] : [],
+					),
+				);
 				// Capture the service tier for use in cost calculations
 				effectiveServiceTier = (params as Record<string, unknown>).service_tier as ServiceTier | undefined;
 				output.serviceTier = parseResolvedServiceTier(effectiveServiceTier);
@@ -815,48 +835,46 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!block) return Math.max(0, output.content.length - 1);
 				return output.content.indexOf(block);
 			};
+			type BlockEvent = Extract<AssistantMessageEvent, { contentIndex: number }>;
+			let deferredBlockEvents: Array<{ event: BlockEvent; block: AssistantMessage["content"][number] }> | undefined;
+			const publishBlockEvent = (event: BlockEvent): void => {
+				const block = output.content[event.contentIndex];
+				if (deferredBlockEvents && block) deferredBlockEvents.push({ event, block });
+				else stream.push(event);
+			};
 			const finishCurrentBlock = (block: OpenAIStreamBlock | undefined): void => {
 				if (!block) return;
 				const contentIndex = blockIndex(block);
 				if (contentIndex < 0) return;
 				if (block.type === "text") {
-					stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+					publishBlockEvent({ type: "text_end", contentIndex, content: block.text, partial: output });
 					return;
 				}
 				if (block.type === "thinking") {
-					stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+					publishBlockEvent({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
 					return;
 				}
 				block.arguments = parseStreamingJson(block.partialArgs);
 				captureUnicodeEscapeEvidence(block, block.partialArgs ?? "");
 				delete (block as { partialArgs?: string }).partialArgs;
-				stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+				publishBlockEvent({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
 			};
-			const appendText = (
-				message: AssistantMessage,
-				eventStream: AssistantMessageEventStream,
-				text: string,
-			): void => {
+			const appendText = (message: AssistantMessage, text: string): void => {
 				if (currentBlock?.type !== "text") {
 					finishCurrentBlock(currentBlock);
 					currentBlock = { type: "text", text: "" };
 					message.content.push(currentBlock);
-					eventStream.push({ type: "text_start", contentIndex: blockIndex(currentBlock), partial: message });
+					publishBlockEvent({ type: "text_start", contentIndex: blockIndex(currentBlock), partial: message });
 				}
 				currentBlock.text += text;
-				eventStream.push({
+				publishBlockEvent({
 					type: "text_delta",
 					contentIndex: blockIndex(currentBlock),
 					delta: text,
 					partial: message,
 				});
 			};
-			const appendThinking = (
-				message: AssistantMessage,
-				eventStream: AssistantMessageEventStream,
-				thinking: string,
-				signature?: string,
-			): void => {
+			const appendThinking = (message: AssistantMessage, thinking: string, signature?: string): void => {
 				if (
 					currentBlock?.type !== "thinking" ||
 					(signature !== undefined && currentBlock.thinkingSignature !== signature)
@@ -864,7 +882,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					finishCurrentBlock(currentBlock);
 					currentBlock = { type: "thinking", thinking: "", thinkingSignature: signature };
 					message.content.push(currentBlock);
-					eventStream.push({
+					publishBlockEvent({
 						type: "thinking_start",
 						contentIndex: blockIndex(currentBlock),
 						partial: message,
@@ -874,7 +892,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					currentBlock.thinkingSignature = signature;
 				}
 				currentBlock.thinking += thinking;
-				eventStream.push({
+				publishBlockEvent({
 					type: "thinking_delta",
 					contentIndex: blockIndex(currentBlock),
 					delta: thinking,
@@ -983,12 +1001,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
 				const emit = feedRepetitionGuard(textRepetitionGuard, text, "text");
-				if (emit) appendText(output, stream, emit);
+				if (emit) appendText(output, emit);
 			};
 			const emitThinkingText = (thinking: string, signature?: string) => {
 				if (!thinking) return;
 				const emit = feedRepetitionGuard(thinkingRepetitionGuard, thinking, "thinking");
-				if (emit) appendThinking(output, stream, emit, signature);
+				if (emit) appendThinking(output, emit, signature);
 			};
 			const appendThinkingDelta = (thinking: string, signature?: string) => {
 				if (!thinking) return;
@@ -1047,9 +1065,79 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (stripped && (stripped === flushable || stripped.trim().length > 0)) appendTextDelta(stripped);
 			};
 
+			// Venice can emit an argument label as a wrapperless invocation. This
+			// is not a tool name and must never enter the DSML recovery parser.
+			const malformedVeniceTags = [
+				'<｜DSML｜ invoke name="_i" string="true">',
+				'<|DSML| invoke name="_i" string="true">',
+			];
+			const checkMalformedVenice =
+				model.provider === "venice" &&
+				/deepseek/i.test(model.id) &&
+				submittedToolNames.size > 0 &&
+				extractToolChoiceLevel(effectiveToolChoice).requestLevel !== "none" &&
+				requestedToolChoiceLevel(options?.toolChoice).requestedLevel !== "none";
+			let malformedVeniceTail = "";
+			let malformedVeniceCall = false;
+			const filterMalformedVenice = (delta: string): string => {
+				if (!checkMalformedVenice || !delta) return delta;
+				if (malformedVeniceCall) return "";
+				const text = malformedVeniceTail + delta;
+				let remaining = text;
+				let clean = "";
+				for (
+					let marker = findFirstTag(remaining, malformedVeniceTags);
+					marker;
+					marker = findFirstTag(remaining, malformedVeniceTags)
+				) {
+					const candidate = remaining.slice(marker.index + marker.tag.length);
+					// A standalone _i example is ambiguous. The observed broken payload
+					// continues with a separate command parameter after the mismatched close.
+					const closer = marker.tag.startsWith("<｜") ? "</｜DSML｜ parameter>" : "</|DSML| parameter>";
+					const nextParameter = marker.tag.startsWith("<｜")
+						? '<｜DSML｜ parameter name="command"'
+						: '<|DSML| parameter name="command"';
+					const closeIndex = candidate.indexOf(closer);
+					const value = closeIndex < 0 ? "" : candidate.slice(0, closeIndex);
+					const suffix = closeIndex < 0 ? "" : candidate.slice(closeIndex + closer.length).trimStart();
+					const hasValue = closeIndex >= 0 && closeIndex <= 4096 && !!value.trim() && !/[<`]/.test(value);
+					if (hasValue && suffix.startsWith(nextParameter)) {
+						malformedVeniceCall = true;
+						malformedVeniceTail = "";
+						return clean + remaining.slice(0, marker.index);
+					}
+					const partialCloser = getTrailingPartialTag(candidate, [closer]);
+					if (
+						(closeIndex < 0 &&
+							candidate.length <= 4096 + closer.length &&
+							!/[<`]/.test(candidate.slice(0, candidate.length - partialCloser.length))) ||
+						(hasValue && candidate.length <= 8192 && nextParameter.startsWith(suffix))
+					) {
+						malformedVeniceTail = remaining.slice(marker.index);
+						return clean + remaining.slice(0, marker.index);
+					}
+					const next = marker.index + marker.tag.length;
+					clean += remaining.slice(0, next);
+					remaining = remaining.slice(next);
+				}
+				malformedVeniceTail = getTrailingPartialTag(remaining, malformedVeniceTags);
+				return clean + remaining.slice(0, remaining.length - malformedVeniceTail.length);
+			};
+
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
+			const dsmlHealer =
+				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens
+					? new DsmlToolCallHealer(`dsml_${randomUUID().replace(/-/g, "").slice(0, 24)}`, checkMalformedVenice)
+					: undefined;
+			// Structured calls can follow leaked markup, so reconcile recovered calls
+			// only after the entire response has arrived.
+			// Each recovered call remembers how many structured calls preceded it, so
+			// reconciliation can tell whether emitting it at end-of-stream would move it
+			// behind a structured call that the model issued after it.
+			const recoveredCalls: { call: HealedToolCall; structuredBefore: number }[] = [];
+			const countStructuredCalls = (): number => output.content.filter(block => block.type === "toolCall").length;
 			let healedToolCallEmitted = false;
-			const emitHealedToolCall = (call: HealedToolCall): void => {
+			const emitHealedToolCall = (call: HealedToolCall, before?: ToolCall): void => {
 				finishCurrentBlock(currentBlock);
 				const block: ToolCall & { partialArgs: string } = {
 					type: "toolCall",
@@ -1059,6 +1147,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					partialArgs: call.arguments,
 				};
 				block.arguments = parseStreamingJson(call.arguments);
+				if (call.incomplete) {
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "malformed";
+				}
 				// The healer already normalized `call.arguments`, decoding any escapes away,
 				// so the signal has to come from its pre-round-trip sample of the raw payload.
 				if (call.escapedNonAsciiArguments) {
@@ -1068,9 +1160,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					}
 				}
 				currentBlock = block;
-				output.content.push(block);
-				stream.push({ type: "toolcall_start", contentIndex: blockIndex(block), partial: output });
-				stream.push({
+				const beforeIndex = before ? output.content.indexOf(before) : -1;
+				if (beforeIndex >= 0) output.content.splice(beforeIndex, 0, block);
+				else output.content.push(block);
+				publishBlockEvent({ type: "toolcall_start", contentIndex: blockIndex(block), partial: output });
+				publishBlockEvent({
 					type: "toolcall_delta",
 					contentIndex: blockIndex(block),
 					delta: call.arguments,
@@ -1080,10 +1174,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				currentBlock = undefined;
 				healedToolCallEmitted = true;
 			};
-			const flushHealedToolCalls = (): void => {
-				if (!kimiHealer) return;
-				const calls = kimiHealer.drainCompleted();
-				for (const call of calls) emitHealedToolCall(call);
+			// Kimi calls stream as soon as they complete; DSML calls wait for
+			// end-of-stream reconciliation against structured calls.
+			const emitKimiHealedToolCalls = (): void => {
+				for (const call of kimiHealer?.drainCompleted() ?? []) emitHealedToolCall(call);
+			};
+			const collectHealedToolCalls = (): void => {
+				const structuredBefore = countStructuredCalls();
+				for (const call of dsmlHealer?.drainCompleted() ?? []) {
+					// A later structured call may be the same call. Hold only the
+					// unresolved suffix so published content indices never change.
+					deferredBlockEvents ??= [];
+					recoveredCalls.push({ call, structuredBefore });
+				}
 			};
 			let providerSafetyStop = false;
 			let hasExplicitUsageReport = false;
@@ -1168,7 +1271,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									markProviderSafetyStop("Provider returned a safety refusal");
 								}
 							}
-							const normalizedDeltaText = normalizeStreamingContentText(choice.delta.content);
+							const normalizedDeltaText = filterMalformedVenice(
+								normalizeStreamingContentText(choice.delta.content),
+							);
 							if (normalizedDeltaText.length > 0) {
 								if (!firstTokenTime) firstTokenTime = Date.now();
 								if (parseMiniMaxThinkTags) {
@@ -1177,6 +1282,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 								} else if (stripDeepseekChatTemplateTokens) {
 									deepseekStripBuffer += normalizedDeltaText;
 									flushDeepseekStripBuffer(false);
+								} else if (dsmlHealer) {
+									// Reconciliation matches each recovered call against structured calls.
+									const clean = dsmlHealer.feed(normalizedDeltaText);
+									if (clean.length > 0) appendTextDelta(clean);
+									collectHealedToolCalls();
 								} else if (kimiHealer) {
 									const hasStructuredToolCalls =
 										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
@@ -1190,7 +1300,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									} else {
 										const clean = kimiHealer.feed(normalizedDeltaText);
 										if (clean.length > 0) appendTextDelta(clean);
-										flushHealedToolCalls();
+										emitKimiHealedToolCalls();
 									}
 								} else {
 									appendTextDelta(normalizedDeltaText);
@@ -1233,7 +1343,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 											partialArgs: "",
 										};
 										output.content.push(currentBlock);
-										stream.push({
+										publishBlockEvent({
 											type: "toolcall_start",
 											contentIndex: blockIndex(currentBlock),
 											partial: output,
@@ -1249,7 +1359,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 											currentBlock.partialArgs += toolCall.function.arguments;
 											currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
 										}
-										stream.push({
+										publishBlockEvent({
 											type: "toolcall_delta",
 											contentIndex: blockIndex(currentBlock),
 											delta,
@@ -1325,6 +1435,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// than be reclassified as a decode loop (#5627 r4, commit c2aa25d30).
 			// No abort either — the stream has already ended, so aborting would set
 			// `repetitionSelfAbort` for nothing.
+			if (malformedVeniceTail) {
+				const clean = dsmlHealer ? dsmlHealer.feed(malformedVeniceTail) : malformedVeniceTail;
+				if (clean) appendTextDelta(clean);
+			}
 			for (const [guard, channel] of [
 				[textRepetitionGuard, "text"],
 				[thinkingRepetitionGuard, "thinking"],
@@ -1334,23 +1448,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				noteRepetitionTrip(guard, channel);
 			}
 
-			if (kimiHealer) {
-				const trailing = kimiHealer.flushPending();
-				if (trailing.length > 0) appendTextDelta(trailing);
-				flushHealedToolCalls();
-				if (healedToolCallEmitted && output.stopReason === "stop") {
-					// Hosts that leak Kimi tool tokens often still report
-					// `finish_reason: stop` for the surrounding turn. Promote
-					// only that natural-completion finish — leave `error`,
-					// `length`, `aborted`, etc. untouched.
-					output.stopReason = "toolUse";
-				}
-			}
-
-			// A turn cut short for length may have stopped mid-tool-call. The open
-			// block's `partialArgs` would otherwise be repaired into a plausible-
-			// but-wrong object by `finishCurrentBlock`; flag it first so the agent
-			// loop rejects the truncated call instead of executing it.
+			// Flag truncated structured arguments before recovered-call emission can
+			// close the current block and repair its partial JSON.
 			if (output.stopReason === "length" && currentBlock?.type === "toolCall") {
 				const partial = (currentBlock as { partialArgs?: string }).partialArgs;
 				if (partial !== undefined && !isCompleteJson(partial)) {
@@ -1359,7 +1458,90 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				}
 			}
 
+			if (kimiHealer) {
+				const trailing = kimiHealer.flushPending();
+				if (trailing.length > 0) appendTextDelta(trailing);
+				emitKimiHealedToolCalls();
+			}
+
+			if (dsmlHealer) {
+				const trailing = dsmlHealer.flushPending();
+				if (trailing.length > 0) appendTextDelta(trailing);
+				collectHealedToolCalls();
+
+				// Recovered calls obey both the caller's logical tool choice and the choice
+				// actually sent. Hosts that cannot express tool_choice omit the wire field,
+				// so the logical request must still gate content-recovered calls. `none` on
+				// either side admits nothing; a named choice on either side admits only it.
+				const wireChoice = extractToolChoiceLevel(effectiveToolChoice);
+				const logicalChoice = requestedToolChoiceLevel(options?.toolChoice);
+				const allowedNames = [wireChoice.targetToolName, logicalChoice.targetToolName].filter(
+					(name): name is string => name !== undefined,
+				);
+				const rejectAll = wireChoice.requestLevel === "none" || logicalChoice.requestedLevel === "none";
+				// Recovered calls never bypass the request's tool contract: a name the
+				// request did not offer (or any name when no tools were offered) is dropped.
+				const offeredToolNames = new Set((context.tools ?? []).map(tool => tool.name));
+				const allowedRecoveredCalls = recoveredCalls.filter(
+					({ call }) =>
+						!rejectAll &&
+						!call.incomplete &&
+						offeredToolNames.has(call.name) &&
+						submittedToolNames.has(call.name) &&
+						allowedNames.every(name => call.name === name),
+				);
+
+				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
+
+				// Each structured call suppresses at most one identical recovered call.
+				const matchedStructuredCallIndices = new Set<number>();
+
+				for (const { call, structuredBefore } of allowedRecoveredCalls) {
+					const recoveredArguments = parseStreamingJson(call.arguments);
+
+					let foundMatchIndex = -1;
+					for (let i = 0; i < structuredCalls.length; i++) {
+						if (
+							!matchedStructuredCallIndices.has(i) &&
+							!structuredCalls[i].incompleteArguments &&
+							structuredCalls[i].name === call.name &&
+							areJsonValuesEqual(structuredCalls[i].arguments, recoveredArguments)
+						) {
+							foundMatchIndex = i;
+							break;
+						}
+					}
+
+					if (foundMatchIndex >= 0) {
+						matchedStructuredCallIndices.add(foundMatchIndex);
+						logger.debug("openai-completions: suppressed recovered tool call matching structured call", {
+							model: model.id,
+							recoveredCallId: call.id,
+							structuredCallId: structuredCalls[foundMatchIndex].id,
+						});
+						continue;
+					}
+
+					emitHealedToolCall(call, structuredCalls[structuredBefore]);
+				}
+			}
+
+			if (healedToolCallEmitted && output.stopReason === "stop") {
+				// Hosts that leak Kimi or DSML tool-call markup often still report
+				// `finish_reason: stop` for the surrounding turn. Promote
+				// only that natural-completion finish — leave `error`,
+				// `length`, `aborted`, etc. untouched.
+				output.stopReason = "toolUse";
+			}
+
 			finishCurrentBlock(currentBlock);
+			if (deferredBlockEvents) {
+				const finalIndices = new Map(output.content.map((block, index) => [block, index] as const));
+				const orderedEvents = deferredBlockEvents
+					.map(({ event, block }) => ({ ...event, contentIndex: finalIndices.get(block) ?? event.contentIndex }))
+					.sort((a, b) => a.contentIndex - b.contentIndex);
+				for (const event of orderedEvents) stream.push(event);
+			}
 
 			// A repetition abort usually surfaces as a throw from the stream
 			// iterator, but a host that had already buffered the rest of the
@@ -1385,7 +1567,15 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			output.errorMessage = strictFallbackErrorMessage;
-			if (isEmptyOpenAICompletionsResponse(output, hasExplicitUsageReport, hasNonzeroUsageEvidence)) {
+			if (
+				malformedVeniceCall &&
+				(output.stopReason === "stop" || output.stopReason === "toolUse") &&
+				countStructuredCalls() === 0
+			) {
+				output.stopReason = "error";
+				output.errorCode = "venice_deepseek_malformed_tool_call";
+				output.errorMessage = "Venice DeepSeek returned malformed tool-call markup without a structured tool call.";
+			} else if (isEmptyOpenAICompletionsResponse(output, hasExplicitUsageReport, hasNonzeroUsageEvidence)) {
 				output.stopReason = "error";
 				output.errorMessage = OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE;
 				output.transportFailure = {
@@ -1666,13 +1856,39 @@ async function createClient(
 	};
 }
 
+/**
+ * Extract requestLevel and targetToolName from an OpenAI tool_choice wire format.
+ * Used to determine whether DSML recovered tool calls should be admitted.
+ */
+function extractToolChoiceLevel(toolChoice: unknown): {
+	requestLevel: "none" | "auto" | "required" | "named";
+	targetToolName?: string;
+} {
+	if (toolChoice === "none") return { requestLevel: "none" };
+	if (toolChoice === undefined || toolChoice === "auto") return { requestLevel: "auto" };
+	if (toolChoice === "required") return { requestLevel: "required" };
+	if (
+		toolChoice &&
+		typeof toolChoice === "object" &&
+		"type" in toolChoice &&
+		toolChoice.type === "function" &&
+		"function" in toolChoice
+	) {
+		const fn = (toolChoice as { function?: { name?: string } }).function;
+		if (fn && typeof fn === "object" && "name" in fn && typeof fn.name === "string") {
+			return { requestLevel: "named", targetToolName: fn.name };
+		}
+	}
+	return { requestLevel: "auto" };
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
 	options: OpenAICompletionsOptions | undefined,
 	resolvedBaseUrl?: string,
 	toolStrictModeOverride?: ToolStrictModeOverride,
-): { params: OpenAICompletionsParams; toolStrictMode: AppliedToolStrictMode } {
+): { params: OpenAICompletionsParams; toolStrictMode: AppliedToolStrictMode; effectiveToolChoice: unknown } {
 	const compat = getCompat(model, resolvedBaseUrl);
 	const messages = convertMessages(model, context, compat);
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
@@ -1796,6 +2012,10 @@ function buildParams(
 			params.tool_choice = mapToOpenAICompletionsToolChoice(toolChoice.resolvedChoice);
 		}
 	}
+
+	// Capture effective tool_choice before it might be deleted as redundant.
+	// The DSML recovery filter uses this to determine which recovered calls to admit.
+	const capturedToolChoice = params.tool_choice;
 
 	if (params.tool_choice === "none" && (!Array.isArray(params.tools) || params.tools.length === 0)) {
 		// `tool_choice: "none"` with no tools to gate is redundant and also
@@ -1939,7 +2159,11 @@ function buildParams(
 		delete params.chat_template_kwargs;
 	}
 
-	return { params, toolStrictMode };
+	// Determine the effective tool_choice for DSML recovery filtering.
+	// Use the captured tool_choice before deletion if available, otherwise check if compat.extraBody injected one.
+	const effectiveToolChoice = capturedToolChoice ?? (compat.extraBody?.tool_choice as unknown);
+
+	return { params, toolStrictMode, effectiveToolChoice };
 }
 
 function getOptionalNumberProperty(value: object, key: string): number | undefined {

@@ -122,6 +122,7 @@ const CODEX_MAX_RETRIES = 5;
 const CODEX_RETRY_DELAY_MS = 500;
 const CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS = 10000;
 const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
+const CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS = 30000;
 /** Longest delay setTimeout honors; larger delays fire after 1 ms, so waits are capped here. */
 const CODEX_MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
@@ -396,6 +397,11 @@ export interface OpenAICodexWebSocketDebugStats {
 	lastInputItems: number;
 	lastDeltaInputItems?: number;
 	lastPreviousResponseId?: string;
+	lastTurn?: {
+		request: {
+			canAppendBeforeRequest: boolean;
+		};
+	};
 }
 
 type CodexWebSocketSessionState = {
@@ -1026,10 +1032,13 @@ async function buildTransformedCodexRequestBody(
 	}
 
 	// Neutralize leaked Harmony control tokens in the system prompt too:
-	// `params.instructions` and the developer messages prepended inside
-	// `transformRequestBody` bypass the `input` sanitizer above, so a poisoned
-	// system prompt rejects every turn with
-	// `Request blocked (code=invalid_prompt)`.
+	// System prompts are sent as developer messages (or as base instructions) so they are prompt-cached.
+	// The top-level `instructions` field is not cached by the Codex backend,
+	// so we pass the first system prompt as `instructions` for moveCodexInstructionsToInput to handle,
+	// and additional system prompts through developerMessages.
+	// Developer messages prepended inside `transformRequestBody` bypass the `input`
+	// sanitizer above, so neutralization is still required. A poisoned system
+	// prompt would reject every turn with `Request blocked (code=invalid_prompt)`.
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt).map(neutralizeReservedControlTokens);
 	if (systemPrompts.length > 0) {
 		params.instructions = systemPrompts[0];
@@ -1106,8 +1115,10 @@ async function openCodexWebSocketTransport(
 	transport: CodexTransport;
 	sentPreviousResponseId: boolean;
 }> {
-	const websocketRequest = buildCodexWebSocketRequest(requestContext.transformedBody, websocketState);
-	const sentPreviousResponseId = typeof websocketRequest.previous_response_id === "string";
+	// Record canAppend BEFORE building the request so we can detect reconnections.
+	let canAppendBeforeRequest = websocketState.canAppend === true;
+	// Build the request without stats initially, since we might rebuild it after reconnect detection.
+	let websocketRequest = buildCodexWebSocketRequestWithoutStats(requestContext.transformedBody, websocketState);
 	const websocketHeaders = createCodexHeaders(
 		requestContext.requestHeaders,
 		requestContext.accountId,
@@ -1125,18 +1136,35 @@ async function openCodexWebSocketTransport(
 		sentTurnStateHeader: websocketHeaders.has(X_CODEX_TURN_STATE_HEADER),
 		sentModelsEtagHeader: websocketHeaders.has(X_MODELS_ETAG_HEADER),
 		requestType: websocketRequest.type,
-		sentPreviousResponseId,
+		sentPreviousResponseId: typeof websocketRequest.previous_response_id === "string",
 		retry,
 		retryBudget: getCodexWebSocketRetryBudget(options),
 	});
-	const eventStream = await openCodexWebSocketEventStream(
+	// Get the WebSocket connection. If it reconnects (closed, idle eviction, token
+	// refresh, or routing-hint change), canAppend will be reset to false.
+	const connection = await getOrCreateCodexWebSocketConnection(
+		websocketState,
 		toWebSocketUrl(requestContext.url),
 		websocketHeaders,
-		websocketRequest,
-		websocketState,
 		requestSetup.requestSignal,
 		options,
+	);
+	// If the socket reconnected, discard any delta built against the old socket
+	// and replay the full transformed body instead.
+	if (canAppendBeforeRequest && !websocketState.canAppend) {
+		websocketRequest = buildCodexWebSocketRequestWithoutStats(requestContext.transformedBody, websocketState);
+		// A reconnect occurred, so the final request was NOT built with canAppend.
+		canAppendBeforeRequest = false;
+	}
+	// Record stats for the final request that will be sent, including whether a reconnect occurred.
+	recordCodexWebSocketRequestStats(websocketState, websocketRequest, canAppendBeforeRequest);
+	const sentPreviousResponseId = typeof websocketRequest.previous_response_id === "string";
+	const eventStream = await connection.streamRequest(
+		websocketRequest,
+		requestSetup.requestSignal,
 		requestSetup.firstEventTimeoutMs,
+		getCodexWebSocketIdleTimeoutMs(options?.streamIdleTimeoutMs),
+		options?.onStreamCreated,
 	);
 	return { eventStream, requestBodyForState, transport: "websocket", sentPreviousResponseId };
 }
@@ -3206,10 +3234,18 @@ function stripInputItemIds(items: Array<Record<string, unknown>>): InputItem[] {
 function recordCodexWebSocketRequestStats(
 	state: CodexWebSocketSessionState | undefined,
 	request: Record<string, unknown>,
+	canAppendBeforeRequest?: boolean,
 ): void {
 	if (!state) return;
 	const input = request.input;
 	state.stats.lastInputItems = Array.isArray(input) ? input.length : 0;
+	if (canAppendBeforeRequest !== undefined) {
+		state.stats.lastTurn = {
+			request: {
+				canAppendBeforeRequest,
+			},
+		};
+	}
 	if (typeof request.previous_response_id === "string" && request.previous_response_id.length > 0) {
 		state.stats.deltaRequests += 1;
 		state.stats.lastDeltaInputItems = state.stats.lastInputItems;
@@ -3221,7 +3257,7 @@ function recordCodexWebSocketRequestStats(
 	state.stats.lastPreviousResponseId = undefined;
 }
 
-function buildCodexWebSocketRequest(
+function buildCodexWebSocketRequestWithoutStats(
 	requestBody: RequestBody,
 	state: CodexWebSocketSessionState | undefined,
 ): Record<string, unknown> {
@@ -3235,7 +3271,6 @@ function buildCodexWebSocketRequest(
 			previous_response_id: state.lastResponseId,
 			input: appendInput,
 		};
-		recordCodexWebSocketRequestStats(state, request);
 		return request;
 	}
 	if (state?.canAppend) {
@@ -3250,6 +3285,14 @@ function buildCodexWebSocketRequest(
 		type: "response.create",
 		...requestBody,
 	};
+	return request;
+}
+
+function buildCodexWebSocketRequest(
+	requestBody: RequestBody,
+	state: CodexWebSocketSessionState | undefined,
+): Record<string, unknown> {
+	const request = buildCodexWebSocketRequestWithoutStats(requestBody, state);
 	recordCodexWebSocketRequestStats(state, request);
 	return request;
 }
@@ -3288,16 +3331,22 @@ class CodexWebSocketConnection {
 	#connectPromise?: Promise<void>;
 	#activeRequest = false;
 	#localCloseReason?: string;
+	#createdAt: number;
 
 	constructor(url: string, headers: Record<string, string>, options: CodexWebSocketConnectionOptions) {
 		this.#url = url;
 		this.#headers = headers;
 		this.#idleTimeoutMs = options.idleTimeoutMs;
 		this.#onHandshakeHeaders = options.onHandshakeHeaders;
+		this.#createdAt = Date.now();
 	}
 
 	isOpen(): boolean {
 		return this.#socket?.readyState === WebSocket.OPEN;
+	}
+
+	isStale(): boolean {
+		return Date.now() - this.#createdAt > CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS;
 	}
 
 	wasClosedLocally(): boolean {
@@ -3569,11 +3618,12 @@ async function getOrCreateCodexWebSocketConnection(
 ): Promise<CodexWebSocketConnection> {
 	const headerRecord = headersToRecord(headers);
 	if (state.connection?.isOpen()) {
-		if (state.connection.matchesAuth(headerRecord)) {
+		if (state.connection.matchesAuth(headerRecord) && !state.connection.isStale()) {
 			logger.time("codexWs:reuseOpenSocket");
 			return state.connection;
 		}
-		state.connection.close("token-refresh");
+		const closeReason = state.connection.isStale() ? "stale-reuse" : "token-refresh";
+		state.connection.close(closeReason);
 		resetCodexWebSocketAppendState(state);
 	}
 	state.connection?.close("reconnect");

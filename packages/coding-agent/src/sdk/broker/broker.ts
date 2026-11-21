@@ -95,6 +95,7 @@ import {
 	type TerminalReadBack,
 } from "./lifecycle-ledger";
 import { brokerLockHostIdentity } from "./lock-host-identity";
+import { type BrokerLockRefusalCode, BrokerLockRefusedError } from "./lock-refusal";
 import {
 	cancelManagedTasks,
 	createManagedDomainBinding,
@@ -4426,20 +4427,24 @@ export class Broker {
 					const foreignHostOwner = !hostUnqualified && current.ownerHostId !== hostIdentity.ownerHostId;
 					let refusal: string;
 					let errorMessage: string;
+					let code: BrokerLockRefusalCode;
 					if (hostUnqualified) {
+						code = "host_unqualified";
 						refusal = `owner pid ${current.pid} has no host identity; automatic recovery is unsafe for shared agent directories. Stop every broker using this agent directory on all hosts, then follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
 						errorMessage = `Broker lock owner is host-unqualified (pid ${current.pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
 					} else if (foreignHostOwner) {
+						code = "foreign_host";
 						refusal = `owner pid ${current.pid} is attributed to another host; its liveness cannot be verified here`;
 						errorMessage = `Broker lock owner is attributed to a different host (pid ${current.pid}); refusing automatic recovery because its liveness cannot be verified from this host.`;
 					} else {
+						code = "live_owner";
 						refusal = `live pid ${current.pid} has published no discovery record`;
 						errorMessage = `Broker lock is held by a live owner (pid ${current.pid})`;
 					}
 					logger.warn(
 						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by ${refusal}`,
 					);
-					throw new Error(errorMessage);
+					throw new BrokerLockRefusedError(errorMessage, this.#lock, code, current.pid);
 				}
 				continue;
 			}

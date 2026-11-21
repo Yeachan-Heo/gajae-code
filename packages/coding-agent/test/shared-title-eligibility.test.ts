@@ -58,7 +58,7 @@ afterEach(async () => {
 	else process.env.PI_NO_TITLE = originalPiNoTitle;
 });
 
-async function fixture() {
+async function fixture(options?: { sharedAppend?: boolean }) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-eligibility-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -84,7 +84,7 @@ async function fixture() {
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: true,
+		rootInteractiveSharedAppend: options?.sharedAppend ?? true,
 		thinkingLevel: ThinkingLevel.Off,
 	});
 	sessions.push(session);
@@ -455,6 +455,9 @@ describe("shared publication admission split", () => {
 
 	it("keeps a refused deferred command result queued and withholds onPersisted", async () => {
 		const f = await fixture();
+		// Keep both prompts off the real provider: the retry flush persists before the
+		// credential preflight, so a buggy first-prompt fallback must also fail here.
+		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
 		// Bun's spyOn cannot patch accessors; shadow the prototype getter so the result defers.
 		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
 		const persisted = vi.fn();
@@ -473,12 +476,14 @@ describe("shared publication admission split", () => {
 			expect.stringContaining("Could not save the deferred command result to this session"),
 			"session-publication",
 		);
-		// The entry stayed queued: the next prompt's flush persists it and fires the callback.
+		// The entry stayed queued: the next prompt's flush persists it and fires the callback
+		// before the credential preflight rejects.
 		refused.mockRestore();
-		await f.session.prompt("retry flush").catch(() => {});
+		await expect(f.session.prompt("retry flush")).rejects.toThrow("No credentials found for anthropic.");
 		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
 		await f.manager.flush();
-		expect(await Bun.file(f.file).text()).toContain("deferred output");
+		expect((await Bun.file(f.file).text()).split("deferred output")).toHaveLength(2);
 	});
 
 	it("never re-queues an unknown deferred command result and closes with its receipt", async () => {
@@ -511,6 +516,30 @@ describe("shared publication admission split", () => {
 		const text = await Bun.file(f.file).text();
 		expect(text.split("unknown output")).toHaveLength(2);
 		expect(text).toContain(`"id":"${attempted}"`);
+	});
+
+	it("does not retry a deferred result whose onPersisted callback throws", async () => {
+		const f = await fixture();
+		// The first prompt's flush failure must not fall through to a provider, and the
+		// retry prompt deliberately stops at the credential preflight.
+		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn(() => {
+			throw new Error("deferred callback exploded");
+		});
+		f.session.recordBashResult("echo deferred-callback", shellResult("deferred callback output"), {
+			onPersisted: persisted,
+		});
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+		await expect(f.session.prompt("flush now")).rejects.toThrow(/1 onPersisted callback failed/);
+		expect(persisted).toHaveBeenCalledTimes(1);
+		// The row was already durable, so the callback failure is reported but never requeued.
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await expect(f.session.prompt("retry flush")).rejects.toThrow("No credentials found for anthropic.");
+		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.flush();
+		expect((await Bun.file(f.file).text()).split("deferred callback output")).toHaveLength(2);
 	});
 
 	it("joins an in-flight deferred drain so one result publishes and reports exactly once", async () => {
@@ -554,6 +583,179 @@ describe("shared publication admission split", () => {
 		expect(f.session.hasPendingBashMessages).toBe(false);
 		await f.manager.flush();
 		expect((await Bun.file(f.file).text()).split("once output")).toHaveLength(2);
+	});
+
+	it("reports a Python result as persisted only after the shared append commits", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "pythonExecution") {
+				entered.resolve();
+				await gate.promise;
+			}
+			return original(message);
+		});
+		const persisted = vi.fn();
+		f.session.recordPythonResult("print('shared')", shellResult("python shared output"), { onPersisted: persisted });
+		try {
+			await entered.promise;
+			expect(persisted).not.toHaveBeenCalled();
+		} finally {
+			gate.resolve();
+		}
+		await f.session.awaitSessionSettlement();
+		expect(persisted).toHaveBeenCalledTimes(1);
+		await f.manager.flush();
+		expect(await Bun.file(f.file).text()).toContain("python shared output");
+	});
+
+	it("withholds Python onPersisted when the shared append is refused", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockResolvedValue({
+			kind: "rejected",
+			error: new Error("lease refused"),
+		});
+		const notice = vi.spyOn(f.session, "emitNotice");
+		const persisted = vi.fn();
+		f.session.recordPythonResult("print('refused')", shellResult("python refused output"), {
+			onPersisted: persisted,
+		});
+		await f.session.awaitSessionSettlement();
+		expect(persisted).not.toHaveBeenCalled();
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Could not save the python result to this session: lease refused",
+			"session-publication",
+		);
+	});
+
+	it("fires Python onPersisted inline for a legacy session", async () => {
+		const f = await fixture({ sharedAppend: false });
+		const persisted = vi.fn();
+		f.session.recordPythonResult("print('legacy')", shellResult("python legacy output"), { onPersisted: persisted });
+		// The legacy path has no shared commit to wait for: the callback follows the
+		// in-memory append and a throw stays inline instead of becoming a background failure.
+		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(() =>
+			f.session.recordPythonResult("print('legacy-throw')", shellResult("python legacy throw"), {
+				onPersisted: () => {
+					throw new Error("legacy callback exploded");
+				},
+			}),
+		).toThrow("legacy callback exploded");
+	});
+
+	it("reserves the queued continuation before a throwing legacy Python callback", async () => {
+		const f = await fixture({ sharedAppend: false });
+		// Queue directly on the agent: the session's own follow-up path would schedule
+		// delivery itself and hide whether this callback path reserved the continuation.
+		f.session.agent.followUp(user("queued legacy follow-up"));
+		const continueQueued = vi.spyOn(f.session.agent, "continueQueuedMessages").mockResolvedValue(undefined);
+		const continueAll = vi.spyOn(f.session.agent, "continue").mockResolvedValue(undefined);
+		let callbackSaw: { appended: boolean; hasPostPromptWork: boolean } | undefined;
+		const sentinel = new Error("legacy queued callback exploded");
+		let thrown: unknown;
+		try {
+			f.session.recordPythonResult("print('legacy-queued-throw')", shellResult("python legacy queued throw"), {
+				onPersisted: () => {
+					// Record instead of asserting: an assertion throw here would replace the sentinel
+					// whose exact identity the legacy append/callback boundary must preserve.
+					callbackSaw = {
+						appended: f.manager
+							.getEntries()
+							.some(
+								entry =>
+									entry.type === "message" &&
+									entry.message.role === "pythonExecution" &&
+									entry.message.code === "print('legacy-queued-throw')",
+							),
+						hasPostPromptWork: f.session.hasPostPromptWork,
+					};
+					throw sentinel;
+				},
+			});
+		} catch (error) {
+			thrown = error;
+		}
+		// Ordering contract: append -> continuation reservation -> callback with the
+		// same inline throw, so the queued delivery survives the callback failure.
+		expect(thrown).toBe(sentinel);
+		expect(callbackSaw).toEqual({ appended: true, hasPostPromptWork: true });
+		expect(continueQueued).not.toHaveBeenCalled();
+		expect(continueAll).not.toHaveBeenCalled();
+
+		await f.session.waitForIdle();
+		expect(continueQueued).toHaveBeenCalledTimes(1);
+		expect(continueAll).not.toHaveBeenCalled();
+	});
+
+	it("observes a throwing completion callback instead of rejecting unhandled", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const notice = vi.spyOn(f.session, "emitNotice");
+			const persisted = vi.fn(() => {
+				throw new Error("completion callback exploded");
+			});
+			f.session.recordBashResult("echo callback", shellResult("callback output"), { onPersisted: persisted });
+			await f.session.awaitSessionSettlement();
+			await Bun.sleep(20);
+			expect(persisted).toHaveBeenCalledTimes(1);
+			expect(notice).toHaveBeenCalledWith(
+				"warning",
+				"Saved the bash result to this session, but its completion step failed.",
+				"session-publication",
+			);
+			// A callback failure must never resend: the row stays durable exactly once.
+			await f.manager.flush();
+			expect((await Bun.file(f.file).text()).split("callback output").length - 1).toBe(1);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+		expect(unhandled).toEqual([]);
+	});
+
+	it("warns and saves one row when a shared completion callback throws a non-coercible value", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const notice = vi.fn();
+		const unsubscribe = f.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "session-publication") notice(event);
+		});
+		const output = "non-coercible callback output";
+		const persisted = vi.fn(() => {
+			throw Object.create(null);
+		});
+		try {
+			f.session.recordBashResult("echo non-coercible", shellResult(output), { onPersisted: persisted });
+			await f.session.awaitSessionSettlement();
+			expect(persisted).toHaveBeenCalledTimes(1);
+			const rows = (await Bun.file(f.file).text()).split("\n");
+			expect(rows.filter(row => row.includes(output))).toHaveLength(1);
+			expect(notice).toHaveBeenCalledTimes(1);
+			expect(notice).toHaveBeenCalledWith({
+				type: "notice",
+				level: "warning",
+				message: "Saved the bash result to this session, but its completion step failed.",
+				source: "session-publication",
+			});
+		} finally {
+			unsubscribe();
+		}
 	});
 
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {

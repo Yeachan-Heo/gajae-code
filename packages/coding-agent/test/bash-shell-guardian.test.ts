@@ -122,6 +122,53 @@ describe("bash-shell-guardian", () => {
 			expect(authenticated?.processRef).toBeUndefined();
 		});
 
+		it("keeps a record pending while its live process cannot be referenced", () => {
+			// A live process can deny the authority Process.fromPid needs (so it returns null) while
+			// Process.observe still reads it: that proves liveness, not ownership, so it must not settle.
+			const line = JSON.stringify({ pid: 4321, incarnation: "live-inc", signature: sign(4321, "live-inc", "") });
+			const bindings = (observation: { status: string; incarnation?: string }) =>
+				({ fromPid: () => null, observe: () => observation }) as never;
+			const samePresent = authenticateOwnershipRecord(
+				line,
+				token,
+				bindings({ status: "present", incarnation: "live-inc" }),
+			);
+			expect(samePresent?.pending).toBe(true);
+			expect(samePresent?.processRef).toBeUndefined();
+			// A different incarnation or a confirmed absence proves the recorded process is gone.
+			expect(
+				authenticateOwnershipRecord(line, token, bindings({ status: "present", incarnation: "replacement" }))
+					?.pending,
+			).toBeUndefined();
+			expect(authenticateOwnershipRecord(line, token, bindings({ status: "absent" }))?.pending).toBeUndefined();
+		});
+
+		it("rejects malformed and forged records without loading the native addon", () => {
+			// Cleanup must still reject untrusted ledger lines and kill the supervised tree when the
+			// addon cannot load, so the binding is resolved only for an authenticated record.
+			const nativesId = require.resolve("@gajae-code/natives");
+			const previous = require.cache[nativesId];
+			const unavailable = new Proxy(
+				{},
+				{
+					get() {
+						throw new Error("native addon unavailable");
+					},
+				},
+			);
+			require.cache[nativesId] = { id: nativesId, filename: nativesId, loaded: true, exports: unavailable } as never;
+			try {
+				expect(authenticateOwnershipRecord("not json", token)).toBeUndefined();
+				const forged = JSON.stringify({ pid: 1234, incarnation: "uuid-abc", signature: sign(1234, "other", "") });
+				expect(authenticateOwnershipRecord(forged, token)).toBeUndefined();
+				const line = JSON.stringify({ pid: 1234, incarnation: "uuid-abc", signature: sign(1234, "uuid-abc", "") });
+				expect(() => authenticateOwnershipRecord(line, token)).toThrow("native addon unavailable");
+			} finally {
+				if (previous) require.cache[nativesId] = previous;
+				else delete require.cache[nativesId];
+			}
+		});
+
 		it("binds the Darwin unique id into the signature", () => {
 			const signature = sign(1234, "uuid-abc", "");
 			const forged = JSON.stringify({ pid: 1234, incarnation: "uuid-abc", darwinUniqueId: "42", signature });

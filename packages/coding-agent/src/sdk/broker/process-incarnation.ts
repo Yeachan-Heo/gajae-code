@@ -128,9 +128,9 @@ export function isProcessIncarnation(value: unknown): value is string {
  * - `status: "present"` carries the exact kernel-reported identity evidence
  *   (the same value `processIncarnation` returns).
  * - `status: "absent"` is positive OS-confirmed death proof (POSIX
- *   `kill(pid, 0)` returning `ESRCH`, or Windows `OpenProcess` failing with
- *   the exact code the kernel reports for an unresolved client id) — never a
- *   permission failure or an ambiguous disappearance.
+ *   `kill(pid, 0)` returning `ESRCH`, or Windows confirming a signaled process
+ *   handle or an unresolved client id) — never a permission failure or an
+ *   ambiguous disappearance.
  * - `status: "unknown"` covers every inconclusive case (invalid pid, missing
  *   or unavailable native addon, permission denial, platform limitation).
  *   Callers MUST NOT treat this as death proof.
@@ -155,9 +155,9 @@ export interface ObserveProcessIncarnationOptions {
 /**
  * Read-only process-incarnation observation for `pid`, distinguishing a
  * proved-live incarnation from positive OS-confirmed absence from every
- * inconclusive outcome. Never signals, kills, reaps, waits on, or spawns any
- * process — it only reads existing native process-table state via
- * `Process.observe`.
+ * inconclusive outcome. Never signals, kills, reaps, blocks waiting for, or
+ * spawns any process — it only reads existing native process-table and
+ * nonblocking exit state via `Process.observe`.
  *
  * `pid` must be a positive safe integer; any other value (including `0`,
  * negative, `NaN`, or non-integer) is reported as `unknown` rather than

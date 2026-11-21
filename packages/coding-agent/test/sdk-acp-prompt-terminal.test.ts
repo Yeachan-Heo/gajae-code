@@ -6,7 +6,7 @@ import {
 	RequestError,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
-import { logger, TempDir } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
@@ -18,6 +18,9 @@ import {
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
 } from "./helpers/sdk-exact-session-authority";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(75_000);
 
@@ -146,7 +149,7 @@ async function createFixture(
 		retainRecoveryQuery?: boolean;
 	} = {},
 ): Promise<Fixture> {
-	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
+	const tempDir = trackedTemp.tempDirSync("@sdk-acp-prompt-terminal-");
 	const agentDir = path.join(tempDir.path(), "agent");
 	const cwd = path.join(tempDir.path(), "workspace");
 	const token = "sdk-acp-prompt-terminal-token";

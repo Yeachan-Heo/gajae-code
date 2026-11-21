@@ -17,6 +17,7 @@ type CommonCandidateSafetyFinishReason =
 type VertexCandidateSafetyFinishReason = "MODEL_ARMOR";
 type CandidateGenericTerminalFinishReason =
 	| "MALFORMED_FUNCTION_CALL"
+	| "MALFORMED_RESPONSE"
 	| "UNEXPECTED_TOOL_CALL"
 	| "NO_IMAGE"
 	| "IMAGE_OTHER"
@@ -58,6 +59,7 @@ const candidateFinishReasonFixtures = {
 	vertexSafety: ["MODEL_ARMOR"],
 	genericTerminal: [
 		"MALFORMED_FUNCTION_CALL",
+		"MALFORMED_RESPONSE",
 		"UNEXPECTED_TOOL_CALL",
 		"NO_IMAGE",
 		"IMAGE_OTHER",
