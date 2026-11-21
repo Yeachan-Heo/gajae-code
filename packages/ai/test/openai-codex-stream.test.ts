@@ -10,6 +10,7 @@ import {
 } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { AssistantMessageEvent, Context, Model, ProviderSessionState, Tool } from "@gajae-code/ai/types";
 import { getAgentDir, logger, setAgentDir, TempDir } from "@gajae-code/utils";
+import { getBundledModel } from "../src/models";
 import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
 
 const RAW_SENTINEL = "RAW_SENTINEL_DO_NOT_SURFACE";
@@ -4618,6 +4619,79 @@ describe("openai-codex streaming", () => {
 		expect(sentRequests[0]?.type).toBe("response.create");
 		expect(sentRequests[0]?.service_tier).toBe("priority");
 		expect(result.usage.premiumRequests).toBeUndefined();
+	});
+
+	it("reconnects the websocket with a new routing hint when entering ultrafast", async () => {
+		const tempDir = trackedTempDir("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+		const sockets: Array<{ hint: string | undefined; sent: Array<Record<string, unknown>> }> = [];
+		global.fetch = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		}) as unknown as typeof fetch;
+
+		class RoutingWebSocket extends MockWebSocket {
+			#record: { hint: string | undefined; sent: Array<Record<string, unknown>> };
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				const headers = options?.headers as Record<string, string> | undefined;
+				this.#record = { hint: headers?.["x-codex-routing-hint"], sent: [] };
+				sockets.push(this.#record);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				this.#record.sent.push(JSON.parse(data) as Record<string, unknown>);
+				const id = `resp_${sockets.length}_${this.#record.sent.length}`;
+				this.sendJson({
+					type: "response.output_item.done",
+					item: {
+						type: "message",
+						id: `msg_${id}`,
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "ok" }],
+					},
+				});
+				this.sendJson({ type: "response.created", response: { id } });
+				this.sendJson({ type: "response.done", response: { id, status: "completed", usage: DEFAULT_USAGE } });
+			}
+		}
+		global.WebSocket = RoutingWebSocket as unknown as typeof WebSocket;
+
+		const model = {
+			...(getBundledModel("openai-codex", "gpt-6.2-sol") as Model<"openai-codex-responses">),
+			preferWebsockets: true,
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "first", timestamp: Date.now() }],
+		};
+		const first = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			sessionId: "ws-routing-session",
+			providerSessionState,
+		}).result();
+		expect(first.stopReason).toBe("stop");
+		context.messages.push(first, { role: "user", content: "second", timestamp: Date.now() });
+		const second = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			serviceTier: "ultrafast",
+			sessionId: "ws-routing-session",
+			providerSessionState,
+		}).result();
+		expect(second.stopReason).toBe("stop");
+
+		expect(sockets.map(socket => socket.hint)).toEqual(["model=gpt-6.2-sol", "model=gpt-6.2-sol;tier=ultrafast"]);
+		const ultrafastRequest = sockets[1]?.sent[0];
+		expect(ultrafastRequest?.service_tier).toBe("ultrafast");
+		expect(ultrafastRequest?.previous_response_id).toBeUndefined();
+		expect(Object.keys(ultrafastRequest ?? {}).slice(0, 4)).toEqual(["type", "model", "stream", "service_tier"]);
 	});
 
 	it("sends websocket continuation deltas after prior assistant response items and records stats", async () => {

@@ -999,16 +999,8 @@ async function buildTransformedCodexRequestBody(
 	if (options?.repetitionPenalty !== undefined) {
 		params.repetition_penalty = options.repetitionPenalty;
 	}
-	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
-	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
-		params.service_tier = resolvedServiceTier;
-	} else if (resolvedServiceTier === "ultrafast") {
-		// Gate ultrafast to models that explicitly support it
-		if (modelSupportsUltrafastTier(model)) {
-			params.service_tier = "ultrafast";
-		}
-		// else: silently omit ultrafast if model doesn't support it (fail-closed)
-	}
+	const requestServiceTier = resolveCodexRequestServiceTier(model, options?.serviceTier);
+	if (requestServiceTier) params.service_tier = requestServiceTier;
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
 		if (options?.toolChoice) {
@@ -2962,11 +2954,25 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 	return stream;
 };
 
+/**
+ * The `service_tier` a Codex request carries for `serviceTier`, or undefined when none is sent.
+ * Ultrafast is sent only for models with `compat.supportsUltrafastTier` (fail-closed).
+ */
+export function resolveCodexRequestServiceTier(
+	model: Model<"openai-codex-responses">,
+	serviceTier: ServiceTier | undefined,
+): "flex" | "scale" | "priority" | "ultrafast" | undefined {
+	const resolved = resolveServiceTier(serviceTier, model.provider);
+	if (resolved === "flex" || resolved === "scale" || resolved === "priority") return resolved;
+	if (resolved === "ultrafast" && modelSupportsUltrafastTier(model)) return "ultrafast";
+	return undefined;
+}
+
 export async function prewarmOpenAICodexResponses(
 	model: Model<"openai-codex-responses">,
 	options?: Pick<
 		OpenAICodexResponsesOptions,
-		"apiKey" | "headers" | "sessionId" | "signal" | "preferWebsockets" | "providerSessionState"
+		"apiKey" | "headers" | "sessionId" | "signal" | "preferWebsockets" | "providerSessionState" | "serviceTier"
 	>,
 ): Promise<void> {
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
@@ -2996,7 +3002,7 @@ export async function prewarmOpenAICodexResponses(
 		promptCacheKey,
 		"websocket",
 		state,
-		{ model: model.id, service_tier: undefined },
+		{ model: model.id, service_tier: resolveCodexRequestServiceTier(model, options?.serviceTier) },
 	);
 	const connectionPromise = logger.time(
 		"prewarmCodex:establishWs",
@@ -3328,11 +3334,6 @@ interface CodexWebSocketConnectionOptions {
 	idleTimeoutMs: number;
 	onHandshakeHeaders?: (headers: Headers) => void;
 }
-
-/** Request body fields to exclude from websocket chaining; ultrafast uses a separate serving path. */
-const CODEX_CHAIN_TOP_LEVEL_EXCLUDE_MAP = {
-	service_tier: true,
-} as const;
 
 class CodexWebSocketConnection {
 	#url: string;

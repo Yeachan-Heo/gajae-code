@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { codexRoutingHint } from "../src/providers/openai-codex/constants";
 import { withCodexRoutingFieldsFirst } from "../src/providers/openai-codex/request-transformer";
 
@@ -101,11 +101,6 @@ describe("Codex field ordering", () => {
 
 		const ordered = withCodexRoutingFieldsFirst(body);
 
-		expect(ordered.model).toBe("gpt-4o");
-		expect(ordered.type).toBe("response.create");
-		expect(ordered.input).toBeDefined();
-		expect(ordered.stream).toBeUndefined();
-		expect(ordered.service_tier).toBeUndefined();
-		expect(ordered.previous_response_id).toBeUndefined();
+		expect(Object.keys(ordered)).toEqual(["type", "model", "input"]);
 	});
 });
