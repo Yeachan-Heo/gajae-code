@@ -7293,6 +7293,9 @@ export class AgentSession {
 			},
 		});
 
+		// Restore goal mode state from the saved session branch during initialization.
+		this.#restoreGoalModeStateFromBranch();
+
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
 		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
@@ -20942,6 +20945,24 @@ export class AgentSession {
 			phase.tasks = phase.tasks.filter(t => t.status !== "completed" && t.status !== "abandoned");
 		}
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
+	}
+
+	/**
+	 * Restore goal mode state from the saved session branch during initialization.
+	 * When a session is resumed from a saved state, the goal mode information is
+	 * stored in the branch's mode_change entries, but it is not automatically
+	 * applied to the agent session. This function restores it.
+	 */
+	#restoreGoalModeStateFromBranch(): void {
+		const sessionContext = this.buildDisplaySessionContext();
+		const mode = sessionContext.mode;
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		if (savedGoal) {
+			this.setGoalModeState({ enabled: mode === "goal", mode: "active", goal: savedGoal });
+		}
 	}
 
 	async #compactionStateSnapshot(

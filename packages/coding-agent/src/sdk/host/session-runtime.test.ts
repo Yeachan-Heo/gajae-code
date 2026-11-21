@@ -736,6 +736,54 @@ describe("SDK goal snapshot lifecycle", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	test("preserves an active goal across session close and resume", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-resume-"));
+		try {
+			const sessionId = "session-with-active-goal";
+			const branch = [goalModeEntry(sessionId, 42)];
+
+			// Simulate resumed session with active goal in the branch
+			const resumedState = await queryGoalState(extensionContext(sessionId, cwd, { branch }), sessionId);
+
+			expect(resumedState).toMatchObject({
+				enabled: true,
+				mode: "active",
+				goal: {
+					status: "active",
+					tokensUsed: 42,
+				},
+			});
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves a paused goal across session close and resume", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-paused-resume-"));
+		try {
+			const sessionId = "session-with-paused-goal";
+			const goalEntry = goalModeEntry(sessionId, 100);
+			goalEntry.mode = "goal_paused";
+
+			// Simulate resumed session with paused goal in the branch
+			const resumedState = await queryGoalState(
+				extensionContext(sessionId, cwd, { branch: [goalEntry] }),
+				sessionId,
+			);
+
+			expect(resumedState).toMatchObject({
+				enabled: false, // paused means disabled
+				mode: "active", // but still has active goal
+				goal: {
+					status: "active",
+					tokensUsed: 100,
+				},
+			});
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
 
 test("preserves an agent failure code in host prompt reconciliation", async () => {
