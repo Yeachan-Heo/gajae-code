@@ -58,7 +58,7 @@ describe("AgentSession disposal with browser tab release timeout", () => {
 	});
 
 	it("handles browser tab release timeout gracefully during session dispose", async () => {
-		session = await createDisposableSession({ disposeTimeoutForTests: 500 });
+		session = await createDisposableSession();
 		session!.setDisposeTimeoutForTests(500);
 
 		// Simulate browser tab release hanging indefinitely
