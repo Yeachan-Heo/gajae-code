@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { computeHandledErrorFingerprint, NO_APP_FRAME } from "../src/crash-fingerprint";
-import { isCredentialKey, redactCrashSecrets } from "../src/crash-redaction";
+import { isCredentialKey, redactCrashSecrets, redactCrashSecretsForPreview } from "../src/crash-redaction";
 import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash, recordHandledError } from "../src/postmortem";
 
 const trackedTempDirs: string[] = [];
@@ -37,6 +37,173 @@ function spawnBun(script: string, options: { args?: string[]; env?: Record<strin
 		stderr: result.stderr.toString(),
 	};
 }
+
+describe("crash redaction classification", () => {
+	it("keeps a URI on the line after a bare auth cue instead of swallowing it", () => {
+		const text = "Token\npostgresql+asyncpg://app:synthetic@db.example.com/db";
+
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).toBe("Token\npostgresql+asyncpg://«redacted-url-credential»@db.example.com/db");
+		expect(redacted).not.toContain("synthetic");
+		expect(redacted).toContain("db.example.com/db");
+	});
+
+	it("recognizes a lower-case auth cue before a continuation value", () => {
+		const value = "abcdefghijopaquevalue";
+
+		const redacted = redactCrashSecrets(`bearer\n${value}`);
+
+		expect(redacted).toBe("bearer\n«redacted-auth»");
+		expect(redacted).not.toContain(value);
+	});
+
+	it("masks a basic-auth continuation whose token68 value ends in base64 padding", () => {
+		const token = "Zml4dHVyZTpwYXNzd29yZA==";
+
+		const redacted = redactCrashSecrets(`Basic\n${token}`);
+
+		expect(redacted).toBe("Basic\n«redacted-auth»");
+		expect(redacted).not.toContain(token);
+	});
+
+	it("still preserves a genuine key=value diagnostic after an auth cue", () => {
+		// The padding rule must not turn every assignment into a credential, nor every
+		// credential into a diagnostic.
+		expect(redactCrashSecrets("Token\ndiagnostic=keep-me")).toBe("Token\ndiagnostic=keep-me");
+		expect(redactCrashSecrets("Basic\nZml4dHVyZTpwYXNzd29yZA==\nnote: keep-me")).toContain("note: keep-me");
+	});
+
+	it("masks only the credential of a wrapped URI after an auth cue", () => {
+		const text = "Token\n_https://app:synthetic@db.example.com/db_";
+
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).toBe("Token\n_https://«redacted-url-credential»@db.example.com/db_");
+		expect(redacted).not.toContain("synthetic");
+		for (const kept of ["_https://", "«redacted-url-credential»@", "db.example.com/db_"])
+			expect(redacted).toContain(kept);
+	});
+
+	it("keeps an apostrophe in a plain scalar from ending the container early", () => {
+		const fixture = `wrapper: [don't, "ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(fixture);
+		expect(redacted).toContain("# keep-me");
+		expect(Bun.YAML.parse(redacted)).toEqual({
+			wrapper: ["don't", "ordinary secret: | continuation"],
+			public: "visible",
+		});
+	});
+
+	it("does not let a comment line open a container that hides a real block scalar", () => {
+		const fixture = `# wrapper: ["ignored\nsecret: |\n  SYNTHETIC_PASSWORD\npublic: 'text"]`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(`# wrapper: ["ignored\nsecret: |\n  «redacted»\npublic: 'text"]`);
+		expect(redacted).not.toContain("SYNTHETIC_PASSWORD");
+		expect(redacted).toContain(`public: 'text"]`);
+	});
+
+	it("accepts a quoted mapping key as a container bound", () => {
+		const fixture = `"wrapper": ["ordinary\n  secret: |\n    continuation"]\n    # keep-me\npublic: visible`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(fixture);
+		expect(redacted).toContain("# keep-me");
+	});
+
+	it("masks an auth continuation across an escaped line break", () => {
+		const value = "opaquecredential123";
+
+		expect(redactCrashSecrets(`{"code":"bearer\\n${value}"}`)).toBe('{"code":"bearer\\n«redacted-auth»"}');
+		expect(redactCrashSecrets(`{"code":"Basic\\nZml4dHVyZTpwYXNzd29yZA=="}`)).toBe(
+			'{"code":"Basic\\n«redacted-auth»"}',
+		);
+		expect(redactCrashSecrets(`{"note":"Token\\ndiagnostic=keep"}`)).toBe(`{"note":"Token\\ndiagnostic=keep"}`);
+	});
+
+	it("keeps a trailing diagnostic after a lower-case Authorization scheme", () => {
+		const redacted = redactCrashSecrets("Authorization: bearer opaquecredential123 diagnostic=keep");
+
+		expect(redacted).toBe("Authorization: «redacted-auth» diagnostic=keep");
+		expect(redacted).not.toContain("opaquecredential123");
+	});
+
+	it("keeps an inline comment from opening a container that hides a real block scalar", () => {
+		const fixture = `wrapper: visible # wrapper: ["ignored\nsecret: |\n  SYNTHETIC_PASSWORD\npublic: 'text"]'`;
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe(`wrapper: visible # wrapper: ["ignored\nsecret: |\n  «redacted»\npublic: 'text"]'`);
+		expect(redacted).not.toContain("SYNTHETIC_PASSWORD");
+	});
+
+	it("separates a padded continuation token from a following diagnostic", () => {
+		const token = "Zml4dHVyZTpwYXNzd29yZA==";
+
+		expect(redactCrashSecrets(`Basic\n${token} diagnostic=keep`)).toBe("Basic\n«redacted-auth» diagnostic=keep");
+		expect(redactCrashSecrets(`Basic\n${token} diagnostic=keep\npassword=opaque-one`)).toBe(
+			"Basic\n«redacted-auth» diagnostic=keep\npassword=«redacted»",
+		);
+	});
+
+	it("masks only the credential of a doubly wrapped URI after an auth cue", () => {
+		const redacted = redactCrashSecrets("Token\n**https://app:synthetic@db.example.com/db**");
+
+		expect(redacted).toBe("Token\n**https://«redacted-url-credential»@db.example.com/db**");
+		expect(redacted).not.toContain("synthetic");
+	});
+
+	it("stops an escaped continuation at the next serialized line break", () => {
+		const fixture = '{message:"fixture", code:{detail:"bearer\\nopaquecredential123\\ndiagnostic=keep"}}';
+
+		const redacted = redactCrashSecrets(fixture);
+
+		expect(redacted).toBe('{message:"fixture", code:{detail:"bearer\\n«redacted-auth»\\ndiagnostic=keep"}}');
+		expect(redacted).not.toContain("opaquecredential123");
+	});
+
+	it("keeps an assignment continuation in the raw and serialized shapes", () => {
+		const raw = "Basic\ndiagnostic= keep";
+		const serialized = '{"code":{"detail":"Basic\\ndiagnostic= keep"}}';
+		const token = "Zml4dHVyZTpwYXNzd29yZA==";
+
+		expect(redactCrashSecrets(raw)).toBe(raw);
+		expect(redactCrashSecrets(serialized)).toBe(serialized);
+		// The positive shape is unchanged: a padded token in the same place is still masked, and
+		// the diagnostic after it is still kept.
+		expect(redactCrashSecrets(`{"code":{"detail":"Basic\\n${token} diagnostic=keep"}}`)).toBe(
+			`{"code":{"detail":"Basic\\n«redacted-auth» diagnostic=keep"}}`,
+		);
+	});
+
+	it("bounds an unpaired private-key replacement to the body it owns", () => {
+		const nested = '{message:"fixture", code:{detail:"-----BEGIN RSA PRIVATE KEY-----\\nBODY", note:"keep-me"}}';
+		const prose = '{code:"PEM example: -----BEGIN RSA PRIVATE KEY-----; diagnostic=keep"}';
+
+		expect(redactCrashSecretsForPreview(nested)).toBe(
+			'{message:"fixture", code:{detail:"«redacted-private-key»", note:"keep-me"}}',
+		);
+		expect(redactCrashSecretsForPreview(prose)).toBe('{code:"PEM example: «redacted-private-key»; diagnostic=keep"}');
+	});
+
+	it("redacts a secret spanning across fatal message and stderr context in one pass", () => {
+		// Regression test for a key split across message and stderr context being emitted.
+		// Combined redaction ensures secrets spanning boundaries are properly masked.
+		const text = `Error: api_key=secret_xyz_subsequent_part123`;
+
+		// When redacted together, the entire secret should be masked
+		const redacted = redactCrashSecrets(text);
+		expect(redacted).not.toContain("secret_xyz_");
+		expect(redacted).not.toContain("subsequent_part");
+		expect(redacted).toContain("«redacted»");
+	});
+});
 
 describe("recordFatalCrash", () => {
 	it("writes a structured, diagnosable record for an Error", () => {
@@ -119,6 +286,26 @@ describe("recordFatalCrash", () => {
 		const contents = fs.readFileSync(target, "utf8");
 		expect(contents).not.toContain(token);
 		expect(contents).toContain("«redacted-auth»");
+	});
+
+	it("keeps the host and trailing note when a private-key block sits inside URL userinfo", () => {
+		const target = tempCrashLog();
+		const fixture =
+			"https://db.example.com(-----BEGIN RSA PRIVATE KEY-----\nBODY\n-----END RSA PRIVATE KEY-----)@note";
+
+		expect(recordFatalCrash("Uncaught Exception", { message: "fixture", code: fixture }, { path: target })).toBe(
+			target,
+		);
+		const contents = fs.readFileSync(target, "utf8");
+		const lines = contents.split("\n");
+
+		// The header, the captured payload and the identity marker stay adjacent on their own lines.
+		expect(lines[0]).toContain("[Uncaught Exception] Error: fixture");
+		expect(lines[1]).toBe('{"code":"https://db.example.com(«redacted-private-key»)@note"}');
+		expect(lines[2]).toStartWith("gjc-crash-record.v1 ");
+		expect(contents).not.toContain("BODY");
+		expect(contents).toContain("db.example.com");
+		expect(contents).toContain("@note");
 	});
 
 	it("keeps frame lines when the header ends in a labeled credential", () => {
@@ -216,6 +403,187 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('"phase":"startup"');
 		expect(contents).toContain('"reason":"pending"');
 		expect(contents).toContain("SDK startup did not complete before readiness cutoff.");
+	});
+
+	it("masks a PEM body in an oversized object that serves as the message", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = {
+			code: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}\n-----END RSA PRIVATE KEY-----`,
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).toContain('Error: {"code":"«redacted-private-key»"}');
+	});
+
+	it("masks a URL credential beyond the captured preview bound", () => {
+		const target = tempCrashLog();
+		const password = "SYNTHETIC_PASSWORD";
+		const reason = {
+			message: "fixture",
+			code: `${"x".repeat(4030)} https://app:${password}${"a".repeat(40)}@db.example.com/db`,
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(password);
+		// The non-secret context around the credential is still printed.
+		expect(contents).toContain(`{"code":"${"x".repeat(64)}`);
+		expect(contents).toContain("https://«redacted-url-credential»");
+		expect(contents).toContain("db.example.com/db");
+	});
+
+	it("masks a PEM body inside an oversized captured object", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = {
+			message: "fixture",
+			code: {
+				detail: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}\n-----END RSA PRIVATE KEY-----`,
+			},
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).not.toContain("BEGIN RSA PRIVATE KEY");
+		expect(contents).toContain('{"code":{"detail":"«redacted-private-key»"}}');
+	});
+
+	it("masks an oversized captured string whose PEM footer falls outside the preview", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = {
+			message: "fixture",
+			code: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}\n-----END RSA PRIVATE KEY-----`,
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).toContain('{"code":"«redacted-private-key»"}');
+	});
+
+	it("masks a captured field whose private-key banner has no footer at all", () => {
+		const target = tempCrashLog();
+		const sentinel = "PEM_BODY_SENTINEL";
+		const reason = { message: "fixture", code: `-----BEGIN RSA PRIVATE KEY-----\n${sentinel}\n${"A".repeat(4100)}` };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(sentinel);
+		expect(contents).toContain('{"code":"«redacted-private-key»"}');
+	});
+
+	it("keeps a nested sibling after an unpaired private-key body and emits valid JSON", () => {
+		const target = tempCrashLog();
+		const reason = {
+			message: "fixture",
+			code: { detail: "-----BEGIN RSA PRIVATE KEY-----\nBODY", note: "keep-me" },
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		const payload = contents.split("\n").find(line => line.startsWith('{"code"'));
+
+		expect(payload).toBe('{"code":{"detail":"«redacted-private-key»","note":"keep-me"}}');
+		expect(JSON.parse(payload as string)).toEqual({ code: { detail: "«redacted-private-key»", note: "keep-me" } });
+	});
+
+	it("keeps a comma-separated note after an unpaired private-key body", () => {
+		const target = tempCrashLog();
+		const body = "Qk9EWUJPRFlCT0RZQk9EWQ==";
+		// Two trailing spaces on the banner and a base64 body: a comma in the still-open JSON
+		// string used to close the value, so the body scan erased `Note` as if it were body.
+		const reason = {
+			message: "fixture",
+			code: { detail: `-----BEGIN RSA PRIVATE KEY-----  \n${body}\nNote, keep`, note: "keep-me" },
+		};
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		const payload = JSON.parse(contents.split("\n").find(line => line.startsWith('{"code"')) as string);
+
+		expect(payload).toEqual({ code: { detail: "«redacted-private-key»\nNote, keep", note: "keep-me" } });
+		expect(payload.code.detail).not.toContain(body);
+	});
+
+	it("keeps prose after an unpaired private-key banner", () => {
+		const target = tempCrashLog();
+		const reason = { code: "PEM example: -----BEGIN RSA PRIVATE KEY-----; diagnostic=keep" };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).toContain('{"code":"PEM example: «redacted-private-key»; diagnostic=keep"}');
+	});
+
+	it("masks an auth continuation inside a nested string of a captured object field", () => {
+		const target = tempCrashLog();
+		const value = "opaquecredential123";
+		const reason = { message: "fixture", code: { detail: `bearer\n${value}` } };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(value);
+		expect(contents).toContain('"detail":"bearer\\n«redacted-auth»"');
+	});
+
+	it("keeps the diagnostic after an escaped continuation in a nested string", () => {
+		const target = tempCrashLog();
+		const reason = { message: "fixture", code: { detail: "bearer\nopaquecredential123\ndiagnostic=keep" } };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain("opaquecredential123");
+		expect(contents).toContain('"detail":"bearer\\n«redacted-auth»\\ndiagnostic=keep"');
+	});
+
+	it("keeps a diagnostic assignment that opens a nested captured string", () => {
+		const target = tempCrashLog();
+		const reason = { message: "fixture", code: { detail: "Basic\ndiagnostic= keep" } };
+
+		expect(recordFatalCrash("Uncaught Exception", reason, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		const payload = contents.split("\n").find(line => line.startsWith('{"code"'));
+
+		expect(payload).toBe('{"code":{"detail":"Basic\\ndiagnostic= keep"}}');
+		expect(JSON.parse(payload as string)).toEqual({ code: { detail: "Basic\ndiagnostic= keep" } });
+	});
+
+	it("masks an auth continuation inside a captured string field", () => {
+		const target = tempCrashLog();
+		const value = "opaquecredential123";
+
+		expect(
+			recordFatalCrash("Uncaught Exception", { message: "fixture", code: `bearer\n${value}` }, { path: target }),
+		).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(value);
+		expect(contents).toContain('{"code":"bearer\\n«redacted-auth»"}');
+	});
+
+	it("masks a token68 continuation inside a captured string field", () => {
+		const target = tempCrashLog();
+		const value = "YWJjZGVmZw==";
+
+		expect(
+			recordFatalCrash("Uncaught Exception", { message: "fixture", code: `bearer\n${value}` }, { path: target }),
+		).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+
+		expect(contents).not.toContain(value);
+		expect(contents).toContain('{"code":"bearer\\n«redacted-auth»"}');
 	});
 
 	it("still records a throwable that cannot be serialized", () => {
@@ -630,6 +998,65 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("credentials=«redacted»");
 		expect(contents).toContain("secrets=«redacted»");
 		expect(contents).toContain('metadata=["public"]');
+	});
+
+	it("masks a credential container whose only private-key footer cannot complete a block", () => {
+		// The block and the container are both detected on the original text, so the footer inside
+		// the container still closes the block instead of the container hiding it from a later pass.
+		// Both masks are absent, and the lines around them keep their text and line structure.
+		const blockFirst = `safe-before=keep\n-----BEGIN PRIVATE KEY-----\nBODY\nsecret={"footer":"-----END PRIVATE KEY-----","payload":"OPAQUE_TAIL"}\nsafe-after=keep\nline4=still-here`;
+		const footerHolder = `body=-----BEGIN PRIVATE KEY-----\nBODY_TEXT\nholder={"footer":"-----END PRIVATE KEY-----"}`;
+
+		const blockRedacted = redactCrashSecrets(blockFirst);
+		expect(blockRedacted).not.toContain("BODY");
+		expect(blockRedacted).not.toContain("OPAQUE_TAIL");
+		expect(blockRedacted).not.toContain("footer");
+		expect(blockRedacted.split("\n")).toEqual([
+			"safe-before=keep",
+			"«redacted-private-key»",
+			"safe-after=keep",
+			"line4=still-here",
+		]);
+		expect(redactCrashSecrets(footerHolder)).not.toContain("BODY_TEXT");
+		expect(redactCrashSecrets(footerHolder)).not.toContain("END PRIVATE KEY");
+
+		// One detection pass pairs the opener with the first footer it can see. That block and the
+		// container it contains are masked; the unrelated line after them is left verbatim, and the
+		// orphan footer carries no key material.
+		const secondFooter = `-----BEGIN PRIVATE KEY-----\nsecret={"footer":"-----END PRIVATE KEY-----"}\nOPAQUE_LINE\n-----END PRIVATE KEY-----`;
+		const secondRedacted = redactCrashSecrets(secondFooter);
+		expect(secondRedacted).not.toContain("BEGIN PRIVATE KEY");
+		expect(secondRedacted).toContain("OPAQUE_LINE");
+
+		// A YAML block scalar under a credential name holds the footer, so its body is part of the
+		// same removal even though the scalar sits between the opener and the footer.
+		const yamlScalar = `-----BEGIN PRIVATE KEY-----\npassword: |\n  -----END PRIVATE KEY-----\n  OPAQUE_YAML_TAIL\nnote=keep`;
+		expect(redactCrashSecrets(yamlScalar)).not.toContain("OPAQUE_YAML_TAIL");
+		expect(redactCrashSecrets(yamlScalar)).toContain("note=keep");
+
+		// An opening banner hidden inside a credential scalar is not a block opener: the scan
+		// pairs the real block further down and the diagnostics between them stay.
+		const hiddenOpener = `password: |\n  -----BEGIN PRIVATE KEY-----\n  placeholder\nnote=keep\n-----BEGIN PRIVATE KEY-----\nBODY\n-----END PRIVATE KEY-----`;
+		expect(redactCrashSecrets(hiddenOpener)).toContain("note=keep");
+		expect(redactCrashSecrets(hiddenOpener)).not.toContain("BODY");
+	});
+
+	it("redacts a key body whose footer the container give-up removed", () => {
+		// The container scan runs out of lookahead among unclosed assignments and masks the rest,
+		// which also removes the footer the block needs. The block body must not survive that.
+		const text = `-----BEGIN PRIVATE KEY-----\nSYNTHETIC_PEM_BODY\n${"password={\n".repeat(100)}-----END PRIVATE KEY-----\nordinary tail`;
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).not.toContain("SYNTHETIC_PEM_BODY");
+		expect(redacted).toBe("«redacted»");
+	});
+
+	it("redacts URL userinfo whose authority delimiter the container give-up removed", () => {
+		const text = `${"secret={\n".repeat(9)}https://fixture-user:OPAQUE_USERINFO:secret={${"A".repeat(1024)}}@example.test`;
+		const redacted = redactCrashSecrets(text);
+
+		expect(redacted).not.toContain("OPAQUE_USERINFO");
+		expect(redacted).toBe("«redacted»");
 	});
 
 	it("preserves later diagnostics after an unterminated credential container", () => {
@@ -1190,6 +1617,7 @@ after=keep`;
 		const wrappedUrlSecret = "wrapped-s3cr3t";
 		const rawAtUrlPassword = "correct@horse";
 		const longSchemeUrlPassword = "opaque-database-password";
+		const tokenPrefixedUrlPassword = "token-prefixed-url-password";
 		const err = new Error(
 			[
 				`fetch failed: ${googleApiKey} ${trailingHyphenGoogleApiKey}`,
@@ -1198,6 +1626,7 @@ after=keep`;
 				`wrapped: _https://deploy:${wrappedUrlSecret}@git.example.com/x.git_`,
 				`raw-at: https://alice:${rawAtUrlPassword}@example.com/repo.git?keep=1`,
 				`database: postgresql+asyncpg://alice:${longSchemeUrlPassword}@example.com/db`,
+				`token-url: Token postgres://app:${tokenPrefixedUrlPassword}@example.com/db`,
 				`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
 			].join(" "),
 		);
@@ -1214,14 +1643,17 @@ after=keep`;
 		expect(contents).not.toContain(wrappedUrlSecret);
 		expect(contents).not.toContain(rawAtUrlPassword);
 		expect(contents).not.toContain(longSchemeUrlPassword);
+		expect(contents).not.toContain(tokenPrefixedUrlPassword);
 		expect(contents).not.toContain(pemBody);
 		expect(contents).toContain("«redacted-google-api-key»");
 		expect(contents).toContain("«redacted-private-key»");
-		// Scheme and host stay readable so the record still says which remote failed.
+		// Scheme and host stay readable so the record still says which remote failed. The `Token`
+		// label itself is context, not a credential value, and must not consume the scheme word.
 		expect(contents).toContain("https://«redacted-url-credential»@git.example.com");
 		expect(contents).toContain("_https://«redacted-url-credential»@git.example.com/x.git_");
 		expect(contents).toContain("raw-at: https://«redacted-url-credential»@example.com/repo.git?keep=1");
 		expect(contents).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
+		expect(contents).toContain("token-url: Token postgres://«redacted-url-credential»@example.com/db");
 	});
 
 	it("scans a large credential-free crash body in linear time", () => {

@@ -77,6 +77,12 @@ export interface CrashFingerprintOptions {
 	readonly installRoot?: string;
 	/** Home directory used for `<home>` substitution. Defaults to `os.homedir()`. */
 	readonly homeDir?: string;
+	/**
+	 * The name and message are already the masked text a record persists. The v2 identity then
+	 * normalizes them without running detection a second time over its own output. Ignored for v1,
+	 * whose historical identity must reproduce the redaction it was written with.
+	 */
+	readonly alreadyMasked?: boolean;
 }
 
 /**
@@ -142,6 +148,17 @@ export function normalizeCrashMessage(message: string, options: CrashFingerprint
 
 function normalizeCrashMessageV1(message: string, options: CrashFingerprintOptions = {}): string {
 	return normalizeCrashMessageWithRedactor(message, options, redactCrashSecretsV1);
+}
+
+function normalizeMessageForVersion(message: string, options: CrashFingerprintOptions, version: number): string {
+	if (version === CRASH_FINGERPRINT_VERSION_V1) return normalizeCrashMessageV1(message, options);
+	return options.alreadyMasked
+		? normalizeCrashMessageWithRedactor(message, options, identity)
+		: normalizeCrashMessage(message, options);
+}
+
+function identity(text: string): string {
+	return text;
 }
 
 function normalizeCrashMessageWithRedactor(
@@ -245,9 +262,8 @@ function computeFingerprint(
 	includeMessage: boolean,
 	version: number,
 ): CrashFingerprint {
-	const normalizeMessage = version === CRASH_FINGERPRINT_VERSION_V1 ? normalizeCrashMessageV1 : normalizeCrashMessage;
-	const fingerprintErrorName = truncateUtf8(normalizeMessage(input.name, options) || "Error", 128);
-	const fingerprintMessageClass = normalizeMessage(input.message, options);
+	const fingerprintErrorName = truncateUtf8(normalizeMessageForVersion(input.name, options, version) || "Error", 128);
+	const fingerprintMessageClass = normalizeMessageForVersion(input.message, options, version);
 	const errorName =
 		version === CRASH_FINGERPRINT_VERSION_V1
 			? truncateUtf8(normalizeCrashMessage(input.name, options) || "Error", 128)

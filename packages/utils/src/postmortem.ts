@@ -25,7 +25,12 @@ import {
 } from "./crash-fingerprint";
 import type { CrashProvenance } from "./crash-journal";
 import { appendCrashEvent, appendFatalCrashEvent, detectCrashProvenance } from "./crash-journal";
-import { redactCrashSecrets } from "./crash-redaction";
+import {
+	type MaskedCrashText,
+	maskStructured,
+	redactCrashSecrets,
+	redactCrashSecretsForPreview,
+} from "./crash-redaction";
 import { getCrashEventsPath, getCrashLogPath, getHandledErrorEventsPath, getHandledErrorLogPath } from "./dirs";
 import { isDesignedError } from "./error-classification";
 import * as logger from "./logger";
@@ -266,7 +271,10 @@ type FieldRead =
 	| { readonly kind: "value"; readonly value: unknown };
 
 interface CapturedPayload {
+	/** Complete raw fields, each bounded; identity and message text for the record. */
 	readonly serialized: string;
+	/** The same fields masked in full and then cut to the preview bound; the printed payload. */
+	readonly masked: string;
 }
 
 /** Reads one top-level field exactly once and keeps both its value and refusal state. */
@@ -286,51 +294,75 @@ function capturedValue(field: FieldRead): unknown {
 }
 
 function boundedJsonString(value: string): string {
-	const redacted = redactCrashSecrets(value);
-	if (Buffer.byteLength(JSON.stringify(redacted), "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES)
-		return JSON.stringify(redacted);
+	const serialized = JSON.stringify(value);
+	if (Buffer.byteLength(serialized, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) return serialized;
 
 	let low = 0;
-	let high = redacted.length;
+	let high = value.length;
 	while (low < high) {
 		const midpoint = Math.ceil((low + high) / 2);
-		const candidate = JSON.stringify(`${redacted.slice(0, midpoint)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
+		const candidate = JSON.stringify(`${value.slice(0, midpoint)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
 		if (Buffer.byteLength(candidate, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) low = midpoint;
 		else high = midpoint - 1;
 	}
 	let end = low;
-	if (end > 0 && /[\uD800-\uDBFF]/.test(redacted[end - 1] ?? "")) end--;
-	return JSON.stringify(`${redacted.slice(0, end)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
+	if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1] ?? "")) end--;
+	return JSON.stringify(`${value.slice(0, end)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
 }
 
 /**
- * Serializes one already-captured diagnostic value. Credential shapes are
- * redacted before output, and oversized fields become a bounded string preview
- * so one request body cannot evict the remaining crash context.
+ * Serializes one already-captured diagnostic value twice: the bounded raw text the record keeps
+ * for identity, and the printed preview. The preview's field text is classified in full once and
+ * then cut, because a cut made first can drop the `@` that ends a URL's userinfo or the footer of
+ * a private-key block, leaving bytes no detector can recognize. The masked text is never fed back
+ * into a detector; the record's header and stack are classified separately at format time.
  */
-function serializeCapturedValue(value: unknown): string {
-	if (value === undefined) return JSON.stringify(UNDEFINED_FIELD);
-	if (typeof value === "string") return boundedJsonString(value);
+function serializeCapturedValue(value: unknown): { serialized: string; masked: string } {
+	if (value === undefined) return capturedStringField(UNDEFINED_FIELD);
+	if (typeof value === "string") return capturedStringField(value);
 
 	try {
 		const serialized = JSON.stringify(value);
-		if (typeof serialized !== "string") return boundedJsonString(String(value));
-		const redacted = redactCrashSecrets(serialized);
-		if (Buffer.byteLength(redacted, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) return redacted;
-		return boundedJsonString(redacted);
+		if (typeof serialized !== "string") return capturedStringField(String(value));
+		return capturedSerializedField(serialized);
 	} catch {
 		try {
-			return boundedJsonString(String(value));
+			return capturedStringField(String(value));
 		} catch {
-			return JSON.stringify(UNREADABLE_FIELD);
+			return capturedStringField(UNREADABLE_FIELD);
 		}
 	}
 }
 
+/** A field whose value is a string: both forms are JSON string literals. */
+function capturedStringField(value: string): { serialized: string; masked: string } {
+	return { serialized: boundedJsonString(value), masked: boundedJsonString(maskCompleteFieldText(value)) };
+}
+
+/** A field already serialized as JSON text: both forms keep the same representation. */
+function capturedSerializedField(serialized: string): { serialized: string; masked: string } {
+	return { serialized: boundedSerialized(serialized), masked: boundedSerialized(maskCompleteFieldText(serialized)) };
+}
+
+function boundedSerialized(text: string): string {
+	return Buffer.byteLength(text, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES ? text : boundedJsonString(text);
+}
+
 /**
- * Captures only stable diagnostic context. Arbitrary request objects and bodies
- * are intentionally excluded: they are large, routinely contain credentials,
- * and add less crash value than transport, process, and lifecycle metadata.
+ * Mask one complete field text in the single classification pass. An opener with no footer is
+ * detected on this original text and replaced only up to the body it owns, so a preview never
+ * rescans its own masked output and never deletes a sibling after the block.
+ */
+function maskCompleteFieldText(value: string): string {
+	return redactCrashSecretsForPreview(value);
+}
+
+/**
+ * Captures only stable diagnostic context. Each field is classified in full before its preview is
+ * cut, and the masked preview is never fed back into a detector; the record's header and stack are
+ * classified separately when it is written. Arbitrary request objects and bodies are intentionally
+ * excluded: they are large, routinely contain credentials, and add less crash value than
+ * transport, process, and lifecycle metadata.
  */
 function capturePayload(reason: object): CapturedPayload | undefined {
 	let keys: string[];
@@ -341,12 +373,15 @@ function capturePayload(reason: object): CapturedPayload | undefined {
 	}
 
 	const properties: string[] = [];
+	const maskedProperties: string[] = [];
 	for (const key of keys) {
 		if (!CRASH_CONTEXT_FIELDS.has(key)) continue;
-		const serialized = serializeCapturedValue(capturedValue(readField(reason, key, true)));
-		properties.push(`${JSON.stringify(key)}:${serialized}`);
+		const captured = serializeCapturedValue(capturedValue(readField(reason, key, true)));
+		properties.push(`${JSON.stringify(key)}:${captured.serialized}`);
+		maskedProperties.push(`${JSON.stringify(key)}:${captured.masked}`);
 	}
-	return properties.length > 0 ? { serialized: `{${properties.join(",")}}` } : undefined;
+	if (properties.length === 0) return undefined;
+	return { serialized: `{${properties.join(",")}}`, masked: `{${maskedProperties.join(",")}}` };
 }
 
 function fieldText(field: FieldRead, fallback: string): string {
@@ -360,11 +395,14 @@ function fieldText(field: FieldRead, fallback: string): string {
 	}
 }
 
-/** A throwable reduced to captured text; the rest of this module reads nothing else. */
+/** A throwable reduced to captured text; formatting redacts the header and stack once. */
 interface FatalDiagnostic {
 	name: string;
 	message: string;
+	/** True when `message` is captured payload output that was already masked at capture. */
+	messageIsMasked?: boolean;
 	stack: string;
+	/** Captured context, masked in full and cut to the per-field preview bound. */
 	payload?: string;
 }
 
@@ -410,9 +448,10 @@ function describeFatal(reason: unknown): FatalDiagnostic {
 
 		return {
 			name,
-			message: payloadIsMessage ? payload.serialized : message,
+			message: payloadIsMessage ? payload.masked : message,
+			messageIsMasked: payloadIsMessage ? true : undefined,
 			stack,
-			payload: payloadIsMessage ? undefined : payload?.serialized,
+			payload: payloadIsMessage ? undefined : payload?.masked,
 		};
 	} catch {
 		return { name: "Error", message: UNREADABLE_THROWABLE, stack: "" };
@@ -436,6 +475,8 @@ function formatFatalError(label: string, fatal: FatalDiagnostic): string {
 	const stackLines = fatal.stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
 	const formattedPayload = fatal.payload ? `\n${fatal.payload}` : "";
+	// Redact the entire combined diagnostic in one pass to ensure secrets spanning across
+	// message, stack, and payload boundaries are properly masked.
 	return boundCrashRecord(
 		redactCrashSecrets(`\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}${formattedPayload}\n`),
 	);
@@ -542,7 +583,9 @@ export function recordHandledError(
 		)
 			return undefined;
 		const fatal = describeFatal(error);
-		const fingerprint = computeHandledErrorFingerprint(persistedCrashInput(fatal)).fingerprint;
+		// Persisted fields are already masked; the identity consumes them without detecting again.
+		const persisted = persistedCrashInput(fatal);
+		const fingerprint = computeHandledErrorFingerprint(persisted, { alreadyMasked: true }).fingerprint;
 		if (handledErrorFingerprints.has(fingerprint)) {
 			// Still hot: dedupe, but refresh recency so an actively failing class
 			// is not the one evicted under pressure.
@@ -558,7 +601,7 @@ export function recordHandledError(
 		const written = writeCrashRecord(label, fatal, {
 			path: options.path ?? getHandledErrorLogPath(),
 			now: options.now,
-			fingerprint: computeHandledErrorFingerprint(persistedCrashInput(fatal)),
+			fingerprint: computeHandledErrorFingerprint(persisted, { alreadyMasked: true }),
 		});
 		if (!written) {
 			handledErrorFingerprints.delete(fingerprint);
@@ -624,15 +667,13 @@ function getHandledErrorEventsTarget(target: string, configuredPath: string | un
 function crashLogStack(name: string, message: string, stack: string): string {
 	const allControls = /[\u0000-\u001f\u007f-\u009f]/g;
 	const frameControls = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
-	const redacted = redactCrashSecrets(stack);
-	const preserved = preserveFrameBoundary(
-		stack,
-		redacted,
-		headerBoundary(name, message, stack),
-		allControls,
-		frameControls,
-	);
-	return preserved ?? redacted.replace(allControls, " ");
+	const masked = maskStructured(stack);
+	const boundary = headerBoundary(name, message, stack);
+	const preserved =
+		boundary === undefined || boundary <= 0 || boundary > stack.length
+			? undefined
+			: flattenAtFrameBoundary(masked, boundary, allControls, frameControls);
+	return preserved ?? masked.text.replace(allControls, " ");
 }
 
 function headerBoundary(name: string, message: string, stack: string): number | undefined {
@@ -648,25 +689,35 @@ function headerBoundary(name: string, message: string, stack: string): number | 
 	return first === name ? newline : undefined;
 }
 
-function preserveFrameBoundary(
-	stack: string,
-	redacted: string,
-	boundary: number | undefined,
+/**
+ * Flatten the header's control characters while keeping the frame newlines in the tail. The
+ * classification already ran over the whole original stack; only the boundary is resolved here.
+ * A replacement that crosses the boundary has no clean split, so the caller flattens everything.
+ */
+function flattenAtFrameBoundary(
+	masked: MaskedCrashText,
+	boundary: number,
 	allControls: RegExp,
 	frameControls: RegExp,
 ): string | undefined {
-	if (boundary === undefined || boundary <= 0 || boundary > stack.length) return undefined;
-	const head = redactCrashSecrets(stack.slice(0, boundary));
-	const tail = redactCrashSecrets(stack.slice(boundary));
-	if (head + tail !== redacted) return undefined;
-	return `${head.replace(allControls, " ")}${redacted.slice(head.length).replace(frameControls, " ")}`;
+	let outputBoundary = boundary;
+	for (const mask of masked.masks) {
+		if (mask.start < boundary && mask.end > boundary) return undefined;
+		// A replacement shortens the text by its input span minus the label it prints.
+		if (mask.end <= boundary) outputBoundary -= mask.end - mask.start - mask.label.length;
+	}
+	const head = masked.text.slice(0, outputBoundary).replace(allControls, " ");
+	const tail = masked.text.slice(outputBoundary).replace(frameControls, " ");
+	return `${head}${tail}`;
 }
 
 /** The name, message, and stack strings that the crash log actually stores. */
 function persistedCrashInput(fatal: FatalDiagnostic): CrashFingerprintInput {
+	// A payload used as the message was masked at capture, so its markers are final.
+	const message = fatal.messageIsMasked ? fatal.message : redactCrashSecrets(fatal.message);
 	return {
 		name: redactCrashSecrets(fatal.name).replace(/[\u0000-\u001f\u007f-\u009f]/g, " "),
-		message: redactCrashSecrets(fatal.message).replace(/[\u0000-\u001f\u007f-\u009f]/g, " "),
+		message: message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "),
 		stack: fatal.stack ? crashLogStack(fatal.name, fatal.message, fatal.stack) : "",
 	};
 }
@@ -681,9 +732,10 @@ function writeCrashRecord(
 		const now = options.now ?? new Date();
 		const persisted = persistedCrashInput(fatal);
 		const stack = persisted.stack ? `${persisted.stack}\n` : "";
-		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
-		// The marker must match the diagnostic a reader rebuilds from this text.
-		const fingerprint = options.fingerprint ?? computeCrashFingerprint(persisted);
+		const payload = fatal.payload ? `${fatal.payload}\n` : "";
+		// The marker must match the diagnostic a reader rebuilds from this text. The persisted
+		// fields are already masked, so the fingerprint consumes them without re-running detection.
+		const fingerprint = options.fingerprint ?? computeCrashFingerprint(persisted, { alreadyMasked: true });
 		const recordId = randomBytes(8).toString("hex");
 		const markerLine = `${formatCrashRecordMarker(fingerprint.fingerprint, fingerprint.version, recordId)}\n`;
 		// The marker is the record's identity, so it is budgeted first and appended
