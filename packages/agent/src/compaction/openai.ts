@@ -18,6 +18,7 @@ import {
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@gajae-code/ai/providers/openai-codex/constants";
+import { moveCodexInstructionsToInput } from "@gajae-code/ai/providers/openai-codex/request-transformer";
 import { parseTextSignature } from "@gajae-code/ai/providers/openai-responses-shared";
 import { transformMessages } from "@gajae-code/ai/providers/transform-messages";
 import type { AssistantMessage, Message, Model } from "@gajae-code/ai/types";
@@ -59,7 +60,9 @@ export interface OpenAiRemoteCompactionPreserveData {
 export interface OpenAiRemoteCompactionRequest {
 	model: string;
 	input: Array<Record<string, unknown>>;
-	instructions: string;
+	instructions?: string;
+	prompt_cache_key?: string;
+	[key: string]: unknown;
 }
 
 export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {}
@@ -526,6 +529,13 @@ export async function requestOpenAiRemoteCompaction(
 		Authorization: `Bearer ${apiKey}`,
 		...(model.headers ?? {}),
 	};
+
+	// codex-rs routes `/responses/compact` through `build_responses_request`:
+	// instructions always ride as a leading input item with the base-instructions tag.
+	// (non-codex providers ignore moveCodexInstructionsToInput for instructions fields)
+	if (model.provider === "openai-codex" || model.provider === "openai") {
+		moveCodexInstructionsToInput(request as any);
+	}
 
 	// OpenAI code backend endpoints require additional auth headers
 	if (model.provider === "openai-codex") {

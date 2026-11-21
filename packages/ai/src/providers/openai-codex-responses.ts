@@ -1026,14 +1026,18 @@ async function buildTransformedCodexRequestBody(
 	}
 
 	// Neutralize leaked Harmony control tokens in the system prompt too:
-	// System prompts are sent as developer messages so they are prompt-cached.
+	// System prompts are sent as developer messages (or as base instructions) so they are prompt-cached.
 	// The top-level `instructions` field is not cached by the Codex backend,
-	// so we pass all system prompts through the `input` array as developer messages.
+	// so we pass the first system prompt as `instructions` for moveCodexInstructionsToInput to handle,
+	// and additional system prompts through developerMessages.
 	// Developer messages prepended inside `transformRequestBody` bypass the `input`
 	// sanitizer above, so neutralization is still required. A poisoned system
 	// prompt would reject every turn with `Request blocked (code=invalid_prompt)`.
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt).map(neutralizeReservedControlTokens);
-	const developerMessages = systemPrompts;
+	if (systemPrompts.length > 0) {
+		params.instructions = systemPrompts[0];
+	}
+	const developerMessages = systemPrompts.slice(1);
 	const codexOptions: CodexRequestOptions = {
 		reasoningEffort: options?.reasoning,
 		reasoningSummary: options?.reasoningSummary ?? "auto",
