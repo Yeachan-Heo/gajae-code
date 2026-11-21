@@ -222,21 +222,27 @@ checkout you open, not just this repository or Sem. Setting it to `false` is not
 the equivalent of leaving it alone — `false` disables *every* project-scope MCP
 source, including project HTTP and SSE servers that load by default.
 
-After the example, restore the setting to its prior state. If you recorded that
-it was unset (empty output), you can simply leave it unset by not setting it
-again in future sessions. If you recorded a prior value, restore it:
+After the example, restore the setting to its prior state. Do one of the
+following based on what you recorded:
 
-```bash
-# Restore to the prior value you recorded (e.g., 'true' or 'false').
-gjc config set mcp.enableProjectConfig <prior-value>
-```
+- **If the prior value was unset** (empty output from `gjc config get`):
+  ```bash
+  # Unset the key to restore the original state.
+  gjc config unset mcp.enableProjectConfig
+  ```
+
+- **If the prior value was set to a specific value** (e.g., 'true' or 'false'):
+  ```bash
+  # Restore to that value.
+  gjc config set mcp.enableProjectConfig <prior-value>
+  ```
 
 **Important:** The `gjc config reset` command is not the correct cleanup. The
 setting has a schema default of `false`, so `reset` writes an explicit `false`
 value, which disables every project-scope MCP source everywhere (including
 project HTTP and SSE servers that load by default), not the desired unset
-behavior. Always restore to the prior value you recorded, or leave it unset
-if it was previously unset.
+behavior. Always explicitly restore to the prior value you recorded, or unset
+the key if it was previously unset.
 
 ### Optional: preview overlapping branch changes with Weave
 
