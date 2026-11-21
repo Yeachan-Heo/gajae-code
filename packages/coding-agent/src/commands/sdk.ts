@@ -1950,6 +1950,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		return;
 	}
 	const agentDir = path.resolve(internal.agentDir);
+	const spawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 	let broker: Broker | undefined;
 	let runningBroker: Broker | undefined;
 	let stopSweep: (() => void) | undefined;
@@ -2107,7 +2108,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			return;
 		}
 		startupAbortController.abort();
-		await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+		await exitDuringStartup(
+			"startup-signal",
+			startupSignalExitCode(signal),
+			signal,
+			undefined,
+			undefined,
+			undefined,
+			spawnAttemptNonce,
+		);
 		// Startup may remain blocked in awaited I/O after abort. Bound best-effort
 		// rollback so shared postmortem can exit with the original signal status.
 		await waitForStartupAbortCleanup();
@@ -2115,7 +2124,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 	const finishPendingStartupSignal = async (): Promise<boolean> => {
 		const signal = pendingShutdownSignal;
 		if (!signal) return false;
-		await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+		await exitDuringStartup(
+			"startup-signal",
+			startupSignalExitCode(signal),
+			signal,
+			undefined,
+			undefined,
+			undefined,
+			spawnAttemptNonce,
+		);
 		return true;
 	};
 	let startupFenceAcquired = false;
@@ -2178,7 +2195,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			const armStartupWatchdog = (): NodeJS.Timeout =>
 				setTimeout(() => {
 					startupAbortController.abort();
-					void exitDuringStartup("startup-deadline", 1, null, effectiveWatchdogMs).then(async started => {
+					void exitDuringStartup(
+						"startup-deadline",
+						1,
+						null,
+						effectiveWatchdogMs,
+						undefined,
+						undefined,
+						spawnAttemptNonce,
+					).then(async started => {
 						if (!started) {
 							// A prior startup signal owns the exit cause; its postmortem callback
 							// returns after bounded cleanup and preserves the signal status.
@@ -2382,14 +2407,23 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				null,
 				BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
 				error.orphanPath,
+				undefined,
+				spawnAttemptNonce,
 			);
 		} else if (error instanceof FileLockAcquireError) {
 			// Nested lock failures or non-orphan-transition errors
-			await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.orphanPath ?? error.lockPath);
+			await exitDuringStartup(
+				"startup-lock-unavailable",
+				1,
+				null,
+				undefined,
+				error.orphanPath ?? error.lockPath,
+				undefined,
+				spawnAttemptNonce,
+			);
 		} else if (error instanceof BrokerLockRefusedError) {
 			// A live, foreign-host or host-unqualified broker.lock is never displaced; the
 			// typed record lets the spawning client report the refusal instead of a bare exit.
-			const spawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 			await exitDuringStartup(
 				"startup-lock-refused",
 				1,
@@ -2411,7 +2445,6 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		// durable marker is the only channel the caller has to see why start()
 		// failed instead of a bare exit code (#3963).
 		const startupFailureIncarnation = processIncarnation(process.pid);
-		const spawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 		const markerWritten = await writeBrokerStartupFailureMarkerBounded(agentDir, {
 			reason: error instanceof Error ? error.message : String(error),
 			exitCode: 1,
