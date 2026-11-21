@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as childProcess from "node:child_process";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -29,6 +29,17 @@ async function fixture() {
 }
 
 describe("doctor broker restart protocol", () => {
+	const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+	afterEach(() => {
+		if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+		else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
+	});
+
+	beforeEach(() => {
+		// Tests that call restartBrokerForDoctor need autostart enabled, not attach-only
+		delete process.env.GJC_SDK_BROKER_AUTOSTART;
+	});
+
 	it("distinguishes absent intent from malformed durable intent, at the independent root slot", async () => {
 		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-intent-"));
 		expect(await readBrokerRestartIntent(dir)).toBeNull();
