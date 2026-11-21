@@ -8485,6 +8485,14 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				provider TEXT PRIMARY KEY,
 				created_at INTEGER NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS auth_broker_pending_revocations (
+				broker_authority TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				broker_credential_id INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (broker_authority, provider, broker_credential_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_auth_broker_pending_revocations_authority ON auth_broker_pending_revocations(broker_authority);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {
@@ -9195,35 +9203,53 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	 * {@link unmarkBrokerLocalProvider}.
 	 */
 	listBrokerLocalProviders(): string[] {
-		try {
-			const rows = this.#db
-				.query<{ provider: string }, []>("SELECT provider FROM auth_broker_local_providers")
-				.all();
-			return rows.map(row => row.provider);
-		} catch {
-			return [];
-		}
+		const rows = this.#db.query<{ provider: string }, []>("SELECT provider FROM auth_broker_local_providers").all();
+		return rows.map(row => row.provider);
 	}
 
 	/** Record `provider` in {@link listBrokerLocalProviders}; a no-op when already listed. */
 	markBrokerLocalProvider(provider: string): void {
-		try {
-			const now = Math.floor(Date.now() / 1000);
-			this.#db
-				.query("INSERT OR IGNORE INTO auth_broker_local_providers (provider, created_at) VALUES (?, ?)")
-				.run(provider, now);
-		} catch {
-			// Ignore marking failures
-		}
+		const now = Math.floor(Date.now() / 1000);
+		this.#db
+			.query("INSERT OR IGNORE INTO auth_broker_local_providers (provider, created_at) VALUES (?, ?)")
+			.run(provider, now);
 	}
 
 	/** Drop `provider` from {@link listBrokerLocalProviders}, so its next login tries the broker again. */
 	unmarkBrokerLocalProvider(provider: string): void {
-		try {
-			this.#db.query("DELETE FROM auth_broker_local_providers WHERE provider = ?").run(provider);
-		} catch {
-			// Ignore unmarking failures
-		}
+		this.#db.query("DELETE FROM auth_broker_local_providers WHERE provider = ?").run(provider);
+	}
+
+	/** Record a pending revocation for a broker credential that failed to disable. */
+	writePendingRevocation(brokerAuthority: string, provider: string, brokerCredentialId: number): void {
+		const now = Math.floor(Date.now() / 1000);
+		this.#db
+			.query(
+				"INSERT OR IGNORE INTO auth_broker_pending_revocations (broker_authority, provider, broker_credential_id, created_at) VALUES (?, ?, ?, ?)",
+			)
+			.run(brokerAuthority, provider, brokerCredentialId, now);
+	}
+
+	/** Remove a pending revocation after successful disable. */
+	deletePendingRevocation(brokerAuthority: string, provider: string, brokerCredentialId: number): void {
+		this.#db
+			.query(
+				"DELETE FROM auth_broker_pending_revocations WHERE broker_authority = ? AND provider = ? AND broker_credential_id = ?",
+			)
+			.run(brokerAuthority, provider, brokerCredentialId);
+	}
+
+	/** List all pending revocations for a broker authority. */
+	listPendingRevocations(brokerAuthority: string): Array<{ provider: string; brokerCredentialId: number }> {
+		const rows = this.#db
+			.query<{ provider: string; broker_credential_id: number }, [string]>(
+				"SELECT provider, broker_credential_id FROM auth_broker_pending_revocations WHERE broker_authority = ?",
+			)
+			.all(brokerAuthority);
+		return rows.map(row => ({
+			provider: row.provider,
+			brokerCredentialId: row.broker_credential_id,
+		}));
 	}
 
 	tryAcquireUsageFetchLease(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined {

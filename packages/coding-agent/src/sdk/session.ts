@@ -834,6 +834,8 @@ export async function discoverAuthStorage(
 		// when the broker doesn't serve a provider's credentials.
 		const localStore = await SqliteAuthCredentialStore.open(getAgentDbPath(agentDir));
 		const store = new HybridAuthCredentialStore({ broker: brokerStore, local: localStore });
+		// Retry any pending revocations from previous failed disables
+		await store.retryPendingRevocations();
 		// Refresh + usage hooks live on the broker store; AuthStorage discovers them automatically.
 		const storage = new AuthStorage(store, {
 			configValueResolver: resolveConfigValue,

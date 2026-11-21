@@ -463,4 +463,59 @@ describe("HybridAuthCredentialStore and broker-local providers", () => {
 			local.close();
 		}
 	});
+
+	test("pending revocations are written and listed", async () => {
+		const local = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		try {
+			const brokerAuthority = "test-broker-authority";
+			const provider = "test-provider";
+			const credentialId = 123;
+
+			// Initially no pending revocations
+			let pending = local.listPendingRevocations(brokerAuthority);
+			expect(pending).toHaveLength(0);
+
+			// Write a pending revocation
+			local.writePendingRevocation(brokerAuthority, provider, credentialId);
+			pending = local.listPendingRevocations(brokerAuthority);
+			expect(pending).toHaveLength(1);
+			expect(pending[0]).toEqual({ provider, brokerCredentialId: credentialId });
+
+			// Delete the pending revocation
+			local.deletePendingRevocation(brokerAuthority, provider, credentialId);
+			pending = local.listPendingRevocations(brokerAuthority);
+			expect(pending).toHaveLength(0);
+		} finally {
+			local.close();
+		}
+	});
+
+	test("pending revocations persist across database opens", async () => {
+		const dbPath = path.join(tempDir, "agent.db");
+		const brokerAuthority = "test-broker-authority";
+		const provider = "test-provider";
+		const credentialId = 456;
+
+		// Write a pending revocation in the first session
+		{
+			const local = await SqliteAuthCredentialStore.open(dbPath);
+			try {
+				local.writePendingRevocation(brokerAuthority, provider, credentialId);
+			} finally {
+				local.close();
+			}
+		}
+
+		// Verify it persists in a new session
+		{
+			const local = await SqliteAuthCredentialStore.open(dbPath);
+			try {
+				const pending = local.listPendingRevocations(brokerAuthority);
+				expect(pending).toHaveLength(1);
+				expect(pending[0]).toEqual({ provider, brokerCredentialId: credentialId });
+			} finally {
+				local.close();
+			}
+		}
+	});
 });

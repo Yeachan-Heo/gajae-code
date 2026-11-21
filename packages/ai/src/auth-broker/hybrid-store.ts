@@ -16,6 +16,7 @@
  * });
  * ```
  */
+import { createHash } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import type {
 	AuthCredential,
@@ -31,6 +32,8 @@ import { AuthBrokerUnservedProviderError } from "./remote-store";
 export interface HybridAuthCredentialStoreOptions {
 	broker: RemoteAuthCredentialStore;
 	local: SqliteAuthCredentialStore;
+	/** Broker authority hash for tracking pending revocations. */
+	brokerAuthority?: string;
 }
 
 /**
@@ -53,17 +56,46 @@ export interface HybridAuthCredentialStoreOptions {
 export class HybridAuthCredentialStore implements AuthCredentialStore {
 	readonly #broker: RemoteAuthCredentialStore;
 	readonly #local: SqliteAuthCredentialStore;
+	readonly #brokerAuthority: string | undefined;
 	#localProviders: Set<string>;
 
 	constructor(opts: HybridAuthCredentialStoreOptions) {
 		this.#broker = opts.broker;
 		this.#local = opts.local;
+		// Compute broker authority from the broker client's URL if not provided
+		this.#brokerAuthority =
+			opts.brokerAuthority ??
+			(opts.broker.client ? createHash("sha256").update(opts.broker.client.baseUrl).digest("hex") : undefined);
+		// Read authoritative routing from database; this will propagate errors if the database is inaccessible
 		this.#localProviders = new Set(opts.local.listBrokerLocalProviders());
+	}
+
+	/** Re-read authoritative routing from the database rather than using the constructor-time cache. */
+	#refreshLocalProviders(): void {
+		this.#localProviders = new Set(this.#local.listBrokerLocalProviders());
 	}
 
 	close(): void {
 		this.#broker.close();
 		this.#local.close();
+	}
+
+	/** Retry all pending revocations for this broker. Must be called after construction. */
+	async retryPendingRevocations(): Promise<void> {
+		if (!this.#brokerAuthority) return;
+		const pending = this.#local.listPendingRevocations(this.#brokerAuthority);
+		for (const { provider, brokerCredentialId } of pending) {
+			try {
+				await this.#broker.disableCredentialsById([brokerCredentialId], "auth-broker-no-serve");
+				this.#local.deletePendingRevocation(this.#brokerAuthority, provider, brokerCredentialId);
+			} catch (error) {
+				logger.warn("Failed to retry pending revocation for broker credential", {
+					provider,
+					brokerCredentialId,
+					error: String(error),
+				});
+			}
+		}
 	}
 
 	refreshSnapshot(signal?: AbortSignal): Promise<unknown> {
@@ -142,9 +174,10 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.replaceAuthCredentialsRemote(provider, credentials);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					await this.#disableUnservedEntries(error.unservedEntries);
+					// P2-3: Commit local fallback credential AND ownership marker before disabling broker copy
 					this.#keepLocal(provider);
 					this.#local.replaceAuthCredentialsForProvider(provider, credentials);
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return this.listAuthCredentials(provider);
 				}
 				throw error;
@@ -160,9 +193,10 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.upsertAuthCredentialRemote(provider, credential);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					await this.#disableUnservedEntries(error.unservedEntries);
+					// P2-3: Commit local fallback credential AND ownership marker before disabling broker copy
 					this.#keepLocal(provider);
 					this.#local.upsertAuthCredentialForProvider(provider, credential);
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return this.listAuthCredentials(provider);
 				}
 				throw error;
@@ -218,9 +252,10 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.upsertAuthCredentialRemoteIfAbsent(provider, credential);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					await this.#disableUnservedEntries(error.unservedEntries);
+					// P2-3: Commit local fallback credential AND ownership marker before disabling broker copy
 					this.#keepLocal(provider);
 					const result = this.#local.upsertAuthCredentialForProviderIfAbsent(provider, credential);
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return {
 						...result,
 						entries: result.entries.map(toHybridRow),
@@ -342,12 +377,11 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		signal?: AbortSignal,
 		expectedRevision?: number,
 	): Promise<import("../utils/oauth/types").OAuthCredentials> {
-		// Route refresh by row ownership: broker rows through the remote hook,
-		// local credentials should NOT reach here because ownsOAuthRefresh returns false.
-		// This method is only called for broker rows that this store owns.
+		// P2-4: Route refresh by row ownership, not method presence.
+		// Broker rows (positive IDs) are refreshed via broker hook.
+		// Local rows (negative IDs): ownsOAuthRefresh returns false, so this should not be reached.
+		// Return unchanged as a defensive fallback.
 		if (isLocalId(credentialId)) {
-			// Should not reach here if ownsOAuthRefresh works correctly,
-			// but as a safety fallback, return the credential unchanged.
 			return credential;
 		}
 		// Broker credentials route through the broker's refresh hook
@@ -360,12 +394,11 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		client: import("../auth-storage").MCPOAuthRefreshClient,
 		signal?: AbortSignal,
 	): Promise<import("../auth-storage").OAuthCredential> {
-		// Route MCP refresh by row ownership: broker rows through the remote hook,
-		// local credentials should NOT reach here because ownsOAuthRefresh returns false.
-		// This method is only called for broker rows that this store owns.
+		// P2-4: Route MCP refresh by row ownership, not method presence.
+		// Broker rows (positive IDs) are refreshed via broker hook.
+		// Local rows (negative IDs): ownsOAuthRefresh returns false, so this should not be reached.
+		// Return unchanged as a defensive fallback.
 		if (isLocalId(credentialId)) {
-			// Should not reach here if ownsOAuthRefresh works correctly,
-			// but as a safety fallback, return the credential unchanged.
 			return credential;
 		}
 		return this.#broker.refreshMCPOAuthCredential?.(credentialId, credential, client, signal) ?? credential;
@@ -507,35 +540,52 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 		logger.warn("Auth broker does not serve this provider's logins; keeping them in the local agent.db", {
 			provider,
 		});
+		// P2-5: Errors propagate; re-read authoritative routing from database
 		this.#local.markBrokerLocalProvider(provider);
-		this.#localProviders.add(provider);
+		this.#refreshLocalProviders();
 	}
 
 	/** After a logout, send `provider`'s next login to the broker once no local login is left. */
 	#returnToBrokerIfEmpty(provider: string): void {
 		if (this.#local.listAuthCredentials(provider).length > 0) return;
+		// P2-5: Errors propagate; re-read authoritative routing from database
 		this.#local.unmarkBrokerLocalProvider(provider);
-		this.#localProviders.delete(provider);
+		this.#refreshLocalProviders();
 	}
 
 	/** Disable credentials that were accepted by the broker but not served back (unserved). */
 	async #disableUnservedEntries(
 		entries: readonly import("../auth-storage").AuthCredentialSnapshotEntry[] | undefined,
+		provider: string,
 	): Promise<void> {
 		if (!entries || entries.length === 0) return;
 		// Extract the specific unserved credential IDs and disable them directly.
 		// These IDs were accepted by the broker but are absent from its snapshot,
 		// so they would not be caught by snapshot-based deletion.
 		const unservedIds = entries.map(entry => entry.id);
+
+		// Write pending revocation records BEFORE attempting disable.
+		// This ensures we can retry if the disable fails.
+		if (this.#brokerAuthority) {
+			for (const id of unservedIds) {
+				this.#local.writePendingRevocation(this.#brokerAuthority, provider, id);
+			}
+		}
+
 		try {
 			await this.#broker.disableCredentialsById(unservedIds, "auth-broker-no-serve");
+			// Delete pending records on successful disable
+			if (this.#brokerAuthority) {
+				for (const id of unservedIds) {
+					this.#local.deletePendingRevocation(this.#brokerAuthority, provider, id);
+				}
+			}
 		} catch (error) {
-			// Log but do not throw: cleanup is incomplete but the credential is
-			// already stored locally, so backing out would leave it in an inconsistent state.
-			// The unserved IDs remain active upstream and may resurface if the broker
-			// later serves this provider, but local storage protects the credential.
+			// Failed to disable: pending records remain so they can be retried later.
+			// The credential is already stored locally, so backing out would leave it
+			// in an inconsistent state.
 			logger.warn(
-				"Failed to disable accepted-but-unserved broker credentials; they may resurface if broker serves this provider",
+				"Failed to disable accepted-but-unserved broker credentials; pending revocation records will retry at next startup",
 				{
 					count: unservedIds.length,
 					error: String(error),
@@ -546,6 +596,17 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 
 	/** Disable any broker-side credentials for a local provider before logging out. */
 	async #disableBrokerCredentialsForProvider(provider: string, disabledCause: string): Promise<void> {
+		// P1-blocking: Check for pending revocations and fail if any exist.
+		// This ensures logout doesn't proceed while revocations are still pending.
+		if (this.#brokerAuthority) {
+			const pending = this.#local.listPendingRevocations(this.#brokerAuthority);
+			const pendingForProvider = pending.filter(p => p.provider === provider);
+			if (pendingForProvider.length > 0) {
+				throw new Error(
+					`Cannot logout of ${provider}: ${pendingForProvider.length} pending credential revocation(s) must complete first`,
+				);
+			}
+		}
 		// Try to find and disable any credentials for this provider that may still exist on the broker
 		// but are not visible to us (they might be unserved from before).
 		// If this fails, the error propagates and prevents us from deleting local credentials,
