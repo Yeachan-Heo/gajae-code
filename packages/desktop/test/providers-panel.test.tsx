@@ -456,6 +456,47 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
+	test("a device code stays on one line and scrolls inside its own block instead of widening the dialog", async () => {
+		const { context, page } = await fixture(390, { height: 844, dialog: true });
+		try {
+			await select(page, "beta");
+			const layout = () =>
+				page.evaluate(() => {
+					const code = document.querySelector<HTMLElement>(".provider-code-value")!;
+					const panel = document.querySelector<HTMLElement>(".providers-panel")!;
+					const range = document.createRange();
+					range.selectNodeContents(code);
+					return {
+						lines: new Set([...range.getClientRects()].map(rect => Math.round(rect.top))).size,
+						inside: code.getBoundingClientRect().right <= panel.getBoundingClientRect().right + 0.5,
+						panelOverflow: panel.scrollWidth - panel.clientWidth,
+					};
+				});
+			for (const code of ["WDJB-MJHT", "WDJB-MJHT-KQPX-ZRTV-LMNB"]) {
+				await set(page, {
+					flow: flow({ status: "waiting", url: "https://sign-in.example.invalid/device", verificationCode: code }),
+				});
+				await page.waitForFunction(
+					value => document.querySelector(".provider-code-value")?.textContent === value,
+					{},
+					code,
+				);
+				for (const size of [14, 20]) {
+					await textSize(page, size);
+					expect({ code, size, ...(await layout()) }).toEqual({
+						code,
+						size,
+						lines: 1,
+						inside: true,
+						panelOverflow: 0,
+					});
+				}
+			}
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("disconnected and another provider's active flow disable every action with a reason", async () => {
 		const { context, page } = await fixture();
 		try {
