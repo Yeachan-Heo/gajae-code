@@ -64,6 +64,16 @@ describe("tool call card summary", () => {
 		expect(search).toContain('title="Activated: todo_write, job"');
 	});
 
+	test("a cancelled call is a neutral outcome: no error styling, unlike a failed one", () => {
+		// The Host marks an aborted call's result as an error and derives `cancelled` from it.
+		const article = (html: string) => /<article[^>]*>/.exec(html)?.[0] ?? "";
+		const cancelled = render(row({ family: "shell", status: "cancelled", subject: "$ sleep 9" }, { isError: true }));
+		const failed = render(row({ family: "shell", status: "failed", subject: "$ false" }, { isError: true }));
+		expect(article(cancelled)).not.toContain("message-error");
+		expect(article(failed)).toContain("message-error");
+		expect(cancelled).toContain("tool-call-status tool-call-cancelled");
+	});
+
 	test("a row without call metadata keeps the plain tool-name row", () => {
 		const legacy: DesktopMessage = { id: "1:1", role: "tool", toolName: "read", text: "output", isError: true };
 		const html = renderToStaticMarkup(<Message message={legacy} />);

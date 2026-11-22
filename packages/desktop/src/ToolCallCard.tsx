@@ -425,9 +425,11 @@ function ToolCallRow({
 	const Body = tool.family === "todo" ? TodoToolBody : tool.family === "tool-search" ? ToolSearchBody : undefined;
 	const output = <ToolOutput message={message} />;
 	const detail = state?.kind === "ready" ? state.detail : undefined;
+	// A stopped call reaches the Host as an errored result, but cancelling is not a failure.
+	const failed = message.isError === true && tool.status !== "cancelled";
 	return (
 		<article
-			className={`message ${message.role} tool-call${message.isError ? " message-error" : ""}`}
+			className={`message ${message.role} tool-call${failed ? " message-error" : ""}`}
 			data-tool-family={tool.family}
 			data-tool-status={tool.status}
 		>

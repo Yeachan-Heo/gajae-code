@@ -738,6 +738,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-call-status svg { width: 14px; height: 14px; }
 .tool-call-running { color: var(--status-running); }
 .tool-call-waiting { color: var(--status-waiting); }
+/* Cancelled is a neutral outcome, like Idle: muted, never the error treatment. */
+.tool-call-status.tool-call-cancelled { color: var(--muted); }
 .tool-call-status.tool-failure { color: var(--error); }
 .tool-call-intent { color: var(--muted); font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
 /* A failed card keeps its error border and status; its summary text stays readable. */
