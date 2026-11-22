@@ -30,6 +30,7 @@ import {
 	getSessionMessageEntryId,
 	getSettingsCatalog,
 	type InputEventResult,
+	isEmbeddedAppendRefused,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
 	readEmbeddedTranscriptTail,
@@ -396,6 +397,9 @@ interface Catalog {
 	 */
 	released?: string[];
 }
+/** The store refused a write because another process (the terminal) changed the transcript first. */
+const STALE_TRANSCRIPT =
+	"This conversation was changed in another window, such as the terminal, after the app opened it. The app reloaded it with the latest messages. Try again.";
 /** Released identities kept; the oldest are dropped first. */
 const RELEASED_LIMIT = 1_000;
 interface TrackedQueuedInput {
@@ -1863,8 +1867,9 @@ export class DesktopHost {
 		await attempt(async () => live.viewPersistence);
 		await attempt(async () => {
 			// A ready exclusive handoff permits capture while its receipt still holds busy.
-			// Failed publications never regain authority, including on cleanup retry.
-			if ((live.busy && !handoff) || !this.#ownsView(live)) return;
+			// Failed publications never regain authority, including on cleanup retry. A copy
+			// the store refused keeps the last view it saved; its newer tail reopens elsewhere.
+			if ((live.busy && !handoff) || !this.#ownsView(live) || isEmbeddedAppendRefused(live.sdk)) return;
 			const view = this.#captureView(live);
 			if (!view) return;
 			await live.sdk.sessionManager.flush();
@@ -1882,7 +1887,8 @@ export class DesktopHost {
 	async #persistLive(live: LiveSession): Promise<void> {
 		do {
 			live.viewPending = false;
-			if (!this.#ownsView(live)) return;
+			// A refused copy cannot write; the last view saved before the refusal stays.
+			if (!this.#ownsView(live) || isEmbeddedAppendRefused(live.sdk)) return;
 			await this.#flushSession(live, live);
 			if (!this.#ownsView(live)) return;
 			await this.#save();
@@ -2334,6 +2340,12 @@ export class DesktopHost {
 					return;
 				}
 			}
+			// The store refused this copy because another process wrote the transcript first. Before
+			// any run took the prompt nothing reached the provider: return the text to the composer.
+			if (!journalFailed && isEmbeddedAppendRefused(live.sdk) && !run.started && !userTurnObserved) {
+				await this.#delivery(id, { disposition: "refused", error: STALE_TRANSCRIPT });
+				throw new Error(STALE_TRANSCRIPT);
+			}
 			await this.#delivery(
 				id,
 				journalFailed
@@ -2441,7 +2453,9 @@ export class DesktopHost {
 		try {
 			if (retireGates) await live.gatePresenter?.withdrawAll();
 			return await operation(() => viewHandoff?.settle());
-		} catch (error) {
+		} catch (caught) {
+			// Any write this operation made may meet the store's refusal; say it plainly, once.
+			const error = isEmbeddedAppendRefused(live.sdk) ? new Error(STALE_TRANSCRIPT) : caught;
 			if (
 				recordFailure &&
 				!live.errorOwner &&
@@ -2467,8 +2481,77 @@ export class DesktopHost {
 				live.busy = false;
 				live.exclusiveViewHandoff = undefined;
 				if (this.#live.get(live.metadata.id) === live) this.#publish(live);
+				// The refusal lasts for this copy's lifetime. Replace it now, so the user sees the
+				// other surface's turns instead of a conversation that fails every write.
+				if (isEmbeddedAppendRefused(live.sdk)) await this.#replaceStale(live);
 			}
 		}
+	}
+	/** Replaces a live copy the store refused, once no work remains on it. */
+	async #replaceStale(live: LiveSession): Promise<void> {
+		if (this.#closed || !this.#catalog.sessions.includes(live.metadata) || !this.#reloadable(live)) return;
+		try {
+			this.#publish(await this.#reload(live));
+		} catch (error) {
+			console.error(`Desktop could not reopen a conversation changed elsewhere: ${String(error)}`);
+		}
+	}
+	/** Nothing a reload could interrupt or lose: no run, queued input, question, gate or startup. */
+	#reloadable(live: LiveSession): boolean {
+		const gates = live.activityUpdate?.activity.sessionState?.gates;
+		return (
+			this.#live.get(live.metadata.id) === live &&
+			!this.#opening.has(live.metadata.id) &&
+			!live.busy &&
+			!live.sdk.isStreaming &&
+			live.queued.size === 0 &&
+			!live.operator?.isBusy() &&
+			!live.startupPending &&
+			!live.gateMutation &&
+			!(gates?.available && gates.pending.length > 0) &&
+			![...this.#questions.values()].some(pending => pending.ownerToken === live.viewOwnerToken)
+		);
+	}
+	/**
+	 * Before showing or prompting an idle conversation, reopen it if another process appended
+	 * to its transcript since this copy read it. The reopen lands on the new tail.
+	 */
+	async #refreshIfMoved(live: LiveSession): Promise<LiveSession> {
+		if (!this.#reloadable(live)) return this.#current(live);
+		const tail = await this.#transcriptTail(live);
+		const moved = isEmbeddedAppendRefused(live.sdk) || (tail !== undefined && tail.committed !== tail.held);
+		// Re-check after the read: another request may have started work on this copy, or already
+		// replaced it, meanwhile.
+		if (!moved || !this.#reloadable(live)) return this.#current(live);
+		return this.#reload(live);
+	}
+	/** The row's current copy; a concurrent request may already be reopening or have replaced it. */
+	#current(live: LiveSession): Promise<LiveSession> {
+		return this.#live.get(live.metadata.id) === live && !this.#opening.has(live.metadata.id)
+			? Promise.resolve(live)
+			: this.#open(live.metadata);
+	}
+	/** Retires a live copy the way a workspace close does, then opens the row again. */
+	#reload(live: LiveSession): Promise<LiveSession> {
+		const metadata = live.metadata;
+		// Synchronous up to its first await, so no request can find the row neither live nor opening.
+		const reopened = (async () => {
+			this.#live.delete(metadata.id);
+			this.#retiredLive.add(live);
+			try {
+				this.#cancelQuestions(live);
+				await this.#disposeLive(live);
+			} catch (error) {
+				console.error(`Desktop could not fully release a stale conversation copy: ${String(error)}`);
+			}
+			return this.#load(metadata);
+		})();
+		this.#opening.set(metadata.id, reopened);
+		const release = () => {
+			if (this.#opening.get(metadata.id) === reopened) this.#opening.delete(metadata.id);
+		};
+		void reopened.then(release, release);
+		return reopened;
 	}
 	handle(request: DesktopRequest): Promise<void> {
 		// Register before initialization or admission can yield. Shutdown must never join itself.
@@ -2893,7 +2976,10 @@ export class DesktopHost {
 			(await this.#transcriptMissing(metadata))
 		)
 			return await this.#forgetMissingSession(metadata);
-		const live = await this.#open(metadata);
+		const live =
+			method === "session.select" || method === "prompt"
+				? await this.#refreshIfMoved(await this.#open(metadata))
+				: await this.#open(metadata);
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
 			live.gateMutation = true;

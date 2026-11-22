@@ -8,6 +8,7 @@ import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import * as sdk from "@gajae-code/coding-agent/sdk";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -544,6 +545,135 @@ test("Done means a turn ended in this app run; opening, selecting or renaming ne
 	expect(status()).toBe("idle");
 	await h.call("session.select", { sessionId });
 	expect(status()).toBe("idle");
+});
+
+const sideBySide = ["app turn", "controlled answer", "continued in the terminal", "answered in the terminal"] as const;
+
+test("an open conversation the terminal continued reloads before the next prompt, which continues it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	const { tail } = await continueInTerminal(stale.sessionFile!, h.projectDir, h.agentDir, h.track);
+	const calls = h.model.calls.length;
+	await h.call("prompt", { sessionId, text: "after the terminal" });
+	await stale.awaitDisposeCompletion();
+	expect(stale.isDisposed).toBe(true);
+	expect(h.model.calls).toHaveLength(calls + 1);
+	expect(
+		h
+			.sdk()
+			.sessionManager.getBranch(h.lastUser())
+			.map(entry => entry.id),
+	).toContain(tail);
+	const history = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(history.messages.map(message => message.text)).toEqual([
+		...sideBySide,
+		"after the terminal",
+		"controlled answer",
+	]);
+	await h.call("prompt", { sessionId, text: "and again" });
+	expect(h.model.calls).toHaveLength(calls + 2);
+	expect(h.snapshot().deliveries.every(receipt => receipt.disposition === "completed")).toBe(true);
+	expect(h.snapshot().sessions[0]?.error).toBeUndefined();
+	await h.close();
+});
+
+test("selecting an open conversation the terminal continued shows the terminal's turns", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	await continueInTerminal(stale.sessionFile!, h.projectDir, h.agentDir, h.track);
+	await h.call("session.select", { sessionId });
+	expect(h.sdk()).not.toBe(stale);
+	expect(h.snapshot().sessions[0]?.messages.map(message => message.text)).toEqual([...sideBySide]);
+	await h.close();
+});
+
+test("concurrent requests after another process appended share one reopened copy", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	await continueInTerminal(stale.sessionFile!, h.projectDir, h.agentDir, h.track);
+	const opened = h.created.length;
+	const selections = await Promise.all([
+		h.call<DesktopSession>("session.select", { sessionId }),
+		h.call<DesktopSession>("session.select", { sessionId }),
+	]);
+	// Both answer from the reopened copy, never from the retired one or a half-open row.
+	for (const selected of selections) expect(selected.messages.map(message => message.text)).toEqual([...sideBySide]);
+	expect(h.created).toHaveLength(opened + 1);
+	expect(h.sdk()).not.toBe(stale);
+	await h.call("prompt", { sessionId, text: "on the reopened copy" });
+	expect(h.created).toHaveLength(opened + 1);
+	expect(
+		h
+			.snapshot()
+			.sessions[0]?.messages.map(message => message.text)
+			.slice(0, 4),
+	).toEqual([...sideBySide]);
+	await h.close();
+});
+
+test("a write the store still refuses returns the text, reloads and says what happened in plain words", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	await continueInTerminal(stale.sessionFile!, h.projectDir, h.agentDir, h.track);
+	// The other process wins the race: it appends after the app's check, before the app's write.
+	const read = sdk.readEmbeddedTranscriptTail;
+	const unmoved = vi.spyOn(sdk, "readEmbeddedTranscriptTail").mockImplementation(async session => {
+		const tail = await read(session);
+		return tail && { committed: tail.held, held: tail.held };
+	});
+	const calls = h.model.calls.length;
+	try {
+		await expect(h.call("prompt", { sessionId, text: "stale write" })).rejects.toThrow("changed in another window");
+	} finally {
+		unmoved.mockRestore();
+	}
+	// Nothing reached the provider, so the app restores the text instead of guessing.
+	expect(h.model.calls).toHaveLength(calls);
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	expect(h.sdk()).not.toBe(stale);
+	expect(h.snapshot().sessions[0]?.messages.map(message => message.text)).toEqual([...sideBySide]);
+	await h.call("prompt", { sessionId, text: "sent again" });
+	expect(h.model.calls).toHaveLength(calls + 1);
+	await h.close();
+});
+
+test("a running turn is never reloaded under it; the stale copy is replaced once the turn settles", async () => {
+	let hold = false;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const h = await controlledFixture(async () => {
+		if (!hold) return;
+		entered.resolve();
+		await release.promise;
+	});
+	cleanups.push(async () => release.resolve());
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	hold = true;
+	const running = h.call("prompt", { sessionId, text: "held turn" });
+	void running.catch(() => {});
+	await entered.promise;
+	const live = h.sdk();
+	await continueInTerminal(live.sessionFile!, h.projectDir, h.agentDir, h.track);
+	await h.call("session.select", { sessionId });
+	expect(h.sdk()).toBe(live);
+	release.resolve();
+	await expect(running).rejects.toThrow("changed in another window");
+	// The provider was already asked, so the outcome stays uncertain rather than refused.
+	expect(h.snapshot().deliveries.at(-1)?.disposition).not.toBe("refused");
+	expect(h.sdk()).not.toBe(live);
+	const texts = h.snapshot().sessions[0]?.messages.map(message => message.text);
+	expect(texts).toContain("held turn");
+	expect(texts?.slice(-2)).toEqual(["continued in the terminal", "answered in the terminal"]);
+	await h.close();
 });
 
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {
