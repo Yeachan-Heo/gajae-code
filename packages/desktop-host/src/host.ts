@@ -2153,6 +2153,14 @@ export class DesktopHost {
 		};
 		const input = await this.#extensionInput(live, id, text, images, allowGateMutation, settleTerminalView);
 		if (input.handled) return;
+		if (live.stopRequests !== stops) {
+			// A Stop during admission (the journal write or an input hook) found nothing to abort. The
+			// prompt has not reached the SDK, so it definitively did not run: hand the text back. From
+			// here on the counter is unchanged, so only a Stop that reaches this prompt's run counts.
+			await settleTerminalView();
+			await this.#delivery(id, { disposition: "refused", error: "Prompt stopped before it started" });
+			return;
+		}
 		accepted = this.#deliveries.list().some(receipt => receipt.id === id && receipt.disposition === "accepted");
 		text = input.text;
 		images = input.images;
@@ -2993,8 +3001,15 @@ export class DesktopHost {
 				throw new Error("Edit the prompt after the current operation finishes.");
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
+				const stops = live.stopRequests;
 				const input = await this.#extensionInput(live, request.id, text, images);
 				if (input.handled) return null;
+				if (live.stopRequests !== stops) {
+					// Stop came while this input's hook ran, before it was queued: the Stop's queue sweep
+					// could not see it. Queueing it now would start a turn after the Stop.
+					await this.#delivery(request.id, { disposition: "refused", error: "Prompt stopped before it started" });
+					return null;
+				}
 				text = input.text;
 				images = input.images;
 				// TUI parity: an active run accepts steering or a follow-up instead of rejecting input.
@@ -3002,7 +3017,6 @@ export class DesktopHost {
 				live.queuedAdmissionOrder = (live.queuedAdmissionOrder ?? 0) + 1;
 				const admissionOrder = live.queuedAdmissionOrder;
 				const errorEpoch = live.errorEpoch;
-				const stops = live.stopRequests;
 				let accepted = this.#deliveries
 					.list()
 					.some(receipt => receipt.id === request.id && receipt.disposition === "accepted");

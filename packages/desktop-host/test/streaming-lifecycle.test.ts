@@ -831,6 +831,89 @@ describe("desktop streaming lifecycle", () => {
 		});
 	});
 
+	/** An input hook that asks the user before letting any text starting with "ask" through. */
+	const askingInputHook = `export default function (pi) {
+		pi.on("input", async (event, ctx) => {
+			if (event.text.startsWith("ask")) await ctx.ui.input("Send " + event.text + "?");
+			return { text: event.text };
+		});
+	}`;
+	const questionShown = async (snapshot: () => Promise<DesktopSnapshot>) => {
+		for (let i = 0; i < 400 && !(await snapshot()).sessions[0]?.question; i++) await Bun.sleep(5);
+		expect((await snapshot()).sessions[0]?.question).toBeDefined();
+	};
+
+	test("Stop while a prompt's input hook runs keeps it from running and returns its text", async () => {
+		const { call, snapshot, session, project, sdk, control } = await launch(true, askingInputHook);
+		const running = call("prompt", { sessionId: session.id, text: "ask first" }, "stopped-in-hook");
+		await questionShown(snapshot);
+		// Nothing has reached the SDK yet, so the Stop's abort has nothing to end.
+		await call("abort", { sessionId: session.id });
+		expect(await Promise.race([running.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe(
+			"settled",
+		);
+		expect(control.prompts).toHaveLength(0);
+		expect(sdk.messages.some(message => message.role === "user")).toBe(false);
+		let state = await snapshot();
+		// `refused` is what returns the text to the composer.
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "stopped-in-hook",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(state.sessions[0]?.status).not.toBe("running");
+		expect(state.sessions[0]?.error).toBeUndefined();
+		// That Stop cannot label a later prompt's Host abort as the user's cancellation.
+		const later = call("prompt", { sessionId: session.id, text: "next task" }, "closed-after-hook-stop");
+		await Promise.race([
+			control.started,
+			later.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("project.close", { projectId: project.id });
+		await expect(later).rejects.toThrow("Prompt outcome unknown");
+		state = await snapshot();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "closed-after-hook-stop", disposition: "unknown" }),
+		);
+	});
+
+	test("Stop while a steer's input hook runs keeps it from queueing or starting a turn", async () => {
+		const { call, snapshot, session, sdk, control } = await launch(true, askingInputHook);
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-before-hooked-steer");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const steer = call("prompt", { sessionId: session.id, text: "ask steer", deliverAs: "steer" }, "steer-in-hook");
+		await questionShown(snapshot);
+		await call("abort", { sessionId: session.id });
+		expect(await running).toBeNull();
+		expect(await steer).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(sdk.isStreaming).toBe(false);
+		expect(sdk.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "run-before-hooked-steer", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-in-hook",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
 	test("invalid prompt reports a definitive refusal before admission", async () => {
 		const { call, session, frames, snapshot } = await launch();
 		await expect(call("prompt", { sessionId: session.id, text: "" }, "invalid-id")).rejects.toThrow();
