@@ -435,7 +435,7 @@ describe("desktop streaming lifecycle", () => {
 		expect((await snapshot()).sessions[0]?.queued ?? []).toHaveLength(1);
 		await call("abort", { sessionId: session.id });
 		// A user Stop is a cancellation, not an uncertain outcome: the prompt request settles
-		// normally and its already-persisted text stays in the conversation.
+		// normally and its text, already in the session's transcript, stays in the conversation.
 		expect(await running).toBeNull();
 		expect(control.aborts).toBe(1);
 		expect(sdk.isStreaming).toBe(false);
@@ -776,6 +776,8 @@ describe("desktop streaming lifecycle", () => {
 		expect(await running).toBeNull();
 		expect(h.control.prompts).toHaveLength(2);
 		expect(userTurns(h.sdk)).toEqual(["long task", "same"]);
+		// The handed-back steer is not left in the agent's queue, so restoring it cannot send it twice.
+		expect(h.sdk.agent.hasQueuedMessages()).toBe(false);
 		// One transcript turn is evidence for one input. The input it does not belong to never ran
 		// visibly, so it must not be settled as a cancellation that drops its text.
 		expect(await settledReceipts(h.snapshot, ["tool-run", "steer-sent", "steer-taken"])).toEqual({
