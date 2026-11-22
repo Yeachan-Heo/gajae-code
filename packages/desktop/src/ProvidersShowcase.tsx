@@ -35,6 +35,7 @@ function fixtureProviders(): DesktopAuthProvider[] {
 			credentialKinds: ["oauth"],
 		}),
 		fixtureProvider("design-local-gateway", "providers.showcaseNameGateway", { configured: true }),
+		fixtureProvider("design-configured-outside", "providers.showcaseNameOutside", { configured: true }),
 		fixtureProvider("design-korean-gateway", "providers.showcaseNameKorean"),
 		fixtureProvider("design-key-only", null, { canSignIn: false }),
 		fixtureProvider("design-browser-sign-in", "providers.showcaseNameBrowser", { canStoreKey: false }),
@@ -49,10 +50,13 @@ function fixtureProviders(): DesktopAuthProvider[] {
 	];
 }
 
-const fixtureModels: DesktopModel[] = ["alpha", "beta", "gamma"].map(id => ({
-	id: `design-ready/${id}`,
+const fixtureModels: DesktopModel[] = [
+	...["alpha", "beta", "gamma"].map(id => ["design-ready", id]),
+	["design-configured-outside", "delta"],
+].map(([provider, id]) => ({
+	id: `${provider}/${id}`,
 	name: `Design ${id}`,
-	provider: "design-ready",
+	provider: provider!,
 	contextWindow: 128000,
 	reasoning: false,
 	thinking: { options: [] },
@@ -97,6 +101,7 @@ function fixtureStates(): FixtureState[] {
 		{ label: "providers.showcaseStateKeyOnly", group: "detail", selected: "design-key-only" },
 		{ label: "providers.showcaseStateConnected", group: "detail", selected: "design-ready" },
 		{ label: "providers.showcaseStateExternal", group: "detail", selected: "design-local-gateway" },
+		{ label: "providers.showcaseStateExternalModels", group: "detail", selected: "design-configured-outside" },
 		{ label: "providers.showcaseStateStarting", group: "flow", selected: korean, flow: flow(korean, "authorizing") },
 		{
 			label: "providers.showcaseStateBrowser",

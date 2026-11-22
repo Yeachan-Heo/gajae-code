@@ -245,6 +245,33 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
+	test("a provider configured outside the app reads by its models and says so in its detail", async () => {
+		const { context, page } = await fixture();
+		try {
+			await set(page, {
+				providers: [...providers, provider("epsilon", "Epsilon Gateway", { configured: true })],
+				models: [...models, { ...models[0]!, id: "epsilon/e1", provider: "epsilon" }],
+			});
+			await page.waitForSelector('.provider-row[data-provider-id="epsilon"]');
+			expect(
+				await page.$eval('.provider-row[data-provider-id="epsilon"] .provider-status', node => [
+					node.getAttribute("data-state"),
+					node.textContent,
+				]),
+			).toEqual(["ready", "1 model"]);
+			await select(page, "epsilon");
+			await waitText(page, "Configured outside the app");
+			// A provider whose credential is stored is not described as configured outside the app.
+			await select(page, "alpha");
+			await waitText(page, "2 models available");
+			expect(await page.$eval(".provider-detail", node => node.textContent)).not.toContain(
+				"Configured outside the app",
+			);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("a provider warning offers Continue only while the flow waits on it", async () => {
 		const { context, page } = await fixture();
 		try {

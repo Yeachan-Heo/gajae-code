@@ -115,6 +115,7 @@ export const providers = {
 	"providers.showcaseStateKeyOnly": "API key only",
 	"providers.showcaseStateConnected": "Connected · Disconnect unavailable",
 	"providers.showcaseStateExternal": "Set outside the app",
+	"providers.showcaseStateExternalModels": "Set outside the app · with models",
 	"providers.showcaseStateStarting": "Signing in",
 	"providers.showcaseStateBrowser": "Browser",
 	"providers.showcaseStateCode": "Browser with code",
@@ -141,6 +142,7 @@ export const providers = {
 	"providers.showcaseNameReady": "Design example cloud",
 	"providers.showcaseNameSubscription": "Design example subscription",
 	"providers.showcaseNameGateway": "Design example local gateway",
+	"providers.showcaseNameOutside": "Design example configured outside the app",
 	"providers.showcaseNameKorean": "한국 클라우드 게이트웨이 (디자인 예시)",
 	"providers.showcaseNameLong":
 		"Design example provider with a deliberately long display name that has to wrap onto another line",

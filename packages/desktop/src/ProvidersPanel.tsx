@@ -468,7 +468,7 @@ function ProviderDetail(
 				</div>
 				<StatusPill row={row} />
 			</header>
-			{(row.connected || row.status === "external") && (
+			{row.connected && (
 				<div className="provider-detail-note">
 					{row.connected && (
 						<p>
@@ -477,7 +477,8 @@ function ProviderDetail(
 								: t("providers.detailNoModels")}
 						</p>
 					)}
-					{row.status === "external" && <p>{t("providers.externalNote")}</p>}
+					{/* Effective auth without a stored credential, whether or not it has models yet. */}
+					{row.configured && !row.stored && <p>{t("providers.externalNote")}</p>}
 					<p>{t("providers.sharedCredentials")}</p>
 				</div>
 			)}
