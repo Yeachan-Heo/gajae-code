@@ -8132,7 +8132,7 @@ type SerializedCredentialRecord = {
 	identityKey: string | null;
 };
 
-const AUTH_SCHEMA_VERSION = 5;
+const AUTH_SCHEMA_VERSION = 6;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
 function normalizeStoredAccountId(accountId: string | null | undefined): string | null {
@@ -8599,6 +8599,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		if (fromVersion < 5) {
 			this.#migrateAuthSchemaV4ToV5();
 		}
+		if (fromVersion < 6) {
+			this.#migrateAuthSchemaV5ToV6();
+		}
 	}
 
 	#migrateAuthSchemaV0ToV1(): void {
@@ -8688,6 +8691,71 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		);
 		if (columns.some(column => column.name === "revision")) return;
 		this.#db.run("ALTER TABLE auth_credentials ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+	}
+
+	#migrateAuthSchemaV5ToV6(): void {
+		const migrate = this.#db.transaction(() => {
+			// Check if auth_broker_local_providers exists
+			const tableExists = this.#withStatement(
+				"SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_broker_local_providers'",
+				statement => statement.get() as { [key: string]: number } | undefined,
+			);
+
+			if (!tableExists) {
+				// Table doesn't exist yet, nothing to migrate
+				return;
+			}
+
+			// Check if the table has the new schema (with broker_authority column)
+			const columns = this.#withStatement(
+				"PRAGMA table_info(auth_broker_local_providers)",
+				statement => statement.all() as Array<{ name?: string }>,
+			);
+			const hasBrokerAuthority = columns.some(col => col.name === "broker_authority");
+
+			if (hasBrokerAuthority) {
+				// Schema is already up to date
+				return;
+			}
+
+			// Schema is old (provider PK without broker_authority), need to migrate
+			// Rename old table and create new one with correct schema
+			this.#db.run("ALTER TABLE auth_broker_local_providers RENAME TO auth_broker_local_providers_v5");
+			this.#db.run(`
+				CREATE TABLE auth_broker_local_providers (
+					broker_authority TEXT NOT NULL,
+					provider TEXT NOT NULL,
+					created_at INTEGER NOT NULL,
+					PRIMARY KEY (broker_authority, provider)
+				)
+			`);
+
+			// Drop the old table since we cannot determine broker_authority from the old data
+			this.#db.run("DROP TABLE auth_broker_local_providers_v5");
+
+			// Also check if auth_broker_pending_revocations needs migration
+			const pendingRevTableExists = this.#withStatement(
+				"SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_broker_pending_revocations'",
+				statement => statement.get() as { [key: string]: number } | undefined,
+			);
+
+			if (!pendingRevTableExists) {
+				// Create the new pending revocations table with correct schema
+				this.#db.run(`
+					CREATE TABLE auth_broker_pending_revocations (
+						broker_authority TEXT NOT NULL,
+						provider TEXT NOT NULL,
+						broker_credential_id INTEGER NOT NULL,
+						created_at INTEGER NOT NULL,
+						PRIMARY KEY (broker_authority, provider, broker_credential_id)
+					)
+				`);
+				this.#db.run(
+					"CREATE INDEX IF NOT EXISTS idx_auth_broker_pending_revocations_authority ON auth_broker_pending_revocations(broker_authority)",
+				);
+			}
+		});
+		migrate.immediate();
 	}
 
 	#backfillCredentialIdentityKeys(): void {
