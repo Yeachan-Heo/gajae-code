@@ -311,6 +311,13 @@ describe("desktop streaming lifecycle", () => {
 			contexts: captures[0]!.contexts,
 			startupEvents,
 			frames,
+			/** Opens another conversation in the same workspace, with its own controlled SDK session. */
+			async open() {
+				const opened = await call<DesktopSession>("session.create", { projectId: project.id });
+				const capture = captures.at(-1);
+				if (!capture || capture.session === captures[0]!.session) throw new Error("No second SDK session");
+				return { session: opened, sdk: capture.session, control: capture.control };
+			},
 		};
 	}
 
@@ -1097,6 +1104,55 @@ describe("desktop streaming lifecycle", () => {
 			}),
 		);
 		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	test("Stop in one conversation leaves another conversation's run and inputs alone", async () => {
+		const first = await launch();
+		const running = first.call("prompt", { sessionId: first.session.id, text: "task a" }, "run-a");
+		await Promise.race([
+			first.control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const other = await first.open();
+		const call = first.call;
+		const runningB = call("prompt", { sessionId: other.session.id, text: "task b" }, "run-b");
+		await Promise.race([
+			other.control.started,
+			runningB.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: other.session.id, text: "b queued", deliverAs: "steer" }, "queued-b");
+		// This input has reached the Host but is not admitted yet when the other conversation stops.
+		const record = holdDeliveryBegin("in-flight-b");
+		const inFlight = call<{ queued: boolean }>(
+			"prompt",
+			{ sessionId: other.session.id, text: "b in flight", deliverAs: "steer" },
+			"in-flight-b",
+		);
+		await record.held;
+		expect(await call("abort", { sessionId: first.session.id })).toBeNull();
+		expect(await running).toBeNull();
+		record.release();
+		expect((await inFlight).queued).toBe(true);
+		expect(other.sdk.isStreaming).toBe(true);
+		other.control.finishTurn("b one");
+		for (let i = 0; i < 400 && other.control.prompts.length < 2; i++) await Bun.sleep(5);
+		other.control.finishTurn("b two");
+		for (let i = 0; i < 400 && other.control.prompts.length < 3; i++) await Bun.sleep(5);
+		other.control.finishTurn("b three");
+		expect(await runningB).toBeNull();
+		expect(first.control.prompts).toHaveLength(1);
+		expect(other.control.prompts).toHaveLength(3);
+		expect(userTurns(other.sdk)).toEqual(["task b", "b queued", "b in flight"]);
+		expect(await settledReceipts(first.snapshot, ["run-a", "run-b", "queued-b", "in-flight-b"])).toEqual({
+			"run-a": "cancelled",
+			"run-b": "completed",
+			"queued-b": "completed",
+			"in-flight-b": "completed",
+		});
 	});
 
 	test("invalid prompt reports a definitive refusal before admission", async () => {
