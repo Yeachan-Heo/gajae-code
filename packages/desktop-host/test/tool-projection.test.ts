@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import { fitMessages, HISTORY_LIMIT, projectHistoryPage, projectMessages } from "../src/message-projection";
 import type { DesktopMessage } from "../src/protocol";
-import { observeToolEvent, projectLiveToolCalls } from "../src/tool-projection";
+import { LIVE_TAIL_LIMIT, observeToolEvent, projectLiveToolCalls } from "../src/tool-projection";
 import { DESKTOP_TOOL_LIMITS, type DesktopToolCall } from "../src/tool-protocol";
 
 type Session = CreateAgentSessionResult["session"];
@@ -297,6 +297,34 @@ describe("live tool rows", () => {
 		// A malformed event is ignored; it neither throws nor disturbs tracked state.
 		observeToolEvent(session, { type: "tool_execution_start", toolCallId: 7 } as { type: string });
 		expect(status()).toEqual(["waiting"]);
+	});
+
+	test("a running shell row carries the newest streamed output, redacted before the cut", () => {
+		const secret = "sk-abcdefghij1234567890";
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]");
+		const session = fakeSession([
+			{ role: "user", content: "go" },
+			assistantCalls(["a", "bash", { command: "make" }]),
+		]);
+		const update = (partialResult: unknown) =>
+			observeToolEvent(session, { type: "tool_execution_update", toolCallId: "a", partialResult } as {
+				type: string;
+			});
+		// The secret straddles the tail bound: cutting first would leave its suffix.
+		const body = `${secret}${"o".repeat(LIVE_TAIL_LIMIT - 5)}`;
+		update({ content: [{ type: "text", text: `start\n${body}` }], details: {} });
+		const [row] = projectLiveToolCalls(session, undefined, redact);
+		expect(row?.tool?.status).toBe("running");
+		expect(row?.text).toHaveLength(LIVE_TAIL_LIMIT);
+		expect(row?.text.startsWith("cted]")).toBe(true);
+		expect(row?.text).not.toContain("1234567890");
+		expect(row?.truncated).toBe(true);
+		// Bash also reports content-less progress (a terminal id); that keeps the last output.
+		update({ content: [], details: { terminalId: "t1" } });
+		expect(projectLiveToolCalls(session, undefined, redact)[0]?.text).toBe(row?.text);
+		update({ content: [{ type: "text", text: "short" }] });
+		expect(projectLiveToolCalls(session, undefined, redact)[0]).toMatchObject({ text: "short" });
+		expect(projectLiveToolCalls(session, undefined, redact)[0]?.truncated).toBeUndefined();
 	});
 
 	test("live rows join only the display list and are redacted like settled rows", () => {

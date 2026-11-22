@@ -163,7 +163,7 @@ describe("desktop live tool rows", () => {
 				id: `call:${CALL_ID}`,
 				role: "tool",
 				toolName: "read",
-				text: "",
+				text: "partial output",
 				tool: { callId: CALL_ID, status: "running", family: "read", subject: "src/app.ts", detail: true },
 			},
 		]);

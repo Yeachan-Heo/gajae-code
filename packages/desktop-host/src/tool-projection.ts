@@ -304,6 +304,8 @@ export function projectToolCall(
 interface LiveCall {
 	/** `tool_execution_start` was seen; `pendingToolCalls` alone misses the gap after its end. */
 	started: boolean;
+	/** Latest streamed output text, unredacted and uncut until it is projected. */
+	tail?: string;
 }
 
 /** Live call state per SDK session. A session that is dropped takes its entry with it. */
@@ -333,12 +335,21 @@ export function observeToolEvent(session: Session, event: { readonly type: strin
 			return;
 		const calls = liveCalls.get(session) ?? new Map<string, LiveCall>();
 		liveCalls.set(session, calls);
-		calls.set(value.toolCallId, { started: true });
+		const call = calls.get(value.toolCallId) ?? { started: false };
+		call.started = true;
+		if (event.type === "tool_execution_update") {
+			// Bash also sends content-less updates (a terminal id, an input prompt); they keep the tail.
+			const text = resultText(record(value.partialResult) ?? {});
+			if (text) call.tail = text;
+		}
+		calls.set(value.toolCallId, call);
 	} catch {
 		// Observation is best effort; the Host's own event handling must continue.
 	}
 }
 
+/** Streamed output kept on a running row: the newest characters, after redaction. */
+export const LIVE_TAIL_LIMIT = 4_000;
 /** Live rows one projection synthesizes, newest last. */
 const LIVE_ROWS_LIMIT = 64;
 
@@ -380,11 +391,13 @@ export function projectLiveToolCalls(
 				: running.has(call.id) || live?.started
 					? "running"
 					: "waiting";
+			const tail = status === "running" ? liveTail(live?.tail, redact) : undefined;
 			rows.push({
 				id: `call:${call.id}`,
 				role: "tool",
 				toolName: redactedHead(call.name, 100, redact) ?? "",
-				text: "",
+				text: tail?.text ?? "",
+				...(tail?.truncated ? { truncated: true } : {}),
 				tool: projectToolCall({ callId: call.id, toolName: call.name, call, status, detail: true }, redact),
 			});
 		}
@@ -392,6 +405,16 @@ export function projectLiveToolCalls(
 	} catch {
 		return [];
 	}
+}
+
+function liveTail(
+	text: string | undefined,
+	redact: (text: string) => string,
+): { text: string; truncated: boolean } | undefined {
+	if (!text || text.length > MAX_REDACTION_CHARS) return undefined;
+	const safe = redact(text);
+	if (safe.length > MAX_REDACTION_CHARS) return undefined;
+	return { text: safe.slice(-LIVE_TAIL_LIMIT), truncated: safe.length > LIVE_TAIL_LIMIT };
 }
 
 /**
