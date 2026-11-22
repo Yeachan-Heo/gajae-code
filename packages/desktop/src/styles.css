@@ -943,6 +943,13 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* The banner spans the dialog like every other dialog's error banner; only Retry keeps its own width. */
 .provider-load-error > .error-banner { justify-self: stretch; margin: 0; }
 .provider-list { display: grid; gap: 0.75rem; max-height: 52dvh; overflow: auto; overscroll-behavior: contain; padding: 4px; }
+/* The list step pins search, the summary line and the footnote; only the list scrolls, and it gives
+   up its height first, as the Tools dialog's list does. The detail step scrolls as one in the
+   dialog's content. */
+.modal-content:has(> .providers-panel[data-step="list"]) { display: flex; flex-direction: column; overflow: hidden; }
+.providers-panel[data-step="list"] { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
+.providers-panel[data-step="list"] > * { flex: none; }
+.providers-panel[data-step="list"] > .provider-list { flex: 0 1 auto; min-height: 0; }
 .provider-group { display: grid; gap: 0.375rem; min-width: 0; }
 .provider-group-heading { padding: 0 0.25rem; color: var(--muted); font-size: 0.75rem; font-weight: 600; }
 .provider-rows { display: grid; gap: 0.375rem; margin: 0; padding: 0; list-style: none; }

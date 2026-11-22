@@ -926,6 +926,67 @@ suite("Providers panel interactions", () => {
 		}
 	}, 60000);
 
+	test("only the provider list scrolls in small windows and at 20 px text; the detail scrolls as one", async () => {
+		const many = Array.from({ length: 30 }, (_, index) =>
+			provider(`fixture-${String(index).padStart(2, "0")}`, `Fixture provider ${index}`),
+		);
+		const { context, page } = await fixture(720, { height: 520, dialog: true });
+		try {
+			await set(page, { providers: [...providers, ...many] });
+			await page.waitForSelector('.provider-row[data-provider-id="fixture-29"]');
+			const layouts: Record<string, unknown> = {};
+			for (const step of ["list", "detail"] as const) {
+				await select(page, step === "list" ? null : "beta");
+				await page.waitForSelector(`.providers-panel[data-step="${step}"]`);
+				for (const [width, height, text] of [
+					[720, 520, 14],
+					[720, 520, 20],
+					[390, 844, 14],
+					[390, 844, 20],
+				] as const) {
+					await page.setViewport({ width, height });
+					await textSize(page, text);
+					layouts[`${step} ${width}x${height}@${text}`] = await page.evaluate(() => {
+						const dialog = document.querySelector("dialog[open]")!;
+						const frame = dialog.getBoundingClientRect();
+						const inside = (node: Element | null) => {
+							const box = node?.getBoundingClientRect();
+							return !!box && box.top >= frame.top - 0.5 && box.bottom <= frame.bottom + 0.5;
+						};
+						const scrolls = (node: Element) => node.scrollHeight > node.clientHeight + 1;
+						const list = dialog.querySelector(".provider-list");
+						return {
+							// Every vertical scroller in the dialog, by class.
+							scrollers: [dialog, ...dialog.querySelectorAll("*")]
+								.filter(node => scrolls(node) && /auto|scroll/u.test(getComputedStyle(node).overflowY))
+								.map(node => node.className),
+							listShowsRows: list ? list.clientHeight >= 48 : null,
+							pinned: list
+								? [".model-search input", ".provider-summary", ".provider-footer"].map(selector =>
+										inside(dialog.querySelector(selector)),
+									)
+								: null,
+						};
+					});
+				}
+			}
+			const list = { scrollers: ["provider-list"], listShowsRows: true, pinned: [true, true, true] };
+			expect(layouts).toMatchObject({
+				"list 720x520@14": list,
+				"list 720x520@20": list,
+				"list 390x844@14": list,
+				"list 390x844@20": list,
+			});
+			// The detail has no inner scroller: at most the dialog's content scrolls, as one.
+			for (const [key, value] of Object.entries(layouts).filter(([key]) => key.startsWith("detail"))) {
+				const { scrollers } = value as { scrollers: string[] };
+				expect({ key, scrollers: scrollers.filter(name => name !== "modal-content") }).toEqual({ key, scrollers: [] });
+			}
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 60000);
+
 	test("fits a 390px window in the list, the detail and the flow card", async () => {
 		const { context, page } = await fixture(390);
 		try {
