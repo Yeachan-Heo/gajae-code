@@ -1,0 +1,463 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { DesktopAuthProvider, DesktopAuthState, DesktopModel } from "@gajae-code/desktop-host/protocol";
+import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import type { ProviderKeyState } from "../src/ProvidersPanel";
+import { browserPath, closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
+
+const suite = browserPath ? describe : describe.skip;
+
+const port = 16000 + Math.floor(Math.random() * 20000);
+const origin = `http://127.0.0.1:${port}`;
+let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
+let browser: Browser;
+
+beforeAll(async () => {
+	if (!browserPath) return;
+	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+		cwd: `${import.meta.dir}/..`,
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	for (let i = 0; i < 100; i++) {
+		try {
+			if ((await fetch(origin)).ok) break;
+		} catch {
+			/* Server is starting. */
+		}
+		await Bun.sleep(100);
+	}
+	browser = await puppeteer.launch({ executablePath: browserPath, headless: true });
+}, 30000);
+afterAll(async () => {
+	await browser?.close();
+	if (server) {
+		server.kill();
+		await server.exited;
+	}
+});
+
+/** Everything the page-side fixture feeds the panel; the step and the query stay panel-owner state. */
+interface FixtureData {
+	providers: DesktopAuthProvider[];
+	models: DesktopModel[];
+	flow: DesktopAuthState | null;
+	owned: string[];
+	loaded: boolean;
+	disconnected: boolean;
+	busy: boolean;
+	keyState: ProviderKeyState | null;
+}
+type Call = [string, ...(string | null)[]];
+interface Control {
+	set(data: Partial<FixtureData>): void;
+	select(provider: string | null): void;
+	calls(): Call[];
+}
+declare global {
+	interface Window {
+		providersTest: Control;
+	}
+}
+
+const provider = (id: string, name: string, overrides: Partial<DesktopAuthProvider> = {}): DesktopAuthProvider => ({
+	id,
+	name,
+	configured: false,
+	stored: false,
+	credentialKinds: [],
+	canSignIn: true,
+	canStoreKey: true,
+	...overrides,
+});
+const providers = [
+	provider("alpha", "Alpha Cloud", { configured: true, stored: true, credentialKinds: ["oauth"] }),
+	provider("beta", "Beta"),
+	provider("gamma", "Gamma Gateway"),
+	provider("delta", "delta", { canSignIn: false }),
+	provider(
+		"long-provider-identifier-that-keeps-going-without-any-break-opportunity-for-wrapping",
+		"Long provider name 긴 이름의 공급자 that must wrap inside a narrow dialog without overflowing",
+	),
+];
+const models: DesktopModel[] = ["a1", "a2"].map(id => ({
+	id: `alpha/${id}`,
+	name: id,
+	provider: "alpha",
+	contextWindow: 8192,
+	reasoning: false,
+	thinking: { options: [] },
+}));
+const FLOW = "00000000-0000-4000-8000-0000000000f1";
+const flow = (overrides: Partial<DesktopAuthState>): DesktopAuthState => ({
+	id: FLOW,
+	provider: "beta",
+	status: "authorizing",
+	...overrides,
+});
+
+async function fixture(width = 1000): Promise<{ context: BrowserContext; page: Page }> {
+	const { context, page } = await componentFixture(browser, origin);
+	try {
+		await page.setViewport({ width, height: 900 });
+		await componentReady(page, async () => {
+			await page.addScriptTag({
+				type: "module",
+				content: `
+					import '/src/styles.css';
+					import React from '/node_modules/.vite/deps/react.js';
+					import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
+					import { ProvidersPanel } from '/src/ProvidersPanel.tsx';
+					import { projectProviders, visibleFlow } from '/src/provider-status.ts';
+					const h = React.createElement;
+					const calls = [];
+					function Fixture() {
+						const [data, setData] = React.useState({ providers: [], models: [], flow: null, owned: [], loaded: true, disconnected: false, busy: false, keyState: null });
+						const [selected, setSelected] = React.useState(null);
+						const [query, setQuery] = React.useState('');
+						window.providersTest = { set: next => setData(previous => ({ ...previous, ...next })), select: setSelected, calls: () => calls };
+						const owned = new Set(data.owned);
+						const shown = visibleFlow(data.flow, owned);
+						return h('div', { className: 'modal-content', style: { maxWidth: '640px' } }, h(ProvidersPanel, {
+							groups: projectProviders(data.providers, data.models, shown, owned),
+							totalModels: data.models.length,
+							loaded: data.loaded,
+							disconnected: data.disconnected,
+							busy: data.busy,
+							query,
+							onQueryChange: setQuery,
+							selected,
+							onSelect: id => { calls.push(['select', id]); setSelected(id); },
+							flow: shown,
+							keyState: data.keyState,
+							onRetryLoad: () => calls.push(['retry']),
+							onSignIn: id => calls.push(['signIn', id]),
+							onAnswer: (flowId, promptId, value) => calls.push(['answer', flowId, promptId, value]),
+							onCancel: flowId => calls.push(['cancel', flowId]),
+							onSaveKey: (id, draft) => calls.push(['saveKey', id, draft]),
+							onOpenUrl: url => calls.push(['open', url]),
+							onDone: () => calls.push(['done']),
+						}));
+					}
+					const root = document.createElement('div');
+					root.id = 'providers-fixture';
+					document.body.replaceChildren(root);
+					ReactDOM.createRoot(root).render(h(Fixture));
+				`,
+			});
+			await page.waitForFunction(
+				() => !!document.querySelector("#providers-fixture .providers-panel") && !!window.providersTest,
+			);
+		});
+		await page.addStyleTag({ url: `${origin}/src/styles.css` });
+		await set(page, { providers, models });
+		await page.waitForSelector(".provider-row");
+		return { context, page };
+	} catch (error) {
+		await context.close();
+		throw error;
+	}
+}
+
+async function set(page: Page, data: Partial<FixtureData>): Promise<void> {
+	await page.evaluate(value => window.providersTest.set(value), data);
+}
+async function select(page: Page, id: string | null): Promise<void> {
+	await page.evaluate(value => window.providersTest.select(value), id);
+}
+async function calls(page: Page): Promise<Call[]> {
+	return page.evaluate(() => window.providersTest.calls());
+}
+/** The focused element, named the way a test reads it. */
+async function focused(page: Page): Promise<string> {
+	return page.evaluate(() => {
+		const active = document.activeElement as HTMLElement | null;
+		if (!active) return "";
+		if (active.dataset.providerId) return `row:${active.dataset.providerId}`;
+		if (active.tagName === "INPUT") return `input:${(active as HTMLInputElement).type}`;
+		return `${active.tagName.toLowerCase()}:${active.textContent?.trim() ?? ""}`;
+	});
+}
+async function buttons(page: Page): Promise<Array<{ text: string; disabled: boolean }>> {
+	return page.$$eval(".providers-panel button", nodes =>
+		nodes.map(node => ({ text: node.textContent?.trim() ?? "", disabled: (node as HTMLButtonElement).disabled })),
+	);
+}
+async function click(page: Page, text: string): Promise<void> {
+	await page.evaluate(label => {
+		const button = [...document.querySelectorAll<HTMLButtonElement>(".providers-panel button")].find(
+			node => node.textContent?.trim() === label,
+		);
+		if (!button) throw new Error(`Missing button: ${label}`);
+		button.click();
+	}, text);
+}
+async function waitText(page: Page, text: string): Promise<void> {
+	await page.waitForFunction(
+		value => document.querySelector(".providers-panel")?.textContent?.includes(value),
+		{},
+		text,
+	);
+}
+
+suite("Providers panel interactions", () => {
+	test("search, rows and Back keep one keyboard path and restore the originating row and query", async () => {
+		const { context, page } = await fixture();
+		try {
+			expect(await page.$$eval(".provider-group-heading", nodes => nodes.map(node => node.textContent))).toEqual([
+				"Connected",
+				"All providers",
+			]);
+			expect(await page.$eval(".provider-summary", node => node.textContent)).toBe(
+				"1 connected · 2 models available",
+			);
+			await page.focus(".model-search input");
+			await page.keyboard.press("ArrowDown");
+			expect(await focused(page)).toBe("row:alpha");
+			await page.keyboard.press("ArrowDown");
+			expect(await focused(page)).toBe("row:beta");
+			await page.keyboard.press("End");
+			expect(await focused(page)).toBe(
+				"row:long-provider-identifier-that-keeps-going-without-any-break-opportunity-for-wrapping",
+			);
+			await page.keyboard.press("Home");
+			expect(await focused(page)).toBe("row:alpha");
+			await page.focus(".model-search input");
+			await page.keyboard.type("GAM");
+			expect(
+				await page.$$eval(".provider-row", nodes => nodes.map(node => node.getAttribute("data-provider-id"))),
+			).toEqual(["gamma"]);
+			await page.keyboard.press("ArrowDown");
+			expect(await focused(page)).toBe("row:gamma");
+			await page.keyboard.press("Enter");
+			await page.waitForSelector(".provider-detail");
+			expect(await focused(page)).toBe("h3:Gamma Gateway");
+			expect(await calls(page)).toEqual([["select", "gamma"]]);
+			await click(page, "All providers");
+			await page.waitForSelector(".provider-row");
+			expect(await focused(page)).toBe("row:gamma");
+			expect(await page.$eval(".model-search input", node => (node as HTMLInputElement).value)).toBe("GAM");
+			await page.$eval(".model-search input", node => (node as HTMLInputElement).select());
+			await page.keyboard.type("no-such-provider");
+			await waitText(page, "No providers match");
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a provider warning offers Continue only while the flow waits on it", async () => {
+		const { context, page } = await fixture();
+		try {
+			const warning = { id: "00000000-0000-4000-8000-0000000000a1", message: "⚠️  WARNING: fixture risk notice" };
+			await set(page, { flow: flow({ status: "waiting", warning }) });
+			await select(page, "beta");
+			await page.waitForSelector(".provider-warning");
+			// Focus lands on the warning heading, never on the confirm button.
+			expect(await focused(page)).toBe("h5:Notice from Beta");
+			expect(await page.$eval(".provider-warning p", node => node.textContent)).toBe(warning.message);
+			await click(page, "Continue");
+			await click(page, "Cancel sign-in");
+			expect(await calls(page)).toEqual([
+				["answer", FLOW, warning.id, "confirm"],
+				["cancel", FLOW],
+			]);
+			// The Host never sends a warning outside waiting; the panel still refuses to confirm one.
+			await set(page, { flow: flow({ status: "authorizing", warning }) });
+			await page.waitForFunction(() => !document.querySelector(".provider-warning button"));
+			const labels = (await buttons(page)).map(button => button.text);
+			expect(labels).not.toContain("Continue");
+			expect(labels.filter(label => label === "Cancel sign-in")).toHaveLength(1);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("prompts take focus, clear on submit and allow an empty answer only when the provider does", async () => {
+		const { context, page } = await fixture();
+		try {
+			await set(page, {
+				flow: flow({
+					status: "waiting",
+					prompt: { id: "00000000-0000-4000-8000-0000000000b1", message: "Enter the code" },
+				}),
+			});
+			await select(page, "beta");
+			await page.waitForSelector(".provider-prompt input");
+			expect(await focused(page)).toBe("input:password");
+			const submit = () => buttons(page).then(list => list.find(button => button.text === "Submit"));
+			expect((await submit())?.disabled).toBe(true);
+			await page.keyboard.type("private-answer");
+			expect((await submit())?.disabled).toBe(false);
+			await page.keyboard.press("Enter");
+			expect(await page.$eval(".provider-prompt input", node => (node as HTMLInputElement).value)).toBe("");
+			await set(page, {
+				flow: flow({
+					status: "waiting",
+					prompt: { id: "00000000-0000-4000-8000-0000000000b2", message: "Enterprise domain", allowEmpty: true },
+				}),
+			});
+			await waitText(page, "Enterprise domain");
+			expect((await submit())?.disabled).toBe(false);
+			await click(page, "Submit");
+			expect(await calls(page)).toEqual([
+				["answer", FLOW, "00000000-0000-4000-8000-0000000000b1", "private-answer"],
+				["answer", FLOW, "00000000-0000-4000-8000-0000000000b2", ""],
+			]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("opens only an HTTPS sign-in page and shows a device code as its own block", async () => {
+		const { context, page } = await fixture();
+		try {
+			await set(page, { flow: flow({ url: "http://sign-in.example.invalid/authorize" }) });
+			await select(page, "beta");
+			await waitText(page, "not a safe HTTPS link");
+			expect((await buttons(page)).map(button => button.text)).not.toContain("Open sign-in page");
+			const url = "https://sign-in.example.invalid/device";
+			await set(page, { flow: flow({ status: "waiting", url, verificationCode: "WDJB-MJHT" }) });
+			await page.waitForSelector(".provider-code-value");
+			expect(await page.$eval(".provider-code-value", node => node.textContent)).toBe("WDJB-MJHT");
+			expect(await page.$eval(".provider-url", node => node.textContent)).toContain(url);
+			await click(page, "Open sign-in page");
+			expect((await calls(page)).at(-1)).toEqual(["open", url]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("disconnected and another provider's active flow disable every action with a reason", async () => {
+		const { context, page } = await fixture();
+		try {
+			await set(page, {
+				flow: flow({ provider: "alpha", status: "waiting", url: "https://sign-in.example.invalid/a" }),
+			});
+			await select(page, "beta");
+			await waitText(page, "Finish or cancel the Alpha Cloud sign-in first.");
+			await page.type(".provider-key input", "sk-typed-key");
+			const disabled = async () =>
+				Object.fromEntries((await buttons(page)).map(button => [button.text, button.disabled]));
+			expect(await disabled()).toMatchObject({ "Sign in": true, "Save key": true, "Go to Alpha Cloud": false });
+			await click(page, "Go to Alpha Cloud");
+			await page.waitForSelector(".provider-flow");
+			expect(await focused(page)).toBe("h4:Continue in your browser");
+			await set(page, { flow: null, disconnected: true });
+			await click(page, "All providers");
+			await page.waitForSelector(".provider-row");
+			expect(
+				await page.$$eval(".provider-row", nodes => nodes.every(node => (node as HTMLButtonElement).disabled)),
+			).toBe(true);
+			expect(await page.$eval(".provider-summary", node => node.textContent)).toContain("disconnected");
+			await select(page, "alpha");
+			await page.waitForSelector(".provider-detail");
+			expect(await disabled()).toMatchObject({ Reconnect: true, "Save key": true, Disconnect: true });
+			expect(await page.$eval(".provider-key input", node => (node as HTMLInputElement).disabled)).toBe(true);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a key submit hands the raw draft to its owner once and never keeps it in the field", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page, "delta");
+			await page.waitForSelector(".provider-key input");
+			// A key-only provider has no sign-in section and keeps the plain heading.
+			expect((await buttons(page)).map(button => button.text)).not.toContain("Sign in");
+			await page.type(".provider-key input", "  sk-raw-draft  ");
+			await page.keyboard.press("Enter");
+			expect(await page.$eval(".provider-key input", node => (node as HTMLInputElement).value)).toBe("");
+			expect((await calls(page)).at(-1)).toEqual(["saveKey", "delta", "  sk-raw-draft  "]);
+			await set(page, { keyState: { provider: "delta", status: "invalid", reason: "command" } });
+			await waitText(page, "terminal command");
+			expect(await page.$eval(".provider-key input", node => node.getAttribute("aria-invalid"))).toBe("true");
+			await set(page, { keyState: { provider: "delta", status: "saved", catalogRefreshed: false } });
+			await waitText(page, "The model list couldn't refresh");
+			await click(page, "Done");
+			expect((await calls(page)).at(-1)).toEqual(["done"]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("the showcase renders every providers fixture state and the onboarding notice placements", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			const errors: string[] = [];
+			page.on("pageerror", error => errors.push(String(error)));
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-providers .providers-panel");
+			expect(
+				await page.$$eval(".showcase-index a", nodes =>
+					nodes.map(node => node.getAttribute("href")).filter(href => href?.includes("provider")),
+				),
+			).toEqual(["#showcase-providers", "#showcase-provider-onboarding"]);
+			const states = await page.$$eval("#showcase-providers > .actions[role=group] button", nodes =>
+				nodes.map(node => node.textContent ?? ""),
+			);
+			expect(states.length).toBeGreaterThanOrEqual(26);
+			for (const label of states) {
+				await page.evaluate(text => {
+					const button = [
+						...document.querySelectorAll<HTMLButtonElement>("#showcase-providers > .actions[role=group] button"),
+					].find(node => node.textContent === text);
+					button?.click();
+				}, label);
+				await page
+					.waitForFunction(
+						text =>
+							document.querySelector("#showcase-providers .showcase-result")?.textContent === `Showing: ${text}`,
+						{ timeout: 5000 },
+						label,
+					)
+					.catch(error => {
+						throw new Error(`State ${label} did not render: ${errors.join("; ")}`, { cause: error });
+					});
+				expect(await page.$$eval("#showcase-providers .providers-panel", nodes => nodes.length)).toBe(2);
+			}
+			expect(
+				await page.$$eval("#showcase-provider-onboarding .provider-notice", nodes =>
+					nodes.map(node => node.parentElement?.className),
+				),
+			).toEqual(["provider-notice-dock", "composer-area", ""]);
+			expect(errors).toEqual([]);
+		} finally {
+			await context.close();
+		}
+	}, 60000);
+
+	test("fits a 390px window in the list, the detail and the flow card", async () => {
+		const { context, page } = await fixture(390);
+		try {
+			const overflow = () =>
+				page.evaluate(() => {
+					const panel = document.querySelector<HTMLElement>(".providers-panel");
+					return {
+						page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+						panel: panel ? panel.scrollWidth - panel.clientWidth : -1,
+					};
+				});
+			expect(await overflow()).toEqual({ page: 0, panel: 0 });
+			const id = "long-provider-identifier-that-keeps-going-without-any-break-opportunity-for-wrapping";
+			await set(page, {
+				flow: flow({
+					provider: id,
+					status: "waiting",
+					url: `https://sign-in.example.invalid/${"segment".repeat(30)}?state=${"0".repeat(64)}`,
+					verificationCode: "WDJB-MJHT",
+				}),
+			});
+			await select(page, id);
+			await page.waitForSelector(".provider-flow");
+			expect(await overflow()).toEqual({ page: 0, panel: 0 });
+			await set(page, { flow: null });
+			await page.waitForSelector(".provider-key");
+			expect(await overflow()).toEqual({ page: 0, panel: 0 });
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+});
