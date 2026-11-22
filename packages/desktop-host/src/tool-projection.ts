@@ -71,6 +71,8 @@ interface SubjectPart {
 	firstLine?: boolean;
 	/** Remove `user:password@` from a URL. */
 	url?: boolean;
+	/** Keep only the file headers of an edit envelope (`*** Update File: a.ts`, `§a.ts`). */
+	headers?: boolean;
 }
 interface ToolSpec {
 	family: DesktopToolFamily;
@@ -91,8 +93,17 @@ const shell = (field: string) => (args: Record<string, unknown>) => ({
  */
 const TOOLS: Readonly<Record<string, ToolSpec>> = {
 	read: { family: "read", subject: args => ({ parts: [{ value: args.path, url: true }] }) },
-	write: { family: "write", subject: args => ({ parts: [{ value: args.path }] }) },
-	edit: { family: "edit", subject: args => ({ parts: [{ value: args.path }] }) },
+	write: { family: "write", subject: args => ({ parts: [{ value: args.path ?? args.file_path }] }) },
+	// Replace, patch and headerless hashline edits name `path`; vim names `file`. apply_patch and
+	// hashline envelopes name their files in header lines, which win over `path` as in the SDK;
+	// only those header lines are read, never content lines.
+	edit: {
+		family: "edit",
+		subject: args =>
+			typeof args.input === "string" && EDIT_HEADER.test(args.input)
+				? { parts: [{ value: args.input, headers: true }] }
+				: { parts: [{ value: args.path ?? args.file_path ?? args.file }] },
+	},
 	ast_edit: { family: "edit", subject: args => ({ parts: paths(args.paths) }) },
 	search: { family: "search", subject: args => ({ parts: [{ value: args.pattern }, ...paths(args.paths)] }) },
 	ast_grep: { family: "search", subject: args => ({ parts: [{ value: args.pat }, ...paths(args.paths)] }) },
@@ -121,6 +132,21 @@ export function toolFamily(name: string): DesktopToolFamily {
 	return Object.hasOwn(TOOLS, name) ? TOOLS[name]!.family : "other";
 }
 
+/** A file header line of an apply_patch (`*** Update File: a.ts`) or hashline (`§a.ts`) envelope. */
+const EDIT_HEADER = /^(?:\*\*\* (?:Add|Update|Delete) File: |§)(.+)$/m;
+
+/** File paths named by the header lines of an edit envelope, in order. */
+function editHeaders(input: string): string[] {
+	const paths: string[] = [];
+	for (const line of input.split("\n")) {
+		const match = EDIT_HEADER.exec(line.replace(/\r$/, "").trimEnd());
+		const path = match?.[1]?.trim();
+		if (path && !paths.includes(path)) paths.push(path);
+		if (paths.length >= SUBJECT_ENTRIES) break;
+	}
+	return paths;
+}
+
 function withoutUserInfo(text: string): string {
 	return text.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@\s]*@/i, "$1");
 }
@@ -139,6 +165,7 @@ function subject(name: string, args: Record<string, unknown>, redact: (text: str
 		if (text.length > MAX_REDACTION_CHARS) continue;
 		if (part.firstLine) text = text.split("\n").find(line => line.trim()) ?? "";
 		if (part.url) text = withoutUserInfo(text);
+		if (part.headers) text = editHeaders(text).join(" · ");
 		text = text.replace(/\s+/g, " ").trim();
 		if (!text) continue;
 		pieces.push(text);
@@ -498,6 +525,18 @@ function commandText(name: string, args: Record<string, unknown>): { field: stri
 	return undefined;
 }
 
+/**
+ * The file an edit call names for its `index`th result, when the result does not say: `path`,
+ * `file_path` or `file`, else the envelope's header lines (read after the whole input is redacted).
+ */
+function callPath(call: ToolCallSource | undefined, index: number, redact: (text: string) => string): unknown {
+	const args = call?.arguments;
+	const named = args?.path ?? args?.file_path ?? args?.file;
+	if (typeof named === "string" || typeof args?.input !== "string" || args.input.length > MAX_REDACTION_CHARS)
+		return named;
+	return editHeaders(redact(args.input))[index];
+}
+
 function diffEntries(
 	call: ToolCallSource | undefined,
 	family: DesktopToolFamily,
@@ -507,8 +546,8 @@ function diffEntries(
 	const details = record(result?.details);
 	const sources: Array<{ path: unknown; diff: unknown; op?: unknown; error?: unknown }> =
 		family === "edit"
-			? editDiffs(details).map(item => ({
-					path: item.path ?? details?.path ?? call?.arguments.path,
+			? editDiffs(details).map((item, index) => ({
+					path: item.path ?? details?.path ?? callPath(call, index, redact),
 					diff: item.diff,
 					op: item.op,
 					error: item.isError === true ? (item.displayErrorText ?? item.errorText) : undefined,

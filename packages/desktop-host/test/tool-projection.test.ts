@@ -47,6 +47,25 @@ describe("tool row summaries", () => {
 			["write", { path: "notes/plan.md", content: "a\nb\n" }, { family: "write", subject: "notes/plan.md" }],
 			["edit", { path: "src/a.ts", edits: [{ old_text: "old-hidden" }] }, { family: "edit", subject: "src/a.ts" }],
 			[
+				"edit",
+				{
+					input: "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-hidden-old\n+hidden-new\n*** Add File: src/b.ts\n+hidden\n*** End Patch",
+				},
+				{ family: "edit", subject: "src/a.ts · src/b.ts" },
+			],
+			[
+				"edit",
+				{ input: "§src/c.ts\n10=hidden-payload", path: "src/other.ts" },
+				{ family: "edit", subject: "src/c.ts" },
+			],
+			["edit", { input: "10=hidden-payload", path: "src/d.ts" }, { family: "edit", subject: "src/d.ts" }],
+			[
+				"edit",
+				{ file: "src/vim.ts", steps: [{ kbd: ["dd"], insert: "hidden" }] },
+				{ family: "edit", subject: "src/vim.ts" },
+			],
+			["write", { file_path: "notes/alt.md", content: "hidden" }, { family: "write", subject: "notes/alt.md" }],
+			[
 				"ast_edit",
 				{ ops: [{ pat: "pat-hidden" }], paths: ["src/", "test/"] },
 				{ family: "edit", subject: "src/ · test/" },
@@ -441,6 +460,12 @@ describe("tool call details", () => {
 		expect(bounded.diff?.map(item => item.diff.length)).toEqual([40_000, DESKTOP_TOOL_LIMITS.diff - 40_000]);
 		expect(bounded.diff?.map(item => item.added)).toEqual([1, 1]);
 		expect(bounded.truncated).toBe(true);
+		// A hashline or apply_patch result names no path; the envelope header does.
+		expect(
+			detail(pair("edit", { input: "§src/tok-123.ts\n≔2dj\nTWO" }, { details: { diff: "+2|TWO" } }), "c1", text =>
+				text.replaceAll("tok-123", "[redacted]"),
+			).diff?.[0]?.path,
+		).toBe("src/[redacted].ts");
 		// Without a diff, a failed edit falls back to its arguments.
 		expect(detail(pair("edit", { path: "a.ts" }, { isError: true })).args).toBe(
 			JSON.stringify({ path: "a.ts" }, null, 2),
