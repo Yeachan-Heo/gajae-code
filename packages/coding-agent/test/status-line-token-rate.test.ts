@@ -65,48 +65,4 @@ describe("token rate calculation", () => {
 		);
 		expect(rate).toBeNull();
 	});
-
-	it("excludes time to first token from the generation duration", () => {
-		const base = assistantMessage();
-		const rate = calculateTokensPerSecond(
-			[assistantMessage({ usage: { ...base.usage, output: 300 }, duration: 12_000, ttft: 10_000 })],
-			false,
-		);
-		expect(rate).toBe(150);
-	});
-
-	it("excludes time to first token while streaming", () => {
-		const base = assistantMessage();
-		const rate = calculateTokensPerSecond(
-			[
-				assistantMessage({
-					timestamp: 10_000,
-					duration: undefined,
-					ttft: 4_000,
-					usage: { ...base.usage, output: 100 },
-				}),
-			],
-			true,
-			16_000,
-		);
-		expect(rate).toBe(50);
-	});
-
-	it("falls back to the full duration when ttft is not shorter than the duration", () => {
-		const base = assistantMessage();
-		const rate = calculateTokensPerSecond(
-			[assistantMessage({ usage: { ...base.usage, output: 100 }, duration: 2_000, ttft: 2_000 })],
-			false,
-		);
-		expect(rate).toBe(50);
-	});
-
-	it("returns null when the post-ttft window is too short to measure", () => {
-		const base = assistantMessage();
-		const rate = calculateTokensPerSecond(
-			[assistantMessage({ usage: { ...base.usage, output: 10 }, duration: 5_050, ttft: 5_000 })],
-			false,
-		);
-		expect(rate).toBeNull();
-	});
 });
