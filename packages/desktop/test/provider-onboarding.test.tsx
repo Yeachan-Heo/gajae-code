@@ -239,6 +239,32 @@ suite("Zero-model onboarding notice", () => {
 		}
 	}, 30000);
 
+	test("stays put when switching between conversations that have no models", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page, "Oldest conversation · Idle");
+			await page.waitForSelector(ABOVE_COMPOSER);
+			await page.evaluate(() => {
+				const flags = window as unknown as { noticeGone: boolean };
+				flags.noticeGone = false;
+				new MutationObserver(() => {
+					if (!document.querySelector(".composer-area > .provider-notice")) flags.noticeGone = true;
+				}).observe(document, { subtree: true, childList: true });
+			});
+			await select(page, "Newest conversation · Done");
+			await page.waitForFunction(() =>
+				window.navigationFixture
+					.requests()
+					.some(request => request.method === "models.list" && request.params.sessionId === "new"),
+			);
+			await Bun.sleep(200);
+			expect(await page.$(ABOVE_COMPOSER)).not.toBeNull();
+			expect(await page.evaluate(() => (window as unknown as { noticeGone: boolean }).noticeGone)).toBe(false);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("its button opens the Providers dialog, and a saved key removes it in the snapshot's render", async () => {
 		const { context, page } = await fixture({ holdModelLists: true });
 		try {

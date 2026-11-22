@@ -32,8 +32,10 @@ export function ProviderOnboardingNotice({ onConnect }: { onConnect(): void }) {
 
 /**
  * Whether the onboarding notice shows (see `shouldShowProviderOnboarding`). The conversation's
- * catalog resets to loading on every snapshot, so the last answer it settled on for the same
- * conversation and control generation is kept until it settles again.
+ * catalog resets to loading on every snapshot and on every switch, so until it settles again the
+ * last settled answer stands in: the same conversation's answer, or another conversation's
+ * "no models" answer. A "models" answer never carries to another conversation, so a catalog that
+ * has models elsewhere cannot make the notice flash in before this one has answered.
  */
 export function useProviderOnboarding({
 	connected,
@@ -52,6 +54,8 @@ export function useProviderOnboarding({
 	useEffect(() => {
 		if (owner && settled) remembered.current = { owner, answer: settled };
 	}, [owner, settled]);
-	const answer = settled ?? (owner && remembered.current?.owner === owner ? remembered.current.answer : undefined);
+	const last = remembered.current;
+	const answer =
+		settled ?? (owner && last && (last.owner === owner || last.answer !== "models") ? last.answer : undefined);
 	return shouldShowProviderOnboarding({ connected, models, conversation: session ? { answer } : null });
 }
