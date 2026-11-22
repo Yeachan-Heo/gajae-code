@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { releaseSettingsScope } from "../capability";
@@ -471,22 +472,102 @@ export interface EmbeddedTranscriptTail {
 	held: string | null;
 }
 
+/** File identity a full tail read was taken against. */
+interface TranscriptStamp {
+	file: string;
+	sessionId: string;
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+/** The last full read per open session; a later check reuses it while the file's stamp is unchanged. */
+const transcriptTails = new WeakMap<SessionManager, { stamp: TranscriptStamp; tail: EmbeddedTranscriptTail }>();
+
+async function stampTranscript(file: string, sessionId: string): Promise<TranscriptStamp | undefined> {
+	try {
+		const stat = await fs.stat(file, { bigint: true });
+		if (!stat.isFile()) return undefined;
+		const { dev, ino, size, mtimeNs, ctimeNs } = stat;
+		return { file, sessionId, dev, ino, size, mtimeNs, ctimeNs };
+	} catch {
+		return undefined;
+	}
+}
+
+function sameStamp(left: TranscriptStamp, right: TranscriptStamp): boolean {
+	return (
+		left.file === right.file &&
+		left.sessionId === right.sessionId &&
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+/**
+ * A write in the same timestamp tick as a read can leave every stat field unchanged. A read
+ * only vouches for later stamps once it began clearly after the file last changed: 10 ms on
+ * filesystems with sub-millisecond timestamps, 2 s on coarse ones (whole-millisecond values).
+ */
+function readAfterSettled(stamp: TranscriptStamp, readStartedNs: bigint): boolean {
+	const fine = stamp.ctimeNs % 1_000_000n !== 0n || stamp.mtimeNs % 1_000_000n !== 0n;
+	const changed = stamp.ctimeNs > stamp.mtimeNs ? stamp.ctimeNs : stamp.mtimeNs;
+	return readStartedNs - changed > (fine ? 10_000_000n : 2_000_000_000n);
+}
+
 /**
  * Read the committed transcript without touching the session's cursor, entries or writer state.
  * Undefined when nothing readable is published for this session: absent, unsupported, or a
  * different transcript identity at its path.
+ *
+ * A repeat check stats the file first and reuses the previous answer while the file's device,
+ * inode, size, modification and change times are all unchanged and that answer held the tail.
+ * Any write changes at least one of them, so the session's own writes and another process's
+ * appends or rewrites (including a same-size rewrite that restores the modification time) are
+ * read in full again.
  */
 export async function readEmbeddedTranscriptTail(
 	session: Pick<CreateAgentSessionResult["session"], "sessionManager">,
 ): Promise<EmbeddedTranscriptTail | undefined> {
 	const manager = session.sessionManager;
+	const file = manager.getSessionFile();
+	const before = file ? await stampTranscript(file, manager.getSessionId()) : undefined;
+	const cached = transcriptTails.get(manager);
+	if (
+		cached &&
+		before &&
+		sameStamp(cached.stamp, before) &&
+		cached.tail.committed === cached.tail.held &&
+		(cached.tail.held === null || manager.getEntry(cached.tail.held) !== undefined)
+	)
+		return { ...cached.tail };
+	transcriptTails.delete(manager);
+	const readStartedNs = BigInt(Date.now()) * 1_000_000n;
 	const read = await manager.captureCommittedSnapshot();
 	if (read.kind !== "snapshot" || read.snapshot.sessionId !== manager.getSessionId()) return undefined;
 	const { entryIds } = read.snapshot;
 	let held: string | null = null;
 	for (let index = entryIds.length - 1; index >= 0 && held === null; index--)
 		if (manager.getEntry(entryIds[index]!)) held = entryIds[index]!;
-	return { committed: entryIds.at(-1) ?? null, held };
+	const tail: EmbeddedTranscriptTail = { committed: entryIds.at(-1) ?? null, held };
+	// Remember the read only when nothing changed the file while it ran.
+	const after =
+		before && read.snapshot.sessionFile === before.file
+			? await stampTranscript(before.file, before.sessionId)
+			: undefined;
+	if (
+		before &&
+		after &&
+		sameStamp(before, after) &&
+		after.size === BigInt(read.snapshot.size) &&
+		readAfterSettled(after, readStartedNs)
+	)
+		transcriptTails.set(manager, { stamp: after, tail: { ...tail } });
+	return tail;
 }
 
 /**

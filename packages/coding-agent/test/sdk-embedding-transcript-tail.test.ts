@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -52,4 +52,74 @@ test("has no tail to report before the transcript is published", async () => {
 	const app = SessionManager.create(cwd, destination);
 	cleanups.push(() => app.close());
 	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toBeUndefined();
+});
+
+/** Past the window in which a same-tick write could leave every stat field unchanged. */
+const settle = () => Bun.sleep(40);
+
+test("an unchanged transcript is read once; later checks only stat it", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close());
+	const own = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	await settle();
+	const reads = vi.spyOn(SessionManager.prototype, "captureCommittedSnapshot");
+	cleanups.push(async () => reads.mockRestore());
+	for (let index = 0; index < 3; index++)
+		expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	expect(reads).toHaveBeenCalledTimes(1);
+
+	// The session's own write changes the file, so the next check reads it again.
+	const next = app.appendMessage(user("second app turn"));
+	await app.flush();
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: next, held: next });
+	expect(reads).toHaveBeenCalledTimes(2);
+});
+
+test("a cached tail still sees another process's append", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close());
+	const own = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	await settle();
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	const terminal = await SessionManager.open(app.getSessionFile()!, destination);
+	const foreign = terminal.appendMessage(user("terminal turn"));
+	await terminal.flush();
+	expect(await terminal.closeStrict()).toMatchObject({ kind: "closed" });
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: foreign, held: own });
+});
+
+test("a same-size rewrite is seen even when the rewriter restores the modification time", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close().catch(() => {}));
+	const own = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	const file = app.getSessionFile()!;
+	// A whole-second mtime can be restored exactly after the rewrite.
+	const mtime = 1_700_000_000;
+	await fs.utimes(file, mtime, mtime);
+	await settle();
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	// Rewrite in place: same inode, same size, a different newest entry id, original mtime.
+	const before = await fs.stat(file, { bigint: true });
+	const replacement = own.replace(/./, character => (character === "0" ? "1" : "0"));
+	const text = await Bun.file(file).text();
+	const handle = await fs.open(file, "r+");
+	try {
+		await handle.write(text.replaceAll(own, replacement), 0, "utf8");
+	} finally {
+		await handle.close();
+	}
+	await fs.utimes(file, mtime, mtime);
+	const after = await fs.stat(file, { bigint: true });
+	// Only the change time, which no writer can set, tells the two files apart.
+	expect([after.ino, after.size, after.mtimeNs]).toEqual([before.ino, before.size, before.mtimeNs]);
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: replacement, held: null });
 });

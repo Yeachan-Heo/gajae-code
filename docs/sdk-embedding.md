@@ -433,7 +433,14 @@ other surface's turns are visible and the next prompt continues them. While a se
 is open, `committed !== held` means another process appended after this session read
 the file. `isEmbeddedAppendRefused(session)` reports the store's lasting refusal of a
 stale writer; reopen the transcript to continue. Both read only; neither changes the
-session's cursor, entries or writer state.
+session's cursor, entries or writer state. A repeat `readEmbeddedTranscriptTail` call on
+the same session costs one `stat`: it reuses the previous full read while the file's device,
+inode, size, modification and change times are unchanged and that read held the tail. Any
+write changes one of them, so the session's own appends, another process's appends and a
+same-size rewrite (even one that restores the modification time) are read in full again.
+A read taken within 10 ms of the file's last change (2 s when the filesystem reports
+whole-millisecond times) is not reused, because a write in the same timestamp tick could
+leave every field equal.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
