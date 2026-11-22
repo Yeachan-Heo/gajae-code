@@ -954,6 +954,7 @@ export class DesktopHost {
 						sessionGeneration: live.sdk.sessionLifecycle.generation,
 						streamingMessage: live.streamingMessage,
 						revision: entryId => this.#revisions(live).revision(live.sdk, entryId),
+						secrets: this.#secrets,
 					},
 				)
 			: [];

@@ -334,6 +334,35 @@ export function hasDetail(call: ToolCallSource | undefined, result: unknown): bo
 }
 
 /**
+ * A token for the contents of a secret set: the same token while they stay the same, a new one
+ * once a secret is added or removed, so anything redacted under an older token is stale.
+ */
+const epochs = new WeakMap<ReadonlySet<string>, { members: string[]; token: object }>();
+export function secretEpoch(secrets: ReadonlySet<string>): object {
+	const known = epochs.get(secrets);
+	if (known && known.members.length === secrets.size) {
+		let index = 0;
+		let same = true;
+		for (const secret of secrets) if (known.members[index++] !== secret) same = false;
+		if (same) return known.token;
+	}
+	const entry = { members: [...secrets], token: {} };
+	epochs.set(secrets, entry);
+	return entry.token;
+}
+
+/**
+ * Subject and intent of a committed call, keyed by its arguments object, which the SDK no longer
+ * changes once the call's message is complete. Only these are remembered: they cost a whole-value
+ * redaction of every allowlisted argument, while status and stats read a result the SDK may
+ * rewrite in place (spilled output, a near-limit failure) and are cheap to read again.
+ */
+const committedLines = new WeakMap<
+	object,
+	{ epoch: object; toolName: string; intent?: string; subject?: string; intentLine?: string }
+>();
+
+/**
  * Call metadata for a transcript row. Every string is redacted whole before it is cut. `detail`
  * is the caller's statement that this Host answers `tool.detail` for the row's session.
  * `argument` redacts the call's argument values (subject and intent); it defaults to `redact`,
@@ -348,13 +377,35 @@ export function projectToolCall(
 		result?: unknown;
 		status: DesktopToolCallStatus;
 		detail: boolean;
+		/**
+		 * `secretEpoch` of the secrets `redact` masks, for a call whose message is complete: its
+		 * subject and intent are then projected once per secret set. Absent, nothing is remembered.
+		 */
+		epoch?: object;
 	},
 	redact: (text: string) => string,
 	argument: (text: string) => string = redact,
 ): DesktopToolCall {
 	const family = toolFamily(input.toolName);
-	const shown = input.call ? subject(input.toolName, input.call.arguments, argument) : undefined;
-	const intent = intentLine(input.call?.intent, argument);
+	const call = input.call;
+	const cached = call && input.epoch ? committedLines.get(call.arguments) : undefined;
+	let shown: string | undefined;
+	let intent: string | undefined;
+	if (cached && cached.epoch === input.epoch && cached.toolName === input.toolName && cached.intent === call?.intent) {
+		shown = cached.subject;
+		intent = cached.intentLine;
+	} else {
+		shown = call ? subject(input.toolName, call.arguments, argument) : undefined;
+		intent = intentLine(call?.intent, argument);
+		if (call && input.epoch)
+			committedLines.set(call.arguments, {
+				epoch: input.epoch,
+				toolName: input.toolName,
+				intent: call.intent,
+				subject: shown,
+				intentLine: intent,
+			});
+	}
 	const facts = stats(input.call, family, record(input.result), redact);
 	return {
 		callId: redactedHead(input.callId, 512, redact) ?? "",

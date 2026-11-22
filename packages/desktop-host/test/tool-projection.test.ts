@@ -211,6 +211,39 @@ describe("tool row summaries", () => {
 		]);
 	});
 
+	test("a committed call's subject and intent are redacted once per secret set, and again after it changes", () => {
+		const secret = "sk-learned-later-0123456789";
+		const secrets = new Set<string>();
+		const input = `*** Begin Patch\n*** Update File: src/${secret}.ts\n${"+ line\n".repeat(1_000)}*** End Patch`;
+		let reads = 0;
+		const redact = (text: string) => {
+			if (text === input) reads++;
+			for (const known of secrets) text = text.replaceAll(known, "[redacted]");
+			return text;
+		};
+		const call = { type: "toolCall", id: "c1", name: "edit", arguments: { input, _i: `Edit ${secret}` } };
+		const messages = [
+			{ role: "assistant", stopReason: "toolUse", content: [call] },
+			{ role: "toolResult", toolCallId: "c1", toolName: "edit", content: "ok", details: { diff: "+1|a" } },
+		];
+		const project = () => projectMessages(messages, redact, 500_000, { ...live, secrets })[0]?.tool;
+		expect(project()).toMatchObject({ subject: `src/${secret}.ts`, intent: `Edit ${secret}` });
+		expect(project()?.subject).toBe(`src/${secret}.ts`);
+		expect(reads).toBe(1);
+		// A secret learned after the first projection is redacted on the next one.
+		secrets.add(secret);
+		expect(project()).toMatchObject({ subject: "src/[redacted].ts", intent: "Edit [redacted]" });
+		expect(reads).toBe(2);
+		// Status and stats come from the result every time: the SDK rewrites results in place.
+		(messages[1] as { isError?: boolean }).isError = true;
+		expect(project()).toMatchObject({ status: "failed", subject: "src/[redacted].ts" });
+		expect(reads).toBe(2);
+		// Without the Host's secret set nothing is remembered.
+		projectMessages(messages, redact, 500_000, live);
+		projectMessages(messages, redact, 500_000, live);
+		expect(reads).toBe(4);
+	});
+
 	test("a reused call id pairs each result with its nearest preceding call", () => {
 		const messages = projectMessages([
 			{ role: "assistant", content: [{ type: "toolCall", id: "dup", name: "read", arguments: { path: "first" } }] },
@@ -223,6 +256,17 @@ describe("tool row summaries", () => {
 		expect(messages.map(message => message.tool?.subject)).toEqual(["first", "second", undefined, undefined]);
 		expect(messages[2]?.tool).toEqual({ callId: "orphan", status: "done", family: "read", detail: false });
 		expect(messages[3]?.tool).toBeUndefined();
+	});
+
+	test("a result in the window pairs with its call even when the call is older than the window", () => {
+		const messages = [
+			{ role: "assistant", content: [{ type: "toolCall", id: "far", name: "read", arguments: { path: "old.ts" } }] },
+			...Array.from({ length: HISTORY_LIMIT + 40 }, (_, index) => ({ role: "user", content: `note ${index}` })),
+			{ role: "toolResult", toolCallId: "far", toolName: "read", content: "ok" },
+		];
+		const projected = projectMessages(messages, undefined, 500_000, live);
+		expect(projected).toHaveLength(HISTORY_LIMIT);
+		expect(projected.at(-1)?.tool?.subject).toBe("old.ts");
 	});
 
 	test("tool metadata stays small enough for a full window in the snapshot budget", () => {

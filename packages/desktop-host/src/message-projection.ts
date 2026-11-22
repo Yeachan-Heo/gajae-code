@@ -4,6 +4,7 @@ import type { DesktopMessage, DesktopMessageBlock, DesktopMessageRevision } from
 import {
 	MAX_REDACTION_CHARS,
 	projectToolCall,
+	secretEpoch,
 	type ToolCallSource,
 	toolCallBlocks,
 	toolResultStatus,
@@ -109,6 +110,11 @@ interface CopyProjection {
 	streamingMessage?: unknown;
 	/** Resolves sibling revisions for a persisted user prompt on the active branch. */
 	revision?: (entryId: string) => DesktopMessageRevision | undefined;
+	/**
+	 * The secrets `redact` masks. With them, a committed call's subject and intent are redacted
+	 * once per secret set instead of on every projection.
+	 */
+	secrets?: ReadonlySet<string>;
 }
 
 function visible(value: unknown): boolean {
@@ -144,18 +150,30 @@ export function countVisibleMessages(messages: readonly unknown[]): number {
 }
 
 /**
- * The call each `toolResult` answers, by message index: the nearest preceding `toolCall` with its
- * id, so a provider that reuses ids still pairs each result with its own arguments.
+ * The call each `toolResult` at or after `from` answers, by message index: the nearest preceding
+ * `toolCall` with its id, so a provider that reuses ids still pairs each result with its own
+ * arguments. One backward pass stops once every result it has passed is paired, so a frame reads
+ * its window and the calls just before it rather than the whole transcript. A result never answers
+ * a call the streaming message is still writing, so every resolved call is complete.
  */
-function resolveToolCalls(messages: readonly unknown[]): Map<number, ToolCallSource> {
-	const latest = new Map<string, ToolCallSource>();
+function resolveToolCalls(
+	messages: readonly unknown[],
+	streamingMessage: unknown,
+	from = 0,
+): Map<number, ToolCallSource> {
+	const waiting = new Map<string, number[]>();
 	const resolved = new Map<number, ToolCallSource>();
-	for (let index = 0; index < messages.length; index++) {
+	for (let index = messages.length - 1; index >= 0 && (index >= from || waiting.size > 0); index--) {
 		const message = record(messages[index]);
-		if (message?.role === "assistant") for (const call of toolCallBlocks(message)) latest.set(call.id, call);
-		else if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
-			const call = latest.get(message.toolCallId);
-			if (call) resolved.set(index, call);
+		if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
+			if (index >= from) waiting.set(message.toolCallId, [...(waiting.get(message.toolCallId) ?? []), index]);
+		} else if (message?.role === "assistant" && messages[index] !== streamingMessage && waiting.size > 0) {
+			// The last block with an id wins within one message, as a forward pass would keep it.
+			const calls = new Map(toolCallBlocks(message).map(call => [call.id, call]));
+			for (const [id, call] of calls) {
+				for (const result of waiting.get(id) ?? []) resolved.set(result, call);
+				waiting.delete(id);
+			}
 		}
 	}
 	return resolved;
@@ -169,6 +187,7 @@ function project(
 	images: { remaining: number },
 	copy?: CopyProjection,
 	call?: ToolCallSource,
+	epoch?: object,
 ): DesktopMessage | undefined {
 	if (!visible(value)) return undefined;
 	const message = record(value)!;
@@ -279,6 +298,7 @@ function project(
 						result: message,
 						status: toolResultStatus(message),
 						detail: copy !== undefined,
+						...(epoch ? { epoch } : {}),
 					},
 					redact,
 				)
@@ -423,9 +443,13 @@ export function projectMessages(
 ): DesktopMessage[] {
 	const result: DesktopMessage[] = [];
 	const images = { remaining: imageBudget };
-	const calls = resolveToolCalls(messages);
+	// The window: the newest `HISTORY_LIMIT` visible messages.
+	let start = messages.length;
+	for (let shown = 0; start > 0 && shown < HISTORY_LIMIT; ) if (visible(messages[--start])) shown++;
+	const calls = resolveToolCalls(messages, copy?.streamingMessage, start);
+	const epoch = copy?.secrets ? secretEpoch(copy.secrets) : undefined;
 	for (let i = messages.length - 1; i >= 0 && result.length < HISTORY_LIMIT; i--) {
-		const message = project(messages[i], i, TEXT_LIMIT, redact, images, copy, calls.get(i));
+		const message = project(messages[i], i, TEXT_LIMIT, redact, images, copy, calls.get(i), epoch);
 		if (message) result.push(message);
 	}
 	return result.reverse();
@@ -443,11 +467,12 @@ export function projectHistoryPage(
 	let budget = HISTORY_PAGE_BYTES - 1;
 	const images = { remaining: HISTORY_PAGE_BYTES };
 	let full = false;
-	const calls = resolveToolCalls(messages);
+	const calls = resolveToolCalls(messages, copy?.streamingMessage);
+	const epoch = copy?.secrets ? secretEpoch(copy.secrets) : undefined;
 	for (let index = 0; index < messages.length; index++) {
 		if (!visible(messages[index])) continue;
 		if (total++ < offset || full || page.length >= limit) continue;
-		let message = project(messages[index], index, 32_000, redact, images, copy, calls.get(index))!;
+		let message = project(messages[index], index, 32_000, redact, images, copy, calls.get(index), epoch)!;
 		let size = bytes(message);
 		if (size > budget && message.blocks?.some(block => block.type === "image")) {
 			message = {
