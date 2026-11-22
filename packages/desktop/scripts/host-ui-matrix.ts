@@ -291,11 +291,13 @@ try {
   await page.fill("#session-search", "");
   await page.waitForTimeout(200);
 
-  // 10. Active-tools dialog lists tools and saves a selection.
+  // 10. Tools dialog opens and lists the conversation's tools.
   setStage("tools-dialog");
   await openMenu();
   await clickText("Manage active tools");
-  await waitFn(() => document.body.innerText.includes("Active tools"));
+  await waitFn(() =>
+    [...document.querySelectorAll("dialog[open] h1, dialog[open] h2")].some(heading => heading.textContent?.trim() === "Tools"),
+  );
   feature("toolsDialog", { opened: true, body: (await body()).slice(-260) });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "08-tools.png"))} });
   await page.keyboard.press("Escape");
