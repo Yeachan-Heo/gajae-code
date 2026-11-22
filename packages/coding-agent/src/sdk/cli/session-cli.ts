@@ -14,6 +14,7 @@ import {
 import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
+import { normalizeBrokerLockRefusalError } from "../broker/lock-refusal";
 import { resolveSessionLocator } from "../broker/session-index";
 import {
 	MASTER_OWNER_SESSION_ENV,
@@ -25,6 +26,7 @@ import {
 	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { BrokerStartupError } from "../broker/startup-failure";
 import { bounded, readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
@@ -229,6 +231,25 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	});
 }
 
+/**
+ * `broker_unavailable` with the fixed `lock_refused` diagnostic when a detached
+ * broker refused an existing `broker.lock`; `undefined` for any other error.
+ * Neither the lock path nor the broker's message is exposed.
+ * Unwraps AggregateError to handle cleanup failures alongside primary refusal.
+ */
+export function brokerLockRefusalFailure(error: unknown, details?: unknown): PublicCommandFailure | undefined {
+	const normalized = normalizeBrokerLockRefusalError(error);
+	if (normalized.refusalCode === undefined) {
+		// Also check BrokerStartupError with lockRefused (when refusal code info was lost)
+		if (!(normalized.primaryError instanceof BrokerStartupError) || !normalized.primaryError.lockRefused)
+			return undefined;
+	}
+	return new PublicCommandFailure({
+		...sdkPublicFailure("broker_unavailable", details, "pre-send").input,
+		diagnostics: normalized.cleanupUnverified ? ["lock_refused", "broker_cleanup_unverified"] : ["lock_refused"],
+	});
+}
+
 function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): PublicCommandFailure {
 	if (error instanceof PublicCommandFailure)
 		return new PublicCommandFailure({
@@ -243,6 +264,8 @@ function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): Publi
 			],
 		});
 	const context = { sessionId: args.sessionId, operationRef: args.opRef, idempotencyKey: args.idempotencyKey };
+	const lockFailure = brokerLockRefusalFailure(error, context);
+	if (lockFailure) return lockFailure;
 	if (error instanceof SdkSessionCliError)
 		return sdkPublicFailure(
 			error.exitCode === 2 && error.code !== "invalid_json" ? "usage" : error.code,

@@ -88,9 +88,29 @@ import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
+/**
+ * AskTool instances built by `AskTool.createIf`. Membership is the only proof of
+ * a built-in `ask`: the set is module-private, so no property, method, or name a
+ * tool carries can claim it.
+ */
+const builtinAskTools = new WeakSet<AskTool>();
+
+/**
+ * Whether `tool` is the built-in AskTool implementation itself. A facade must be
+ * resolved to its implementation first (`LazyAgentTool.implementationOf`).
+ */
+export function isBuiltinAskTool(tool: unknown): boolean {
+	return tool instanceof AskTool && builtinAskTools.has(tool);
+}
+
+import {
+	recordUltragoalHumanBlockedAskAnswered,
+	recordUltragoalHumanBlockedAskReleased,
+	recordUltragoalHumanBlockedAskReserved,
+} from "../gjc-runtime/ultragoal-runtime";
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
-import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
+import { assertUltragoalAskAllowed, isHumanBlockedAskReceiptCurrent } from "./ultragoal-ask-guard";
 
 // =============================================================================
 // Types
@@ -114,6 +134,8 @@ export interface AskToolDetails {
 	selectedOptions?: string[];
 	customInput?: string;
 	clarificationQuestion?: string;
+	/** Set when the selection came from the `ask.timeout` deadline, not from the user. */
+	timedOut?: boolean;
 	/** Multi-part question mode */
 	results?: QuestionResult[];
 }
@@ -803,6 +825,9 @@ type AskParams = AskToolInput;
  * Allows gathering user preferences, clarifying instructions, and getting decisions
  * on implementation choices as the agent works.
  */
+/** Human-blocked ask admissions that are open, or answered without a durable spend row, keyed by session and classification. */
+const humanBlockedAsksInFlight = new Set<string>();
+
 export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
@@ -828,9 +853,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
-		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
-			? new AskTool(session)
-			: null;
+		if (!(session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.())) return null;
+		const tool = new AskTool(session);
+		// Only this factory vouches for an instance. The constructor is public, so
+		// vouching there would also cover a subclass that overrides `execute` and
+		// skips the durable one-question settlement.
+		builtinAskTools.add(tool);
+		return tool;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -950,12 +979,112 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		await assertUltragoalAskAllowed(
+		const admission = await assertUltragoalAskAllowed(
 			this.session.cwd,
 			{ sessionId: this.session.getSessionId?.() ?? null },
 			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
 			params,
 		);
+		const receipt = admission?.humanBlockedReceipt;
+		if (!receipt) return this.#ask(_toolCallId, params, signal, _onUpdate, context);
+		// The pause verdict is recorded through the session's own CLI authority, so
+		// it is not independent proof by itself. Only an attended interactive UI puts
+		// a human in front of the question; headless answer sources stay refused.
+		if (context?.hasUI !== true || !context.ui) {
+			throw new ToolError(
+				"Ultragoal ask guard: a human-only blocker admits an ask only in an interactive session. Record the blocker with `gjc ultragoal record-review-blockers` instead.",
+			);
+		}
+		// A verified human-only blocker admits one answered ask. Parallel asks in
+		// one turn all pass the guard before any of them is answered, so the
+		// admission is reserved here; it is spent only once the question returned
+		// an answer. A cancelled ask throws and leaves it usable.
+		const reservation = `${receipt.sessionId}:${receipt.classificationEventId}`;
+		if (humanBlockedAsksInFlight.has(reservation)) {
+			throw new ToolError(
+				"Ultragoal ask guard: the single ask for this human-only blocker is already open or was already answered.",
+			);
+		}
+		humanBlockedAsksInFlight.add(reservation);
+		let release = true;
+		try {
+			let reserved: boolean;
+			try {
+				reserved = await recordUltragoalHumanBlockedAskReserved({ cwd: this.session.cwd, ...receipt }, () =>
+					isHumanBlockedAskReceiptCurrent(this.session.cwd, receipt),
+				);
+			} catch (error) {
+				throw new ToolError(
+					`Ultragoal ask guard: the single ask for this human-only blocker could not be reserved, so it was not opened: ${errorMessage(error)}`,
+				);
+			}
+			if (!reserved) {
+				throw new ToolError(
+					"Ultragoal ask guard: the single ask for this human-only blocker is already open or was already answered.",
+				);
+			}
+			let result: AgentToolResult<AskToolDetails>;
+			let userAnswered = false;
+			try {
+				// Human-blocked asks must not be settled through remote/programmatic answer
+				// sources; only attended interactive UI is permitted. Mark this context so the
+				// ask handler can enforce it.
+				const humanBlockedContext = { ...context, isHumanBlockedAsk: true };
+				result = await this.#ask(_toolCallId, params, signal, _onUpdate, humanBlockedContext);
+				// Determine if the user provided input (not just timeout or clarification)
+				userAnswered = !(result.details?.timedOut === true || result.details?.clarificationQuestion !== undefined);
+			} catch (error) {
+				// Distinguish between user cancellation and other errors:
+				// - ToolAbortError: user cancelled -> should release
+				// - Other errors: might be recorder failure after user answered -> should NOT release
+				if (error instanceof ToolAbortError) {
+					// User cancelled before or during questioning: hand the admission back
+					try {
+						await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
+					} catch (releaseError) {
+						release = false;
+						logger.warn(`ask: releasing the cancelled human-blocked ask failed: ${errorMessage(releaseError)}`);
+					}
+				}
+				// Either way, propagate the error so the caller knows asking failed
+				throw error;
+			}
+
+			// Now we know the result. Determine if we should release or record as answered.
+			if (!userAnswered) {
+				// User didn't provide input (timeout or clarification): hand the admission back
+				// so the question can be asked again.
+				try {
+					await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
+				} catch (error) {
+					release = false;
+					logger.warn(`ask: releasing the unanswered human-blocked ask failed: ${errorMessage(error)}`);
+				}
+				return result;
+			}
+
+			// User answered: record the answer (even if recording fails, the answer was accepted)
+			try {
+				await recordUltragoalHumanBlockedAskAnswered({ cwd: this.session.cwd, ...receipt });
+			} catch (error) {
+				// The user already answered, so the answer is returned. The durable
+				// reservation keeps the admission closed, including across restarts.
+				release = false;
+				logger.warn(`ask: recording the human-blocked ask answer failed: ${errorMessage(error)}`);
+			}
+			return result;
+		} finally {
+			if (release) humanBlockedAsksInFlight.delete(reservation);
+		}
+	}
+
+	async #ask(
+		_toolCallId: string,
+		params: AskParams,
+		signal?: AbortSignal,
+		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<AskToolDetails>> {
 		assertDeepInterviewStructuredResponseWithinLimit(params);
 		// Recheck at execution time as well: direct SDK callers and a phase change
 		// after tool-call validation must not open an unrecordable interview ask.
@@ -1001,13 +1130,25 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// attended TUI asks would route to emitGate() and hang forever waiting on
 		// a remote responder.
 		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
-		const initialAnswerSource = this.session.getAskAnswerSource?.();
+		let initialAnswerSource = this.session.getAskAnswerSource?.();
+		// Human-blocked asks permit only interactive UI answers; disable remote/programmatic
+		// sources to enforce human-origin provenance for the answer.
+		if (context?.isHumanBlockedAsk === true && initialAnswerSource) {
+			initialAnswerSource = undefined;
+		}
 		const canUseWorkflowGate =
 			!hasInteractiveUi && !initialAnswerSource && gateEmitter?.supportsRemoteGateAnswers() === true;
 		// Headless fallback: an SDK answer source or workflow gate is the non-TUI answer path.
+		// Human-blocked asks cannot use headless mode; they require interactive UI.
 		if (!hasInteractiveUi && !initialAnswerSource && !canUseWorkflowGate) {
 			context?.abort();
 			throw new ToolAbortError("Ask tool requires interactive mode");
+		}
+		if (context?.isHumanBlockedAsk === true && !hasInteractiveUi) {
+			context?.abort();
+			throw new ToolError(
+				"Ultragoal ask guard: a human-blocked ask requires interactive UI. This should have been caught by the guard earlier.",
+			);
 		}
 
 		// Only a headless ask needs an answer deadline: an interactive UI answers
@@ -1052,7 +1193,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const extensionUi = context?.ui;
 		const logicalQuestionIds = params.questions.map(() => randomUUID());
 		let logicalQuestionId: string | undefined;
-		const publicSessionId = hasInteractiveUi ? this.session.getSessionId?.() : undefined;
+		// A human-blocked ask is answered on the attended UI only: it publishes no
+		// pending ask for the session and races no answer source against the dialog,
+		// for the selector and for the custom-input and clarification editors alike.
+		const localOnly = context?.isHumanBlockedAsk === true;
+		const publicSessionId = hasInteractiveUi && !localOnly ? this.session.getSessionId?.() : undefined;
 		const invokeLocal = <T>(work: () => Promise<T>): Promise<T> => {
 			try {
 				return work();
@@ -1099,7 +1244,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				let pendingAsk: PendingAskHandle | undefined;
 				const selectorRequest = activeRemoteRequest;
 				let inlineMode: "custom_editor" | "clarification_editor" | undefined;
-				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
+				if (localOnly || (!publicSessionId && !this.session.getAskAnswerSource?.())) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 					return extensionUi.select(prompt, options, dialogOptions);
 				}
@@ -1292,7 +1437,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
-				if (!publicSessionId && !this.session.getAskAnswerSource?.()) {
+				if (localOnly || (!publicSessionId && !this.session.getAskAnswerSource?.())) {
 					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 					return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
 				}
@@ -1739,8 +1884,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
+			// An ordinary ask keeps the `ask.timeout` auto-selection as its result. A
+			// human-blocked ask exists to get the user's own answer, so there a timeout
+			// is no answer: nothing is recorded as a round or reported as a selection.
+			const unanswered = timedOut && context?.isHumanBlockedAsk === true;
 			if (
 				clarificationQuestion === undefined &&
+				!unanswered &&
 				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
 			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
@@ -1760,6 +1910,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				selectedOptions,
 				customInput,
 				clarificationQuestion,
+				...(timedOut ? { timedOut: true } : {}),
 			};
 
 			const responseParts: string[] = [];
@@ -1773,7 +1924,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						: `User asked a clarification question about the choices: ${clarificationQuestion}`,
 				);
 			}
-			if (selectedOptions.length > 0) {
+			if (selectedOptions.length > 0 && !unanswered) {
 				responseParts.push(
 					q.multi ? `User selected: ${selectedOptions.join(", ")}` : `User selected: ${selectedOptions[0]}`,
 				);
@@ -1788,7 +1939,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						: `User provided custom input: ${customInput}`,
 				);
 			}
-			const responseText = responseParts.length > 0 ? responseParts.join("\n") : "User cancelled the selection";
+			const responseText =
+				responseParts.length > 0
+					? responseParts.join("\n")
+					: unanswered
+						? "Ask timed out without user response"
+						: "User cancelled the selection";
 
 			return { content: [{ type: "text" as const, text: responseText }], details };
 		}

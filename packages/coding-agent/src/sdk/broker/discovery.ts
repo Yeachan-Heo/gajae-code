@@ -666,7 +666,9 @@ export async function readBrokerRestartIntent(agentDir: string): Promise<BrokerR
 			identity: { dev: after.dev, ino: after.ino },
 		};
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT" && !handle) return null;
+		// ENOENT after the open means the intent was cleared while it was being read, so the
+		// path names no intent now; the bytes already read belong to the cleared one.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 		throw error;
 	} finally {
 		await handle?.close();

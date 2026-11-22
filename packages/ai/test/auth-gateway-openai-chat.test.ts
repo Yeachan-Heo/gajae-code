@@ -352,6 +352,17 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		const events: AssistantMessageEvent[] = [
 			{ type: "toolcall_start", contentIndex: 0, partial },
 			{ type: "toolcall_delta", contentIndex: 0, delta: "{}", partial },
+			{
+				type: "toolcall_end",
+				contentIndex: 0,
+				toolCall: {
+					type: "toolCall",
+					id: "call_X0JvpoDX2wMBEwKU9g2sOpy3|fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+					name: "skill",
+					arguments: {},
+				},
+				partial,
+			},
 			{ type: "done", reason: "toolUse", message: { ...partial, stopReason: "toolUse" } },
 		];
 
@@ -384,8 +395,20 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 			{ type: "toolcall_start", contentIndex: 1, partial },
 			{ type: "toolcall_delta", contentIndex: 1, delta: '{"a":', partial },
 			{ type: "toolcall_delta", contentIndex: 1, delta: "1}", partial },
+			{
+				type: "toolcall_end",
+				contentIndex: 1,
+				toolCall: { type: "toolCall", id: "call_A", name: "tool_a", arguments: { a: 1 } },
+				partial,
+			},
 			{ type: "toolcall_start", contentIndex: 2, partial },
 			{ type: "toolcall_delta", contentIndex: 2, delta: "{}", partial },
+			{
+				type: "toolcall_end",
+				contentIndex: 2,
+				toolCall: { type: "toolCall", id: "call_B", name: "tool_b", arguments: {} },
+				partial,
+			},
 			{
 				type: "done",
 				reason: "toolUse",

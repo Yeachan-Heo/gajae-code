@@ -4,7 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getBundledModels, writeModelCache } from "@gajae-code/ai";
+import { closeModelCache, getBundledModels, writeModelCache } from "@gajae-code/ai";
 import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
 import { withModelPresetRegistryTestTrust } from "../src/config/internal/model-preset-registry-test-support";
 import {
@@ -237,7 +237,10 @@ async function accept(
 }
 
 afterEach(async () => {
-	for (const directory of directories) testTrustRunners.delete(directory);
+	for (const directory of directories) {
+		testTrustRunners.delete(directory);
+		closeModelCache(path.join(directory, "models.db"));
+	}
 	await Promise.all(directories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
 	for (const dispose of ownedDirectoryDisposers.splice(0)) dispose();
 });

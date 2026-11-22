@@ -1,8 +1,8 @@
 import { $env } from "@gajae-code/utils";
 import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE } from "./fallback-transport";
 
-const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
-const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900_000;
+const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 900_000;
 const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 600_000;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MS = 300_000;
 // Local LM Studio models can spend several minutes loading weights and filling

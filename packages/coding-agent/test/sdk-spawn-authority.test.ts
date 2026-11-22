@@ -21,10 +21,13 @@ import {
 import { createSpawnSubstrateProvider } from "../src/sdk/broker/spawn-substrate";
 import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
-const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
+const temp = () => trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
 async function writeSpawnModelFixtures(agentDir: string): Promise<void> {
 	await fs.writeFile(
 		path.join(agentDir, "models.yml"),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Process } from "../native/index.js";
+import { Process, ProcessStatus } from "../native/index.js";
 
 /**
  * Coverage for `Process.observe` (D8/D9 death-proof primitive).
@@ -38,6 +38,32 @@ describe("Process.observe", () => {
 		expect(reference?.incarnation).toBe(result.incarnation);
 	});
 
+	it.skipIf(process.platform !== "win32")(
+		"reports exit while a native handle still pins the process object",
+		async () => {
+			const child = Bun.spawn([process.execPath, "-e", "await Bun.stdin.text(); process.exit(0);"], {
+				stdio: ["pipe", "ignore", "ignore"],
+			});
+			try {
+				const reference = Process.fromPid(child.pid);
+				expect(reference).not.toBeNull();
+				if (!reference) throw new Error("Could not pin owned child");
+				const incarnation = reference.incarnation;
+				expect(Process.observe(child.pid)).toEqual({ status: "present", incarnation });
+
+				// EOF lets only our owned child exit normally. Keep the native reference
+				// alive across exit: OpenProcess can still open this terminated object.
+				child.stdin.end();
+				expect(await child.exited).toBe(0);
+				expect(Process.observe(child.pid)).toEqual({ status: "absent" });
+				expect(reference.incarnation).toBe(incarnation);
+			} finally {
+				if (child.exitCode === null) child.kill("SIGKILL");
+				await child.exited;
+			}
+		},
+	);
+
 	it("reports an owned, spawned-and-reaped child as positively absent", async () => {
 		// Own the entire lifecycle: spawn, confirm alive, kill, wait for exit, and
 		// only then observe. No other process is touched.
@@ -67,9 +93,10 @@ describe("Process.observe", () => {
 			expect(observation.incarnation).toBeUndefined();
 			expect(observation.reasonCode).toBeUndefined();
 
-			// Death proof must also be reflected through fromPid returning null —
-			// observe() and fromPid() must never disagree about a confirmed-dead pid.
-			expect(Process.fromPid(childPid)).toBeNull();
+			// fromPid may still hand back a reference (Windows keeps an exited process
+			// object queryable while a handle is open), but it must report the exit.
+			const reference = Process.fromPid(childPid);
+			if (reference) expect(reference.status()).toBe(ProcessStatus.Exited);
 		} finally {
 			if (!child.killed) child.kill("SIGKILL");
 		}

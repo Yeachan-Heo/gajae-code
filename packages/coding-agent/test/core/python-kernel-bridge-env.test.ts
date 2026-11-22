@@ -4,6 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { filterEnv } from "@gajae-code/coding-agent/eval/py/runtime";
 import fc from "fast-check";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const SHELL_URL = "http://127.0.0.1:9/shell";
 const PROJECT_URL = "http://127.0.0.1:9/project";
@@ -12,7 +15,7 @@ const runtimeSource = path.resolve(import.meta.dir, "../../src/eval/py/runtime.t
 const executorSource = path.resolve(import.meta.dir, "../../src/eval/py/executor.ts");
 
 function tempDir(prefix: string): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	return trackedTemp.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 function writeProject(dir: string, files: Record<string, string | Buffer>): void {

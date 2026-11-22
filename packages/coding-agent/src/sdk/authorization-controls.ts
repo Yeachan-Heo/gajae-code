@@ -43,6 +43,8 @@ export interface AuthorizationFlowState {
 	url?: string;
 	/** One-time browser device challenge, never a stored access token. */
 	verificationCode?: string;
+	/** OAuth risk warning that must be explicitly confirmed before proceeding. */
+	warning?: { id: string; message: string };
 	prompt?: { id: string; message: string; allowEmpty: boolean };
 	error?: string;
 }
@@ -74,6 +76,8 @@ interface AuthorizationFlow {
 	timer?: Timer;
 	task?: Promise<void>;
 	pending?: { id: string; resolve: (answer: string) => void; reject: (error: Error) => void };
+	warningUnsubscribe?: () => void;
+	warningConfirmed?: boolean;
 }
 
 class AuthorizationBusyError extends Error {
@@ -358,6 +362,13 @@ export class AuthorizationControls {
 		flow.task = Promise.resolve().then(async () => {
 			try {
 				if (!this.#live(flow)) return;
+				// Subscribe to OAuth warnings for providers that require confirmation
+				const warningUnsubscribe = this.#session.modelRegistry.authStorage.onOAuthWarning(event => {
+					if (!this.#live(flow) || flow.warningConfirmed) return;
+					// Emit warning and require confirmation before proceeding
+					void this.#requireWarningConfirmation(flow, event);
+				});
+				flow.warningUnsubscribe = warningUnsubscribe;
 				await this.#session.modelRegistry.authStorage.login(
 					provider,
 					{
@@ -381,6 +392,7 @@ export class AuthorizationControls {
 						},
 						onPrompt: prompt => this.#prompt(flow, prompt),
 						onManualCodeInput: () => this.#prompt(flow, { message: "Authorization answer required" }),
+						onConfirmWarning: warning => this.#confirmWarning(flow, warning),
 					},
 					{ manualCode },
 				);
@@ -395,6 +407,8 @@ export class AuthorizationControls {
 			} catch {
 				this.#stop(flow, "error", "Authorization failed");
 			} finally {
+				// Clean up warning subscription
+				flow.warningUnsubscribe?.();
 				// Providers can persist before observing cancellation. Do not report rollback.
 				try {
 					flow.state.stored = this.#status(provider).stored;
@@ -459,6 +473,49 @@ export class AuthorizationControls {
 		flow.state.status = "authorizing";
 		pending.resolve(value);
 		return this.#snapshot(flow);
+	}
+
+	#requireWarningConfirmation(flow: AuthorizationFlow, warning: { provider: string; message: string }): void {
+		if (!this.#live(flow) || flow.warningConfirmed) return;
+		// Store warning in flow state for client to see
+		const id = crypto.randomUUID();
+		flow.state.warning = { id, message: warning.message };
+	}
+
+	#confirmWarning(flow: AuthorizationFlow, warning: { provider: string; message: string }): Promise<boolean> {
+		if (!this.#live(flow)) return Promise.reject(new Error("Authorization stopped"));
+		if (flow.pending || flow.promptCount >= 16) {
+			this.#stop(flow, "error", "Provider authorization prompt limit exceeded");
+			return Promise.reject(new Error("Authorization prompt limit exceeded"));
+		}
+		flow.promptCount += 1;
+		const waiter = Promise.withResolvers<boolean>();
+		void waiter.promise.catch(() => {});
+		const warningId = crypto.randomUUID();
+		flow.pending = {
+			id: warningId,
+			resolve: (answer: string) => {
+				// Accept explicit confirmation (yes/true/confirm/etc)
+				const confirmed = /^(yes|true|confirm|y)$/i.test(answer);
+				waiter.resolve(confirmed);
+			},
+			reject: waiter.reject,
+		};
+		flow.state.status = "waiting";
+		flow.state.warning = {
+			id: warningId,
+			message: warning.message,
+		};
+		// Return a promise that resolves once user confirms or rejects
+		return waiter.promise.then(confirmed => {
+			if (confirmed) {
+				flow.warningConfirmed = true;
+				flow.pending = undefined;
+				delete flow.state.warning;
+				flow.state.status = "authorizing";
+			}
+			return confirmed;
+		});
 	}
 
 	async #refreshCatalog(): Promise<boolean> {
