@@ -98,13 +98,14 @@ import {
 	SessionRow,
 	SettingField,
 } from "./components";
-import { restoreAttachments, restoreDraft } from "./composer-draft";
+import { restoreAttachments, restoreDraft, restoreDraftInOrder } from "./composer-draft";
 import {
 	commitDraftAndDelivery,
 	type DeliveryRecovery,
 	deleteDelivery,
 	loadDeliveries,
 	loadDrafts,
+	nextDeliverySequence,
 	recoveryNotice,
 	saveDelivery,
 	saveDrafts,
@@ -425,9 +426,16 @@ export default function App() {
 					await flushDraft(entry.sessionId);
 					return;
 				}
+				// Recovery records are kept in submission order; texts sent earlier and already back in
+				// this composer stay above this one.
+				const position = recoveriesRef.current.findIndex(item => item.id === entry.id);
+				const earlier = recoveriesRef.current
+					.slice(0, position < 0 ? recoveriesRef.current.length : position)
+					.filter(item => item.sessionId === entry.sessionId && item.restored)
+					.map(item => item.text);
 				const currentText = draftsRef.current[entry.sessionId] ?? "";
 				const currentAttachments = attachmentsRef.current[entry.sessionId] ?? [];
-				const text = restoreDraft(currentText, entry.text);
+				const text = restoreDraftInOrder(currentText, entry.text, earlier);
 				const attachments = restoreAttachments(currentAttachments, entry.attachments);
 				const next = { ...entry, restored: true };
 				await commitDraftAndDelivery(next, {
@@ -438,7 +446,7 @@ export default function App() {
 				updateRecoveries(recoveriesRef.current.map(item => (item.id === entry.id ? next : item)));
 				const latestText = draftsRef.current[entry.sessionId] ?? "";
 				const latestAttachments = attachmentsRef.current[entry.sessionId] ?? [];
-				const mergedText = latestText === currentText ? text : restoreDraft(latestText, entry.text);
+				const mergedText = latestText === currentText ? text : restoreDraftInOrder(latestText, entry.text, earlier);
 				const mergedAttachments =
 					latestAttachments === currentAttachments
 						? attachments
@@ -1459,6 +1467,7 @@ export default function App() {
 				attachments: ownedAttachments,
 				disposition: "pending",
 				prepared: true,
+				sequence: nextDeliverySequence(),
 			};
 			const sentIds = new Set(ownedAttachments.map(draft => draft.id));
 			const commit = recoveryWork.current.then(async () => {
@@ -1561,7 +1570,14 @@ export default function App() {
 	): Promise<{ queued?: boolean }> => {
 		const id = crypto.randomUUID();
 		validateDesktopRequest("prompt", params, id);
-		const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
+		const entry: DeliveryRecovery = {
+			id,
+			sessionId,
+			text,
+			attachments: [],
+			disposition: "pending",
+			sequence: nextDeliverySequence(),
+		};
 		const commit = recoveryWork.current.then(async () => {
 			await saveDelivery(entry);
 			updateRecoveries([...recoveriesRef.current, entry]);

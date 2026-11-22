@@ -2172,6 +2172,80 @@ suite("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	/** Sends while the session runs (each send queues a steer) and records exactly that prompt. */
+	async function queue(page: Page, text: string, count: number): Promise<PromptRequest> {
+		await page.type(".composer textarea", text);
+		await page.click('.composer button[type="submit"]');
+		await page.waitForFunction(count => window.fixture.requests().filter(r => r.method === "prompt").length === count, {}, count);
+		const request = await page.evaluate(() => window.fixture.lastPrompt());
+		if (!request) throw new Error("Prompt was not recorded");
+		expect(request.params).toMatchObject({ text, deliverAs: "steer" });
+		await page.evaluate((id: string) => window.fixture.response(id, true), request.id);
+		await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "");
+		return request;
+	}
+	const running: DesktopSession = { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] };
+	const composerText = (page: Page) => page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value);
+
+	for (const order of ["sent", "reversed"] as const) test(`Stop's handed-back queue returns in the order it was sent, above typed text (${order} receipts)`, async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate((session: DesktopSession) => window.fixture.emit({ type: "session", session }), running);
+			const first = await queue(page, "first queued", 1);
+			const second = await queue(page, "second queued", 2);
+			await page.type(".composer textarea", "still typing");
+			for (const request of order === "sent" ? [first, second] : [second, first]) await receipt(page, request, "removed");
+			await step(page, "wait for both restorations", () => page.waitForFunction(() => window.fixture.requests().filter(r => r.method === "delivery.ack").length === 2));
+			expect(await composerText(page)).toBe("first queued\n\nsecond queued\n\nstill typing");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	for (const ids of ["ascending", "descending"] as const) test(`handed-back queue keeps its order when it is reconciled after a reload (${ids} ids)`, async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			// The record store lists records by id and bootstrap reconciles them in that order. Pin the
+			// order of every id this document makes, so either message can be the one stored first.
+			await page.evaluate((step: number) => {
+				let next = step > 0 ? 0x10000000 : 0xefffffff;
+				crypto.randomUUID = () => {
+					const id = next.toString(16).padStart(8, "0");
+					next += step;
+					return `${id}-0000-4000-8000-000000000000`;
+				};
+			}, ids === "ascending" ? 1 : -1);
+			await page.evaluate((session: DesktopSession) => window.fixture.emit({ type: "session", session }), running);
+			const first = await queue(page, "first queued", 1);
+			const second = await queue(page, "second queued", 2);
+			expect(first.id < second.id).toBe(ids === "ascending");
+			await page.type(".composer textarea", "still typing");
+			await step(page, "wait for the typed draft to persist", () => page.waitForFunction(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const request = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					request.onsuccess = () => resolve(request.result);
+					request.onerror = () => reject(request.error);
+				});
+				const drafts = await new Promise<{ sessionId: string; text: string }[]>((resolve, reject) => {
+					const request = db.transaction("drafts").objectStore("drafts").getAll();
+					request.onsuccess = () => resolve(request.result);
+					request.onerror = () => reject(request.error);
+				});
+				db.close();
+				return drafts.some(draft => draft.sessionId === "a" && draft.text === "still typing");
+			}));
+			// The Host journal lists the two removals in admission order; bootstrap reconciles them in that order.
+			await page.evaluate(({ first, second }) => {
+				const state = JSON.parse(sessionStorage.getItem("fixture") || "{}");
+				state.receipts = [first, second].map(id => ({ id, sessionId: "a", disposition: "removed" }));
+				sessionStorage.setItem("fixture", JSON.stringify(state));
+			}, { first: first.id, second: second.id });
+			await page.reload(); await select(page);
+			await step(page, "wait for both restorations", () => page.waitForFunction(() => window.fixture.requests().filter(r => r.method === "delivery.ack").length === 2));
+			expect(await composerText(page)).toBe("first queued\n\nsecond queued\n\nstill typing");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("identical errors deduplicate only by request owner", async () => {
 		const { context, page } = await fixture();
 		try {

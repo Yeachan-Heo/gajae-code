@@ -12,6 +12,15 @@ export interface DeliveryRecovery {
 	restored?: boolean;
 	finalizing?: boolean;
 	prepared?: boolean;
+	/** Submission order on this device; records saved before it existed sort first. */
+	sequence?: number;
+}
+
+let lastSequence = 0;
+/** A strictly increasing submission order, so several restored drafts keep the order they were sent in. */
+export function nextDeliverySequence(): number {
+	lastSequence = Math.max(Date.now(), lastSequence + 1);
+	return lastSequence;
 }
 
 export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean): string | null {
@@ -87,7 +96,11 @@ async function transact<T>(mode: IDBTransactionMode, action: (store: IDBObjectSt
 	return transactionResult(tx, () => operation.result);
 }
 
-export const loadDeliveries = () => transact<DeliveryRecovery[]>("readonly", store => store.getAll());
+/** Records come back in submission order; the store itself orders them by id. */
+export const loadDeliveries = async () =>
+	(await transact<DeliveryRecovery[]>("readonly", store => store.getAll())).sort(
+		(left, right) => (left.sequence ?? 0) - (right.sequence ?? 0),
+	);
 export const saveDelivery = (entry: DeliveryRecovery) => transact<IDBValidKey>("readwrite", store => store.put(entry));
 export const deleteDelivery = (id: string) => transact<undefined>("readwrite", store => store.delete(id));
 
