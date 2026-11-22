@@ -178,6 +178,8 @@ export function ToolCallLine({ tool, toolName }: { tool: DesktopToolCall; toolNa
 /** Where an expanded card loads `tool.detail`. */
 export interface ToolDetailSource {
 	load(callId: string): Promise<DesktopToolDetail>;
+	/** The conversation's project directory: diff headers name files inside it relative to it. */
+	directory?: string;
 }
 
 /**
@@ -221,15 +223,38 @@ function DiffLine({ line }: { line: string }) {
 	);
 }
 
+/**
+ * `path` relative to `directory` when the path lies inside it, otherwise unchanged. Both arrive
+ * already redacted by the Host; only a whole leading directory is removed, on a separator
+ * boundary, so a sibling such as `/work/app2` is never shortened against `/work/app`.
+ */
+export function projectRelativePath(path: string, directory: string | undefined): string {
+	const base = directory?.replace(/[\\/]+$/, "");
+	if (!base || path.length <= base.length + 1 || !path.startsWith(base)) return path;
+	const separator = path[base.length];
+	return separator === "/" || separator === "\\" ? path.slice(base.length + 1) : path;
+}
+
+/** A diff header's file name: relative inside the project, with the full path on hover. */
+function FilePath({ path, directory }: { path: string; directory: string | undefined }) {
+	const shown = projectRelativePath(path, directory);
+	return (
+		<code className="tool-diff-path" title={shown === path ? undefined : path}>
+			{shown}
+		</code>
+	);
+}
+
 /** Per-file diffs of an edit, or the content a write left in its file. */
 function ToolDiffs({ diffs, written }: { diffs: DesktopToolDiff[]; written: boolean }) {
+	const directory = useContext(ToolDetailContext)?.directory;
 	return (
 		<div className="tool-detail-section">
 			<span className="tool-detail-heading">{t(written ? "tools.detailWritten" : "tools.detailChanges")}</span>
 			{diffs.map((file, index) => (
 				<div className="tool-diff-file" key={index}>
 					<div className="tool-diff-header">
-						<code className="tool-diff-path">{file.path}</code>
+						<FilePath path={file.path} directory={directory} />
 						{file.op === "create" && <span className="tool-diff-op">{t("tools.diffCreated")}</span>}
 						{file.op === "delete" && <span className="tool-diff-op">{t("tools.diffDeleted")}</span>}
 						{!written && (

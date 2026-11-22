@@ -135,9 +135,12 @@ function callFixtures(): DesktopMessage[] {
 	];
 }
 
-const resolved = (detail: Omit<DesktopToolDetail, "callId">): ToolDetailSource => ({
+const resolved = (detail: Omit<DesktopToolDetail, "callId">, directory?: string): ToolDetailSource => ({
 	load: async callId => ({ callId, ...detail }),
+	...(directory ? { directory } : {}),
 });
+/** The showcase conversation's project directory, a made-up path. */
+const PROJECT = "/work/gajae-code";
 /** A load that never settles, so the loading state stays on screen. */
 const pending: ToolDetailSource = { load: () => Promise.withResolvers<DesktopToolDetail>().promise };
 const failing: ToolDetailSource = {
@@ -180,25 +183,35 @@ function detailFixtures(): Array<{ id: string; source: ToolDetailSource | null; 
 		},
 		{
 			id: "edit",
-			source: resolved({
-				diff: [
-					{ path: "packages/desktop/src/ToolCallCard.tsx", diff: editDiff, added: 2, removed: 1, op: "update" },
-					{
-						path: "packages/desktop/src/new-helper.ts",
-						diff: "+1|export const helper = 1;",
-						added: 1,
-						removed: 0,
-						op: "create",
-					},
-					{
-						path: "packages/desktop/src/missing.ts",
-						diff: "",
-						added: 0,
-						removed: 0,
-						error: t("tools.showcaseEditError"),
-					},
-				],
-			}),
+			// Files inside the project read relative to it; the sibling checkout keeps its full path.
+			source: resolved(
+				{
+					diff: [
+						{
+							path: `${PROJECT}/packages/desktop/src/ToolCallCard.tsx`,
+							diff: editDiff,
+							added: 2,
+							removed: 1,
+							op: "update",
+						},
+						{
+							path: `${PROJECT}/packages/desktop/src/new-helper.ts`,
+							diff: "+1|export const helper = 1;",
+							added: 1,
+							removed: 0,
+							op: "create",
+						},
+						{
+							path: `${PROJECT}-old/packages/desktop/src/missing.ts`,
+							diff: "",
+							added: 0,
+							removed: 0,
+							error: t("tools.showcaseEditError"),
+						},
+					],
+				},
+				PROJECT,
+			),
 			message: fixture("detail-edit", "edit", {
 				family: "edit",
 				status: "done",

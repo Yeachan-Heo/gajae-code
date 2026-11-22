@@ -130,4 +130,29 @@ describe("tool call card details", () => {
 		expect(written).toContain("Content written");
 		expect(written).not.toContain("tool-fact-removed");
 	});
+
+	test("a diff header names a file inside the project relative to it, with the full path on hover", () => {
+		// The conversation's detail loader carries its project directory.
+		const headers = (directory: string | undefined, paths: string[]) => {
+			const html = renderToStaticMarkup(
+				<ToolDetailContext.Provider value={directory === undefined ? null : { ...source, directory }}>
+					<ToolCallDetails family="edit" state={{ kind: "ready", detail: {
+						callId: "c", diff: paths.map(path => ({ path, diff: "+1|x", added: 1, removed: 0 })),
+					} }} />
+				</ToolDetailContext.Provider>,
+			);
+			return [...html.matchAll(/<code class="tool-diff-path"( title="([^"]*)")?>([^<]*)<\/code>/g)].map((match): [string, string | null] => [match[3] ?? "", match[2] ?? null]);
+		};
+		expect(headers("/work/app", ["/work/app/src/a.ts", "/work/app2/b.ts", "/elsewhere/c.ts", "/work/app", "rel/d.ts"])).toEqual([
+			["src/a.ts", "/work/app/src/a.ts"],
+			// A sibling that shares the prefix is outside the project.
+			["/work/app2/b.ts", null],
+			["/elsewhere/c.ts", null],
+			["/work/app", null],
+			["rel/d.ts", null],
+		]);
+		expect(headers("/work/app/", ["/work/app/src/a.ts"])).toEqual([["src/a.ts", "/work/app/src/a.ts"]]);
+		expect(headers("C:\\work\\app", ["C:\\work\\app\\src\\e.ts"])).toEqual([["src\\e.ts", "C:\\work\\app\\src\\e.ts"]]);
+		expect(headers(undefined, ["/work/app/src/a.ts"])).toEqual([["/work/app/src/a.ts", null]]);
+	});
 });

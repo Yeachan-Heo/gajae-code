@@ -2829,6 +2829,7 @@ export default function App() {
 											<TranscriptEntry
 												item={item}
 												session={session}
+												directory={project?.path}
 												connected={connected}
 												renderMessage={message => (
 													<Message

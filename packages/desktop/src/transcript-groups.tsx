@@ -266,13 +266,16 @@ export interface TranscriptEntryProps {
 	item: TranscriptItem;
 	/** The conversation the entry belongs to. */
 	session: DesktopSession;
+	/** The conversation's project directory, for project-relative file paths in tool details. */
+	directory?: string;
 	connected: boolean;
 	renderMessage: (message: DesktopMessage) => ReactNode;
 }
 
 /** `tool.detail` for one conversation, checked to be a detail for the requested call. */
-function toolDetailSource(sessionId: string): ToolDetailSource {
+function toolDetailSource(sessionId: string, directory: string | undefined): ToolDetailSource {
 	return {
+		...(directory ? { directory } : {}),
 		async load(callId) {
 			const value = await request<unknown>("tool.detail", { sessionId, callId });
 			if (!value || typeof value !== "object" || (value as { callId?: unknown }).callId !== callId)
@@ -286,8 +289,11 @@ function toolDetailSource(sessionId: string): ToolDetailSource {
  * Renders one entry with its conversation's detail loader: a tool run through `ToolRun`, any
  * other entry message by message through `renderMessage`.
  */
-export function TranscriptEntry({ item, session, connected, renderMessage }: TranscriptEntryProps) {
-	const source = useMemo(() => (connected ? toolDetailSource(session.id) : null), [connected, session.id]);
+export function TranscriptEntry({ item, session, directory, connected, renderMessage }: TranscriptEntryProps) {
+	const source = useMemo(
+		() => (connected ? toolDetailSource(session.id, directory) : null),
+		[connected, session.id, directory],
+	);
 	return (
 		<ToolDetailContext.Provider value={source}>
 			{item.tools ? (
