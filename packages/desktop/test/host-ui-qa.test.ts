@@ -6,6 +6,7 @@ import type { FixtureSessionObservation, FixtureSnapshot } from "../scripts/qa-m
 interface WrapperConfig {
 	serverUrl: string;
 	token: string;
+	bootstrapUrl: string;
 	modelFixture: { dataDir: string };
 }
 
@@ -155,6 +156,55 @@ test("requested QA shutdown delivers its final frame and exits successfully", as
 		expect(await qa.child.exited).toBe(0);
 		expect(await qa.stderr).not.toContain("Host terminated unexpectedly");
 		await qa.stdout;
+	} finally {
+		await qa.close();
+	}
+}, 45000);
+
+test("each harness run clears recovery storage on its first page load only", async () => {
+	const recoveryDatabase = "gjc.desktop.delivery-recovery";
+	const composerDrafts = "gjc.desktop.composer-drafts";
+	// The harness must clear exactly the storage the app reads; a product rename must fail here.
+	const desktopSource = (file: string) => Bun.file(path.resolve(import.meta.dir, "../src", file)).text();
+	expect(await desktopSource("delivery-recovery.ts")).toContain(`indexedDB.open("${recoveryDatabase}"`);
+	expect(await desktopSource("App.tsx")).toContain(`localStorage.getItem("${composerDrafts}")`);
+	const qa = await wrapper();
+	try {
+		const bootstrap = await fetch(qa.config.bootstrapUrl);
+		expect(bootstrap.status).toBe(200);
+		const source = await bootstrap.text();
+		// One origin's storage as an earlier run left it: a recovery record and a saved draft.
+		const local = new Map<string, string>([
+			["gjc.desktop.qa-run", "an-earlier-run"],
+			[composerDrafts, '{"earlier-session":"earlier draft"}'],
+		]);
+		const deleted: string[] = [];
+		const load = () => {
+			const page = new Function("location", "window", "addEventListener", "localStorage", "indexedDB", source);
+			page(
+				{ origin: "http://127.0.0.1:1420" },
+				{},
+				() => {},
+				{
+					getItem: (key: string) => local.get(key) ?? null,
+					setItem: (key: string, value: string) => local.set(key, value),
+					removeItem: (key: string) => local.delete(key),
+				},
+				{ deleteDatabase: (name: string) => deleted.push(name) },
+			);
+		};
+		load();
+		expect(deleted).toEqual([recoveryDatabase]);
+		expect(local.has(composerDrafts)).toBe(false);
+		// The app records work during this run; reloading the page must keep it for recovery QA.
+		local.set(composerDrafts, '{"current-session":"current draft"}');
+		load();
+		load();
+		expect(deleted).toEqual([recoveryDatabase]);
+		expect(local.get(composerDrafts)).toBe('{"current-session":"current draft"}');
+		await qa.connect();
+		await qa.call("shutdown");
+		expect(await qa.child.exited).toBe(0);
 	} finally {
 		await qa.close();
 	}

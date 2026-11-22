@@ -9,6 +9,9 @@
 // and awaits the host, then recreates it on the SAME data/provider. Bootstrap/select
 // through the normal app (reload is optional), then call hostStatus for after evidence.
 // Gate controls emit/wait on real SDK gates only; the app owns presentation, answers and retirement ACKs.
+// The first page load of each harness run clears the app's origin-keyed delivery-recovery database
+// and composer drafts, so an earlier run's records never surface as orphans; reloads keep them.
+// A storage error during that reset is left in window.__qaStorageResetError.
 // Save status before teardown: the owned request/chunk artifact is removed with the QA root.
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -51,6 +54,12 @@ if (
 const origin = uiOrigin.origin;
 const root = path.resolve(import.meta.dir, "../../..");
 const token = crypto.randomUUID();
+// Identifies this harness run in page storage. Distinct from the token, which authorizes requests.
+const runId = crypto.randomUUID();
+// The app's own storage names (src/delivery-recovery.ts, src/App.tsx) and the harness marker.
+const RECOVERY_DATABASE = "gjc.desktop.delivery-recovery";
+const COMPOSER_DRAFTS = "gjc.desktop.composer-drafts";
+const QA_RUN_MARKER = "gjc.desktop.qa-run";
 const allowed = new Set<DesktopMethod>([
 	"bootstrap",
 	"project.open",
@@ -175,6 +184,19 @@ function injection(base: string) {
 	// A self-contained JS source string: no browser automation closure serialization.
 	return `(() => {
 		if (location.origin !== ${JSON.stringify(origin)}) return;
+		// Browser storage is keyed by origin only, not by this run's temporary data root, so an
+		// earlier run's recovery records would reappear as "outcome unknown" cards. Clear them on
+		// this run's first page load, synchronously before the app boots: its later IndexedDB open
+		// queues behind the delete. Later reloads in the same run keep them for recovery QA.
+		try {
+			if (localStorage.getItem(${JSON.stringify(QA_RUN_MARKER)}) !== ${JSON.stringify(runId)}) {
+				indexedDB.deleteDatabase(${JSON.stringify(RECOVERY_DATABASE)});
+				localStorage.removeItem(${JSON.stringify(COMPOSER_DRAFTS)});
+				localStorage.setItem(${JSON.stringify(QA_RUN_MARKER)}, ${JSON.stringify(runId)});
+			}
+		} catch (error) {
+			window.__qaStorageResetError = String(error);
+		}
 		const base = ${JSON.stringify(base)};
 		const token = ${JSON.stringify(token)};
 		const client = crypto.randomUUID();
