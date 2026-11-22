@@ -185,7 +185,7 @@ suite("Providers dialog in the mounted app", () => {
 			await page.waitForSelector(".provider-warning button");
 			expect((await dialogButtons(page)).filter(label => label === "Cancel sign-in")).toHaveLength(1);
 			await clickInDialog(page, "Cancel sign-in");
-			await waitDialogText(page, "Sign-in cancelled.");
+			await waitDialogText(page, "Sign-in cancelled");
 			expect(await sent(page, "auth.cancel")).toEqual([{ flowId: FLOW }]);
 			expect(await sent(page, "auth.answer")).toHaveLength(1);
 		} finally {

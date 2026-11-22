@@ -286,6 +286,7 @@ function FlowCard({
 		failed: t("providers.flowFailedHeading"),
 		cancelled: t("providers.flowCancelledHeading"),
 	};
+	// Failed has its error banner instead, and cancelled says everything in its heading.
 	const statusLine =
 		view === "warning"
 			? t("providers.flowWarningStatus", { name })
@@ -303,9 +304,7 @@ function FlowCard({
 								: t("providers.flowConnectedNoModels")
 							: view === "saved-refresh-failed"
 								? t("providers.flowSavedNoRefresh")
-								: view === "cancelled"
-									? t("providers.flowCancelled")
-									: "";
+								: "";
 	const tone =
 		view === "warning" || view === "saved-refresh-failed" || (view === "connected" && row.models === 0)
 			? "waiting"
@@ -451,6 +450,8 @@ function ProviderDetail(
 	const ownKey = keyState?.provider === row.id ? keyState : null;
 	const invalid = ownKey?.status === "invalid" ? ownKey.reason : null;
 	const keySaved = ownKey?.status === "saved" ? { catalogRefreshed: ownKey.catalogRefreshed } : undefined;
+	// A connected outcome states this provider's models itself, so the note does not repeat them.
+	const outcomeCountsModels = ownFlow ? flowOutcome(ownFlow) === "connected" : keySaved?.catalogRefreshed === true;
 	const reconnect = row.credentialKinds.includes("oauth");
 	const back = () => props.onSelect(null);
 	return (
@@ -470,7 +471,7 @@ function ProviderDetail(
 			</header>
 			{row.connected && (
 				<div className="provider-detail-note">
-					{row.connected && (
+					{!outcomeCountsModels && (
 						<p>
 							{row.models > 0
 								? counted(row.models, "providers.detailModelsOne", "providers.detailModels")

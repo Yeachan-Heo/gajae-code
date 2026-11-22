@@ -395,6 +395,34 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
+	test("each outcome says its news once, and another provider's sign-in reads correctly for any name", async () => {
+		const { context, page } = await fixture();
+		const occurrences = (text: string) =>
+			page.$eval(".provider-detail", (node, value) => node.textContent!.split(value).length - 1, text);
+		try {
+			const configured = provider("zeta", "Zeta Cloud", { configured: true, stored: true });
+			const browserSignIn = provider("eta", "Design example browser sign-in", { canStoreKey: false });
+			await set(page, {
+				providers: [...providers, configured, browserSignIn],
+				flow: flow({ provider: "zeta", status: "complete" }),
+				owned: [FLOW],
+			});
+			await select(page, "zeta");
+			await page.waitForSelector('.provider-flow[data-view="connected"]');
+			expect(await occurrences("No models from this provider yet.")).toBe(1);
+			await set(page, { flow: flow({ provider: "zeta", status: "cancelled" }) });
+			await page.waitForSelector('.provider-flow[data-view="cancelled"]');
+			expect(await occurrences("Sign-in cancelled")).toBe(1);
+			await set(page, { flow: flow({ provider: "eta", status: "authorizing" }) });
+			await page.waitForSelector(".provider-blocked");
+			expect(await page.$eval(".provider-blocked", node => node.firstChild?.textContent)).toBe(
+				"A sign-in to Design example browser sign-in is still in progress. Finish or cancel it first.",
+			);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("a dialog that opens on a pending answer or warning focuses it, not the dialog's Close button", async () => {
 		const { context, page } = await fixture(1000, { dialog: true, closed: true });
 		try {
@@ -504,7 +532,7 @@ suite("Providers panel interactions", () => {
 				flow: flow({ provider: "alpha", status: "waiting", url: "https://sign-in.example.invalid/a" }),
 			});
 			await select(page, "beta");
-			await waitText(page, "Finish or cancel the Alpha Cloud sign-in first.");
+			await waitText(page, "A sign-in to Alpha Cloud is still in progress. Finish or cancel it first.");
 			await page.type(".provider-key input", "sk-typed-key");
 			const disabled = async () =>
 				Object.fromEntries((await buttons(page)).map(button => [button.text, button.disabled]));
