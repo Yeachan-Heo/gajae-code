@@ -352,6 +352,88 @@ describe("live tool rows", () => {
 		expect(projectLiveToolCalls(session, undefined, redact)[0]?.truncated).toBeUndefined();
 	});
 
+	describe("values still growing withhold any part of a known secret", () => {
+		const secret = "sk-live-ABCDEFGHIJKLMNOP";
+		const secrets = new Set([secret]);
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]");
+		const running = () => {
+			const session = fakeSession([
+				{ role: "user", content: "go" },
+				assistantCalls(["a", "bash", { command: "print-key" }]),
+			]);
+			const tail = (text: string) => {
+				observeToolEvent(session, {
+					type: "tool_execution_update",
+					toolCallId: "a",
+					partialResult: { content: [{ type: "text", text }] },
+				} as { type: string });
+				return projectLiveToolCalls(session, undefined, redact, secrets)[0]?.text;
+			};
+			return tail;
+		};
+
+		test("a running tail holds back a secret split across output chunks until it is whole", () => {
+			const tail = running();
+			expect(tail("key is sk-live-ABCDEFGH")).toBe("key is ");
+			expect(tail("key is sk-live-ABCDEFGHIJKLMNOP done")).toBe("key is [redacted] done");
+			// A tail that ends in an unrelated character shows everything.
+			expect(tail("key is sk-live-ABCDEFGHIJKLMNOP done\nnext")).toBe("key is [redacted] done\nnext");
+		});
+
+		test("a tail the SDK cut inside a secret drops the secret's remaining end", () => {
+			const tail = running();
+			const shown = tail("IJKLMNOP and the rest\nnext line");
+			expect(shown).toBe(" and the rest\nnext line");
+			expect(shown).not.toContain("MNOP");
+		});
+
+		test("hold-back reads the redacted tail, so a whole secret is never cut into a visible prefix", () => {
+			// The end of one secret starts another: holding back raw text first would show "tok-".
+			const first = "tok-1234";
+			const both = new Set([first, "1234-other-secret"]);
+			const mask = (text: string) =>
+				text.replaceAll(first, "[redacted]").replaceAll("1234-other-secret", "[redacted]");
+			const session = fakeSession([
+				{ role: "user", content: "go" },
+				assistantCalls(["a", "bash", { command: "print-key" }]),
+			]);
+			observeToolEvent(session, {
+				type: "tool_execution_update",
+				toolCallId: "a",
+				partialResult: { content: [{ type: "text", text: `use ${first}` }] },
+			} as { type: string });
+			const shown = projectLiveToolCalls(session, undefined, mask, both)[0]?.text;
+			expect(shown).toBe("use [redacted]");
+			expect(shown).not.toContain("tok-");
+		});
+
+		test("a call whose arguments still stream shows neither the start of a secret nor its details", () => {
+			const session = fakeSession([{ role: "user", content: "go" }]);
+			const streaming = assistantCalls([
+				"p",
+				"bash",
+				{ command: "curl -H 'Authorization: Bearer sk-live-ABCDEF", _i: "Call with sk-live-ABC" },
+			]);
+			const [row] = projectLiveToolCalls(session, streaming, redact, secrets);
+			expect(row?.tool).toMatchObject({
+				status: "preparing",
+				subject: "$ curl -H 'Authorization: Bearer",
+				intent: "Call with",
+			});
+			const detail = projectToolDetail(session, streaming, "p", redact, secrets);
+			expect(detail.command).toBe("curl -H 'Authorization: Bearer ");
+			expect(JSON.stringify([row, detail])).not.toContain("sk-live");
+			// Once the message is complete the same arguments are shown as written.
+			const committed = fakeSession([
+				{ role: "user", content: "go" },
+				assistantCalls(["p", "bash", { command: "echo sk-live-ABCDEF" }]),
+			]);
+			expect(projectLiveToolCalls(committed, undefined, redact, secrets)[0]?.tool?.subject).toBe(
+				"$ echo sk-live-ABCDEF",
+			);
+		});
+	});
+
 	test("live rows join only the display list and are redacted like settled rows", () => {
 		const redact = (text: string) => text.replaceAll("token-123", "[redacted]");
 		const session = fakeSession([

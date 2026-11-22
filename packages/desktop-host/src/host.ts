@@ -984,7 +984,7 @@ export class DesktopHost {
 		// Calls still running join the display copy too; they never count as transcript.
 		const display = [
 			...anchorNotices(transcript, notices),
-			...projectLiveToolCalls(live?.sdk, live?.streamingMessage, text => this.#redact(text)),
+			...projectLiveToolCalls(live?.sdk, live?.streamingMessage, text => this.#redact(text), this.#secrets),
 		];
 		const fitted = fitMessages(display.slice(-HISTORY_LIMIT), messageBudget);
 		return {
@@ -2967,8 +2967,12 @@ export class DesktopHost {
 		}
 		if (method === "tools.list") return projectToolCatalog(live.sdk, text => this.#redact(text));
 		if (method === "tool.detail")
-			return projectToolDetail(live.sdk, live.streamingMessage, requiredString(params, "callId", 512), text =>
-				this.#redact(text),
+			return projectToolDetail(
+				live.sdk,
+				live.streamingMessage,
+				requiredString(params, "callId", 512),
+				text => this.#redact(text),
+				this.#secrets,
 			);
 		if (method === "diff.get") return this.#diff(live);
 		if (method === "prompt") {

@@ -31,6 +31,42 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 const count = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 
+/** Length of the longest suffix of `text` that is a proper prefix of `secret`. */
+function secretStartAtEnd(text: string, secret: string): number {
+	const first = secret.charCodeAt(0);
+	for (let at = Math.max(0, text.length - secret.length + 1); at < text.length; at++)
+		if (text.charCodeAt(at) === first && secret.startsWith(text.slice(at))) return text.length - at;
+	return 0;
+}
+
+/** Length of the longest prefix of `text` that is a proper suffix of `secret`. */
+function secretEndAtStart(text: string, secret: string): number {
+	const last = secret.charCodeAt(secret.length - 1);
+	for (let end = Math.min(text.length, secret.length - 1); end > 0; end--)
+		if (text.charCodeAt(end - 1) === last && secret.endsWith(text.slice(0, end))) return end;
+	return 0;
+}
+
+/**
+ * Already-redacted text of a value that is still growing, with any part of a known secret at its
+ * edges withheld: at its end, text that could be the start of a secret whose rest has not arrived
+ * (a streamed argument, a running command's newest output); with `start`, text at its beginning
+ * that could be the end of one (the SDK keeps only a command's newest output, so that tail can
+ * begin inside a secret). It reads the redacted text, so a whole secret is already masked and is
+ * never cut into a visible prefix. Unlike the assistant-text stream redactor it needs no fixed
+ * hold-back: each frame projects the whole value again, so only an actual partial match is held.
+ */
+export function withholdPartialSecrets(text: string, secrets: Iterable<string>, start = false): string {
+	let head = 0;
+	let tail = 0;
+	for (const secret of secrets) {
+		if (secret.length < 2) continue;
+		tail = Math.max(tail, secretStartAtEnd(text, secret));
+		if (start) head = Math.max(head, secretEndAtStart(text, secret));
+	}
+	return head + tail >= text.length ? "" : text.slice(head, text.length - tail);
+}
+
 /** Redact the whole string, then cut its head; undefined when it cannot be shown safely. */
 function redactedHead(value: unknown, limit: number, redact: (text: string) => string): string | undefined {
 	if (typeof value !== "string" || !value || value.length > MAX_REDACTION_CHARS) return undefined;
@@ -300,6 +336,8 @@ export function hasDetail(call: ToolCallSource | undefined, result: unknown): bo
 /**
  * Call metadata for a transcript row. Every string is redacted whole before it is cut. `detail`
  * is the caller's statement that this Host answers `tool.detail` for the row's session.
+ * `argument` redacts the call's argument values (subject and intent); it defaults to `redact`,
+ * and a call whose arguments still stream passes one that also withholds partial secrets.
  */
 export function projectToolCall(
 	input: {
@@ -312,10 +350,11 @@ export function projectToolCall(
 		detail: boolean;
 	},
 	redact: (text: string) => string,
+	argument: (text: string) => string = redact,
 ): DesktopToolCall {
 	const family = toolFamily(input.toolName);
-	const shown = input.call ? subject(input.toolName, input.call.arguments, redact) : undefined;
-	const intent = intentLine(input.call?.intent, redact);
+	const shown = input.call ? subject(input.toolName, input.call.arguments, argument) : undefined;
+	const intent = intentLine(input.call?.intent, argument);
 	const facts = stats(input.call, family, record(input.result), redact);
 	return {
 		callId: redactedHead(input.callId, 512, redact) ?? "",
@@ -391,6 +430,7 @@ export function projectLiveToolCalls(
 	session: Pick<Session, "isStreaming" | "messages" | "state"> | undefined,
 	streamingMessage: unknown,
 	redact: (text: string) => string,
+	secrets: Iterable<string> = [],
 ): DesktopMessage[] {
 	try {
 		if (!session?.isStreaming) return [];
@@ -419,8 +459,12 @@ export function projectLiveToolCalls(
 				: running.has(call.id) || live?.started
 					? "running"
 					: "waiting";
-			const tail = status === "running" ? liveTail(live?.tail, redact) : undefined;
-			const tool = projectToolCall({ callId: call.id, toolName: call.name, call, status, detail: true }, redact);
+			const tail = status === "running" ? liveTail(live?.tail, redact, secrets) : undefined;
+			const tool = projectToolCall(
+				{ callId: call.id, toolName: call.name, call, status, detail: true },
+				redact,
+				status === "preparing" ? growing(redact, secrets) : redact,
+			);
 			rows.push({
 				// The redacted id, like `tool.callId`: a row id is display data too.
 				id: `call:${tool.callId}`,
@@ -437,13 +481,21 @@ export function projectLiveToolCalls(
 	}
 }
 
+/** Redaction for argument values the streaming message is still writing. */
+function growing(redact: (text: string) => string, secrets: Iterable<string>): (text: string) => string {
+	return text => withholdPartialSecrets(redact(text), secrets);
+}
+
 function liveTail(
 	text: string | undefined,
 	redact: (text: string) => string,
+	secrets: Iterable<string>,
 ): { text: string; truncated: boolean } | undefined {
 	if (!text || text.length > MAX_REDACTION_CHARS) return undefined;
-	const safe = redact(text);
-	if (safe.length > MAX_REDACTION_CHARS) return undefined;
+	const redacted = redact(text);
+	if (redacted.length > MAX_REDACTION_CHARS) return undefined;
+	// Output is still arriving at its end, and the SDK may have cut its start.
+	const safe = withholdPartialSecrets(redacted, secrets, true);
 	return { text: safe.slice(-LIVE_TAIL_LIMIT), truncated: safe.length > LIVE_TAIL_LIMIT };
 }
 
@@ -643,11 +695,11 @@ function findCall(
 	streamingMessage: unknown,
 	callId: string,
 	redact: (text: string) => string,
-): { call?: ToolCallSource; result?: Record<string, unknown> } | undefined {
+): { call?: ToolCallSource; result?: Record<string, unknown>; streaming?: true } | undefined {
 	const matches = (id: unknown) =>
 		typeof id === "string" && (id === callId || redactedHead(id, 512, redact) === callId);
 	const streaming = toolCallBlocks(streamingMessage).find(call => matches(call.id));
-	if (streaming) return { call: streaming };
+	if (streaming) return { call: streaming, streaming: true };
 	const messages = session.messages;
 	let result: Record<string, unknown> | undefined;
 	for (let index = messages.length - 1; index >= 0; index--) {
@@ -665,17 +717,20 @@ function findCall(
  * Answers `tool.detail` for a live session: the full command, pretty-printed arguments, per-file
  * diffs, tool-search matches or the resulting task list, whichever apply to the call.
  * `tool.detail` is a projected control method, so the Host does not redact this result when it
- * emits it: every string here is redacted whole before any `DESKTOP_TOOL_LIMITS` cut.
+ * emits it: every string here is redacted whole before any `DESKTOP_TOOL_LIMITS` cut. A call the
+ * streaming message is still writing also withholds any partly written secret among `secrets`.
  */
 export function projectToolDetail(
 	session: Pick<Session, "messages">,
 	streamingMessage: unknown,
 	callId: string,
-	redact: (text: string) => string,
+	redactText: (text: string) => string,
+	secrets: Iterable<string> = [],
 ): DesktopToolDetail {
-	const found = findCall(session, streamingMessage, callId, redact);
+	const found = findCall(session, streamingMessage, callId, redactText);
 	if (!found) throw new Error(TOOL_DETAIL_GONE);
 	const { call, result } = found;
+	const redact = found.streaming ? growing(redactText, secrets) : redactText;
 	const name = call?.name ?? (typeof result?.toolName === "string" ? result.toolName : "");
 	const family = toolFamily(name);
 	const detail: DesktopToolDetail = { callId };

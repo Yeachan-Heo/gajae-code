@@ -25,7 +25,7 @@ import {
 const CALL_ID = "toolu_live_1";
 
 /** A `read` tool that reports partial output, then parks until released or aborted. */
-function parkedRead() {
+function parkedRead(partial = "partial output") {
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	const tool: AgentTool = {
@@ -34,7 +34,7 @@ function parkedRead() {
 		description: "Parks until the test releases it",
 		parameters: z.object({ path: z.string() }),
 		execute: async (_id, _args, signal, onUpdate) => {
-			onUpdate?.({ content: [{ type: "text", text: "partial output" }] });
+			onUpdate?.({ content: [{ type: "text", text: partial }] });
 			entered.resolve();
 			const aborted = Promise.withResolvers<never>();
 			signal?.addEventListener("abort", () => aborted.reject(new Error("aborted")), { once: true });
@@ -66,7 +66,7 @@ describe("desktop live tool rows", () => {
 		}
 	});
 
-	async function launch() {
+	async function launch(partial?: string) {
 		const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-tools-live-"));
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-tools-project-"));
 		await setModelPresetRegistryDisabled({ agentDir: path.join(dataDir, "agent"), disabled: true });
@@ -75,7 +75,7 @@ describe("desktop live tool rows", () => {
 			"compaction:\n  enabled: false\nretry:\n  enabled: false\n",
 		);
 		vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined);
-		const read = parkedRead();
+		const read = parkedRead(partial);
 		const mock = createMockModel({
 			responses: [
 				{ content: [{ type: "toolCall", id: CALL_ID, name: "read", arguments: { path: "src/app.ts" } }] },
@@ -182,6 +182,21 @@ describe("desktop live tool rows", () => {
 			tool: { status: "done", subject: "src/app.ts" },
 		});
 		expect(done.messages.some(message => message.id.startsWith("call:"))).toBe(false);
+	}, 30_000);
+
+	test("a running row withholds the start of a credential the Host knows until the rest arrives", async () => {
+		const key = "QXJ9-kv7w-ZP2M-4tN8-Hc6R-credential";
+		const h = await launch(`token: ${key.slice(0, 14)}`);
+		// The Host learns a submitted key before it validates the provider.
+		await h.call("auth.setKey", { provider: "unknown-provider", key }).catch(() => {});
+		const running = h.published(session => rowsFor(session)[0]?.tool?.status === "running");
+		const prompt = h.call("prompt", { sessionId: h.session.id, text: "read it" });
+		await h.read.entered;
+		const live = await running;
+		expect(rowsFor(live)[0]?.text).toBe("token: ");
+		expect(JSON.stringify(live)).not.toContain(key.slice(0, 6));
+		h.read.release();
+		await prompt;
 	}, 30_000);
 
 	test("a call stopped while it runs settles as cancelled, never as running", async () => {
