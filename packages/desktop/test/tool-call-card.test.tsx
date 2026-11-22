@@ -141,6 +141,20 @@ describe("tool call card details", () => {
 		expect(written).not.toContain("tool-fact-removed");
 	});
 
+	test("a diff header shows only the line counts a file has, and none for a file whose edit failed", () => {
+		const html = renderToStaticMarkup(<ToolCallDetails family="edit" state={{ kind: "ready", detail: {
+			callId: "c",
+			diff: [
+				{ path: "both.ts", diff: "-1|a\n+1|b", added: 1, removed: 1 },
+				{ path: "new.ts", diff: "+1|x\n+2|y", added: 2, removed: 0, op: "create" },
+				{ path: "gone.ts", diff: "-1|x", added: 0, removed: 1, op: "delete" },
+				{ path: "failed.ts", diff: "", added: 0, removed: 0, error: "No match" },
+			],
+		} }} />);
+		const headers = [...html.matchAll(/<div class="tool-diff-header">([\s\S]*?)<\/div>/g)].map(match => text(match[1]!));
+		expect(headers).toEqual(["both.ts+1 −1", "new.tsCreated+2", "gone.tsDeleted−1", "failed.ts"]);
+	});
+
 	test("a diff header names a file inside the project relative to it, with the full path on hover", () => {
 		// The conversation's detail loader carries its project directory.
 		const headers = (directory: string | undefined, paths: string[]) => {

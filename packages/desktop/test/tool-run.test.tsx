@@ -176,6 +176,20 @@ suite("tool cards and runs in a mounted transcript", () => {
 		} finally { await closeComponentFixture(context, page); }
 	}, 30000);
 
+	test("an open card's output keeps inside the card's rounded border", async () => {
+		const { context, page } = await fixture([call("1:2", "a", "failed")]);
+		try {
+			await page.click(".tool-call summary");
+			const corners = await page.$eval(".tool-call", card => {
+				const outer = getComputedStyle(card.querySelector(".tool-disclosure")!);
+				const output = getComputedStyle(card.querySelector(".tool-disclosure .bounded-output")!);
+				const inner = Number.parseFloat(outer.borderBottomLeftRadius) - Number.parseFloat(outer.borderBottomWidth);
+				return [output.borderBottomLeftRadius, output.borderBottomRightRadius].map(value => Number.parseFloat(value) - inner);
+			});
+			expect(corners).toEqual([0, 0]);
+		} finally { await closeComponentFixture(context, page); }
+	}, 30000);
+
 	test("a group stays collapsed through failures and new calls, shows the newest call, and opens only on request", async () => {
 		const { context, page } = await fixture([call("1:2", "a", "done"), call("call:b", "b", "running")]);
 		try {

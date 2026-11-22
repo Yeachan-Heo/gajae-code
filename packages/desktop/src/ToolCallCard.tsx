@@ -257,13 +257,15 @@ function ToolDiffs({ diffs, written }: { diffs: DesktopToolDiff[]; written: bool
 						<FilePath path={file.path} directory={directory} />
 						{file.op === "create" && <span className="tool-diff-op">{t("tools.diffCreated")}</span>}
 						{file.op === "delete" && <span className="tool-diff-op">{t("tools.diffDeleted")}</span>}
-						{!written && (
+						{/* Only the counts a file has; a file whose edit failed changed nothing. */}
+						{!written && !file.error && (file.added > 0 || file.removed > 0) && (
 							<span
 								className="tool-call-facts"
 								title={t("tools.factDiff", { added: file.added, removed: file.removed })}
 							>
-								<span className="tool-fact-added">+{file.added}</span>{" "}
-								<span className="tool-fact-removed">−{file.removed}</span>
+								{file.added > 0 && <span className="tool-fact-added">+{file.added}</span>}
+								{file.added > 0 && file.removed > 0 && " "}
+								{file.removed > 0 && <span className="tool-fact-removed">−{file.removed}</span>}
 							</span>
 						)}
 					</div>
