@@ -139,6 +139,7 @@ export const providers = {
 	"providers.showcaseOpenDialog": "Open in a native dialog",
 	"providers.showcaseWideHeading": "Dialog width",
 	"providers.showcaseNarrowHeading": "Narrow container · 390px",
+	"providers.showcaseSummaryHeading": "Settings → Account summary · with models and without",
 	"providers.showcaseNameReady": "Design example cloud",
 	"providers.showcaseNameSubscription": "Design example subscription",
 	"providers.showcaseNameGateway": "Design example local gateway",

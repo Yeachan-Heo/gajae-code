@@ -3,7 +3,7 @@ import { useState } from "react";
 import { Button, Composer, Modal } from "./components";
 import { type MessageKey, t } from "./i18n";
 import { ProviderOnboardingNotice } from "./ProviderOnboardingNotice";
-import { type ProviderKeyState, ProvidersPanel } from "./ProvidersPanel";
+import { type ProviderKeyState, ProvidersPanel, ProvidersSummary } from "./ProvidersPanel";
 import { normalizeApiKeyDraft, projectProviders, visibleFlow } from "./provider-status";
 
 // Every id below is a design fixture; nothing here reaches the host, the SDK or a provider.
@@ -299,6 +299,13 @@ function FixtureProvidersPanel() {
 			<h3>{t("providers.showcaseNarrowHeading")}</h3>
 			<div className="providers-showcase-frame" data-narrow="">
 				<FixturePanel key={`narrow:${state.label}`} state={state} onLocal={local} onDone={local} />
+			</div>
+			<h3>{t("providers.showcaseSummaryHeading")}</h3>
+			<div className="providers-showcase-frame">
+				<ProvidersSummary models={fixtureModels} onManage={local} />
+			</div>
+			<div className="providers-showcase-frame">
+				<ProvidersSummary models={[]} onManage={local} />
 			</div>
 			{dialog && (
 				<Modal title={t("providers.dialogTitle")} className="providers-dialog" onClose={() => setDialog(false)}>
