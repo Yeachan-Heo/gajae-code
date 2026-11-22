@@ -461,8 +461,6 @@ interface LiveSession extends SessionCandidate {
 	revisions?: PromptRevisions;
 	/** User turns already attributed to one input; a turn is evidence for at most one. */
 	claimedUserTurns: WeakSet<AgentMessage>;
-	/** Queued inputs the SDK reported as taken into a run and not yet settled, in the order taken. */
-	consumedClaimants: UserTurnClaimant[];
 }
 interface PendingQuestion {
 	ownerToken: symbol;
@@ -1336,7 +1334,6 @@ export class DesktopHost {
 			queued: new Map(),
 			scopeOwners: new Map(),
 			claimedUserTurns: new WeakSet(),
-			consumedClaimants: [],
 		};
 		this.#live.set(live.metadata.id, live);
 		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
@@ -2283,30 +2280,22 @@ export class DesktopHost {
 	/**
 	 * Finds the transcript user turn that is this queued input's own. The SDK does not say which
 	 * turn an input became, so the match is by exact text, made one-to-one: a turn already claimed
-	 * (including a prompt's own, bound by scope) is skipped, and inputs taken into a run earlier
-	 * have first pick, since the SDK appends inputs in the order it takes them. An input that was
-	 * taken but never appended therefore cannot borrow an identical earlier input's turn. The
-	 * claimant is retired either way; only a found turn is claimed.
+	 * (including a prompt's own, bound by scope) is skipped and the first free match is claimed.
+	 *
+	 * Claims happen as terminals settle. The SDK settles a run's inputs in the order it took them
+	 * and runs end one after another; each Host terminal handler then waits only for its own
+	 * queued-receipt write, which the journal completes in admission order. The only input taken
+	 * but never appended is a steer handed back by the Stop that ends its run (a taken follow-up
+	 * is always appended), and it is the last one taken. Every input taken before it was admitted
+	 * before it too (steers are taken in admission order and ahead of any follow-up waiting at the
+	 * same boundary), so all of them claim first, their own turns are the free matches, and the
+	 * handed-back steer finds none. A follow-up claiming ahead of an earlier-taken steer can only
+	 * swap two appended turns of the same text, which changes no outcome.
 	 */
-	#claimUserTurn(live: LiveSession, claimant: UserTurnClaimant, claim: boolean): AgentMessage | undefined {
-		const position = live.consumedClaimants.indexOf(claimant);
-		if (position >= 0) live.consumedClaimants.splice(position, 1);
-		if (!claim) return undefined;
-		const reserved = new Set<AgentMessage>();
-		const firstFree = (candidate: UserTurnClaimant) =>
-			candidate.turns.find(
-				message =>
-					!live.claimedUserTurns.has(message) &&
-					!reserved.has(message) &&
-					copyableMessageText(message) === candidate.text,
-			);
-		const earlier = position >= 0 ? live.consumedClaimants.slice(0, position) : live.consumedClaimants;
-		for (const candidate of earlier) {
-			if (candidate.text !== claimant.text) continue;
-			const turn = firstFree(candidate);
-			if (turn) reserved.add(turn);
-		}
-		const turn = firstFree(claimant);
+	#claimUserTurn(live: LiveSession, claimant: UserTurnClaimant): AgentMessage | undefined {
+		const turn = claimant.turns.find(
+			message => !live.claimedUserTurns.has(message) && copyableMessageText(message) === claimant.text,
+		);
 		if (turn) live.claimedUserTurns.add(turn);
 		return turn;
 	}
@@ -3064,12 +3053,6 @@ export class DesktopHost {
 				// The terminal's attempt scope can name a different attempt of the same logical run, so
 				// this input's own user turn is found by its text among those appended after admission.
 				const claimant: UserTurnClaimant = { text, turns: [] };
-				let claimSettled = false;
-				const settleClaim = (claim: boolean) => {
-					if (claimSettled) return undefined;
-					claimSettled = true;
-					return this.#claimUserTurn(live, claimant, claim);
-				};
 				const unsubscribeTerminal = live.sdk.subscribe(event => {
 					if (event.type === "message_end" && event.message.role === "user") claimant.turns.push(event.message);
 					if (event.type !== "agent_end" || !event.scope) return;
@@ -3109,7 +3092,6 @@ export class DesktopHost {
 					sdkSubmissionId: submission.submissionId,
 				}).catch(error => {
 					unsubscribeTerminal();
-					settleClaim(false);
 					throw error;
 				});
 				const dto: DesktopQueuedInput = {
@@ -3130,8 +3112,6 @@ export class DesktopHost {
 				this.#observeDelivery(
 					submission.execution.then(
 						async outcome => {
-							// Record the SDK's take order before any await: earlier-taken inputs claim first.
-							if (outcome.disposition !== "removed" && !claimSettled) live.consumedClaimants.push(claimant);
 							if (outcome.disposition !== "removed" && live.errorEpoch === errorEpoch) {
 								const key = scopeKey(outcome.attemptScope);
 								const owner = live.scopeOwners.get(key);
@@ -3177,7 +3157,8 @@ export class DesktopHost {
 									: undefined;
 							// Consumption settles before the input's own message is appended, so after a Stop
 							// this input counts as sent only once its own turn is in the transcript.
-							const ownTurn = settleClaim(outcome.disposition === "completed");
+							const ownTurn =
+								outcome.disposition === "completed" ? this.#claimUserTurn(live, claimant) : undefined;
 							const stopped = this.#stopCount(live.metadata.id) !== stops;
 							const inTranscript = ownTurn !== undefined && persistedUserTurn(live.sdk, ownTurn);
 							const disposition =
@@ -3221,7 +3202,6 @@ export class DesktopHost {
 								this.#recordScopeFailure(live, outcome.attemptScope, request.id);
 						},
 						async () => {
-							settleClaim(false);
 							await queuedPersisted;
 							unsubscribeTerminal();
 							live.queued.delete(dto.id);
