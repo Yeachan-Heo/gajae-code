@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { z } from "@gajae-code/ai";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
@@ -49,8 +50,27 @@ function controlledAgent() {
 	const prompts: string[] = [];
 	let aborts = 0;
 	let finishTurn: ((text: string, failed?: boolean) => void) | undefined;
+	let finishWithToolCall: (() => void) | undefined;
+	let toolCalls = 0;
+	let toolEntered = Promise.withResolvers<void>();
+	let releaseTool: (() => void) | undefined;
+	// A real tool the controlled model can call; it runs until the test releases it or the run aborts.
+	const read: AgentTool = {
+		name: "read",
+		label: "Read",
+		description: "Parks until the test releases it",
+		parameters: z.object({ path: z.string() }),
+		execute: async (_id, _args, signal) => {
+			const released = Promise.withResolvers<void>();
+			releaseTool = () => released.resolve();
+			signal?.addEventListener("abort", () => released.resolve(), { once: true });
+			toolEntered.resolve();
+			await released.promise;
+			return { content: [{ type: "text", text: "file body" }] };
+		},
+	};
 	const agent = new Agent({
-		initialState: { model, messages: [], tools: [], systemPrompt: [] },
+		initialState: { model, messages: [], tools: [read], systemPrompt: [] },
 		getApiKey: () => "local-stream-only",
 		streamFn: (_model, context, options) => {
 			const text = context.messages
@@ -106,6 +126,16 @@ function controlledAgent() {
 			};
 			const abort = () => settle(true);
 			finishTurn = (response, failed) => settle(false, response, failed);
+			finishWithToolCall = () => {
+				if (done) return;
+				done = true;
+				options?.signal?.removeEventListener("abort", abort);
+				message.content = [
+					{ type: "toolCall", id: `read-${++toolCalls}`, name: "read", arguments: { path: "a.ts" } },
+				];
+				message.stopReason = "toolUse";
+				stream.push({ type: "done", reason: "toolUse", message });
+			};
 			options?.signal?.addEventListener("abort", abort, { once: true });
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: message });
@@ -128,6 +158,17 @@ function controlledAgent() {
 		finishTurn(response: string, failed = false) {
 			if (!finishTurn) throw new Error("No controlled provider turn is running");
 			finishTurn(response, failed);
+		},
+		/** Ends the streaming turn with a `read` call and resolves once that tool is running. */
+		callTool(): Promise<void> {
+			if (!finishWithToolCall) throw new Error("No controlled provider turn is running");
+			toolEntered = Promise.withResolvers<void>();
+			finishWithToolCall();
+			return toolEntered.promise;
+		},
+		releaseTool() {
+			if (!releaseTool) throw new Error("No controlled tool is running");
+			releaseTool();
 		},
 	};
 }
@@ -673,6 +714,123 @@ describe("desktop streaming lifecycle", () => {
 		expect(receiptTrail(frames, "queued-before-close")).not.toContain("cancelled");
 	});
 
+	/**
+	 * Presses Stop from inside the SDK's report that it took the next steer from the queue: the
+	 * input is consumed but not yet appended, so the aborted run hands it back and never sends it.
+	 */
+	function stopAtNextSteerConsumption(sdk: AgentSession, stop: () => Promise<unknown>): () => Promise<unknown> {
+		const consumed = sdk.agent.onSteeringConsumed;
+		if (!consumed) throw new Error("The SDK no longer reports steering consumption");
+		cleanups.push(async () => {
+			sdk.agent.onSteeringConsumed = consumed;
+		});
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const stopping = Promise.withResolvers<unknown>();
+		sdk.agent.onSteeringConsumed = async (messages, promotion) => {
+			await consumed(messages, promotion);
+			sdk.agent.onSteeringConsumed = consumed;
+			stop().then(stopping.resolve, stopping.reject);
+			await stopReached.promise;
+		};
+		return () => stopping.promise;
+	}
+	const userTurns = (sdk: AgentSession) => sdk.messages.filter(message => message.role === "user").map(copyText);
+	const settledReceipts = async (snapshot: () => Promise<DesktopSnapshot>, ids: string[]) => {
+		let state = await snapshot();
+		for (
+			let i = 0;
+			i < 200 &&
+			ids.some(id =>
+				["pending", "accepted", "queued"].includes(
+					state.deliveries.find(item => item.id === id)?.disposition ?? "pending",
+				),
+			);
+			i++
+		) {
+			await Bun.sleep(5);
+			state = await snapshot();
+		}
+		return Object.fromEntries(ids.map(id => [id, state.deliveries.find(item => item.id === id)?.disposition]));
+	};
+
+	test("an identical steer the stopped run took but never sent does not borrow the earlier one's turn", async () => {
+		const h = await launch();
+		const running = h.call("prompt", { sessionId: h.session.id, text: "long task" }, "tool-run");
+		await h.control.started;
+		await h.control.callTool();
+		// Both are queued before either reaches the transcript, so both can see the first one's turn.
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-sent");
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-taken");
+		h.control.releaseTool();
+		for (let i = 0; i < 400 && h.control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(h.control.prompts[1]).toBe("long task\nsame");
+		await h.control.callTool();
+		const stopped = stopAtNextSteerConsumption(h.sdk, () => h.call("abort", { sessionId: h.session.id }));
+		h.control.releaseTool();
+		expect(await stopped()).toBeNull();
+		expect(await running).toBeNull();
+		expect(h.control.prompts).toHaveLength(2);
+		expect(userTurns(h.sdk)).toEqual(["long task", "same"]);
+		// One transcript turn is evidence for one input. The input it does not belong to never ran
+		// visibly, so it must not be settled as a cancellation that drops its text.
+		expect(await settledReceipts(h.snapshot, ["tool-run", "steer-sent", "steer-taken"])).toEqual({
+			"tool-run": "cancelled",
+			"steer-sent": "cancelled",
+			"steer-taken": "unknown",
+		});
+	});
+
+	test("after Stop, a steer taken at a finished turn but never sent is not reported completed", async () => {
+		const h = await launch();
+		const running = h.call("prompt", { sessionId: h.session.id, text: "long task" }, "finished-run");
+		await h.control.started;
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-answered");
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-dropped");
+		h.control.finishTurn("one");
+		for (let i = 0; i < 400 && h.control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(h.control.prompts[1]).toBe("long task\nsame");
+		const stopped = stopAtNextSteerConsumption(h.sdk, () => h.call("abort", { sessionId: h.session.id }));
+		// The turn's answer is final, so the run ends completed although Stop handed the steer back.
+		h.control.finishTurn("two");
+		expect(await stopped()).toBeNull();
+		await running;
+		expect(h.control.prompts).toHaveLength(2);
+		expect(userTurns(h.sdk)).toEqual(["long task", "same"]);
+		expect(h.sdk.agent.hasQueuedMessages()).toBe(false);
+		expect(await settledReceipts(h.snapshot, ["finished-run", "steer-answered", "steer-dropped"])).toEqual({
+			"finished-run": "completed",
+			"steer-answered": "completed",
+			// `completed` would finalize it silently; its text never reached the conversation.
+			"steer-dropped": "unknown",
+		});
+	});
+
+	test("Stop after two identical steers both reached the transcript cancels both", async () => {
+		const h = await launch();
+		const running = h.call("prompt", { sessionId: h.session.id, text: "long task" }, "both-sent-run");
+		await h.control.started;
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-one");
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-two");
+		h.control.finishTurn("one");
+		for (let i = 0; i < 400 && h.control.prompts.length < 2; i++) await Bun.sleep(5);
+		h.control.finishTurn("two");
+		for (let i = 0; i < 400 && h.control.prompts.length < 3; i++) await Bun.sleep(5);
+		expect(h.control.prompts[2]).toBe("long task\nsame\nsame");
+		await h.call("abort", { sessionId: h.session.id });
+		expect(await running).toBeNull();
+		expect(userTurns(h.sdk)).toEqual(["long task", "same", "same"]);
+		expect(await settledReceipts(h.snapshot, ["both-sent-run", "steer-one", "steer-two"])).toEqual({
+			"both-sent-run": "cancelled",
+			"steer-one": "cancelled",
+			"steer-two": "cancelled",
+		});
+	});
+
 	test("invalid prompt reports a definitive refusal before admission", async () => {
 		const { call, session, frames, snapshot } = await launch();
 		await expect(call("prompt", { sessionId: session.id, text: "" }, "invalid-id")).rejects.toThrow();
@@ -1061,4 +1219,6 @@ interface ControlledAgent {
 	prompts: string[];
 	readonly aborts: number;
 	finishTurn(response: string, failed?: boolean): void;
+	callTool(): Promise<void>;
+	releaseTool(): void;
 }

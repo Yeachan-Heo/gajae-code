@@ -130,9 +130,10 @@ const SETTING_CATALOG = getSettingsCatalog(Settings.isolated());
 const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
 	JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
 /**
- * Transcript evidence that a user turn durably joined the conversation: the SDK bound this exact
- * message to a session entry. Preflight acceptance is not this proof, because it commits before
- * the message is appended.
+ * Transcript evidence for a user turn: the SDK bound this exact message to a session entry, and
+ * the session's transcript state still holds that entry. This proves the text is part of the
+ * conversation, not that it was flushed to disk (an unpersisted session holds it in memory only).
+ * Preflight acceptance is not this proof, because it commits before the message is appended.
  */
 const persistedUserTurn = (sdk: AgentSession, message: AgentMessage | undefined): boolean => {
 	const entryId = message === undefined ? undefined : getSessionMessageEntryId(message);
@@ -388,6 +389,13 @@ interface TrackedQueuedInput {
 	submission: QueuedInputSubmission;
 	deliveryId: string;
 }
+/** A queued input's search for its own user turn, which the SDK does not identify (see `#claimUserTurn`). */
+interface UserTurnClaimant {
+	/** The exact text the input was submitted with. */
+	text: string;
+	/** User turns appended after the input was admitted, in transcript order. */
+	turns: AgentMessage[];
+}
 interface SessionCandidate {
 	sdk: AgentSession;
 	factory: EmbeddedAgentSessionResult;
@@ -453,6 +461,10 @@ interface LiveSession extends SessionCandidate {
 	revisions?: PromptRevisions;
 	/** User Stop requests so far. Only a run stopped after its input counted one ends `cancelled`. */
 	stopRequests: number;
+	/** User turns already attributed to one input; a turn is evidence for at most one. */
+	claimedUserTurns: WeakSet<AgentMessage>;
+	/** Queued inputs the SDK reported as taken into a run and not yet settled, in the order taken. */
+	consumedClaimants: UserTurnClaimant[];
 }
 interface PendingQuestion {
 	ownerToken: symbol;
@@ -1318,6 +1330,8 @@ export class DesktopHost {
 			queued: new Map(),
 			scopeOwners: new Map(),
 			stopRequests: 0,
+			claimedUserTurns: new WeakSet(),
+			consumedClaimants: [],
 		};
 		this.#live.set(live.metadata.id, live);
 		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
@@ -2151,8 +2165,11 @@ export class DesktopHost {
 		const unsubscribe = live.sdk.subscribe(event => {
 			if (event.type === "message_end" && event.message.role === "user") {
 				userTurnObserved = true;
-				if (promptMessage === undefined && event.scope && scopeKey(event.scope) === promptScope)
+				if (promptMessage === undefined && event.scope && scopeKey(event.scope) === promptScope) {
 					promptMessage = event.message;
+					// Bound by its run's scope, so no queued input with the same text may claim it.
+					live.claimedUserTurns.add(event.message);
+				}
 			}
 			if (event.type !== "agent_end" || !event.scope) return;
 			const assistant = event.messages.filter(message => message.role === "assistant").at(-1);
@@ -2243,6 +2260,36 @@ export class DesktopHost {
 		});
 		if (accepted && run.started && owned?.reason === "completed" && owned.assistant === "stop")
 			completeTask(run.started.scope);
+	}
+	/**
+	 * Finds the transcript user turn that is this queued input's own. The SDK does not say which
+	 * turn an input became, so the match is by exact text, made one-to-one: a turn already claimed
+	 * (including a prompt's own, bound by scope) is skipped, and inputs taken into a run earlier
+	 * have first pick, since the SDK appends inputs in the order it takes them. An input that was
+	 * taken but never appended therefore cannot borrow an identical earlier input's turn. The
+	 * claimant is retired either way; only a found turn is claimed.
+	 */
+	#claimUserTurn(live: LiveSession, claimant: UserTurnClaimant, claim: boolean): AgentMessage | undefined {
+		const position = live.consumedClaimants.indexOf(claimant);
+		if (position >= 0) live.consumedClaimants.splice(position, 1);
+		if (!claim) return undefined;
+		const reserved = new Set<AgentMessage>();
+		const firstFree = (candidate: UserTurnClaimant) =>
+			candidate.turns.find(
+				message =>
+					!live.claimedUserTurns.has(message) &&
+					!reserved.has(message) &&
+					copyableMessageText(message) === candidate.text,
+			);
+		const earlier = position >= 0 ? live.consumedClaimants.slice(0, position) : live.consumedClaimants;
+		for (const candidate of earlier) {
+			if (candidate.text !== claimant.text) continue;
+			const turn = firstFree(candidate);
+			if (turn) reserved.add(turn);
+		}
+		const turn = firstFree(claimant);
+		if (turn) live.claimedUserTurns.add(turn);
+		return turn;
 	}
 	#recordScopeFailure(
 		live: LiveSession,
@@ -2974,11 +3021,17 @@ export class DesktopHost {
 					},
 				};
 				const terminalEvents = new Map<string, { reason: string | undefined; assistant: string | undefined }>();
-				// User turns appended after this admission. The terminal's attempt scope can name a
-				// different attempt of the same logical run, so the exact text identifies this input.
-				const userTurns: AgentMessage[] = [];
+				// The terminal's attempt scope can name a different attempt of the same logical run, so
+				// this input's own user turn is found by its text among those appended after admission.
+				const claimant: UserTurnClaimant = { text, turns: [] };
+				let claimSettled = false;
+				const settleClaim = (claim: boolean) => {
+					if (claimSettled) return undefined;
+					claimSettled = true;
+					return this.#claimUserTurn(live, claimant, claim);
+				};
 				const unsubscribeTerminal = live.sdk.subscribe(event => {
-					if (event.type === "message_end" && event.message.role === "user") userTurns.push(event.message);
+					if (event.type === "message_end" && event.message.role === "user") claimant.turns.push(event.message);
 					if (event.type !== "agent_end" || !event.scope) return;
 					const assistant = event.messages.filter(message => message.role === "assistant").at(-1);
 					terminalEvents.set(scopeKey(event.scope), {
@@ -3009,6 +3062,7 @@ export class DesktopHost {
 					sdkSubmissionId: submission.submissionId,
 				}).catch(error => {
 					unsubscribeTerminal();
+					settleClaim(false);
 					throw error;
 				});
 				const dto: DesktopQueuedInput = {
@@ -3029,6 +3083,8 @@ export class DesktopHost {
 				this.#observeDelivery(
 					submission.execution.then(
 						async outcome => {
+							// Record the SDK's take order before any await: earlier-taken inputs claim first.
+							if (outcome.disposition !== "removed" && !claimSettled) live.consumedClaimants.push(claimant);
 							if (outcome.disposition !== "removed" && live.errorEpoch === errorEpoch) {
 								const key = scopeKey(outcome.attemptScope);
 								const owner = live.scopeOwners.get(key);
@@ -3072,14 +3128,11 @@ export class DesktopHost {
 								outcome.disposition === "completed"
 									? terminalEvents.get(scopeKey(outcome.attemptScope))
 									: undefined;
-							// Consumption settles before the input's own message is appended, so a
-							// Stop cancels this input only once that exact text is in the transcript.
-							const stoppedInTranscript =
-								outcome.disposition === "completed" &&
-								live.stopRequests !== stops &&
-								userTurns.some(
-									message => copyableMessageText(message) === text && persistedUserTurn(live.sdk, message),
-								);
+							// Consumption settles before the input's own message is appended, so after a Stop
+							// this input counts as sent only once its own turn is in the transcript.
+							const ownTurn = settleClaim(outcome.disposition === "completed");
+							const stopped = live.stopRequests !== stops;
+							const inTranscript = ownTurn !== undefined && persistedUserTurn(live.sdk, ownTurn);
 							const disposition =
 								outcome.disposition === "removed"
 									? outcome.reason === "cancelled"
@@ -3092,9 +3145,14 @@ export class DesktopHost {
 										: terminal?.reason === "completed" &&
 												terminal.assistant &&
 												terminal.assistant !== "aborted"
-											? "completed"
+											? // A run Stop ended after its final answer still completes, but an input
+												// it took and handed back unsent is not part of that answer.
+												stopped && !inTranscript
+												? "unknown"
+												: "completed"
 											: (terminal?.assistant === "aborted" || terminal?.reason === "cancelled") &&
-													stoppedInTranscript
+													stopped &&
+													inTranscript
 												? "cancelled"
 												: "unknown";
 							await this.#delivery(request.id, {
@@ -3116,6 +3174,7 @@ export class DesktopHost {
 								this.#recordScopeFailure(live, outcome.attemptScope, request.id);
 						},
 						async () => {
+							settleClaim(false);
 							await queuedPersisted;
 							unsubscribeTerminal();
 							live.queued.delete(dto.id);
