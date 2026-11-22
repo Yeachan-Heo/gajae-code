@@ -571,6 +571,39 @@ suite("Providers panel interactions", () => {
 		}
 	}, 60000);
 
+	test("a refused key draws the field in the error color, focused or not, and a valid field does not", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			await select(page, "delta");
+			await page.waitForSelector(".provider-key input");
+			const errorColor = await page.evaluate(() => {
+				const probe = document.createElement("span");
+				probe.style.color = "var(--status-error)";
+				document.body.append(probe);
+				const color = getComputedStyle(probe).color;
+				probe.remove();
+				return color;
+			});
+			const border = () => page.$eval(".provider-key input", node => getComputedStyle(node).borderTopColor);
+			expect(await border()).not.toBe(errorColor);
+			await page.type(".provider-key input", "!op read secret");
+			await page.keyboard.press("Enter");
+			await set(page, { keyState: { provider: "delta", status: "invalid", reason: "command" } });
+			await page.waitForSelector('.provider-key input[aria-invalid="true"]');
+			// The field keeps focus after the refused submit, where the focus ring must not hide the error.
+			expect(await page.evaluate(() => document.activeElement?.matches(".provider-key input"))).toBe(true);
+			expect(await border()).toBe(errorColor);
+			await page.$eval(".provider-key input", node => (node as HTMLInputElement).blur());
+			expect(await border()).toBe(errorColor);
+			await set(page, { keyState: null });
+			await page.waitForSelector('.provider-key input:not([aria-invalid="true"])');
+			expect(await border()).not.toBe(errorColor);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("amber flow-card text, the failed status and the key error clear 4.5:1 in every bundled theme", async () => {
 		const { context, page } = await fixture(1000, { dialog: true });
 		try {

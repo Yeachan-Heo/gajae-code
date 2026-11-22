@@ -971,6 +971,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-field-row > input { flex: 1 1 12rem; }
 .provider-field-row > .button { flex: none; }
 .provider-field-error { color: var(--provider-error-ink); font-size: 0.75rem; }
+/* A refused key keeps an error edge, also while focused (the field keeps focus after the refusal),
+   where the focus halo takes the error hue instead of the accent. */
+.provider-key input[aria-invalid="true"] { border-color: var(--status-error); }
+.provider-key input[aria-invalid="true"]:focus-visible { border-color: var(--status-error); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-error) 45%, transparent); }
 .provider-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .provider-blocked { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; padding: 0.625rem 0.75rem; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); font-size: 0.8125rem; }
 .provider-link { min-height: 0; padding: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
