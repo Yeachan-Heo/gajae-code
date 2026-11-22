@@ -1593,8 +1593,17 @@ export class Agent {
 
 	/** Replace both executable queues with a prior snapshot. */
 	restoreQueues(snapshot: AgentQueueSnapshot): void {
+		const steeringChanged =
+			this.#steeringQueue.length !== snapshot.steering.length ||
+			this.#steeringQueue.some((msg, i) => msg !== snapshot.steering[i]);
+		const followUpChanged =
+			this.#followUpQueue.length !== snapshot.followUp.length ||
+			this.#followUpQueue.some((msg, i) => msg !== snapshot.followUp[i]);
 		this.#steeringQueue = snapshot.steering.slice();
 		this.#followUpQueue = snapshot.followUp.slice();
+		if (steeringChanged || followUpChanged) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	/**
@@ -2776,6 +2785,7 @@ export class Agent {
 		if (this.#steeringQueue.length > 0) {
 			terminalEvent.disownedSteering = this.#steeringQueue;
 			this.#steeringQueue = [];
+			for (const notify of [...this.#queueChangeWaiters]) notify();
 		}
 		if (domain) {
 			setAgentTerminalOwnerContext(terminalEvent, {
