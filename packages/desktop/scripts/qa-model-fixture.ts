@@ -7,6 +7,9 @@ import * as path from "node:path";
 export const QA_PROVIDER = "desktop-qa-fixture";
 export const QA_KEY = "fixture-only-not-a-provider-secret";
 export const QA_MODEL_IDS = ["qa-reasoning", "qa-plain", "qa-discrete"] as const;
+/** Default per-collection completion cap; a long interactive run can raise it. */
+export const QA_DEFAULT_REQUEST_LIMIT = 64;
+export const QA_MAX_REQUEST_LIMIT = 512;
 const MAX_CALLS_PER_RESPONSE = 16;
 const MAX_CHAIN_STEPS = 16;
 const markerName = "qa-model-fixture.json";
@@ -483,6 +486,8 @@ export interface FixtureSnapshot {
 	baseUrl: string;
 	models: string[];
 	holdNext: boolean;
+	/** Completions accepted per collection before the fixture answers 429. */
+	requestLimit: number;
 	/** Main and side-chat model turns; automatic title transactions do not consume these IDs or holds. */
 	requests: FixtureRequestRecord[];
 	/** Independently numbered title transactions, including their input digest and SSE chunks. */
@@ -659,12 +664,25 @@ function isTitleRequest(body: Record<string, unknown>): boolean {
 	);
 }
 
-export function startModelFixture(artifactPath: string): ModelFixture {
+export interface ModelFixtureOptions {
+	/**
+	 * Hold the first main completion until `release(id)` (the default). False lets an interactive
+	 * run answer its first prompt at once; `holdNext()` still arms a hold for the next completion.
+	 */
+	initialHold?: boolean;
+	/** Completions accepted per collection (main and title) before 429; 1 to `QA_MAX_REQUEST_LIMIT`. */
+	requestLimit?: number;
+}
+
+export function startModelFixture(artifactPath: string, options: ModelFixtureOptions = {}): ModelFixture {
+	const limit = options.requestLimit ?? QA_DEFAULT_REQUEST_LIMIT;
+	if (!Number.isSafeInteger(limit) || limit < 1 || limit > QA_MAX_REQUEST_LIMIT)
+		throw new Error(`Fixture request limit must be an integer from 1 to ${QA_MAX_REQUEST_LIMIT}`);
 	const providerToken = crypto.randomUUID();
 	const records: FixtureRequestRecord[] = [];
 	const titleRecords: FixtureRequestRecord[] = [];
 	const held = new Map<number, () => void>();
-	let holdNext = true;
+	let holdNext = options.initialHold ?? true;
 	let writes = Promise.resolve();
 	let writeError: unknown;
 	const encoder = new TextEncoder();
@@ -675,6 +693,7 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 		baseUrl,
 		models: QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`),
 		holdNext,
+		requestLimit: limit,
 		requests: structuredClone(records),
 		titleRequests: structuredClone(titleRecords),
 	});
@@ -706,7 +725,7 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 				request.headers.get("X-Desktop-QA-Fixture") !== providerToken
 			)
 				return new Response("Forbidden fixture request", { status: 403 });
-			if (records.length >= 64 && titleRecords.length >= 64)
+			if (records.length >= limit && titleRecords.length >= limit)
 				return new Response("Fixture request limit", { status: 429 });
 			let body: Record<string, unknown>;
 			try {
@@ -720,7 +739,7 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 			}
 			const title = isTitleRequest(body);
 			const collection = title ? titleRecords : records;
-			if (collection.length >= 64) return new Response("Fixture request limit", { status: 429 });
+			if (collection.length >= limit) return new Response("Fixture request limit", { status: 429 });
 			// Title transactions offer only set_title, so a marker in the prompt they quote is ignored.
 			let toolCalls: FixtureToolCall[] | null = null;
 			let refusal: string | undefined;

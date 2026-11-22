@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { DesktopFrame, DesktopMethod, DesktopSession, DesktopSnapshot } from "@gajae-code/desktop-host/protocol";
 import type { FixtureSessionObservation, FixtureSnapshot } from "../scripts/qa-model-fixture";
@@ -7,7 +9,9 @@ interface WrapperConfig {
 	serverUrl: string;
 	token: string;
 	bootstrapUrl: string;
-	modelFixture: { dataDir: string };
+	lifetimeMinutes: number;
+	expiresAt: string;
+	modelFixture: { dataDir: string; initialHold: boolean; requestLimit: number };
 }
 
 interface HostStatus {
@@ -28,11 +32,12 @@ async function waitFor(predicate: () => boolean, label: string) {
 	}
 }
 
-async function wrapper() {
-	const root = path.resolve(import.meta.dir, "../../..");
+const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+
+async function wrapper(env: Record<string, string> = {}) {
 	const child = Bun.spawn([process.execPath, "packages/desktop/scripts/host-ui-qa.ts"], {
-		cwd: root,
-		env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GJC_DESKTOP_QA_MODEL_FIXTURE: "1" },
+		cwd: repositoryRoot,
+		env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GJC_DESKTOP_QA_MODEL_FIXTURE: "1", ...env },
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -147,6 +152,82 @@ async function wrapper() {
 		throw error;
 	}
 }
+
+test("invalid or misplaced run controls are refused before any state exists", async () => {
+	const cases: Array<[Record<string, string>, string]> = [
+		[{ GJC_DESKTOP_QA_LIFETIME_MINUTES: "0" }, "GJC_DESKTOP_QA_LIFETIME_MINUTES must be an integer from 1 to 240"],
+		[{ GJC_DESKTOP_QA_LIFETIME_MINUTES: "241" }, "from 1 to 240"],
+		[{ GJC_DESKTOP_QA_LIFETIME_MINUTES: "1e2" }, "from 1 to 240"],
+		[{ GJC_DESKTOP_QA_INITIAL_HOLD: "false" }, "GJC_DESKTOP_QA_INITIAL_HOLD must be 0 or 1"],
+		[{ GJC_DESKTOP_QA_REQUEST_LIMIT: "513" }, "GJC_DESKTOP_QA_REQUEST_LIMIT must be an integer from 1 to 512"],
+		[
+			{ GJC_DESKTOP_QA_MODEL_FIXTURE: "", GJC_DESKTOP_QA_INITIAL_HOLD: "0" },
+			"require GJC_DESKTOP_QA_MODEL_FIXTURE=1",
+		],
+		[
+			{ GJC_DESKTOP_QA_MODEL_FIXTURE: "", GJC_DESKTOP_QA_REQUEST_LIMIT: "100" },
+			"require GJC_DESKTOP_QA_MODEL_FIXTURE=1",
+		],
+	];
+	const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-qa-refusal-")));
+	try {
+		for (const [env, message] of cases) {
+			const child = Bun.spawn([process.execPath, "packages/desktop/scripts/host-ui-qa.ts"], {
+				cwd: repositoryRoot,
+				env: {
+					PATH: process.env.PATH ?? "/usr/bin:/bin",
+					GJC_DESKTOP_QA_MODEL_FIXTURE: "1",
+					TMPDIR: scratch,
+					...env,
+				},
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [code, stdout, stderr] = await Promise.all([
+				child.exited,
+				Bun.readableStreamToText(child.stdout),
+				Bun.readableStreamToText(child.stderr),
+			]);
+			expect(code).not.toBe(0);
+			expect(stdout).toBe("");
+			expect(stderr).toContain(message);
+			expect(await fs.readdir(scratch)).toEqual([]);
+		}
+	} finally {
+		await fs.rm(scratch, { recursive: true, force: true });
+	}
+}, 45000);
+
+test("an interactive run streams its first prompt at once and reports its run controls", async () => {
+	const started = Date.now();
+	const qa = await wrapper({
+		GJC_DESKTOP_QA_INITIAL_HOLD: "0",
+		GJC_DESKTOP_QA_LIFETIME_MINUTES: "90",
+		GJC_DESKTOP_QA_REQUEST_LIMIT: "200",
+	});
+	try {
+		expect(qa.config.lifetimeMinutes).toBe(90);
+		const expires = Date.parse(qa.config.expiresAt) - started;
+		expect(expires).toBeGreaterThan(89 * 60 * 1000);
+		expect(expires).toBeLessThanOrEqual(90 * 60 * 1000 + 30000);
+		expect(qa.config.modelFixture).toMatchObject({ initialHold: false, requestLimit: 200 });
+		await qa.connect();
+		const snapshot = await qa.call<DesktopSnapshot>("bootstrap");
+		const seeded = snapshot.sessions.find(session => session.title === "Short conversation");
+		if (!seeded) throw new Error("Missing short fixture session");
+		await qa.call("session.select", { sessionId: seeded.id });
+		// Nothing releases this prompt: it must finish on its own.
+		await qa.call("prompt", { sessionId: seeded.id, text: "first prompt without a hold" });
+		const status = (await (await qa.post("/fixture/status", {})).json()) as FixtureSnapshot;
+		expect(status).toMatchObject({ holdNext: false, requestLimit: 200 });
+		expect(status.requests[0]).toMatchObject({ id: 1, state: "completed", held: false, released: false });
+		await qa.call("shutdown");
+		expect(await qa.child.exited).toBe(0);
+	} finally {
+		await qa.close();
+	}
+}, 60000);
 
 test("requested QA shutdown delivers its final frame and exits successfully", async () => {
 	const qa = await wrapper();

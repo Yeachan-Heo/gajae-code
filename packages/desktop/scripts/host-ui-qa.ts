@@ -3,6 +3,13 @@
 // Page.addScriptToEvaluateOnNewDocument `source`, then navigate to the allowed origin.
 // Zero-provider fixture: GJC_DESKTOP_QA_MODEL_FIXTURE=1 bun packages/desktop/scripts/host-ui-qa.ts
 // LIVE=1 is incompatible. Fixture metadata is printed as one JSON bootstrap line.
+// Wrapper-only controls, validated before anything is created and never passed to the Host:
+//   GJC_DESKTOP_QA_LIFETIME_MINUTES=1..240 (default 15) bounds the run; on expiry the bridge
+//     stops the Host and removes the temporary root.
+//   GJC_DESKTOP_QA_INITIAL_HOLD=0 (fixture only; default 1) lets the first completion stream at
+//     once instead of waiting for release(1). hold() still pauses the next completion.
+//   GJC_DESKTOP_QA_REQUEST_LIMIT=1..512 (fixture only; default 64) completions per collection
+//     before the fixture answers 429. A tool turn costs one completion per step plus one.
 // Browser controls: __qaFixture.status(), .hold(), .release(requestId),
 // .gate(sessionId, 'approval'|'question'|'execution'), .gates(sessionId).
 // .hostStatus(sessionId) reads the exact live SDK leaf. .coldRestart(sessionId) SIGKILLs
@@ -26,7 +33,9 @@ import {
 	fixtureLayout,
 	type ModelFixture,
 	observeFixtureSession,
+	QA_DEFAULT_REQUEST_LIMIT,
 	QA_KEY,
+	QA_MAX_REQUEST_LIMIT,
 	QA_MODEL_IDS,
 	QA_PROVIDER,
 	readFixtureGateControl,
@@ -37,6 +46,27 @@ import {
 
 const fixtureMode = process.env.GJC_DESKTOP_QA_MODEL_FIXTURE === "1";
 if (fixtureMode) assertFixtureMode(process.env);
+
+function integerFlag(name: string, fallback: number, min: number, max: number): number {
+	const value = process.env[name];
+	if (value === undefined) return fallback;
+	if (!/^[0-9]{1,4}$/.test(value) || Number(value) < min || Number(value) > max)
+		throw new Error(`${name} must be an integer from ${min} to ${max}`);
+	return Number(value);
+}
+function switchFlag(name: string, fallback: boolean): boolean {
+	const value = process.env[name];
+	if (value === undefined) return fallback;
+	if (value !== "0" && value !== "1") throw new Error(`${name} must be 0 or 1`);
+	return value === "1";
+}
+const lifetimeMinutes = integerFlag("GJC_DESKTOP_QA_LIFETIME_MINUTES", 15, 1, 240);
+const initialHold = switchFlag("GJC_DESKTOP_QA_INITIAL_HOLD", true);
+const requestLimit = integerFlag("GJC_DESKTOP_QA_REQUEST_LIMIT", QA_DEFAULT_REQUEST_LIMIT, 1, QA_MAX_REQUEST_LIMIT);
+if (!fixtureMode && (!initialHold || requestLimit !== QA_DEFAULT_REQUEST_LIMIT))
+	throw new Error(
+		"GJC_DESKTOP_QA_INITIAL_HOLD and GJC_DESKTOP_QA_REQUEST_LIMIT require GJC_DESKTOP_QA_MODEL_FIXTURE=1",
+	);
 
 const uiOrigin = new URL(process.env.GJC_DESKTOP_QA_UI_ORIGIN ?? "http://127.0.0.1:1420");
 if (
@@ -412,7 +442,7 @@ try {
 	};
 	if (fixtureMode) {
 		const layout = fixtureLayout(temporary);
-		fixture = startModelFixture(layout.artifactPath);
+		fixture = startModelFixture(layout.artifactPath, { initialHold, requestLimit });
 		await seedFixture(layout, fixture.baseUrl, fixture.providerToken);
 	}
 	const ownedRoot = temporary;
@@ -752,12 +782,10 @@ try {
 	heartbeat = setInterval(() => {
 		for (const controller of clients.values()) controller.enqueue(encoder.encode(": heartbeat\n\n"));
 	}, 15000);
-	timer = setTimeout(
-		() => {
-			void cleanup();
-		},
-		15 * 60 * 1000,
-	);
+	const lifetimeMs = lifetimeMinutes * 60 * 1000;
+	timer = setTimeout(() => {
+		void cleanup();
+	}, lifetimeMs);
 	process.once("SIGTERM", () => {
 		void cleanup();
 	});
@@ -772,6 +800,8 @@ try {
 			bootstrapUrl: `http://127.0.0.1:${server.port}/bootstrap.js?token=${token}`,
 			pid: process.pid,
 			project,
+			lifetimeMinutes,
+			expiresAt: new Date(Date.now() + lifetimeMs).toISOString(),
 			...(fixture
 				? {
 						mode: "test-only-model-fixture",
@@ -791,7 +821,11 @@ try {
 								hostStatus: "/fixture/host-status",
 								coldRestart: "/fixture/cold-restart",
 							},
-							initialHold: "first completion pauses after initial SSE text until release(requestId) or abort",
+							initialHold,
+							holdBehavior: initialHold
+								? "the first completion pauses after its initial SSE text until release(requestId) or abort; hold() arms the next one"
+								: "completions stream to the end; hold() pauses the next completion until release(requestId)",
+							requestLimit,
 						},
 					}
 				: {}),

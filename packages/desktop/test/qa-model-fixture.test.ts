@@ -22,6 +22,7 @@ import {
 	fixtureEnvironment,
 	fixtureFetch,
 	fixtureLayout,
+	type ModelFixtureOptions,
 	observeFixtureSession,
 	QA_KEY,
 	QA_PROVIDER,
@@ -44,10 +45,10 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	}
 }
 
-async function ownedFixture() {
+async function ownedFixture(options: ModelFixtureOptions = {}) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-ui-qa-")));
 	const layout = fixtureLayout(root);
-	const fixture = startModelFixture(layout.artifactPath);
+	const fixture = startModelFixture(layout.artifactPath, options);
 	cleanups.push(async () => {
 		try {
 			await fixture.close();
@@ -868,6 +869,33 @@ describe("deterministic loopback SSE", () => {
 		expect(fixture.snapshot().requests[1]).toMatchObject({ state: "held", held: true });
 		expect(fixture.release(2)).toBe(true);
 		expect(await next.text()).not.toContain("reasoning_content");
+	});
+
+	test("an interactive run can skip the initial hold and still arm one later", async () => {
+		const { fixture } = await ownedFixture({ initialHold: false });
+		expect(fixture.snapshot()).toMatchObject({ holdNext: false, requestLimit: 64 });
+		const first = await completion(fixture.baseUrl, fixture.providerToken);
+		expect(await first.text()).toContain("Fixture turn 1 complete.");
+		expect(fixture.snapshot().requests[0]).toMatchObject({ state: "completed", held: false, released: false });
+		fixture.holdNext();
+		const second = await completion(fixture.baseUrl, fixture.providerToken);
+		expect(fixture.snapshot().requests[1]).toMatchObject({ state: "held", held: true });
+		expect(fixture.release(2)).toBe(true);
+		expect(await second.text()).toContain("Fixture turn 2 complete.");
+	});
+
+	test("the completion cap is configurable within bounds", async () => {
+		for (const requestLimit of [0, 513, 1.5, Number.NaN])
+			expect(() => startModelFixture(path.join(os.tmpdir(), "never-written.json"), { requestLimit })).toThrow(
+				"request limit must be an integer from 1 to 512",
+			);
+		const { fixture } = await ownedFixture({ initialHold: false, requestLimit: 2 });
+		for (const id of [1, 2]) {
+			const response = await completion(fixture.baseUrl, fixture.providerToken);
+			expect(await response.text()).toContain(`Fixture turn ${id} complete.`);
+		}
+		expect((await completion(fixture.baseUrl, fixture.providerToken)).status).toBe(429);
+		expect(fixture.snapshot()).toMatchObject({ requestLimit: 2, requests: [{ id: 1 }, { id: 2 }] });
 	});
 
 	test("provider route refuses browser origins, bad auth, unknown models and non-completion routes", async () => {
