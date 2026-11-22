@@ -132,6 +132,14 @@ function controlledAgent() {
 	};
 }
 
+/** The visible text of a transcript message, for asserting what actually reached the conversation. */
+const copyText = (message: AgentSession["messages"][number]): string =>
+	!("content" in message)
+		? ""
+		: typeof message.content === "string"
+			? message.content
+			: message.content.map(block => (block.type === "text" ? block.text : "")).join("");
+
 describe("desktop streaming lifecycle", () => {
 	let environment: NodeJS.ProcessEnv;
 	let previousAgentDir: string;
@@ -466,6 +474,53 @@ describe("desktop streaming lifecycle", () => {
 		expect((await snapshot()).deliveries).toContainEqual(
 			expect.objectContaining({ id: "closed-run", disposition: "unknown" }),
 		);
+	});
+
+	test("Stop leaves the conversation idle and keeps a follow-up the agent queued for the next turn", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-with-agent-follow-up");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		// Monitor and cron notifications reach a streaming run as agent follow-ups that trigger a turn.
+		await sdk.sendCustomMessage(
+			{ customType: "task-notification", content: "monitor fired", display: false, attribution: "agent" },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		expect(sdk.agent.hasQueuedMessages()).toBe(true);
+		await call("abort", { sessionId: session.id });
+		// Stop settles the stopped prompt's own request instead of handing the session to a new turn.
+		expect(await Promise.race([running.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe(
+			"settled",
+		);
+		// A resumed turn would start about a millisecond after the abort returns.
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(sdk.isStreaming).toBe(false);
+		const state = await snapshot();
+		expect(state.sessions[0]?.status).toBe("done");
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-with-agent-follow-up", disposition: "cancelled" }),
+		);
+		// The notification is not lost: it waits in the queue and follows the next turn.
+		expect(sdk.agent.hasQueuedMessages()).toBe(true);
+		const next = call("prompt", { sessionId: session.id, text: "next" }, "after-stop");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		control.finishTurn("answered");
+		for (let i = 0; i < 400 && control.prompts.length < 3; i++) await Bun.sleep(5);
+		expect(control.prompts).toHaveLength(3);
+		control.finishTurn("notification handled");
+		await next;
+		const delivered = sdk.messages.findIndex(
+			message => message.role === "custom" && message.customType === "task-notification",
+		);
+		const nextPrompt = sdk.messages.findIndex(message => message.role === "user" && copyText(message) === "next");
+		expect(nextPrompt).toBeGreaterThan(-1);
+		expect(delivered).toBeGreaterThan(nextPrompt);
+		expect(sdk.agent.hasQueuedMessages()).toBe(false);
 	});
 
 	test("invalid prompt reports a definitive refusal before admission", async () => {

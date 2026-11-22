@@ -2736,8 +2736,10 @@ export class DesktopHost {
 			for (const tracked of live.queued.values()) {
 				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			}
-			// The TUI's Esc cause: this is the user's interrupt, not a Host teardown.
-			await live.sdk.abort({ cause: "user_interrupt" });
+			// Stop means stop: the default cause ends the run and leaves anything still queued, including
+			// agent follow-ups, for the next turn. The TUI's `user_interrupt` would resume into them at
+			// once. Outcomes are classified from `stopRequests`, not from the cause.
+			await live.sdk.abort();
 			this.#publish(live);
 			return null;
 		}
