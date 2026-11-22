@@ -393,13 +393,15 @@ export function projectLiveToolCalls(
 					? "running"
 					: "waiting";
 			const tail = status === "running" ? liveTail(live?.tail, redact) : undefined;
+			const tool = projectToolCall({ callId: call.id, toolName: call.name, call, status, detail: true }, redact);
 			rows.push({
-				id: `call:${call.id}`,
+				// The redacted id, like `tool.callId`: a row id is display data too.
+				id: `call:${tool.callId}`,
 				role: "tool",
 				toolName: redactedHead(call.name, 100, redact) ?? "",
 				text: tail?.text ?? "",
 				...(tail?.truncated ? { truncated: true } : {}),
-				tool: projectToolCall({ callId: call.id, toolName: call.name, call, status, detail: true }, redact),
+				tool,
 			});
 		}
 		return rows;

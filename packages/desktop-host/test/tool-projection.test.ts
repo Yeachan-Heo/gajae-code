@@ -341,6 +341,12 @@ describe("live tool rows", () => {
 		]);
 		const [row] = projectLiveToolCalls(session, undefined, redact);
 		expect(row?.tool?.subject).toBe("$ curl -H [redacted] host");
+		const [secretId] = projectLiveToolCalls(
+			fakeSession([{ role: "user", content: "go" }, assistantCalls(["id-token-123", "read", { path: "a" }])]),
+			undefined,
+			redact,
+		);
+		expect([secretId?.id, secretId?.tool?.callId]).toEqual(["call:id-[redacted]", "id-[redacted]"]);
 		expect(JSON.stringify(row)).not.toContain("env-secret");
 		expect(JSON.stringify(row)).not.toContain("token-123");
 	});
