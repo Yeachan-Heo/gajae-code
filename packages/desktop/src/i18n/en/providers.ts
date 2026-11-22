@@ -137,7 +137,7 @@ export const providers = {
 	"providers.showcaseNoticeLocal": "Design example only: nothing was sent.",
 	"providers.showcaseOpenDialog": "Open in a native dialog",
 	"providers.showcaseWideHeading": "Dialog width",
-	"providers.showcaseNarrowHeading": "Narrow container · 390px",
+	"providers.showcaseNarrowHeading": "Dialog in a 390px window",
 	"providers.showcaseSummaryHeading": "Settings → Account summary · with models and without",
 	"providers.showcaseNameReady": "Design example cloud",
 	"providers.showcaseNameSubscription": "Design example subscription",
@@ -160,5 +160,5 @@ export const providers = {
 		"Design example only: the app shows this notice while it is connected and no model is available. Its button is local here. Check 200% text with the browser's text zoom.",
 	"providers.showcaseOnboardingDock": "Docked below the empty state",
 	"providers.showcaseOnboardingComposer": "Above the composer",
-	"providers.showcaseOnboardingNarrow": "Narrow container · 390px",
+	"providers.showcaseOnboardingNarrow": "In a 390px window",
 } as const;

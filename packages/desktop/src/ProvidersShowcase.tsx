@@ -349,7 +349,7 @@ function FixtureOnboarding() {
 				<Composer value="" onChange={() => {}} onSend={connect} onStop={connect} busy={false} disabled />
 			</div>
 			<h3>{t("providers.showcaseOnboardingNarrow")}</h3>
-			<div style={{ maxWidth: 390 }}>
+			<div className="providers-showcase-narrow-notice">
 				<ProviderOnboardingNotice onConnect={connect} />
 			</div>
 		</>

@@ -925,6 +925,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .providers-dialog { width: min(640px, calc(100vw - 32px)); }
 /* The dialog's generic section/form rhythm must not stack on the panel's own grid. */
 .providers-panel { display: grid; gap: 0.75rem; min-width: 0; }
+/* The panel is the query container for its narrow layout (end of this section), so the dialog in a
+   narrow window and the showcase's narrow frame lay out alike. */
+.providers-panel { container: providers-panel / inline-size; }
 /* Error words mix the error hue toward the body ink, so they clear 4.5:1 on the card, a hovered row
    and inset surfaces in every bundled palette; dots and icons keep the pure hue. */
 .providers-panel { --provider-error-ink: color-mix(in srgb, var(--status-error) 60%, var(--text)); }
@@ -1027,7 +1030,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .providers-summary-empty { display: flex; align-items: center; gap: 0.375rem; color: var(--status-waiting); }
 .providers-summary-empty > svg { flex: none; width: 1rem; height: 1rem; }
 .providers-showcase-frame { max-width: 640px; min-width: 0; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); }
-.providers-showcase-frame[data-narrow] { max-width: 390px; }
+/* The Providers dialog in a 390px window: its width there (the UA's dialog max-width, 100% - 6px - 2em,
+   under the dialog's own 100vw - 32px), its 16px narrow padding and the content's 4px. */
+.providers-showcase-frame[data-narrow] { max-width: min(358px, calc(384px - 2em)); padding: 20px; }
 .providers-showcase-column { display: flex; flex-direction: column; min-height: 22rem; border: 1px dashed var(--border-soft); border-radius: var(--radius-lg); }
 @media (max-width: 759px) {
 	.provider-notice-dock { padding: 8px 12px 16px; }
@@ -1040,10 +1045,18 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 	.provider-notice-main { flex-basis: auto; }
 	.provider-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 }
-@media (max-width: 480px) {
+/* 404px is the panel's width in the dialog of a 480px window at the default text size. */
+@container providers-panel (max-width: 404px) {
 	.provider-row-meta { margin-left: 0; align-items: flex-start; }
 	.provider-methods { justify-content: flex-start; }
 	.provider-field-row { flex-wrap: wrap; }
-	.providers-panel .provider-actions > .button, .provider-field-row > .button, .provider-browser > .button,
+	.provider-actions > .button, .provider-field-row > .button, .provider-browser > .button { flex: 1 1 100%; width: 100%; }
+}
+@media (max-width: 480px) {
 	.provider-notice-action { flex: 1 1 100%; width: 100%; }
 }
+/* Showcase only: the notice as a 390px window shows it, in a column that is the window less the 64px
+   sidebar rail and 12px of padding each side; the narrow rule above keys off the window, so it is
+   repeated for this frame. */
+.providers-showcase-narrow-notice { max-width: 302px; }
+.providers-showcase-narrow-notice .provider-notice-action { flex: 1 1 100%; width: 100%; }

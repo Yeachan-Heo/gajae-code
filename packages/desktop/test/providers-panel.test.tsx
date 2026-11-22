@@ -638,7 +638,18 @@ suite("Providers panel interactions", () => {
 				await page.$$eval("#showcase-provider-onboarding .provider-notice", nodes =>
 					nodes.map(node => node.parentElement?.className),
 				),
-			).toEqual(["provider-notice-dock", "composer-area", ""]);
+			).toEqual(["provider-notice-dock", "composer-area", "providers-showcase-narrow-notice"]);
+			// The narrow onboarding frame is as wide as the notice in a 390 px window, and lays out as there.
+			expect(
+				await page.$eval(".providers-showcase-narrow-notice .provider-notice", notice => {
+					const button = notice.querySelector(".provider-notice-action")!.getBoundingClientRect();
+					const main = notice.querySelector(".provider-notice-main")!.getBoundingClientRect();
+					return {
+						width: Math.round(notice.getBoundingClientRect().width),
+						fullWidthButton: Math.round(button.width) === Math.round(main.width),
+					};
+				}),
+			).toEqual({ width: 302, fullWidthButton: true });
 			expect(errors).toEqual([]);
 		} finally {
 			await context.close();
@@ -804,6 +815,42 @@ suite("Providers panel interactions", () => {
 					if (sample.ratio < 4.5) failures.push(`${theme} · "${sample.text}": ${sample.ratio}`);
 			}
 			expect(failures).toEqual([]);
+		} finally {
+			await context.close();
+		}
+	}, 60000);
+
+	test("the narrow layout follows the panel's width: the dialog in a 480 px window and the showcase's narrow frame", async () => {
+		const narrowLayout = (page: Page, scope: string) =>
+			page.$eval(`${scope} .providers-panel`, panel => ({
+				width: Math.round(panel.getBoundingClientRect().width),
+				narrow: getComputedStyle(panel.querySelector(".provider-row-meta")!).alignItems === "flex-start",
+			}));
+		const dialogPanel: Record<number, { width: number; narrow: boolean }> = {};
+		for (const width of [390, 480, 481]) {
+			const { context, page } = await fixture(width, { dialog: true });
+			try {
+				dialogPanel[width] = await narrowLayout(page, "dialog");
+			} finally {
+				await closeComponentFixture(context, page);
+			}
+		}
+		expect(dialogPanel[390]!.narrow).toBe(true);
+		expect(dialogPanel[480]!.narrow).toBe(true);
+		expect(dialogPanel[481]!.narrow).toBe(false);
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-providers .provider-row");
+			// The narrow frame shows what a 390 px window shows: the same panel width and layout.
+			expect(await narrowLayout(page, "#showcase-providers .providers-showcase-frame[data-narrow]")).toEqual(
+				dialogPanel[390],
+			);
+			expect(
+				(await narrowLayout(page, "#showcase-providers .providers-showcase-frame:not([data-narrow])")).narrow,
+			).toBe(false);
 		} finally {
 			await context.close();
 		}
