@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DesktopAuthProvider, DesktopModel, DesktopRequest } from "@gajae-code/desktop-host/protocol";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import { FONT_SIZE_STORAGE_KEY } from "../src/themes";
 import { browserPath } from "./component-fixture";
 import { installNavigationFixture, type NavigationFixtureOptions } from "./fixtures/navigation";
 
@@ -57,6 +58,9 @@ interface Launch {
 	/** Hold every `models.list` request so the test answers it (the conversation catalog). */
 	holdModelLists?: boolean;
 	options?: NavigationFixtureOptions;
+	viewport?: { width: number; height: number };
+	/** The reader's text size, stored before launch as Settings stores it. */
+	fontSize?: number;
 }
 
 /** The mounted App on the page-owned navigation transport, by default in its zero-model state. */
@@ -64,7 +68,13 @@ async function fixture(launch: Launch = {}): Promise<{ context: BrowserContext; 
 	const context = await browser.createBrowserContext();
 	try {
 		const page = await context.newPage();
-		await page.setViewport({ width: 1400, height: 900 });
+		await page.setViewport(launch.viewport ?? { width: 1400, height: 900 });
+		if (launch.fontSize)
+			await page.evaluateOnNewDocument(
+				(key, size) => localStorage.setItem(key, size),
+				FONT_SIZE_STORAGE_KEY,
+				String(launch.fontSize),
+			);
 		await page.evaluateOnNewDocument(installNavigationFixture, launch.holdBootstrap === true, {
 			zeroModels: true,
 			providers,
@@ -136,6 +146,19 @@ function resnapshot(): void {
 async function noticeSeenAboveComposer(page: Page): Promise<boolean> {
 	return page.evaluate(() => (window as unknown as { noticeAboveComposerSeen: boolean }).noticeAboveComposerSeen);
 }
+/** Where the notice's icon and button sit relative to its text, and its height. */
+async function noticeLayout(page: Page, selector: string) {
+	return page.$eval(selector, notice => {
+		const icon = notice.querySelector(".provider-notice-icon")!.getBoundingClientRect();
+		const text = notice.querySelector(".provider-notice-text")!.getBoundingClientRect();
+		const button = notice.querySelector(".provider-notice-action")!.getBoundingClientRect();
+		return {
+			iconBesideText: icon.right <= text.left && icon.top < text.bottom && icon.bottom > text.top,
+			buttonBesideText: button.left >= text.right && button.top < text.bottom && button.bottom > text.top,
+			height: Math.round(notice.getBoundingClientRect().height),
+		};
+	});
+}
 async function composerStatus(page: Page): Promise<string[]> {
 	return page.$$eval(
 		".composer .model-control-status, .composer .model-controls > .button:not(.model-trigger)",
@@ -179,6 +202,28 @@ suite("Zero-model onboarding notice", () => {
 			await context.close();
 		}
 	}, 30000);
+
+	for (const { viewport, fontSize, buttonBesideText } of [
+		{ viewport: { width: 390, height: 844 }, fontSize: 14, buttonBesideText: false },
+		{ viewport: { width: 720, height: 520 }, fontSize: 20, buttonBesideText: true },
+	]) {
+		test(`lays out the same docked and above the composer at ${viewport.width}x${viewport.height} with ${fontSize}px text`, async () => {
+			const { context, page } = await fixture({ viewport, fontSize });
+			try {
+				await page.waitForSelector(DOCKED);
+				const docked = await noticeLayout(page, DOCKED);
+				await select(page, "Oldest conversation · Idle");
+				await page.waitForSelector(ABOVE_COMPOSER);
+				const above = await noticeLayout(page, ABOVE_COMPOSER);
+				// The icon never drops onto a line of its own, and the button stays beside the text when it fits.
+				expect(docked).toMatchObject({ iconBesideText: true, buttonBesideText });
+				expect(above).toMatchObject({ iconBesideText: true, buttonBesideText });
+				expect(Math.abs(docked.height - above.height)).toBeLessThanOrEqual(1);
+			} finally {
+				await context.close();
+			}
+		}, 30000);
+	}
 
 	test("never shows while bootstrapping or after a fatal error", async () => {
 		const { context, page } = await fixture({ holdBootstrap: true });

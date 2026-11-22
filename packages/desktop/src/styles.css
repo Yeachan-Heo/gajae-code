@@ -1008,8 +1008,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-prompt { display: grid; gap: 0.375rem; }
 /* The zero-model guide: the waiting hue marks a missing prerequisite, not a failure. */
 .provider-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; max-width: 800px; min-width: 0; margin: 0 auto 8px; padding: 0.75rem 0.875rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
+/* Icon and text are one flex item: the button wraps below them, never the icon. */
+.provider-notice-main { flex: 1 1 16rem; min-width: 0; display: flex; align-items: center; gap: 0.75rem; }
 .provider-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; color: var(--status-waiting); }
-.provider-notice-text { flex: 1 1 16rem; min-width: 0; display: grid; gap: 2px; }
+.provider-notice-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; }
 .provider-notice-text > span { font-size: 0.8125rem; }
 .provider-notice-action { flex: none; margin-left: auto; }
 /* Below the empty state, which takes the free space, so the notice lands at the column's bottom. */
@@ -1028,6 +1030,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
    explanation stays available to assistive technology. */
 @media (max-height: 640px) {
 	.provider-notice { padding: 0.5rem 0.75rem; }
+	/* Only the title shows, so the text asks for its own width and the button stays beside it whenever both fit. */
+	.provider-notice-main { flex-basis: auto; }
 	.provider-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 }
 @media (max-width: 480px) {

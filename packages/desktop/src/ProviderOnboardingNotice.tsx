@@ -18,10 +18,13 @@ export function ProviderOnboardingNotice({ onConnect }: { onConnect(): void }) {
 	const titleId = useId();
 	return (
 		<div className="provider-notice" role="status" aria-labelledby={titleId}>
-			<TriangleAlert className="provider-notice-icon" aria-hidden="true" />
-			<div className="provider-notice-text">
-				<strong id={titleId}>{t("providers.noticeTitle")}</strong>
-				<span>{t("providers.noticeBody")}</span>
+			{/* Icon and text wrap as one unit, so the icon never lands on a line of its own. */}
+			<div className="provider-notice-main">
+				<TriangleAlert className="provider-notice-icon" aria-hidden="true" />
+				<div className="provider-notice-text">
+					<strong id={titleId}>{t("providers.noticeTitle")}</strong>
+					<span>{t("providers.noticeBody")}</span>
+				</div>
 			</div>
 			<Button className="primary provider-notice-action" onClick={onConnect}>
 				{t("providers.noticeAction")}
