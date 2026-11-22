@@ -953,9 +953,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-load-error > .error-banner { justify-self: stretch; margin: 0; }
 .provider-list { display: grid; gap: 0.75rem; max-height: 52dvh; overflow: auto; overscroll-behavior: contain; padding: 4px; }
 /* The list step pins search, the summary line and the footnote; only the list scrolls, and it gives
-   up its height first, as the Tools dialog's list does. The detail step scrolls as one in the
-   dialog's content. */
-.modal-content:has(> .providers-panel[data-step="list"]) { display: flex; flex-direction: column; overflow: hidden; }
+   up its height first, as the Tools dialog's list does. Only if the pinned parts alone cannot fit
+   does the dialog's content scroll, as it does for the whole detail step. */
+.modal-content:has(> .providers-panel[data-step="list"]) { display: flex; flex-direction: column; }
 .providers-panel[data-step="list"] { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
 .providers-panel[data-step="list"] > * { flex: none; }
 .providers-panel[data-step="list"] > .provider-list { flex: 0 1 auto; min-height: 0; }

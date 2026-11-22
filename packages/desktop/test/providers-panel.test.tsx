@@ -1020,9 +1020,11 @@ suite("Providers panel interactions", () => {
 			for (const step of ["list", "detail"] as const) {
 				await select(page, step === "list" ? null : "beta");
 				await page.waitForSelector(`.providers-panel[data-step="${step}"]`);
+				// 28 px is past the Settings range (200% of the default), where the reviewer also looks.
 				for (const [width, height, text] of [
 					[720, 520, 14],
 					[720, 520, 20],
+					[720, 520, 28],
 					[390, 844, 14],
 					[390, 844, 20],
 				] as const) {
@@ -1056,6 +1058,7 @@ suite("Providers panel interactions", () => {
 			expect(layouts).toMatchObject({
 				"list 720x520@14": list,
 				"list 720x520@20": list,
+				"list 720x520@28": list,
 				"list 390x844@14": list,
 				"list 390x844@20": list,
 			});
