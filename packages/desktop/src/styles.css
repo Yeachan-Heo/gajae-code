@@ -1086,3 +1086,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
    repeated for this frame. */
 .providers-showcase-narrow-notice { max-width: 302px; }
 .providers-showcase-narrow-notice .provider-notice-action { flex: 1 1 100%; width: 100%; }
+/* Section S: session connection and recovery labels (RecoveryConversation.tsx). */
+/* A recovery card names its conversation; Open or Copy sits on the same line when it fits. */
+.recovery-conversation { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; margin: 0.25rem 0 0.5rem; }
+.recovery-conversation-name { margin: 0; min-width: 0; color: var(--text); font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-conversation-hint { flex-basis: 100%; margin: 0; word-break: keep-all; overflow-wrap: anywhere; }
+/* Showcase only: the narrow state's column. */
+.showcase-session-narrow { max-width: 20rem; }

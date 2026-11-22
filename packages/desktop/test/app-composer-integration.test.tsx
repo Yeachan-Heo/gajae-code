@@ -277,7 +277,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					request.method === "project.reorder" ||
 					request.method === "session.reorder" ||
 					request.method === "session.rename" ||
-					request.method === "session.revision"
+					request.method === "session.revision" ||
+					request.method === "session.delete"
 				)
 					result = null;
 				if (request.method === "delivery.ack") {
@@ -3597,6 +3598,89 @@ suite("mounted composer delivery recovery", () => {
 			await page.evaluate(() => [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Discard restored record"))?.click());
 			await page.waitForFunction(() => !document.body.textContent?.includes("Delivery recovery:"));
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("unknown disposable");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a recovery card names its conversation and opens it from the empty screen", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); await send(page, "named payload");
+			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
+			await page.reload();
+			await page.waitForSelector(".recovery-conversation");
+			expect(await page.$eval(".recovery-conversation", el => el.textContent)).toContain("Session A");
+			// The conversation is still listed: its draft can be restored there, so nothing offers a copy.
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent === "Copy text"))).toBe(false);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".recovery-conversation button")].find(button => button.textContent === "Open conversation")?.click());
+			await page.waitForFunction(() => document.querySelector(".desktop-sidebar .session-select[aria-current='page'] .session-title")?.textContent === "Session A");
+			// Under its own open conversation the card still names it but offers no way to open it again.
+			expect(await page.$eval(".recovery-conversation", el => el.textContent)).toContain("Session A");
+			expect(await page.evaluate(() => [...document.querySelectorAll(".recovery-conversation button")].some(button => button.textContent === "Open conversation"))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a recovery card whose conversation is gone offers its text and can be discarded without restoring", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					open.onsuccess = () => resolve(open.result);
+					open.onerror = () => reject(open.error);
+				});
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction("deliveries", "readwrite");
+					tx.objectStore("deliveries").put({ id: "orphan-delivery", sessionId: "gone", title: "Old chat", text: "orphaned prompt text", attachments: [], disposition: "accepted" });
+					tx.oncomplete = () => resolve();
+					tx.onerror = () => reject(tx.error);
+				});
+				db.close();
+			});
+			await page.reload();
+			await page.waitForSelector(".recovery-conversation");
+			const card = await page.$eval(".recovery-conversation", el => el.textContent);
+			expect(card).toContain("Old chat");
+			expect(card).toContain("no longer in the conversation list");
+			// No draft can be restored into a conversation that is not listed.
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent?.includes("Restore draft")))).toBe(false);
+			await installResponseClipboard(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".recovery-conversation button")].find(button => button.textContent === "Copy text")?.click());
+			await page.waitForFunction(() => window.responseClipboard.commits.length === 1);
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["orphaned prompt text"]);
+			expect(await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("Discard"))?.disabled)).toBe(false);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("Discard"))?.click());
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === "orphan-delivery"));
+			await page.waitForFunction(() => !document.querySelector(".recovery-conversation"));
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("deleting a conversation drops its recovery records", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); await send(page, "deleted with its conversation");
+			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "disconnected" }));
+			await page.reload(); await select(page);
+			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes("the outcome is unknown")));
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".command-list button")].find(button => button.textContent?.includes("Delete"))?.click());
+			await page.waitForSelector(".delete-confirmation");
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".modal button.danger")].find(button => button.textContent?.includes("Delete"))?.click());
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "session.delete"));
+			await page.waitForFunction(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					open.onsuccess = () => resolve(open.result);
+					open.onerror = () => reject(open.error);
+				});
+				const entries = await new Promise<unknown[]>((resolve, reject) => {
+					const request = db.transaction("deliveries").objectStore("deliveries").getAll();
+					request.onsuccess = () => resolve(request.result);
+					request.onerror = () => reject(request.error);
+				});
+				db.close();
+				return entries.length === 0;
+			});
+			expect(await page.evaluate(() => document.body.textContent?.includes("the outcome is unknown"))).toBe(false);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 

@@ -5,6 +5,8 @@ import { t } from "./i18n";
 export interface DeliveryRecovery {
 	id: string;
 	sessionId: string;
+	/** The conversation's title when the prompt was sent; names the card once the row is gone. */
+	title?: string;
 	text: string;
 	attachments: DesktopAttachmentDraft[];
 	disposition: DesktopDeliveryReceipt["disposition"];

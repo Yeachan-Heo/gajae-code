@@ -37,6 +37,7 @@ import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
 import { SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
+import { ShowcaseSession, ShowcaseSessionNav } from "./ShowcaseSession";
 import { ShowcaseTodo, ShowcaseTodoNav } from "./ShowcaseTodo";
 import { ShowcaseToolCalls, ShowcaseToolCallsNav } from "./ShowcaseToolCalls";
 import { ShowcaseToolCatalog, ShowcaseToolCatalogNav } from "./ShowcaseToolCatalog";
@@ -1397,6 +1398,7 @@ export default function Showcase() {
 					<ShowcaseTodoNav />
 					<ShowcaseToolCatalogNav />
 					<ProvidersShowcaseNav />
+					<ShowcaseSessionNav />
 				</nav>
 			</header>
 			<section id="showcase-sessions">
@@ -1832,6 +1834,7 @@ export default function Showcase() {
 			<ShowcaseTodo />
 			<ShowcaseToolCatalog />
 			<ProvidersShowcase />
+			<ShowcaseSession />
 			<p className="showcase-result" role="status">
 				{answer || t("showcase.answerIdle")}
 			</p>

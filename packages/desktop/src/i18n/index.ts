@@ -13,6 +13,7 @@ import { catalog } from "./en/catalog";
 import { models } from "./en/models";
 import { panels } from "./en/panels";
 import { providers } from "./en/providers";
+import { recovery } from "./en/recovery";
 import { settings } from "./en/settings";
 import { shell } from "./en/shell";
 import { showcase } from "./en/showcase";
@@ -37,6 +38,7 @@ const english = {
 	...todo,
 	...catalog,
 	...providers,
+	...recovery,
 };
 
 export type MessageKey = keyof typeof english;

@@ -120,6 +120,7 @@ import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboa
 import { ProvidersDialog } from "./ProvidersDialog";
 import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
+import { RecoveryConversation } from "./RecoveryConversation";
 import { Select } from "./Select";
 import { SessionHudPanel } from "./SessionHudPanel";
 import { hasSessionWorkContent, SessionWorkPanel } from "./SessionWorkPanel";
@@ -496,6 +497,16 @@ export default function App() {
 		},
 		[updateRecoveries, enqueueRecovery],
 	);
+	/** The Host already forgot a deleted conversation's receipts; its local records go with it. */
+	const dropRecoveries = (sessionId: string) =>
+		enqueueRecovery(async () => {
+			for (const entry of recoveriesRef.current.filter(item => item.sessionId === sessionId)) {
+				await deleteDelivery(entry.id);
+				restorationFailures.current.delete(entry.id);
+				if (unsentRepairs.current.has(entry.id)) finishUnsentRepair(entry.id, sessionId);
+				updateRecoveries(recoveriesRef.current.filter(item => item.id !== entry.id));
+			}
+		});
 	const reconcileReceipt = useCallback(
 		async (receipt: DesktopDeliveryReceipt) => {
 			const entry = recoveriesRef.current.find(
@@ -1484,6 +1495,7 @@ export default function App() {
 			const entry: DeliveryRecovery = {
 				id,
 				sessionId,
+				title: session.title,
 				text,
 				attachments: ownedAttachments,
 				disposition: "pending",
@@ -1591,9 +1603,11 @@ export default function App() {
 	): Promise<{ queued?: boolean }> => {
 		const id = crypto.randomUUID();
 		validateDesktopRequest("prompt", params, id);
+		const title = snapshot?.sessions.find(item => item.id === sessionId)?.title;
 		const entry: DeliveryRecovery = {
 			id,
 			sessionId,
+			title,
 			text,
 			attachments: [],
 			disposition: "pending",
@@ -2507,10 +2521,20 @@ export default function App() {
 			restorationFailure?.sessionId === item.sessionId
 				? t("shell.recoveryRestoreFailed")
 				: recoveryNotice(item, unsentRepairs.current.get(item.id) === item.sessionId);
+		const owner = snapshot?.sessions.find(entry => entry.id === item.sessionId);
+		// Only a settled snapshot can say a conversation is gone (deleted, or its workspace closed).
+		const orphan = snapshot !== null && !owner;
 		return copy ? (
 			<div className="notice" key={item.id} role="status">
 				<p>{copy}</p>
 				{item.error && <p>{item.error}</p>}
+				<RecoveryConversation
+					title={owner?.title}
+					rememberedTitle={item.title}
+					current={owner?.id === session?.id}
+					text={item.text}
+					onOpen={() => owner && select(owner)}
+				/>
 				{(unsentRepairs.current.get(item.id) === item.sessionId ||
 					restorationFailure?.sessionId === item.sessionId) && (
 					<Button
@@ -2534,32 +2558,41 @@ export default function App() {
 						{t("shell.retryRecovery")}
 					</Button>
 				)}
+				{!orphan && (
+					<Button
+						disabled={
+							item.restored || unsentBlocked[item.sessionId] || restorationFailure?.sessionId === item.sessionId
+						}
+						onClick={() =>
+							enqueueRecovery(async () => {
+								const current = recoveriesRef.current.find(entry => entry.id === item.id);
+								if (current) await restoreRecovery(current);
+							})
+						}
+					>
+						{t("shell.restoreDraft")}
+					</Button>
+				)}
 				<Button
 					disabled={
-						item.restored || unsentBlocked[item.sessionId] || restorationFailure?.sessionId === item.sessionId
-					}
-					onClick={() =>
-						enqueueRecovery(async () => {
-							const current = recoveriesRef.current.find(entry => entry.id === item.id);
-							if (current) await restoreRecovery(current);
-						})
-					}
-				>
-					{t("shell.restoreDraft")}
-				</Button>
-				<Button
-					disabled={
-						(!isFinalDelivery(item.disposition) && !(item.disposition === "unknown" && item.restored)) ||
 						item.finalizing ||
-						unsentRepairs.current.has(item.id) ||
-						restorationFailure?.sessionId === item.sessionId
+						(!orphan &&
+							((!isFinalDelivery(item.disposition) && !(item.disposition === "unknown" && item.restored)) ||
+								unsentRepairs.current.has(item.id) ||
+								restorationFailure?.sessionId === item.sessionId))
 					}
 					onClick={() =>
 						enqueueRecovery(async () => {
 							const current = recoveriesRef.current.find(entry => entry.id === item.id);
+							if (!current || current.finalizing) return;
+							// An orphan has no conversation to restore into; its text stays available to copy.
+							if (orphan) {
+								await finalizeRecovery(current);
+								restorationFailures.current.delete(current.id);
+								if (unsentRepairs.current.has(current.id)) finishUnsentRepair(current.id, current.sessionId);
+								return;
+							}
 							if (
-								!current ||
-								current.finalizing ||
 								unsentRepairs.current.has(current.id) ||
 								restorationFailures.current.get(current.id)?.sessionId === current.sessionId
 							)
@@ -3575,6 +3608,7 @@ export default function App() {
 									const generation = dialogGeneration.current;
 									void run(sessionId, async () => {
 										await request("session.delete", { sessionId });
+										dropRecoveries(sessionId);
 										if (dialogGeneration.current === generation && selectedRef.current === sessionId)
 											closeDialog();
 									});
