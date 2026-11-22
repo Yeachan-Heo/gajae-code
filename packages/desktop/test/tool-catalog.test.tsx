@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DesktopMethod, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolList } from "@gajae-code/desktop-host/tool-protocol";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import { editedToolNames, parseToolList } from "../src/ToolCatalogDialog";
 import { browserPath } from "./component-fixture";
 import { installNavigationFixture } from "./fixtures/navigation";
 
@@ -214,6 +215,16 @@ const catalog = {
 	discovery: { enabled: true },
 } satisfies DesktopToolList;
 
+describe("tools to save", () => {
+	test("keep every active tool, including those past the catalog's description bound", () => {
+		// The Host describes only the first 400 tools; activity always comes from the full lists.
+		const names = Array.from({ length: 405 }, (_, index) => `tool_${index}`);
+		const parsed = parseToolList({ available: names, active: names, tools: [] })!;
+		expect(editedToolNames(parsed, new Map([["tool_2", false]]))).toEqual(names.filter(name => name !== "tool_2"));
+		expect(editedToolNames(parsed, new Map())).toHaveLength(405);
+	});
+});
+
 suite("Tools dialog", () => {
 	test("lists the conversation's tools, saves the edited set and re-reads it", async () => {
 		const { context, page } = await fixture();
@@ -257,6 +268,9 @@ suite("Tools dialog", () => {
 				status: ["1 unsaved change"],
 			});
 			await clickButton(page, "Save tools");
+			// Save first reads the tools active now, then applies the edit to them.
+			const [, current] = await waitHeld(page, "tools.list", 2);
+			await answer(page, [current!], { available: ["read", "bash", "python"], active: ["read"] });
 			const [save] = await waitHeld(page, "tools.set", 1);
 			expect(save!.params).toEqual({ sessionId: "old", names: ["read", "bash"] });
 			// The list stays in place while saving, so the query, scroll and focus survive; it is locked meanwhile.
@@ -272,7 +286,7 @@ suite("Tools dialog", () => {
 
 			await answer(page, [save!], null);
 			// A save is followed by one fresh read, which replaces the edits with what the SDK applied.
-			const [reread] = (await waitHeld(page, "tools.list", 2)).slice(1);
+			const [reread] = (await waitHeld(page, "tools.list", 3)).slice(2);
 			expect(reread!.params).toEqual({ sessionId: "old" });
 			await answer(page, [reread!], { available: ["read", "bash", "python"], active: ["read", "bash"] });
 			await page.waitForFunction(
@@ -290,7 +304,7 @@ suite("Tools dialog", () => {
 				errors: [],
 			});
 			expect(await held(page, "tools.set")).toHaveLength(1);
-			expect(await held(page, "tools.list")).toHaveLength(2);
+			expect(await held(page, "tools.list")).toHaveLength(3);
 
 			await page.keyboard.press("Escape");
 			await page.waitForSelector("dialog[open]", { hidden: true });
@@ -464,8 +478,51 @@ suite("Tools dialog", () => {
 			});
 			expect(await page.evaluate(() => document.activeElement?.closest(".model-search") !== null)).toBe(true);
 			await clickButton(page, "Save tools");
+			const [current] = (await waitHeld(page, "tools.list", 4)).slice(3);
+			await answer(page, [current!], {
+				...catalog,
+				active: ["read", "bash", "todo_write", "mcp_github_search"],
+			});
 			const [save] = await waitHeld(page, "tools.set", 1);
 			expect(save!.params).toEqual({ sessionId: "old", names: ["bash", "todo_write", "mcp_github_search"] });
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
+	test("Save re-reads the tools and applies only the user's changes to the ones active now", async () => {
+		const { context, page } = await fixture();
+		try {
+			await openTools(page);
+			await answer(page, await waitHeld(page, "tools.list", 1), catalog);
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			await toggle(page, "bash");
+			await toggle(page, "todo_write");
+			await clickButton(page, "Save tools");
+			// Nothing is saved from the list read when the dialog opened.
+			const [, before] = await waitHeld(page, "tools.list", 2);
+			await Bun.sleep(100);
+			expect(await held(page, "tools.set")).toHaveLength(0);
+			expect((await read(page)).status).toEqual(["Saving tools…"]);
+			// Meanwhile an MCP reconnect turned a tool on; the save keeps it and applies the two changes.
+			await answer(page, [before!], { ...catalog, active: ["read", "bash", "mcp_github_search"] });
+			const [save] = await waitHeld(page, "tools.set", 1);
+			expect(save!.params).toEqual({ sessionId: "old", names: ["read", "mcp_github_search", "todo_write"] });
+			await answer(page, [save!], null);
+			const [, , after] = await waitHeld(page, "tools.list", 3);
+			await answer(page, [after!], { ...catalog, active: ["read", "mcp_github_search", "todo_write"] });
+			await page.waitForFunction(() => document.body.textContent?.includes("Tools saved."));
+
+			// A re-read that fails saves nothing and keeps the changes.
+			await toggle(page, "read");
+			await clickButton(page, "Save tools");
+			const [, , , failing] = await waitHeld(page, "tools.list", 4);
+			await page.evaluate(id => {
+				window.navigationFixture.emit({ type: "response", id, ok: false, error: "Session changed" });
+			}, failing!.id);
+			await page.waitForFunction(() => document.querySelector("dialog[open] .error-banner") !== null);
+			expect(await held(page, "tools.set")).toHaveLength(1);
+			expect(await read(page)).toMatchObject({ errors: ["Session changed"], status: ["1 unsaved change"] });
 		} finally {
 			await context.close();
 		}

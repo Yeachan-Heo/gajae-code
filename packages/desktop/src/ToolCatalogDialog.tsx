@@ -105,7 +105,11 @@ export function toolSearchResultIds(messages: DesktopMessage[]): string[] {
 		.map(message => message.id);
 }
 
-/** Names to send with `tools.set`: the saved active set in SDK order with the edits applied. */
+/**
+ * Names to send with `tools.set`: the catalog's active set in SDK order with the edits applied.
+ * Save passes a catalog read just before it, so a tool that became active while the dialog was
+ * open (an MCP reconnect, a tool search) stays on unless the user turned it off.
+ */
 export function editedToolNames(catalog: ToolCatalog, edits: ReadonlyMap<string, boolean>): string[] {
 	const active = new Set(catalog.active);
 	return [
@@ -419,7 +423,8 @@ export interface ToolCatalogDialogProps {
 
 /**
  * The Tools dialog: reads `tools.list` once per open, after each save, and again when a new
- * tool-search result lands while nothing is edited; saves the checked set with `tools.set`.
+ * tool-search result lands while nothing is edited; saves with `tools.set` the user's changes
+ * applied to a `tools.list` read made just before saving.
  * Save waits while a turn owns the conversation, because an explicit selection made during a
  * turn cancels a tool search that is still activating tools.
  */
@@ -486,7 +491,11 @@ export function ToolCatalogDialog({ session, connected, onClose }: ToolCatalogDi
 		setNotice("");
 		let saved = false;
 		try {
-			await request("tools.set", { sessionId, names: editedToolNames(catalog, editsRef.current) });
+			// `tools.set` takes the whole list, so build it from the tools active now, not at the last read.
+			const fresh = parseToolList(await request<unknown>("tools.list", { sessionId }));
+			if (!current(owner)) return;
+			if (!fresh) throw new Error(t("catalog.invalid"));
+			await request("tools.set", { sessionId, names: editedToolNames(fresh, editsRef.current) });
 			saved = true;
 		} catch (failure) {
 			if (current(owner))
