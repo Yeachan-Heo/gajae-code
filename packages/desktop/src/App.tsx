@@ -1015,6 +1015,26 @@ export default function App() {
 			unsubscribe?.();
 		};
 	}, [applyActivityUpdate, rememberOperator, enqueueRecovery, reconcileReceipt]);
+	// The terminal can create conversations while this window is in the background. On focus,
+	// ask the Host to look again: bootstrap re-lists open workspaces and emits a snapshot frame,
+	// which the frame handler above applies. One look at a time, spaced at least 5 s apart.
+	useEffect(() => {
+		if (!connected) return;
+		let looking = false;
+		let lastLook = Date.now();
+		const lookForConversations = () => {
+			if (looking || Date.now() - lastLook < 5_000) return;
+			looking = true;
+			lastLook = Date.now();
+			void request("bootstrap")
+				.catch(() => {})
+				.finally(() => {
+					looking = false;
+				});
+		};
+		window.addEventListener("focus", lookForConversations);
+		return () => window.removeEventListener("focus", lookForConversations);
+	}, [connected]);
 	useEffect(() => {
 		setActivity(null);
 		if (!selected || !connected) return;

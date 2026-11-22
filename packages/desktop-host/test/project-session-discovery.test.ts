@@ -16,6 +16,7 @@ import {
 	type DesktopProject,
 	type DesktopRequest,
 	type DesktopSession,
+	type DesktopSnapshot,
 	parseRequest,
 } from "../src/protocol";
 
@@ -172,6 +173,41 @@ test("refreshes an existing registration idempotently and preserves desktop-owne
 	expect(h.created).toHaveLength(1);
 	const selected = await h.call<DesktopSession>("session.select", { sessionId: desktop.id });
 	expect(selected.id).toBe(desktop.id);
+});
+
+test("bootstrap discovers a conversation the terminal created after the project was opened", async () => {
+	const h = await fixture();
+	const first = await h.persist("Before the project was opened");
+	await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	const second = await h.persist("Created in the terminal later");
+	const snapshot = await h.call<DesktopSnapshot>("bootstrap");
+	expect(snapshot.sessions.map(session => [session.id, session.title])).toEqual([
+		[first.id, "Before the project was opened"],
+		[second.id, "Created in the terminal later"],
+	]);
+	expect(h.created).toHaveLength(0);
+	expect(await Bun.file(second.file).text()).toBe(second.bytes);
+	// Nothing new to add: bootstrap leaves the catalog file untouched.
+	const catalog = path.join(h.dataDir, "catalog.json");
+	const before = await fs.stat(catalog);
+	await h.call("bootstrap");
+	const after = await fs.stat(catalog);
+	expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+	await h.restart();
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([first.id, second.id]);
+});
+
+test("bootstrap still answers when one workspace cannot be listed", async () => {
+	const h = await fixture();
+	const first = await h.persist("Listed before");
+	await h.call("project.open", { path: h.projectDir });
+	await h.persist("Not listed this time");
+	const listing = vi
+		.spyOn(sdk, "listEmbeddedProjectSessions")
+		.mockRejectedValueOnce(new Error("Fixture inventory unavailable"));
+	const snapshot = await h.call<DesktopSnapshot>("bootstrap");
+	expect(listing).toHaveBeenCalledTimes(1);
+	expect(snapshot.sessions.map(session => session.id)).toEqual([first.id]);
 });
 
 test("keeps discovered references across close, reopen and host restart", async () => {

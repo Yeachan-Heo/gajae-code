@@ -390,7 +390,14 @@ interface Catalog {
 	version: 1;
 	projects: DesktopProject[];
 	sessions: SavedSession[];
+	/**
+	 * SDK transcript identities whose rows this app removed. Discovery never offers them again
+	 * as another surface's conversations, including a transcript whose removal failed.
+	 */
+	released?: string[];
 }
+/** Released identities kept; the oldest are dropped first. */
+const RELEASED_LIMIT = 1_000;
 interface TrackedQueuedInput {
 	dto: DesktopQueuedInput;
 	submission: QueuedInputSubmission;
@@ -537,6 +544,12 @@ export class DesktopHost {
 	#cleanupRuns = new WeakMap<SessionCandidate, Promise<void>>();
 	#cleanupOwners = new Map<SessionCandidate, Promise<void>>();
 	#pendingForks = new Set<string>();
+	/**
+	 * Every transcript this process created or held, by SDK identity and resolved file. Discovery
+	 * never lists them as another surface's conversations, including ones the app deliberately
+	 * left uncataloged (a branch fork's ancestor, retained cleanup, a failed removal). In-run only.
+	 */
+	#heldTranscripts = new Set<string>();
 	#opening = new Map<string, Promise<LiveSession>>();
 	/**
 	 * One queue per workspace path. Open and close both mutate the same catalog entry, and the
@@ -715,7 +728,13 @@ export class DesktopHost {
 				new Set(sessions.map(s => s.id)).size !== sessions.length
 			)
 				throw new Error("Duplicate desktop IDs");
-			this.#catalog = { version: 1, projects, sessions };
+			const released = catalog.released;
+			if (
+				released !== undefined &&
+				(!Array.isArray(released) || released.some(id => typeof id !== "string" || !ID.test(id)))
+			)
+				throw new Error("Invalid desktop catalog");
+			this.#catalog = { version: 1, projects, sessions, ...(released?.length ? { released } : {}) };
 		}
 		this.#control = await createEmbeddedAgentSession({
 			cwd: this.dataDir,
@@ -1227,10 +1246,12 @@ export class DesktopHost {
 	async #forgetMissingSession(metadata: SavedSession): Promise<null> {
 		const index = this.#catalog.sessions.indexOf(metadata);
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
+		const restoreReleased = this.#release(metadata);
 		try {
 			await this.#save();
 		} catch (error) {
 			this.#catalog.sessions.splice(index, 0, metadata);
+			restoreReleased();
 			throw error;
 		}
 		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
@@ -1267,6 +1288,7 @@ export class DesktopHost {
 			notificationHostModeSupported: false,
 			sdkHostModeSupported: false,
 		});
+		this.#holdTranscript(result.session.sessionManager);
 		const candidate: SessionCandidate = {
 			sdk: result.session,
 			factory: result,
@@ -1566,6 +1588,8 @@ export class DesktopHost {
 					? { agentDir: this.agentDir, managed: true as const }
 					: { directory }),
 			});
+			this.#holdTranscript(manager);
+			const copiedId = manager.getSessionId();
 			rememberOwnedFile(manager.getSessionFile());
 			assertSource();
 			candidate = await this.#constructCandidate(fork, manager);
@@ -1577,6 +1601,7 @@ export class DesktopHost {
 					throw new Error("Invalid entry ID for branching");
 				const result = await candidate.factory.branch(entryId);
 				// The SDK may rotate identity even when later cleanup or hooks throw.
+				this.#holdTranscript(candidate.sdk.sessionManager);
 				rememberOwnedFile(candidate.sdk.sessionManager.getSessionFile());
 				assertSource();
 				if (result.cancelled) {
@@ -1597,6 +1622,9 @@ export class DesktopHost {
 			this.#opening.set(fork.id, publication.promise);
 			this.#pendingForks.add(fork.id);
 			this.#catalog.sessions.push(fork);
+			// A branch keeps the full copy it was cut from as private lineage. Release that copy in
+			// this same save, so deleting the branch later never surfaces it as a conversation.
+			if (candidate.sdk.sessionId !== copiedId) this.#releaseId(copiedId);
 			await this.#save();
 			assertSource();
 			published = this.#publishCandidate(candidate);
@@ -1904,6 +1932,7 @@ export class DesktopHost {
 		live.metadata.file = relative;
 		live.metadata.scope = scope;
 		live.metadata.sessionId = manager.getSessionId();
+		this.#holdTranscript(manager);
 		// A committed empty successor reserves its path before creating the file.
 		// Materialize through the SDK, never publish a merely reserved catalog path.
 		await manager.ensureOnDisk();
@@ -2495,8 +2524,30 @@ export class DesktopHost {
 		const { method, params } = request;
 		const attachmentInput = method === "prompt" ? prepareDesktopAttachmentInput(request) : undefined;
 		if (method === "bootstrap") {
+			// Pick up conversations another surface (the terminal) created since the workspace was
+			// opened. Each workspace refreshes under its own open/close fence; one that cannot be
+			// listed keeps its current rows and never blocks the snapshot.
+			await Promise.all(
+				this.#catalog.projects
+					.filter(project => !project.closed)
+					.map(project =>
+						this.#withProject(project.path, () => this.#refreshProject(project)).catch(error => {
+							console.error(`Desktop could not refresh a workspace's conversations: ${String(error)}`);
+						}),
+					),
+			);
 			const snapshot = this.snapshot();
 			this.#emit({ type: "snapshot", snapshot });
+			// The snapshot splits one history budget across every row, and the app replaces its
+			// rows with it. Follow with the full projection of any open conversation it cut short,
+			// so a refresh on window focus never shrinks the transcript being read.
+			for (const live of this.#live.values()) {
+				const row = snapshot.sessions.find(session => session.id === live.metadata.id);
+				if (!row) continue;
+				const full = this.#dto(live.metadata);
+				if (JSON.stringify(full.messages) !== JSON.stringify(row.messages))
+					this.#emit({ type: "session", session: full });
+			}
 			return snapshot;
 		}
 		if (method === "delivery.ack") {
@@ -3789,14 +3840,8 @@ export class DesktopHost {
 		const discovered: SavedSession[] = [];
 		const creationTimes = new Map<string, number>();
 		const ids = new Set(this.#catalog.sessions.map(session => session.id));
-		for (const session of sessions.sort((left, right) => left.created.getTime() - right.created.getTime())) {
-			const createdAt = session.created.getTime();
-			if (!ID.test(session.id) || !session.cwd || !Number.isFinite(createdAt) || createdAt < 0) continue;
-			// Managed inventories can include legacy and project-local candidates. Header
-			// scope must still name this exact directory, never a parent or sibling project.
-			const cwd = await fs.realpath(session.cwd).catch(() => undefined);
-			if (cwd !== project.path) continue;
-			const existing = this.#catalog.sessions.find(
+		const catalogRow = (session: (typeof sessions)[number]) =>
+			this.#catalog.sessions.find(
 				item =>
 					item.id === session.id ||
 					(item.projectId === project.id && item.sessionId === session.id) ||
@@ -3804,8 +3849,32 @@ export class DesktopHost {
 						item.file !== undefined &&
 						path.resolve(session.path) === this.#sessionPath(item.file, item.scope)),
 			);
+		// A branch fork keeps the full copy it was cut from as private parent lineage, and only
+		// the branch enters the catalog. A listed conversation's parent is lineage, not a new row.
+		const lineage = new Set<string>();
+		for (const session of sessions)
+			if (session.parentSessionPath && catalogRow(session)) lineage.add(session.parentSessionPath);
+		for (const session of sessions.sort((left, right) => left.created.getTime() - right.created.getTime())) {
+			const createdAt = session.created.getTime();
+			if (!ID.test(session.id) || !session.cwd || !Number.isFinite(createdAt) || createdAt < 0) continue;
+			// Managed inventories can include legacy and project-local candidates. Header
+			// scope must still name this exact directory, never a parent or sibling project.
+			const cwd = await fs.realpath(session.cwd).catch(() => undefined);
+			if (cwd !== project.path) continue;
+			const existing = catalogRow(session);
 			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
-			if (existing || desktop.includes(session) || ids.has(session.id)) continue;
+			if (
+				existing ||
+				desktop.includes(session) ||
+				ids.has(session.id) ||
+				// Includes a conversation still being created, whose catalog row has no SDK id yet.
+				this.#heldTranscripts.has(session.id) ||
+				this.#catalog.released?.includes(session.id) ||
+				this.#heldTranscripts.has(path.resolve(session.path)) ||
+				lineage.has(session.id) ||
+				lineage.has(path.resolve(session.path))
+			)
+				continue;
 			ids.add(session.id);
 			discovered.push({
 				id: session.id,
@@ -3827,15 +3896,74 @@ export class DesktopHost {
 			name: (path.basename(resolved) || resolved).slice(0, 200),
 			path: resolved,
 		};
-		const { discovered, creationTimes } = await this.#discoverProjectSessions(project);
-		const previousCreationTimes = new Map(this.#catalog.sessions.map(session => [session, session.createdAt]));
-		for (const session of this.#catalog.sessions) {
-			const createdAt = creationTimes.get(session.id);
-			if (createdAt !== undefined) session.createdAt = createdAt;
-		}
+		const discovery = await this.#discoverProjectSessions(project);
 		const closed = project.closed;
 		delete project.closed;
 		if (!existing) this.#catalog.projects.push(project);
+		const undo = this.#mergeDiscovered(project, discovery);
+		try {
+			await this.#save();
+		} catch (error) {
+			undo?.();
+			if (!existing) this.#catalog.projects = this.#catalog.projects.filter(item => item !== project);
+			if (closed !== undefined) project.closed = closed;
+			throw error;
+		}
+		this.#publishSnapshot();
+		return project;
+	}
+
+	/** Records a removed row's transcript identity in the next catalog save; returns its undo. */
+	#release(metadata: SavedSession): () => void {
+		return this.#releaseId(metadata.sessionId ?? (metadata.managed ? metadata.id : undefined));
+	}
+	#releaseId(id: string | undefined): () => void {
+		const previous = this.#catalog.released;
+		if (id === undefined || previous?.includes(id)) return () => {};
+		this.#catalog.released = [...(previous ?? []), id].slice(-RELEASED_LIMIT);
+		return () => {
+			if (previous) this.#catalog.released = previous;
+			else delete this.#catalog.released;
+		};
+	}
+	#holdTranscript(manager: SessionManager): void {
+		this.#heldTranscripts.add(manager.getSessionId());
+		const file = manager.getSessionFile();
+		if (file) this.#heldTranscripts.add(path.resolve(file));
+	}
+
+	/**
+	 * Adds conversations another surface created in an open workspace. The caller holds the
+	 * workspace fence and publishes; nothing is saved when the discovery changed nothing.
+	 */
+	async #refreshProject(project: DesktopProject): Promise<void> {
+		// Queued behind a close or reopen of the same path: refresh only what is still open.
+		if (project.closed || !this.#catalog.projects.includes(project)) return;
+		const discovery = await this.#discoverProjectSessions(project);
+		const undo = this.#mergeDiscovered(project, discovery);
+		// Creation-time corrections alone are saved with the next catalog write; a new row needs
+		// its own, and only then can bootstrap wait on the catalog queue.
+		if (!undo || !discovery.discovered.length) return;
+		try {
+			await this.#save();
+		} catch (error) {
+			undo();
+			throw error;
+		}
+	}
+
+	/** Applies one discovery to the catalog and returns its undo, or undefined when nothing changed. */
+	#mergeDiscovered(
+		project: DesktopProject,
+		{ discovered, creationTimes }: { discovered: SavedSession[]; creationTimes: Map<string, number> },
+	): (() => void) | undefined {
+		const previousCreationTimes = new Map<SavedSession, number | undefined>();
+		for (const session of this.#catalog.sessions) {
+			const createdAt = creationTimes.get(session.id);
+			if (createdAt === undefined || createdAt === session.createdAt) continue;
+			previousCreationTimes.set(session, session.createdAt);
+			session.createdAt = createdAt;
+		}
 		// Place newly discovered history chronologically without disturbing any existing user order.
 		for (const session of discovered) {
 			const index = this.#catalog.sessions.findIndex(
@@ -3848,21 +3976,15 @@ export class DesktopHost {
 			if (index === -1) this.#catalog.sessions.push(session);
 			else this.#catalog.sessions.splice(index, 0, session);
 		}
-		try {
-			await this.#save();
-		} catch (error) {
+		if (!discovered.length && !previousCreationTimes.size) return undefined;
+		return () => {
 			for (const [session, createdAt] of previousCreationTimes) {
 				if (createdAt === undefined) delete session.createdAt;
 				else session.createdAt = createdAt;
 			}
 			const added = new Set(discovered);
 			this.#catalog.sessions = this.#catalog.sessions.filter(session => !added.has(session));
-			if (!existing) this.#catalog.projects = this.#catalog.projects.filter(item => item !== project);
-			if (closed !== undefined) project.closed = closed;
-			throw error;
-		}
-		this.#publishSnapshot();
-		return project;
+		};
 	}
 
 	/**
@@ -3909,10 +4031,12 @@ export class DesktopHost {
 		this.#live.delete(metadata.id);
 		const index = this.#catalog.sessions.indexOf(metadata);
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
+		const restoreReleased = this.#release(metadata);
 		try {
 			await this.#save();
 		} catch (error) {
 			this.#catalog.sessions.splice(index, 0, metadata);
+			restoreReleased();
 			throw error;
 		}
 		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);

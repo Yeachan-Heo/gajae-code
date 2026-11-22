@@ -1112,6 +1112,58 @@ suite("mounted desktop navigation", () => {
 		} finally { await context.close(); }
 	}, 30000);
 
+	test("window focus asks the Host to look for new conversations, spaced and one look at a time", async () => {
+		const { context, page } = await fixture();
+		try {
+			const looks = () => page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "bootstrap").length);
+			const focusAfter = (ms: number) => page.evaluate(ms => {
+				const scoped = window as unknown as { advanceClock?: (ms: number) => void };
+				if (!scoped.advanceClock) {
+					const now = Date.now.bind(Date);
+					let offset = 0;
+					Date.now = () => now() + offset;
+					scoped.advanceClock = by => { offset += by; };
+				}
+				scoped.advanceClock(ms);
+				window.dispatchEvent(new Event("focus"));
+			}, ms);
+			const settle = () => page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
+			expect(await looks()).toBe(1);
+			// The connection just bootstrapped; an immediate focus has nothing new to find.
+			await focusAfter(0);
+			await settle();
+			expect(await looks()).toBe(1);
+			await focusAfter(6_000);
+			await page.waitForFunction(() => window.navigationFixture.requests().filter(request => request.method === "bootstrap").length === 2);
+			await focusAfter(1_000);
+			await settle();
+			expect(await looks()).toBe(2);
+			// A look that has not answered yet blocks the next one, however long it takes.
+			await holdRequest(page, "bootstrap");
+			await focusAfter(6_000);
+			await heldRequest(page, "bootstrap", 3);
+			await focusAfter(60_000);
+			await settle();
+			expect(await looks()).toBe(3);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("window focus does not ask a disconnected Host for anything", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => window.navigationFixture.emit({ type: "fatal", error: "Host stopped" }));
+			await page.waitForSelector(".main-pane .error-banner");
+			const before = await page.evaluate(() => window.navigationFixture.requests().length);
+			await page.evaluate(() => {
+				const now = Date.now.bind(Date);
+				Date.now = () => now() + 60_000;
+				window.dispatchEvent(new Event("focus"));
+			});
+			await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
+			expect(await page.evaluate(() => window.navigationFixture.requests().length)).toBe(before);
+		} finally { await context.close(); }
+	}, 30000);
+
 	test("keeps a failed connection visible as an error, not a permanent spinner", async () => {
 		const { context, page } = await fixture(true);
 		try {

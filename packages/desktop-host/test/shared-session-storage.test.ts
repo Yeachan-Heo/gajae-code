@@ -118,6 +118,7 @@ async function fixture(model?: Model) {
 		agentDir,
 		projectDir,
 		snapshot: () => host.snapshot(),
+		frames,
 		restart: async () => {
 			await host.close();
 			await Promise.all(created.map(result => result.session.awaitDisposeCompletion()));
@@ -628,6 +629,57 @@ test("a fork of a shared conversation lands in the same store and keeps its sour
 	expect(fork.session.id).not.toBe(source.id);
 	expect(h.snapshot().sessions.map(item => item.id)).toEqual([source.id, fork.session.id]);
 	expect(await Bun.file(sourceTranscript).text()).toBe(sourceBytes);
+});
+
+test("a workspace refresh never shrinks the open conversation's transcript", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const file = h.sdk().sessionFile!;
+	for (let index = 0; index < 6; index++) await h.call("session.create", { projectId: h.project.id });
+	await h.call("project.close", { projectId: h.project.id });
+	// A long history: the snapshot's per-row share cannot carry all of it.
+	const terminal = h.track(await resumeAsTerminal(file, h.projectDir, h.agentDir));
+	for (let index = 0; index < 40; index++)
+		terminal.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `${index} ${"x".repeat(7_000)}` }],
+			timestamp: Date.now(),
+		});
+	await terminal.flush();
+	expect(await terminal.closeStrict()).toMatchObject({ kind: "closed" });
+	await h.call("project.open", { path: h.projectDir });
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	const from = h.frames.length;
+	await h.call("bootstrap");
+	// Apply the frames in order, as the app does: the snapshot replaces rows, session frames follow.
+	let shown: DesktopSession | undefined;
+	for (const frame of h.frames.slice(from)) {
+		if (frame.type === "snapshot") shown = frame.snapshot.sessions.find(session => session.id === sessionId);
+		if (frame.type === "session" && frame.session.id === sessionId) shown = frame.session;
+	}
+	expect(shown?.messages.length).toBeGreaterThan(20);
+	expect(shown?.messages).toEqual(selected.messages);
+});
+
+test("refreshing the workspace does not list a branch fork's private ancestor as a conversation", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "first turn" });
+	await h.call("prompt", { sessionId, text: "second turn" });
+	const fork = await h.call<{ session: DesktopSession }>("session.fork", { sessionId, entryId: h.lastUser() });
+	const rows = h.snapshot().sessions.map(session => session.id);
+	expect(rows).toEqual([sessionId, fork.session.id]);
+	// The SDK keeps the full copy the branch was cut from; only the branch is the user's conversation.
+	await h.call("bootstrap");
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual(rows);
+	await h.restart();
+	await h.call("bootstrap");
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual(rows);
+	// Nor does the copy surface once the branch itself is deleted.
+	await h.call("session.delete", { sessionId: fork.session.id });
+	await h.call("bootstrap");
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([sessionId]);
 });
 
 test("an existing private transcript keeps opening in place after the store change", async () => {
