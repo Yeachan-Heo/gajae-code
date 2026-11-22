@@ -4,6 +4,7 @@ import type { DesktopToolCall } from "@gajae-code/desktop-host/tool-protocol";
 import puppeteer, { type Browser } from "puppeteer-core";
 import { THEME_IDS } from "../src/themes";
 import { browserPath, closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
+import { measureContrast } from "./fixtures/contrast";
 
 const suite = browserPath ? describe : describe.skip;
 const port = 16000 + Math.floor(Math.random() * 20000);
@@ -169,6 +170,67 @@ suite("tool card contrast", () => {
 					.map(([name, ratio]) => `${theme} ${name} ${ratio}`),
 			);
 			expect(below).toEqual([]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 60000);
+
+	test("the removed-lines count reads at 4.5:1 on a card, under the pointer and in a file header, in every theme", async () => {
+		const { context, page } = await componentFixture(browser, origin);
+		try {
+			const edited: DesktopMessage = {
+				id: "e",
+				role: "tool",
+				toolName: "edit",
+				text: "",
+				tool: { callId: "e", status: "done", family: "edit", subject: "src/a.ts", detail: false, stats: { added: 3, removed: 3 } },
+			};
+			await componentReady(page, async () => {
+				await page.addScriptTag({
+					type: "module",
+					content: `
+						import React from '/node_modules/.vite/deps/react.js';
+						import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
+						import { Message } from '/src/components.tsx';
+						import { ToolCallDetails } from '/src/ToolCallCard.tsx';
+						import { applyTheme } from '/src/themes.ts';
+						const h = React.createElement;
+						const ready = { kind: 'ready', detail: { callId: 'd', diff: [
+							{ path: 'src/a.ts', diff: '@@ -1 +1 @@\\n-1|old\\n+1|new', added: 1, removed: 1 },
+						] } };
+						function Fixture() {
+							return h('div', { className: 'conversation' },
+								h(Message, { message: ${JSON.stringify(edited)} }),
+								// An expanded card's body, inside the card's own disclosure as the app renders it.
+								h('article', { className: 'message tool tool-call' }, h('details', { className: 'tool-disclosure', open: true },
+									h('summary', null, 'Edited'),
+									h('div', { className: 'tool-call-details' }, h(ToolCallDetails, { family: 'edit', state: ready })))));
+						}
+						window.applyTheme = applyTheme;
+						const root = document.createElement('div');
+						document.body.replaceChildren(root);
+						ReactDOM.createRoot(root).render(h(Fixture));
+					`,
+				});
+				await page.waitForSelector(".tool-diff-header .tool-fact-removed");
+			});
+			await page.addStyleTag({ url: `${origin}/src/styles.css` });
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			const summary = '.tool-call[data-tool-family="edit"] .tool-disclosure > summary';
+			const failures: string[] = [];
+			const check = async (theme: string, state: string, selector: string) => {
+				for (const sample of await page.evaluate(measureContrast, [selector]))
+					if (sample.ratio < 4.5) failures.push(`${theme} · ${state}: ${sample.ratio}`);
+			};
+			for (const theme of THEME_IDS) {
+				await page.evaluate(id => (window as unknown as { applyTheme(id: string): void }).applyTheme(id), theme);
+				await page.mouse.move(1, 1);
+				await check(theme, "card summary", `${summary} .tool-fact-removed`);
+				await check(theme, "file header", ".tool-diff-header .tool-fact-removed");
+				await page.hover(summary);
+				await check(theme, "summary under the pointer", `${summary} .tool-fact-removed`);
+			}
+			expect(failures).toEqual([]);
 		} finally {
 			await closeComponentFixture(context, page);
 		}

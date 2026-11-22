@@ -749,7 +749,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-call-meta { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-left: auto; color: var(--muted); font-size: 0.75rem; }
 .tool-call-facts { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tool-fact-added { color: var(--status-done); }
-.tool-fact-removed { color: var(--status-error); }
+.tool-fact-removed { color: var(--tool-error-text); }
 .tool-call-status { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .tool-call .tool-disclosure > summary .tool-call-status svg, .tool-group-summary .tool-call-status svg { width: 0.875rem; height: 0.875rem; }
 .tool-call-running { color: var(--status-running); }
