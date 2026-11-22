@@ -92,7 +92,7 @@ export const QA_DEMONSTRATIONS = {
 			{ name: "todo_write", arguments: todoDemoArguments },
 		])}`,
 		expect:
-			"A tool-search row that activates todo_write, then a todo_write row (the tool is offered only after the search); the task list has three phases with the first task done and the next in progress.",
+			"A tool-search row that activates todo_write, then a todo_write row (the tool is offered only after the search); the task list has three phases with the first task done and the next in progress. Use a fresh conversation: a repeat finds nothing left to activate.",
 	},
 } as const satisfies Record<string, QaDemonstration>;
 

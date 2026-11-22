@@ -170,6 +170,13 @@ async function wrapper(env: Record<string, string> = {}) {
 	}
 }
 
+test("the script header lists every demonstration prompt verbatim", async () => {
+	const source = await Bun.file(path.resolve(import.meta.dir, "../scripts/host-ui-qa.ts")).text();
+	const header = source.slice(0, source.indexOf("\nimport "));
+	for (const [name, demonstration] of Object.entries(QA_DEMONSTRATIONS))
+		expect(header).toContain(`//   ${name}: ${demonstration.prompt}\n`);
+});
+
 test("invalid or misplaced run controls are refused before any state exists", async () => {
 	const cases: Array<[Record<string, string>, string]> = [
 		[{ GJC_DESKTOP_QA_LIFETIME_MINUTES: "0" }, "GJC_DESKTOP_QA_LIFETIME_MINUTES must be an integer from 1 to 240"],

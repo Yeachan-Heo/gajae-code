@@ -20,9 +20,16 @@
 //   qa-tool-chain:[step,…]                            step k answers after k assistant responses;
 //     a step is one call object or an array of them, checked against the tools offered at that moment.
 // A marker that names an unoffered tool or is malformed fails the turn with a 400 whose message says
-// why. Ready-made prompts (QA_DEMONSTRATIONS in qa-model-fixture.ts) are printed in the bootstrap line
-// as modelFixture.demonstrations: failingRead, slowShell, edit, editUndo (edit is single use until
-// undone), multiCall and searchThenTodo (tool search activates the hidden todo_write, then calls it).
+// why. Ready-made demonstrations (QA_DEMONSTRATIONS in qa-model-fixture.ts, also printed with what each
+// shows as modelFixture.demonstrations; a test keeps these lines in sync). Paste one line as a prompt:
+//   failingRead: qa-tool-call:read:{"path":"qa-missing-file.txt"}
+//   slowShell: qa-tool-call:bash:{"command":"sleep 4; echo slow call finished"}
+//   edit: qa-tool-call:edit:{"path":"qa-edit-demo.txt","edits":[{"old_text":"status: draft\nreviewer: none","new_text":"status: reviewed\nreviewer: desktop-qa"}]}
+//   editUndo: qa-tool-call:edit:{"path":"qa-edit-demo.txt","edits":[{"old_text":"status: reviewed\nreviewer: desktop-qa","new_text":"status: draft\nreviewer: none"}]}
+//   multiCall: qa-tool-calls:[{"name":"read","arguments":{"path":"qa-edit-demo.txt"}},{"name":"find","arguments":{"paths":["*.move"]}},{"name":"search","arguments":{"pattern":"OWNED_DEFINITION_MARKER"}}]
+//   searchThenTodo: qa-tool-chain:[{"name":"search_tool_bm25","arguments":{"query":"todo","limit":1}},{"name":"todo_write","arguments":{"ops":[{"op":"init","list":[{"phase":"Investigate","items":["Reproduce the expired-session sign-out","Read the session refresh middleware"]},{"phase":"Fix","items":["Refresh the token before retrying the request","Add a regression test for the retry"]},{"phase":"Verify","items":["Run the auth test suite","Check sign-in in the desktop app"]}]},{"op":"done","task":"Reproduce the expired-session sign-out"}]}}]
+// edit is single use until editUndo runs. searchThenTodo activates the hidden todo_write through tool
+// search and then calls it; run it in a fresh conversation, since a repeat finds nothing to activate.
 // Browser controls: __qaFixture.status(), .hold(), .release(requestId),
 // .gate(sessionId, 'approval'|'question'|'execution'), .gates(sessionId).
 // .hostStatus(sessionId) reads the exact live SDK leaf. .coldRestart(sessionId) SIGKILLs
