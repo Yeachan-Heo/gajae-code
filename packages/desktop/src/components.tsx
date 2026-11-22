@@ -1,16 +1,13 @@
 import type {
 	DesktopGoal,
 	DesktopMessage,
-	DesktopMessageBlock,
 	DesktopQuestion,
 	DesktopSession,
 	DesktopSetting,
-	DesktopTodoPhase,
 } from "@gajae-code/desktop-host/protocol";
 import {
 	ArrowUp,
 	Check,
-	ChevronDown,
 	ChevronLeft,
 	ChevronRight,
 	Circle,
@@ -18,7 +15,6 @@ import {
 	CircleCheck,
 	CircleHelp,
 	Copy,
-	ListChecks,
 	LoaderCircle,
 	Pause,
 	Pencil,
@@ -32,7 +28,11 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { type ComposerAutocompleteSource, useComposerAutocomplete } from "./ComposerAutocomplete";
 import { t } from "./i18n";
 import { Markdown } from "./Markdown";
+import { MessageBlocks } from "./MessageBlocks";
 import { Select } from "./Select";
+import { ToolCallCard } from "./ToolCallCard";
+
+export * from "./TodoPanel";
 
 export function Button({ children, className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
 	return (
@@ -103,66 +103,6 @@ export function SessionRow({
 		</div>
 	);
 }
-function MessageImage({ block }: { block: Extract<DesktopMessageBlock, { type: "image" }> }) {
-	const [failedSource, setFailedSource] = useState<string>();
-	const safeMime = ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(block.mimeType);
-	const safeData =
-		typeof block.data === "string" && block.data.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/u.test(block.data);
-	const source = `data:${block.mimeType};base64,${block.data}`;
-	if (!safeMime || !safeData || failedSource === source)
-		return <p className="message-image-unavailable">{t("support.imageUnavailable")}</p>;
-	return (
-		<figure className="message-image">
-			<img src={source} alt={t("support.imageAlt")} onError={() => setFailedSource(source)} />
-		</figure>
-	);
-}
-
-function MessageBlocks({
-	blocks,
-	tool,
-	markdown = false,
-}: {
-	blocks: DesktopMessageBlock[];
-	tool: boolean;
-	markdown?: boolean;
-}) {
-	return blocks.map((block, index) => {
-		switch (block.type) {
-			case "text":
-				return block.text.trim() ? (
-					tool ? (
-						<pre className="bounded-output" key={index}>
-							{block.text}
-						</pre>
-					) : (
-						<div className="message-text" key={index}>
-							{markdown ? <Markdown text={block.text} /> : block.text}
-						</div>
-					)
-				) : null;
-			case "thinking":
-				return block.text.trim() ? (
-					<details className="thinking-disclosure" key={index}>
-						<summary>{t("support.reasoningSummary")}</summary>
-						<div className="message-text">
-							<Markdown text={block.text} />
-						</div>
-					</details>
-				) : null;
-			case "image":
-				return <MessageImage key={index} block={block} />;
-			case "image-unavailable":
-				return (
-					<p className="message-image-unavailable" key={index}>
-						{t("support.imageUnavailableWithReason", { reason: block.reason })}
-					</p>
-				);
-		}
-		return null;
-	});
-}
-
 /** Copies the exact persisted text the host returns, never the bounded transcript preview. */
 function MessageCopy({
 	onCopy,
@@ -424,6 +364,7 @@ export function Message({
 		? blocks.some(block => block.type === "image" || block.type === "image-unavailable" || !!block.text.trim())
 		: !!message.text.trim();
 	if (message.role === "assistant" && !hasContent) return null;
+	if (message.role === "tool") return <ToolCallCard message={message} />;
 	const copyable =
 		(message.role === "user" || (message.role === "assistant" && !message.isError && !message.cancelled)) &&
 		!!onCopy &&
@@ -514,37 +455,7 @@ export function Message({
 				roleLabel
 			)}
 			{message.truncated && <small className="truncation-notice">{t("support.truncated")}</small>}
-			{message.role === "tool" ? (
-				<details className="tool-disclosure">
-					<summary>
-						<ChevronRight className="disclosure-chevron" aria-hidden="true" />
-						<span className="tool-name">{message.toolName || t("support.toolFallback")}</span>
-						{message.excludeFromContext && <small> · {t("support.excludedFromContext")}</small>}
-						{message.cancelled ? (
-							<small> · {t("support.cancelled")}</small>
-						) : (
-							message.isError && (
-								<span className="tool-failure">
-									<CircleAlert aria-hidden="true" /> · {t("support.failed")}
-								</span>
-							)
-						)}
-					</summary>
-					<div className="tool-output">
-						{hasContent ? (
-							blocks ? (
-								<MessageBlocks blocks={blocks} tool />
-							) : (
-								<pre className="bounded-output">{message.text}</pre>
-							)
-						) : (
-							<pre className="bounded-output">{t("support.noOutput")}</pre>
-						)}
-					</div>
-				</details>
-			) : (
-				body
-			)}
+			{body}
 			{message.role === "assistant" && copyable && onCopy && (
 				<div className="message-actions">
 					<MessageCopy
@@ -736,57 +647,6 @@ export function Composer({
 		</form>
 	);
 }
-const todoStatusIcons = {
-	pending: Circle,
-	in_progress: LoaderCircle,
-	completed: CircleCheck,
-	abandoned: X,
-};
-
-/**
- * The live `todo_write` list. Collapsed it states the progress and the task in flight; expanded
- * it shows every task, so the tool's state is visible without reading the tool result.
- */
-export function TodoPanel({ phases }: { phases: DesktopTodoPhase[] }) {
-	const [open, setOpen] = useState(false);
-	const tasks = phases.flatMap(phase => phase.tasks);
-	if (tasks.length === 0) return null;
-	const done = tasks.filter(task => task.status === "completed").length;
-	const active = tasks.find(task => task.status === "in_progress");
-	return (
-		<section className="todo-panel" aria-label={t("support.todosLabel")}>
-			<button className="todo-toggle" type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
-				<ListChecks aria-hidden="true" />
-				<span className="todo-summary">
-					{t("support.todoProgress", { done, total: tasks.length })}
-					{!open && active && <small>{active.content}</small>}
-				</span>
-				{open ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
-			</button>
-			{open && (
-				<div className="todo-phases">
-					{phases.map((phase, phaseIndex) => (
-						<div className="todo-phase" key={`${phaseIndex}-${phase.name}`}>
-							{phase.name && <h3>{phase.name}</h3>}
-							<ul>
-								{phase.tasks.map((task, index) => {
-									const Icon = todoStatusIcons[task.status];
-									return (
-										<li key={`${task.content}-${index}`} className={`todo-task ${task.status}`}>
-											<Icon aria-hidden="true" />
-											<span>{task.content}</span>
-										</li>
-									);
-								})}
-							</ul>
-						</div>
-					))}
-				</div>
-			)}
-		</section>
-	);
-}
-
 const goalStatusLabels = {
 	active: () => t("support.goalActive"),
 	paused: () => t("support.goalPaused"),

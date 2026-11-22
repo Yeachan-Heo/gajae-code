@@ -121,7 +121,9 @@ import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
 import { SessionHudPanel } from "./SessionHudPanel";
 import { hasSessionWorkContent, SessionWorkPanel } from "./SessionWorkPanel";
+import { SessionWorkProgress, sessionWorkLabel } from "./SessionWorkProgress";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
+import { ToolCatalogDialog } from "./ToolCatalogDialog";
 import {
 	applyFontSize,
 	applyTheme,
@@ -137,6 +139,7 @@ import {
 	writeFontSizePreference,
 	writeThemePreference,
 } from "./themes";
+import { groupTranscript, TranscriptEntry, transcriptAnchorIndex } from "./transcript-groups";
 import { UpdatesNotification, UpdatesPanel, useDesktopUpdates } from "./UpdatesPanel";
 import "./styles.css";
 
@@ -673,8 +676,6 @@ export default function App() {
 	/** Sidebar rename target; independent of the selected conversation's dialogs. */
 	const [renaming, setRenaming] = useState<{ sessionId: string; title: string } | null>(null);
 	const [result, setResult] = useState("");
-	const [toolNames, setToolNames] = useState<string[]>([]);
-	const [activeTools, setActiveTools] = useState<string[]>([]);
 	const transcriptPositions = useRef(new Map<string, TranscriptPosition>());
 	const transcriptView = useRef<TranscriptView | null>(null);
 	const [, setTranscriptRevision] = useState(0);
@@ -689,9 +690,10 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const session = snapshot?.sessions.find(item => item.id === selected);
 	const rememberedTranscript = transcriptPositions.current.get(selected);
-	const anchorIndex = rememberedTranscript?.anchor
-		? (session?.messages.findIndex(message => message.id === rememberedTranscript.anchor?.id) ?? -1)
-		: -1;
+	const anchorIndex =
+		rememberedTranscript?.anchor && session
+			? transcriptAnchorIndex(session.messages, rememberedTranscript.anchor.id)
+			: -1;
 	// Appending a streamed message must not push the reader's anchor out of the rendered tail.
 	const historyLimit = Math.max(
 		rememberedTranscript?.historyLimit ?? 100,
@@ -811,7 +813,6 @@ export default function App() {
 		`${setting.path} ${setting.description ?? ""}`.toLowerCase().includes(settingFilter.toLowerCase()),
 	);
 	const settingsScope = `settings:${dialogOwner}:${dialogGeneration.current}`;
-	const toolsScope = `tools:${dialogOwner}:${dialogGeneration.current}`;
 	const historyScope = `history:${dialogOwner}:${dialogGeneration.current}`;
 	const authScope = `auth:${dialogOwner}:${dialogGeneration.current}`;
 	const operatorScope = `operator:${dialogOwner}`;
@@ -1406,14 +1407,6 @@ export default function App() {
 			}
 		});
 	};
-	const saveTools = () => {
-		const sessionId = dialogOwner;
-		const generation = dialogGeneration.current;
-		void run(toolsScope, async () => {
-			await request("tools.set", { sessionId, names: activeTools });
-			if (dialogGeneration.current === generation) setNotice(t("shell.toolsSaved"));
-		});
-	};
 	const openBtw = (question = "", composerText?: string) => {
 		if (!session || !connected || session.controlGeneration === null) return;
 		setBtwOwner({ sessionId: session.id, generation: session.controlGeneration, question, composerText });
@@ -1746,29 +1739,6 @@ export default function App() {
 			alive = false;
 		};
 	}, [review, selected, connected, session?.status]);
-	const openTools = () => {
-		const sessionId = selected;
-		const generation = setDialog("tools");
-		setToolNames([]);
-		setActiveTools([]);
-		void run(`tools:${sessionId}:${generation}`, async () => {
-			const value = await request<unknown>("tools.list", { sessionId });
-			if (dialogGeneration.current !== generation) return;
-			if (
-				!value ||
-				typeof value !== "object" ||
-				!("available" in value) ||
-				!("active" in value) ||
-				!Array.isArray(value.available) ||
-				!Array.isArray(value.active) ||
-				!value.available.every(item => typeof item === "string") ||
-				!value.active.every(item => typeof item === "string")
-			)
-				throw new Error(t("shell.toolListInvalid"));
-			setToolNames(value.available);
-			setActiveTools(value.active);
-		});
-	};
 	const activityScope = `activity:${selected}`;
 	const activityReadScope = `activity-read:${selected}`;
 	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
@@ -2762,8 +2732,8 @@ export default function App() {
 
 							<Button
 								id={workToggleId}
-								aria-label={t("shell.sessionWork")}
-								title={t("shell.sessionWork")}
+								aria-label={sessionWorkLabel(session)}
+								title={sessionWorkLabel(session)}
 								aria-expanded={workOpen}
 								aria-pressed={workOpen}
 								aria-controls={workPanelId}
@@ -2774,6 +2744,7 @@ export default function App() {
 								}}
 							>
 								<ListChecks size={15} aria-hidden="true" />
+								<SessionWorkProgress session={session} />
 								{activity?.sessionId === selected &&
 									activity.activity.sessionState?.gates.available &&
 									activity.activity.sessionState.gates.pending.length > 0 && (
@@ -2838,16 +2809,23 @@ export default function App() {
 										) : (
 											<div className="empty">{t("shell.emptyConversation")}</div>
 										))}
-									{session.messages.slice(-historyLimit).map(message => (
+									{groupTranscript(session.messages, historyLimit).map(item => (
 										<div
-											key={`${session.id}:${session.controlGeneration}:${message.id}`}
-											data-transcript-message={message.id}
+											key={`${session.id}:${session.controlGeneration}:${item.key}`}
+											data-transcript-message={item.key}
 											style={{ display: "contents" }}
 										>
-											<Message
-												message={message}
-												onCopy={readResponse(session.id, message)}
-												prompt={promptControls(session, message)}
+											<TranscriptEntry
+												item={item}
+												session={session}
+												connected={connected}
+												renderMessage={message => (
+													<Message
+														message={message}
+														onCopy={readResponse(session.id, message)}
+														prompt={promptControls(session, message)}
+													/>
+												)}
 											/>
 										</div>
 									))}
@@ -3092,14 +3070,21 @@ export default function App() {
 					}}
 				/>
 			)}
-			{dialog && dialog !== "btw" && dialogOwner === selected && (
+			{dialog === "tools" && dialogOwner === selected && session && (
+				<ToolCatalogDialog
+					key={dialogGeneration.current}
+					session={session}
+					connected={connected}
+					onClose={closeDialog}
+				/>
+			)}
+			{dialog && dialog !== "btw" && dialog !== "tools" && dialogOwner === selected && (
 				<Modal
 					title={
 						{
 							settings: t("shell.settings"),
 							fork: t("shell.dialogFork"),
 							delete: t("shell.dialogDelete"),
-							tools: t("shell.dialogTools"),
 							goal: t("shell.dialogGoal"),
 							result: t("shell.dialogResult"),
 							"activity-detail": t("shell.dialogActivityDetail"),
@@ -3111,7 +3096,7 @@ export default function App() {
 					}
 					onClose={closeDialog}
 				>
-					{[settingsScope, authScope, toolsScope, "goal", selected].map(scope =>
+					{[settingsScope, authScope, "goal", selected].map(scope =>
 						scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 					)}
 					{notice && <p role="status">{notice}</p>}
@@ -3159,7 +3144,7 @@ export default function App() {
 								<FileOutput aria-hidden="true" />
 								{t("shell.exportConversation")}
 							</Button>
-							<Button disabled={sessionActionDisabled} onClick={openTools}>
+							<Button disabled={sessionActionDisabled} onClick={() => setDialog("tools")}>
 								<Wrench aria-hidden="true" />
 								{t("shell.manageActiveTools")}
 							</Button>
@@ -3593,35 +3578,6 @@ export default function App() {
 								}}
 							>
 								{t("shell.dialogDelete")}
-							</Button>
-						</>
-					)}
-					{dialog === "tools" && (
-						<>
-							{pending[toolsScope] ? (
-								<p>{t("shell.loadingTools")}</p>
-							) : toolNames.length === 0 ? (
-								<p>{t("shell.noTools")}</p>
-							) : (
-								toolNames.map(name => (
-									<label className="checkbox-label" key={name}>
-										<input
-											type="checkbox"
-											checked={activeTools.includes(name)}
-											onChange={event =>
-												setActiveTools(previous =>
-													event.target.checked
-														? [...previous, name]
-														: previous.filter(item => item !== name),
-												)
-											}
-										/>
-										{name}
-									</label>
-								))
-							)}
-							<Button disabled={!connected || pending[toolsScope] || !!errors[toolsScope]} onClick={saveTools}>
-								{t("shell.saveTools")}
 							</Button>
 						</>
 					)}
