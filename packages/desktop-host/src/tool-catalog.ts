@@ -30,7 +30,11 @@ export interface ToolCatalogSession {
 	getToolByName(name: string): CatalogTool | undefined;
 	/** Inactive tools a tool search can still activate. Active tools are never listed here. */
 	getDiscoverableTools(): ReadonlyArray<{ name: string; serverName?: string }>;
-	/** Tools a tool search activated in this session, including selected MCP tools. */
+	/**
+	 * Builtins a tool search activated in this session, plus the selected MCP tools. The MCP part
+	 * is not search-only: it also holds MCP tools a person selected, and every active MCP tool
+	 * while MCP discovery is off.
+	 */
 	getSelectedDiscoveredToolNames(): string[];
 	isToolDiscoveryEnabled(): boolean;
 }
@@ -76,7 +80,7 @@ function origin(tool: CatalogTool | undefined, discoverable: boolean, discovered
  * `DESKTOP_TOOL_LIMITS.catalog` registered tools: their label, a one-line description, how they
  * entered the registry (`origin`), whether a tool search activated them (`discovered`), whether
  * they wait for a tool search (`hidden`: discovery is on, the tool is inactive and a search can
- * still find it) and their MCP server.
+ * still find it) and their MCP server. `discovered` is never set for an MCP tool.
  */
 export function projectToolCatalog(session: ToolCatalogSession, redact: (text: string) => string): DesktopToolList {
 	const names = session.getAllToolNames();
@@ -84,7 +88,7 @@ export function projectToolCatalog(session: ToolCatalogSession, redact: (text: s
 	const active = new Set(activeNames);
 	const discoveryEnabled = session.isToolDiscoveryEnabled();
 	const discoverable = new Map(session.getDiscoverableTools().map(tool => [tool.name, tool]));
-	const discovered = new Set(session.getSelectedDiscoveredToolNames());
+	const selected = new Set(discoveryEnabled ? session.getSelectedDiscoveredToolNames() : []);
 	const tools = names.slice(0, DESKTOP_TOOL_LIMITS.catalog).map((name): DesktopToolInfo => {
 		const tool = session.getToolByName(name);
 		const searchable = discoverable.get(name);
@@ -95,13 +99,16 @@ export function projectToolCatalog(session: ToolCatalogSession, redact: (text: s
 			tool && "mcpServerName" in tool && typeof tool.mcpServerName === "string" && tool.mcpServerName
 				? tool.mcpServerName
 				: searchable?.serverName;
+		// The SDK's selection cannot tell a searched MCP tool from one a person picked, so only a
+		// builtin is ever called found; a missing tag is safer than a false one.
+		const discovered = selected.has(name) && !server;
 		return {
 			name: redact(name),
 			label: bound(redact(label), DESKTOP_TOOL_LIMITS.description),
 			...(description ? { description } : {}),
 			active: isActive,
-			origin: origin(tool, searchable !== undefined, discovered.has(name)),
-			discovered: discovered.has(name),
+			origin: origin(tool, searchable !== undefined, selected.has(name)),
+			discovered,
 			...(discoveryEnabled && !isActive && searchable ? { hidden: true } : {}),
 			...(server ? { mcpServer: bound(redact(server), DESKTOP_TOOL_LIMITS.description) } : {}),
 		};

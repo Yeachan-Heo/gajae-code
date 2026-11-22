@@ -132,12 +132,13 @@ describe("tools.list projection", () => {
 				hidden: true,
 				mcpServer: "github",
 			},
+			// A selected MCP tool may have been picked by a person rather than found, so it is never "found".
 			{
 				name: "mcp_docs_lookup",
 				label: "docs/lookup",
 				active: true,
 				origin: "discoverable",
-				discovered: true,
+				discovered: false,
 				mcpServer: "docs",
 			},
 			// A tool without a label shows its name; one without a sentence terminator keeps its line.
@@ -152,19 +153,21 @@ describe("tools.list projection", () => {
 		]);
 	});
 
-	test("never marks a tool hidden while tool search is off", () => {
+	test("never marks a tool hidden or found while tool search is off", () => {
 		const result = projectToolCatalog(
-			fakeSession([{ name: "todo_write", loadMode: "discoverable" }], {
-				active: [],
-				discoverable: ["todo_write"],
-				selected: [],
-				discovery: false,
-			}),
+			fakeSession(
+				[
+					{ name: "todo_write", loadMode: "discoverable" },
+					{ name: "ast_grep", loadMode: "discoverable" },
+				],
+				{ active: ["ast_grep"], discoverable: ["todo_write"], selected: ["ast_grep"], discovery: false },
+			),
 			text => text,
 		);
 		expect(result.discovery).toEqual({ enabled: false });
 		expect(result.tools?.[0]).toMatchObject({ name: "todo_write", active: false, origin: "discoverable" });
 		expect(result.tools?.[0]?.hidden).toBeUndefined();
+		expect(result.tools?.[1]).toMatchObject({ name: "ast_grep", active: true, discovered: false });
 	});
 
 	test("redacts a whole description before cutting it, and bounds labels, descriptions and the list", () => {

@@ -445,9 +445,11 @@ suite("Tools dialog", () => {
 				...catalog,
 				active: ["read", "bash", "todo_write", "mcp_github_search"],
 				tools: catalog.tools.map(tool =>
-					tool.name === "todo_write" || tool.name === "mcp_github_search"
+					tool.name === "todo_write"
 						? { ...tool, active: true, discovered: true, hidden: undefined }
-						: tool,
+						: tool.name === "mcp_github_search"
+							? { ...tool, active: true, hidden: undefined }
+							: tool,
 				),
 			});
 			await page.waitForFunction(
@@ -458,7 +460,7 @@ suite("Tools dialog", () => {
 			expect((await read(page)).tools.find(tool => tool.name === "read")).toMatchObject({ checked: false });
 			expect((await read(page)).tools.find(tool => tool.name === "mcp_github_search")).toMatchObject({
 				checked: true,
-				tags: ["Found by tool search", "MCP · github"],
+				tags: ["MCP · github"],
 			});
 			expect(await page.evaluate(() => document.activeElement?.closest(".model-search") !== null)).toBe(true);
 			await clickButton(page, "Save tools");

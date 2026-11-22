@@ -47,7 +47,7 @@ const fixtureTools: DesktopToolInfo[] = [
 		description: "Create an issue in a Linear team.",
 		active: true,
 		origin: "discoverable",
-		discovered: true,
+		discovered: false,
 		mcpServer: "linear",
 	},
 	{
@@ -117,7 +117,7 @@ const koreanTools: DesktopToolInfo[] = [
 		description: "노션 워크스페이스에서 페이지와 데이터베이스를 검색합니다.",
 		active: true,
 		origin: "discoverable",
-		discovered: true,
+		discovered: false,
 		mcpServer: "노션",
 	},
 	{
