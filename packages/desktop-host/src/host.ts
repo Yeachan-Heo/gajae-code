@@ -418,6 +418,11 @@ const STALE_OUTCOME: Record<StaleReplacement, string> = {
 /** Every writing request on a released conversation answers with this, before any work starts. */
 const DISCONNECTED =
 	"This conversation is disconnected from the app, so the terminal can continue it. Connect it to continue here.";
+/** A request that arrives once a Disconnect has committed to releasing the conversation. */
+const DISCONNECTING =
+	"This conversation is being disconnected from the app, so nothing new can start in it. Connect it again to continue here.";
+/** How long a Disconnect waits for inputs still being admitted, or settling, before it releases the writer. */
+const DISCONNECT_SETTLE_MS = 5_000;
 /** A live process other than the app (usually a terminal) holds the transcript open. */
 const ELSEWHERE =
 	"Another gjc process, such as a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.";
@@ -434,6 +439,8 @@ interface TrackedQueuedInput {
 	dto: DesktopQueuedInput;
 	submission: QueuedInputSubmission;
 	deliveryId: string;
+	/** Settles once this input's final receipt is written. */
+	settled?: Promise<void>;
 }
 /** A queued input's search for its own user turn, which the SDK does not identify (see `#claimUserTurn`). */
 interface UserTurnClaimant {
@@ -572,6 +579,13 @@ export class DesktopHost {
 	 * input that arrived before such a Stop can end `cancelled` or be handed back as not run.
 	 */
 	#runStops = new Map<string, number>();
+	/**
+	 * Conversations whose Disconnect has committed to releasing them. From that instant every new
+	 * request sees the conversation as not writable, and Connect or delete waits for the release.
+	 */
+	#disconnecting = new Map<string, Promise<unknown>>();
+	/** Input requests (`prompt`, `command.run`) still in flight, per conversation. */
+	#inputs = new Map<string, Set<Promise<void>>>();
 	#live = new Map<string, LiveSession>();
 	/** Publication tokens survive live-map removal without retaining disposed SDK owners. */
 	#viewOwners = new WeakMap<SavedSession, symbol>();
@@ -1135,10 +1149,12 @@ export class DesktopHost {
 	}
 	/** The app may open its own writer for this conversation. */
 	#writable(metadata: SavedSession): boolean {
-		return this.#connection(metadata) === "connected";
+		return !this.#disconnecting.has(metadata.id) && this.#connection(metadata) === "connected";
 	}
 	#notWritable(metadata: SavedSession): Error {
-		return new Error(metadata.disconnected ? DISCONNECTED : ELSEWHERE);
+		return new Error(
+			metadata.disconnected ? DISCONNECTED : this.#disconnecting.has(metadata.id) ? DISCONNECTING : ELSEWHERE,
+		);
 	}
 	/**
 	 * Ask the broker whether another live process holds this transcript open, and remember the
@@ -2257,6 +2273,7 @@ export class DesktopHost {
 		images: ImageContent[],
 		allowGateMutation = false,
 		beforeTerminal?: () => Promise<void>,
+		stopped?: () => boolean,
 	): Promise<{ handled: boolean; text: string; images: ImageContent[] }> {
 		const runner = live.sdk.extensionRunner;
 		if (!runner?.hasHandlers("input")) return { handled: false, text, images };
@@ -2277,7 +2294,14 @@ export class DesktopHost {
 			(live.gateMutation && !allowGateMutation)
 		) {
 			if (beforeTerminal) await beforeTerminal();
-			await this.#delivery(id, { disposition: "unknown", error: "Session changed during extension input" });
+			// A Stop (or a Disconnect stopping the run) ended this conversation's run while the hook
+			// ran, so this input never reached it: hand its text back, as the Stop would have.
+			await this.#delivery(
+				id,
+				stopped?.()
+					? { disposition: "refused", error: "Prompt stopped before it started" }
+					: { disposition: "unknown", error: "Session changed during extension input" },
+			);
 			throw new Error("Session changed during extension input");
 		}
 		if (result.handled) {
@@ -2370,7 +2394,7 @@ export class DesktopHost {
 			}
 			settleView();
 		};
-		const input = await this.#extensionInput(live, id, text, images, allowGateMutation, settleTerminalView);
+		const input = await this.#extensionInput(live, id, text, images, allowGateMutation, settleTerminalView, stopped);
 		if (input.handled) return;
 		if (stopped()) {
 			// A Stop that overtook this prompt before it reached the SDK (its delivery record, startup
@@ -2648,7 +2672,7 @@ export class DesktopHost {
 		// This Stop goes on to stop the run. Record its arrival before releasing anything it
 		// interrupts, so every input that arrived earlier sees it from here on. A Stop that only
 		// cancelled a shell command, or could not proceed, returned above without recording.
-		this.#runStops.set(live.metadata.id, Math.max(this.#runStops.get(live.metadata.id) ?? 0, arrival));
+		this.#recordRunStop(live.metadata.id, arrival);
 		this.#cancelQuestions(live);
 		// An input still queued never reached the conversation, so Stop hands it back: `removed`
 		// returns its text to the composer, where `cancelled` would drop it. This write lands
@@ -2662,6 +2686,9 @@ export class DesktopHost {
 		// from the recorded Stop, not from the cause.
 		await live.sdk.abort();
 		this.#publish(live);
+	}
+	#recordRunStop(sessionId: string, arrival: number): void {
+		this.#runStops.set(sessionId, Math.max(this.#runStops.get(sessionId) ?? 0, arrival));
 	}
 	/** Work Disconnect would stop: a turn, queued input, a command or a question still waiting. */
 	#disconnectWouldStop(live: LiveSession): { running: boolean; queued: number } | undefined {
@@ -2682,19 +2709,65 @@ export class DesktopHost {
 		if (metadata.managed) throw new Error("Disconnect this conversation in the terminal that owns it.");
 		const opening = this.#opening.get(metadata.id);
 		if (opening) await opening.catch(() => {});
-		let live = this.#live.get(metadata.id);
+		// One release at a time: a Disconnect already releasing this conversation finishes first.
+		for (let pending = this.#disconnecting.get(metadata.id); pending; pending = this.#disconnecting.get(metadata.id))
+			await pending.catch(() => {});
+		// No await from here to the commit below.
+		const live = this.#live.get(metadata.id);
+		const stopping = live && !metadata.disconnected ? this.#disconnectWouldStop(live) : undefined;
+		if (stopping && !confirm) return { disconnected: false, confirm: stopping };
+		if (live && stopping && live.operator?.isBusy() && !live.operatorCurrentId)
+			throw new Error("Waiting for the previous command to settle. Stop cannot be proven for this conversation.");
+		// Committed. Like a Stop, this ends anything an earlier input would start: every input that
+		// arrived before it is refused or handed back. Every request that arrives after it sees the
+		// conversation as not writable, so nothing new is admitted into the session being released,
+		// and Connect or delete waits for the release.
+		this.#recordRunStop(metadata.id, arrival);
+		const release = Promise.withResolvers<void>();
+		release.promise.catch(() => {});
+		this.#disconnecting.set(metadata.id, release.promise);
+		try {
+			const result = await this.#releaseWriter(metadata, live, stopping !== undefined, arrival);
+			release.resolve();
+			return result;
+		} catch (error) {
+			release.reject(error);
+			throw error;
+		} finally {
+			if (this.#disconnecting.get(metadata.id) === release.promise) this.#disconnecting.delete(metadata.id);
+		}
+	}
+	/** The committed part of Disconnect: stop, settle every receipt, then release the writer. */
+	async #releaseWriter(
+		metadata: SavedSession,
+		found: LiveSession | undefined,
+		stopping: boolean,
+		arrival: number,
+	): Promise<DesktopDisconnectResult> {
+		let live = found;
 		if (live && !metadata.disconnected) {
-			const stopping = this.#disconnectWouldStop(live);
-			if (stopping && !confirm) return { disconnected: false, confirm: stopping };
 			if (stopping) await this.#stop(live, arrival);
 			// Join the stopped request until its receipt and view are written; disposing earlier would
 			// turn a cancelled prompt into an unknown one.
 			for (let attempt = 0; attempt < 3 && live.exclusiveDone; attempt++) await live.exclusiveDone;
+			// Inputs still being admitted (a delivery record, an input hook, the SDK's admission) are
+			// refused or handed back against the recorded stop; let them finish against this session.
+			const budget = AbortSignal.timeout(DISCONNECT_SETTLE_MS);
+			await bounded(Promise.allSettled([...(this.#inputs.get(metadata.id) ?? [])]), budget).catch(() => {});
 			await live.viewPersistence?.catch(() => {});
 			if (live.sdk.isStreaming) await live.sdk.waitForIdle().catch(() => {});
-			live = this.#live.get(metadata.id);
-			if (live && (live.busy || live.sdk.isStreaming || live.operator?.isBusy()))
+			// Hand back anything still queued that no run took, as Stop does, and let the inputs the run
+			// took settle from this session's transcript before it is disposed.
+			for (const tracked of live.queued.values()) {
+				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "removed" });
+			}
+			await bounded(Promise.allSettled([...live.queued.values()].map(tracked => tracked.settled)), budget).catch(
+				() => {},
+			);
+			const current = this.#live.get(metadata.id);
+			if (current && (current.busy || current.sdk.isStreaming || current.operator?.isBusy()))
 				throw new Error("The conversation is still stopping. Try Disconnect again.");
+			live = current;
 		}
 		// From here every writing request refuses, and nothing reopens the writer behind this.
 		metadata.disconnected = true;
@@ -2870,6 +2943,7 @@ export class DesktopHost {
 		return (
 			this.#live.get(live.metadata.id) === live &&
 			!this.#opening.has(live.metadata.id) &&
+			!this.#disconnecting.has(live.metadata.id) &&
 			!live.busy &&
 			!live.sdk.isStreaming &&
 			live.queued.size === 0 &&
@@ -2927,6 +3001,18 @@ export class DesktopHost {
 		if (request.method !== "shutdown") {
 			this.#tasks.add(task);
 			const release = () => this.#tasks.delete(task);
+			void task.then(release, release);
+		}
+		// A Disconnect waits for inputs still being admitted, so none is left to a disposed session.
+		const sessionId = request.params.sessionId;
+		if ((request.method === "prompt" || request.method === "command.run") && typeof sessionId === "string") {
+			const inputs = this.#inputs.get(sessionId) ?? new Set<Promise<void>>();
+			this.#inputs.set(sessionId, inputs);
+			inputs.add(task);
+			const release = () => {
+				inputs.delete(task);
+				if (!inputs.size && this.#inputs.get(sessionId) === inputs) this.#inputs.delete(sessionId);
+			};
 			void task.then(release, release);
 		}
 		return task;
@@ -3362,6 +3448,14 @@ export class DesktopHost {
 		];
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
+		// Connect and delete act on the released conversation, once a committed Disconnect has finished.
+		if (method === "session.connect" || method === "session.delete")
+			for (
+				let pending = this.#disconnecting.get(metadata.id);
+				pending;
+				pending = this.#disconnecting.get(metadata.id)
+			)
+				await pending.catch(() => {});
 		if (method === "session.disconnect") {
 			if (params.confirm !== undefined && typeof params.confirm !== "boolean") throw new Error("Invalid confirm");
 			return this.#disconnect(metadata, params.confirm === true, arrival);
@@ -3616,7 +3710,7 @@ export class DesktopHost {
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
 				const stopped = () => this.#stoppedSince(live.metadata.id, arrival);
-				const input = await this.#extensionInput(live, request.id, text, images);
+				const input = await this.#extensionInput(live, request.id, text, images, false, undefined, stopped);
 				if (input.handled) return null;
 				if (stopped()) {
 					// A Stop overtook this input before it was queued (its delivery record, startup or
@@ -3699,7 +3793,8 @@ export class DesktopHost {
 					deliverAs,
 					cancelable: true,
 				};
-				live.queued.set(dto.id, { dto, submission, deliveryId: request.id });
+				const tracked: TrackedQueuedInput = { dto, submission, deliveryId: request.id };
+				live.queued.set(dto.id, tracked);
 				const settle = (execution?: DesktopQueuedInput["execution"]) => {
 					const tracked = live.queued.get(dto.id);
 					if (!tracked) return;
@@ -3743,75 +3838,67 @@ export class DesktopHost {
 						},
 					),
 				);
-				this.#observeDelivery(
-					submission.terminal.then(
-						async outcome => {
-							await queuedPersisted;
-							unsubscribeTerminal();
-							live.queued.delete(dto.id);
-							this.#publish(live);
-							const terminal =
-								outcome.disposition === "completed"
-									? terminalEvents.get(scopeKey(outcome.attemptScope))
-									: undefined;
-							// Consumption settles before the input's own message is appended, so after a Stop
-							// this input counts as sent only once its own turn is in the transcript.
-							const ownTurn =
-								outcome.disposition === "completed" ? this.#claimUserTurn(live, claimant) : undefined;
-							const stoppedRun = stopped();
-							const inTranscript = ownTurn !== undefined && persistedUserTurn(live.sdk, ownTurn);
-							const disposition =
-								outcome.disposition === "removed"
-									? outcome.reason === "cancelled"
-										? "cancelled"
-										: outcome.reason === "refused"
-											? "refused"
-											: "removed"
-									: terminal?.assistant === "error"
-										? "failed"
-										: terminal?.reason === "completed" &&
-												terminal.assistant &&
-												terminal.assistant !== "aborted"
-											? // A run Stop ended after its final answer still completes, but an input
-												// it took and handed back unsent is not part of that answer.
-												stoppedRun && !inTranscript
-												? "unknown"
-												: "completed"
-											: (terminal?.assistant === "aborted" || terminal?.reason === "cancelled") &&
-													stoppedRun &&
-													inTranscript
-												? "cancelled"
-												: "unknown";
-							await this.#delivery(request.id, {
-								disposition,
-								...(disposition === "failed" ? { error: "Prompt failed" } : {}),
-							});
-							if (
-								accepted &&
-								disposition === "completed" &&
-								terminal?.assistant === "stop" &&
-								outcome.disposition === "completed"
-							)
-								completeTask(outcome.attemptScope);
-							if (
-								disposition === "failed" &&
-								outcome.disposition === "completed" &&
-								live.errorEpoch === errorEpoch
-							)
-								this.#recordScopeFailure(live, outcome.attemptScope, request.id);
-						},
-						async () => {
-							await queuedPersisted;
-							unsubscribeTerminal();
-							live.queued.delete(dto.id);
-							this.#publish(live);
-							await this.#delivery(request.id, {
-								disposition: "unknown",
-								error: "Submission lifecycle unavailable",
-							});
-						},
-					),
+				tracked.settled = submission.terminal.then(
+					async outcome => {
+						await queuedPersisted;
+						unsubscribeTerminal();
+						live.queued.delete(dto.id);
+						this.#publish(live);
+						const terminal =
+							outcome.disposition === "completed"
+								? terminalEvents.get(scopeKey(outcome.attemptScope))
+								: undefined;
+						// Consumption settles before the input's own message is appended, so after a Stop
+						// this input counts as sent only once its own turn is in the transcript.
+						const ownTurn = outcome.disposition === "completed" ? this.#claimUserTurn(live, claimant) : undefined;
+						const stoppedRun = stopped();
+						const inTranscript = ownTurn !== undefined && persistedUserTurn(live.sdk, ownTurn);
+						const disposition =
+							outcome.disposition === "removed"
+								? outcome.reason === "cancelled"
+									? "cancelled"
+									: outcome.reason === "refused"
+										? "refused"
+										: "removed"
+								: terminal?.assistant === "error"
+									? "failed"
+									: terminal?.reason === "completed" && terminal.assistant && terminal.assistant !== "aborted"
+										? // A run Stop ended after its final answer still completes, but an input
+											// it took and handed back unsent is not part of that answer.
+											stoppedRun && !inTranscript
+											? "unknown"
+											: "completed"
+										: (terminal?.assistant === "aborted" || terminal?.reason === "cancelled") &&
+												stoppedRun &&
+												inTranscript
+											? "cancelled"
+											: "unknown";
+						await this.#delivery(request.id, {
+							disposition,
+							...(disposition === "failed" ? { error: "Prompt failed" } : {}),
+						});
+						if (
+							accepted &&
+							disposition === "completed" &&
+							terminal?.assistant === "stop" &&
+							outcome.disposition === "completed"
+						)
+							completeTask(outcome.attemptScope);
+						if (disposition === "failed" && outcome.disposition === "completed" && live.errorEpoch === errorEpoch)
+							this.#recordScopeFailure(live, outcome.attemptScope, request.id);
+					},
+					async () => {
+						await queuedPersisted;
+						unsubscribeTerminal();
+						live.queued.delete(dto.id);
+						this.#publish(live);
+						await this.#delivery(request.id, {
+							disposition: "unknown",
+							error: "Submission lifecycle unavailable",
+						});
+					},
 				);
+				this.#observeDelivery(tracked.settled);
 				// A Stop that arrived after this input may have swept the queue while the SDK was still
 				// admitting it, before it was added above; the plain abort keeps a follow-up queued for
 				// the next turn. Hand it back as the sweep would have. The write is issued before the

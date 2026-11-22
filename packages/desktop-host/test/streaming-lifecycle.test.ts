@@ -23,6 +23,7 @@ import { DeliveryJournal } from "../src/delivery-journal";
 import { DesktopHost } from "../src/host";
 import {
 	type DesktopCommandResult,
+	type DesktopDisconnectResult,
 	type DesktopFrame,
 	type DesktopHistory,
 	type DesktopProject,
@@ -1241,6 +1242,173 @@ describe("desktop streaming lifecycle", () => {
 				error: "Prompt stopped before it started",
 			}),
 		);
+	});
+
+	/** A request's own response frame, whether it succeeded or not. */
+	async function respond(
+		h: {
+			call: (method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<unknown>;
+		} & {
+			frames: DesktopFrame[];
+		},
+		method: DesktopRequest["method"],
+		params: Record<string, unknown>,
+		id: string = crypto.randomUUID(),
+	) {
+		await h.call(method, params, id).catch(() => {});
+		return h.frames.findLast(frame => frame.type === "response" && frame.id === id);
+	}
+	const active = (snapshot: DesktopSnapshot) =>
+		snapshot.deliveries.filter(receipt => ["pending", "accepted", "queued"].includes(receipt.disposition));
+
+	test("requests that arrive while a confirmed Disconnect is stopping the run are refused and handed back", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-disconnect");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "queued before", deliverAs: "followUp" }, "queued-before-disconnect");
+		// Keep the Disconnect inside its Stop: the run is still being ended.
+		const abort = sdk.abort.bind(sdk);
+		const abortReached = Promise.withResolvers<void>();
+		const finishAbort = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			abortReached.resolve();
+			await finishAbort.promise;
+			return abort(options);
+		});
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await abortReached.promise;
+		const prompt = await respond(h, "prompt", { sessionId, text: "typed while disconnecting" }, "prompt-late");
+		const steer = await respond(
+			h,
+			"prompt",
+			{ sessionId, text: "steered while disconnecting", deliverAs: "steer" },
+			"steer-late",
+		);
+		const command = await respond(h, "prompt", { sessionId, text: "/notify on" }, "command-late");
+		const rename = await respond(h, "session.rename", { sessionId, title: "renamed while disconnecting" });
+		finishAbort.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		for (const response of [prompt, steer, command])
+			expect(response).toMatchObject({ ok: false, deliveryDisposition: "refused" });
+		expect(rename).toMatchObject({ ok: false, error: expect.stringContaining("disconnect") });
+		const state = await snapshot();
+		expect(
+			await settledReceipts(snapshot, [
+				"run-before-disconnect",
+				"queued-before-disconnect",
+				"prompt-late",
+				"steer-late",
+				"command-late",
+			]),
+		).toEqual({
+			"run-before-disconnect": "cancelled",
+			"queued-before-disconnect": "removed",
+			"prompt-late": "refused",
+			"steer-late": "refused",
+			"command-late": "refused",
+		});
+		expect(active(state)).toEqual([]);
+		expect(state.sessions[0]?.connection).toEqual({ state: "disconnected" });
+		expect(state.sessions[0]?.title).not.toBe("renamed while disconnecting");
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	test("Disconnect settles a steer the run already sent as cancelled before releasing the writer", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-with-sent-steer");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "steer it", deliverAs: "steer" }, "sent-steer");
+		control.finishTurn("first answer");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(control.prompts[1]).toBe("long task\nsteer it");
+		await call("prompt", { sessionId, text: "still waiting", deliverAs: "followUp" }, "waiting-follow-up");
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		// Every receipt is final the moment Disconnect answers, judged against this session's transcript.
+		const state = await snapshot();
+		expect(active(state)).toEqual([]);
+		expect(
+			Object.fromEntries(
+				state.deliveries
+					.filter(receipt => ["run-with-sent-steer", "sent-steer", "waiting-follow-up"].includes(receipt.id))
+					.map(receipt => [receipt.id, receipt.disposition]),
+			),
+		).toEqual({ "run-with-sent-steer": "cancelled", "sent-steer": "cancelled", "waiting-follow-up": "removed" });
+		expect(await running).toBeNull();
+		expect(control.prompts).toHaveLength(2);
+		expect(userTurns(sdk)).toEqual(["long task", "steer it"]);
+	});
+
+	test("Disconnect waits for an input still in its hook and hands it back before releasing the writer", async () => {
+		const holdKey = "__gjcDesktopDisconnectHookHold";
+		const enteredKey = "__gjcDesktopDisconnectHookEntered";
+		const hold = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const globals = globalThis as Record<string, unknown>;
+		globals[holdKey] = hold.promise;
+		globals[enteredKey] = () => entered.resolve();
+		cleanups.push(async () => {
+			hold.resolve();
+			delete globals[holdKey];
+			delete globals[enteredKey];
+		});
+		const h = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => {
+				if (event.text.startsWith("slow")) {
+					globalThis.${enteredKey}();
+					await globalThis.${holdKey};
+				}
+				return { text: event.text };
+			});
+		}`,
+		);
+		const { call, snapshot, session, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-hooked-disconnect");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const steer = respond(h, "prompt", { sessionId, text: "slow steer", deliverAs: "steer" }, "steer-in-hook");
+		await entered.promise;
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		// The writer is not released under an input that is still being admitted.
+		expect(await Promise.race([disconnecting.then(() => "released"), Bun.sleep(200).then(() => "waiting")])).toBe(
+			"waiting",
+		);
+		hold.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		const state = await snapshot();
+		expect(active(state)).toEqual([]);
+		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "steer-in-hook", disposition: "refused" }));
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "run-before-hooked-disconnect", disposition: "cancelled" }),
+		);
+		// The request settles; its refused receipt is what returns the text to the composer.
+		expect(await steer).toMatchObject({ ok: true, result: null });
+		expect(control.prompts).toHaveLength(1);
 	});
 
 	test("Stop in one conversation leaves another conversation's run and inputs alone", async () => {
