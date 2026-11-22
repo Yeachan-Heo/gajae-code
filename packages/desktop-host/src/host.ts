@@ -116,6 +116,8 @@ import { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./protocol";
 import { projectDesktopSessionInfo, readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
+import { projectToolCatalog } from "./tool-catalog";
+import { observeToolEvent, projectToolDetail } from "./tool-projection";
 
 type AgentSession = CreateAgentSessionResult["session"];
 type SessionManager = AgentSession["sessionManager"];
@@ -156,6 +158,8 @@ const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"mcp.get",
 	"mcp.operate",
 	"session.info",
+	"tools.list",
+	"tool.detail",
 ]);
 const HISTORY_PAGE_LIMIT = 500;
 const COMMAND_OUTPUT_LIMIT = 200_000;
@@ -1324,6 +1328,7 @@ export class DesktopHost {
 					}),
 				);
 			this.#schedule(live);
+			observeToolEvent(live.sdk, event);
 		});
 		live.unsubscribeActivity = live.activity.onChange(() => this.#scheduleActivity(live));
 		live.unsubscribeIdentity = live.sdk.subscribeSessionIdentityChanges(() => this.#schedule(live));
@@ -2654,6 +2659,7 @@ export class DesktopHost {
 			"diff.get",
 			"tools.list",
 			"tools.set",
+			"tool.detail",
 			"goal.operate",
 			"queue.cancel",
 		];
@@ -2870,8 +2876,11 @@ export class DesktopHost {
 			this.#assertModelCatalogReady(live.sdk.modelRegistry);
 			return this.#sessionModels(live.sdk).map(projectDesktopModel);
 		}
-		if (method === "tools.list")
-			return { available: live.sdk.getAllToolNames(), active: live.sdk.getActiveToolNames() };
+		if (method === "tools.list") return projectToolCatalog(live.sdk, text => this.#redact(text));
+		if (method === "tool.detail")
+			return projectToolDetail(live.sdk, live.streamingMessage, requiredString(params, "callId", 512), text =>
+				this.#redact(text),
+			);
 		if (method === "diff.get") return this.#diff(live);
 		if (method === "prompt") {
 			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");

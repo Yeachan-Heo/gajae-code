@@ -116,6 +116,7 @@ const allowed = new Set<DesktopMethod>([
 	"auth.keyProviders",
 	"auth.state",
 	"tools.list",
+	"tool.detail",
 	"diff.get",
 	"shutdown",
 ]);
@@ -123,6 +124,7 @@ if (fixtureMode) {
 	allowed.add("project.close");
 	allowed.add("thinking.set");
 	allowed.add("auth.setKey");
+	allowed.add("tools.set");
 }
 const clients = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
 const encoder = new TextEncoder();

@@ -3,6 +3,7 @@ import type { DesktopBtwEvent } from "./btw-protocol";
 import type { DesktopGatePresentationEvent } from "./gate-presentation-protocol";
 import type { DesktopOperatorEvent } from "./operator-protocol";
 import type { DesktopPreferenceOutcome } from "./preferences-protocol";
+import type { DesktopToolCall } from "./tool-protocol";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -71,6 +72,7 @@ export const DESKTOP_METHODS = [
 	"diff.get",
 	"tools.list",
 	"tools.set",
+	"tool.detail",
 	"goal.operate",
 	"shutdown",
 ] as const;
@@ -105,6 +107,8 @@ export interface DesktopMessage {
 	cancelled?: boolean;
 	isError?: boolean;
 	truncated?: boolean;
+	/** Call metadata on a `role: "tool"` row; a row without it renders from `toolName` and `text`. */
+	tool?: DesktopToolCall;
 }
 
 export interface DesktopMessageRevision {
@@ -184,6 +188,8 @@ export interface DesktopThinking {
 export interface DesktopTodoItem {
 	content: string;
 	status: "pending" | "in_progress" | "completed" | "abandoned";
+	/** The task's notes, oldest first: at most 5, each redacted and cut to 300 characters. */
+	notes?: string[];
 }
 export interface DesktopTodoPhase {
 	name: string;

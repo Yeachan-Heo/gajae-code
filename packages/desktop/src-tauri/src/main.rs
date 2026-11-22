@@ -624,6 +624,7 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "diff.get"
 			| "tools.list"
 			| "tools.set"
+			| "tool.detail"
 			| "goal.operate"
 			| "project.close"
 			| "project.reorder"

@@ -14,7 +14,8 @@
 		"./operator-protocol": "./src/operator-protocol.ts",
 		"./preferences-protocol": "./src/preferences-protocol.ts",
 		"./protocol": "./src/protocol.ts",
-		"./session-info-protocol": "./src/session-info-protocol.ts"
+		"./session-info-protocol": "./src/session-info-protocol.ts",
+		"./tool-protocol": "./src/tool-protocol.ts"
 	},
 	"scripts": {
 		"start": "bun src/index.ts",
