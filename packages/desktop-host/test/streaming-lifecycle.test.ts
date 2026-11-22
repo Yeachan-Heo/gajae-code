@@ -1323,6 +1323,51 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task"]);
 	});
 
+	test("a second Disconnect and a delete wait for a Disconnect that is still stopping the run", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-joined-disconnect");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const abort = sdk.abort.bind(sdk);
+		const abortReached = Promise.withResolvers<void>();
+		const finishAbort = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			abortReached.resolve();
+			await finishAbort.promise;
+			return abort(options);
+		});
+		const first = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await abortReached.promise;
+		const order: string[] = [];
+		const second = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true }).then(result => {
+			order.push("second disconnect");
+			return result;
+		});
+		const deleted = call("session.delete", { sessionId }).then(result => {
+			order.push("delete");
+			return result;
+		});
+		await Bun.sleep(100);
+		// Neither acts on the conversation while the first Disconnect is still releasing it.
+		expect(order).toEqual([]);
+		finishAbort.resolve();
+		expect((await first).disconnected).toBe(true);
+		expect((await second).disconnected).toBe(true);
+		await deleted;
+		expect(order).toEqual(["second disconnect", "delete"]);
+		expect(await running).toBeNull();
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions.some(item => item.id === sessionId)).toBe(false);
+		expect(active(state)).toEqual([]);
+	});
+
 	test("Disconnect settles a steer the run already sent as cancelled before releasing the writer", async () => {
 		const h = await launch();
 		const { call, snapshot, session, sdk, control } = h;

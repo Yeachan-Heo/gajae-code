@@ -1028,6 +1028,38 @@ test("a prompt after a long idle checks again and steps aside for a terminal tha
 	await h.close();
 });
 
+test("a prompt sent just before a Disconnect of an idle conversation never runs in it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const now = Date.now();
+	const later = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60_000);
+	cleanups.push(async () => later.mockRestore());
+	// The prompt has been admitted to the conversation but waits for the owner check.
+	const releaseBroker = h.holdBroker();
+	const lookups = h.ownerLookups.length;
+	const calls = h.model.calls.length;
+	const prompt = h.call("prompt", { sessionId, text: "sent before disconnect" });
+	void prompt.catch(() => {});
+	await until(() => h.ownerLookups.length > lookups, "the owner lookup");
+	// Nothing runs yet, so Disconnect needs no confirmation.
+	const disconnecting = h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
+	releaseBroker();
+	expect((await disconnecting).disconnected).toBe(true);
+	expect(await prompt).toBeNull();
+	expect(h.model.calls).toHaveLength(calls);
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({
+		sessionId,
+		disposition: "refused",
+		error: "Prompt stopped before it started",
+	});
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
+	await h.close();
+});
+
 test("a turn that starts while the owner check is waiting is not released under it", async () => {
 	const held = heldTurn();
 	const h = await controlledFixture(held.handler);
