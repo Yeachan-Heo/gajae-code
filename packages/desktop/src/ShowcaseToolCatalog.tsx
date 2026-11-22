@@ -1,11 +1,10 @@
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolInfo, DesktopToolSearchDetail } from "@gajae-code/desktop-host/tool-protocol";
-import { ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { Button, Modal } from "./components";
 import { t } from "./i18n";
+import { ToolCallCard, ToolDetailContext, type ToolDetailSource } from "./ToolCallCard";
 import { type ToolCatalog, ToolCatalogPanel, type ToolCatalogPanelProps } from "./ToolCatalogDialog";
-import { ToolSearchBody } from "./ToolSearchBody";
 
 /** Design-only tool rows. Labels and descriptions stand in for Host-issued tool metadata, which is not catalog copy. */
 const fixtureTools: DesktopToolInfo[] = [
@@ -230,13 +229,21 @@ const states: Array<{ id: string; title: () => string; props: FixtureProps; narr
 	{ id: "empty", title: () => t("catalog.showcaseEmpty"), props: { catalog: catalogOf([]) } },
 ];
 
-const searchMessage: DesktopMessage = {
+/** A settled tool-search row as the Host projects it; `activated` feeds the summary's fact. */
+const searchMessage = (query: string, activated: string[]): DesktopMessage => ({
 	id: "DESIGN-ONLY-tool-search",
 	role: "tool",
 	toolName: "search_tool_bm25",
-	text: '{"query":"todo list","activated_tools":["todo_write","mcp_linear_create_issue"],"match_count":4,"total_tools":31}',
-	tool: { callId: "DESIGN-ONLY-call", status: "done", family: "tool-search", subject: "todo list", detail: true },
-};
+	text: JSON.stringify({ query, activated_tools: activated, match_count: 4, total_tools: 31 }),
+	tool: {
+		callId: "DESIGN-ONLY-call",
+		status: "done",
+		family: "tool-search",
+		subject: query,
+		...(activated.length > 0 ? { stats: { activated } } : {}),
+		detail: true,
+	},
+});
 
 const populatedSearch: DesktopToolSearchDetail = {
 	query: "todo list",
@@ -284,6 +291,17 @@ const searchStates: Array<{ id: string; title: () => string; search?: DesktopToo
 	{ id: "fallback", title: () => t("catalog.showcaseSearchFallback") },
 ];
 
+/** One local detail source per state, so a re-render never reloads the card. */
+const searchSources = new Map<DesktopToolSearchDetail | undefined, ToolDetailSource>();
+function searchSource(search: DesktopToolSearchDetail | undefined): ToolDetailSource {
+	let source = searchSources.get(search);
+	if (!source) {
+		source = { load: async callId => ({ callId, ...(search ? { toolSearch: search } : {}) }) };
+		searchSources.set(search, source);
+	}
+	return source;
+}
+
 /** Showcase index links for the tool catalog and tool search sections. */
 export function ShowcaseToolCatalogNav() {
 	return (
@@ -308,23 +326,13 @@ export function ShowcaseToolCatalog() {
 				{searchStates.map(state => (
 					<div className="tool-catalog-showcase" id={`showcase-tool-search-${state.id}`} key={state.id}>
 						<h3>{state.title()}</h3>
-						<article className="message tool">
-							<details className="tool-disclosure" open>
-								<summary>
-									<ChevronRight className="disclosure-chevron" aria-hidden="true" />
-									<span className="tool-name">{searchMessage.toolName}</span>
-								</summary>
-								<ToolSearchBody
-									message={searchMessage}
-									detail={state.search ? { callId: "DESIGN-ONLY-call", toolSearch: state.search } : undefined}
-									output={
-										<div className="tool-output">
-											<pre className="bounded-output">{searchMessage.text}</pre>
-										</div>
-									}
-								/>
-							</details>
-						</article>
+						{/* The real card, loading its details from a local source the way the app does. */}
+						<ToolDetailContext.Provider value={searchSource(state.search)}>
+							<ToolCallCard
+								message={searchMessage(state.search?.query ?? "todo list", state.search?.activated ?? [])}
+								defaultOpen
+							/>
+						</ToolDetailContext.Provider>
 					</div>
 				))}
 			</section>

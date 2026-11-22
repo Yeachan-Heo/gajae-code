@@ -708,6 +708,8 @@ suite("Tools dialog", () => {
 			await page.setViewport({ width: 390, height: 844 });
 			await page.goto(`${origin}/?showcase`);
 			await page.waitForSelector("#showcase-tool-catalog-empty");
+			// Tool-search states render the real card, which loads its details like the app does.
+			await page.waitForFunction(() => document.querySelectorAll("#showcase-tool-search .tool-search-body").length === 3);
 			const layout = await page.evaluate(() => ({
 				states: [...document.querySelectorAll("#showcase-tool-catalog .tool-catalog-showcase")].map(
 					node => node.id,
@@ -715,6 +717,10 @@ suite("Tools dialog", () => {
 				searchStates: [...document.querySelectorAll("#showcase-tool-search .tool-catalog-showcase")].map(
 					node => node.id,
 				),
+				searchCards: [...document.querySelectorAll("#showcase-tool-search .tool-catalog-showcase")].map(node => [
+					node.querySelector(".tool-call .tool-call-line")?.textContent?.replace(/\s+/g, " ").trim(),
+					node.querySelector(".tool-search-body") ? "matches" : node.querySelector(".tool-output") ? "output" : "none",
+				]),
 				nav: [
 					document.querySelector('.showcase-index a[href="#showcase-tool-catalog"]')?.textContent,
 					document.querySelector('.showcase-index a[href="#showcase-tool-search"]')?.textContent,
@@ -757,6 +763,12 @@ suite("Tools dialog", () => {
 			expect(layout.searchStates).toEqual(
 				["populated", "capped", "empty", "fallback"].map(state => `showcase-tool-search-${state}`),
 			);
+			expect(layout.searchCards).toEqual([
+				["Searched tools todo list activated 2", "matches"],
+				["Searched tools todo list", "matches"],
+				["Searched tools kubernetes rollout", "matches"],
+				["Searched tools todo list", "output"],
+			]);
 			expect(layout.nav).toEqual(["Tools dialog", "Tool search results"]);
 			expect(layout.sections).toBe(2);
 			expect(layout.overflow).toEqual([]);
