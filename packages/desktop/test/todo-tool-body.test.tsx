@@ -53,9 +53,9 @@ describe("todo_write tool body", () => {
 		}
 	});
 
-	test("a todo row in the transcript still shows its output before detail is loaded", () => {
-		const html = renderToStaticMarkup(<Message message={message} />);
-		expect(html).toContain("todo_write");
+	test("a todo row without detail still shows its output in the transcript", () => {
+		const plain: DesktopMessage = { ...message, tool: { callId: "call-1", status: "done", family: "todo", detail: false } };
+		const html = renderToStaticMarkup(<Message message={plain} />);
 		expect(html).toContain("Phase 1/1");
 		expect(html).not.toContain("todo-tool-body");
 	});

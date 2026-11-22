@@ -139,6 +139,13 @@ const todoRow: DesktopMessage = {
 	tool: { callId: "showcase-todo-call", status: "done", family: "todo", detail: true },
 };
 
+/** Rendered through the real tool card, so it claims no detail the card could try to load. */
+const plainRow: DesktopMessage = {
+	...todoRow,
+	id: "showcase-todo-plain",
+	tool: { callId: "showcase-todo-plain", status: "done", family: "todo", detail: false },
+};
+
 const failedRow: DesktopMessage = {
 	...todoRow,
 	id: "showcase-todo-failed",
@@ -327,7 +334,7 @@ export function ShowcaseTodo() {
 					</div>
 				</State>
 				<State caption="todo.showcaseToolFallback">
-					<Message message={todoRow} />
+					<Message message={plainRow} />
 				</State>
 				<State caption="todo.showcaseToolFailed">
 					<Message message={failedRow} />
