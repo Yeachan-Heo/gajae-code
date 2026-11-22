@@ -560,6 +560,7 @@ suite("Tools dialog", () => {
 			});
 			await page.waitForSelector("dialog[open] .tool-catalog-changed");
 			const layouts: Record<string, unknown> = {};
+			const controls: Record<string, number[]> = {};
 			for (const [width, height, text] of [
 				[720, 520, 20],
 				[720, 520, 14],
@@ -569,6 +570,11 @@ suite("Tools dialog", () => {
 				await page.setViewport({ width, height });
 				await page.evaluate(size => document.documentElement.style.setProperty("--text-size", `${size}px`), text);
 				await Bun.sleep(50);
+				controls[`${width}x${height}@${text}`] = await page.evaluate(() =>
+					["dialog[open] input[data-tool-name]", "dialog[open] .tool-catalog-head svg"].map(
+						selector => document.querySelector(selector)!.getBoundingClientRect().width,
+					),
+				);
 				layouts[`${width}x${height}@${text}`] = await page.evaluate(() => {
 					const dialog = document.querySelector("dialog[open]")!;
 					const inside = (node: Element | null | undefined) => {
@@ -599,6 +605,9 @@ suite("Tools dialog", () => {
 				"390x844@20": pinned,
 				"390x844@14": pinned,
 			});
+			// Checkboxes and the search icon grow with the text size like the rest of the dialog.
+			for (const [index, size] of controls["720x520@20"]!.entries())
+				expect(size / controls["720x520@14"]![index]!).toBeGreaterThan(1.35);
 		} finally {
 			await context.close();
 		}
