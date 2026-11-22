@@ -2,12 +2,22 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { findEmbeddedLiveOwner } from "../src/sdk/embedding";
 import type { SessionLifecycleClient } from "../src/sdk/lifecycle/service";
+import {
+	cleanupFixtureRoots,
+	createFixtureBrokerEnvironment,
+	createFixtureRootCleanup,
+	type FixtureRootCleanup,
+	withFixtureBrokerEnvironment,
+} from "./helpers/fixture-broker-cleanup";
 
 const cleanups: Array<() => Promise<void>> = [];
+const brokerRoots: FixtureRootCleanup[] = [];
 afterEach(async () => {
 	while (cleanups.length) await cleanups.pop()?.();
+	await cleanupFixtureRoots(brokerRoots);
 });
 
 async function agentDir() {
@@ -77,3 +87,14 @@ test("a broker that fails or does not answer in time is reported as unknown", as
 	});
 	expect(Date.now() - started).toBeLessThan(1000);
 });
+
+test("a real broker accepts the exact lookup and answers none for a transcript nobody holds", async () => {
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-embedding-owner-broker-")));
+	const dir = path.join(root, "agent");
+	const env = createFixtureBrokerEnvironment(root, dir);
+	await Promise.all([dir, env.TMPDIR!, env.XDG_CONFIG_HOME!].map(item => fs.mkdir(item, { recursive: true })));
+	const started = await withFixtureBrokerEnvironment(() => startFixtureBrokerWithLeaseForTest({ agentDir: dir, env }));
+	brokerRoots.push(createFixtureRootCleanup(root, dir, started.lease));
+	// `unknown` here would mean the broker refused the request shape, actor or target.
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "none" });
+}, 60_000);
