@@ -974,6 +974,131 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task"]);
 	});
 
+	/** Holds the Host's first journal write for one delivery: the request has arrived but is not yet admitted. */
+	function holdDeliveryBegin(id: string) {
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const begin = DeliveryJournal.prototype.begin;
+		vi.spyOn(DeliveryJournal.prototype, "begin").mockImplementation(async function (
+			this: DeliveryJournal,
+			deliveryId,
+			sessionId,
+		) {
+			if (deliveryId === id) {
+				held.resolve();
+				await release.promise;
+			}
+			return begin.call(this, deliveryId, sessionId);
+		});
+		return { held: held.promise, release: () => release.resolve() };
+	}
+
+	test("Stop while a steer's delivery record is written keeps it from starting a turn, not later messages", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-before-record");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const record = holdDeliveryBegin("steer-in-record");
+		const steer = call(
+			"prompt",
+			{ sessionId: session.id, text: "typed then stopped", deliverAs: "steer" },
+			"steer-in-record",
+		);
+		await record.held;
+		// Nothing is queued yet, so the Stop only ends the run; the steer arrives at an idle session.
+		expect(await call("abort", { sessionId: session.id })).toBeNull();
+		expect(await running).toBeNull();
+		record.release();
+		expect(await Promise.race([steer.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe("settled");
+		expect(await steer).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(sdk.isStreaming).toBe(false);
+		let state = await snapshot();
+		expect(state.sessions[0]?.status).toBe("done");
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "run-before-record", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-in-record",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+		// A Stop that has settled is not held against messages sent after it.
+		const later = call("prompt", { sessionId: session.id, text: "sent after Stop" }, "after-settled-stop");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		const laterSteer = await call<{ queued: boolean }>(
+			"prompt",
+			{ sessionId: session.id, text: "steered after Stop", deliverAs: "steer" },
+			"steer-after-settled-stop",
+		);
+		expect(laterSteer.queued).toBe(true);
+		control.finishTurn("first answer");
+		for (let i = 0; i < 400 && control.prompts.length < 3; i++) await Bun.sleep(5);
+		control.finishTurn("second answer");
+		expect(await later).toBeNull();
+		expect(await settledReceipts(snapshot, ["after-settled-stop", "steer-after-settled-stop"])).toEqual({
+			"after-settled-stop": "completed",
+			"steer-after-settled-stop": "completed",
+		});
+		state = await snapshot();
+		expect(userTurns(sdk)).toEqual(["long task", "sent after Stop", "steered after Stop"]);
+	});
+
+	test("a steer whose record lands while the Stop is still ending the run is handed back", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-still-stopping");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const record = holdDeliveryBegin("steer-while-stopping");
+		const steer = call(
+			"prompt",
+			{ sessionId: session.id, text: "typed then stopped", deliverAs: "steer" },
+			"steer-while-stopping",
+		);
+		await record.held;
+		// Keep the run streaming until the steer has been through the queued path.
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		const proceed = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			stopReached.resolve();
+			await proceed.promise;
+			return abort(options);
+		});
+		const stopping = call("abort", { sessionId: session.id });
+		await stopReached.promise;
+		record.release();
+		expect(await steer).toBeNull();
+		proceed.resolve();
+		expect(await stopping).toBeNull();
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-while-stopping",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
 	test("invalid prompt reports a definitive refusal before admission", async () => {
 		const { call, session, frames, snapshot } = await launch();
 		await expect(call("prompt", { sessionId: session.id, text: "" }, "invalid-id")).rejects.toThrow();

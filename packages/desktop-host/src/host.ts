@@ -459,8 +459,6 @@ interface LiveSession extends SessionCandidate {
 	/** Explicitly queued steering/follow-up submissions, in admission order. */
 	queued: Map<string, TrackedQueuedInput>;
 	revisions?: PromptRevisions;
-	/** User Stop requests so far. Only a run stopped after its input counted one ends `cancelled`. */
-	stopRequests: number;
 	/** User turns already attributed to one input; a turn is evidence for at most one. */
 	claimedUserTurns: WeakSet<AgentMessage>;
 	/** Queued inputs the SDK reported as taken into a run and not yet settled, in the order taken. */
@@ -511,6 +509,12 @@ export class DesktopHost {
 	#deliveries!: DeliveryJournal;
 	/** Process-local only: receipts and snapshots never recreate completion intent. */
 	#completedTasks = new Set<string>();
+	/**
+	 * User Stop requests per conversation, counted when each request arrives (see `#handle`). Only
+	 * an input that arrived before a Stop compares unequal, so only it can end `cancelled` or be
+	 * handed back as not run.
+	 */
+	#stopCounts = new Map<string, number>();
 	#live = new Map<string, LiveSession>();
 	/** Publication tokens survive live-map removal without retaining disposed SDK owners. */
 	#viewOwners = new WeakMap<SavedSession, symbol>();
@@ -1331,7 +1335,6 @@ export class DesktopHost {
 			busy: false,
 			queued: new Map(),
 			scopeOwners: new Map(),
-			stopRequests: 0,
 			claimedUserTurns: new WeakSet(),
 			consumedClaimants: [],
 		};
@@ -2135,10 +2138,12 @@ export class DesktopHost {
 		alreadyBegun = false,
 		allowGateMutation = false,
 		editEntryId?: string,
+		stopsAtArrival?: number,
 	): Promise<void> {
 		let completeTask = this.#localTaskCompletion(live);
-		// Only a Stop counted after this point interrupts this prompt.
-		const stops = live.stopRequests;
+		// Only a Stop counted after the request arrived (or, for a forwarded command, after this
+		// point) interrupts this prompt.
+		const stops = stopsAtArrival ?? this.#stopCount(live.metadata.id);
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
 		const settleTerminalView = async () => {
@@ -2155,10 +2160,10 @@ export class DesktopHost {
 		};
 		const input = await this.#extensionInput(live, id, text, images, allowGateMutation, settleTerminalView);
 		if (input.handled) return;
-		if (live.stopRequests !== stops) {
-			// A Stop during admission (the journal write or an input hook) found nothing to abort. The
-			// prompt has not reached the SDK, so it definitively did not run: hand the text back. From
-			// here on the counter is unchanged, so only a Stop that reaches this prompt's run counts.
+		if (this.#stopCount(live.metadata.id) !== stops) {
+			// A Stop that overtook this prompt before it reached the SDK (its delivery record, startup
+			// or an input hook) found nothing to abort. The prompt definitively did not run: hand the
+			// text back. From here on the count is unchanged, so only a Stop that reaches its run counts.
 			await settleTerminalView();
 			await this.#delivery(id, { disposition: "refused", error: "Prompt stopped before it started" });
 			return;
@@ -2219,7 +2224,7 @@ export class DesktopHost {
 			await live.sdk.waitForIdle();
 		} catch (error) {
 			await settleTerminalView();
-			if (!journalFailed && live.stopRequests !== stops) {
+			if (!journalFailed && this.#stopCount(live.metadata.id) !== stops) {
 				// The user stopped this prompt. Once its text is in the transcript that is a
 				// cancellation. If no run ever took it, it definitively did not run: `refused`
 				// is what returns the text to the composer, which `cancelled` would not.
@@ -2254,7 +2259,11 @@ export class DesktopHost {
 		if (owned?.assistant === "error" || owned?.assistant === "aborted" || owned?.reason === "cancelled") {
 			// A user Stop whose prompt text is already in the transcript is a cancellation, not
 			// an uncertain outcome. A Host abort (workspace close, session switch) stays unknown.
-			if (owned.assistant !== "error" && live.stopRequests !== stops && persistedUserTurn(live.sdk, promptMessage)) {
+			if (
+				owned.assistant !== "error" &&
+				this.#stopCount(live.metadata.id) !== stops &&
+				persistedUserTurn(live.sdk, promptMessage)
+			) {
 				await this.#delivery(id, { disposition: "cancelled" });
 				return;
 			}
@@ -2386,7 +2395,18 @@ export class DesktopHost {
 		}
 		return task;
 	}
+	#stopCount(sessionId: string): number {
+		return this.#stopCounts.get(sessionId) ?? 0;
+	}
 	async #handle(request: DesktopRequest): Promise<void> {
+		// Stops and inputs are compared in the order they reach the Host, before any await: a Stop
+		// counts on arrival and an input keeps the count it arrived under. A Stop that overtakes an
+		// input while its delivery record is written or startup is awaited is therefore seen by it,
+		// and a Stop that settled before a message arrived never applies to that message.
+		const sessionId = typeof request.params.sessionId === "string" ? request.params.sessionId : undefined;
+		if (request.method === "abort" && sessionId !== undefined)
+			this.#stopCounts.set(sessionId, this.#stopCount(sessionId) + 1);
+		const stopsAtArrival = sessionId === undefined ? 0 : this.#stopCount(sessionId);
 		let promptBegun = false;
 		let promptAdmissionAttempted = false;
 		try {
@@ -2401,7 +2421,7 @@ export class DesktopHost {
 				promptBegun = true;
 			}
 			if (this.#closed && request.method !== "shutdown") throw new Error("Host is closed");
-			const result = await this.#dispatch(request);
+			const result = await this.#dispatch(request, stopsAtArrival);
 			this.#emit(
 				{ type: "response", id: request.id, ok: true, result: result ?? null },
 				PROJECTED_CONTROL_METHODS.has(request.method),
@@ -2445,7 +2465,7 @@ export class DesktopHost {
 			);
 		}
 	}
-	async #dispatch(request: DesktopRequest): Promise<unknown> {
+	async #dispatch(request: DesktopRequest, stopsAtArrival: number): Promise<unknown> {
 		const { method, params } = request;
 		const attachmentInput = method === "prompt" ? prepareDesktopAttachmentInput(request) : undefined;
 		if (method === "bootstrap") {
@@ -2787,8 +2807,7 @@ export class DesktopHost {
 				this.#publish(live);
 				return null;
 			}
-			// Count the Stop before releasing anything it interrupts, so their outcomes observe it.
-			live.stopRequests++;
+			// `#handle` counted this Stop on arrival, before anything it interrupts is released.
 			this.#cancelQuestions(live);
 			// An input still queued never reached the conversation, so Stop hands it back: `removed`
 			// returns its text to the composer, where `cancelled` would drop it. This write lands
@@ -2799,7 +2818,7 @@ export class DesktopHost {
 			// Stop means stop: the default cause ends the run without starting another. A user steer it
 			// did not take is dropped and reported removed; an agent follow-up stays queued for the next
 			// turn. The TUI's `user_interrupt` would resume into both at once. Outcomes are classified
-			// from `stopRequests`, not from the cause.
+			// from the Stop count, not from the cause.
 			await live.sdk.abort();
 			this.#publish(live);
 			return null;
@@ -3007,12 +3026,13 @@ export class DesktopHost {
 				throw new Error("Edit the prompt after the current operation finishes.");
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
-				const stops = live.stopRequests;
+				const stops = stopsAtArrival;
 				const input = await this.#extensionInput(live, request.id, text, images);
 				if (input.handled) return null;
-				if (live.stopRequests !== stops) {
-					// Stop came while this input's hook ran, before it was queued: the Stop's queue sweep
-					// could not see it. Queueing it now would start a turn after the Stop.
+				if (this.#stopCount(live.metadata.id) !== stops) {
+					// A Stop overtook this input before it was queued (its delivery record, startup or
+					// input hook): the Stop's queue sweep could not see it, and queueing it now would
+					// start a turn after the Stop.
 					await this.#delivery(request.id, { disposition: "refused", error: "Prompt stopped before it started" });
 					return null;
 				}
@@ -3068,7 +3088,8 @@ export class DesktopHost {
 					unsubscribeTerminal();
 					// A Stop cancelled this steer's pending admission. As for a prompt Stop caught before
 					// its run, nothing of it reached the conversation, so its text goes back.
-					const stoppedBeforeQueue = !journalFailed && live.stopRequests !== stops && !claimant.turns.length;
+					const stoppedBeforeQueue =
+						!journalFailed && this.#stopCount(live.metadata.id) !== stops && !claimant.turns.length;
 					await this.#delivery(
 						request.id,
 						journalFailed
@@ -3157,7 +3178,7 @@ export class DesktopHost {
 							// Consumption settles before the input's own message is appended, so after a Stop
 							// this input counts as sent only once its own turn is in the transcript.
 							const ownTurn = settleClaim(outcome.disposition === "completed");
-							const stopped = live.stopRequests !== stops;
+							const stopped = this.#stopCount(live.metadata.id) !== stops;
 							const inTranscript = ownTurn !== undefined && persistedUserTurn(live.sdk, ownTurn);
 							const disposition =
 								outcome.disposition === "removed"
@@ -3219,7 +3240,17 @@ export class DesktopHost {
 			return this.#exclusive(
 				live,
 				async settleView => {
-					await this.#promptDelivery(live, request.id, text, images, settleView, true, false, editEntryId);
+					await this.#promptDelivery(
+						live,
+						request.id,
+						text,
+						images,
+						settleView,
+						true,
+						false,
+						editEntryId,
+						stopsAtArrival,
+					);
 					return null;
 				},
 				false,
