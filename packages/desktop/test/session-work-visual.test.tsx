@@ -149,6 +149,9 @@ suite("Session work visuals", () => {
 						// Other users of the shared icon rule, which keep their size.
 						bannerIcon: box("#showcase-feedback .error-banner > svg"),
 						composerIcon: box("#showcase-composers .composer-action > svg"),
+						// Icons inside a tool disclosure that keep their own sizes over the moved rule.
+						todoTaskIcon: box("#showcase-todo-tool .tool-disclosure .todo-task > svg"),
+						toolStatusIcon: box("#showcase-tool-calls .tool-call .tool-call-status svg"),
 					};
 				}, px);
 			expect(await sizes(14)).toEqual({
@@ -159,6 +162,8 @@ suite("Session work visuals", () => {
 				closeButton: "34x34",
 				bannerIcon: "16x16",
 				composerIcon: "16x16",
+				todoTaskIcon: "14x14",
+				toolStatusIcon: "14x14",
 			});
 			// 1rem and 2.125rem at 20 px text, whose root is 20 / 0.875 = 22.86 px (whole pixels, as layout rounds).
 			expect(await sizes(20)).toEqual({
@@ -169,6 +174,8 @@ suite("Session work visuals", () => {
 				closeButton: "49x49",
 				bannerIcon: "16x16",
 				composerIcon: "16x16",
+				todoTaskIcon: "14x14",
+				toolStatusIcon: "20x20",
 			});
 		} finally {
 			await context.close();
