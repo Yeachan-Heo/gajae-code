@@ -11,8 +11,11 @@ afterEach(async () => {
 });
 
 const user = (text: string) => ({ role: "user" as const, content: [{ type: "text" as const, text }], timestamp: 1 });
-const texts = (messages: readonly { content?: unknown }[]) =>
-	messages.map(message => (Array.isArray(message.content) ? (message.content[0] as { text: string }).text : ""));
+const texts = (messages: readonly object[]) =>
+	messages.map(message => {
+		const content = "content" in message ? message.content : undefined;
+		return Array.isArray(content) ? (content[0] as { text: string }).text : "";
+	});
 
 async function transcript() {
 	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-embedding-history-")));
