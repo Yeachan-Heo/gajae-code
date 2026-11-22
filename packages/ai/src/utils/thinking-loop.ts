@@ -15,6 +15,12 @@
  */
 
 /**
+ * Error code when Gemini header runaway detector fires and aborts the stream.
+ * Classified as terminal in retry policy to prevent replay of the same context.
+ */
+export const GEMINI_HEADER_RUNAWAY_ERROR_CODE = "gemini_header_runaway";
+
+/**
  * Consecutive Gemini thought-summary headers in one uninterrupted reasoning
  * stream that trips the tool-call reminder. Gemini occasionally narrates a long
  * chain of titled summaries ("Examining Result Handling", "Refining Result
@@ -28,6 +34,15 @@
  * fast on the actual pathology.
  */
 export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 64;
+
+/**
+ * True when a model is a Gemini model (either direct Google API or via proxy like
+ * Bizrouter, GitHub Copilot, etc.). Checks model ID for Gemini branding. Used to
+ * gate reasoning-header runaway detection to Gemini only, not all reasoning models.
+ */
+export function isGeminiModel(modelId: string): boolean {
+	return /gemini/i.test(modelId);
+}
 
 /**
  * True when a single trimmed line is a Gemini reasoning-summary title: a markdown

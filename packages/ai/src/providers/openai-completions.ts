@@ -106,7 +106,7 @@ import {
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
-import { GeminiHeaderRunDetector } from "../utils/thinking-loop";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE, GeminiHeaderRunDetector, isGeminiModel } from "../utils/thinking-loop";
 import {
 	DsmlToolCallHealer,
 	type HealedToolCall,
@@ -576,8 +576,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		// alone is true for all three, and using it there discarded the real
 		// timeout/transport facts and flipped the retry classification (#5627 review r4).
 		let repetitionSelfAbort = false;
-		// Gemini reasoning-summary header runaway detector.
-		const geminiHeaderRunDetector = new GeminiHeaderRunDetector();
+		// Gemini reasoning-summary header runaway detector (Gemini models only).
+		const isGemini = isGeminiModel(model.id);
+		const geminiHeaderRunDetector = isGemini ? new GeminiHeaderRunDetector() : null;
 		let geminiHeaderRunawaySelfAbort = false;
 		const finalizeRepetitionGuardStop = (): void => {
 			if (!repetitionTrip) return;
@@ -1280,7 +1281,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 							);
 							if (normalizedDeltaText.length > 0) {
 								// Reset Gemini header runaway detector when transitioning to visible text.
-								geminiHeaderRunDetector.reset();
+								geminiHeaderRunDetector?.reset();
 								if (!firstTokenTime) firstTokenTime = Date.now();
 								if (parseMiniMaxThinkTags) {
 									taggedTextBuffer += normalizedDeltaText;
@@ -1335,19 +1336,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 							if (foundReasoningField) {
 								const delta = (choice.delta as any)[foundReasoningField];
 								appendThinkingDelta(delta, foundReasoningField);
-								// Feed reasoning to Gemini header runaway detector.
-								if (geminiHeaderRunDetector.push(delta)) {
+								// Feed reasoning to Gemini header runaway detector (Gemini models only).
+								if (geminiHeaderRunDetector?.push(delta)) {
 									logger.debug(
 										`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupting stream.`,
 									);
 									geminiHeaderRunawaySelfAbort = true;
-									requestAbortController.abort();
+									// Defer abort until after tool calls in this frame are processed.
 								}
 							}
 
 							if (choice?.delta?.tool_calls && choice.delta.tool_calls.length > 0) {
 								// Reset Gemini header runaway detector when transitioning to tool calls.
-								geminiHeaderRunDetector.reset();
+								geminiHeaderRunDetector?.reset();
 								for (const toolCall of choice.delta.tool_calls) {
 									if (currentBlock?.type !== "toolCall" || (toolCall.id && currentBlock.id !== toolCall.id)) {
 										finishCurrentBlock(currentBlock);
@@ -1397,6 +1398,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 										}
 									}
 								}
+							}
+
+							// After frame is fully processed, commit the detector-triggered abort.
+							if (geminiHeaderRunawaySelfAbort && !repetitionTrippedAt) {
+								requestAbortController.abort();
 							}
 						}
 					}
@@ -1616,8 +1622,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// during the drain window must keep its own facts.
 			if (geminiHeaderRunawaySelfAbort && !abortTracker.wasCallerAbort()) {
 				output.stopReason = "error";
-				output.errorCode = "gemini_header_runaway";
-				output.errorMessage = `Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupted to prevent budget exhaustion.`;
+				output.errorCode = GEMINI_HEADER_RUNAWAY_ERROR_CODE;
+				output.errorMessage = `Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector?.count ?? 0} consecutive headers. Interrupted to prevent budget exhaustion.`;
 				output.duration = Date.now() - startTime;
 				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 				stream.push({ type: "error", reason: "error", error: output });
