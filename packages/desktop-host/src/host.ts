@@ -2764,11 +2764,8 @@ export class DesktopHost {
 			await bounded(Promise.allSettled([...(this.#inputs.get(metadata.id) ?? [])]), budget).catch(() => {});
 			await live.viewPersistence?.catch(() => {});
 			if (live.sdk.isStreaming) await live.sdk.waitForIdle().catch(() => {});
-			// Hand back anything still queued that no run took, as Stop does, and let the inputs the run
-			// took settle from this session's transcript before it is disposed.
-			for (const tracked of live.queued.values()) {
-				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "removed" });
-			}
+			// The Stop's sweep, and the queued branch's own check after it, handed back what no run took.
+			// Let the inputs the run took settle from this session's transcript before it is disposed.
 			await bounded(Promise.allSettled([...live.queued.values()].map(tracked => tracked.settled)), budget).catch(
 				() => {},
 			);
