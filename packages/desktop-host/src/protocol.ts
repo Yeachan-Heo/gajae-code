@@ -327,10 +327,23 @@ export interface DesktopHistory {
 	messages: DesktopMessage[];
 	truncated: boolean;
 }
+/** One provider the app can enroll: `auth.login` and/or `auth.setKey` is admitted for it. */
 export interface DesktopAuthProvider {
 	id: string;
+	/** OAuth catalog name when one exists, otherwise the provider id verbatim. */
 	name: string;
-	configured?: boolean;
+	/** Effective authentication now: a stored credential, models.yml or a runtime key. */
+	configured: boolean;
+	/**
+	 * Current presence of a credential in the shared SDK store (shared with the terminal app).
+	 * Presence, not history: it never says which flow or key save put the credential there.
+	 */
+	stored: boolean;
+	credentialKinds: ("api_key" | "oauth")[];
+	/** `auth.login` is admitted for this provider. */
+	canSignIn: boolean;
+	/** `auth.setKey` is admitted for this provider. */
+	canStoreKey: boolean;
 }
 export interface DesktopCredentialSaveResult {
 	provider: string;
@@ -344,6 +357,8 @@ export interface DesktopAuthState {
 	status: "authorizing" | "waiting" | "complete" | "cancelled" | "error";
 	url?: string;
 	instructions?: string;
+	/** One-time device code to enter on the provider's page; `instructions` carries the same code as prose. */
+	verificationCode?: string;
 	/**
 	 * A provider risk notice the user must accept before the flow continues. Present only while
 	 * the flow is `waiting` on that acknowledgement, never alongside `prompt`. Confirm with
@@ -352,6 +367,12 @@ export interface DesktopAuthState {
 	warning?: { id: string; message: string };
 	prompt?: { id: string; message: string; placeholder?: string; allowEmpty?: boolean };
 	error?: string;
+	/**
+	 * Present only as `false`, on an `error` state whose credentials were saved but whose model
+	 * catalog refresh failed (mirrors `DesktopCredentialSaveResult.catalogRefreshed`). Every other
+	 * error, including a re-sign-in that fails while older credentials remain stored, omits it.
+	 */
+	catalogRefreshed?: false;
 }
 export interface DesktopActivityUpdate {
 	sessionId: string;

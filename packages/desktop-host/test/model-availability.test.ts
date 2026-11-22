@@ -322,6 +322,33 @@ describe("desktop canonical model availability", () => {
 		expect(sdkB.model).toBeUndefined();
 	});
 
+	test("a first saved key publishes its models before answering and leaves already-open sessions without a model", async () => {
+		const { call, first, second, sessions, frames } = await launch();
+		const start = frames.length;
+		const saved = await call<DesktopCredentialSaveResult>("auth.setKey", { provider, key: "first-key-secret" });
+		expect(saved).toEqual({ provider, saved: true, catalogRefreshed: true });
+		const published = frames.slice(start);
+		const snapshotIndex = published.findIndex(
+			frame => frame.type === "snapshot" && ids(frame.snapshot.models).join() === eligibleIds.join(),
+		);
+		const responseIndex = published.findIndex(
+			frame =>
+				frame.type === "response" &&
+				frame.ok &&
+				(frame.result as Partial<DesktopCredentialSaveResult> | null)?.saved === true,
+		);
+		// The renderer hides its zero-model notice from the snapshot, so it must arrive first.
+		expect(snapshotIndex).toBeGreaterThanOrEqual(0);
+		expect(snapshotIndex).toBeLessThan(responseIndex);
+		// Refreshing the catalog never selects a model for a conversation that was already open.
+		expect(sessions.map(session => session.model)).toEqual([undefined, undefined]);
+		const snapshot = published[snapshotIndex];
+		if (snapshot?.type !== "snapshot") throw new Error("Expected the published snapshot");
+		for (const id of [first.id, second.id])
+			expect(snapshot.snapshot.sessions.find(session => session.id === id)?.model).toBeUndefined();
+		expect(JSON.stringify(frames)).not.toContain("first-key-secret");
+	});
+
 	test("a runtime-registered provider exposes only its declared subset in its owning SDK registry", async () => {
 		const { host, call, first, second, sessions, list } = await launch();
 		const sdk = sessions[0]!;

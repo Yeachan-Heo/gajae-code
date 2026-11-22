@@ -94,6 +94,7 @@ import type { DesktopPreferenceOutcome, DesktopPreferenceResult } from "./prefer
 import { PromptRevisions } from "./prompt-revisions";
 import type {
 	DesktopActivityUpdate,
+	DesktopAuthProvider,
 	DesktopAuthState,
 	DesktopCapability,
 	DesktopCommand,
@@ -210,6 +211,18 @@ export const CAPABILITIES: DesktopCapability[] = [
 		id: "oauth",
 		label: "App-owned account authorization",
 		available: true,
+	},
+	{
+		id: "provider-removal",
+		label: "Disconnect a provider",
+		available: false,
+		reason: "The public SDK has no credential-removal operation yet.",
+	},
+	{
+		id: "custom-provider-endpoints",
+		label: "Custom OpenAI-compatible endpoints",
+		available: false,
+		reason: "The public SDK cannot register custom endpoints yet; add them to models.yml from the terminal app.",
 	},
 ];
 
@@ -758,7 +771,9 @@ export class DesktopHost {
 			provider: state.provider,
 			status: state.status === "stored" ? (state.catalogRefreshed === false ? "error" : "complete") : state.status,
 			...(state.url ? { url: state.url } : {}),
-			...(state.verificationCode ? { instructions: `Verification code: ${state.verificationCode}` } : {}),
+			...(state.verificationCode
+				? { instructions: `Verification code: ${state.verificationCode}`, verificationCode: state.verificationCode }
+				: {}),
 			// A warning is a pending answer with no prompt: dropping it leaves the flow waiting on
 			// a confirmation the user was never shown. The SDK holds one pending answer at a time
 			// and clears a confirmed warning a step after it resumes, so it is only answerable
@@ -768,8 +783,10 @@ export class DesktopHost {
 				: {}),
 			...(state.prompt ? { prompt: { ...state.prompt, message: this.#redact(state.prompt.message) } } : {}),
 			...(state.error ? { error: this.#redact(state.error) } : {}),
+			// Only this outcome says the flow saved credentials. The SDK's `stored` flag is current
+			// presence (it also covers credentials that predate the flow), so it is never projected.
 			...(state.status === "stored" && state.catalogRefreshed === false
-				? { error: "Credentials were saved, but model catalog refresh failed" }
+				? { error: "Credentials were saved, but model catalog refresh failed", catalogRefreshed: false as const }
 				: {}),
 		};
 		if (JSON.stringify(projected) !== JSON.stringify(this.#authState)) {
@@ -2394,14 +2411,20 @@ export class DesktopHost {
 			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
 		}
 		if (method === "auth.providers") {
-			const statuses = await this.#authorizationProviders();
-			return getOAuthProviders()
-				.filter(provider => statuses.some(status => status.provider === provider.id && status.canEnroll))
-				.map(provider => ({
-					id: provider.id,
-					name: provider.name,
-					configured: statuses.find(status => status.provider === provider.id)!.configured,
-				}));
+			const names = new Map(getOAuthProviders().map(provider => [provider.id, provider.name]));
+			return (await this.#authorizationProviders())
+				.filter(status => status.canEnroll || status.canStoreApiKey)
+				.map(
+					(status): DesktopAuthProvider => ({
+						id: status.provider,
+						name: names.get(status.provider) ?? status.provider,
+						configured: status.configured,
+						stored: status.stored,
+						credentialKinds: [...status.credentialKinds],
+						canSignIn: status.canEnroll,
+						canStoreKey: status.canStoreApiKey,
+					}),
+				);
 		}
 		if (method === "auth.keyProviders") {
 			// Enrollment metadata is not a model selection catalog. Unauthenticated

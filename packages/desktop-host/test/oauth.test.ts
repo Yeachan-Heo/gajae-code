@@ -50,6 +50,10 @@ describe("desktop authorization through the public SDK", () => {
 	const directories: string[] = [];
 	const restores: Array<() => void> = [];
 	const releases: Array<() => void> = [];
+	/** A test's stand-in SDK answer for one operation; undefined defers to the real controls. */
+	let flowOverride:
+		| ((operation: sdk.AuthorizationControlOperation) => sdk.AuthorizationControlResult | undefined)
+		| undefined;
 
 	beforeEach(() => {
 		environment = { ...process.env };
@@ -76,7 +80,10 @@ describe("desktop authorization through the public SDK", () => {
 		) {
 			authorization = this;
 			authorizationCalls.push({ operation, input: structuredClone(input) });
-			return executeAuthorization.call(this, operation, input);
+			const override = flowOverride?.(operation);
+			return override
+				? Promise.resolve(structuredClone(override))
+				: executeAuthorization.call(this, operation, input);
 		});
 		restores.push(
 			() => factory.mockRestore(),
@@ -110,6 +117,7 @@ describe("desktop authorization through the public SDK", () => {
 			fetchHook[Symbol.dispose]();
 			factoryInputs.length = 0;
 			authorizationCalls.length = 0;
+			flowOverride = undefined;
 			for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];
 			Object.assign(process.env, environment);
 			setAgentDir(previousAgentDir);
@@ -177,6 +185,34 @@ describe("desktop authorization through the public SDK", () => {
 		expect(providers.find(provider => provider.id === "minimax-code")).toMatchObject({ configured: false });
 		expect(await h.call<string[]>("auth.keyProviders")).toContain("minimax-code");
 		expect(h.owner.session.modelRegistry.authStorage.get("minimax-code")).toBeUndefined();
+	});
+
+	test("lists every provider the app can enroll with its sign-in and key capabilities", async () => {
+		const h = await launch();
+		const providers = await h.call<DesktopAuthProvider[]>("auth.providers");
+		// A login provider is named from the OAuth catalog and admits both methods.
+		expect(providers.find(provider => provider.id === "minimax-code")).toEqual({
+			id: "minimax-code",
+			name: "MiniMax Coding Plan (International)",
+			configured: false,
+			stored: false,
+			credentialKinds: [],
+			canSignIn: true,
+			canStoreKey: true,
+		});
+		// A catalog-only provider has no OAuth name and admits only an API key.
+		expect(providers.find(provider => provider.id === "openai")).toMatchObject({
+			name: "openai",
+			canSignIn: false,
+			canStoreKey: true,
+		});
+		// The local proxy status provider admits neither method, so it is not offered.
+		expect(providers.some(provider => provider.id === "opencodex")).toBe(false);
+		expect(providers.every(provider => provider.canSignIn || provider.canStoreKey)).toBe(true);
+		expect(new Set(providers.map(provider => provider.id)).size).toBe(providers.length);
+		// Every API-key provider is still listed, so the list is a superset of the key-only lookup.
+		const keyProviders = await h.call<string[]>("auth.keyProviders");
+		expect(keyProviders.every(id => providers.some(provider => provider.id === id))).toBe(true);
 	});
 
 	test("routes exact flow/prompt identities to native login and waits for catalog settlement before completion", async () => {
@@ -265,7 +301,12 @@ describe("desktop authorization through the public SDK", () => {
 		const waiting = await observe(h.state, state => state.status === "waiting");
 		await h.call("auth.answer", { flowId: flow.id, promptId: promptId(waiting), value: key });
 		const failed = await observe(h.state, state => state.status === "error");
-		expect(failed).toMatchObject({ id: flow.id, error: "Credentials were saved, but model catalog refresh failed" });
+		expect(failed).toMatchObject({
+			id: flow.id,
+			error: "Credentials were saved, but model catalog refresh failed",
+			catalogRefreshed: false,
+		});
+		expect(h.frames).toContainEqual({ type: "auth", auth: failed });
 		expect(failed.url).toBeUndefined();
 		expect(failed.prompt).toBeUndefined();
 		expect(h.owner.session.modelRegistry.authStorage.get("minimax-code")).toEqual({ type: "api_key", key });
@@ -284,7 +325,12 @@ describe("desktop authorization through the public SDK", () => {
 		});
 		expect(h.owner.session.modelRegistry.authStorage.get("minimax-code")).toEqual({ type: "api_key", key });
 		const providers = await h.call<DesktopAuthProvider[]>("auth.providers");
-		expect(providers.find(provider => provider.id === "minimax-code")?.configured).toBe(true);
+		expect(providers.find(provider => provider.id === "minimax-code")).toMatchObject({
+			configured: true,
+			stored: true,
+			credentialKinds: ["api_key"],
+		});
+		expect(JSON.stringify(providers)).not.toContain(key);
 		const refresh = vi
 			.spyOn(h.owner.session.modelRegistry, "refresh")
 			.mockRejectedValue(new Error("private-catalog-detail"));
@@ -307,6 +353,47 @@ describe("desktop authorization through the public SDK", () => {
 		await expect(h.call("auth.setKey", { provider: "unknown-provider", key })).rejects.toThrow();
 		for (const secret of [key, replacement, "private-catalog-detail"])
 			expect(JSON.stringify(h.frames)).not.toContain(secret);
+	});
+
+	test("a failed or cancelled re-sign-in over stored credentials never reads as a saved credential", async () => {
+		respond = (url, init) => {
+			if (url !== "https://api.minimax.io/v1/chat/completions") throw new Error("Unexpected validation endpoint");
+			expect(init?.method).toBe("POST");
+			return new Response("{}", { status: 401 });
+		};
+		const h = await launch();
+		const key = "sk-existing-before-the-flow";
+		await h.call<DesktopCredentialSaveResult>("auth.setKey", { provider: "minimax-code", key });
+		const cancelledFlow = await h.call<DesktopAuthState>("auth.login", { provider: "minimax-code" });
+		await observe(h.state, state => state.status === "waiting");
+		// The SDK flow reports stored:true here because the earlier key still exists.
+		expect(await h.call<DesktopAuthState>("auth.cancel", { flowId: cancelledFlow.id })).toEqual({
+			id: cancelledFlow.id,
+			provider: "minimax-code",
+			status: "cancelled",
+		});
+		// The cancelled provider task settles asynchronously; a start before then is refused as busy.
+		const failedFlow = await observe(
+			() => h.call<DesktopAuthState>("auth.login", { provider: "minimax-code" }).catch(() => undefined),
+			state => state !== undefined,
+		);
+		if (!failedFlow) throw new Error("Expected a second sign-in flow");
+		const waiting = await observe(h.state, state => state.id === failedFlow.id && state.status === "waiting");
+		await h.call("auth.answer", { flowId: failedFlow.id, promptId: promptId(waiting), value: "sk-rejected-answer" });
+		const failed = await observe(h.state, state => state.status === "error");
+		expect(failed).toEqual({
+			id: failedFlow.id,
+			provider: "minimax-code",
+			status: "error",
+			error: "Authorization failed",
+		});
+		expect(h.owner.session.modelRegistry.authStorage.get("minimax-code")).toEqual({ type: "api_key", key });
+		for (const frame of h.frames)
+			if (frame.type === "auth") {
+				expect(frame.auth).not.toHaveProperty("stored");
+				expect(frame.auth).not.toHaveProperty("catalogRefreshed");
+			}
+		for (const secret of [key, "sk-rejected-answer"]) expect(JSON.stringify(h.frames)).not.toContain(secret);
 	});
 
 	for (const unsafeUrl of [
@@ -411,6 +498,10 @@ describe("desktop authorization through the public SDK", () => {
 			promptId: warningId,
 			value: "confirm",
 		});
+		expect(authorizationCalls).toContainEqual({
+			operation: "auth.answer",
+			input: { flowId: flow.id, promptId: warningId, value: "confirm" },
+		});
 		// The SDK clears a confirmed warning one step after resuming; it must not be offered again.
 		expect(answered.warning).toBeUndefined();
 		const authorizing = await observe(h.state, state => state.url !== undefined || state.status === "error");
@@ -423,6 +514,50 @@ describe("desktop authorization through the public SDK", () => {
 		expect(logins()).toBe(1);
 		await expect(h.call("auth.answer", { flowId: flow.id, promptId: warningId, value: "confirm" })).rejects.toThrow();
 		expect((await h.call<DesktopAuthState>("auth.cancel", { flowId: flow.id })).status).toBe("cancelled");
+	});
+
+	test("projects a provider warning redacted, and only while the flow waits on it without a prompt", async () => {
+		const h = await launch();
+		const key = "sk-secret-echoed-by-a-provider-warning";
+		await h.call<DesktopCredentialSaveResult>("auth.setKey", { provider: "minimax-code", key });
+		const flowId = crypto.randomUUID();
+		const warning = { id: crypto.randomUUID(), message: `Risk notice: ${key} may be shared` };
+		let state: sdk.AuthorizationFlowState = {
+			id: flowId,
+			provider: "google-gemini-cli",
+			status: "waiting",
+			stored: false,
+			warning,
+		};
+		flowOverride = operation =>
+			operation === "auth.status"
+				? {
+						provider: state.provider,
+						canEnroll: true,
+						canStoreApiKey: true,
+						stored: false,
+						configured: false,
+						credentialKinds: [],
+						flow: { flowId, status: state.status, providerSettled: true },
+					}
+				: ["auth.start", "auth.read", "auth.cancel"].includes(operation)
+					? state
+					: undefined;
+		const waiting = await h.call<DesktopAuthState>("auth.login", { provider: "google-gemini-cli" });
+		expect(waiting.warning?.id).toBe(warning.id);
+		expect(waiting.warning?.message).toStartWith("Risk notice: ");
+		expect(waiting.warning?.message).not.toContain(key);
+		state = { ...state, prompt: { id: crypto.randomUUID(), message: "Enter the code", allowEmpty: false } };
+		expect((await h.state()).warning).toBeUndefined();
+		state = { id: flowId, provider: "google-gemini-cli", status: "authorizing", stored: false, warning };
+		expect(await h.state()).toEqual({ id: flowId, provider: "google-gemini-cli", status: "authorizing" });
+		state = { id: flowId, provider: "google-gemini-cli", status: "cancelled", stored: false, warning };
+		expect(await h.call<DesktopAuthState>("auth.cancel", { flowId })).toEqual({
+			id: flowId,
+			provider: "google-gemini-cli",
+			status: "cancelled",
+		});
+		expect(JSON.stringify(h.frames)).not.toContain(key);
 	});
 
 	test("cancels a native prompt without accepting stale answers or duplicate cancellation", async () => {
@@ -463,6 +598,7 @@ describe("desktop authorization through the public SDK", () => {
 		);
 		const display = await h.state();
 		expect(display.instructions).toBe("Verification code: ABCD-EFGH");
+		expect(display.verificationCode).toBe("ABCD-EFGH");
 		expect(display.url).toBe("https://example.invalid/device");
 		await expect(h.call("auth.cancel", { flowId: crypto.randomUUID() })).rejects.toThrow();
 		expect((await h.state()).id).toBe(flow.id);
