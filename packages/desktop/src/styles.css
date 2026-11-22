@@ -775,6 +775,51 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .showcase-todo-label { display: block; font-size: 0.8125rem; }
 
 /* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
+/* The Tools dialog pins its search row and Save footer; only the list scrolls. When 200% text
+   or a short window cannot fit the pinned parts, the whole panel scrolls instead. */
+.modal-content:has(> .tool-catalog) { display: flex; flex-direction: column; overflow: hidden; }
+.tool-catalog { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; gap: 0.75rem; overflow: auto; overscroll-behavior: contain; }
+.tool-catalog-head { flex: none; }
+.tool-catalog-head > .model-search { height: 2.25rem; margin: 0; }
+.tool-catalog-summary { margin: 0.5rem 0 0; font-size: 0.75rem; }
+.tool-catalog-loading { margin: 0; color: var(--muted); }
+.tool-catalog-failure { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; flex: none; }
+.tool-catalog-failure > .error-banner { align-self: stretch; margin: 0; }
+.tool-catalog-changed { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; flex: none; padding: 0.5rem 0.75rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 9%, transparent); }
+.tool-catalog-changed > p { flex: 1 1 14rem; margin: 0; font-size: 0.8125rem; }
+.tool-catalog-list { flex: 1 1 auto; min-height: min(12rem, 40dvh); overflow: auto; overscroll-behavior: contain; padding: 0.125rem; }
+.modal .tool-catalog-section { margin: 0 0 1rem; }
+.modal .tool-catalog-section:last-child { margin-bottom: 0; }
+.tool-catalog-section > h3 { display: flex; align-items: baseline; gap: 0.375rem; margin: 0 0 0.5rem; font-size: 0.75rem; color: var(--muted); }
+.tool-catalog-count { font-weight: 400; font-variant-numeric: tabular-nums; }
+.tool-catalog-section > ul { display: flex; flex-direction: column; gap: 0.375rem; margin: 0; padding: 0; list-style: none; }
+/* A row is one bordered box like a model option; the whole box toggles its checkbox. */
+.tool-catalog-option { display: flex; align-items: flex-start; gap: 0.625rem; margin: 0; padding: 0.5rem 0.625rem; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); cursor: pointer; transition: border-color var(--dur) var(--ease), background-color var(--dur) var(--ease); }
+.tool-catalog-option:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); background: var(--surface); }
+.tool-catalog-option input[type="checkbox"] { flex: none; width: auto; min-height: 0; margin: 0.1875rem 0 0; padding: 0; border: 0; background: none; box-shadow: none; accent-color: var(--accent); }
+.tool-catalog-option:has(input:disabled) { cursor: default; }
+/* A checked state that differs from the saved one: a dashed accent edge until Save lands. */
+.tool-catalog-row[data-edited] > .tool-catalog-option { border-style: dashed; border-color: color-mix(in srgb, var(--accent) 70%, var(--border-soft)); }
+.tool-catalog-main { display: flex; flex: 1; flex-direction: column; gap: 0.125rem; min-width: 0; }
+.tool-catalog-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.5rem; }
+.tool-catalog-name { font-family: var(--mono); font-size: 0.8125rem; font-weight: 600; overflow-wrap: anywhere; word-break: break-all; }
+.tool-catalog-label { font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-catalog-description { font-size: 0.75rem; line-height: 1.45; color: var(--muted); word-break: keep-all; overflow-wrap: anywhere; }
+.tool-catalog-tags { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }
+.tool-catalog-tag { display: inline-flex; align-items: center; padding: 0.0625rem 0.5rem; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); background: var(--surface-2); color: var(--muted); font-size: 0.6875rem; line-height: 1.5; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-catalog-tag-found { border-color: transparent; background: var(--accent-soft); color: var(--accent); }
+.tool-catalog-tag-hidden { border-style: dashed; background: transparent; }
+.tool-catalog-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 0.5rem 0.75rem; flex: none; padding-top: 0.75rem; border-top: 1px solid var(--border-soft); }
+.tool-catalog-status { flex: 1 1 14rem; min-width: 0; font-size: 0.75rem; color: var(--muted); }
+.tool-catalog-status > p { margin: 0; }
+.tool-catalog-status > .tool-catalog-reason { color: var(--text); }
+/* Showcase only: a dialog-sized frame so each state shows the pinned search, list and footer. */
+.tool-catalog-showcase { margin: 1.5rem 0 0; scroll-margin-top: 1rem; }
+.tool-catalog-frame { display: flex; flex-direction: column; max-height: 30rem; margin-top: 0.5rem; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); box-shadow: var(--shadow-soft); }
+.tool-catalog-frame-narrow { max-width: 20rem; }
+@media (max-width: 480px) {
+	.tool-catalog-footer > .button { width: 100%; }
+}
 
 /* Section P: providers dialog and onboarding notice (ProvidersDialog.tsx, ProvidersPanel.tsx,
    ProviderOnboardingNotice.tsx). */

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { DesktopMethod, DesktopRequest } from "@gajae-code/desktop-host/protocol";
+import type { DesktopMethod, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
+import type { DesktopToolList } from "@gajae-code/desktop-host/tool-protocol";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
 import { installNavigationFixture } from "./fixtures/navigation";
@@ -52,7 +53,9 @@ async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
 			await page.evaluate(method => {
 				const transport = (
 					window as unknown as {
-						__TAURI_INTERNALS__: { invoke(command: string, args?: { request?: DesktopRequest }): Promise<unknown> };
+						__TAURI_INTERNALS__: {
+							invoke(command: string, args?: { request?: DesktopRequest }): Promise<unknown>;
+						};
 					}
 				).__TAURI_INTERNALS__;
 				const invoke = transport.invoke.bind(transport);
@@ -110,12 +113,13 @@ async function openTools(page: Page): Promise<void> {
 		if (!button) throw new Error("Missing Manage active tools");
 		button.click();
 	});
-	await page.waitForFunction(() => document.querySelector("dialog[open] h2")?.textContent === "Active tools");
+	await page.waitForFunction(() => document.querySelector("dialog[open] h2")?.textContent === "Tools");
 }
 
 interface DialogReading {
 	text: string;
-	tools: Array<{ name: string; checked: boolean }>;
+	sections: string[];
+	tools: Array<{ name: string; checked: boolean; disabled: boolean; tags: string[] }>;
 	saveDisabled: boolean;
 	status: string[];
 	errors: string[];
@@ -124,21 +128,94 @@ interface DialogReading {
 async function read(page: Page): Promise<DialogReading> {
 	return page.$eval("dialog[open]", dialog => ({
 		text: dialog.querySelector(".modal-content")?.textContent ?? "",
-		tools: [...dialog.querySelectorAll<HTMLLabelElement>("label.checkbox-label")].map(label => ({
-			name: label.textContent ?? "",
-			checked: label.querySelector<HTMLInputElement>("input[type=checkbox]")?.checked ?? false,
+		sections: [...dialog.querySelectorAll(".tool-catalog-section > h3")].map(node => node.textContent ?? ""),
+		tools: [...dialog.querySelectorAll<HTMLInputElement>("input[type=checkbox][data-tool-name]")].map(box => ({
+			name: box.dataset.toolName ?? "",
+			checked: box.checked,
+			disabled: box.disabled,
+			tags: [...(box.closest("li")?.querySelectorAll(".tool-catalog-tag") ?? [])].map(tag => tag.textContent ?? ""),
 		})),
 		saveDisabled:
 			[...dialog.querySelectorAll<HTMLButtonElement>("button")].find(
 				button => button.textContent?.trim() === "Save tools",
 			)?.disabled ?? true,
-		status: [...dialog.querySelectorAll('[role="status"]')].map(node => node.textContent ?? ""),
+		status: [...dialog.querySelectorAll('[role="status"]')].map(node => node.textContent ?? "").filter(Boolean),
 		errors: [...dialog.querySelectorAll(".error-banner")].map(node => node.textContent ?? ""),
 	}));
 }
 
-suite("Active tools dialog", () => {
-	test("lists the conversation's tools and saves the checked names", async () => {
+async function toggle(page: Page, name: string): Promise<void> {
+	await page.click(`dialog[open] input[data-tool-name="${name}"]`);
+}
+
+async function clickButton(page: Page, text: string): Promise<void> {
+	await page.evaluate(text => {
+		const button = [...document.querySelectorAll<HTMLButtonElement>("dialog[open] button")].find(
+			button => button.textContent?.trim() === text,
+		);
+		if (!button) throw new Error(`Missing button ${text}`);
+		button.click();
+	}, text);
+}
+
+async function focusedTool(page: Page): Promise<string | null> {
+	return page.evaluate(() => (document.activeElement as HTMLElement | null)?.dataset?.toolName ?? null);
+}
+
+/** Replaces the "old" conversation in the fixture snapshot, the way a Host session frame does. */
+async function updateSession(page: Page, patch: Partial<DesktopSession>): Promise<void> {
+	await page.evaluate(patch => {
+		const session = window.navigationFixture.snapshot().sessions.find(item => item.id === "old");
+		if (!session) throw new Error("Missing old session");
+		window.navigationFixture.emit({ type: "session", session: { ...session, ...patch } });
+	}, patch);
+}
+
+const catalog = {
+	available: ["read", "bash", "todo_write", "mcp_github_search"],
+	active: ["read", "bash"],
+	tools: [
+		{
+			name: "read",
+			label: "Read",
+			description: "Read files and URLs",
+			active: true,
+			origin: "essential",
+			discovered: false,
+		},
+		{
+			name: "bash",
+			label: "Bash",
+			description: "Run a shell command",
+			active: true,
+			origin: "essential",
+			discovered: false,
+		},
+		{
+			name: "todo_write",
+			label: "Todo Write",
+			description: "작업 목록을 단계별로 기록합니다.",
+			active: false,
+			origin: "discoverable",
+			discovered: false,
+			hidden: true,
+		},
+		{
+			name: "mcp_github_search",
+			label: "github/search",
+			description: "Search GitHub issues",
+			active: false,
+			origin: "discoverable",
+			discovered: false,
+			hidden: true,
+			mcpServer: "github",
+		},
+	],
+	discovery: { enabled: true },
+} satisfies DesktopToolList;
+
+suite("Tools dialog", () => {
+	test("lists the conversation's tools, saves the edited set and re-reads it", async () => {
 		const { context, page } = await fixture();
 		try {
 			await openTools(page);
@@ -150,54 +227,70 @@ suite("Active tools dialog", () => {
 			expect(await read(page)).toMatchObject({ tools: [], saveDisabled: true, errors: [] });
 			expect((await read(page)).text).toContain("Loading tools…");
 
+			// An older Host's names-only answer still lists every tool.
 			await answer(page, reads, { available: ["read", "bash", "python"], active: ["read"] });
-			await page.waitForSelector("dialog[open] label.checkbox-label");
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			// Save stays off until something changes: an unchanged save would still record an explicit selection.
 			expect(await read(page)).toMatchObject({
+				sections: ["Active 1", "Available 2"],
 				tools: [
 					{ name: "read", checked: true },
 					{ name: "bash", checked: false },
 					{ name: "python", checked: false },
 				],
-				saveDisabled: false,
+				saveDisabled: true,
 				status: [],
 				errors: [],
 			});
+			// The search field takes focus once the list lands.
+			expect(await page.evaluate(() => document.activeElement?.closest(".model-search") !== null)).toBe(true);
 
-			await page.evaluate(() => {
-				const labels = [...document.querySelectorAll<HTMLLabelElement>("dialog[open] label.checkbox-label")];
-				labels.find(label => label.textContent === "bash")?.querySelector("input")?.click();
-			});
-			await page.waitForFunction(
-				() =>
-					[...document.querySelectorAll<HTMLLabelElement>("dialog[open] label.checkbox-label")].find(
-						label => label.textContent === "bash",
-					)?.querySelector("input")?.checked === true,
-			);
-			await page.evaluate(() => {
-				const button = [...document.querySelectorAll<HTMLButtonElement>("dialog[open] button")].find(
-					button => button.textContent?.trim() === "Save tools",
-				);
-				button?.click();
-			});
-			const [save] = await waitHeld(page, "tools.set", 1);
-			expect(save!.params).toEqual({ sessionId: "old", names: ["read", "bash"] });
-			// The read and the save share one pending state, so the list yields to the loading line.
-			expect(await read(page)).toMatchObject({ tools: [], saveDisabled: true });
-			expect((await read(page)).text).toContain("Loading tools…");
-
-			await answer(page, [save!], null);
-			await page.waitForSelector("dialog[open] label.checkbox-label");
+			await toggle(page, "bash");
 			expect(await read(page)).toMatchObject({
+				sections: ["Active 1", "Available 2"],
 				tools: [
 					{ name: "read", checked: true },
 					{ name: "bash", checked: true },
 					{ name: "python", checked: false },
 				],
 				saveDisabled: false,
-				status: ["Active tools saved."],
+				status: ["1 unsaved change"],
+			});
+			await clickButton(page, "Save tools");
+			const [save] = await waitHeld(page, "tools.set", 1);
+			expect(save!.params).toEqual({ sessionId: "old", names: ["read", "bash"] });
+			// The list stays in place while saving, so the query, scroll and focus survive; it is locked meanwhile.
+			expect(await read(page)).toMatchObject({
+				tools: [
+					{ name: "read", disabled: true },
+					{ name: "bash", disabled: true },
+					{ name: "python", disabled: true },
+				],
+				saveDisabled: true,
+				status: ["Saving tools…"],
+			});
+
+			await answer(page, [save!], null);
+			// A save is followed by one fresh read, which replaces the edits with what the SDK applied.
+			const [reread] = (await waitHeld(page, "tools.list", 2)).slice(1);
+			expect(reread!.params).toEqual({ sessionId: "old" });
+			await answer(page, [reread!], { available: ["read", "bash", "python"], active: ["read", "bash"] });
+			await page.waitForFunction(
+				() => document.querySelector("dialog[open] .tool-catalog-section > h3")?.textContent === "Active 2",
+			);
+			expect(await read(page)).toMatchObject({
+				sections: ["Active 2", "Available 1"],
+				tools: [
+					{ name: "bash", checked: true, disabled: false },
+					{ name: "read", checked: true, disabled: false },
+					{ name: "python", checked: false, disabled: false },
+				],
+				saveDisabled: true,
+				status: ["Tools saved."],
 				errors: [],
 			});
 			expect(await held(page, "tools.set")).toHaveLength(1);
+			expect(await held(page, "tools.list")).toHaveLength(2);
 
 			await page.keyboard.press("Escape");
 			await page.waitForSelector("dialog[open]", { hidden: true });
@@ -210,7 +303,173 @@ suite("Active tools dialog", () => {
 		}
 	}, 30000);
 
-	test("a failed or malformed read is shown and keeps Save unavailable", async () => {
+	test("searches names, labels and descriptions, and moves between rows with the arrow keys", async () => {
+		const { context, page } = await fixture();
+		try {
+			await openTools(page);
+			await answer(page, await waitHeld(page, "tools.list", 1), catalog);
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			expect(await read(page)).toMatchObject({
+				sections: ["Active 2", "Available 2"],
+				tools: [
+					{ name: "bash", tags: ["Essential"] },
+					{ name: "read", tags: ["Essential"] },
+					{ name: "mcp_github_search", tags: ["Hidden until searched", "MCP · github"] },
+					{ name: "todo_write", tags: ["Hidden until searched"] },
+				],
+			});
+			expect((await read(page)).text).toContain("2 active · 2 available");
+
+			const search = "dialog[open] .model-search input";
+			await page.type(search, "단계");
+			expect((await read(page)).tools.map(tool => tool.name)).toEqual(["todo_write"]);
+			expect((await read(page)).sections).toEqual(["Available 1"]);
+			await page.$eval(search, input => {
+				(input as HTMLInputElement).select();
+			});
+			await page.type(search, "ＧＩＴＨＵＢ");
+			expect((await read(page)).tools.map(tool => tool.name)).toEqual(["mcp_github_search"]);
+			await page.$eval(search, input => {
+				(input as HTMLInputElement).select();
+			});
+			await page.type(search, "zzz");
+			expect(await read(page)).toMatchObject({ tools: [], sections: [] });
+			expect((await read(page)).text).toContain("No tools match “zzz”.");
+
+			await page.$eval(search, input => {
+				(input as HTMLInputElement).select();
+			});
+			await page.keyboard.press("Backspace");
+			await page.focus(search);
+			await page.keyboard.press("ArrowDown");
+			expect(await focusedTool(page)).toBe("bash");
+			await page.keyboard.press("ArrowDown");
+			expect(await focusedTool(page)).toBe("read");
+			// Navigation crosses from Active into Available like one list.
+			await page.keyboard.press("ArrowDown");
+			expect(await focusedTool(page)).toBe("mcp_github_search");
+			await page.keyboard.press("End");
+			expect(await focusedTool(page)).toBe("todo_write");
+			await page.keyboard.press("ArrowDown");
+			expect(await focusedTool(page)).toBe("todo_write");
+			await page.keyboard.press("Home");
+			expect(await focusedTool(page)).toBe("bash");
+			await page.keyboard.press("Space");
+			expect((await read(page)).tools[0]).toMatchObject({ name: "bash", checked: false });
+			expect((await read(page)).sections).toEqual(["Active 2", "Available 2"]);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
+	test("Save waits while a turn runs, and a new tool-search result re-reads the list", async () => {
+		const { context, page } = await fixture();
+		try {
+			await updateSession(page, {
+				messages: [{ id: "earlier-search", role: "tool", toolName: "search_tool_bm25", text: "{}" }],
+			});
+			await openTools(page);
+			await answer(page, await waitHeld(page, "tools.list", 1), catalog);
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+
+			// A turn starts while the dialog is open. A tool-search row that is still running is not a result yet.
+			await updateSession(page, {
+				status: "running",
+				messages: [
+					{ id: "earlier-search", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+					{
+						id: "call:search-1",
+						role: "tool",
+						toolName: "search_tool_bm25",
+						text: "",
+						tool: { callId: "search-1", status: "running", family: "tool-search", detail: false },
+					},
+				],
+			});
+			await toggle(page, "todo_write");
+			await page.waitForFunction(() => document.body.textContent?.includes("You can save when this turn ends."));
+			expect(await read(page)).toMatchObject({ saveDisabled: true });
+			await toggle(page, "todo_write");
+			expect((await read(page)).status).toEqual([]);
+
+			// With nothing edited, a settled tool-search result re-reads the list.
+			await updateSession(page, {
+				status: "running",
+				messages: [
+					{ id: "earlier-search", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+					{
+						id: "search-result-1",
+						role: "tool",
+						toolName: "search_tool_bm25",
+						text: '{"activated_tools":["todo_write"]}',
+					},
+				],
+			});
+			const [reread] = (await waitHeld(page, "tools.list", 2)).slice(1);
+			await answer(page, [reread!], {
+				...catalog,
+				active: ["read", "bash", "todo_write"],
+				tools: catalog.tools.map(tool =>
+					tool.name === "todo_write" ? { ...tool, active: true, discovered: true, hidden: undefined } : tool,
+				),
+			});
+			await page.waitForFunction(
+				() => document.querySelector("dialog[open] .tool-catalog-section > h3")?.textContent === "Active 3",
+			);
+			expect((await read(page)).tools.find(tool => tool.name === "todo_write")).toMatchObject({
+				checked: true,
+				tags: ["Found by tool search"],
+			});
+			// The focused row moved to Active and was remounted there; focus followed it.
+			expect(await focusedTool(page)).toBe("todo_write");
+
+			// Over unsaved edits, the next result does not move rows under the user: Save waits for a reload.
+			await toggle(page, "read");
+			await updateSession(page, {
+				status: "idle",
+				messages: [
+					{ id: "earlier-search", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+					{ id: "search-result-1", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+					{ id: "search-result-2", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+				],
+			});
+			await page.waitForFunction(() =>
+				document.body.textContent?.includes("A tool search changed this conversation"),
+			);
+			await Bun.sleep(100);
+			expect(await held(page, "tools.list")).toHaveLength(2);
+			expect(await read(page)).toMatchObject({ saveDisabled: true });
+			await page.click("dialog[open] .tool-catalog-changed button");
+			const [reload] = (await waitHeld(page, "tools.list", 3)).slice(2);
+			await answer(page, [reload!], {
+				...catalog,
+				active: ["read", "bash", "todo_write", "mcp_github_search"],
+				tools: catalog.tools.map(tool =>
+					tool.name === "todo_write" || tool.name === "mcp_github_search"
+						? { ...tool, active: true, discovered: true, hidden: undefined }
+						: tool,
+				),
+			});
+			await page.waitForFunction(
+				() => document.querySelector("dialog[open] .tool-catalog-section > h3")?.textContent === "Active 4",
+			);
+			// The reload keeps the edit on top of the new list, and focus returns to the search field.
+			expect(await read(page)).toMatchObject({ saveDisabled: false, status: ["1 unsaved change"] });
+			expect((await read(page)).tools.find(tool => tool.name === "read")).toMatchObject({ checked: false });
+			expect((await read(page)).tools.find(tool => tool.name === "mcp_github_search")).toMatchObject({
+				checked: true,
+				tags: ["Found by tool search", "MCP · github"],
+			});
+			expect(await page.evaluate(() => document.activeElement?.closest(".model-search") !== null)).toBe(true);
+			await clickButton(page, "Save tools");
+			const [save] = await waitHeld(page, "tools.set", 1);
+			expect(save!.params).toEqual({ sessionId: "old", names: ["bash", "todo_write", "mcp_github_search"] });
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
+	test("a failed read offers a retry; a malformed read is refused", async () => {
 		const { context, page } = await fixture();
 		try {
 			await openTools(page);
@@ -218,7 +477,12 @@ suite("Active tools dialog", () => {
 			await page.evaluate(
 				ids => {
 					for (const id of ids)
-						window.navigationFixture.emit({ type: "response", id, ok: false, error: "Tool registry unavailable" });
+						window.navigationFixture.emit({
+							type: "response",
+							id,
+							ok: false,
+							error: "Tool registry unavailable",
+						});
 				},
 				failed.map(request => request.id),
 			);
@@ -228,11 +492,17 @@ suite("Active tools dialog", () => {
 				saveDisabled: true,
 				errors: ["Tool registry unavailable"],
 			});
-			expect((await read(page)).text).toContain("No tools are available.");
+			// A failed read is not an empty registry.
+			expect((await read(page)).text).not.toContain("No tools are available.");
+			await clickButton(page, "Try again");
+			const [retry] = (await waitHeld(page, "tools.list", 2)).slice(1);
+			await answer(page, [retry!], catalog);
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			expect(await read(page)).toMatchObject({ errors: [] });
 
 			await page.keyboard.press("Escape");
 			await page.waitForSelector("dialog[open]", { hidden: true });
-			const before = failed.length;
+			const before = (await held(page, "tools.list")).length;
 			await openTools(page);
 			const reads = (await waitHeld(page, "tools.list", before + 1)).slice(before);
 			expect((await read(page)).errors).toEqual([]);
@@ -243,6 +513,74 @@ suite("Active tools dialog", () => {
 				saveDisabled: true,
 				errors: ["The tool list response format is invalid."],
 			});
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
+	test("a conversation owned by another process shows the catalog as unavailable", async () => {
+		const { context, page } = await fixture();
+		try {
+			await openTools(page);
+			const reads = await waitHeld(page, "tools.list", 1);
+			await page.evaluate(
+				ids => {
+					for (const id of ids)
+						window.navigationFixture.emit({
+							type: "response",
+							id,
+							ok: false,
+							error: "The SDK owner does not support desktop tools.list. Use its original control surface.",
+						});
+				},
+				reads.map(request => request.id),
+			);
+			await page.waitForSelector("dialog[open] .tool-catalog-unavailable");
+			expect(await read(page)).toMatchObject({ tools: [], errors: [], saveDisabled: true });
+			expect((await read(page)).text).toContain("Another gjc process owns this conversation");
+			expect((await read(page)).text).not.toContain("Save tools");
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
+	test("the showcase renders every Tools dialog state without widening a 390 px page", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			const errors: string[] = [];
+			page.on("pageerror", error => errors.push(String(error)));
+			await page.setViewport({ width: 390, height: 844 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-tool-catalog-empty");
+			const layout = await page.evaluate(() => ({
+				states: [...document.querySelectorAll("#showcase-tool-catalog .tool-catalog-showcase")].map(node => node.id),
+				nav: document.querySelector('.showcase-index a[href="#showcase-tool-catalog"]')?.textContent,
+				width: document.documentElement.clientWidth,
+				scroll: document.documentElement.scrollWidth,
+				frames: [...document.querySelectorAll(".tool-catalog-frame")].map(frame => frame.scrollWidth <= frame.clientWidth),
+			}));
+			expect(layout.states).toEqual(
+				[
+					"loading",
+					"error",
+					"populated",
+					"long",
+					"korean",
+					"no-matches",
+					"running",
+					"saving",
+					"search-changed",
+					"discovery-off",
+					"disconnected",
+					"unavailable",
+					"empty",
+				].map(state => `showcase-tool-catalog-${state}`),
+			);
+			expect(layout.nav).toBe("Tools dialog");
+			expect(layout.scroll).toBeLessThanOrEqual(layout.width);
+			expect(layout.frames.every(Boolean)).toBe(true);
+			expect(errors).toEqual([]);
 		} finally {
 			await context.close();
 		}
@@ -264,8 +602,8 @@ suite("Active tools dialog", () => {
 			expect((await read(page)).text).toContain("Loading tools…");
 
 			await answer(page, reads, { available: ["read"], active: [] });
-			await page.waitForSelector("dialog[open] label.checkbox-label");
-			expect((await read(page)).tools).toEqual([{ name: "read", checked: false }]);
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			expect((await read(page)).tools).toMatchObject([{ name: "read", checked: false }]);
 		} finally {
 			await context.close();
 		}
