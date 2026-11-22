@@ -3812,6 +3812,17 @@ export class DesktopHost {
 						},
 					),
 				);
+				// A Stop that arrived after this input may have swept the queue while the SDK was still
+				// admitting it, before it was added above; the plain abort keeps a follow-up queued for
+				// the next turn. Hand it back as the sweep would have. The write is issued before the
+				// SDK's own cancellation report, which the final receipt then ignores.
+				if (stopped() && submission.cancel()) {
+					const handedBack = this.#delivery(request.id, { disposition: "removed" });
+					await queuedPersisted;
+					await handedBack;
+					this.#publish(live);
+					return null;
+				}
 				await queuedPersisted;
 				this.#publish(live);
 				return { queued: true, submissionId: submission.submissionId };

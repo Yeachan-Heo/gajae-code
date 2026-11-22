@@ -1060,6 +1060,46 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task", "sent after Stop", "steered after Stop"]);
 	});
 
+	for (const deliverAs of ["followUp", "steer"] as const)
+		test(`an input the SDK admits while Stop sweeps the queue is handed back too (${deliverAs})`, async () => {
+			const { call, snapshot, session, sdk, control, frames } = await launch();
+			const running = call("prompt", { sessionId: session.id, text: "long task" }, `run-swept-${deliverAs}`);
+			await Promise.race([
+				control.started,
+				running.then(() => {
+					throw new Error("Prompt settled before its controlled stream started");
+				}),
+			]);
+			const abort = sdk.abort.bind(sdk);
+			const abortReached = Promise.withResolvers<void>();
+			vi.spyOn(sdk, "abort").mockImplementation(options => {
+				abortReached.resolve();
+				return abort(options);
+			});
+			const submit = sdk.submitUserMessage.bind(sdk);
+			let stopping: Promise<unknown> | undefined;
+			vi.spyOn(sdk, "submitUserMessage").mockImplementation(async (content, options) => {
+				const submission = await submit(content, options);
+				// The SDK has admitted the input; Stop sweeps the queue and aborts before the Host adds it.
+				stopping = call("abort", { sessionId: session.id });
+				await abortReached.promise;
+				return submission;
+			});
+			const id = `admitted-during-sweep-${deliverAs}`;
+			expect(
+				await call("prompt", { sessionId: session.id, text: "typed as Stop was pressed", deliverAs }, id),
+			).toBeNull();
+			expect(await stopping).toBeNull();
+			expect(await running).toBeNull();
+			await Bun.sleep(50);
+			expect(control.prompts).toHaveLength(1);
+			expect(sdk.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			const state = await snapshot();
+			expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+			expect(state.deliveries).toContainEqual(expect.objectContaining({ id, disposition: "removed" }));
+			expect(receiptTrail(frames, id)).not.toContain("cancelled");
+		});
+
 	test("a steer whose record lands while the Stop is still ending the run is handed back", async () => {
 		const { call, snapshot, session, sdk, control } = await launch();
 		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-still-stopping");
