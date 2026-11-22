@@ -1,4 +1,5 @@
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import type { DesktopMessage } from "./protocol";
 import {
 	DESKTOP_TOOL_LIMITS,
 	type DesktopToolCall,
@@ -299,12 +300,99 @@ export function projectToolCall(
 	};
 }
 
+/** Execution state the agent loop reports between a call's `message_end` and its result. */
+interface LiveCall {
+	/** `tool_execution_start` was seen; `pendingToolCalls` alone misses the gap after its end. */
+	started: boolean;
+}
+
+/** Live call state per SDK session. A session that is dropped takes its entry with it. */
+const liveCalls = new WeakMap<object, Map<string, LiveCall>>();
+
 /**
  * Receives every event of a live SDK session, before the Host's own handling, so running calls
- * can be tracked between `message_end` and their result. It must not throw. Nothing is tracked
- * yet.
+ * can be tracked between `message_end` and their result. It must not throw.
  */
-export function observeToolEvent(_session: Session, _event: { readonly type: string }): void {}
+export function observeToolEvent(session: Session, event: { readonly type: string }): void {
+	try {
+		if (event.type === "agent_start" || event.type === "agent_end") {
+			liveCalls.delete(session);
+			return;
+		}
+		const value = event as unknown as Record<string, unknown>;
+		if (event.type === "message_end") {
+			const message = record(value.message);
+			if (message?.role === "toolResult" && typeof message.toolCallId === "string")
+				liveCalls.get(session)?.delete(message.toolCallId);
+			return;
+		}
+		if (
+			(event.type !== "tool_execution_start" && event.type !== "tool_execution_update") ||
+			typeof value.toolCallId !== "string"
+		)
+			return;
+		const calls = liveCalls.get(session) ?? new Map<string, LiveCall>();
+		liveCalls.set(session, calls);
+		calls.set(value.toolCallId, { started: true });
+	} catch {
+		// Observation is best effort; the Host's own event handling must continue.
+	}
+}
+
+/** Live rows one projection synthesizes, newest last. */
+const LIVE_ROWS_LIMIT = 64;
+
+/**
+ * Rows for calls that have no result yet, only while the session streams: `preparing` while the
+ * streaming message is still writing the call, `running` once the agent loop executes it, and
+ * `waiting` in between. Saved history never produces them. Each row's id is `call:<callId>`; a
+ * call whose result is already in `session.messages` gets no row, so one id never appears twice.
+ */
+export function projectLiveToolCalls(
+	session: Pick<Session, "isStreaming" | "messages" | "state"> | undefined,
+	streamingMessage: unknown,
+	redact: (text: string) => string,
+): DesktopMessage[] {
+	try {
+		if (!session?.isStreaming) return [];
+		const messages = session.messages;
+		const settled = new Set<string>();
+		const pending: ToolCallSource[] = [];
+		// The current turn starts after the newest user message; every result follows its call.
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = record(messages[index]);
+			if (message?.role === "user") break;
+			if (message?.role === "toolResult" && typeof message.toolCallId === "string") settled.add(message.toolCallId);
+			else if (message?.role === "assistant")
+				pending.unshift(...toolCallBlocks(message).filter(call => !settled.has(call.id)));
+		}
+		const preparing = toolCallBlocks(streamingMessage);
+		const running = session.state.pendingToolCalls;
+		const tracked = liveCalls.get(session as object);
+		const rows: DesktopMessage[] = [];
+		const seen = new Set<string>();
+		for (const call of [...pending, ...preparing].slice(-LIVE_ROWS_LIMIT)) {
+			if (seen.has(call.id)) continue;
+			seen.add(call.id);
+			const live = tracked?.get(call.id);
+			const status: DesktopToolCallStatus = preparing.includes(call)
+				? "preparing"
+				: running.has(call.id) || live?.started
+					? "running"
+					: "waiting";
+			rows.push({
+				id: `call:${call.id}`,
+				role: "tool",
+				toolName: redactedHead(call.name, 100, redact) ?? "",
+				text: "",
+				tool: projectToolCall({ callId: call.id, toolName: call.name, call, status, detail: true }, redact),
+			});
+		}
+		return rows;
+	} catch {
+		return [];
+	}
+}
 
 /**
  * Answers `tool.detail` for a live session. `tool.detail` is a projected control method, so the

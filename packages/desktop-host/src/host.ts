@@ -117,7 +117,7 @@ import { projectDesktopSessionInfo, readDesktopPullRequest, readDesktopSessionIn
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 import { projectToolCatalog } from "./tool-catalog";
-import { observeToolEvent, projectToolDetail } from "./tool-projection";
+import { observeToolEvent, projectLiveToolCalls, projectToolDetail } from "./tool-projection";
 
 type AgentSession = CreateAgentSessionResult["session"];
 type SessionManager = AgentSession["sessionManager"];
@@ -952,7 +952,12 @@ export class DesktopHost {
 			},
 		}));
 		// Notices sit where they were raised rather than after every later turn.
-		const fitted = fitMessages(anchorNotices(transcript, notices).slice(-HISTORY_LIMIT), messageBudget);
+		// Calls still running join the display copy too; they never count as transcript.
+		const display = [
+			...anchorNotices(transcript, notices),
+			...projectLiveToolCalls(live?.sdk, live?.streamingMessage, text => this.#redact(text)),
+		];
+		const fitted = fitMessages(display.slice(-HISTORY_LIMIT), messageBudget);
 		return {
 			id: metadata.id,
 			projectId: metadata.projectId,

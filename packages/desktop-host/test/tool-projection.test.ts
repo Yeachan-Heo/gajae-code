@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import { fitMessages, HISTORY_LIMIT, projectHistoryPage, projectMessages } from "../src/message-projection";
 import type { DesktopMessage } from "../src/protocol";
+import { observeToolEvent, projectLiveToolCalls } from "../src/tool-projection";
 import { DESKTOP_TOOL_LIMITS, type DesktopToolCall } from "../src/tool-protocol";
+
+type Session = CreateAgentSessionResult["session"];
 
 const live = { sessionGeneration: 1 };
 
@@ -230,5 +234,80 @@ describe("tool row summaries", () => {
 		// Typical rows fit when three conversations share the snapshot.
 		const typical = window("todo list", "Find the task tool", ["todo_write"]);
 		expect(fitMessages(typical, Math.floor(500_000 / 3)).truncated).toBe(false);
+	});
+});
+
+/** The parts of a live SDK session the live-row projection reads. */
+function fakeSession(messages: unknown[], pending: string[] = [], isStreaming = true) {
+	return { isStreaming, messages, state: { pendingToolCalls: new Set(pending) } } as unknown as Session;
+}
+const assistantCalls = (...calls: Array<[string, string, Record<string, unknown>]>) => ({
+	role: "assistant",
+	stopReason: "toolUse",
+	content: calls.map(([id, name, args]) => ({ type: "toolCall", id, name, arguments: args })),
+});
+
+describe("live tool rows", () => {
+	test("calls without a result are preparing, waiting or running only while the session streams", () => {
+		const history = [
+			{ role: "user", content: "earlier" },
+			assistantCalls(["old", "read", { path: "never-settled" }]),
+			{ role: "user", content: "now" },
+			assistantCalls(
+				["a", "read", { path: "a.ts" }],
+				["b", "bash", { command: "npm test" }],
+				["c", "edit", { path: "c.ts" }],
+			),
+			{ role: "toolResult", toolCallId: "a", toolName: "read", content: "done" },
+		];
+		const streaming = {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "d", name: "write", arguments: { path: "d.md", __partialJson: '{"path":"d.md' } },
+			],
+		};
+		const session = fakeSession(history, ["b"]);
+		const rows = projectLiveToolCalls(session, streaming, text => text);
+		expect(rows.map(row => [row.id, row.role, row.tool?.status, row.tool?.subject])).toEqual([
+			["call:b", "tool", "running", "$ npm test"],
+			["call:c", "tool", "waiting", "c.ts"],
+			["call:d", "tool", "preparing", "d.md"],
+		]);
+		expect(rows.every(row => row.tool?.detail === true && row.text === "")).toBe(true);
+		expect(projectLiveToolCalls(fakeSession(history, ["b"], false), streaming, text => text)).toEqual([]);
+		expect(projectLiveToolCalls(undefined, streaming, text => text)).toEqual([]);
+	});
+
+	test("a call stays running after its execution ends until its result is appended", () => {
+		const history = [{ role: "user", content: "go" }, assistantCalls(["a", "read", { path: "a.ts" }])];
+		const session = fakeSession(history);
+		const status = () => projectLiveToolCalls(session, undefined, text => text).map(row => row.tool?.status);
+		expect(status()).toEqual(["waiting"]);
+		observeToolEvent(session, { type: "tool_execution_start", toolCallId: "a" } as { type: string });
+		observeToolEvent(session, { type: "tool_execution_end", toolCallId: "a" } as { type: string });
+		expect(status()).toEqual(["running"]);
+		const result = { role: "toolResult", toolCallId: "a", toolName: "read", content: "ok" };
+		history.push(result);
+		observeToolEvent(session, { type: "message_end", message: result } as { type: string });
+		expect(status()).toEqual([]);
+		// A new run starts clean: an id seen before is not running until it starts again.
+		history.pop();
+		observeToolEvent(session, { type: "agent_start" });
+		expect(status()).toEqual(["waiting"]);
+		// A malformed event is ignored; it neither throws nor disturbs tracked state.
+		observeToolEvent(session, { type: "tool_execution_start", toolCallId: 7 } as { type: string });
+		expect(status()).toEqual(["waiting"]);
+	});
+
+	test("live rows join only the display list and are redacted like settled rows", () => {
+		const redact = (text: string) => text.replaceAll("token-123", "[redacted]");
+		const session = fakeSession([
+			{ role: "user", content: "go" },
+			assistantCalls(["a", "bash", { command: "curl -H token-123 host", env: { KEY: "env-secret" } }]),
+		]);
+		const [row] = projectLiveToolCalls(session, undefined, redact);
+		expect(row?.tool?.subject).toBe("$ curl -H [redacted] host");
+		expect(JSON.stringify(row)).not.toContain("env-secret");
+		expect(JSON.stringify(row)).not.toContain("token-123");
 	});
 });
