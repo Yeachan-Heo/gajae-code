@@ -1002,8 +1002,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-flow[data-tone="waiting"] .provider-flow-heading > svg { color: var(--status-waiting); }
 .provider-flow-status { color: var(--muted); font-size: 0.8125rem; }
 /* Text on an amber-tinted card uses the body ink: muted ink falls under 4.5:1 on the tint in some
-   palettes. The amber stays on the card's edge, its icon and its heading. */
-.provider-flow[data-tone="waiting"] .provider-flow-status { color: var(--text); }
+   palettes. The amber stays on the card's edge, its icon and its heading. A warning can arrive after
+   the sign-in page and code, so they are covered too. */
+.provider-flow[data-tone="waiting"] :is(.provider-flow-status, .provider-code > span, .provider-url) { color: var(--text); }
 .provider-code { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.25rem; justify-items: start; min-width: 0; }
 .provider-code > span { color: var(--muted); font-size: 0.75rem; }
 .provider-code-value { padding: 0.5rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); font-family: var(--mono); font-size: 1.5rem; font-weight: 600; letter-spacing: 0.12em; user-select: all; }

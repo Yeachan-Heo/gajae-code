@@ -832,6 +832,18 @@ suite("Providers panel interactions", () => {
 				await set(page, { flow: flow({ provider: "beta", status: "waiting", warning }) });
 				await page.waitForSelector('.provider-flow[data-view="warning"][data-tone="waiting"]');
 				await check(theme, "provider warning", [".provider-flow-status", ".provider-warning > h5", ".provider-warning > p"]);
+				// The Host does not drop a URL or device code it already sent when a warning arrives.
+				await set(page, {
+					flow: flow({
+						provider: "beta",
+						status: "waiting",
+						warning,
+						url: "https://sign-in.example.invalid/device",
+						verificationCode: "WDJB-MJHT",
+					}),
+				});
+				await page.waitForSelector('.provider-flow[data-view="warning"][data-tone="waiting"] .provider-url');
+				await check(theme, "provider warning with a sign-in page", [".provider-code > span", ".provider-url"]);
 				await set(page, { flow: null, keyState: { provider: "delta", status: "saved", catalogRefreshed: false } });
 				await select(page, "delta");
 				await page.waitForSelector('.provider-flow[data-view="saved-refresh-failed"][data-tone="waiting"]');
