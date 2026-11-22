@@ -201,6 +201,10 @@ suite("Active tools dialog", () => {
 
 			await page.keyboard.press("Escape");
 			await page.waitForSelector("dialog[open]", { hidden: true });
+			// Closing returns focus to the toolbar control that opened Conversation actions.
+			await page.waitForFunction(
+				() => document.activeElement?.getAttribute("aria-label") === "Conversation actions menu",
+			);
 		} finally {
 			await context.close();
 		}

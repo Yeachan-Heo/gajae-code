@@ -47,10 +47,10 @@ export type DesktopToolFamily =
 	| "other";
 
 /**
- * Lifecycle of one call. `preparing` (arguments still streaming), `waiting` (queued behind
- * another call) and `running` exist only while the session streams; saved history never invents
- * them. `background` means the tool returned while its work continues. A settled call is
- * `done`, `failed` or `cancelled`.
+ * Lifecycle of one call. `preparing` (its arguments are still streaming), `waiting` (its
+ * assistant message is complete but execution has not started) and `running` exist only while
+ * the session streams; saved history never invents them. `background` means the tool returned
+ * while its work continues. A settled call is `done`, `failed` or `cancelled`.
  */
 export type DesktopToolCallStatus =
 	| "preparing"

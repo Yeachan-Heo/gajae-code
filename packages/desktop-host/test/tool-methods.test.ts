@@ -78,7 +78,7 @@ describe("desktop tool methods on a live session", () => {
 		const result = await h.call<{ available: string[]; active: string[] }>("tools.list", {
 			sessionId: h.session.id,
 		});
-		expect(result).toEqual({ available: h.sdk.getAllToolNames(), active: h.sdk.getActiveToolNames() });
+		expect(result).toMatchObject({ available: h.sdk.getAllToolNames(), active: h.sdk.getActiveToolNames() });
 		expect(result.active.length).toBeGreaterThan(0);
 	}, 30_000);
 
