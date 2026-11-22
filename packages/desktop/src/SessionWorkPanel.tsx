@@ -2,7 +2,7 @@ import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-
 import type { DesktopSession } from "@gajae-code/desktop-host/protocol";
 import { useId } from "react";
 import { ActivityPanel, type ActivityPanelProps } from "./ActivityPanel";
-import { ErrorBanner, GoalStrip, TodoPanel } from "./components";
+import { ErrorBanner, GoalStrip, SessionWorkTodos } from "./components";
 import { t } from "./i18n";
 
 export type DesktopGoalOperation = "resume" | "pause" | "complete" | "drop";
@@ -53,12 +53,7 @@ export function SessionWorkPanel({ session, activity, goalPending, goalError, on
 			</header>
 			<div className="session-work-body">
 				{empty && <p className="activity-empty">{t("panels.sessionWorkEmpty")}</p>}
-				{hasTasks && (
-					<section className="session-work-todos" aria-label={t("panels.sessionWorkTodos")}>
-						<h3>{t("panels.sessionWorkTodos")}</h3>
-						<TodoPanel phases={session.todos?.filter(phase => phase.tasks.length > 0) ?? []} />
-					</section>
-				)}
+				{hasTasks && <SessionWorkTodos session={session} />}
 				{session.goal && (
 					<section className="session-work-goal" aria-label={t("support.goalLabel")}>
 						<h3>{t("support.goalLabel")}</h3>

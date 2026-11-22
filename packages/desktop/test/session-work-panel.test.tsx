@@ -34,6 +34,17 @@ describe("SessionWorkPanel", () => {
 		expect(html).toContain("time used 3s");
 	});
 
+	test("says the task list may be out of date after its last update failed, and not otherwise", () => {
+		const failed = { id: "todo-failed", role: "tool" as const, toolName: "todo_write", text: "rejected", isError: true };
+		const html = renderToStaticMarkup(<SessionWorkPanel session={{ ...session, messages: [failed] }} activity={activity} onOperateGoal={() => {}} />);
+		expect(html).toContain("Task list may be out of date. Its last update failed.");
+		expect(html.indexOf("Plan tasks")).toBeLessThan(html.indexOf("todo-stale"));
+		expect(html.indexOf("todo-stale")).toBeLessThan(html.indexOf("todo-panel"));
+		const recovered = { ...failed, id: "todo-ok", text: "applied", isError: undefined };
+		expect(renderToStaticMarkup(<SessionWorkPanel session={{ ...session, messages: [failed, recovered] }} activity={activity} onOperateGoal={() => {}} />)).not.toContain("todo-stale");
+		expect(renderToStaticMarkup(<SessionWorkPanel session={{ ...session, todos: [], messages: [failed] }} activity={activity} onOperateGoal={() => {}} />)).not.toContain("todo-stale");
+	});
+
 	test("keeps empty tasks, missing goal and independent errors explicit", () => {
 		const html = renderToStaticMarkup(<SessionWorkPanel session={{ ...session, todos: [], goal: undefined }} activity={{ ...activity, snapshot: null, error: "Activity failed" }} goalError="Goal failed" onOperateGoal={() => {}} />);
 		expect(html).not.toContain("No tasks yet.");

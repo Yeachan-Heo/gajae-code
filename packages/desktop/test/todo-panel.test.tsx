@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import type { DesktopSession, DesktopTodoPhase } from "@gajae-code/desktop-host/protocol";
+import type { DesktopMessage, DesktopSession, DesktopTodoPhase } from "@gajae-code/desktop-host/protocol";
+import type { DesktopToolCallStatus } from "@gajae-code/desktop-host/tool-protocol";
 import { renderToStaticMarkup } from "react-dom/server";
 import { SessionWorkProgress, sessionWorkLabel } from "../src/SessionWorkProgress";
-import { TODO_TASK_LIMIT, TodoPanel, TodoPhaseList, todoProgress } from "../src/TodoPanel";
+import {
+	SessionWorkTodos,
+	TODO_TASK_LIMIT,
+	TodoPanel,
+	TodoPhaseList,
+	todoListStale,
+	todoProgress,
+} from "../src/TodoPanel";
 
 const phases: DesktopTodoPhase[] = [
 	{
@@ -140,5 +148,53 @@ describe("Session work toolbar progress", () => {
 			'<span class="session-work-progress complete" aria-hidden="true">2/2</span>',
 		);
 		expect(sessionWorkLabel(finished)).toBe("Session work, 2 of 2 tasks done");
+	});
+});
+
+describe("stale task list hint", () => {
+	let next = 0;
+	const row = (fields: Partial<DesktopMessage>): DesktopMessage => ({ id: `m${next++}`, role: "tool", text: "", ...fields });
+	const todo = (fields: Partial<DesktopMessage> = {}) => row({ toolName: "todo_write", ...fields });
+	const call = (status: DesktopToolCallStatus, fields: Partial<DesktopMessage> = {}) =>
+		row({ toolName: "todo_write", tool: { callId: `c${next}`, status, family: "todo", detail: false }, ...fields });
+	const user = row({ role: "user", text: "go" });
+
+	test("is set only when the newest settled todo_write row failed", () => {
+		expect(todoListStale([])).toBe(false);
+		expect(todoListStale([user, todo()])).toBe(false);
+		expect(todoListStale([user, todo({ isError: true })])).toBe(true);
+		expect(todoListStale([todo({ isError: true }), todo()])).toBe(false);
+		expect(todoListStale([todo(), todo({ isError: true })])).toBe(true);
+		expect(todoListStale([call("done"), call("failed")])).toBe(true);
+	});
+
+	test("ignores other tools, cancelled calls and calls still in flight", () => {
+		const failed = todo({ isError: true });
+		expect(todoListStale([failed, row({ toolName: "read" })])).toBe(true);
+		expect(todoListStale([todo(), row({ toolName: "read", isError: true })])).toBe(false);
+		expect(todoListStale([todo(), todo({ cancelled: true, isError: true })])).toBe(false);
+		expect(todoListStale([failed, call("cancelled")])).toBe(true);
+		for (const status of ["preparing", "waiting", "running"] as const) {
+			expect(todoListStale([failed, call(status)])).toBe(true);
+			expect(todoListStale([todo(), call(status)])).toBe(false);
+		}
+	});
+
+	test("recognises a todo row by its family when the tool name differs", () => {
+		expect(todoListStale([call("failed", { toolName: "renamed" })])).toBe(true);
+	});
+
+	test("the Session work group shows the hint above the list only when the list is stale", () => {
+		const session: DesktopSession = {
+			id: "fixture", projectId: "fixture", title: "Fixture", status: "done", starred: false,
+			imageInput: null, operatorRunning: false, controlGeneration: null, messages: [todo({ isError: true })],
+			todos: [{ name: "Work", tasks: [{ content: "Task", status: "pending" }] }],
+		};
+		const stale = renderToStaticMarkup(<SessionWorkTodos session={session} />);
+		expect(stale).toContain("Task list may be out of date. Its last update failed.");
+		expect(stale.indexOf("todo-stale")).toBeLessThan(stale.indexOf("todo-panel"));
+		expect(renderToStaticMarkup(<SessionWorkTodos session={{ ...session, messages: [todo()] }} />)).not.toContain("todo-stale");
+		// Without a list there is nothing to call out of date.
+		expect(renderToStaticMarkup(<SessionWorkTodos session={{ ...session, todos: [] }} />)).toBe("");
 	});
 });

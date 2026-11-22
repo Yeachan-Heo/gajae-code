@@ -14,4 +14,5 @@ export const todo = {
 	"todo.capNotice": "Only the first {count} tasks are shown.",
 	"todo.progressChip": "{done}/{total}",
 	"todo.sessionWorkLabel": "Session work, {done} of {total} tasks done",
+	"todo.stale": "Task list may be out of date. Its last update failed.",
 } as const;

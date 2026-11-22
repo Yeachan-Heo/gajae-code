@@ -1,4 +1,9 @@
-import type { DesktopTodoItem, DesktopTodoPhase } from "@gajae-code/desktop-host/protocol";
+import type {
+	DesktopMessage,
+	DesktopSession,
+	DesktopTodoItem,
+	DesktopTodoPhase,
+} from "@gajae-code/desktop-host/protocol";
 import {
 	ChevronDown,
 	ChevronRight,
@@ -8,6 +13,7 @@ import {
 	LoaderCircle,
 	type LucideIcon,
 	StickyNote,
+	TriangleAlert,
 	X,
 } from "lucide-react";
 import { useState } from "react";
@@ -142,6 +148,45 @@ export function TodoPanel({ phases, defaultOpen = false }: { phases: DesktopTodo
 				{open ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
 			</button>
 			{open && <TodoPhaseList phases={phases} />}
+		</section>
+	);
+}
+
+/**
+ * True when the newest settled `todo_write` row in the visible transcript failed, so the list the
+ * Host reports may not be the one the model meant to write. Cancelled rows changed nothing and
+ * calls still in flight have no result yet, so both are skipped in favour of the row before.
+ */
+export function todoListStale(messages: readonly DesktopMessage[]): boolean {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "tool") continue;
+		if (message.tool?.family !== "todo" && message.toolName !== "todo_write") continue;
+		const status = message.tool?.status;
+		if (message.cancelled || status === "cancelled") continue;
+		if (status === "preparing" || status === "waiting" || status === "running") continue;
+		return message.isError === true || status === "failed";
+	}
+	return false;
+}
+
+/**
+ * The task list group of the Session work card: its heading, a hint when the last update failed,
+ * and the panel. Renders nothing for a session without tasks.
+ */
+export function SessionWorkTodos({ session }: { session: DesktopSession }) {
+	const phases = session.todos?.filter(phase => phase.tasks.length > 0) ?? [];
+	if (phases.length === 0) return null;
+	return (
+		<section className="session-work-todos" aria-label={t("panels.sessionWorkTodos")}>
+			<h3>{t("panels.sessionWorkTodos")}</h3>
+			{todoListStale(session.messages) && (
+				<p className="todo-stale">
+					<TriangleAlert aria-hidden="true" />
+					<span>{t("todo.stale")}</span>
+				</p>
+			)}
+			<TodoPanel phases={phases} />
 		</section>
 	);
 }
