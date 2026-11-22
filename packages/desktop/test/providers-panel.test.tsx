@@ -829,7 +829,13 @@ suite("Providers panel interactions", () => {
 				await check(theme, "failed row under the pointer", [failed]);
 				await select(page, "gamma");
 				await page.waitForSelector('.provider-flow[data-view="failed"]');
-				await check(theme, "failed detail", ['.provider-detail-head .provider-status[data-state="failed"]']);
+				await check(theme, "failed detail", [
+					'.provider-detail-head .provider-status[data-state="failed"]',
+					".provider-flow .error-banner .error-content",
+				]);
+				await set(page, { flow: flow({ provider: "gamma", url: "http://sign-in.example.invalid/authorize" }) });
+				await page.waitForSelector(".provider-flow .error-banner");
+				await check(theme, "insecure sign-in address", [".provider-flow .error-banner .error-content"]);
 				// The amber outcome cards: connected without models, and saved without a refreshed list.
 				await set(page, { flow: flow({ provider: "beta", status: "complete" }) });
 				await select(page, "beta");
@@ -857,10 +863,44 @@ suite("Providers panel interactions", () => {
 				await set(page, { keyState: { provider: "delta", status: "invalid", reason: "command" } });
 				await page.waitForSelector(".provider-field-error");
 				await check(theme, "key error", [".provider-field-error"]);
+				await set(page, { keyState: { provider: "delta", status: "error", error: "Fixture save failure" } });
+				await page.waitForSelector(".provider-key .error-banner");
+				await check(theme, "key save failure", [".provider-key .error-banner .error-content"]);
+				await select(page, null);
+				await set(page, { keyState: null, loaded: false, loadError: "Could not load the provider list." });
+				await page.waitForSelector(".provider-load-error .error-banner");
+				await check(theme, "load error", [".provider-load-error .error-banner .error-content"]);
+				await set(page, { loaded: true, loadError: undefined });
 			}
 			expect(failures).toEqual([]);
 		} finally {
 			await closeComponentFixture(context, page);
+		}
+	}, 60000);
+
+	test("the shared error banner clears 4.5:1 in every bundled theme in the other places it appears", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			const failures: string[] = [];
+			for (const theme of THEME_IDS) {
+				await page.evaluate((key, id) => localStorage.setItem(key, id), THEME_STORAGE_KEY, theme);
+				await page.reload();
+				await page.waitForFunction(id => document.documentElement.dataset.theme === id, {}, theme);
+				await page.waitForSelector("#showcase-tool-catalog-error .error-banner");
+				// The Tools dialog's read error, and the app's generic banner (a lost host connection).
+				const samples = await page.evaluate(measureContrast, [
+					"#showcase-tool-catalog-error .error-banner .error-content",
+					"#showcase-feedback .error-banner .error-content",
+				]);
+				for (const sample of samples)
+					if (sample.ratio < 4.5) failures.push(`${theme} · ${sample.selector}: ${sample.ratio}`);
+			}
+			expect(failures).toEqual([]);
+		} finally {
+			await context.close();
 		}
 	}, 60000);
 
