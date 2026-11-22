@@ -1192,9 +1192,15 @@ test("the tool search demonstration activates todo_write between completions of 
 	expect(offered[0]).toContain("search_tool_bm25");
 	expect(offered[0]).not.toContain("todo_write");
 	expect(offered[1]).toContain("todo_write");
+	const searchResult = (fixture.snapshot().requests[1]!.body.messages as Array<{ role: string; content: unknown }>)
+		.filter(message => message.role === "tool")
+		.at(-1);
+	expect(JSON.parse(String(searchResult?.content))).toMatchObject({ activated_tools: ["todo_write"] });
 	const settled = await call<DesktopSession>("session.select", { sessionId: session.id });
-	const search = settled.messages.find(message => message.role === "tool" && message.toolName === "search_tool_bm25");
-	expect(JSON.parse(search?.text ?? "{}")).toMatchObject({ activated_tools: ["todo_write"] });
+	expect(settled.messages.flatMap(message => (message.role === "tool" ? [message.toolName] : []))).toEqual([
+		"search_tool_bm25",
+		"todo_write",
+	]);
 	expect(settled.todos?.map(phase => [phase.name, phase.tasks.map(task => task.status)])).toEqual([
 		["Investigate", ["completed", "in_progress"]],
 		["Fix", ["pending", "pending"]],
@@ -1206,26 +1212,35 @@ test("the printed tool demonstrations run as documented against the real Host", 
 	const { layout, fixture, child, call, send, session } = await sdkHost();
 	const editTarget = path.join(layout.project, QA_EDIT_DEMO_FILE);
 	const original = await Bun.file(editTarget).text();
-	const toolRows = async () =>
-		(await call<DesktopSession>("session.select", { sessionId: session.id })).messages.filter(
-			message => message.role === "tool",
+	const toolNames = async () =>
+		(await call<DesktopSession>("session.select", { sessionId: session.id })).messages.flatMap(message =>
+			message.role === "tool" && message.toolName ? [message.toolName] : [],
 		);
+	// Evidence the fixture owns: the completions of the turn and the tool results the SDK sent back.
 	const run = async (prompt: string) => {
-		const before = (await toolRows()).length;
+		const rowsBefore = (await toolNames()).length;
+		const requestsBefore = fixture.snapshot().requests.length;
 		const started = Date.now();
 		const response = send("prompt", { sessionId: session.id, text: prompt });
-		if (fixture.snapshot().requests.length === 0) {
+		if (requestsBefore === 0) {
 			await waitFor(() => fixture.snapshot().requests.length === 1, "first demonstration");
 			expect(fixture.release(1)).toBe(true);
 		}
 		expect((await response).ok).toBe(true);
-		return { rows: (await toolRows()).slice(before), elapsed: Date.now() - started };
+		const requests = fixture.snapshot().requests.slice(requestsBefore);
+		const closing = requests.at(-1)!.body.messages as Array<{ role: string; content: unknown }>;
+		return {
+			requests,
+			results: closing.filter(message => message.role === "tool").map(message => String(message.content)),
+			rows: (await toolNames()).slice(rowsBefore),
+			elapsed: Date.now() - started,
+		};
 	};
 
 	const failing = await run(QA_DEMONSTRATIONS.failingRead.prompt);
-	expect(failing.rows).toMatchObject([
-		{ toolName: "read", isError: true, text: "Path 'qa-missing-file.txt' not found" },
-	]);
+	expect(failing.rows).toEqual(["read"]);
+	expect(failing.results).toHaveLength(1);
+	expect(failing.results[0]).toContain("qa-missing-file.txt' not found");
 
 	// Two seconds after the model asked for the call, the turn is still running without its result.
 	const callRequest = fixture.snapshot().requests.length + 1;
@@ -1235,16 +1250,16 @@ test("the printed tool demonstrations run as documented against the real Host", 
 		return call<DesktopSession>("session.select", { sessionId: session.id });
 	})();
 	const slow = await run(QA_DEMONSTRATIONS.slowShell.prompt);
-	expect(slow.rows).toMatchObject([{ toolName: "bash", text: "slow call finished\n" }]);
+	expect(slow.rows).toEqual(["bash"]);
+	expect(slow.results.at(-1)).toContain("slow call finished");
 	expect(slow.elapsed).toBeGreaterThanOrEqual(3500);
 	const midway = await probe;
 	expect(midway.status).toBe("running");
 	expect(midway.messages.some(message => message.role === "tool" && message.toolName === "bash")).toBe(false);
 
 	const edited = await run(QA_DEMONSTRATIONS.edit.prompt);
-	expect(edited.rows).toMatchObject([
-		{ toolName: "edit", text: `Successfully replaced text in ${QA_EDIT_DEMO_FILE}.` },
-	]);
+	expect(edited.rows).toEqual(["edit"]);
+	expect(edited.results.at(-1)).toContain("Successfully replaced text");
 	expect(await Bun.file(editTarget).text()).toBe(
 		original.replace("status: draft\nreviewer: none", "status: reviewed\nreviewer: desktop-qa"),
 	);
@@ -1268,18 +1283,21 @@ test("the printed tool demonstrations run as documented against the real Host", 
 	expect(editDiffs[0]).toContain("status: reviewed");
 
 	const undone = await run(QA_DEMONSTRATIONS.editUndo.prompt);
-	expect(undone.rows).toMatchObject([{ toolName: "edit" }]);
+	expect(undone.rows).toEqual(["edit"]);
 	expect(await Bun.file(editTarget).text()).toBe(original);
 
-	const before = fixture.snapshot().requests.length;
 	const grouped = await run(QA_DEMONSTRATIONS.multiCall.prompt);
-	expect(grouped.rows.map(row => row.toolName).sort()).toEqual(["find", "read", "search"]);
-	expect(grouped.rows.find(row => row.toolName === "read")?.text).toBe(original);
-	expect(grouped.rows.find(row => row.toolName === "find")?.text).toBe("definition.move\nprobe.move");
-	// One response carried all three calls; the next completion closed the turn.
-	const groupedRequests = fixture.snapshot().requests.slice(before);
-	expect(groupedRequests).toHaveLength(2);
-	expect(groupedRequests[0]!.chunks.filter(chunk => chunk.includes('"tool_calls":[{')).length).toBe(3);
+	expect(grouped.rows.toSorted()).toEqual(["find", "read", "search"]);
+	// One response carried all three calls; the next completion received three results and closed the turn.
+	expect(grouped.requests).toHaveLength(2);
+	expect(grouped.requests[0]!.chunks.filter(chunk => chunk.includes('"tool_calls":[{')).length).toBe(3);
+	expect(grouped.results.slice(-3)).toEqual(
+		expect.arrayContaining([
+			original,
+			"definition.move\nprobe.move",
+			expect.stringContaining("OWNED_DEFINITION_MARKER"),
+		]),
+	);
 }, 90000);
 
 test("QA driver fixture controls retain Origin/token/method and SSE-first admission fences", async () => {
