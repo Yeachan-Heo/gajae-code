@@ -117,6 +117,8 @@ function createStubInputControllerContext(opts: {
 		skillCommands: opts.skillCommands,
 		session: {
 			sessionId: "stub-session",
+			queuedMessageMark: vi.fn(() => new Set()),
+			dropUserInputQueuedSince: vi.fn(),
 			isStreaming: opts.isStreaming,
 			isCompacting: false,
 			isBashRunning: opts.isBashRunning ?? false,
@@ -285,7 +287,6 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		(ctx as unknown as { showStatus: (text: string) => void }).showStatus = () => {};
 		(ctx as unknown as { recordLocalSubmission: (text: string) => () => void }).recordLocalSubmission =
 			() => () => {};
-		(ctx.session as unknown as { clearQueue: () => void }).clearQueue = () => {};
 		const uiHelpers = new UiHelpers(ctx);
 		// Queue through the production entry point so the mark is recorded, not
 		// hand-written into the queue.

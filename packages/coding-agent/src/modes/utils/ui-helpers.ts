@@ -1300,8 +1300,8 @@ export class UiHelpers {
 		this.ctx.compactionQueuedMessages = [] as CompactionQueuedMessage[];
 		this.ctx.updatePendingMessagesDisplay();
 
-		let queuedBeforeFlush = this.ctx.session.queuedMessageMark();
-		let queuedByFlush: ReadonlySet<any> | undefined;
+		const queuedBeforeFlush = this.ctx.session.queuedMessageMark();
+		let queuedByFlush: ReadonlySet<AgentMessage> | undefined;
 		let restored = false;
 
 		const restoreQueue = (error: unknown) => {

@@ -20675,8 +20675,8 @@ export class AgentSession {
 	dropUserInputQueuedSince(mark: ReadonlySet<AgentMessage>, until?: ReadonlySet<AgentMessage>): void {
 		const callers = (message: AgentMessage): boolean =>
 			!mark.has(message) && (until === undefined || until.has(message));
-		const keepFrom = (queue: readonly AgentMessage[]): AgentMessage[] => {
-			const kept: AgentMessage[] = [];
+		const dropped = new Set<AgentMessage>();
+		const collect = (queue: readonly AgentMessage[]): void => {
 			let companions: AgentMessage[] = [];
 			for (const message of queue) {
 				if (callers(message) && isHiddenUserCompanion(message)) {
@@ -20684,14 +20684,24 @@ export class AgentSession {
 					continue;
 				}
 				// Companions go with the message they precede.
-				if (!callers(message) || !isUserAuthoredQueuedMessage(message)) kept.push(...companions, message);
+				if (callers(message) && isUserAuthoredQueuedMessage(message)) {
+					for (const companion of companions) dropped.add(companion);
+					dropped.add(message);
+				}
 				companions = [];
 			}
-			return kept;
 		};
-		const steering = keepFrom(this.agent.snapshotSteering());
-		const followUp = keepFrom(this.agent.snapshotFollowUp());
-		this.agent.restoreQueues({ steering, followUp });
+		collect(this.agent.snapshotSteering());
+		collect(this.agent.snapshotFollowUp());
+		if (dropped.size === 0) return;
+		this.agent.removeQueuedMessages(candidate => dropped.has(candidate));
+		this.#steeringMessages = this.#steeringMessages.filter(
+			entry => entry.message === undefined || !dropped.has(entry.message),
+		);
+		this.#followUpMessages = this.#followUpMessages.filter(
+			entry => entry.message === undefined || !dropped.has(entry.message),
+		);
+		this.#fireQueuedRemovalHooks([...dropped]);
 	}
 
 	/** Number of pending messages (includes steering, follow-up, and next-turn messages) */
