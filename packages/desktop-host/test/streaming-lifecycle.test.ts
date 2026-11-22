@@ -14,7 +14,7 @@ import {
 	type ExtensionUIContext,
 	loadExtensions,
 } from "@gajae-code/coding-agent/extensibility/extensions";
-import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import { type CreateAgentSessionResult, createSdkOperatorControls } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
@@ -1104,6 +1104,74 @@ describe("desktop streaming lifecycle", () => {
 			}),
 		);
 		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	const until = async (check: () => boolean | Promise<boolean>, what: string) => {
+		for (let i = 0; i < 1_000; i++) {
+			if (await check()) return;
+			await Bun.sleep(5);
+		}
+		throw new Error(`Timed out waiting for ${what}`);
+	};
+	/** A prompt that arrived just before a Stop of something other than the run must still run. */
+	async function promptOutlivesStop(
+		h: {
+			call: <T>(method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<T>;
+		} & {
+			session: DesktopSession;
+			sdk: AgentSession;
+			control: ControlledAgent;
+		},
+		id: string,
+		stop: () => Promise<void>,
+	) {
+		const record = holdDeliveryBegin(id);
+		const prompt = h.call("prompt", { sessionId: h.session.id, text: "sent before Stop" }, id);
+		await record.held;
+		await stop();
+		await until(() => !h.sdk.isBashRunning, "the command to end");
+		record.release();
+		expect(
+			await Promise.race([
+				h.control.started.then(() => "ran"),
+				prompt.then(
+					() => "settled without running",
+					() => "failed without running",
+				),
+			]),
+		).toBe("ran");
+		h.control.finishTurn("answered");
+		expect(await prompt).toBeNull();
+		expect(h.control.prompts).toHaveLength(1);
+		expect(userTurns(h.sdk)).toEqual(["sent before Stop"]);
+	}
+
+	test("a Stop that cancels a running shell command is not held against a prompt sent before it", async () => {
+		const h = await launch();
+		await h.call("operator.execute", { sessionId: h.session.id, text: "! sleep 30" });
+		await until(() => h.sdk.isBashRunning, "the command to start");
+		await promptOutlivesStop(h, "prompt-before-command-stop", async () => {
+			// This Stop is the command's, not the conversation run's.
+			expect(await h.call("abort", { sessionId: h.session.id })).toBeNull();
+		});
+		expect(await settledReceipts(h.snapshot, ["prompt-before-command-stop"])).toEqual({
+			"prompt-before-command-stop": "completed",
+		});
+	});
+
+	test("a Stop refused because another owner's command is running is not held against a prompt sent before it", async () => {
+		const h = await launch();
+		// Another owner of the same SDK session runs the command, so the Host has no operation to cancel.
+		const owner = createSdkOperatorControls(h.sdk);
+		const running = owner.execute({ text: "! sleep 30" });
+		await until(() => h.sdk.isBashRunning, "the command to start");
+		await promptOutlivesStop(h, "prompt-before-refused-stop", async () => {
+			await expect(h.call("abort", { sessionId: h.session.id })).rejects.toThrow("Stop cannot be proven");
+			owner.cancel({ operationId: running.operation.operationId });
+		});
+		expect(await settledReceipts(h.snapshot, ["prompt-before-refused-stop"])).toEqual({
+			"prompt-before-refused-stop": "completed",
+		});
 	});
 
 	test("Stop in one conversation leaves another conversation's run and inputs alone", async () => {
