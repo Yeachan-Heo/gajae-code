@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { DesktopFrame, DesktopMethod, DesktopSession, DesktopSnapshot } from "@gajae-code/desktop-host/protocol";
-import type { FixtureSessionObservation, FixtureSnapshot } from "../scripts/qa-model-fixture";
+import {
+	type FixtureSessionObservation,
+	type FixtureSnapshot,
+	QA_DEMONSTRATIONS,
+	QA_EDIT_DEMO_FILE,
+} from "../scripts/qa-model-fixture";
 
 interface WrapperConfig {
 	serverUrl: string;
@@ -11,7 +16,14 @@ interface WrapperConfig {
 	bootstrapUrl: string;
 	lifetimeMinutes: number;
 	expiresAt: string;
-	modelFixture: { dataDir: string; initialHold: boolean; requestLimit: number };
+	project: string;
+	modelFixture: {
+		dataDir: string;
+		initialHold: boolean;
+		requestLimit: number;
+		demonstrations: unknown;
+		editDemoFile: string;
+	};
 }
 
 interface HostStatus {
@@ -222,6 +234,17 @@ test("an interactive run streams its first prompt at once and reports its run co
 		const status = (await (await qa.post("/fixture/status", {})).json()) as FixtureSnapshot;
 		expect(status).toMatchObject({ holdNext: false, requestLimit: 200 });
 		expect(status.requests[0]).toMatchObject({ id: 1, state: "completed", held: false, released: false });
+		// The printed demonstrations are the exact prompts the Host tests run.
+		expect(qa.config.modelFixture.demonstrations).toEqual(QA_DEMONSTRATIONS);
+		expect(qa.config.modelFixture.editDemoFile).toBe(path.join(qa.config.project, QA_EDIT_DEMO_FILE));
+		await qa.call("prompt", { sessionId: seeded.id, text: QA_DEMONSTRATIONS.edit.prompt });
+		const diff = await qa.call<Array<{ path: string; status: string; patch: string }>>("diff.get", {
+			sessionId: seeded.id,
+		});
+		const demo = diff.find(file => file.path === QA_EDIT_DEMO_FILE);
+		expect(demo?.status).not.toBe("??");
+		expect(demo?.patch).toContain("-status: draft\n-reviewer: none\n+status: reviewed\n+reviewer: desktop-qa\n");
+		expect(diff.find(file => file.path === "qa-untracked.txt")?.status).toBe("??");
 		await qa.call("shutdown");
 		expect(await qa.child.exited).toBe(0);
 	} finally {

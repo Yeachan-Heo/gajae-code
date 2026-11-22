@@ -13,6 +13,82 @@ export const QA_MAX_REQUEST_LIMIT = 512;
 const MAX_CALLS_PER_RESPONSE = 16;
 const MAX_CHAIN_STEPS = 16;
 const markerName = "qa-model-fixture.json";
+/** Project file the edit demonstrations change; seeded fresh into every owned project. */
+export const QA_EDIT_DEMO_FILE = "qa-edit-demo.txt";
+const QA_EDIT_DEMO_TEXT =
+	"# Release checklist (TEST ONLY fixture file)\nstatus: draft\nreviewer: none\nnotes: changed only by QA demonstrations\n";
+
+const todoDemoArguments = {
+	ops: [
+		{
+			op: "init",
+			list: [
+				{
+					phase: "Investigate",
+					items: ["Reproduce the expired-session sign-out", "Read the session refresh middleware"],
+				},
+				{
+					phase: "Fix",
+					items: ["Refresh the token before retrying the request", "Add a regression test for the retry"],
+				},
+				{ phase: "Verify", items: ["Run the auth test suite", "Check sign-in in the desktop app"] },
+			],
+		},
+		{ op: "done", task: "Reproduce the expired-session sign-out" },
+	],
+};
+
+export interface QaDemonstration {
+	/** Paste verbatim into the composer. */
+	prompt: string;
+	/** What the transcript should show. */
+	expect: string;
+}
+
+/**
+ * Ready-made prompts for a QA driver. The wrapper prints them in its bootstrap line and the
+ * Host tests run these exact strings. Paths are relative to the owned QA project.
+ */
+export const QA_DEMONSTRATIONS = {
+	failingRead: {
+		prompt: 'qa-tool-call:read:{"path":"qa-missing-file.txt"}',
+		expect: "One read row that fails because qa-missing-file.txt does not exist, then the closing text.",
+	},
+	slowShell: {
+		prompt: 'qa-tool-call:bash:{"command":"sleep 4; echo slow call finished"}',
+		expect: "One bash row that stays running for about four seconds, then shows 'slow call finished'.",
+	},
+	edit: {
+		prompt: `qa-tool-call:edit:${JSON.stringify({
+			path: QA_EDIT_DEMO_FILE,
+			edits: [{ old_text: "status: draft\nreviewer: none", new_text: "status: reviewed\nreviewer: desktop-qa" }],
+		})}`,
+		expect: `One edit row whose diff turns two lines of ${QA_EDIT_DEMO_FILE} from draft to reviewed. Single use: run editUndo before repeating it.`,
+	},
+	editUndo: {
+		prompt: `qa-tool-call:edit:${JSON.stringify({
+			path: QA_EDIT_DEMO_FILE,
+			edits: [{ old_text: "status: reviewed\nreviewer: desktop-qa", new_text: "status: draft\nreviewer: none" }],
+		})}`,
+		expect: `One edit row whose diff restores ${QA_EDIT_DEMO_FILE}; it fails as a not-found edit if edit has not run.`,
+	},
+	multiCall: {
+		prompt: `qa-tool-calls:${JSON.stringify([
+			{ name: "read", arguments: { path: QA_EDIT_DEMO_FILE } },
+			{ name: "find", arguments: { paths: ["*.move"] } },
+			{ name: "search", arguments: { pattern: "OWNED_DEFINITION_MARKER" } },
+		])}`,
+		expect: "One assistant response with three tool rows (read, find, search), then the closing text.",
+	},
+	searchThenTodo: {
+		prompt: `qa-tool-chain:${JSON.stringify([
+			{ name: "search_tool_bm25", arguments: { query: "todo", limit: 1 } },
+			{ name: "todo_write", arguments: todoDemoArguments },
+		])}`,
+		expect:
+			"A tool-search row that activates todo_write, then a todo_write row (the tool is offered only after the search); the task list has three phases with the first task done and the next in progress.",
+	},
+} as const satisfies Record<string, QaDemonstration>;
 
 export interface FixtureSessionObservation {
 	pid: number;
@@ -238,6 +314,10 @@ export default function() {}
 			// An unfinished task list would otherwise make the SDK append up to three hidden reminder
 			// turns, each answered with closing text, after every todo demonstration.
 			todo: { reminders: false },
+			// The qa-* model ids match no model family, so `auto` would pick hashline, whose anchors
+			// come from a prior read and cannot be scripted. Replace mode takes
+			// {path, edits: [{old_text, new_text}]}, which the edit demonstrations use.
+			edit: { mode: "replace" },
 		}),
 	);
 	// Reuse the SDK's real protocol fixture, copied into this run's owned root.
@@ -269,6 +349,7 @@ export default function() {}
 	await Bun.write(path.join(layout.project, ".move-root"), "owned fixture\n");
 	await Bun.write(path.join(layout.project, "probe.move"), "probe_symbol\n");
 	await Bun.write(path.join(layout.project, "definition.move"), "OWNED_DEFINITION_MARKER\n");
+	await Bun.write(path.join(layout.project, QA_EDIT_DEMO_FILE), QA_EDIT_DEMO_TEXT);
 	await Bun.write(
 		path.join(layout.root, markerName),
 		JSON.stringify({ version: 1, root: layout.root, baseUrl, providerToken }),

@@ -10,6 +10,15 @@
 //     once instead of waiting for release(1). hold() still pauses the next completion.
 //   GJC_DESKTOP_QA_REQUEST_LIMIT=1..512 (fixture only; default 64) completions per collection
 //     before the fixture answers 429. A tool turn costs one completion per step plus one.
+// Scripted model turns (fixture mode), read from the newest user message; JSON fills the rest of the line:
+//   qa-tool-call:<tool>[:<json object>]               one call
+//   qa-tool-calls:[{"name":…,"arguments":{…}},…]      several calls in one response
+//   qa-tool-chain:[step,…]                            step k answers after k assistant responses;
+//     a step is one call object or an array of them, checked against the tools offered at that moment.
+// A marker that names an unoffered tool or is malformed fails the turn with a 400 whose message says
+// why. Ready-made prompts (QA_DEMONSTRATIONS in qa-model-fixture.ts) are printed in the bootstrap line
+// as modelFixture.demonstrations: failingRead, slowShell, edit, editUndo (edit is single use until
+// undone), multiCall and searchThenTodo (tool search activates the hidden todo_write, then calls it).
 // Browser controls: __qaFixture.status(), .hold(), .release(requestId),
 // .gate(sessionId, 'approval'|'question'|'execution'), .gates(sessionId).
 // .hostStatus(sessionId) reads the exact live SDK leaf. .coldRestart(sessionId) SIGKILLs
@@ -34,6 +43,8 @@ import {
 	type ModelFixture,
 	observeFixtureSession,
 	QA_DEFAULT_REQUEST_LIMIT,
+	QA_DEMONSTRATIONS,
+	QA_EDIT_DEMO_FILE,
 	QA_KEY,
 	QA_MAX_REQUEST_LIMIT,
 	QA_MODEL_IDS,
@@ -333,19 +344,22 @@ try {
 		GIT_CONFIG_GLOBAL: os.devNull,
 		GIT_TERMINAL_PROMPT: "0",
 	};
-	const git: Bun.Subprocess<"ignore", "pipe", "pipe"> = Bun.spawn(["/usr/bin/git", "init", "--quiet", project], {
-		cwd: temporary,
-		env: cleanEnv,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const gitTimeout = setTimeout(() => git.kill("SIGKILL"), 10000);
-	try {
-		if ((await git.exited) !== 0) throw new Error("Isolated git init failed");
-	} finally {
-		clearTimeout(gitTimeout);
-	}
+	const isolatedGit = async (args: string[], failure: string) => {
+		const git: Bun.Subprocess<"ignore", "pipe", "pipe"> = Bun.spawn(["/usr/bin/git", ...args], {
+			cwd: temporary,
+			env: cleanEnv,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const gitTimeout = setTimeout(() => git.kill("SIGKILL"), 10000);
+		try {
+			if ((await git.exited) !== 0) throw new Error(failure);
+		} finally {
+			clearTimeout(gitTimeout);
+		}
+	};
+	await isolatedGit(["init", "--quiet", project], "Isolated git init failed");
 	await Bun.write(path.join(project, "qa-untracked.txt"), "Real isolated desktop QA untracked change.\n");
 	// Seed a realistic catalog so the UI renders a non-trivial snapshot instead of
 	// an empty workbench: three conversations, one of which is large enough that
@@ -444,6 +458,27 @@ try {
 		const layout = fixtureLayout(temporary);
 		fixture = startModelFixture(layout.artifactPath, { initialHold, requestLimit });
 		await seedFixture(layout, fixture.baseUrl, fixture.providerToken);
+		// Commit only the edit target, so the edit demonstration shows as a modification in the
+		// diff view while everything else stays untracked.
+		await isolatedGit(["-C", project, "add", "--", QA_EDIT_DEMO_FILE], "Isolated git add failed");
+		await isolatedGit(
+			[
+				"-C",
+				project,
+				"-c",
+				"user.name=Desktop QA fixture",
+				"-c",
+				"user.email=qa-fixture@example.invalid",
+				"-c",
+				"commit.gpgsign=false",
+				"commit",
+				"--quiet",
+				"--no-verify",
+				"-m",
+				"TEST ONLY fixture baseline",
+			],
+			"Isolated git commit failed",
+		);
 	}
 	const ownedRoot = temporary;
 	const hostStatus = async (sessionId?: string) => {
@@ -826,6 +861,8 @@ try {
 								? "the first completion pauses after its initial SSE text until release(requestId) or abort; hold() arms the next one"
 								: "completions stream to the end; hold() pauses the next completion until release(requestId)",
 							requestLimit,
+							demonstrations: QA_DEMONSTRATIONS,
+							editDemoFile: path.join(project, QA_EDIT_DEMO_FILE),
 						},
 					}
 				: {}),
