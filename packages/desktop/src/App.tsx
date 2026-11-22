@@ -3144,7 +3144,7 @@ export default function App() {
 								<FileOutput aria-hidden="true" />
 								{t("shell.exportConversation")}
 							</Button>
-							<Button disabled={sessionActionDisabled} onClick={() => setDialog("tools")}>
+							<Button disabled={!connected || !session} onClick={() => setDialog("tools")}>
 								<Wrench aria-hidden="true" />
 								{t("shell.manageActiveTools")}
 							</Button>

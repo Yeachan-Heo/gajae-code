@@ -469,6 +469,26 @@ suite("Tools dialog", () => {
 		}
 	}, 30000);
 
+	test("opens while a turn runs, so tool search can be watched, and holds Save until the turn ends", async () => {
+		const { context, page } = await fixture();
+		try {
+			await updateSession(page, { status: "running" });
+			await page.waitForSelector('.session-select[title="Oldest conversation · Working"]');
+			await openTools(page);
+			await answer(page, await waitHeld(page, "tools.list", 1), catalog);
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			await toggle(page, "todo_write");
+			expect(await read(page)).toMatchObject({ saveDisabled: true });
+			expect((await read(page)).text).toContain("You can save when this turn ends.");
+
+			await updateSession(page, { status: "done" });
+			await page.waitForFunction(() => !document.body.textContent?.includes("You can save when this turn ends."));
+			expect(await read(page)).toMatchObject({ saveDisabled: false, status: ["1 unsaved change"] });
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("a failed read offers a retry; a malformed read is refused", async () => {
 		const { context, page } = await fixture();
 		try {

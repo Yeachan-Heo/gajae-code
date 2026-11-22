@@ -5,4 +5,4 @@
 
 ### Changed
 
-- Saving in the Tools dialog now waits until the conversation's turn ends, because changing tools mid-turn would cancel a tool search that is turning tools on; the dialog says why. Save is also off until you change something, and the list refreshes after a save and when a new tool search finishes.
+- The Tools dialog can now be opened while the agent is working, so you can watch tool searches turn tools on. Saving waits until the conversation's turn ends, because changing tools mid-turn would cancel a tool search that is turning tools on; the dialog says why. Save is also off until you change something, and the list refreshes after a save and when a new tool search finishes.
