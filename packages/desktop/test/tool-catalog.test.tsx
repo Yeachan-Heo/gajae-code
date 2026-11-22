@@ -523,6 +523,24 @@ suite("Tools dialog", () => {
 			await page.waitForFunction(() => document.querySelector("dialog[open] .error-banner") !== null);
 			expect(await held(page, "tools.set")).toHaveLength(1);
 			expect(await read(page)).toMatchObject({ errors: ["Session changed"], status: ["1 unsaved change"] });
+
+			// A malformed re-read saves nothing either: the list from the earlier read is not used instead.
+			await clickButton(page, "Save tools");
+			const [, , , , malformed] = await waitHeld(page, "tools.list", 5);
+			await answer(page, [malformed!], { available: "read", active: ["read"] });
+			// Wait for either outcome, so a save from the stale list fails here rather than timing out.
+			await page.waitForFunction(
+				() =>
+					document.querySelector("dialog[open] .error-banner")?.textContent?.includes("format is invalid") ||
+					window.navigationFixture.requests().filter(request => request.method === "tools.set").length > 1,
+			);
+			await Bun.sleep(100);
+			expect(await held(page, "tools.set")).toHaveLength(1);
+			expect(await read(page)).toMatchObject({
+				errors: ["The tool list response format is invalid."],
+				status: ["1 unsaved change"],
+			});
+			expect((await read(page)).tools.find(tool => tool.name === "read")).toMatchObject({ checked: false });
 		} finally {
 			await context.close();
 		}
