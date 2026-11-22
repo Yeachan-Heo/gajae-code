@@ -146,6 +146,25 @@ describe("delivery journal", () => {
 		expect(journal.list()).toEqual([{ id: "id", sessionId: "session", disposition: "removed" }]);
 	});
 
+	test("forgetting a conversation drops its receipts durably and still accepts late acknowledgements", async () => {
+		const dir = await directory();
+		const journal = new DeliveryJournal(dir);
+		await journal.initialize();
+		await journal.begin("gone-final", "deleted");
+		await journal.update("gone-final", { disposition: "failed", error: "Prompt failed" });
+		await journal.begin("gone-active", "deleted");
+		await journal.begin("kept", "other");
+		await journal.forget("deleted");
+		expect(journal.list()).toEqual([{ id: "kept", sessionId: "other", disposition: "pending" }]);
+		// A late acknowledgement and a late observer for a forgotten receipt are harmless.
+		await journal.ack("gone-final");
+		await journal.update("gone-active", { disposition: "completed" });
+		await expect(journal.begin("gone-active", "deleted")).rejects.toThrow("Duplicate delivery id");
+		const restored = new DeliveryJournal(dir);
+		await restored.initialize();
+		expect(restored.list()).toEqual([{ id: "kept", sessionId: "other", disposition: "unknown" }]);
+	});
+
 	test("invalid persisted data fails closed", async () => {
 		const dir = await directory();
 		await Bun.write(

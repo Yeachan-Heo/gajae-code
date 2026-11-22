@@ -146,6 +146,20 @@ export class DeliveryJournal {
 		});
 	}
 
+	/**
+	 * Drop every receipt of a removed conversation. Each id becomes an acknowledgement tombstone,
+	 * so a late `ack` still succeeds and a late observer's `update` or a reused id changes nothing.
+	 */
+	forget(sessionId: string): Promise<void> {
+		return this.#createChange((receipts, acknowledged) => {
+			for (const receipt of [...receipts.values()]) {
+				if (receipt.sessionId !== sessionId) continue;
+				receipts.delete(receipt.id);
+				acknowledged.add(receipt.id);
+			}
+		});
+	}
+
 	async #save(receipts: Map<string, DesktopDeliveryReceipt>, acknowledged = this.#acknowledged): Promise<void> {
 		const temporary = path.join(this.directory, `deliveries.${crypto.randomUUID()}.tmp`);
 		try {

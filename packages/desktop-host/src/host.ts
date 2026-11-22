@@ -1293,9 +1293,22 @@ export class DesktopHost {
 			restoreReleased();
 			throw error;
 		}
+		await this.#forgetDeliveries(metadata);
 		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;
+	}
+	/**
+	 * A removed conversation keeps no delivery receipts, so its recovery cards never outlive it as
+	 * orphans. The row is already durably gone; a journal failure is logged, not reported as a
+	 * failed delete, and any receipt left behind surfaces as an orphan the app can discard.
+	 */
+	async #forgetDeliveries(metadata: SavedSession): Promise<void> {
+		try {
+			await this.#deliveries.forget(metadata.id);
+		} catch (error) {
+			console.error(`Desktop could not forget a removed conversation's deliveries: ${String(error)}`);
+		}
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
 	async #constructCandidate(metadata: SavedSession, manager?: SessionManager): Promise<SessionCandidate> {
@@ -4204,6 +4217,7 @@ export class DesktopHost {
 			restoreReleased();
 			throw error;
 		}
+		await this.#forgetDeliveries(metadata);
 		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;

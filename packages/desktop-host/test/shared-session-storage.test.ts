@@ -751,6 +751,24 @@ test("a refused write hands back queued input it can never send, then reloads", 
 	await h.close();
 });
 
+test("deleting a conversation removes its delivery receipts, including after a restart", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const receipt = h.snapshot().deliveries.find(item => item.sessionId === sessionId);
+	expect(receipt?.disposition).toBe("completed");
+	await h.call("session.delete", { sessionId });
+	expect(h.snapshot().deliveries.filter(item => item.sessionId === sessionId)).toEqual([]);
+	const published = h.frames.findLast(frame => frame.type === "snapshot");
+	expect(
+		published?.type === "snapshot" && published.snapshot.deliveries.some(item => item.sessionId === sessionId),
+	).toBe(false);
+	// The app may still acknowledge the record it held for that conversation.
+	await h.call("delivery.ack", { deliveryId: receipt!.id });
+	await h.restart();
+	expect(h.snapshot().deliveries.filter(item => item.sessionId === sessionId)).toEqual([]);
+});
+
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
