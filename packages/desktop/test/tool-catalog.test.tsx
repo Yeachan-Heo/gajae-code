@@ -586,11 +586,19 @@ suite("Tools dialog", () => {
 					document.querySelector('.showcase-index a[href="#showcase-tool-catalog"]')?.textContent,
 					document.querySelector('.showcase-index a[href="#showcase-tool-search"]')?.textContent,
 				],
-				width: document.documentElement.clientWidth,
-				scroll: document.documentElement.scrollWidth,
-				frames: [...document.querySelectorAll(".tool-catalog-frame")].map(
-					frame => frame.scrollWidth <= frame.clientWidth,
-				),
+				// The showcase main scrolls on its own, so the page width cannot reveal overflow: measure
+				// the scroller, each section and every element inside them against their containers.
+				overflow: [
+					document.querySelector(".showcase"),
+					...document.querySelectorAll("#showcase-tool-catalog, #showcase-tool-search"),
+					...document.querySelectorAll(
+						"#showcase-tool-catalog .tool-catalog-frame, #showcase-tool-catalog .tool-catalog-list, #showcase-tool-search .tool-disclosure, #showcase-tool-search .tool-search-body",
+					),
+				]
+					.filter((node): node is Element => node !== null)
+					.filter(node => node.scrollWidth > node.clientWidth)
+					.map(node => node.id || node.className),
+				sections: document.querySelectorAll("#showcase-tool-catalog, #showcase-tool-search").length,
 			}));
 			expect(layout.states).toEqual(
 				[
@@ -613,8 +621,8 @@ suite("Tools dialog", () => {
 				["populated", "capped", "empty", "fallback"].map(state => `showcase-tool-search-${state}`),
 			);
 			expect(layout.nav).toEqual(["Tools dialog", "Tool search results"]);
-			expect(layout.scroll).toBeLessThanOrEqual(layout.width);
-			expect(layout.frames.every(Boolean)).toBe(true);
+			expect(layout.sections).toBe(2);
+			expect(layout.overflow).toEqual([]);
 			expect(errors).toEqual([]);
 		} finally {
 			await context.close();
