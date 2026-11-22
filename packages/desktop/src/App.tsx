@@ -24,7 +24,6 @@ import type {
 	DesktopActivityUpdate,
 	DesktopCommandResult,
 	DesktopCompletionResult,
-	DesktopCredentialSaveResult,
 	DesktopDeliveryReceipt,
 	DesktopDiff,
 	DesktopForkResult,
@@ -115,10 +114,10 @@ import { GateDialog } from "./GateDialog";
 import { t, useLocale } from "./i18n";
 import { McpPanel } from "./McpPanel";
 import { ModelPicker } from "./ModelPicker";
-import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
 import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboardingNotice";
 import { ProvidersDialog } from "./ProvidersDialog";
+import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
 import { SessionHudPanel } from "./SessionHudPanel";
@@ -670,9 +669,6 @@ export default function App() {
 	 * stands down instead of also closing the review pane.
 	 */
 	const menuEscapeAt = useRef(-1);
-	const [provider, setProvider] = useState("");
-	const [keyProviders, setKeyProviders] = useState<string[] | null>(null);
-	const [key, setKey] = useState("");
 	const [notice, setNotice] = useState("");
 	const [editText, setEditText] = useState("");
 	/** Sidebar rename target; independent of the selected conversation's dialogs. */
@@ -810,7 +806,6 @@ export default function App() {
 		(next: Dialog) => {
 			dialogGeneration.current += 1;
 			setDialogOwner(selected);
-			setKey("");
 			setNotice("");
 			setDialogState(next);
 			return dialogGeneration.current;
@@ -825,7 +820,6 @@ export default function App() {
 	);
 	const settingsScope = `settings:${dialogOwner}:${dialogGeneration.current}`;
 	const historyScope = `history:${dialogOwner}:${dialogGeneration.current}`;
-	const authScope = `auth:${dialogOwner}:${dialogGeneration.current}`;
 	const operatorScope = `operator:${dialogOwner}`;
 	useEffect(() => {
 		try {
@@ -921,7 +915,6 @@ export default function App() {
 				dialogGeneration.current += 1;
 				setDialogState(null);
 				setCardSelection(previous => ({ ...previous, [selectedRef.current]: null }));
-				setKey("");
 			}
 			if (event.type === "snapshot") {
 				setSnapshot(event.snapshot);
@@ -1306,11 +1299,7 @@ export default function App() {
 				}));
 			setErrors(previous => ({
 				...previous,
-				[scope]: scope.startsWith("auth:")
-					? t("shell.apiKeyRequestFailed")
-					: error instanceof Error
-						? error.message
-						: t("shell.requestFailed"),
+				[scope]: error instanceof Error ? error.message : t("shell.requestFailed"),
 			}));
 		} finally {
 			locks.current.delete(scope);
@@ -1390,17 +1379,10 @@ export default function App() {
 		const sessionId = selected;
 		const generation = setDialog("settings");
 		setSettings(null);
-		setKeyProviders(null);
 		setSettingFilter("");
 		void run(`settings:${sessionId}:${generation}`, async () => {
-			const [value, providers] = await Promise.all([
-				request<DesktopSetting[]>("settings.get", sessionId ? { sessionId } : {}),
-				request<string[]>("auth.keyProviders"),
-			]);
-			if (dialogGeneration.current === generation) {
-				setSettings(value);
-				setKeyProviders(providers);
-			}
+			const value = await request<DesktopSetting[]>("settings.get", sessionId ? { sessionId } : {});
+			if (dialogGeneration.current === generation) setSettings(value);
 		});
 	};
 	// Zero-argument so entry points can pass this by reference without a click
@@ -3126,7 +3108,7 @@ export default function App() {
 					}
 					onClose={closeDialog}
 				>
-					{[settingsScope, authScope, "goal", selected].map(scope =>
+					{[settingsScope, "goal", selected].map(scope =>
 						scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 					)}
 					{notice && <p role="status">{notice}</p>}
@@ -3421,64 +3403,17 @@ export default function App() {
 									aria-labelledby={settingsTabId(settingsPanelPrefix, "account")}
 									hidden={settingsTab !== "account"}
 								>
-									<p className="settings-panel-hint">{t("shell.accountHint")}</p>
-									{/* OAuthSettings renders its own heading and section frame. */}
-									<OAuthSettings key={dialogGeneration.current} connected={connected} />
 									<SettingsSection
-										id={`${settingsPanelPrefix}-key`}
-										title={t("shell.apiKey")}
-										hint={t("shell.apiKeyHint")}
+										id={`${settingsPanelPrefix}-providers`}
+										title={t("providers.summaryTitle")}
+										hint={t("providers.summaryHint")}
 									>
-										<form
-											className="settings-form"
-											onSubmit={event => {
-												event.preventDefault();
-												const secret = key;
-												const generation = dialogGeneration.current;
-												setKey("");
-												void run(`auth:${dialogOwner}:${generation}`, async () => {
-													const saved = await request<DesktopCredentialSaveResult>("auth.setKey", {
-														provider,
-														key: secret,
-													});
-													if (dialogGeneration.current === generation)
-														setNotice(
-															saved.catalogRefreshed
-																? t("shell.apiKeySaved")
-																: t("shell.apiKeySavedNoRefresh"),
-														);
-												});
-											}}
-										>
-											<label htmlFor="provider">{t("shell.provider")}</label>
-											<input
-												id="provider"
-												list="providers"
-												value={provider}
-												onChange={event => setProvider(event.target.value)}
-												required
-											/>
-											<datalist id="providers">
-												{(keyProviders ?? []).map(name => (
-													<option key={name} value={name} />
-												))}
-											</datalist>
-											<label htmlFor="api-key">{t("shell.apiKeyHidden")}</label>
-											<input
-												id="api-key"
-												type="password"
-												autoComplete="off"
-												value={key}
-												onChange={event => setKey(event.target.value)}
-												required
-											/>
-											<Button
-												type="submit"
-												disabled={!connected || pending[authScope] || !provider.trim() || !key.trim()}
-											>
-												{t("shell.saveKey")}
-											</Button>
-										</form>
+										{/* The Providers dialog stacks above Settings, so Escape returns here. */}
+										<ProvidersSummary
+											models={snapshot?.models ?? []}
+											disabled={!connected}
+											onManage={() => setProvidersOpen(true)}
+										/>
 									</SettingsSection>
 								</div>
 								<div

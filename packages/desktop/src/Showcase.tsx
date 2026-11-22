@@ -31,6 +31,7 @@ import { ForkPanel, type ForkPanelProps } from "./ForkPanel";
 import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole, type PickerSelectionScope } from "./ModelPicker";
+import { ProvidersSummary } from "./ProvidersPanel";
 import { ProvidersShowcase, ProvidersShowcaseNav } from "./ProvidersShowcase";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
@@ -1139,32 +1140,14 @@ function FixtureSettingsPanels({
 				hidden={active !== "account"}
 			>
 				<SettingsSection
-					id={`${prefix}-form`}
-					title={t("showcase.settingsFormTitle")}
-					hint={t("showcase.settingsFormHint")}
+					id={`${prefix}-providers`}
+					title={t("providers.summaryTitle")}
+					hint={t("providers.summaryHint")}
 				>
-					<form
-						className="settings-form"
-						onSubmit={event => {
-							event.preventDefault();
-							onSaved();
-						}}
-					>
-						<label htmlFor={`${prefix}-key-field`}>{t("showcase.settingsFormKeyLabel")}</label>
-						<input
-							id={`${prefix}-key-field`}
-							type="password"
-							autoComplete="off"
-							defaultValue={t("showcase.settingsFormKeyValue")}
-							readOnly
-						/>
-						<Button type="submit" className="primary">
-							{t("showcase.settingsFormSave")}
-						</Button>
-					</form>
+					<ProvidersSummary models={[]} onManage={onSaved} />
 					{saved && (
 						<p className="settings-hint" role="status">
-							{t("showcase.settingsFormSaved")}
+							{t("providers.showcaseSummaryNotice")}
 						</p>
 					)}
 				</SettingsSection>

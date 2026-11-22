@@ -2327,7 +2327,6 @@ suite("mounted composer delivery recovery", () => {
 			});
 			// Every choice list uses the app's own listbox instead of a native macOS menu.
 			expect(account.nativeSelects).toBe(0);
-			expect(account.listboxes).toBeGreaterThan(0);
 		} finally { await closeFixture(context, page); }
 	}, 40000);
 
@@ -3439,9 +3438,9 @@ suite("mounted composer delivery recovery", () => {
 					formMarginTop: form ? getComputedStyle(form).marginTop : null,
 				};
 			});
-			expect(account.headings.filter(heading => heading === "Account connections")).toHaveLength(1);
+			expect(account.headings.filter(heading => heading === "Providers")).toHaveLength(1);
 			expect(account.marginTop).toBe("0px");
-			expect(account.formMarginTop).toBe("0px");
+			expect(account.formMarginTop ?? "0px").toBe("0px");
 			// Panels are hidden, not unmounted: the same DOM node comes back, which is what keeps
 			// panel-local state (an OAuth provider choice, an unsaved setting draft) alive.
 			await page.evaluate(() => {

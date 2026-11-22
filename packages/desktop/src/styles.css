@@ -388,12 +388,6 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .modal section, .modal form { margin: 16px 0 24px; }
 .modal form > .button { margin-top: 12px; }
 .modal .setting-field { margin: 16px 0; }
-.oauth-flow { border: 1px solid var(--border-soft); border-radius: var(--radius-md); padding: 16px; min-width: 0; background: var(--card); }
-.oauth-url { font-family: var(--mono); font-size: 0.75rem; overflow-wrap: anywhere; word-break: break-all; }
-.oauth-settings .bounded-output { white-space: pre-wrap; }
-.oauth-warning { margin: 12px 0 0; padding: 12px; min-width: 0; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
-.oauth-warning legend { padding: 0 6px; font-size: 0.8125rem; font-weight: 600; color: var(--status-waiting); }
-.oauth-warning p { margin: 0 0 12px; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
 .setting-field { padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
 .setting-field small { display: block; margin: 4px 0 8px; }
 .setting-field label { font-family: var(--mono); overflow-wrap: anywhere; font-size: 0.8125rem; }
@@ -594,10 +588,6 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* The dialog generic `section, form` margin must not stack inside a panel. */
 .settings-panel :is(section, form) { margin: 0; }
 .settings-panel-hint { margin: 4px 4px 8px; }
-/* OAuthSettings brings its own section frame and heading; align it with the panel inset. */
-.settings-panel > .oauth-settings { padding: 4px; }
-.settings-panel > .oauth-settings > h3 { font-size: 0.875rem; margin: 0 0 4px; }
-.settings-panel > .oauth-settings .bounded-output { margin-top: 8px; }
 .theme-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin: 8px 0 16px; }
 .theme-option { justify-content: flex-start; gap: 10px; }
 .theme-option[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
@@ -983,6 +973,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* Below the empty state, which takes the free space, so the notice lands at the column's bottom. */
 .provider-notice-dock { flex: none; padding: 12px 24px 20px; }
 .provider-notice-dock > .provider-notice { margin-bottom: 0; }
+.providers-summary { display: grid; gap: 0.625rem; justify-items: start; }
+.providers-summary-empty { display: flex; align-items: center; gap: 0.375rem; color: var(--status-waiting); }
+.providers-summary-empty > svg { flex: none; width: 1rem; height: 1rem; }
 .providers-showcase-frame { max-width: 640px; min-width: 0; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); }
 .providers-showcase-frame[data-narrow] { max-width: 390px; }
 .providers-showcase-column { display: flex; flex-direction: column; min-height: 22rem; border: 1px dashed var(--border-soft); border-radius: var(--radius-lg); }

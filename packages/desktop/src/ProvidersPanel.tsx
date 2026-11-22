@@ -1,4 +1,4 @@
-import type { DesktopAuthState } from "@gajae-code/desktop-host/protocol";
+import type { DesktopAuthState, DesktopModel } from "@gajae-code/desktop-host/protocol";
 import { ChevronLeft, CircleCheck, LoaderCircle, Search, TriangleAlert } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, type RefObject, useEffect, useId, useRef, useState } from "react";
 import { Button, ErrorBanner } from "./components";
@@ -7,6 +7,7 @@ import {
 	filterProviders,
 	flowOutcome,
 	isActiveFlow,
+	modelCounts,
 	type ProviderGroups,
 	type ProviderRow,
 	type ProviderStatus,
@@ -641,6 +642,39 @@ export function ProvidersPanel(props: ProvidersPanelProps) {
 			) : (
 				<ProviderList {...props} searchRef={search} listRef={listRef} />
 			)}
+		</div>
+	);
+}
+
+/** The Settings -> Account summary: what the snapshot can use now, and the way to change it. */
+export function ProvidersSummary({
+	models,
+	disabled,
+	onManage,
+}: {
+	models: readonly DesktopModel[];
+	disabled?: boolean;
+	onManage(): void;
+}) {
+	const providers = modelCounts(models).size;
+	return (
+		<div className="providers-summary">
+			{models.length > 0 ? (
+				<p role="status">
+					{counted(providers, "providers.summaryProvidersOne", "providers.summaryProviders")} ·{" "}
+					{counted(models.length, "providers.summaryModelsOne", "providers.summaryModels")}
+				</p>
+			) : (
+				<p className="providers-summary-empty" role="status">
+					<TriangleAlert aria-hidden="true" />
+					{t("providers.summaryEmpty")}
+				</p>
+			)}
+			<div className="provider-actions">
+				<Button className="primary" disabled={disabled} onClick={onManage}>
+					{t("providers.manage")}
+				</Button>
+			</div>
 		</div>
 	);
 }

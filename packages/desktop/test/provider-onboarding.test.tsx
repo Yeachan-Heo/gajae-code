@@ -267,6 +267,60 @@ suite("Zero-model onboarding notice", () => {
 		}
 	}, 30000);
 
+	test("Settings -> Account summarizes models, and Manage providers stacks the dialog with Escape returning to it", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.waitForSelector(DOCKED);
+			await page.click('button[aria-label="Settings"], button[title="Settings"]');
+			await page.waitForSelector(".settings-tabs");
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>(".settings-tab")]
+					.find(tab => tab.textContent?.trim() === "Account")
+					?.click(),
+			);
+			const panel = ".settings-panel:not([hidden])";
+			await page.waitForFunction(
+				selector => document.querySelector(selector)?.textContent?.includes("Manage providers"),
+				{},
+				panel,
+			);
+			expect(await page.$eval(`${panel} .providers-summary [role=status]`, node => node.textContent)).toBe(
+				"No models available yet.",
+			);
+			await page.click(`${panel} .providers-summary .button`);
+			await page.waitForSelector("dialog.providers-dialog[open]");
+			// Stacked: Settings stays open underneath, and the Providers dialog is the top layer.
+			expect(
+				(await page.$$eval("dialog[open] > header h2", nodes => nodes.map(node => node.textContent ?? ""))).sort(),
+			).toEqual(["Providers", "Settings"]);
+			expect(
+				await page.evaluate(() => {
+					const rect = document.querySelector("dialog.providers-dialog")!.getBoundingClientRect();
+					const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + 24);
+					return hit?.closest("dialog")?.classList.contains("providers-dialog");
+				}),
+			).toBe(true);
+			await page.click('.provider-row[data-provider-id="fixture"]');
+			await page.waitForSelector(".provider-key input");
+			await page.type(".provider-key input", "sk-settings-key");
+			await page.keyboard.press("Enter");
+			await page.waitForFunction(() =>
+				document.querySelector("dialog.providers-dialog")?.textContent?.includes("Connected · 2 models available"),
+			);
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector("dialog.providers-dialog"));
+			expect(await page.$$eval("dialog[open] > header h2", nodes => nodes.map(node => node.textContent))).toEqual([
+				"Settings",
+			]);
+			expect(await page.evaluate(() => document.activeElement?.textContent?.trim())).toBe("Manage providers");
+			expect(await page.$eval(`${panel} .providers-summary [role=status]`, node => node.textContent)).toBe(
+				"1 provider with models · 2 models available",
+			);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("with models elsewhere, the composer names what is missing and opens the dialog from Manage providers", async () => {
 		const { context, page } = await fixture({ holdModelLists: true, options: { zeroModels: false } });
 		try {
@@ -288,7 +342,9 @@ suite("Zero-model onboarding notice", () => {
 			await page.evaluate(resnapshot);
 			await answerModelLists(page, lists, [{ ...fixtureModel, id: "fixture/other", name: "Other" }]);
 			await page.waitForFunction(() =>
-				document.querySelector(".composer .model-control-status")?.textContent?.includes("Choose a model to start."),
+				document
+					.querySelector(".composer .model-control-status")
+					?.textContent?.includes("Choose a model to start."),
 			);
 			expect(await composerStatus(page)).toEqual(["Choose a model to start."]);
 		} finally {
