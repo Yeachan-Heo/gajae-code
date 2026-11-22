@@ -752,6 +752,28 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-call-intent { color: var(--muted); font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
 /* A failed card keeps its error border and status; its summary text stays readable. */
 .tool-call.message-error { color: var(--text); }
+/* The expanded body: what tool.detail adds (or why it cannot), then the bounded output. */
+.tool-call-details { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px 0; min-width: 0; }
+.tool-call-details > .truncation-notice { margin: 0; }
+.tool-detail-note { margin: 0; color: var(--muted); font-size: 0.8125rem; }
+.tool-detail-error { margin: 0; }
+.tool-detail-section, .tool-diff-file { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tool-detail-heading { color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+.tool-output-heading { display: block; padding: 10px 12px 4px; }
+.tool-call-details .bounded-output { margin: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); }
+.tool-detail-code { white-space: pre-wrap; word-break: normal; overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.8125rem; }
+.tool-diff-header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 0.75rem; }
+.tool-diff-path { min-width: 0; font-family: var(--mono); word-break: normal; overflow-wrap: anywhere; }
+.tool-diff-op { padding: 0 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); }
+.tool-diff-error { margin: 0; color: var(--error); font-size: 0.8125rem; word-break: keep-all; overflow-wrap: anywhere; }
+/* A grid keeps every line as wide as the widest, so highlights span the scrolled width too. */
+.tool-diff { display: grid; margin: 0; max-height: 320px; overflow: auto; padding: 6px 0; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); background: var(--surface-2); font-family: var(--mono); font-size: 0.8125rem; line-height: 1.5; }
+.tool-diff-line { min-height: 1.5em; padding: 0 12px; white-space: pre; }
+.tool-diff-add { background: color-mix(in srgb, var(--status-done) 14%, transparent); }
+.tool-diff-remove { background: color-mix(in srgb, var(--status-error) 14%, transparent); }
+.tool-diff-hunk { color: var(--muted); }
+.tool-diff-number { display: inline-block; min-width: 4ch; margin-right: 8px; color: var(--muted); text-align: right; user-select: none; }
+.tool-diff-sign { margin-right: 6px; }
 
 /* Section B: task list (TodoPanel.tsx, TodoToolBody.tsx, SessionWorkProgress.tsx). */
 .todo-progress { display: block; height: 0.25rem; margin-top: 0.25rem; overflow: hidden; border-radius: var(--radius-pill); background: var(--border-soft); }

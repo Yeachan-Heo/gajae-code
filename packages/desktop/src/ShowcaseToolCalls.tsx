@@ -1,7 +1,7 @@
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
-import type { DesktopToolCall } from "@gajae-code/desktop-host/tool-protocol";
+import type { DesktopToolCall, DesktopToolDetail } from "@gajae-code/desktop-host/tool-protocol";
 import { t } from "./i18n";
-import { ToolCallCard } from "./ToolCallCard";
+import { ToolCallCard, ToolDetailContext, type ToolDetailSource } from "./ToolCallCard";
 
 /** A fixture tool row; its call id doubles as the message id. */
 function fixture(
@@ -133,9 +133,152 @@ function callFixtures(): DesktopMessage[] {
 	];
 }
 
+const resolved = (detail: Omit<DesktopToolDetail, "callId">): ToolDetailSource => ({
+	load: async callId => ({ callId, ...detail }),
+});
+/** A load that never settles, so the loading state stays on screen. */
+const pending: ToolDetailSource = { load: () => Promise.withResolvers<DesktopToolDetail>().promise };
+const failing: ToolDetailSource = {
+	load: async () => {
+		throw new Error(t("tools.showcaseDetailGone"));
+	},
+};
+
+const editDiff = [
+	"@@ -40,4 +40,5 @@",
+	" 40|export function toolVerb(tool: DesktopToolCall): string {",
+	'-41|\tif (tool.family === "other") return tool.name;',
+	'+41|\tif (tool.family === "other") return toolName || t("support.toolFallback");',
+	"+42|\tconst family = FAMILIES[tool.family];",
+	" 43|\treturn t(isLiveToolStatus(tool.status) ? family.live : family.done);",
+	" 44|}",
+].join("\n");
+
+/** Expanded cards, one per detail state. Each one loads from its own local fixture source. */
+function detailFixtures(): Array<{ id: string; source: ToolDetailSource | null; message: DesktopMessage }> {
+	return [
+		{
+			id: "shell",
+			source: resolved({
+				command: "cd packages/desktop\nbun test test/tool-call-card.test.tsx --timeout 30000",
+				args: JSON.stringify({ cwd: "packages/desktop", timeout: 60 }, null, 2),
+			}),
+			message: fixture(
+				"detail-shell",
+				"bash",
+				{
+					family: "shell",
+					status: "failed",
+					subject: "$ cd packages/desktop",
+					stats: { exitCode: 1 },
+					detail: true,
+				},
+				{ text: t("tools.showcaseOutputFailed") },
+			),
+		},
+		{
+			id: "edit",
+			source: resolved({
+				diff: [
+					{ path: "packages/desktop/src/ToolCallCard.tsx", diff: editDiff, added: 2, removed: 1, op: "update" },
+					{
+						path: "packages/desktop/src/new-helper.ts",
+						diff: "+1|export const helper = 1;",
+						added: 1,
+						removed: 0,
+						op: "create",
+					},
+					{
+						path: "packages/desktop/src/missing.ts",
+						diff: "",
+						added: 0,
+						removed: 0,
+						error: t("tools.showcaseEditError"),
+					},
+				],
+			}),
+			message: fixture("detail-edit", "edit", {
+				family: "edit",
+				status: "done",
+				subject: "packages/desktop/src/ToolCallCard.tsx",
+				stats: { added: 3, removed: 1, files: 3 },
+				detail: true,
+			}),
+		},
+		{
+			id: "write",
+			source: resolved({
+				diff: [
+					{
+						path: "docs/notes.md",
+						diff: "+1|# Notes\n+2|\n+3|Tool cards load details on first open.",
+						added: 3,
+						removed: 0,
+					},
+				],
+			}),
+			message: fixture("detail-write", "write", {
+				family: "write",
+				status: "done",
+				subject: "docs/notes.md",
+				stats: { added: 3 },
+				detail: true,
+			}),
+		},
+		{
+			id: "args",
+			source: resolved({
+				args: JSON.stringify({ query: "react details element toggle event", recency: "month" }, null, 2),
+				truncated: true,
+			}),
+			message: fixture("detail-args", "web_search", {
+				family: "web",
+				status: "done",
+				subject: "react details element toggle event",
+				detail: true,
+			}),
+		},
+		{
+			id: "loading",
+			source: pending,
+			message: fixture("detail-loading", "read", {
+				family: "read",
+				status: "done",
+				subject: "src/App.tsx",
+				detail: true,
+			}),
+		},
+		{
+			id: "error",
+			source: failing,
+			message: fixture("detail-error", "read", {
+				family: "read",
+				status: "done",
+				subject: "src/App.tsx",
+				detail: true,
+			}),
+		},
+		{
+			id: "unavailable",
+			source: null,
+			message: fixture("detail-unavailable", "read", {
+				family: "read",
+				status: "done",
+				subject: "src/App.tsx",
+				detail: true,
+			}),
+		},
+	];
+}
+
 /** Showcase index links for the tool call card sections. */
 export function ShowcaseToolCallsNav() {
-	return <a href="#showcase-tool-calls">{t("tools.showcaseNavCalls")}</a>;
+	return (
+		<>
+			<a href="#showcase-tool-calls">{t("tools.showcaseNavCalls")}</a>
+			<a href="#showcase-tool-details">{t("tools.showcaseNavDetails")}</a>
+		</>
+	);
 }
 
 /**
@@ -143,6 +286,15 @@ export function ShowcaseToolCallsNav() {
  * `<h2>` and a matching index link.
  */
 export function ShowcaseToolCalls() {
+	return (
+		<>
+			<ShowcaseToolCallRows />
+			<ShowcaseToolDetails />
+		</>
+	);
+}
+
+function ShowcaseToolCallRows() {
 	return (
 		<section id="showcase-tool-calls">
 			<h2>{t("tools.showcaseCallsHeading")}</h2>
@@ -156,6 +308,22 @@ export function ShowcaseToolCalls() {
 				<p className="muted">{t("tools.showcaseLegacyNote")}</p>
 				<ToolCallCard message={{ id: "showcase-legacy", role: "tool", toolName: "read", text: "" }} />
 			</div>
+		</section>
+	);
+}
+
+function ShowcaseToolDetails() {
+	return (
+		<section id="showcase-tool-details">
+			<h2>{t("tools.showcaseDetailsHeading")}</h2>
+			<p className="muted">{t("tools.showcaseDetailsNote")}</p>
+			{detailFixtures().map(({ id, source, message }) => (
+				<div key={id} id={`showcase-tool-detail-${id}`}>
+					<ToolDetailContext.Provider value={source}>
+						<ToolCallCard message={message} defaultOpen />
+					</ToolDetailContext.Provider>
+				</div>
+			))}
 		</section>
 	);
 }

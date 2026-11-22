@@ -1,5 +1,9 @@
 import type { DesktopMessage, DesktopSession } from "@gajae-code/desktop-host/protocol";
-import { Fragment, type ReactNode } from "react";
+import type { DesktopToolDetail } from "@gajae-code/desktop-host/tool-protocol";
+import { Fragment, type ReactNode, useMemo } from "react";
+import { request } from "./bridge";
+import { t } from "./i18n";
+import { ToolDetailContext, type ToolDetailSource } from "./ToolCallCard";
 
 /** One rendered transcript entry. */
 export interface TranscriptItem {
@@ -48,7 +52,26 @@ export interface TranscriptEntryProps {
 	renderMessage: (message: DesktopMessage) => ReactNode;
 }
 
-/** Renders one entry through `renderMessage`, message by message. */
-export function TranscriptEntry({ item, renderMessage }: TranscriptEntryProps) {
-	return item.messages.map(message => <Fragment key={message.id}>{renderMessage(message)}</Fragment>);
+/** `tool.detail` for one conversation, checked to be a detail for the requested call. */
+function toolDetailSource(sessionId: string): ToolDetailSource {
+	return {
+		async load(callId) {
+			const value = await request<unknown>("tool.detail", { sessionId, callId });
+			if (!value || typeof value !== "object" || (value as { callId?: unknown }).callId !== callId)
+				throw new Error(t("tools.detailInvalid"));
+			return value as DesktopToolDetail;
+		},
+	};
+}
+
+/** Renders one entry through `renderMessage`, message by message, with its conversation's detail loader. */
+export function TranscriptEntry({ item, session, connected, renderMessage }: TranscriptEntryProps) {
+	const source = useMemo(() => (connected ? toolDetailSource(session.id) : null), [connected, session.id]);
+	return (
+		<ToolDetailContext.Provider value={source}>
+			{item.messages.map(message => (
+				<Fragment key={message.id}>{renderMessage(message)}</Fragment>
+			))}
+		</ToolDetailContext.Provider>
+	);
 }

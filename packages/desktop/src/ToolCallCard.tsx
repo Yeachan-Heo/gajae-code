@@ -1,5 +1,10 @@
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
-import type { DesktopToolCall, DesktopToolDetail, DesktopToolFamily } from "@gajae-code/desktop-host/tool-protocol";
+import type {
+	DesktopToolCall,
+	DesktopToolDetail,
+	DesktopToolDiff,
+	DesktopToolFamily,
+} from "@gajae-code/desktop-host/tool-protocol";
 import {
 	Bot,
 	ChevronRight,
@@ -20,7 +25,7 @@ import {
 	TextSearch,
 	Wrench,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { type MessageKey, t } from "./i18n";
 import { MessageBlocks } from "./MessageBlocks";
 import { TodoToolBody } from "./TodoToolBody";
@@ -170,17 +175,136 @@ export function ToolCallLine({ tool, toolName }: { tool: DesktopToolCall; toolNa
 	);
 }
 
+/** Where an expanded card loads `tool.detail`. */
+export interface ToolDetailSource {
+	load(callId: string): Promise<DesktopToolDetail>;
+}
+
 /**
- * One `role: "tool"` transcript row: a native disclosure whose summary names the tool and its
- * state and whose body is the bounded output. `todo` and `tool-search` calls get their own body.
- * A row without call metadata (older history, managed sessions) keeps the plain tool-name row.
+ * The detail loader for cards below it. A transcript entry provides one for its conversation
+ * while connected; without one (the showcase, static renders, a closed connection) an expandable
+ * card says its details are unavailable.
  */
-export function ToolCallCard({ message }: { message: DesktopMessage }) {
+export const ToolDetailContext = createContext<ToolDetailSource | null>(null);
+
+/** What the expanded body shows above the output. */
+export type ToolDetailState =
+	| { kind: "unavailable" }
+	| { kind: "loading" }
+	| { kind: "error"; message: string }
+	| { kind: "ready"; detail: DesktopToolDetail };
+
+/** One diff line: the SDK writes `+12|text`, `-3|text` or ` 4|text`; anything else is shown as is. */
+function DiffLine({ line }: { line: string }) {
+	const kind = line.startsWith("+")
+		? "tool-diff-add"
+		: line.startsWith("-")
+			? "tool-diff-remove"
+			: line.startsWith("@@")
+				? "tool-diff-hunk"
+				: "tool-diff-context";
+	const numbered = /^([+\- ])(\d+)\|(.*)$/s.exec(line);
+	return (
+		<span className={`tool-diff-line ${kind}`}>
+			{numbered ? (
+				<>
+					<span className="tool-diff-number" aria-hidden="true">
+						{numbered[2]}
+					</span>
+					<span className="tool-diff-sign">{numbered[1]}</span>
+					{numbered[3]}
+				</>
+			) : (
+				line
+			)}
+		</span>
+	);
+}
+
+/** Per-file diffs of an edit, or the content a write left in its file. */
+function ToolDiffs({ diffs, written }: { diffs: DesktopToolDiff[]; written: boolean }) {
+	return (
+		<div className="tool-detail-section">
+			<span className="tool-detail-heading">{t(written ? "tools.detailWritten" : "tools.detailChanges")}</span>
+			{diffs.map((file, index) => (
+				<div className="tool-diff-file" key={index}>
+					<div className="tool-diff-header">
+						<code className="tool-diff-path">{file.path}</code>
+						{file.op === "create" && <span className="tool-diff-op">{t("tools.diffCreated")}</span>}
+						{file.op === "delete" && <span className="tool-diff-op">{t("tools.diffDeleted")}</span>}
+						{!written && (
+							<span
+								className="tool-call-facts"
+								title={t("tools.factDiff", { added: file.added, removed: file.removed })}
+							>
+								<span className="tool-fact-added">+{file.added}</span>{" "}
+								<span className="tool-fact-removed">−{file.removed}</span>
+							</span>
+						)}
+					</div>
+					{file.error && <p className="tool-diff-error">{file.error}</p>}
+					{file.diff ? (
+						<pre className="tool-diff">
+							{file.diff.split("\n").map((line, line_index) => (
+								<DiffLine key={line_index} line={line} />
+							))}
+						</pre>
+					) : (
+						!file.error && <p className="tool-detail-note">{t("tools.diffEmpty")}</p>
+					)}
+				</div>
+			))}
+		</div>
+	);
+}
+
+/**
+ * The part of an expanded card that comes from `tool.detail`: its loading, failure or
+ * unavailable state, else the full command, per-file diffs and remaining arguments. Task-list and
+ * tool-search sections belong to their family bodies.
+ */
+export function ToolCallDetails({ family, state }: { family: DesktopToolFamily; state: ToolDetailState }) {
+	if (state.kind === "unavailable") return <p className="tool-detail-note">{t("tools.detailUnavailable")}</p>;
+	if (state.kind === "loading")
+		return (
+			<p className="tool-detail-note" role="status">
+				{t("tools.detailLoading")}
+			</p>
+		);
+	if (state.kind === "error")
+		return (
+			<div className="error-banner tool-detail-error" role="alert">
+				<CircleAlert aria-hidden="true" />
+				<div className="error-content">{t("tools.detailFailed", { reason: state.message })}</div>
+			</div>
+		);
+	const { detail } = state;
+	return (
+		<>
+			{detail.truncated && <small className="truncation-notice">{t("tools.detailTruncated")}</small>}
+			{detail.command !== undefined && (
+				<div className="tool-detail-section">
+					<span className="tool-detail-heading">{t("tools.detailCommand")}</span>
+					<pre className="bounded-output tool-detail-code">{detail.command}</pre>
+				</div>
+			)}
+			{detail.diff && detail.diff.length > 0 && <ToolDiffs diffs={detail.diff} written={family === "write"} />}
+			{detail.args !== undefined && (
+				<div className="tool-detail-section">
+					<span className="tool-detail-heading">{t("tools.detailArguments")}</span>
+					<pre className="bounded-output tool-detail-code">{detail.args}</pre>
+				</div>
+			)}
+		</>
+	);
+}
+
+function ToolOutput({ message }: { message: DesktopMessage }) {
 	const blocks = message.blocks;
 	const hasContent = blocks
 		? blocks.some(block => block.type === "image" || block.type === "image-unavailable" || !!block.text.trim())
 		: !!message.text.trim();
-	const output = (
+	return (
 		<div className="tool-output">
 			{hasContent ? (
 				blocks ? (
@@ -193,32 +317,89 @@ export function ToolCallCard({ message }: { message: DesktopMessage }) {
 			)}
 		</div>
 	);
-	const tool = message.tool;
-	if (!tool)
-		return (
-			<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
-				<strong className="role-label">{t("support.roleTool")}</strong>
-				{message.truncated && <small className="truncation-notice">{t("support.truncated")}</small>}
-				<details className="tool-disclosure">
-					<summary>
-						<ChevronRight className="disclosure-chevron" aria-hidden="true" />
-						<span className="tool-name">{message.toolName || t("support.toolFallback")}</span>
-						{message.excludeFromContext && <small> · {t("support.excludedFromContext")}</small>}
-						{message.cancelled ? (
-							<small> · {t("support.cancelled")}</small>
-						) : (
-							message.isError && (
-								<span className="tool-failure">
-									<CircleAlert aria-hidden="true" /> · {t("support.failed")}
-								</span>
-							)
-						)}
-					</summary>
-					{output}
-				</details>
-			</article>
+}
+
+function LegacyToolRow({ message }: { message: DesktopMessage }) {
+	return (
+		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
+			<strong className="role-label">{t("support.roleTool")}</strong>
+			{message.truncated && <small className="truncation-notice">{t("support.truncated")}</small>}
+			<details className="tool-disclosure">
+				<summary>
+					<ChevronRight className="disclosure-chevron" aria-hidden="true" />
+					<span className="tool-name">{message.toolName || t("support.toolFallback")}</span>
+					{message.excludeFromContext && <small> · {t("support.excludedFromContext")}</small>}
+					{message.cancelled ? (
+						<small> · {t("support.cancelled")}</small>
+					) : (
+						message.isError && (
+							<span className="tool-failure">
+								<CircleAlert aria-hidden="true" /> · {t("support.failed")}
+							</span>
+						)
+					)}
+				</summary>
+				<ToolOutput message={message} />
+			</details>
+		</article>
+	);
+}
+
+/**
+ * Loads `tool.detail` the first time the card is open, and again when the call's status changes
+ * while it is open (a running call's diff exists only once it settles). A failed load retries
+ * on the next open.
+ */
+function useToolDetail(tool: DesktopToolCall, open: boolean): ToolDetailState | undefined {
+	const source = useContext(ToolDetailContext);
+	const [state, setState] = useState<ToolDetailState | undefined>();
+	const loaded = useRef<{ source: ToolDetailSource; callId: string; status: string } | null>(null);
+	const request = useRef(0);
+	// A flag, not a request bump: a development StrictMode remount must keep the first load.
+	const alive = useRef(true);
+	useEffect(() => {
+		alive.current = true;
+		return () => {
+			alive.current = false;
+		};
+	}, []);
+	useEffect(() => {
+		if (!open || !tool.detail || !source) return;
+		const previous = loaded.current;
+		if (previous?.source === source && previous.callId === tool.callId && previous.status === tool.status) return;
+		loaded.current = { source, callId: tool.callId, status: tool.status };
+		const id = ++request.current;
+		setState(current => (current?.kind === "ready" ? current : { kind: "loading" }));
+		source.load(tool.callId).then(
+			detail => {
+				if (alive.current && request.current === id) setState({ kind: "ready", detail });
+			},
+			(error: unknown) => {
+				if (!alive.current || request.current !== id) return;
+				loaded.current = null;
+				setState({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+			},
 		);
+	}, [open, source, tool.callId, tool.detail, tool.status]);
+	if (!tool.detail) return undefined;
+	if (!source) return { kind: "unavailable" };
+	return state ?? { kind: "loading" };
+}
+
+function ToolCallRow({
+	message,
+	tool,
+	defaultOpen,
+}: {
+	message: DesktopMessage;
+	tool: DesktopToolCall;
+	defaultOpen: boolean;
+}) {
+	const [open, setOpen] = useState(defaultOpen);
+	const state = useToolDetail(tool, open);
 	const Body = tool.family === "todo" ? TodoToolBody : tool.family === "tool-search" ? ToolSearchBody : undefined;
+	const output = <ToolOutput message={message} />;
+	const detail = state?.kind === "ready" ? state.detail : undefined;
 	return (
 		<article
 			className={`message ${message.role} tool-call${message.isError ? " message-error" : ""}`}
@@ -227,7 +408,11 @@ export function ToolCallCard({ message }: { message: DesktopMessage }) {
 		>
 			<strong className="role-label">{t("support.roleTool")}</strong>
 			{message.truncated && <small className="truncation-notice">{t("support.truncated")}</small>}
-			<details className="tool-disclosure">
+			<details
+				className="tool-disclosure"
+				open={defaultOpen || undefined}
+				onToggle={event => setOpen(event.currentTarget.open)}
+			>
 				<summary>
 					<ChevronRight className="disclosure-chevron" aria-hidden="true" />
 					<span className="tool-call-head">
@@ -235,8 +420,31 @@ export function ToolCallCard({ message }: { message: DesktopMessage }) {
 						{tool.intent && <span className="tool-call-intent">{tool.intent}</span>}
 					</span>
 				</summary>
-				{Body ? <Body message={message} output={output} /> : output}
+				{/* Nothing is requested or rendered for a closed card. */}
+				{open && state && (
+					<div className="tool-call-details">
+						<ToolCallDetails family={tool.family} state={state} />
+					</div>
+				)}
+				{state && open && Body === undefined && (
+					<span className="tool-detail-heading tool-output-heading">{t("tools.detailOutput")}</span>
+				)}
+				{Body ? <Body message={message} detail={detail} output={output} /> : output}
 			</details>
 		</article>
+	);
+}
+
+/**
+ * One `role: "tool"` transcript row: a native disclosure whose summary names the call and its
+ * state and whose body loads the call's details on first expand above the bounded output.
+ * `todo` and `tool-search` calls get their own body. A row without call metadata (older history,
+ * managed sessions) keeps the plain tool-name row. `defaultOpen` is for design examples.
+ */
+export function ToolCallCard({ message, defaultOpen = false }: { message: DesktopMessage; defaultOpen?: boolean }) {
+	return message.tool ? (
+		<ToolCallRow message={message} tool={message.tool} defaultOpen={defaultOpen} />
+	) : (
+		<LegacyToolRow message={message} />
 	);
 }

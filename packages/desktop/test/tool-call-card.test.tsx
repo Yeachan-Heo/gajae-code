@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolCall } from "@gajae-code/desktop-host/tool-protocol";
 import { Message } from "../src/components";
-import { ToolCallCard } from "../src/ToolCallCard";
+import { ToolCallCard, ToolCallDetails, ToolDetailContext, type ToolDetailSource } from "../src/ToolCallCard";
 
 const row = (tool: Partial<DesktopToolCall> & Pick<DesktopToolCall, "family" | "status">, extra: Partial<DesktopMessage> = {}): DesktopMessage => ({
 	id: "1:1", role: "tool", toolName: "read", text: "output", ...extra,
@@ -71,5 +71,63 @@ describe("tool call card summary", () => {
 		expect(html).toContain('<span class="tool-name">read</span>');
 		expect(html).toContain("Failed");
 		expect(renderToStaticMarkup(<Message message={row({ family: "read", status: "done" })} />)).toContain("tool-call-line");
+	});
+});
+
+describe("tool call card details", () => {
+	const loads: string[] = [];
+	const source: ToolDetailSource = { load: async callId => { loads.push(callId); return { callId }; } };
+	const withSource = (message: DesktopMessage, value: ToolDetailSource | null, open = true) => renderToStaticMarkup(
+		<ToolDetailContext.Provider value={value}><ToolCallCard message={message} defaultOpen={open} /></ToolDetailContext.Provider>,
+	);
+	const expandable = row({ family: "read", status: "done", subject: "a.ts", detail: true });
+
+	test("an open expandable card shows loading until its details arrive; a closed one requests nothing", () => {
+		const open = withSource(expandable, source);
+		expect(open).toContain('role="status"');
+		expect(open).toContain("Loading details…");
+		expect(open.indexOf("Loading details…")).toBeLessThan(open.indexOf("bounded-output"));
+		expect(withSource(expandable, source, false)).not.toContain("tool-call-details");
+		// Static rendering runs no effects, so nothing was requested.
+		expect(loads).toEqual([]);
+	});
+
+	test("details are unavailable without a loader, and absent for rows that have none", () => {
+		expect(withSource(expandable, null)).toContain("Details are unavailable for this connection.");
+		const none = withSource(row({ family: "read", status: "done", detail: false }), source);
+		expect(none).not.toContain("tool-call-details");
+		expect(none).toContain("output");
+	});
+
+	test("a failed load keeps the output and explains the failure", () => {
+		const html = renderToStaticMarkup(<ToolCallDetails family="read" state={{ kind: "error", message: "This tool call is no longer available." }} />);
+		expect(html).toContain('role="alert"');
+		expect(text(html)).toBe("Details could not be loaded. This tool call is no longer available.");
+	});
+
+	test("loaded details show the command, arguments, per-file diffs and the truncation notice", () => {
+		const html = renderToStaticMarkup(<ToolCallDetails family="edit" state={{ kind: "ready", detail: {
+			callId: "c", truncated: true, command: "npm test <x>", args: '{\n  "cwd": "app"\n}',
+			diff: [
+				{ path: "src/a.ts", diff: "@@ -1 +1 @@\n-1|old\n+1|new\n 2|same", added: 1, removed: 1, op: "update" },
+				{ path: "src/new.ts", diff: "+1|x", added: 1, removed: 0, op: "create" },
+				{ path: "src/gone.ts", diff: "", added: 0, removed: 0, error: "No match" },
+			],
+		} }} />);
+		expect(html).toContain("Some details were shortened to fit.");
+		expect(html).toContain("npm test &lt;x&gt;");
+		expect(html.indexOf("Command")).toBeLessThan(html.indexOf("Changes"));
+		expect(html.indexOf("Changes")).toBeLessThan(html.indexOf("Arguments"));
+		expect(html.match(/class="tool-diff-line tool-diff-add"/g)).toHaveLength(2);
+		expect(html.match(/class="tool-diff-line tool-diff-remove"/g)).toHaveLength(1);
+		expect(html).toContain('class="tool-diff-line tool-diff-hunk">@@ -1 +1 @@</span>');
+		expect(html).toContain('<span class="tool-diff-number" aria-hidden="true">1</span><span class="tool-diff-sign">-</span>old');
+		expect(html).toContain("Created");
+		expect(html).toContain("No match");
+		const written = renderToStaticMarkup(<ToolCallDetails family="write" state={{ kind: "ready", detail: {
+			callId: "c", diff: [{ path: "n.md", diff: "+1|# Notes", added: 1, removed: 0 }],
+		} }} />);
+		expect(written).toContain("Content written");
+		expect(written).not.toContain("tool-fact-removed");
 	});
 });
