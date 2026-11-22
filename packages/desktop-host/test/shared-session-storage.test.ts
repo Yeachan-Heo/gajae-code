@@ -1011,6 +1011,45 @@ test("a prompt after a long idle checks again and steps aside for a terminal tha
 	await h.close();
 });
 
+test("Disconnect and Connect never leave a long transcript shrunk to its snapshot share", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const file = h.sdk().sessionFile!;
+	for (let index = 0; index < 6; index++) await h.call("session.create", { projectId: h.project.id });
+	await h.call("project.close", { projectId: h.project.id });
+	const terminal = h.track(await resumeAsTerminal(file, h.projectDir, h.agentDir));
+	for (let index = 0; index < 40; index++)
+		terminal.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `${index} ${"x".repeat(7_000)}` }],
+			timestamp: Date.now(),
+		});
+	await terminal.flush();
+	expect(await terminal.closeStrict()).toMatchObject({ kind: "closed" });
+	await h.call("project.open", { path: h.projectDir });
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.messages.length).toBeGreaterThan(20);
+	// Apply the frames in order, as the app does: a snapshot replaces rows, session frames follow.
+	const shownAfter = async (operation: () => Promise<unknown>) => {
+		const from = h.frames.length;
+		await operation();
+		let shown: DesktopSession | undefined;
+		for (const frame of h.frames.slice(from)) {
+			if (frame.type === "snapshot") shown = frame.snapshot.sessions.find(session => session.id === sessionId);
+			if (frame.type === "session" && frame.session.id === sessionId) shown = frame.session;
+		}
+		return shown;
+	};
+	const released = await shownAfter(() => h.call("session.disconnect", { sessionId }));
+	expect(released?.connection).toEqual({ state: "disconnected" });
+	expect(released?.messages.map(message => message.text)).toEqual(selected.messages.map(message => message.text));
+	const connected = await shownAfter(() => h.call("session.connect", { sessionId }));
+	expect(connected?.connection).toEqual({ state: "connected" });
+	expect(connected?.messages.map(message => message.text)).toEqual(selected.messages.map(message => message.text));
+	await h.close();
+});
+
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });

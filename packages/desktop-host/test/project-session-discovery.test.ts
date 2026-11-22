@@ -153,6 +153,8 @@ test("discovers exact-project SDK sessions in creation order without opening or 
 		[second.id, project.id, "Second terminal conversation"],
 	]);
 	expect(h.created).toHaveLength(0);
+	// The app does not write these, so it offers no Disconnect or Connect for them.
+	expect(h.snapshot().sessions.map(session => session.connection)).toEqual([undefined, undefined]);
 	expect(await Bun.file(first.file).text()).toBe(first.bytes);
 	expect(await Bun.file(second.file).text()).toBe(second.bytes);
 	const catalog = await Bun.file(path.join(h.dataDir, "catalog.json")).text();

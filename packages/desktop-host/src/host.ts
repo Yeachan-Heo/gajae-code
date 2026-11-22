@@ -1126,7 +1126,8 @@ export class DesktopHost {
 			...projectGoal(live?.sdk, text => this.#redact(text)),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
-			connection: { state: this.#connection(metadata) },
+			// Rows another surface owns through the SDK carry no connection of the app's own.
+			...(metadata.managed ? {} : { connection: { state: this.#connection(metadata) } }),
 		};
 	}
 	#connection(metadata: SavedSession): DesktopSessionConnection["state"] {
@@ -2715,7 +2716,8 @@ export class DesktopHost {
 			failures.push(error);
 		}
 		await this.#loadReadOnly(metadata);
-		this.#publishSnapshot();
+		// No row was added or removed: a full session frame, never the snapshot's budget-split copy.
+		this.#emit({ type: "session", session: this.#dto(metadata) });
 		if (failures.length === 1) throw failures[0];
 		if (failures.length) throw new AggregateError(failures, "Disconnect could not release every resource");
 		return { disconnected: true, session: this.#dto(metadata) };
@@ -2743,7 +2745,7 @@ export class DesktopHost {
 			// Another process still holds it: an answer, not a failure. The user asked to connect, so
 			// the next select takes it once that process closes.
 			if (this.#elsewhere.has(metadata.id)) {
-				this.#publishSnapshot();
+				this.#emit({ type: "session", session: this.#dto(metadata) });
 				return this.#dto(metadata);
 			}
 			// A reopen that fails leaves the conversation released, with Connect still offered.
@@ -2751,10 +2753,9 @@ export class DesktopHost {
 				metadata.disconnected = true;
 				await this.#save().catch(() => {});
 			}
-			this.#publishSnapshot();
+			this.#emit({ type: "session", session: this.#dto(metadata) });
 			throw error;
 		}
-		this.#publishSnapshot();
 		return this.#dto(metadata);
 	}
 	/** Show a conversation the app does not write, from its transcript, re-reading only a changed file. */
@@ -2859,8 +2860,7 @@ export class DesktopHost {
 			// The process that wrote it still has it open; the row is now shown read-only.
 			if (this.#elsewhere.has(id)) return "elsewhere";
 			console.error(`Desktop could not reopen a conversation changed elsewhere: ${String(error)}`);
-			// The row is no longer live; publish it so the app stops offering the retired copy.
-			this.#publishSnapshot();
+			// The app keeps showing the last copy beside the error; selecting again opens a fresh one.
 			return "failed";
 		}
 	}
