@@ -25,12 +25,14 @@ import {
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	executeAcpBuiltinSlashCommand,
+	findEmbeddedLiveOwner,
 	forkEmbeddedSession,
 	getEmbeddedAvailableModels,
 	getSessionMessageEntryId,
 	getSettingsCatalog,
 	type InputEventResult,
 	isEmbeddedAppendRefused,
+	type lifecycle,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
 	readEmbeddedTranscriptHistory,
@@ -406,8 +408,9 @@ interface Catalog {
 const STALE_TRANSCRIPT =
 	"This conversation was changed in another window, such as the terminal, after the app opened it.";
 /** What became of the stale copy once the refused operation ended; the message names only that. */
-type StaleReplacement = "reloaded" | "deferred" | "failed";
+type StaleReplacement = "reloaded" | "deferred" | "failed" | "elsewhere";
 const STALE_OUTCOME: Record<StaleReplacement, string> = {
+	elsewhere: `${STALE_TRANSCRIPT} Another gjc process, such as a terminal, has it open, so the app now shows it read-only.`,
 	reloaded: `${STALE_TRANSCRIPT} The app reloaded it with the latest messages. Try again.`,
 	deferred: `${STALE_TRANSCRIPT} The app will reload it with the latest messages once the work still running in it finishes. Then try again.`,
 	failed: `${STALE_TRANSCRIPT} The app could not reload it. Select the conversation again to retry.`,
@@ -415,6 +418,14 @@ const STALE_OUTCOME: Record<StaleReplacement, string> = {
 /** Every writing request on a released conversation answers with this, before any work starts. */
 const DISCONNECTED =
 	"This conversation is disconnected from the app, so the terminal can continue it. Connect it to continue here.";
+/** A live process other than the app (usually a terminal) holds the transcript open. */
+const ELSEWHERE =
+	"Another gjc process, such as a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.";
+/** The app must not remove a transcript another process may be writing. */
+const ELSEWHERE_DELETE =
+	"Another gjc process, such as a terminal, has this conversation open. Close it there before deleting it here.";
+/** A live writer older than this checks again for another owner before it takes a prompt. */
+const OWNER_RECHECK_MS = 5 * 60_000;
 /** Activity for a conversation the app does not hold open; the Session work card shows the reason. */
 const READ_ONLY_ACTIVITY = "Background work is shown only while the app is connected to this conversation.";
 /** Released identities kept; the oldest are dropped first. */
@@ -498,6 +509,8 @@ interface LiveSession extends SessionCandidate {
 	claimedUserTurns: WeakSet<AgentMessage>;
 	/** The exclusive request in flight; settles after its receipt and final view are written. */
 	exclusiveDone?: Promise<void>;
+	/** When this writer last confirmed no other process holds its transcript open. */
+	ownerCheckedAt: number;
 }
 /** A conversation the app shows without holding it open: its transcript's history only. */
 interface ReadOnlyView {
@@ -514,6 +527,8 @@ export interface HostOptions {
 	dataDir?: string;
 	emit: (frame: DesktopFrame) => void;
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+	/** Answers the live-owner lookup instead of the agent directory's running broker. */
+	liveOwnerClient?: lifecycle.SessionLifecycleClient;
 }
 
 /** A close stops its runs on a budget: a wedged abort must not strand the folder's queue. */
@@ -583,6 +598,9 @@ export class DesktopHost {
 	#endedTurns = new Set<string>();
 	/** History of conversations the app does not write, by catalog id; filled when they are shown. */
 	#readOnly = new Map<string, ReadOnlyView>();
+	/** Rows another live process holds open, from the last owner check; never persisted. */
+	#elsewhere = new Set<string>();
+	readonly #liveOwnerClient?: lifecycle.SessionLifecycleClient;
 	#opening = new Map<string, Promise<LiveSession>>();
 	/**
 	 * One queue per workspace path. Open and close both mutate the same catalog entry, and the
@@ -657,6 +675,7 @@ export class DesktopHost {
 			options.emit(detached);
 		};
 		this.#createSession = options.createSession ?? createAgentSession;
+		this.#liveOwnerClient = options.liveOwnerClient;
 	}
 	#redact(text: string): string {
 		for (const secret of this.#secrets) text = text.split(secret).join("[redacted]");
@@ -1111,14 +1130,30 @@ export class DesktopHost {
 		};
 	}
 	#connection(metadata: SavedSession): DesktopSessionConnection["state"] {
-		return metadata.disconnected ? "disconnected" : "connected";
+		return metadata.disconnected ? "disconnected" : this.#elsewhere.has(metadata.id) ? "elsewhere" : "connected";
 	}
 	/** The app may open its own writer for this conversation. */
 	#writable(metadata: SavedSession): boolean {
 		return this.#connection(metadata) === "connected";
 	}
-	#notWritable(_metadata: SavedSession): Error {
-		return new Error(DISCONNECTED);
+	#notWritable(metadata: SavedSession): Error {
+		return new Error(metadata.disconnected ? DISCONNECTED : ELSEWHERE);
+	}
+	/**
+	 * Ask the broker whether another live process holds this transcript open, and remember the
+	 * answer. An absent, failing or slow broker means no: the app opens writable as before and the
+	 * store's compare-and-append refusal stays the backstop.
+	 */
+	async #ownedElsewhere(metadata: SavedSession): Promise<boolean> {
+		if (!metadata.sessionId || !metadata.file) return false;
+		const owner = await findEmbeddedLiveOwner({
+			agentDir: this.agentDir,
+			sessionId: metadata.sessionId,
+			...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
+		});
+		if (owner.kind === "live") this.#elsewhere.add(metadata.id);
+		else this.#elsewhere.delete(metadata.id);
+		return owner.kind === "live";
 	}
 	snapshot(): DesktopSnapshot {
 		return {
@@ -1215,6 +1250,13 @@ export class DesktopHost {
 		}
 	}
 	async #load(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
+		// One writer at a time: an existing transcript another live process holds open is shown
+		// read-only instead. A new conversation or a fork's own copy has no other owner yet.
+		if (!manager && (await this.#ownedElsewhere(metadata))) {
+			await this.#loadReadOnly(metadata);
+			this.#emit({ type: "session", session: this.#dto(metadata) });
+			throw new Error(ELSEWHERE);
+		}
 		// A conversation this load creates has no catalog transcript yet; if it never
 		// publishes, its transcript must not survive as a conversation the user never got.
 		const createdHere = metadata.file === undefined;
@@ -1475,6 +1517,7 @@ export class DesktopHost {
 			queued: new Map(),
 			scopeOwners: new Map(),
 			claimedUserTurns: new WeakSet(),
+			ownerCheckedAt: Date.now(),
 		};
 		this.#live.set(live.metadata.id, live);
 		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
@@ -2567,6 +2610,29 @@ export class DesktopHost {
 		}
 	}
 	/**
+	 * A writer opened a while ago checks again before taking a prompt: a terminal may have opened
+	 * the same conversation since. If one has, the app steps aside, keeping its final view, and
+	 * the prompt is refused before anything runs, so its text returns to the composer.
+	 */
+	async #recheckOwner(live: LiveSession): Promise<void> {
+		if (Date.now() - live.ownerCheckedAt < OWNER_RECHECK_MS || !this.#reloadable(live)) return;
+		live.ownerCheckedAt = Date.now();
+		if (!(await this.#ownedElsewhere(live.metadata))) return;
+		if (this.#live.get(live.metadata.id) === live) {
+			this.#live.delete(live.metadata.id);
+			this.#retiredLive.add(live);
+			try {
+				this.#cancelQuestions(live);
+				await this.#disposeLive(live);
+			} catch (error) {
+				console.error(`Desktop could not fully release a conversation another process opened: ${String(error)}`);
+			}
+		}
+		await this.#loadReadOnly(live.metadata);
+		this.#emit({ type: "session", session: this.#dto(live.metadata) });
+		throw new Error(ELSEWHERE);
+	}
+	/**
 	 * A user Stop; a confirmed Disconnect stops a conversation exactly this way. `arrival` is the
 	 * arrival number of the request that asked for it.
 	 */
@@ -2657,6 +2723,8 @@ export class DesktopHost {
 	/** Take the conversation back through the normal open path, which lands on any newer tail. */
 	async #connect(metadata: SavedSession): Promise<DesktopSession> {
 		if (metadata.managed) return this.#dto(metadata);
+		// Check again: the process that held it open may have closed.
+		this.#elsewhere.delete(metadata.id);
 		const wasDisconnected = metadata.disconnected === true;
 		if (wasDisconnected) {
 			delete metadata.disconnected;
@@ -2672,6 +2740,12 @@ export class DesktopHost {
 			this.#readOnly.delete(metadata.id);
 			this.#publish(live);
 		} catch (error) {
+			// Another process still holds it: an answer, not a failure. The user asked to connect, so
+			// the next select takes it once that process closes.
+			if (this.#elsewhere.has(metadata.id)) {
+				this.#publishSnapshot();
+				return this.#dto(metadata);
+			}
 			// A reopen that fails leaves the conversation released, with Connect still offered.
 			if (wasDisconnected) {
 				metadata.disconnected = true;
@@ -2745,6 +2819,10 @@ export class DesktopHost {
 					},
 				} satisfies DesktopActivityUpdate;
 			case "session.delete":
+				// A released conversation may since have been opened by the terminal; never remove a
+				// transcript another process may be writing.
+				if (this.#elsewhere.has(metadata.id) || (await this.#ownedElsewhere(metadata)))
+					throw new Error(ELSEWHERE_DELETE);
 				this.#readOnly.delete(metadata.id);
 				return this.#forgetMissingSession(metadata);
 			default:
@@ -2761,7 +2839,7 @@ export class DesktopHost {
 			if (!opening) return this.#live.has(id) ? "reloaded" : "failed";
 			return opening.then(
 				() => "reloaded" as const,
-				() => "failed" as const,
+				() => (this.#elsewhere.has(id) ? ("elsewhere" as const) : ("failed" as const)),
 			);
 		}
 		// Queued input can never be written by a refused copy. Hand back what no run has taken yet:
@@ -2778,6 +2856,8 @@ export class DesktopHost {
 			this.#publish(await this.#reload(live));
 			return "reloaded";
 		} catch (error) {
+			// The process that wrote it still has it open; the row is now shown read-only.
+			if (this.#elsewhere.has(id)) return "elsewhere";
 			console.error(`Desktop could not reopen a conversation changed elsewhere: ${String(error)}`);
 			// The row is no longer live; publish it so the app stops offering the retired copy.
 			this.#publishSnapshot();
@@ -3197,7 +3277,11 @@ export class DesktopHost {
 		if (method === "history.get") {
 			const target = this.#metadata(params);
 			if (!target.managed && !this.#writable(target)) return this.#dispatchReadOnly(request, target);
-			const live = await this.#open(target);
+			const live = await this.#open(target).catch(error => {
+				if (!target.managed && !this.#writable(target)) return undefined;
+				throw error;
+			});
+			if (!live) return this.#dispatchReadOnly(request, target);
 			const offset = params.offset === undefined ? 0 : params.offset;
 			const limit = params.limit === undefined ? HISTORY_PAGE_LIMIT : params.limit;
 			if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0)
@@ -3272,7 +3356,11 @@ export class DesktopHost {
 			return this.#disconnect(metadata, params.confirm === true, arrival);
 		}
 		if (method === "session.connect") return this.#connect(metadata);
-		if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
+		if (!this.#writable(metadata)) {
+			// The terminal that had it open may have closed since: selecting checks again.
+			if (method === "session.select" && !metadata.disconnected) this.#elsewhere.delete(metadata.id);
+			else return this.#dispatchReadOnly(request, metadata);
+		}
 		// A transcript another surface removed must not wedge its row. A session this host
 		// still owns keeps the normal delete path, which disposes it and tolerates the
 		// missing file; only an unowned row is forgotten outright.
@@ -3283,10 +3371,16 @@ export class DesktopHost {
 			(await this.#transcriptMissing(metadata))
 		)
 			return await this.#forgetMissingSession(metadata);
-		const live =
-			method === "session.select" || method === "prompt"
-				? await this.#refreshIfMoved(await this.#open(metadata))
-				: await this.#open(metadata);
+		let live: LiveSession;
+		try {
+			const opened = await this.#open(metadata);
+			if (method === "prompt") await this.#recheckOwner(opened);
+			live = method === "session.select" || method === "prompt" ? await this.#refreshIfMoved(opened) : opened;
+		} catch (error) {
+			// The owner check found another process holding it: answer as a read-only conversation.
+			if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
+			throw error;
+		}
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
 			live.gateMutation = true;

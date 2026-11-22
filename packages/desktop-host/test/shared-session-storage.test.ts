@@ -96,7 +96,26 @@ async function fixture(model?: Model) {
 		created.push(result);
 		return result;
 	};
-	const createHost = () => new DesktopHost({ dataDir, emit: frame => frames.push(frame), createSession });
+	// The broker's live-owner answer: transcript ids a terminal holds open, or a broker that fails.
+	const liveOwners = new Set<string>();
+	let brokerFails = false;
+	const ownerLookups: string[] = [];
+	const liveOwnerClient = {
+		global: async (_operation: string, input: Record<string, unknown>) => {
+			ownerLookups.push(String(input.resolveSessionId));
+			if (brokerFails) throw new Error("broker connection refused");
+			return {
+				ok: true,
+				result: {
+					indexSeq: 1,
+					sessions: [...liveOwners].map(sessionId => ({ sessionId, live: true })),
+					warnings: [],
+				},
+			};
+		},
+	};
+	const createHost = () =>
+		new DesktopHost({ dataDir, emit: frame => frames.push(frame), createSession, liveOwnerClient });
 	let host = createHost();
 	await host.initialize();
 	cleanups.push(async () => {
@@ -131,6 +150,11 @@ async function fixture(model?: Model) {
 		track: (manager: SessionManager) => {
 			managers.push(manager);
 			return manager;
+		},
+		liveOwners,
+		ownerLookups,
+		failBroker: (fails: boolean) => {
+			brokerFails = fails;
 		},
 	};
 }
@@ -883,6 +907,104 @@ test("Disconnect during a turn asks first, then stops it like Stop before releas
 	expect(live.isDisposed).toBe(true);
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
 	expect(h.snapshot().sessions[0]?.status).not.toBe("running");
+	await h.close();
+});
+
+/** The SDK transcript identity the broker would list for the row. */
+async function transcriptId(h: { dataDir: string }): Promise<string> {
+	return (await readCatalog(h.dataDir)).sessions[0]!.sessionId;
+}
+
+test("a conversation a terminal has open is shown read-only and taken back once the terminal closes", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	await h.restart();
+	const owner = await transcriptId(h);
+	h.liveOwners.add(owner);
+	const opened = h.created.length;
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.connection).toEqual({ state: "elsewhere" });
+	expect(selected.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	expect(h.ownerLookups).toContain(owner);
+	// Nothing opened a writer, and nothing can be sent.
+	expect(h.created).toHaveLength(opened);
+	const calls = h.model.calls.length;
+	await expect(h.call("prompt", { sessionId, text: "while the terminal has it" })).rejects.toThrow("terminal");
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	await expect(h.call("session.delete", { sessionId })).rejects.toThrow("terminal");
+	expect(h.snapshot().sessions).toHaveLength(1);
+	// Checking again while the terminal still has it is an answer, not an error.
+	const still = await h.call<DesktopSession>("session.connect", { sessionId });
+	expect(still.connection).toEqual({ state: "elsewhere" });
+	expect(h.created).toHaveLength(opened);
+	expect(h.model.calls).toHaveLength(calls);
+	// The terminal closes: selecting takes the conversation back through the normal open.
+	h.liveOwners.delete(owner);
+	const back = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(back.connection).toEqual({ state: "connected" });
+	expect(h.created).toHaveLength(opened + 1);
+	await h.call("prompt", { sessionId, text: "after the terminal closed" });
+	expect(h.model.calls).toHaveLength(calls + 1);
+	await h.close();
+});
+
+test("Connect on a disconnected conversation the terminal still has open waits for it, read-only", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	await h.call("session.disconnect", { sessionId });
+	const owner = await transcriptId(h);
+	h.liveOwners.add(owner);
+	// The terminal may be writing it: the app refuses to delete it underneath.
+	await expect(h.call("session.delete", { sessionId })).rejects.toThrow("terminal");
+	const opened = h.created.length;
+	const waiting = await h.call<DesktopSession>("session.connect", { sessionId });
+	expect(waiting.connection).toEqual({ state: "elsewhere" });
+	expect(h.created).toHaveLength(opened);
+	h.liveOwners.delete(owner);
+	expect((await h.call<DesktopSession>("session.connect", { sessionId })).connection).toEqual({ state: "connected" });
+	expect(h.created).toHaveLength(opened + 1);
+	await h.close();
+});
+
+test("an unreachable broker never blocks opening; the app opens writable as before", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	await h.restart();
+	h.failBroker(true);
+	const opened = h.created.length;
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.connection).toEqual({ state: "connected" });
+	expect(h.created).toHaveLength(opened + 1);
+	await h.close();
+});
+
+test("a prompt after a long idle checks again and steps aside for a terminal that opened the conversation", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const owner = await transcriptId(h);
+	h.liveOwners.add(owner);
+	// A prompt soon after the last check sends no broker lookup.
+	const lookups = h.ownerLookups.length;
+	await h.call("prompt", { sessionId, text: "still recent" });
+	expect(h.ownerLookups).toHaveLength(lookups);
+	const now = Date.now();
+	const later = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60_000);
+	const calls = h.model.calls.length;
+	try {
+		await expect(h.call("prompt", { sessionId, text: "after a long idle" })).rejects.toThrow("terminal");
+	} finally {
+		later.mockRestore();
+	}
+	expect(h.model.calls).toHaveLength(calls);
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
 	await h.close();
 });
 
