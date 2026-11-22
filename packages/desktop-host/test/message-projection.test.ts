@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	anchorNotices,
 	copyableMessageText,
 	fitMessages,
 	HISTORY_PAGE_BYTES,
@@ -34,6 +35,41 @@ describe("desktop message projection", () => {
 			{ type: "text", text: "second" },
 		]);
 		expect(JSON.stringify(message)).not.toContain("secret");
+	});
+
+	test("places each notice before the first projected message at or after its anchor", () => {
+		const transcript = projectMessages([
+			{ role: "user", content: "zero", timestamp: 1 },
+			{ role: "assistant", content: [], stopReason: "stop" },
+			{ role: "assistant", content: "two", stopReason: "stop", timestamp: 2 },
+			{ role: "user", content: "three", timestamp: 3 },
+		]);
+		const notice = (text: string, anchor: number) => ({
+			anchor,
+			message: { id: text, role: "system" as const, text },
+		});
+		const merged = anchorNotices(transcript, [
+			notice("at start", 0),
+			// Index 1 is not visible, so this lands before the next visible message.
+			notice("after zero", 1),
+			notice("also after zero", 1),
+			notice("after three", 4),
+			notice("past a shrunken transcript", 9),
+		]);
+		expect(merged.map(message => message.text)).toEqual([
+			"at start",
+			"zero",
+			"after zero",
+			"also after zero",
+			"two",
+			"three",
+			"after three",
+			"past a shrunken transcript",
+		]);
+		// Transcript message ids are untouched by the merge.
+		expect(merged.filter(message => message.role !== "system").map(message => message.id)).toEqual(
+			transcript.map(message => message.id),
+		);
 	});
 
 	test("omits empty assistant turns consistently from history offsets", () => {

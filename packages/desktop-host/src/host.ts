@@ -66,6 +66,8 @@ import {
 import { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
+	type AnchoredNotice,
+	anchorNotices,
 	copyableMessageText,
 	countVisibleMessages,
 	fitMessages,
@@ -102,7 +104,6 @@ import type {
 	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
-	DesktopMessage,
 	DesktopProject,
 	DesktopQuestion,
 	DesktopQueuedInput,
@@ -376,7 +377,7 @@ interface SessionCandidate {
 	metadata: SavedSession;
 	settings: Settings;
 	registry: ModelRegistry;
-	notices: DesktopMessage[];
+	notices: AnchoredNotice[];
 }
 interface ExclusiveViewHandoff {
 	/** No more SDK mutations remain in the exclusive operation. Receipt writes may still be pending. */
@@ -909,7 +910,9 @@ export class DesktopHost {
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
 		const awaitingGate = gates?.available && gates.pending.length > 0;
-		const projected = live
+		// The real transcript. Status, and anything else that describes the conversation itself,
+		// reads this list; notices and other Host-synthesized rows join only the display copy below.
+		const transcript = live
 			? projectMessages(
 					live.streamingMessage ? [...live.sdk.messages, live.streamingMessage] : live.sdk.messages,
 					text => this.#redact(text),
@@ -921,27 +924,31 @@ export class DesktopHost {
 					},
 				)
 			: [];
-		const notices = (live?.notices ?? []).map(message => ({
-			...message,
-			text: this.#redact(message.text),
-			...(message.toolName === undefined ? {} : { toolName: this.#redact(message.toolName) }),
-			...(message.blocks === undefined
-				? {}
-				: {
-						blocks: message.blocks.map(block => {
-							if (block.type === "text" || block.type === "thinking")
-								return { ...block, text: this.#redact(block.text) };
-							if (block.type === "image-unavailable") return { ...block, reason: this.#redact(block.reason) };
-							return this.#redact(block.data) === block.data
-								? block
-								: {
-										type: "image-unavailable" as const,
-										reason: "Image preview is unavailable for security reasons.",
-									};
+		const notices = (live?.notices ?? []).map(({ anchor, message }) => ({
+			anchor,
+			message: {
+				...message,
+				text: this.#redact(message.text),
+				...(message.toolName === undefined ? {} : { toolName: this.#redact(message.toolName) }),
+				...(message.blocks === undefined
+					? {}
+					: {
+							blocks: message.blocks.map(block => {
+								if (block.type === "text" || block.type === "thinking")
+									return { ...block, text: this.#redact(block.text) };
+								if (block.type === "image-unavailable") return { ...block, reason: this.#redact(block.reason) };
+								return this.#redact(block.data) === block.data
+									? block
+									: {
+											type: "image-unavailable" as const,
+											reason: "Image preview is unavailable for security reasons.",
+										};
+							}),
 						}),
-					}),
+			},
 		}));
-		const fitted = fitMessages([...projected, ...notices].slice(-HISTORY_LIMIT), messageBudget);
+		// Notices sit where they were raised rather than after every later turn.
+		const fitted = fitMessages(anchorNotices(transcript, notices).slice(-HISTORY_LIMIT), messageBudget);
 		return {
 			id: metadata.id,
 			projectId: metadata.projectId,
@@ -954,7 +961,7 @@ export class DesktopHost {
 						? "running"
 						: live?.error
 							? "error"
-							: fitted.messages.length > 0
+							: transcript.length > 0
 								? "done"
 								: "idle",
 			...(live?.sdk.model ? { model: `${live.sdk.model.provider}/${live.sdk.model.id}` } : {}),
@@ -1211,25 +1218,34 @@ export class DesktopHost {
 			metadata,
 			settings: result.session.settings,
 			registry: result.session.modelRegistry,
+			// Anchored after restore below, once the transcript they follow is known.
 			notices: result.extensionsResult.errors.map(error => ({
-				id: crypto.randomUUID(),
-				role: "system" as const,
-				text: `Extension discovery failed: ${this.#redact(error.error).slice(0, TEXT_LIMIT)}`,
-				isError: true,
+				anchor: 0,
+				message: {
+					id: crypto.randomUUID(),
+					role: "system" as const,
+					text: `Extension discovery failed: ${this.#redact(error.error).slice(0, TEXT_LIMIT)}`,
+					isError: true,
+				},
 			})),
 		};
 		this.#candidates.add(candidate);
 		try {
 			if (result.modelProfileWarning)
 				candidate.notices.push({
-					id: `profile:${metadata.id}`,
-					role: "system",
-					text: result.modelProfileWarning,
-					isError: true,
+					anchor: 0,
+					message: {
+						id: `profile:${metadata.id}`,
+						role: "system",
+						text: result.modelProfileWarning,
+						isError: true,
+					},
 				});
 			// Restore before publication or metadata reconciliation. A stale/foreign cursor
 			// must leave the saved intent intact, not silently publish the file's latest branch.
 			if (metadata.view) await restoreSessionView(result.session, metadata.view);
+			// Construction notices were raised as the conversation opened: after its restored history.
+			for (const notice of candidate.notices) notice.anchor = result.session.messages.length;
 			// Materialization remains behind the SDK factory's owned manager.
 			await result.session.sessionManager.ensureOnDisk();
 			await this.#flushSession(candidate);
@@ -1912,10 +1928,13 @@ export class DesktopHost {
 				)
 					return;
 				live.notices.push({
-					id: crypto.randomUUID(),
-					role: "system",
-					text: this.#redact(message).slice(0, TEXT_LIMIT),
-					isError: type === "error",
+					anchor: live.sdk.messages.length,
+					message: {
+						id: crypto.randomUUID(),
+						role: "system",
+						text: this.#redact(message).slice(0, TEXT_LIMIT),
+						isError: type === "error",
+					},
 				});
 				live.notices = live.notices.slice(-20);
 				this.#schedule(live);

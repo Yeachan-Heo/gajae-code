@@ -201,8 +201,9 @@ export interface DesktopSession {
 	projectId: string;
 	title: string;
 	/**
-	 * `done` means at least one visible message exists and the session is otherwise settled
-	 * (not busy, waiting on an answer/gate, or failed); a never-used session stays `idle`.
+	 * `done` means at least one visible transcript message exists and the session is otherwise
+	 * settled (not busy, waiting on an answer/gate, or failed); a never-used session stays `idle`.
+	 * Host notices in `messages` are not transcript messages and never make a session `done`.
 	 */
 	status: "idle" | "done" | "running" | "waiting" | "error";
 	queued?: DesktopQueuedInput[];

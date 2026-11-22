@@ -738,6 +738,39 @@ describe("desktop streaming lifecycle", () => {
 			message => message.role === "user" || message.role === "assistant",
 		);
 
+	test("notices stay where they were raised and never count as conversation", async () => {
+		const { call, snapshot, session, control, runner } = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("session_start", async (_event, ctx) => ctx.ui.notify("extension ready", "info"));
+		}`,
+		);
+		let state = await snapshot();
+		for (let i = 0; i < 200 && !state.sessions[0]?.messages.length; i++) {
+			await Bun.sleep(5);
+			state = await snapshot();
+		}
+		expect(state.sessions[0]?.messages).toEqual([
+			expect.objectContaining({ role: "system", text: "extension ready" }),
+		]);
+		// A notice is not a turn: a new conversation holding only a notice is still idle.
+		expect(state.sessions[0]?.status).toBe("idle");
+		await promptTurn(call, control, { sessionId: session.id, text: "first turn" }, "first answer");
+		if (!runner) throw new Error("Expected extension runner");
+		runner.getUIContext().notify("between turns", "info");
+		await promptTurn(call, control, { sessionId: session.id, text: "second turn" }, "second answer");
+		const after = (await snapshot()).sessions[0];
+		expect(after?.messages.map(message => message.text)).toEqual([
+			"extension ready",
+			"first turn",
+			"first answer",
+			"between turns",
+			"second turn",
+			"second answer",
+		]);
+		expect(after?.status).toBe("done");
+	});
+
 	test("editing a prompt rewinds like /tree and its revisions switch between branches", async () => {
 		const { call, snapshot, session, control } = await launch();
 		await promptTurn(call, control, { sessionId: session.id, text: "first question" }, "answer one");

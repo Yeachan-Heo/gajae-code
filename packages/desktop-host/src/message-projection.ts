@@ -19,6 +19,8 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8") + 1;
 const messageId = (index: number, timestamp: unknown): string =>
 	`${index}:${typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : ""}`;
+/** The source transcript index a projected message id encodes (see `messageId`). */
+const projectedIndex = (message: DesktopMessage): number => Number.parseInt(message.id, 10);
 
 function projectText(
 	value: string,
@@ -336,6 +338,38 @@ export function fitMessages(
 		result.push(message);
 	}
 	return { messages: result.reverse(), truncated };
+}
+
+/** A Host notice and the transcript position it was raised at. */
+export interface AnchoredNotice {
+	/**
+	 * Transcript length when the notice was raised. It is positional, not an entry identity, so it
+	 * is approximate across compaction or a branch switch: a shorter transcript moves it to the end.
+	 */
+	anchor: number;
+	message: DesktopMessage;
+}
+
+/**
+ * Interleave notices into messages projected by this module. Each notice goes before the first
+ * message whose source index is at or after its anchor; equal anchors keep the order they were
+ * raised in, and anchors past the transcript go last. Transcript messages are not altered.
+ */
+export function anchorNotices(
+	transcript: readonly DesktopMessage[],
+	notices: readonly AnchoredNotice[],
+): DesktopMessage[] {
+	// Array sort is stable, so equal anchors keep raise order.
+	const pending = [...notices].sort((left, right) => left.anchor - right.anchor);
+	const result: DesktopMessage[] = [];
+	let next = 0;
+	for (const message of transcript) {
+		const index = projectedIndex(message);
+		while (next < pending.length && pending[next]!.anchor <= index) result.push(pending[next++]!.message);
+		result.push(message);
+	}
+	while (next < pending.length) result.push(pending[next++]!.message);
+	return result;
 }
 
 export function projectMessages(
