@@ -899,10 +899,11 @@ test("Disconnect during a turn asks first, then stops it like Stop before releas
 	const confirmed = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
 	expect(confirmed.disconnected).toBe(true);
 	await running;
-	// The stopped prompt and the queued follow-up end exactly as a user Stop leaves them.
+	// The stopped prompt and the queued follow-up end exactly as a user Stop leaves them: the
+	// prompt that ran is cancelled, and the follow-up that never ran is handed back to the composer.
 	const [held_, queued] = h.snapshot().deliveries.slice(-2);
 	expect(held_?.disposition).toBe("cancelled");
-	expect(queued?.disposition).toBe("cancelled");
+	expect(queued?.disposition).toBe("removed");
 	await live.awaitDisposeCompletion();
 	expect(live.isDisposed).toBe(true);
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
