@@ -3222,14 +3222,25 @@ export class DesktopHost {
 		if (method === "settings.get") {
 			const target = params.sessionId ? this.#metadata(params) : undefined;
 			// A released conversation has no session settings of its own open; show the app's.
-			const settings = target && this.#writable(target) ? (await this.#open(target)).settings : this.#settings!;
+			const opened =
+				target && this.#writable(target)
+					? await this.#open(target).catch(error => {
+							// Another process turned out to hold it: show the app's settings, as for any read-only row.
+							if (this.#writable(target)) throw error;
+							return undefined;
+						})
+					: undefined;
+			const settings = opened?.settings ?? this.#settings!;
 			return desktopSettings(settings);
 		}
 		if (method === "settings.set") {
 			const settingPath = validateDesktopSetting(params.path, params.value);
 			if (params.sessionId) {
 				const target = this.#metadata(params);
-				if (this.#writable(target)) await this.#open(target);
+				if (this.#writable(target))
+					await this.#open(target).catch(error => {
+						if (this.#writable(target)) throw error;
+					});
 			}
 			// Settings are application-wide; refuse to change them under an active run.
 			const targets = [...this.#live.values()];
@@ -4309,6 +4320,9 @@ export class DesktopHost {
 				console.error(`Desktop workspace close could not dispose session ${id}: ${String(error)}`);
 			}
 		}
+		// Read-only histories of the closed workspace are read again when it reopens.
+		for (const session of this.#catalog.sessions)
+			if (session.projectId === projectId) this.#readOnly.delete(session.id);
 		if (questionFailures.length)
 			throw new AggregateError(questionFailures, "Workspace close could not publish question cancellations");
 	}

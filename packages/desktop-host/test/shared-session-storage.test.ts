@@ -923,6 +923,9 @@ test("a conversation a terminal has open is shown read-only and taken back once 
 	const owner = await transcriptId(h);
 	h.liveOwners.add(owner);
 	const opened = h.created.length;
+	// A settings read is the first request to find the other owner: it answers with the app's settings.
+	expect(Array.isArray(await h.call("settings.get", { sessionId }))).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
 	const selected = await h.call<DesktopSession>("session.select", { sessionId });
 	expect(selected.connection).toEqual({ state: "elsewhere" });
 	expect(selected.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
