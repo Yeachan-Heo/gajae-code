@@ -1,2 +1,15 @@
 /** Task list surfaces (`todo.*`). */
-export const todo = {} as const;
+export const todo = {
+	"todo.phaseUntitled": "Untitled phase",
+	"todo.phaseCount": "{done}/{total}",
+	"todo.phaseProgress": "{done} of {total} done",
+	"todo.statusPending": "Pending",
+	"todo.statusInProgress": "In progress",
+	"todo.statusCompleted": "Done",
+	"todo.statusAbandoned": "Abandoned",
+	"todo.notesLabel": "Notes",
+	"todo.noteCount": "Notes: {count}",
+	"todo.noteCountAtLeast": "Notes: {count} or more",
+	"todo.noteCountShortAtLeast": "{count}+",
+	"todo.capNotice": "Only the first {count} tasks are shown.",
+} as const;

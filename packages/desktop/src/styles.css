@@ -185,17 +185,17 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .todo-toggle:hover { background: var(--surface-2); }
 .todo-toggle > svg:first-child { color: var(--accent); flex: none; }
 .todo-toggle > svg:last-child { margin-left: auto; color: var(--muted); flex: none; }
-.todo-summary { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 0.8125rem; }
+.todo-summary { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; font-size: 0.8125rem; }
 .todo-summary small { color: var(--muted); font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .todo-phases { padding: 4px 8px 10px; }
-.todo-phase h3 { margin: 6px 0 2px; font-size: 0.75rem; color: var(--muted); }
-.todo-phase ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.todo-phase h3 { margin: 0; font-size: 0.75rem; color: var(--muted); }
+.todo-phase > ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
 .todo-task { display: flex; align-items: flex-start; gap: 8px; font-size: 0.8125rem; line-height: 1.45; }
 .todo-task > svg { flex: none; margin-top: 3px; width: 14px; height: 14px; }
-.todo-task.completed { color: var(--muted); text-decoration: line-through; }
+.todo-task.completed { color: var(--muted); }
 .todo-task.completed > svg { color: var(--status-done); }
 .todo-task.in_progress > svg { color: var(--accent); }
-.todo-task.abandoned { color: var(--muted); text-decoration: line-through; }
+.todo-task.abandoned { color: var(--muted); }
 .goal-strip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
 .goal-status { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 0.75rem; color: var(--muted); }
 .goal-objective { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8125rem; }
@@ -732,6 +732,26 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* Section A: tool call cards (ToolCallCard.tsx, transcript-groups.tsx). */
 
 /* Section B: task list (TodoPanel.tsx, TodoToolBody.tsx, SessionWorkProgress.tsx). */
+.todo-progress { display: block; height: 0.25rem; margin-top: 0.25rem; overflow: hidden; border-radius: var(--radius-pill); background: var(--border-soft); }
+.todo-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.todo-progress.complete > span { background: var(--status-done); }
+/* Phases are numbered by position, as in the terminal; the number is presentation, not data. */
+.todo-phases { counter-reset: todo-phase; }
+.todo-phase { counter-increment: todo-phase; }
+.todo-phase + .todo-phase { margin-top: 0.5rem; }
+.todo-phase-heading { display: flex; align-items: baseline; gap: 0.5rem; margin: 0.375rem 0 0.25rem; }
+.todo-phase-heading h3 { flex: 1; min-width: 0; }
+.todo-phase-heading h3::before { content: counter(todo-phase) " · "; font-variant-numeric: tabular-nums; }
+.todo-phase-count { flex: none; color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.todo-task-body { flex: 1; min-width: 0; }
+.todo-task-text { word-break: keep-all; overflow-wrap: anywhere; }
+.todo-task.completed .todo-task-text, .todo-task.abandoned .todo-task-text { text-decoration: line-through; }
+.todo-note-count { display: inline-flex; align-items: center; gap: 0.125rem; margin-left: 0.375rem; padding: 0 0.375rem; border-radius: var(--radius-pill); background: var(--surface-2); color: var(--muted); font-size: 0.6875rem; line-height: 1.5; white-space: nowrap; vertical-align: 0.0625rem; }
+.todo-note-count > svg { width: 0.6875rem; height: 0.6875rem; flex: none; }
+.todo-task .todo-notes { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.25rem 0 0.125rem; padding: 0 0 0 0.625rem; border-left: 2px solid var(--border-soft); list-style: none; color: var(--muted); font-size: 0.75rem; }
+/* Notes are prose the model wrote, often several lines; keep its line breaks. */
+.todo-notes > li { white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
+.todo-cap { margin: 0.5rem 0 0; color: var(--muted); font-size: 0.75rem; }
 
 /* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
 
