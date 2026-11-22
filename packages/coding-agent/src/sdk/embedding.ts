@@ -22,6 +22,9 @@ import {
 	SessionManager,
 } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
+import { readBrokerDiscovery } from "./broker/discovery";
+import { SdkClient } from "./client/client";
+import { type SessionLifecycleClient, SessionLifecycleService } from "./lifecycle/service";
 import { createSdkPreferenceControls } from "./preference-controls";
 import type { SdkRevisionInput, SdkRevisionResult } from "./protocol/revision-contracts";
 import { reviseSession, SdkRevisionError, type SdkRevisionRuntimeOptions } from "./revision-controls";
@@ -640,6 +643,71 @@ export async function readEmbeddedTranscriptHistory(
  */
 export function isEmbeddedAppendRefused(session: Pick<CreateAgentSessionResult["session"], "sessionManager">): boolean {
 	return session.sessionManager.getAppendIdentityMismatch() !== undefined;
+}
+
+/**
+ * Whether another process is registered with the SDK broker as the live owner of a transcript.
+ * `unknown` means the answer could not be had: no broker is running (`broker_absent`), or it
+ * failed or did not answer in time (`broker_unavailable`).
+ */
+export type EmbeddedLiveOwner =
+	| { kind: "live" }
+	| { kind: "none" }
+	| { kind: "unknown"; reason: "broker_absent" | "broker_unavailable" };
+
+const LIVE_OWNER_ACTOR = { id: "embedding", namespace: "embedding-live-owner" };
+const LIVE_OWNER_TIMEOUT_MS = 1_000;
+
+/**
+ * Ask the running SDK broker whether a live process (a terminal session hosting the SDK, or an
+ * owner the broker started) holds `sessionId` open. Read-only and bounded: it never starts,
+ * restarts or recovers a broker, makes one exact `session.list` lookup with a single connection
+ * and no reconnects, and answers `unknown` instead of waiting past `timeoutMs`. Advisory only: a
+ * process that does not register with the broker, or registers after the answer, is not seen.
+ * `client` replaces the agent directory's broker connection (tests, custom transports).
+ */
+export async function findEmbeddedLiveOwner(input: {
+	agentDir: string;
+	sessionId: string;
+	timeoutMs?: number;
+	client?: SessionLifecycleClient;
+}): Promise<EmbeddedLiveOwner> {
+	const timeoutMs = input.timeoutMs ?? LIVE_OWNER_TIMEOUT_MS;
+	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
+	let client = input.client;
+	if (!client) {
+		let discovery: Awaited<ReturnType<typeof readBrokerDiscovery>>;
+		try {
+			discovery = await readBrokerDiscovery(input.agentDir);
+		} catch {
+			return unavailable;
+		}
+		if (!discovery) return { kind: "unknown", reason: "broker_absent" };
+		const { url, token } = discovery;
+		client = {
+			global: async (operation, request, options) => {
+				const connection = await SdkClient.connect(url, token, { timeoutMs, reconnectAttempts: 0 });
+				try {
+					return await connection.global(operation, request, { timeoutMs: options.timeoutMs ?? timeoutMs });
+				} finally {
+					await connection.close().catch(() => {});
+				}
+			},
+		};
+	}
+	const lookup = (async (): Promise<EmbeddedLiveOwner> => {
+		const listed = await new SessionLifecycleService(client).list({
+			actor: LIVE_OWNER_ACTOR,
+			capability: "session.list",
+			target: { resolveSessionId: input.sessionId },
+			timeoutMs,
+		});
+		if (!listed.ok || "rows" in listed.result) return unavailable;
+		return listed.result.sessions.some(entry => entry.sessionId === input.sessionId && entry.live === true)
+			? { kind: "live" }
+			: { kind: "none" };
+	})().catch(() => unavailable);
+	return Promise.race([lookup, Bun.sleep(timeoutMs).then(() => unavailable)]);
 }
 
 /** The embedding must first release its writer and remove the durable catalog reference. */
