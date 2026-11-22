@@ -426,7 +426,7 @@ export function projectToolCall(
 interface LiveCall {
 	/** `tool_execution_start` was seen; `pendingToolCalls` alone misses the gap after its end. */
 	started: boolean;
-	/** `tool_execution_end` was seen: the output is complete, though the result is not appended yet. */
+	/** The latest event was `tool_execution_end`: output is complete, though the result is not appended yet. */
 	ended?: boolean;
 	/** Latest streamed output text, unredacted and uncut until it is projected. */
 	tail?: string;
@@ -465,7 +465,9 @@ export function observeToolEvent(session: Session, event: { readonly type: strin
 		liveCalls.set(session, calls);
 		const call = calls.get(value.toolCallId) ?? { started: false };
 		call.started = true;
-		if (event.type !== "tool_execution_update") call.ended = event.type === "tool_execution_end";
+		// Only the latest event says whether output can still arrive: the SDK does not stop a tool's
+		// updates at `tool_execution_end`, so an update after it resumes the end edge's hold-back.
+		call.ended = event.type === "tool_execution_end";
 		if (event.type === "tool_execution_update") {
 			// Bash also sends content-less updates (a terminal id, an input prompt); they keep the tail.
 			const text = resultText(record(value.partialResult) ?? {});

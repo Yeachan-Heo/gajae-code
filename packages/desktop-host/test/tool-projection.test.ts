@@ -455,6 +455,25 @@ describe("live tool rows", () => {
 			expect(settled.at(-1)?.text).toBe("progress: 10 items");
 		});
 
+		test("output that arrives after execution ended is held back at its end again", () => {
+			const session = fakeSession([
+				{ role: "user", content: "go" },
+				assistantCalls(["a", "bash", { command: "print-key" }]),
+			]);
+			const event = (event: Record<string, unknown>) =>
+				observeToolEvent(session, { toolCallId: "a", ...event } as unknown as { type: string });
+			const shown = () => projectLiveToolCalls(session, undefined, redact, secrets)[0];
+			event({ type: "tool_execution_start" });
+			event({ type: "tool_execution_end" });
+			// Nothing stops the SDK from reporting more output after the end; it may still be growing.
+			event({
+				type: "tool_execution_update",
+				partialResult: { content: [{ type: "text", text: "key is sk-live-ABCDEFGH" }] },
+			});
+			expect(shown()?.tool?.status).toBe("running");
+			expect(shown()?.text).toBe("key is ");
+		});
+
 		test("a tail the SDK cut inside a secret drops the secret's remaining end", () => {
 			const tail = running();
 			const shown = tail("IJKLMNOP and the rest\nnext line");
