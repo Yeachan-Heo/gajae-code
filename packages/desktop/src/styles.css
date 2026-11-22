@@ -764,6 +764,15 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .todo-tool-body { max-height: 20rem; min-width: 0; overflow: auto; padding: 0.625rem 0.75rem; }
 .todo-tool-summary { margin: 0; font-size: 0.8125rem; }
 .todo-tool-body .todo-phases { padding: 0.25rem 0 0; }
+.showcase-todo-states { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1.5rem; align-items: start; }
+.showcase-todo-state { min-width: 0; }
+.showcase-todo-state + .showcase-todo-state { margin-top: 1.5rem; }
+.showcase-todo-states > .showcase-todo-state { margin-top: 0; }
+.showcase-todo-state > h3 { margin: 0 0 0.5rem; color: var(--muted); font-size: 0.75rem; font-weight: 500; }
+.showcase-todo-state .todo-panel { margin: 0; max-width: none; }
+.showcase-todo-card { margin: 0; }
+.showcase-todo-toolbar { border: 1px solid var(--border-soft); border-radius: var(--radius-md); margin-bottom: 0.5rem; }
+.showcase-todo-label { display: block; font-size: 0.8125rem; }
 
 /* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
 

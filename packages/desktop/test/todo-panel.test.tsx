@@ -3,6 +3,7 @@ import type { DesktopMessage, DesktopSession, DesktopTodoPhase } from "@gajae-co
 import type { DesktopToolCallStatus } from "@gajae-code/desktop-host/tool-protocol";
 import { renderToStaticMarkup } from "react-dom/server";
 import { SessionWorkProgress, sessionWorkLabel } from "../src/SessionWorkProgress";
+import { ShowcaseTodo, ShowcaseTodoNav } from "../src/ShowcaseTodo";
 import {
 	SessionWorkTodos,
 	TODO_TASK_LIMIT,
@@ -196,5 +197,25 @@ describe("stale task list hint", () => {
 		expect(renderToStaticMarkup(<SessionWorkTodos session={{ ...session, messages: [todo()] }} />)).not.toContain("todo-stale");
 		// Without a list there is nothing to call out of date.
 		expect(renderToStaticMarkup(<SessionWorkTodos session={{ ...session, todos: [] }} />)).toBe("");
+	});
+});
+
+describe("task list showcase", () => {
+	test("every index link resolves to a section, and each reviewed state is present", () => {
+		const html = renderToStaticMarkup(
+			<>
+				<ShowcaseTodoNav />
+				<ShowcaseTodo />
+			</>,
+		);
+		const links = [...html.matchAll(/href="#([^"]+)"/gu)].map(match => match[1]);
+		expect(links).toEqual(["showcase-todo-panel", "showcase-todo-card", "showcase-todo-chip", "showcase-todo-tool"]);
+		for (const id of links) expect(html).toContain(`<section id="${id}"><h2>`);
+		expect(html).toContain("Task list may be out of date. Its last update failed.");
+		expect(html).toContain("Only the first 120 tasks are shown.");
+		expect(html).toContain('title="Notes: 5 or more"');
+		for (const chip of [">0/4<", ">2/5<", ">3/3<"]) expect(html).toContain(chip);
+		expect(html).toContain('aria-label="Session work"');
+		expect(html).toContain('class="todo-tool-body"');
 	});
 });
