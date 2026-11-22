@@ -265,6 +265,25 @@ suite("Zero-model onboarding notice", () => {
 		}
 	}, 30000);
 
+	test("Escape closes only the Providers dialog and leaves an open Session work card in place", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page, "Oldest conversation · Idle");
+			await page.waitForSelector(ABOVE_COMPOSER);
+			await page.click(".session-work-toggle");
+			await page.waitForSelector(".session-work-card");
+			await page.click(`${ABOVE_COMPOSER} .button`);
+			await page.waitForSelector("dialog.providers-dialog[open] .provider-row");
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector("dialog.providers-dialog"));
+			await Bun.sleep(100);
+			expect(await page.$(".session-work-card")).not.toBeNull();
+			expect(await page.evaluate(() => document.activeElement?.closest(".provider-notice") !== null)).toBe(true);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("its button opens the Providers dialog, and a saved key removes it in the snapshot's render", async () => {
 		const { context, page } = await fixture({ holdModelLists: true });
 		try {
