@@ -49,11 +49,13 @@ const call = (id: string, status: DesktopToolCall["status"], extra: Partial<Desk
 /** The tool-card text WCAG AA asks 4.5:1 of, each against what is actually painted behind it. */
 const TARGETS = {
 	failedStatus: ".tool-call-status.tool-failure",
+	cancelledStatus: ".tool-call-status.tool-call-cancelled",
 	groupFailed: ".tool-group-failed",
 	diffError: ".tool-diff-error",
 	detailError: ".tool-detail-error .error-content",
 	addedNumber: ".tool-diff-add .tool-diff-number",
 	removedNumber: ".tool-diff-remove .tool-diff-number",
+	hunkLine: ".tool-diff-hunk",
 	addedLine: ".tool-diff-add",
 	removedLine: ".tool-diff-remove",
 	detailTruncated: ".tool-call-details > .truncation-notice",
@@ -78,6 +80,7 @@ suite("tool card contrast", () => {
 						import { applyTheme } from '/src/themes.ts';
 						const h = React.createElement;
 						const failed = ${JSON.stringify(call("f", "failed", { isError: true, truncated: true }))};
+						const cancelled = ${JSON.stringify(call("c", "cancelled", { isError: true }))};
 						const group = groupTranscript([${JSON.stringify(call("a", "done"))}, ${JSON.stringify(call("b", "failed", { isError: true }))}], 10)[0];
 						const ready = { kind: 'ready', detail: { callId: 'd', truncated: true, diff: [
 							{ path: 'src/a.ts', diff: '@@ -1 +1 @@\\n-1|old\\n+1|new', added: 1, removed: 1 },
@@ -86,6 +89,7 @@ suite("tool card contrast", () => {
 						function Fixture() {
 							return h('div', { className: 'conversation' },
 								h(Message, { message: failed }),
+								h(Message, { message: cancelled }),
 								h(ToolRun, { item: group, renderMessage: message => h(Message, { message }) }),
 								h('article', { className: 'message tool tool-call' }, h('div', { className: 'tool-call-details' },
 									h(ToolCallDetails, { family: 'edit', state: ready }),
