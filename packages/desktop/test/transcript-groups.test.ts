@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolCall } from "@gajae-code/desktop-host/tool-protocol";
-import { groupTranscript, toolRunKinds, transcriptAnchorIndex } from "../src/transcript-groups";
+import { groupTranscript, TranscriptRuns, toolRunKinds, transcriptAnchorIndex } from "../src/transcript-groups";
 
 const row = (id: string): DesktopMessage => ({ id, role: "assistant", text: `answer ${id}` });
 const call = (
@@ -124,6 +124,50 @@ describe("tool runs", () => {
 		}
 		expect(groupTranscript(growing, 100)[1]?.memberKeys).toEqual(["tool:a", "tool:b"]);
 		expect(groupTranscript(settled, 100)[1]?.memberKeys).toEqual(["tool:a", "tool:b"]);
+	});
+
+	test("a run keeps one key while it outgrows the Host's sliding row window", () => {
+		// The Host sends the newest 160 rows, so a long run's first call leaves the window.
+		const window = 160;
+		const user = row("0:0");
+		const transcript = (calls: number) =>
+			[user, ...Array.from({ length: calls }, (_, index) => call(`${index + 1}:1`, `c${index + 1}`, "done"))].slice(
+				-window,
+			);
+		const runs = new TranscriptRuns();
+		const keys = new Set<string>();
+		for (let calls = 150; calls <= 175; calls++) {
+			const messages = transcript(calls);
+			const items = groupTranscript(messages, 100, runs);
+			const run = items.find(item => item.tools)!;
+			keys.add(run.key);
+			// The remembered key still anchors the run's current first row.
+			expect(transcriptAnchorIndex(messages, run.key, runs)).toBe(messages.indexOf(run.messages[0]!));
+		}
+		expect([...keys]).toEqual(["tool:c1"]);
+		// Without the conversation's run memory the key moves with the window.
+		expect(groupTranscript(transcript(175), 100).find(item => item.tools)?.key).toBe("tool:c16");
+	});
+
+	test("a remembered run key goes to one entry only when its run splits", () => {
+		const runs = new TranscriptRuns();
+		const first = [row("0:1"), call("1:2", "a", "done"), call("2:3", "b", "done"), call("3:4", "c", "done")];
+		expect(groupTranscript(first, 100, runs).map(item => item.key)).toEqual(["0:1", "tool:a"]);
+		// The window slid past "a", and a notice now sits between "b" and "c".
+		const notice: DesktopMessage = { id: "notice", role: "system", text: "Model changed" };
+		const split = [call("2:3", "b", "done"), notice, call("3:4", "c", "done")];
+		expect(shape(groupTranscript(split, 100, runs))).toEqual([
+			["tool:a", true, ["2:3"]],
+			["notice", false, ["notice"]],
+			["tool:c", true, ["3:4"]],
+		]);
+		// A remembered key never takes another entry's own key.
+		const runs2 = new TranscriptRuns();
+		groupTranscript([call("1:2", "a", "done"), call("2:3", "b", "done")], 100, runs2);
+		const reordered = [call("2:3", "b", "done"), notice, call("1:2", "a", "done")];
+		const items = groupTranscript(reordered, 100, runs2);
+		expect(items.map(item => item.key)).toEqual(["tool:b", "notice", "tool:a"]);
+		expect(new Set(items.map(item => item.key)).size).toBe(items.length);
 	});
 
 	test("a run that starts before the rendered tail is included whole", () => {

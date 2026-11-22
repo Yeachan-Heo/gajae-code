@@ -35,7 +35,7 @@ declare global {
 	}
 }
 
-/** The transcript map App renders (grouped entries in `data-transcript-message` wrappers) with a counting detail loader. */
+/** The transcript map App renders (grouped entries in `data-transcript-message` wrappers, keyed through the same run memory) with a counting detail loader. */
 async function fixture(initial: DesktopMessage[]): Promise<{ context: BrowserContext; page: Page }> {
 	const { context, page } = await componentFixture(browser, origin);
 	try {
@@ -45,7 +45,7 @@ async function fixture(initial: DesktopMessage[]): Promise<{ context: BrowserCon
 				import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
 				import { Message } from '/src/components.tsx';
 				import { ToolDetailContext } from '/src/ToolCallCard.tsx';
-				import { groupTranscript, ToolRun } from '/src/transcript-groups.tsx';
+				import { groupTranscript, ToolRun, useTranscriptRuns } from '/src/transcript-groups.tsx';
 				const h = React.createElement;
 				const loads = [];
 				const source = { load: async callId => { loads.push(callId); return { callId, command: 'command ' + loads.length }; } };
@@ -53,8 +53,9 @@ async function fixture(initial: DesktopMessage[]): Promise<{ context: BrowserCon
 				function Fixture() {
 					const [messages, setMessages] = React.useState(${JSON.stringify(initial)});
 					update = setMessages;
+					const runs = useTranscriptRuns('fixture', 1);
 					return h(ToolDetailContext.Provider, { value: source }, h('div', { className: 'conversation' },
-						groupTranscript(messages, 100).map(item => h('div', { key: item.key, 'data-transcript-message': item.key, style: { display: 'contents' } },
+						groupTranscript(messages, 100, runs).map(item => h('div', { key: item.key, 'data-transcript-message': item.key, style: { display: 'contents' } },
 							item.tools
 								? h(ToolRun, { item, renderMessage: message => h(Message, { message }) })
 								: item.messages.map(message => h(Message, { key: message.id, message }))))));
@@ -112,6 +113,34 @@ suite("tool cards and runs in a mounted transcript", () => {
 			expect(await page.$eval(".tool-run-items", node => (node as HTMLElement).hidden)).toBe(false);
 			expect(await page.$eval('[data-tool-status="done"]', node => (node as HTMLElement).dataset.fixtureTag)).toBe("kept");
 			expect(await page.$$eval("[data-transcript-message]", nodes => nodes.map(node => (node as HTMLElement).dataset.transcriptMessage))).toEqual(["tool:a"]);
+		} finally { await closeComponentFixture(context, page); }
+	}, 30000);
+
+	test("an opened group longer than the Host's row window stays open and mounted as new calls slide the window", async () => {
+		// The Host sends its newest 160 rows; past that, every new call drops the run's first call.
+		const window = (calls: number) => [
+			{ id: "0:0", role: "user" as const, text: "go" },
+			...Array.from({ length: calls }, (_, index) => call(`${index + 1}:1`, `c${index + 1}`, "done")),
+		].slice(-160);
+		const { context, page } = await fixture(window(150));
+		try {
+			await page.click(".tool-group-summary");
+			// Expand the newest card, which stays in the window, and mark its element.
+			await page.$$eval(".tool-call", nodes => {
+				const newest = nodes.at(-1) as HTMLElement;
+				newest.dataset.fixtureCard = "opened";
+				newest.querySelector("summary")?.click();
+			});
+			await tag(page, ".tool-run");
+			for (const calls of [160, 161, 168, 175]) await set(page, window(calls));
+			await page.waitForFunction(() => document.querySelectorAll(".tool-call").length === 160);
+			expect(await page.$eval(".tool-run", node => [
+				(node as HTMLElement).dataset.fixtureTag,
+				node.querySelector(".tool-group-summary")?.getAttribute("aria-expanded"),
+				node.parentElement?.dataset.transcriptMessage,
+			])).toEqual(["kept", "true", "tool:c1"]);
+			// The card the reader expanded is the same element and still open.
+			expect(await page.$eval('[data-fixture-card="opened"] details', node => (node as HTMLDetailsElement).open)).toBe(true);
 		} finally { await closeComponentFixture(context, page); }
 	}, 30000);
 

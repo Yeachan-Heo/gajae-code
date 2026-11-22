@@ -11,7 +11,8 @@ export interface TranscriptItem {
 	/**
 	 * Stable identity for the React key and the `data-transcript-message` scroll anchor: the key
 	 * of the entry's first message, which is `tool:<callId>` for a call whose id is unique in the
-	 * transcript, otherwise the message id.
+	 * transcript, otherwise the message id. A tool run keeps the key it was first shown with while
+	 * any of its members is still in the window (see `TranscriptRuns`).
 	 */
 	key: string;
 	/** The entry's messages in transcript order. */
@@ -51,37 +52,124 @@ function reasoningOnly(message: DesktopMessage): boolean {
 }
 
 /**
- * Entries for the newest `limit` messages. Entries and keys are computed over the whole
- * transcript, so an entry's key never depends on how much history is rendered; a tool run that
- * starts before the cut is included whole, which keeps its key and its first message together.
+ * The tool runs one conversation view has shown, by member key. The Host sends only its newest
+ * rows, so once a run is longer than that window its first call leaves on every new call, and a
+ * key taken from the first member would remount the group (losing its open state, expanded cards
+ * and loaded details). A run that still holds a member of a remembered run keeps that run's key
+ * instead. Only the latest grouping is remembered, so the memory stays the window's size.
  */
-export function groupTranscript(messages: readonly DesktopMessage[], limit: number): TranscriptItem[] {
-	const keys = transcriptKeys(messages);
-	const cut = messages.length - Math.min(messages.length, Math.max(0, limit));
-	const items: TranscriptItem[] = [];
+export class TranscriptRuns {
+	#keys = new Map<string, string>();
+	/** The run key a member belonged to in the latest grouping. */
+	get(memberKey: string): string | undefined {
+		return this.#keys.get(memberKey);
+	}
+	/** Replace the memory with this grouping's runs. */
+	remember(spans: readonly Span[], keys: readonly string[]): void {
+		const next = new Map<string, string>();
+		for (const span of spans)
+			if (span.tools) for (let i = span.start; i <= span.end; i++) next.set(keys[i]!, span.key);
+		this.#keys = next;
+	}
+}
+
+interface Span {
+	start: number;
+	end: number;
+	key: string;
+	tools: boolean;
+}
+
+/**
+ * Entries over the whole list. A run takes the remembered key of its earliest member that has
+ * one, unless an earlier entry already took it or it is another entry's own key, so keys stay
+ * unique when a run splits or the list is rearranged; otherwise it takes its first member's key.
+ */
+function spans(messages: readonly DesktopMessage[], keys: readonly string[], runs?: TranscriptRuns): Span[] {
+	const result: Span[] = [];
 	for (let start = 0; start < messages.length; ) {
 		let end = start;
-		if (groupable(messages[start]!)) {
+		const tools = groupable(messages[start]!);
+		if (tools) {
 			for (let next = start + 1; next < messages.length; next++) {
 				if (groupable(messages[next]!)) end = next;
 				else if (!reasoningOnly(messages[next]!)) break;
 			}
 		}
-		if (end >= cut)
-			items.push({
-				key: keys[start]!,
-				messages: messages.slice(start, end + 1),
-				memberKeys: keys.slice(start, end + 1),
-				tools: groupable(messages[start]!),
-			});
+		result.push({ start, end, key: keys[start]!, tools });
 		start = end + 1;
 	}
-	return items;
+	if (!runs) return result;
+	const own = new Set(result.map(span => span.key));
+	const taken = new Set<string>();
+	for (const span of result) {
+		if (span.tools)
+			for (let i = span.start; i <= span.end; i++) {
+				const remembered = runs.get(keys[i]!);
+				if (remembered && !taken.has(remembered) && (remembered === span.key || !own.has(remembered))) {
+					span.key = remembered;
+					break;
+				}
+			}
+		taken.add(span.key);
+	}
+	return result;
 }
 
-/** Index in `messages` of the first message of the entry whose key is `key`, or -1. */
-export function transcriptAnchorIndex(messages: readonly DesktopMessage[], key: string): number {
-	return transcriptKeys(messages).indexOf(key);
+/**
+ * Entries for the newest `limit` messages. Entries and keys are computed over the whole
+ * transcript, so an entry's key never depends on how much history is rendered; a tool run that
+ * starts before the cut is included whole, which keeps its key and its first message together.
+ * With the conversation's `runs`, a run keeps its key as the Host's window slides, and the
+ * grouping is remembered for the next call; calling it again with the same messages gives the
+ * same keys, so a repeated render is harmless.
+ */
+export function groupTranscript(
+	messages: readonly DesktopMessage[],
+	limit: number,
+	runs?: TranscriptRuns,
+): TranscriptItem[] {
+	const keys = transcriptKeys(messages);
+	const all = spans(messages, keys, runs);
+	runs?.remember(all, keys);
+	const cut = messages.length - Math.min(messages.length, Math.max(0, limit));
+	return all
+		.filter(span => span.end >= cut)
+		.map(span => ({
+			key: span.key,
+			messages: messages.slice(span.start, span.end + 1),
+			memberKeys: keys.slice(span.start, span.end + 1),
+			tools: span.tools,
+		}));
+}
+
+/**
+ * Index in `messages` of the first message of the entry whose key is `key`, or -1. Pass the same
+ * `runs` as `groupTranscript`, so a run's remembered key resolves to its current first message.
+ */
+export function transcriptAnchorIndex(messages: readonly DesktopMessage[], key: string, runs?: TranscriptRuns): number {
+	const keys = transcriptKeys(messages);
+	return spans(messages, keys, runs).find(span => span.key === key)?.start ?? keys.indexOf(key);
+}
+
+/** Conversation views whose run memory is kept; an older one starts again from first members. */
+const RUN_MEMORY_LIMIT = 32;
+
+/**
+ * The run memory for one conversation view, by conversation and control generation. A new
+ * generation remounts the transcript anyway, so it starts with an empty memory.
+ */
+export function useTranscriptRuns(sessionId: string, generation: number | null): TranscriptRuns {
+	const views = useRef(new Map<string, TranscriptRuns>());
+	const id = `${sessionId}:${generation}`;
+	const runs = views.current.get(id) ?? new TranscriptRuns();
+	views.current.delete(id);
+	views.current.set(id, runs);
+	for (const oldest of views.current.keys()) {
+		if (views.current.size <= RUN_MEMORY_LIMIT) break;
+		views.current.delete(oldest);
+	}
+	return runs;
 }
 
 const KINDS: Record<DesktopToolFamily, { one: MessageKey; many: MessageKey }> = {

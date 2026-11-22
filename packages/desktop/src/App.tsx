@@ -141,7 +141,7 @@ import {
 	writeFontSizePreference,
 	writeThemePreference,
 } from "./themes";
-import { groupTranscript, TranscriptEntry, transcriptAnchorIndex } from "./transcript-groups";
+import { groupTranscript, TranscriptEntry, transcriptAnchorIndex, useTranscriptRuns } from "./transcript-groups";
 import { UpdatesNotification, UpdatesPanel, useDesktopUpdates } from "./UpdatesPanel";
 import "./styles.css";
 
@@ -696,9 +696,10 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const session = snapshot?.sessions.find(item => item.id === selected);
 	const rememberedTranscript = transcriptPositions.current.get(selected);
+	const transcriptRuns = useTranscriptRuns(selected, session?.controlGeneration ?? null);
 	const anchorIndex =
 		rememberedTranscript?.anchor && session
-			? transcriptAnchorIndex(session.messages, rememberedTranscript.anchor.id)
+			? transcriptAnchorIndex(session.messages, rememberedTranscript.anchor.id, transcriptRuns)
 			: -1;
 	// Appending a streamed message must not push the reader's anchor out of the rendered tail.
 	const historyLimit = Math.max(
@@ -2819,7 +2820,7 @@ export default function App() {
 										) : (
 											<div className="empty">{t("shell.emptyConversation")}</div>
 										))}
-									{groupTranscript(session.messages, historyLimit).map(item => (
+									{groupTranscript(session.messages, historyLimit, transcriptRuns).map(item => (
 										<div
 											key={`${session.id}:${session.controlGeneration}:${item.key}`}
 											data-transcript-message={item.key}
