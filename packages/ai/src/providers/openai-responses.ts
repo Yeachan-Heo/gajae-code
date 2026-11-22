@@ -656,7 +656,8 @@ function getOpenAIResponsesCacheSessionId(
 	return normalizeOpenAIResponsesPromptCacheKey(options?.sessionId);
 }
 
-function buildParams(
+/** @internal Exported for tests. */
+export function buildParams(
 	model: Model<"openai-responses">,
 	context: Context,
 	options: OpenAIResponsesOptions | undefined,
