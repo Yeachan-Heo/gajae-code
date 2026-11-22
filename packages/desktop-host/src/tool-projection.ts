@@ -48,21 +48,25 @@ function secretEndAtStart(text: string, secret: string): number {
 }
 
 /**
- * Already-redacted text of a value that is still growing, with any part of a known secret at its
- * edges withheld: at its end, text that could be the start of a secret whose rest has not arrived
- * (a streamed argument, a running command's newest output); with `start`, text at its beginning
- * that could be the end of one (the SDK keeps only a command's newest output, so that tail can
- * begin inside a secret). It reads the redacted text, so a whole secret is already masked and is
- * never cut into a visible prefix. Unlike the assistant-text stream redactor it needs no fixed
- * hold-back: each frame projects the whole value again, so only an actual partial match is held.
+ * Already-redacted text with any part of a known secret at the named edges withheld: with `end`,
+ * text that could be the start of a secret whose rest has not arrived (a streamed argument, a
+ * running command's newest output); with `start`, text at its beginning that could be the end of
+ * one (the SDK keeps only a command's newest output, so that tail can begin inside a secret). It
+ * reads the redacted text, so a whole secret is already masked and is never cut into a visible
+ * prefix. Unlike the assistant-text stream redactor it needs no fixed hold-back: each frame
+ * projects the whole value again, so only an actual partial match is held.
  */
-export function withholdPartialSecrets(text: string, secrets: Iterable<string>, start = false): string {
+export function withholdPartialSecrets(
+	text: string,
+	secrets: Iterable<string>,
+	edges: { start?: boolean; end?: boolean } = { end: true },
+): string {
 	let head = 0;
 	let tail = 0;
 	for (const secret of secrets) {
 		if (secret.length < 2) continue;
-		tail = Math.max(tail, secretStartAtEnd(text, secret));
-		if (start) head = Math.max(head, secretEndAtStart(text, secret));
+		if (edges.end) tail = Math.max(tail, secretStartAtEnd(text, secret));
+		if (edges.start) head = Math.max(head, secretEndAtStart(text, secret));
 	}
 	return head + tail >= text.length ? "" : text.slice(head, text.length - tail);
 }
@@ -422,6 +426,8 @@ export function projectToolCall(
 interface LiveCall {
 	/** `tool_execution_start` was seen; `pendingToolCalls` alone misses the gap after its end. */
 	started: boolean;
+	/** `tool_execution_end` was seen: the output is complete, though the result is not appended yet. */
+	ended?: boolean;
 	/** Latest streamed output text, unredacted and uncut until it is projected. */
 	tail?: string;
 }
@@ -449,7 +455,9 @@ export function observeToolEvent(session: Session, event: { readonly type: strin
 			return;
 		}
 		if (
-			(event.type !== "tool_execution_start" && event.type !== "tool_execution_update") ||
+			(event.type !== "tool_execution_start" &&
+				event.type !== "tool_execution_update" &&
+				event.type !== "tool_execution_end") ||
 			typeof value.toolCallId !== "string"
 		)
 			return;
@@ -457,6 +465,7 @@ export function observeToolEvent(session: Session, event: { readonly type: strin
 		liveCalls.set(session, calls);
 		const call = calls.get(value.toolCallId) ?? { started: false };
 		call.started = true;
+		if (event.type !== "tool_execution_update") call.ended = event.type === "tool_execution_end";
 		if (event.type === "tool_execution_update") {
 			// Bash also sends content-less updates (a terminal id, an input prompt); they keep the tail.
 			const text = resultText(record(value.partialResult) ?? {});
@@ -512,7 +521,7 @@ export function projectLiveToolCalls(
 				: running.has(call.id) || live?.started
 					? "running"
 					: "waiting";
-			const tail = status === "running" ? liveTail(live?.tail, redact, secrets) : undefined;
+			const tail = status === "running" ? liveTail(live?.tail, redact, secrets, live?.ended !== true) : undefined;
 			const tool = projectToolCall(
 				{ callId: call.id, toolName: call.name, call, status, detail: true },
 				redact,
@@ -543,12 +552,15 @@ function liveTail(
 	text: string | undefined,
 	redact: (text: string) => string,
 	secrets: Iterable<string>,
+	arriving: boolean,
 ): { text: string; truncated: boolean } | undefined {
 	if (!text || text.length > MAX_REDACTION_CHARS) return undefined;
 	const redacted = redact(text);
 	if (redacted.length > MAX_REDACTION_CHARS) return undefined;
-	// Output is still arriving at its end, and the SDK may have cut its start.
-	const safe = withholdPartialSecrets(redacted, secrets, true);
+	// Output may still be arriving at its end until execution ends. Its start stays withheld even
+	// then: the SDK's partial result (tail text plus tool details) never says whether its tail
+	// buffer dropped the beginning, so a cut start cannot be told from a whole one.
+	const safe = withholdPartialSecrets(redacted, secrets, { start: true, end: arriving });
 	return { text: safe.slice(-LIVE_TAIL_LIMIT), truncated: safe.length > LIVE_TAIL_LIMIT };
 }
 

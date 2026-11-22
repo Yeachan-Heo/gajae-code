@@ -424,11 +424,54 @@ describe("live tool rows", () => {
 			expect(tail("key is sk-live-ABCDEFGHIJKLMNOP done\nnext")).toBe("key is [redacted] done\nnext");
 		});
 
+		test("once the command has finished, its tail's end is shown in full; a settled row never withholds", () => {
+			const session = fakeSession([
+				{ role: "user", content: "go" },
+				assistantCalls(["a", "bash", { command: "count" }]),
+			]);
+			const event = (event: Record<string, unknown>) =>
+				observeToolEvent(session, { toolCallId: "a", ...event } as unknown as { type: string });
+			const shown = () => projectLiveToolCalls(session, undefined, redact, secrets)[0];
+			event({ type: "tool_execution_start" });
+			event({
+				type: "tool_execution_update",
+				partialResult: { content: [{ type: "text", text: "progress: 10 items" }] },
+			});
+			// While output can still arrive, a trailing "s" could be the start of the key.
+			expect(shown()?.text).toBe("progress: 10 item");
+			event({ type: "tool_execution_end" });
+			// The row stays running until its result is appended, but its output is complete.
+			expect(shown()?.tool?.status).toBe("running");
+			expect(shown()?.text).toBe("progress: 10 items");
+			const settled = projectMessages(
+				[
+					assistantCalls(["a", "bash", { command: "count" }]),
+					{ role: "toolResult", toolCallId: "a", toolName: "bash", content: "progress: 10 items" },
+				],
+				redact,
+				500_000,
+				{ ...live, secrets },
+			);
+			expect(settled.at(-1)?.text).toBe("progress: 10 items");
+		});
+
 		test("a tail the SDK cut inside a secret drops the secret's remaining end", () => {
 			const tail = running();
 			const shown = tail("IJKLMNOP and the rest\nnext line");
 			expect(shown).toBe(" and the rest\nnext line");
 			expect(shown).not.toContain("MNOP");
+			// Finishing does not reveal it: the SDK's partial result never says whether the start was cut.
+			const session = fakeSession([
+				{ role: "user", content: "go" },
+				assistantCalls(["a", "bash", { command: "print-key" }]),
+			]);
+			for (const type of ["tool_execution_start", "tool_execution_update", "tool_execution_end"])
+				observeToolEvent(session, {
+					type,
+					toolCallId: "a",
+					partialResult: { content: [{ type: "text", text: "IJKLMNOP and the rest" }] },
+				} as { type: string });
+			expect(projectLiveToolCalls(session, undefined, redact, secrets)[0]?.text).toBe(" and the rest");
 		});
 
 		test("hold-back reads the redacted tail, so a whole secret is never cut into a visible prefix", () => {
