@@ -1008,9 +1008,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-code { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.25rem; justify-items: start; min-width: 0; }
 .provider-code > span { color: var(--muted); font-size: 0.75rem; }
 .provider-code-value { padding: 0.5rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); font-family: var(--mono); font-size: 1.5rem; font-weight: 600; letter-spacing: 0.12em; user-select: all; }
-/* A code is typed character by character, so it never breaks across lines; a block too wide for a
-   narrow window scrolls on its own instead. */
-.provider-code-value { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; white-space: nowrap; }
+/* A code is typed character by character, so it never breaks across lines. In a narrow panel the
+   type shrinks with the panel's width (10cqi keeps a usual 9-character code whole in the dialog of a
+   390px window at the largest text size); a longer code scrolls inside its own block. */
+.provider-code-value { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; white-space: nowrap; font-size: min(1.5rem, 10cqi); }
 .provider-browser { display: grid; gap: 0.5rem; justify-items: start; min-width: 0; }
 .provider-url { max-width: 100%; color: var(--muted); font-family: var(--mono); font-size: 0.75rem; overflow-wrap: anywhere; word-break: break-all; }
 .provider-warning { display: grid; gap: 0.625rem; min-width: 0; padding: 0.75rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }

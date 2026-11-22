@@ -502,7 +502,7 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
-	test("a device code stays on one line and scrolls inside its own block instead of widening the dialog", async () => {
+	test("a device code stays on one line, fits a narrow window whole and scrolls only when longer", async () => {
 		const { context, page } = await fixture(390, { height: 844, dialog: true });
 		try {
 			await select(page, "beta");
@@ -516,9 +516,14 @@ suite("Providers panel interactions", () => {
 						lines: new Set([...range.getClientRects()].map(rect => Math.round(rect.top))).size,
 						inside: code.getBoundingClientRect().right <= panel.getBoundingClientRect().right + 0.5,
 						panelOverflow: panel.scrollWidth - panel.clientWidth,
+						scrolls: code.scrollWidth > code.clientWidth,
 					};
 				});
-			for (const code of ["WDJB-MJHT", "WDJB-MJHT-KQPX-ZRTV-LMNB"]) {
+			// A usual device code is shown whole; a longer one scrolls inside its block, never widening the dialog.
+			for (const [code, scrolls] of [
+				["WDJB-MJHT", false],
+				["WDJB-MJHT-KQPX-ZRTV-LMNB", true],
+			] as const) {
 				await set(page, {
 					flow: flow({ status: "waiting", url: "https://sign-in.example.invalid/device", verificationCode: code }),
 				});
@@ -535,6 +540,7 @@ suite("Providers panel interactions", () => {
 						lines: 1,
 						inside: true,
 						panelOverflow: 0,
+						scrolls,
 					});
 				}
 			}
