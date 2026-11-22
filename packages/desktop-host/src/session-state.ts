@@ -8,6 +8,8 @@ const MAX_PHASES = 24;
 const MAX_TASKS = 120;
 const MAX_TEXT = 300;
 const MAX_SOURCE_TEXT = 8 * 1024 * 1024;
+/** Notes kept per task: the newest ones, since notes are append-only and the latest says the most. */
+const MAX_NOTES = 5;
 
 function text(value: unknown, redact: (value: string) => string): string {
 	if (typeof value !== "string" || value.length > MAX_SOURCE_TEXT) return "";
@@ -16,8 +18,23 @@ function text(value: unknown, redact: (value: string) => string): string {
 }
 
 /**
+ * A task's newest notes in the order they were written. `todo_write` never validates its notes
+ * array, so non-string and empty entries are skipped rather than shown.
+ */
+function notes(value: unknown, redact: (value: string) => string): string[] {
+	if (!Array.isArray(value)) return [];
+	const projected: string[] = [];
+	for (let index = value.length - 1; index >= 0 && projected.length < MAX_NOTES; index--) {
+		const note = text(value[index], redact);
+		if (note.trim()) projected.push(note);
+	}
+	return projected.reverse();
+}
+
+/**
  * Live `todo_write` state, so the desktop can show the checklist the tool maintains.
- * Returns no property at all when the list is empty, so the frame stays small.
+ * Returns no property at all when the list is empty, so the frame stays small. Each task keeps
+ * at most its newest `MAX_NOTES` notes, each redacted whole before it is cut like task text.
  */
 export function projectTodos(
 	session?: Pick<Session, "getTodoPhases">,
@@ -41,14 +58,15 @@ export function projectTodos(
 		for (const task of tasks) {
 			if (remaining <= 0) break;
 			if (!task || typeof task !== "object") continue;
-			const item = task as { content?: unknown; status?: unknown };
+			const item = task as { content?: unknown; status?: unknown; notes?: unknown };
 			const content = text(item.content, redact);
 			if (!content) continue;
 			const status =
 				item.status === "completed" || item.status === "in_progress" || item.status === "abandoned"
 					? item.status
 					: "pending";
-			items.push({ content, status });
+			const taskNotes = notes(item.notes, redact);
+			items.push(taskNotes.length > 0 ? { content, status, notes: taskNotes } : { content, status });
 			remaining--;
 		}
 		if (items.length > 0) projected.push({ name: text(record.name, redact), tasks: items });
