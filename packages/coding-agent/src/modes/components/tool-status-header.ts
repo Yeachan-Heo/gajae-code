@@ -239,7 +239,6 @@ export class StatusLineComponent implements Component {
 	#prLookupInFlight = false;
 	#defaultBranch?: string;
 	#lastTokensPerSecond: number | null = null;
-	#lastTokensPerSecondTimestamp: number | null = null;
 
 	// Provider usage caching (5-min TTL, OAuth/sub only)
 	#cachedUsage: SegmentContext["usage"] = null;
@@ -662,33 +661,18 @@ export class StatusLineComponent implements Component {
 	}
 
 	#getTokensPerSecond(): number | null {
-		let lastAssistantTimestamp: number | null = null;
-		for (let i = this.session.state.messages.length - 1; i >= 0; i--) {
-			const message = this.session.state.messages[i];
-			if (message?.role === "assistant") {
-				lastAssistantTimestamp = message.timestamp;
-				break;
-			}
-		}
-
-		if (lastAssistantTimestamp === null) {
+		const hasAssistant = this.session.state.messages.some(message => message?.role === "assistant");
+		if (!hasAssistant) {
 			this.#lastTokensPerSecond = null;
-			this.#lastTokensPerSecondTimestamp = null;
 			return null;
 		}
 
+		// Hold the last measured rate across turns: a new assistant message has no
+		// measurable rate until output tokens and a generation window exist, and
+		// dropping to null there makes the segment flicker in and out.
 		const rate = calculateTokensPerSecond(this.session.state.messages, this.session.isStreaming);
-		if (rate !== null) {
-			this.#lastTokensPerSecond = rate;
-			this.#lastTokensPerSecondTimestamp = lastAssistantTimestamp;
-			return rate;
-		}
-
-		if (this.#lastTokensPerSecondTimestamp === lastAssistantTimestamp) {
-			return this.#lastTokensPerSecond;
-		}
-
-		return null;
+		if (rate !== null) this.#lastTokensPerSecond = rate;
+		return this.#lastTokensPerSecond;
 	}
 
 	#refreshSkillHudInBackground(): void {
