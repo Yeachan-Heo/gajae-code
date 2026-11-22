@@ -1242,11 +1242,37 @@ export class DesktopHost {
 			throw error;
 		}
 	}
+	/** Only a successful inventory that no longer lists the transcript proves it is gone. */
+	async #discoveredTranscriptGone(metadata: SavedSession): Promise<boolean> {
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+		if (!project || this.#managedOpening.has(metadata.id)) return false;
+		try {
+			const { managed, local } = await listEmbeddedProjectSessions({
+				cwd: project.path,
+				agentDir: this.agentDir,
+				directory: path.join(this.dataDir, "sessions", project.id),
+			});
+			return ![...managed, ...local].some(session => session.id === metadata.id);
+		} catch {
+			return false;
+		}
+	}
+	/** Detach any stale SDK attachment, then forget the reference; its transcript is already gone. */
+	async #forgetDiscovered(metadata: SavedSession): Promise<null> {
+		const attachment = this.#managed.get(metadata.id);
+		if (attachment) {
+			this.#managed.delete(metadata.id);
+			await attachment.close();
+		}
+		// An inventory can come back empty without failing, so absence is not proof enough to
+		// release the identity: a transcript that is truly gone never lists again anyway.
+		return this.#forgetMissingSession(metadata, false);
+	}
 	/** Remove the unowned catalog reference durably, then clean SDK-owned sidecars/artifacts. */
-	async #forgetMissingSession(metadata: SavedSession): Promise<null> {
+	async #forgetMissingSession(metadata: SavedSession, release = true): Promise<null> {
 		const index = this.#catalog.sessions.indexOf(metadata);
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
-		const restoreReleased = this.#release(metadata);
+		const restoreReleased = release ? this.#release(metadata) : () => {};
 		try {
 			await this.#save();
 		} catch (error) {
@@ -2562,7 +2588,14 @@ export class DesktopHost {
 		if (method === "message.copyText") return this.#copyText(request);
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
-			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
+			if (metadata?.managed) {
+				// The terminal may already have deleted a discovered conversation's transcript. That
+				// row can never open again, so deleting it only forgets the reference. A transcript
+				// the SDK still lists stays under its own control surface.
+				if (method === "session.delete" && (await this.#discoveredTranscriptGone(metadata)))
+					return this.#forgetDiscovered(metadata);
+				return this.#dispatchManaged(request, this.#metadata(params));
+			}
 		}
 		if (method === "auth.providers") {
 			const names = new Map(getOAuthProviders().map(provider => [provider.id, provider.name]));

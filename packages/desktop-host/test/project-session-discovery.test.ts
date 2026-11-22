@@ -452,6 +452,44 @@ test("late discovery preserves explicit desktop session order across refresh and
 	expect(await Bun.file(older.file).text()).toBe(older.bytes);
 });
 
+test("a discovered conversation whose transcript the terminal deleted can be removed", async () => {
+	const h = await fixture();
+	const terminal = await h.persist("Deleted in the terminal");
+	await h.call("project.open", { path: h.projectDir });
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
+	// The terminal removes its own transcript through the SDK.
+	await sdk.deleteEmbeddedSession(terminal.file, { managed: true });
+	// Without a successful inventory there is no proof the transcript is gone: still refused.
+	const listing = vi
+		.spyOn(sdk, "listEmbeddedProjectSessions")
+		.mockRejectedValueOnce(new Error("Fixture inventory unavailable"));
+	await expect(h.call("session.delete", { sessionId: terminal.id })).rejects.toThrow(
+		"does not support desktop session.delete",
+	);
+	expect(listing).toHaveBeenCalledTimes(1);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
+	await h.call("session.delete", { sessionId: terminal.id });
+	expect(h.snapshot().sessions).toEqual([]);
+	await h.call("bootstrap");
+	expect(h.snapshot().sessions).toEqual([]);
+	await h.restart();
+	expect(h.snapshot().sessions).toEqual([]);
+	expect(h.created).toHaveLength(0);
+});
+
+test("an inventory that comes back empty cannot remove a terminal conversation for good", async () => {
+	const h = await fixture();
+	const terminal = await h.persist("Still in the terminal");
+	await h.call("project.open", { path: h.projectDir });
+	vi.spyOn(sdk, "listEmbeddedProjectSessions").mockResolvedValueOnce({ managed: [], local: [] });
+	await h.call("session.delete", { sessionId: terminal.id });
+	expect(h.snapshot().sessions).toEqual([]);
+	// Its identity was not released, so the next refresh lists the existing transcript again.
+	await h.call("bootstrap");
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
+	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+});
+
 test("uses SDK ownership admission rather than a local transcript writer when selecting a discovered session", async () => {
 	const h = await fixture();
 	const terminal = await h.persist("Still owned by terminal", h.projectDir, true);
