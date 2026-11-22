@@ -1255,7 +1255,12 @@ test("the printed tool demonstrations run as documented against the real Host", 
 	expect(slow.elapsed).toBeGreaterThanOrEqual(3500);
 	const midway = await probe;
 	expect(midway.status).toBe("running");
-	expect(midway.messages.some(message => message.role === "tool" && message.toolName === "bash")).toBe(false);
+	// Two seconds in, the call has no result yet: its row is the live one, still running.
+	expect(
+		midway.messages
+			.filter(message => message.role === "tool" && message.toolName === "bash")
+			.map(row => row.tool?.status),
+	).toEqual(["running"]);
 
 	const edited = await run(QA_DEMONSTRATIONS.edit.prompt);
 	expect(edited.rows).toEqual(["edit"]);

@@ -375,11 +375,11 @@ function ShowcaseToolCallRows() {
 			<h2>{t("tools.showcaseCallsHeading")}</h2>
 			<p className="muted">{t("tools.showcaseCallsNote")}</p>
 			{callFixtures().map(message => (
-				<div key={message.id} id={`showcase-tool-${message.tool!.callId.replace("showcase-", "")}`}>
+				<div key={message.id} id={`showcase-tool-call-${message.tool!.callId.replace("showcase-", "")}`}>
 					<ToolCallCard message={message} />
 				</div>
 			))}
-			<div id="showcase-tool-legacy">
+			<div id="showcase-tool-call-legacy">
 				<p className="muted">{t("tools.showcaseLegacyNote")}</p>
 				<ToolCallCard message={{ id: "showcase-legacy", role: "tool", toolName: "read", text: "" }} />
 			</div>
