@@ -112,6 +112,69 @@ suite("Session work visuals", () => {
 		}
 	}, 30000);
 
+	test("tool-row, dialog close, provider Back and toolbar icons grow with the text; nothing moves at the default size", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-todo-chip .session-work-toggle");
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			// A provider detail (for Back), and the native Providers dialog (for its close button).
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("#showcase-providers > .actions button")]
+					.find(button => button.textContent === "Both methods")
+					?.click(),
+			);
+			await page.waitForSelector("#showcase-providers .provider-back");
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("#showcase-providers > .actions button")]
+					.find(button => button.textContent === "Open in a native dialog")
+					?.click(),
+			);
+			await page.waitForSelector("dialog[open] .modal-close");
+			const sizes = (px: number) =>
+				page.evaluate(size => {
+					document.documentElement.style.setProperty("--text-size", `${size}px`);
+					const box = (selector: string) => {
+						const rect = document.querySelector(selector)!.getBoundingClientRect();
+						return `${Math.round(rect.width)}x${Math.round(rect.height)}`;
+					};
+					return {
+						legacyChevron: box("#showcase-tool-call-legacy .tool-disclosure > summary > .disclosure-chevron"),
+						toolbarIcon: box("#showcase-todo-chip .session-work-toggle > svg"),
+						backChevron: box("#showcase-providers .provider-back > svg"),
+						closeIcon: box("dialog[open] .modal-close > svg"),
+						closeButton: box("dialog[open] .modal-close"),
+						// Other users of the shared icon rule, which keep their size.
+						bannerIcon: box("#showcase-feedback .error-banner > svg"),
+						composerIcon: box("#showcase-composers .composer-action > svg"),
+					};
+				}, px);
+			expect(await sizes(14)).toEqual({
+				legacyChevron: "16x16",
+				toolbarIcon: "16x16",
+				backChevron: "16x16",
+				closeIcon: "16x16",
+				closeButton: "34x34",
+				bannerIcon: "16x16",
+				composerIcon: "16x16",
+			});
+			// 1rem and 2.125rem at 20 px text, whose root is 20 / 0.875 = 22.86 px (whole pixels, as layout rounds).
+			expect(await sizes(20)).toEqual({
+				legacyChevron: "23x23",
+				toolbarIcon: "23x23",
+				backChevron: "23x23",
+				closeIcon: "23x23",
+				closeButton: "49x49",
+				bannerIcon: "16x16",
+				composerIcon: "16x16",
+			});
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("the Identity disclosure shows only the app's chevron, turned when open", async () => {
 		const context = await browser.createBrowserContext();
 		try {
