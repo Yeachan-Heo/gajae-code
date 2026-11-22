@@ -1313,6 +1313,15 @@ export class EventController {
 		this.#idleCompactionTimer.unref?.();
 	}
 
+	/** Rearm idle compaction after a live idle setting changes. */
+	refreshIdleCompactionTimer(): void {
+		if (this.ctx.session.isStreaming) {
+			this.#cancelIdleCompaction();
+			return;
+		}
+		this.#scheduleIdleCompaction();
+	}
+
 	#currentContextTokens(): number {
 		const lastAssistant = this.ctx.session.agent.state.messages
 			.slice()

@@ -1455,6 +1455,12 @@ export class SelectorController {
 				this.ctx.ui.setClearOnShrink(value as boolean);
 				break;
 
+			case "compaction.idleEnabled":
+			case "compaction.idleThresholdTokens":
+			case "compaction.idleTimeoutSeconds":
+				this.ctx.eventController.refreshIdleCompactionTimer();
+				break;
+
 			case "autocompleteMaxVisible":
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
 				break;

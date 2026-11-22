@@ -573,6 +573,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#goalModeController;
 	}
 
+	get eventController(): EventController {
+		return this.#eventController;
+	}
+
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
 	#foregroundActivity = false;
