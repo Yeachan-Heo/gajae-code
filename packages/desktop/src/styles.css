@@ -730,6 +730,28 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
    responsive rules. */
 
 /* Section A: tool call cards (ToolCallCard.tsx, transcript-groups.tsx). */
+/* The summary is one call line plus an optional muted intent line. The subject keeps one line and
+   ellipsizes (the full text is its hover title); facts and status wrap below it when narrow. */
+.tool-call .tool-disclosure > summary { flex-wrap: nowrap; align-items: flex-start; }
+.tool-call .tool-disclosure > summary > .disclosure-chevron { margin-top: 2px; }
+.tool-call-head { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.tool-call-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.tool-call-icon { color: var(--muted); }
+.tool-call-verb { flex-shrink: 0; font-weight: 600; }
+.tool-call-verb.tool-name { font-weight: 500; }
+.tool-call-subject { flex: 1 1 8rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 0.8125rem; color: var(--text); }
+.tool-call-meta { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-left: auto; color: var(--muted); font-size: 0.75rem; }
+.tool-call-facts { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tool-fact-added { color: var(--status-done); }
+.tool-fact-removed { color: var(--status-error); }
+.tool-call-status { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.tool-call-status svg { width: 14px; height: 14px; }
+.tool-call-running { color: var(--status-running); }
+.tool-call-waiting { color: var(--status-waiting); }
+.tool-call-status.tool-failure { color: var(--error); }
+.tool-call-intent { color: var(--muted); font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
+/* A failed card keeps its error border and status; its summary text stays readable. */
+.tool-call.message-error { color: var(--text); }
 
 /* Section B: task list (TodoPanel.tsx, TodoToolBody.tsx, SessionWorkProgress.tsx). */
 .todo-progress { display: block; height: 0.25rem; margin-top: 0.25rem; overflow: hidden; border-radius: var(--radius-pill); background: var(--border-soft); }
