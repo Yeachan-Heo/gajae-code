@@ -408,11 +408,14 @@ describe("desktop streaming lifecycle", () => {
 		expect(aborted?.errorOwner).toBeUndefined();
 		expect(aborted?.queued ?? []).toHaveLength(0);
 		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "stopped-run", disposition: "cancelled" }));
+		// Stop kept the queued follow-up from running. It never reached the conversation, so it is
+		// `removed`, which returns its text to the composer; `cancelled` would drop it.
 		expect(state.deliveries).toContainEqual(
-			expect.objectContaining({ id: "followup-delivery", disposition: "cancelled" }),
+			expect.objectContaining({ id: "followup-delivery", disposition: "removed" }),
 		);
 		const history = await call<DesktopHistory>("history.get", { sessionId: session.id });
 		expect(history.messages.map(message => message.text)).toContain("long task");
+		expect(history.messages.map(message => message.text)).not.toContain("second turn");
 		expect(frames.some(frame => frame.type === "session" && frame.session.status === "running")).toBe(true);
 	});
 
@@ -521,6 +524,153 @@ describe("desktop streaming lifecycle", () => {
 		expect(nextPrompt).toBeGreaterThan(-1);
 		expect(delivered).toBeGreaterThan(nextPrompt);
 		expect(sdk.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	/** Every receipt a delivery id passed through, in emission order. */
+	const receiptTrail = (frames: DesktopFrame[], id: string) =>
+		frames.flatMap(frame =>
+			frame.type === "delivery" && frame.receipt.id === id ? [frame.receipt.disposition] : [],
+		);
+
+	test("Stop returns every input still queued to the composer, identical texts included", async () => {
+		const { call, snapshot, session, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-with-queue");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "same", deliverAs: "steer" }, "queued-first");
+		await call("prompt", { sessionId: session.id, text: "same", deliverAs: "steer" }, "queued-second");
+		expect((await snapshot()).sessions[0]?.queued).toHaveLength(2);
+		await call("abort", { sessionId: session.id });
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-with-queue", disposition: "cancelled" }),
+		);
+		for (const id of ["queued-first", "queued-second"]) {
+			expect(state.deliveries).toContainEqual(expect.objectContaining({ id, disposition: "removed" }));
+			// The SDK also reports these as cancelled removals. The app settles a receipt on the first
+			// final frame it sees, so no `cancelled` frame may ever reach it for them.
+			expect(receiptTrail(frames, id)).not.toContain("cancelled");
+		}
+		expect(sdk.messages.filter(message => message.role === "user").map(copyText)).toEqual(["long task"]);
+	});
+
+	test("a steer admitted while Stop is settling the queue is returned as well", async () => {
+		const { call, snapshot, session, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-while-settling");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "queued first", deliverAs: "steer" }, "settled-first");
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			// Hold Stop's own write for the queued input; other journal writes proceed.
+			if (id === "settled-first" && changes.disposition !== "queued" && changes.disposition !== "accepted") {
+				held.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const stopping = call("abort", { sessionId: session.id });
+		await held.promise;
+		// Stop has counted itself and is writing the first input's receipt; this steer still queues.
+		const late = await call<{ queued: boolean }>(
+			"prompt",
+			{ sessionId: session.id, text: "typed during Stop", deliverAs: "steer" },
+			"admitted-during-stop",
+		);
+		expect(late.queued).toBe(true);
+		release.resolve();
+		expect(await stopping).toBeNull();
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		for (const id of ["settled-first", "admitted-during-stop"]) {
+			expect(state.deliveries).toContainEqual(expect.objectContaining({ id, disposition: "removed" }));
+			expect(receiptTrail(frames, id)).not.toContain("cancelled");
+		}
+		expect(sdk.messages.filter(message => message.role === "user").map(copyText)).toEqual(["long task"]);
+	});
+
+	test("pressing Stop twice settles the run once and returns the queued input", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-twice");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "typed next", deliverAs: "steer" }, "queued-before-stops");
+		const first = call("abort", { sessionId: session.id });
+		const second = call("abort", { sessionId: session.id });
+		expect(await Promise.all([first, second])).toEqual([null, null]);
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(control.aborts).toBe(1);
+		expect(sdk.isStreaming).toBe(false);
+		const state = await snapshot();
+		expect(state.sessions[0]?.status).toBe("done");
+		expect(state.sessions[0]?.error).toBeUndefined();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-twice", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "queued-before-stops", disposition: "removed" }),
+		);
+	});
+
+	test("a workspace close right after Stop keeps the Stop's outcomes", async () => {
+		const { call, snapshot, session, project, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-then-closed");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "typed next", deliverAs: "steer" }, "queued-before-close");
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const stopping = call("abort", { sessionId: session.id });
+		// The close starts while the Stop's abort is still unwinding.
+		await stopReached.promise;
+		const closing = call("project.close", { projectId: project.id });
+		expect(await stopping).toBeNull();
+		await closing;
+		expect(await running).toBeNull();
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-then-closed", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "queued-before-close", disposition: "removed" }),
+		);
+		expect(receiptTrail(frames, "queued-before-close")).not.toContain("cancelled");
 	});
 
 	test("invalid prompt reports a definitive refusal before admission", async () => {

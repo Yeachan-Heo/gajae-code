@@ -2733,12 +2733,16 @@ export class DesktopHost {
 			// Count the Stop before releasing anything it interrupts, so their outcomes observe it.
 			live.stopRequests++;
 			this.#cancelQuestions(live);
+			// An input still queued never reached the conversation, so Stop hands it back: `removed`
+			// returns its text to the composer, where `cancelled` would drop it. This write lands
+			// before the SDK's own cancellation report, which the final receipt then ignores.
 			for (const tracked of live.queued.values()) {
-				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
+				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "removed" });
 			}
-			// Stop means stop: the default cause ends the run and leaves anything still queued, including
-			// agent follow-ups, for the next turn. The TUI's `user_interrupt` would resume into them at
-			// once. Outcomes are classified from `stopRequests`, not from the cause.
+			// Stop means stop: the default cause ends the run without starting another. A user steer it
+			// did not take is dropped and reported removed; an agent follow-up stays queued for the next
+			// turn. The TUI's `user_interrupt` would resume into both at once. Outcomes are classified
+			// from `stopRequests`, not from the cause.
 			await live.sdk.abort();
 			this.#publish(live);
 			return null;
