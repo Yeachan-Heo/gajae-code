@@ -19,6 +19,11 @@ async function fuzzyFindNative(): Promise<NativeFuzzyFind> {
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
 const MAX_AUTOCOMPLETE_SUGGESTIONS = 100;
 
+/**
+ * Without a deadline the native walk follows symlinks at unbounded depth and never returns.
+ */
+const AT_FUZZY_TIMEOUT_MS = 1_500;
+
 function isAbsolutePathLike(value: string): boolean {
 	return path.isAbsolute(value) || path.win32.isAbsolute(value);
 }
@@ -33,6 +38,7 @@ function buildAutocompleteFuzzyDiscoveryProfile(
 	hidden: boolean;
 	gitignore: boolean;
 	cache: boolean;
+	timeoutMs: number;
 } {
 	return {
 		query,
@@ -41,6 +47,7 @@ function buildAutocompleteFuzzyDiscoveryProfile(
 		hidden: true,
 		gitignore: true,
 		cache: true,
+		timeoutMs: AT_FUZZY_TIMEOUT_MS,
 	};
 }
 
