@@ -2759,8 +2759,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#selectorController.showFrictionlessOnboarding();
 	}
 
-	showPluginSelector(mode?: "install" | "uninstall"): Promise<void> {
-		return this.#selectorController.showPluginSelector(mode);
+	showPluginSelector(mode?: "install" | "uninstall"): void {
+		void this.#selectorController.showPluginSelector(mode);
 	}
 
 	showUserMessageSelector(): void {

@@ -447,7 +447,7 @@ export interface InteractiveModeContext {
 	showEffortSelector(): void;
 	showProviderOnboarding(): void;
 	showFrictionlessOnboarding(): Promise<void>;
-	showPluginSelector(mode?: "install" | "uninstall"): Promise<void>;
+	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(): void;

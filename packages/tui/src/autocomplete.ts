@@ -28,7 +28,8 @@ function isAbsolutePathLike(value: string): boolean {
 	return path.isAbsolute(value) || path.win32.isAbsolute(value);
 }
 
-function buildAutocompleteFuzzyDiscoveryProfile(
+/** @internal Exported for tests. */
+export function buildAutocompleteFuzzyDiscoveryProfile(
 	query: string,
 	basePath: string,
 ): {
