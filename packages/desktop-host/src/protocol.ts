@@ -23,6 +23,8 @@ export const DESKTOP_METHODS = [
 	"session.compact",
 	"session.retry",
 	"session.export",
+	"session.disconnect",
+	"session.connect",
 	"prompt",
 	"abort",
 	"models.list",
@@ -236,7 +238,29 @@ export interface DesktopSession {
 	/** Last failed prompt turn for this conversation; administrative refusals answer their request instead. */
 	error?: string;
 	errorOwner?: string;
+	/** Whether the app writes this conversation itself. Absent on another surface's SDK-owned rows. */
+	connection?: DesktopSessionConnection;
 }
+
+/**
+ * Who writes a conversation the app created. `connected`: the app opens its own writer when the
+ * conversation is used. `disconnected`: the user released it (`session.disconnect`) so another
+ * surface, such as the terminal, can continue it; it survives restarts, its history is read from
+ * the transcript and nothing can be sent until `session.connect`. `elsewhere`: another gjc
+ * process has it open, so the app shows it read-only; `session.connect` checks again.
+ */
+export interface DesktopSessionConnection {
+	state: "connected" | "disconnected" | "elsewhere";
+}
+
+/**
+ * `session.disconnect` answer. Without `confirm`, a conversation with a running turn or queued
+ * input is left untouched and the answer says what Disconnect would stop. With `confirm: true`
+ * that work is stopped exactly as Stop does before the writer is released.
+ */
+export type DesktopDisconnectResult =
+	| { disconnected: true; session: DesktopSession }
+	| { disconnected: false; confirm: { running: boolean; queued: number } };
 
 export type DesktopForkResult =
 	| { cancelled: true }

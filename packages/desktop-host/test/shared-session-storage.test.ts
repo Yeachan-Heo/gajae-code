@@ -22,6 +22,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
 import {
+	type DesktopDisconnectResult,
 	type DesktopFrame,
 	type DesktopHistory,
 	type DesktopProject,
@@ -148,6 +149,7 @@ interface SharedCatalog {
 		createdAt?: number;
 		view?: SdkSessionView;
 		viewTail?: string | null;
+		disconnected?: true;
 	}>;
 }
 
@@ -155,14 +157,15 @@ async function readCatalog(dataDir: string): Promise<SharedCatalog> {
 	return Bun.file(path.join(dataDir, "catalog.json")).json();
 }
 
-async function controlledFixture(handler?: () => Promise<void>) {
+async function controlledFixture(handler?: (signal?: AbortSignal) => Promise<void>) {
 	process.env.GJC_NO_TITLE = "1";
 	const api = `desktop-exact-view-${crypto.randomUUID()}`;
 	const model = createMockModel({
 		provider: "desktop-exact-view-fixture",
-		handler: async () => {
-			await handler?.();
-			return { content: ["controlled answer"] };
+		handler: async (_context, options) => {
+			await handler?.(options?.signal);
+			// A call stopped while held ends as aborted, as a provider would.
+			return { content: ["controlled answer"], ...(options?.signal?.aborted ? { delayMs: 1 } : {}) };
 		},
 	});
 	Object.defineProperty(model, "api", { value: api });
@@ -767,6 +770,120 @@ test("deleting a conversation removes its delivery receipts, including after a r
 	await h.call("delivery.ack", { deliveryId: receipt!.id });
 	await h.restart();
 	expect(h.snapshot().deliveries.filter(item => item.sessionId === sessionId)).toEqual([]);
+});
+
+/** Holds the next provider call until released or stopped. */
+function heldTurn() {
+	let hold = false;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const handler = async (signal?: AbortSignal) => {
+		if (!hold) return;
+		hold = false;
+		entered.resolve();
+		const stopped = Promise.withResolvers<void>();
+		signal?.addEventListener("abort", () => stopped.resolve(), { once: true });
+		await Promise.race([release.promise, stopped.promise]);
+	};
+	return { arm: () => (hold = true), entered: entered.promise, release: () => release.resolve(), handler };
+}
+
+test("Disconnect releases the app's writer without deleting; Connect reopens at the terminal's tail", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const file = live.sessionFile!;
+	const result = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
+	expect(result.disconnected).toBe(true);
+	expect(result.disconnected && result.session.connection).toEqual({ state: "disconnected" });
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	expect(await Bun.file(file).exists()).toBe(true);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([sessionId]);
+	// History comes from the transcript; no read opens a writer.
+	const opened = h.created.length;
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	expect(selected.controlGeneration).toBeNull();
+	const page = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(page.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	await h.call("activity.get", { sessionId });
+	await h.call("settings.get", { sessionId });
+	expect(h.created).toHaveLength(opened);
+	// A prompt is refused before anything reaches the provider; its text returns to the composer.
+	const calls = h.model.calls.length;
+	await expect(h.call("prompt", { sessionId, text: "while disconnected" })).rejects.toThrow("Connect");
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	await expect(h.call("session.rename", { sessionId, title: "renamed" })).rejects.toThrow("Connect");
+	expect(h.model.calls).toHaveLength(calls);
+	// The terminal continues; selecting again shows its turns, still read-only.
+	const { tail } = await continueInTerminal(file, h.projectDir, h.agentDir, h.track);
+	const reread = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(reread.messages.map(message => message.text)).toEqual([...sideBySide]);
+	expect(h.created).toHaveLength(opened);
+	// Connect reopens through the normal path, at the terminal's tail.
+	const connected = await h.call<DesktopSession>("session.connect", { sessionId });
+	expect(connected.connection).toEqual({ state: "connected" });
+	expect(h.created).toHaveLength(opened + 1);
+	expect(captureSessionView(h.sdk()).leafEntryId).toBe(tail);
+	await h.call("prompt", { sessionId, text: "back in the app" });
+	expect(h.model.calls).toHaveLength(calls + 1);
+	expect(
+		h
+			.sdk()
+			.sessionManager.getBranch(h.lastUser())
+			.map(entry => entry.id),
+	).toContain(tail);
+	await h.close();
+});
+
+test("a disconnected conversation stays disconnected across a restart and opens no writer", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	await h.call("session.disconnect", { sessionId });
+	expect((await readCatalog(h.dataDir)).sessions[0]).toMatchObject({ disconnected: true });
+	await h.restart();
+	const opened = h.created.length;
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	expect(h.created).toHaveLength(opened);
+	await h.call("session.connect", { sessionId });
+	expect((await readCatalog(h.dataDir)).sessions[0]).not.toHaveProperty("disconnected");
+	await h.restart();
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+});
+
+test("Disconnect during a turn asks first, then stops it like Stop before releasing the writer", async () => {
+	const held = heldTurn();
+	const h = await controlledFixture(held.handler);
+	cleanups.push(async () => held.release());
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	held.arm();
+	const running = h.call("prompt", { sessionId, text: "held turn" });
+	void running.catch(() => {});
+	await held.entered;
+	await h.call("prompt", { sessionId, text: "queued behind", deliverAs: "followUp" });
+	const live = h.sdk();
+	const asked = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
+	expect(asked).toEqual({ disconnected: false, confirm: { running: true, queued: 1 } });
+	expect(live.isDisposed).toBe(false);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	const confirmed = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+	expect(confirmed.disconnected).toBe(true);
+	await running;
+	// The stopped prompt and the queued follow-up end exactly as a user Stop leaves them.
+	const [held_, queued] = h.snapshot().deliveries.slice(-2);
+	expect(held_?.disposition).toBe("cancelled");
+	expect(queued?.disposition).toBe("cancelled");
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
+	expect(h.snapshot().sessions[0]?.status).not.toBe("running");
+	await h.close();
 });
 
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {

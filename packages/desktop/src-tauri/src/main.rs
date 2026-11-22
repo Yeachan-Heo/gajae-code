@@ -575,6 +575,8 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "session.compact"
 			| "session.retry"
 			| "session.export"
+			| "session.disconnect"
+			| "session.connect"
 			| "prompt"
 			| "abort"
 			| "models.list"

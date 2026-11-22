@@ -312,6 +312,30 @@ test("onboarding mode starts with no models, admits only the fixture key and kee
 	}
 }, 60000);
 
+test("the bridge admits Disconnect and Connect, and a disconnected conversation refuses a prompt", async () => {
+	const qa = await wrapper({ GJC_DESKTOP_QA_INITIAL_HOLD: "0" });
+	try {
+		await qa.connect();
+		const snapshot = await qa.call<DesktopSnapshot>("bootstrap");
+		const created = await qa.call<DesktopSession>("session.create", { projectId: snapshot.projects[0]!.id });
+		await qa.call("prompt", { sessionId: created.id, text: "a turn before disconnecting" });
+		const released = await qa.call<{ disconnected: boolean; session?: DesktopSession }>("session.disconnect", {
+			sessionId: created.id,
+		});
+		expect(released.disconnected).toBe(true);
+		expect(released.session?.connection).toEqual({ state: "disconnected" });
+		await expect(qa.call("prompt", { sessionId: created.id, text: "refused while disconnected" })).rejects.toThrow(
+			"Connect",
+		);
+		const connected = await qa.call<DesktopSession>("session.connect", { sessionId: created.id });
+		expect(connected.connection).toEqual({ state: "connected" });
+		await qa.call("shutdown");
+		expect(await qa.child.exited).toBe(0);
+	} finally {
+		await qa.close();
+	}
+}, 60000);
+
 test("requested QA shutdown delivers its final frame and exits successfully", async () => {
 	const qa = await wrapper();
 	try {

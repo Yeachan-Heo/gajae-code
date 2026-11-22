@@ -33,6 +33,7 @@ import {
 	isEmbeddedAppendRefused,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
+	readEmbeddedTranscriptHistory,
 	readEmbeddedTranscriptTail,
 	resolveManagedSessionScope,
 	restoreSessionView,
@@ -105,6 +106,7 @@ import type {
 	DesktopCompletionResult,
 	DesktopDeliveryReceipt,
 	DesktopDiff,
+	DesktopDisconnectResult,
 	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
@@ -113,6 +115,7 @@ import type {
 	DesktopQueuedInput,
 	DesktopRequest,
 	DesktopSession,
+	DesktopSessionConnection,
 	DesktopSetting,
 	DesktopSnapshot,
 } from "./protocol";
@@ -386,6 +389,8 @@ interface SavedSession {
 	createdAt?: number;
 	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
 	managed?: true;
+	/** The user released the app's writer (Disconnect); it stays read-only until Connect. */
+	disconnected?: true;
 }
 interface Catalog {
 	version: 1;
@@ -407,6 +412,11 @@ const STALE_OUTCOME: Record<StaleReplacement, string> = {
 	deferred: `${STALE_TRANSCRIPT} The app will reload it with the latest messages once the work still running in it finishes. Then try again.`,
 	failed: `${STALE_TRANSCRIPT} The app could not reload it. Select the conversation again to retry.`,
 };
+/** Every writing request on a released conversation answers with this, before any work starts. */
+const DISCONNECTED =
+	"This conversation is disconnected from the app, so the terminal can continue it. Connect it to continue here.";
+/** Activity for a conversation the app does not hold open; the Session work card shows the reason. */
+const READ_ONLY_ACTIVITY = "Background work is shown only while the app is connected to this conversation.";
 /** Released identities kept; the oldest are dropped first. */
 const RELEASED_LIMIT = 1_000;
 interface TrackedQueuedInput {
@@ -486,6 +496,14 @@ interface LiveSession extends SessionCandidate {
 	revisions?: PromptRevisions;
 	/** User turns already attributed to one input; a turn is evidence for at most one. */
 	claimedUserTurns: WeakSet<AgentMessage>;
+	/** The exclusive request in flight; settles after its receipt and final view are written. */
+	exclusiveDone?: Promise<void>;
+}
+/** A conversation the app shows without holding it open: its transcript's history only. */
+interface ReadOnlyView {
+	/** File identity the history was read from; an unchanged file is not parsed again. */
+	stamp: string;
+	messages: AgentMessage[];
 }
 interface PendingQuestion {
 	ownerToken: symbol;
@@ -563,6 +581,8 @@ export class DesktopHost {
 	#heldTranscripts = new Set<string>();
 	/** Catalog rows whose turn ended while this Host ran. Loading or opening a row never adds it. */
 	#endedTurns = new Set<string>();
+	/** History of conversations the app does not write, by catalog id; filled when they are shown. */
+	#readOnly = new Map<string, ReadOnlyView>();
 	#opening = new Map<string, Promise<LiveSession>>();
 	/**
 	 * One queue per workspace path. Open and close both mutate the same catalog entry, and the
@@ -733,6 +753,10 @@ export class DesktopHost {
 					if (!session.view || (item.viewTail !== null && typeof item.viewTail !== "string"))
 						throw new Error("Invalid saved session view");
 					session.viewTail = item.viewTail === null ? null : requiredString(item, "viewTail", 128);
+				}
+				if (item.disconnected !== undefined) {
+					if (item.disconnected !== true || session.managed) throw new Error("Invalid session connection");
+					session.disconnected = true;
 				}
 				return session;
 			});
@@ -987,6 +1011,7 @@ export class DesktopHost {
 		const managed = this.#managed.get(metadata.id);
 		if (managed) return managed.dto(messageBudget);
 		const live = this.#live.get(metadata.id);
+		const readOnly = live ? undefined : this.#readOnly.get(metadata.id);
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
 		const awaitingGate = gates?.available && gates.pending.length > 0;
@@ -1004,7 +1029,10 @@ export class DesktopHost {
 						secrets: this.#secrets,
 					},
 				)
-			: [];
+			: readOnly
+				? // Display only: no copy, edit or revision authority without a live writer.
+					projectMessages(readOnly.messages, text => this.#redact(text), messageBudget)
+				: [];
 		const notices = (live?.notices ?? []).map(({ anchor, message }) => ({
 			anchor,
 			message: {
@@ -1063,6 +1091,9 @@ export class DesktopHost {
 					}
 				: null,
 			messages: fitted.messages,
+			...(readOnly && (fitted.truncated || countVisibleMessages(readOnly.messages) > HISTORY_LIMIT)
+				? { historyTruncated: true }
+				: {}),
 			...(live &&
 			(fitted.truncated ||
 				countVisibleMessages(live.sdk.messages) +
@@ -1076,7 +1107,18 @@ export class DesktopHost {
 			...projectGoal(live?.sdk, text => this.#redact(text)),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
+			connection: { state: this.#connection(metadata) },
 		};
+	}
+	#connection(metadata: SavedSession): DesktopSessionConnection["state"] {
+		return metadata.disconnected ? "disconnected" : "connected";
+	}
+	/** The app may open its own writer for this conversation. */
+	#writable(metadata: SavedSession): boolean {
+		return this.#connection(metadata) === "connected";
+	}
+	#notWritable(_metadata: SavedSession): Error {
+		return new Error(DISCONNECTED);
 	}
 	snapshot(): DesktopSnapshot {
 		return {
@@ -1154,6 +1196,9 @@ export class DesktopHost {
 		// transcripts, with no exclusivity the terminal itself does not provide.
 		if (metadata.managed)
 			throw new Error("This terminal conversation requires SDK ownership admission before desktop resume.");
+		// Every path that would open the app's own writer passes here; reads of a released
+		// conversation are answered from its transcript before they reach it.
+		if (!this.#writable(metadata)) throw this.#notWritable(metadata);
 		const pending = this.#opening.get(metadata.id);
 		if (pending) return pending;
 		const existing = this.#live.get(metadata.id);
@@ -2455,6 +2500,8 @@ export class DesktopHost {
 		if (live.busy || live.sdk.isStreaming || live.operator?.isBusy())
 			throw new Error("Another operation is running. Try again when it finishes.");
 		live.busy = true;
+		const done = Promise.withResolvers<void>();
+		live.exclusiveDone = done.promise;
 		live.gateMutation = retireGates;
 		live.error = undefined;
 		live.errorOwner = undefined;
@@ -2503,6 +2550,8 @@ export class DesktopHost {
 				live.gateMutation = false;
 				live.busy = false;
 				live.exclusiveViewHandoff = undefined;
+				done.resolve();
+				if (live.exclusiveDone === done.promise) live.exclusiveDone = undefined;
 				if (this.#live.get(live.metadata.id) === live) this.#publish(live);
 				// The refusal lasts for this copy's lifetime. Replace it now, so the user sees the
 				// other surface's turns instead of a conversation that fails every write.
@@ -2515,6 +2564,191 @@ export class DesktopHost {
 					}
 				}
 			}
+		}
+	}
+	/**
+	 * A user Stop; a confirmed Disconnect stops a conversation exactly this way. `arrival` is the
+	 * arrival number of the request that asked for it.
+	 */
+	async #stop(live: LiveSession, arrival: number): Promise<void> {
+		if (live.operator?.isBusy()) {
+			if (!live.operatorCurrentId)
+				throw new Error("Waiting for the previous command to settle. Stop cannot be proven for this conversation.");
+			live.operator.abort({ operationId: live.operatorCurrentId });
+			this.#publish(live);
+			return;
+		}
+		// This Stop goes on to stop the run. Record its arrival before releasing anything it
+		// interrupts, so every input that arrived earlier sees it from here on. A Stop that only
+		// cancelled a shell command, or could not proceed, returned above without recording.
+		this.#runStops.set(live.metadata.id, Math.max(this.#runStops.get(live.metadata.id) ?? 0, arrival));
+		this.#cancelQuestions(live);
+		// An input still queued never reached the conversation, so Stop hands it back: `removed`
+		// returns its text to the composer, where `cancelled` would drop it. This write lands
+		// before the SDK's own cancellation report, which the final receipt then ignores.
+		for (const tracked of live.queued.values()) {
+			if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "removed" });
+		}
+		// Stop means stop: the default cause ends the run without starting another. A user steer it
+		// did not take is dropped and reported removed; an agent follow-up stays queued for the next
+		// turn. The TUI's `user_interrupt` would resume into both at once. Outcomes are classified
+		// from the recorded Stop, not from the cause.
+		await live.sdk.abort();
+		this.#publish(live);
+	}
+	/** Work Disconnect would stop: a turn, queued input, a command or a question still waiting. */
+	#disconnectWouldStop(live: LiveSession): { running: boolean; queued: number } | undefined {
+		const running =
+			live.sdk.isStreaming ||
+			live.exclusiveDone !== undefined ||
+			live.operator?.isBusy() === true ||
+			[...this.#questions.values()].some(pending => pending.ownerToken === live.viewOwnerToken);
+		return running || live.queued.size > 0 ? { running, queued: live.queued.size } : undefined;
+	}
+	/**
+	 * Release the app's writer for one conversation without deleting it, so another surface (the
+	 * terminal) can continue it. The final view is saved first, so Connect lands where the app
+	 * left off unless someone appended. Work in progress needs explicit confirmation and is
+	 * stopped through Stop, whose receipts classify each input as usual.
+	 */
+	async #disconnect(metadata: SavedSession, confirm: boolean, arrival: number): Promise<DesktopDisconnectResult> {
+		if (metadata.managed) throw new Error("Disconnect this conversation in the terminal that owns it.");
+		const opening = this.#opening.get(metadata.id);
+		if (opening) await opening.catch(() => {});
+		let live = this.#live.get(metadata.id);
+		if (live && !metadata.disconnected) {
+			const stopping = this.#disconnectWouldStop(live);
+			if (stopping && !confirm) return { disconnected: false, confirm: stopping };
+			if (stopping) await this.#stop(live, arrival);
+			// Join the stopped request until its receipt and view are written; disposing earlier would
+			// turn a cancelled prompt into an unknown one.
+			for (let attempt = 0; attempt < 3 && live.exclusiveDone; attempt++) await live.exclusiveDone;
+			await live.viewPersistence?.catch(() => {});
+			if (live.sdk.isStreaming) await live.sdk.waitForIdle().catch(() => {});
+			live = this.#live.get(metadata.id);
+			if (live && (live.busy || live.sdk.isStreaming || live.operator?.isBusy()))
+				throw new Error("The conversation is still stopping. Try Disconnect again.");
+		}
+		// From here every writing request refuses, and nothing reopens the writer behind this.
+		metadata.disconnected = true;
+		const failures: unknown[] = [];
+		if (live) {
+			this.#live.delete(metadata.id);
+			this.#retiredLive.add(live);
+			live.queued.clear();
+			try {
+				// Persists the final view and saves the catalog, now carrying the released state.
+				await this.#disposeLive(live);
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		try {
+			await this.#save();
+		} catch (error) {
+			failures.push(error);
+		}
+		await this.#loadReadOnly(metadata);
+		this.#publishSnapshot();
+		if (failures.length === 1) throw failures[0];
+		if (failures.length) throw new AggregateError(failures, "Disconnect could not release every resource");
+		return { disconnected: true, session: this.#dto(metadata) };
+	}
+	/** Take the conversation back through the normal open path, which lands on any newer tail. */
+	async #connect(metadata: SavedSession): Promise<DesktopSession> {
+		if (metadata.managed) return this.#dto(metadata);
+		const wasDisconnected = metadata.disconnected === true;
+		if (wasDisconnected) {
+			delete metadata.disconnected;
+			try {
+				await this.#save();
+			} catch (error) {
+				metadata.disconnected = true;
+				throw error;
+			}
+		}
+		try {
+			const live = await this.#open(metadata);
+			this.#readOnly.delete(metadata.id);
+			this.#publish(live);
+		} catch (error) {
+			// A reopen that fails leaves the conversation released, with Connect still offered.
+			if (wasDisconnected) {
+				metadata.disconnected = true;
+				await this.#save().catch(() => {});
+			}
+			this.#publishSnapshot();
+			throw error;
+		}
+		this.#publishSnapshot();
+		return this.#dto(metadata);
+	}
+	/** Show a conversation the app does not write, from its transcript, re-reading only a changed file. */
+	async #loadReadOnly(metadata: SavedSession): Promise<ReadOnlyView> {
+		const file = metadata.file ? this.#sessionPath(metadata.file, metadata.scope) : undefined;
+		const stat = file ? await fs.stat(file).catch(() => undefined) : undefined;
+		const stamp = stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : "";
+		const cached = this.#readOnly.get(metadata.id);
+		if (cached && cached.stamp === stamp) return cached;
+		const view = metadata.view;
+		const history =
+			file && stat
+				? await readEmbeddedTranscriptHistory(
+						file,
+						view && {
+							entryId: view.leafEntryId,
+							...(metadata.viewTail === undefined ? {} : { whenTail: metadata.viewTail }),
+						},
+					)
+				: undefined;
+		const loaded: ReadOnlyView = {
+			stamp,
+			// Another transcript at the recorded path is not this conversation's history.
+			messages: history && (!metadata.sessionId || history.sessionId === metadata.sessionId) ? history.messages : [],
+		};
+		this.#readOnly.set(metadata.id, loaded);
+		return loaded;
+	}
+	/**
+	 * Requests on a conversation the app does not write. Reads answer from the transcript; delete
+	 * removes it without opening a writer; everything else refuses before any work starts.
+	 */
+	async #dispatchReadOnly(request: DesktopRequest, metadata: SavedSession): Promise<unknown> {
+		const { method, params } = request;
+		switch (method) {
+			case "session.select":
+				await this.#loadReadOnly(metadata);
+				this.#emit({ type: "session", session: this.#dto(metadata) });
+				return this.#dto(metadata);
+			case "history.get": {
+				const offset = params.offset === undefined ? 0 : params.offset;
+				const limit = params.limit === undefined ? HISTORY_PAGE_LIMIT : params.limit;
+				if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0)
+					throw new Error("Invalid history offset");
+				if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > HISTORY_PAGE_LIMIT)
+					throw new Error("Invalid history limit");
+				const view = await this.#loadReadOnly(metadata);
+				const { total, page, truncated } = projectHistoryPage(view.messages, offset, limit, text =>
+					this.#redact(text),
+				);
+				return { sessionId: metadata.id, total, offset, messages: page, truncated } satisfies DesktopHistory;
+			}
+			case "activity.get":
+				return {
+					sessionId: metadata.id,
+					revision: 0,
+					activity: {
+						available: false,
+						reason: READ_ONLY_ACTIVITY,
+						sessionGeneration: "read-only",
+						connectionGeneration: this.#connectionGeneration,
+					},
+				} satisfies DesktopActivityUpdate;
+			case "session.delete":
+				this.#readOnly.delete(metadata.id);
+				return this.#forgetMissingSession(metadata);
+			default:
+				throw this.#notWritable(metadata);
 		}
 	}
 	/** Replaces a live copy the store refused, once no work remains on it. */
@@ -2707,10 +2941,14 @@ export class DesktopHost {
 			// The snapshot splits one history budget across every row, and the app replaces its
 			// rows with it. Follow with the full projection of any open conversation it cut short,
 			// so a refresh on window focus never shrinks the transcript being read.
-			for (const live of this.#live.values()) {
-				const row = snapshot.sessions.find(session => session.id === live.metadata.id);
+			const shown = [
+				...[...this.#live.values()].map(live => live.metadata),
+				...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id)),
+			];
+			for (const metadata of shown) {
+				const row = snapshot.sessions.find(session => session.id === metadata.id);
 				if (!row) continue;
-				const full = this.#dto(live.metadata);
+				const full = this.#dto(metadata);
 				if (JSON.stringify(full.messages) !== JSON.stringify(row.messages))
 					this.#emit({ type: "session", session: full });
 			}
@@ -2902,12 +3140,17 @@ export class DesktopHost {
 			return { provider, saved: true, catalogRefreshed: stored.catalogRefreshed && catalogRefreshed };
 		}
 		if (method === "settings.get") {
-			const settings = params.sessionId ? (await this.#open(this.#metadata(params))).settings : this.#settings!;
+			const target = params.sessionId ? this.#metadata(params) : undefined;
+			// A released conversation has no session settings of its own open; show the app's.
+			const settings = target && this.#writable(target) ? (await this.#open(target)).settings : this.#settings!;
 			return desktopSettings(settings);
 		}
 		if (method === "settings.set") {
 			const settingPath = validateDesktopSetting(params.path, params.value);
-			if (params.sessionId) await this.#open(this.#metadata(params));
+			if (params.sessionId) {
+				const target = this.#metadata(params);
+				if (this.#writable(target)) await this.#open(target);
+			}
 			// Settings are application-wide; refuse to change them under an active run.
 			const targets = [...this.#live.values()];
 			if (targets.some(live => live.busy || live.sdk.isStreaming)) throw new Error("Session busy");
@@ -2952,7 +3195,9 @@ export class DesktopHost {
 		if (method === "command.run")
 			return this.#command(this.#metadata(params), requiredString(params, "text"), request.id, arrival);
 		if (method === "history.get") {
-			const live = await this.#open(this.#metadata(params));
+			const target = this.#metadata(params);
+			if (!target.managed && !this.#writable(target)) return this.#dispatchReadOnly(request, target);
+			const live = await this.#open(target);
 			const offset = params.offset === undefined ? 0 : params.offset;
 			const limit = params.limit === undefined ? HISTORY_PAGE_LIMIT : params.limit;
 			if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0)
@@ -2975,6 +3220,8 @@ export class DesktopHost {
 			} satisfies DesktopHistory;
 		}
 		const sessionMethods = [
+			"session.disconnect",
+			"session.connect",
 			"session.select",
 			"session.rename",
 			"session.delete",
@@ -3020,6 +3267,12 @@ export class DesktopHost {
 		];
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
+		if (method === "session.disconnect") {
+			if (params.confirm !== undefined && typeof params.confirm !== "boolean") throw new Error("Invalid confirm");
+			return this.#disconnect(metadata, params.confirm === true, arrival);
+		}
+		if (method === "session.connect") return this.#connect(metadata);
+		if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
 		// A transcript another surface removed must not wedge its row. A session this host
 		// still owns keeps the normal delete path, which disposes it and tolerates the
 		// missing file; only an unowned row is forgotten outright.
@@ -3051,32 +3304,7 @@ export class DesktopHost {
 			return this.#dto(metadata);
 		}
 		if (method === "abort") {
-			if (live.operator?.isBusy()) {
-				if (!live.operatorCurrentId)
-					throw new Error(
-						"Waiting for the previous command to settle. Stop cannot be proven for this conversation.",
-					);
-				live.operator.abort({ operationId: live.operatorCurrentId });
-				this.#publish(live);
-				return null;
-			}
-			// This Stop goes on to stop the run. Record its arrival before releasing anything it
-			// interrupts, so every input that arrived earlier sees it from here on. A Stop that only
-			// cancelled a shell command, or could not proceed, returned above without recording.
-			this.#runStops.set(live.metadata.id, Math.max(this.#runStops.get(live.metadata.id) ?? 0, arrival));
-			this.#cancelQuestions(live);
-			// An input still queued never reached the conversation, so Stop hands it back: `removed`
-			// returns its text to the composer, where `cancelled` would drop it. This write lands
-			// before the SDK's own cancellation report, which the final receipt then ignores.
-			for (const tracked of live.queued.values()) {
-				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "removed" });
-			}
-			// Stop means stop: the default cause ends the run without starting another. A user steer it
-			// did not take is dropped and reported removed; an agent follow-up stays queued for the next
-			// turn. The TUI's `user_interrupt` would resume into both at once. Outcomes are classified
-			// from the recorded Stop, not from the cause.
-			await live.sdk.abort();
-			this.#publish(live);
+			await this.#stop(live, arrival);
 			return null;
 		}
 		if (method.startsWith("btw.")) {
