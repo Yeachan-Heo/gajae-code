@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import type { DesktopTodoPhase } from "@gajae-code/desktop-host/protocol";
+import type { DesktopSession, DesktopTodoPhase } from "@gajae-code/desktop-host/protocol";
 import { renderToStaticMarkup } from "react-dom/server";
+import { SessionWorkProgress, sessionWorkLabel } from "../src/SessionWorkProgress";
 import { TODO_TASK_LIMIT, TodoPanel, TodoPhaseList, todoProgress } from "../src/TodoPanel";
 
 const phases: DesktopTodoPhase[] = [
@@ -103,5 +104,41 @@ describe("TodoPanel", () => {
 		expect(html).toContain("<h3>긴 단계 이름</h3>");
 		expect(texts(html, "todo-task-text")).toEqual([long, cjk]);
 		expect(html).toContain(`<li>${cjk}</li>`);
+	});
+});
+
+describe("Session work toolbar progress", () => {
+	const session: DesktopSession = {
+		id: "fixture", projectId: "fixture", title: "Fixture", status: "running", starred: false,
+		imageInput: null, operatorRunning: false, controlGeneration: null, messages: [],
+	};
+	const withTasks = (statuses: DesktopTodoPhase["tasks"][number]["status"][]): DesktopSession => ({
+		...session,
+		todos: [{ name: "Work", tasks: statuses.map((status, index) => ({ content: `Task ${index}`, status })) }],
+	});
+
+	test("shows no chip and the plain name when the session has no tasks", () => {
+		for (const value of [session, { ...session, todos: [] }, { ...session, todos: [{ name: "Empty", tasks: [] }] }]) {
+			expect(renderToStaticMarkup(<SessionWorkProgress session={value} />)).toBe("");
+			expect(sessionWorkLabel(value)).toBe("Session work");
+		}
+	});
+
+	test("states done/total from the first task on, and names the button with the same progress", () => {
+		expect(renderToStaticMarkup(<SessionWorkProgress session={withTasks(["pending", "pending"])} />)).toBe(
+			'<span class="session-work-progress" aria-hidden="true">0/2</span>',
+		);
+		expect(sessionWorkLabel(withTasks(["pending", "pending"]))).toBe("Session work, 0 of 2 tasks done");
+		const partial = withTasks(["completed", "abandoned", "in_progress", "pending", "pending"]);
+		expect(renderToStaticMarkup(<SessionWorkProgress session={partial} />)).toContain(">2/5<");
+		expect(sessionWorkLabel(partial)).toBe("Session work, 2 of 5 tasks done");
+	});
+
+	test("marks a finished list complete", () => {
+		const finished = withTasks(["completed", "abandoned"]);
+		expect(renderToStaticMarkup(<SessionWorkProgress session={finished} />)).toBe(
+			'<span class="session-work-progress complete" aria-hidden="true">2/2</span>',
+		);
+		expect(sessionWorkLabel(finished)).toBe("Session work, 2 of 2 tasks done");
 	});
 });

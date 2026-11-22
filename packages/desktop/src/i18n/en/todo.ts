@@ -12,4 +12,6 @@ export const todo = {
 	"todo.noteCountAtLeast": "Notes: {count} or more",
 	"todo.noteCountShortAtLeast": "{count}+",
 	"todo.capNotice": "Only the first {count} tasks are shown.",
+	"todo.progressChip": "{done}/{total}",
+	"todo.sessionWorkLabel": "Session work, {done} of {total} tasks done",
 } as const;

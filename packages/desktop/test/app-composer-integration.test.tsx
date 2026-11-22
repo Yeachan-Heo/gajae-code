@@ -2497,7 +2497,9 @@ suite("mounted composer delivery recovery", () => {
 				}),
 			);
 			await page.waitForSelector(".session-work-body .todo-panel");
-			expect(await page.$eval('.toolbar button[aria-label="Session work"]', el => el.getAttribute("aria-expanded"))).toBe("true");
+			// With a task list the toggle's name carries its progress, and its chip shows it whether or not the card is open.
+			expect(await page.$eval('.toolbar button[aria-label="Session work, 1 of 3 tasks done"]', el => el.getAttribute("aria-expanded"))).toBe("true");
+			expect(await page.$eval(".toolbar .session-work-toggle .session-work-progress", el => el.textContent)).toBe("1/3");
 			expect(await page.$(".session-work-body .goal-status")).not.toBeNull();
 			const collapsed = await page.evaluate(() => ({
 				summary: document.querySelector(".todo-summary")?.textContent,
