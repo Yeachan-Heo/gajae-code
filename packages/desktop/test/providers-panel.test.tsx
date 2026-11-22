@@ -49,6 +49,7 @@ interface FixtureData {
 	disconnected: boolean;
 	busy: boolean;
 	keyState: ProviderKeyState | null;
+	loadError?: string;
 }
 type Call = [string, ...(string | null)[]];
 interface Control {
@@ -139,6 +140,7 @@ async function fixture(width = 1000, options: FixtureOptions = {}): Promise<{ co
 							groups: projectProviders(data.providers, data.models, shown, owned),
 							totalModels: data.models.length,
 							loaded: data.loaded,
+							loadError: data.loadError,
 							disconnected: data.disconnected,
 							busy: data.busy,
 							query,
@@ -418,6 +420,22 @@ suite("Providers panel interactions", () => {
 			expect(await page.$eval(".provider-blocked", node => node.firstChild?.textContent)).toBe(
 				"A sign-in to Design example browser sign-in is still in progress. Finish or cancel it first.",
 			);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a load error spans the dialog like the other dialogs' error banners", async () => {
+		const { context, page } = await fixture(1000, { dialog: true });
+		try {
+			await set(page, { loaded: false, loadError: "Could not load the provider list." });
+			await page.waitForSelector(".provider-load-error .error-banner");
+			const widths = await page.evaluate(() => ({
+				banner: Math.round(document.querySelector(".provider-load-error .error-banner")!.getBoundingClientRect().width),
+				panel: Math.round(document.querySelector(".providers-panel")!.getBoundingClientRect().width),
+			}));
+			expect(widths.banner).toBe(widths.panel);
+			expect((await buttons(page)).map(button => button.text)).toContain("Retry");
 		} finally {
 			await closeComponentFixture(context, page);
 		}

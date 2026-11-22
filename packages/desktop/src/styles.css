@@ -931,6 +931,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-summary, .provider-footer, .provider-hint { color: var(--muted); font-size: 0.75rem; }
 .provider-summary { font-size: 0.8125rem; }
 .provider-load-error { display: grid; gap: 0.5rem; justify-items: start; }
+/* The banner spans the dialog like every other dialog's error banner; only Retry keeps its own width. */
+.provider-load-error > .error-banner { justify-self: stretch; margin: 0; }
 .provider-list { display: grid; gap: 0.75rem; max-height: 52dvh; overflow: auto; overscroll-behavior: contain; padding: 4px; }
 .provider-group { display: grid; gap: 0.375rem; min-width: 0; }
 .provider-group-heading { padding: 0 0.25rem; color: var(--muted); font-size: 0.75rem; font-weight: 600; }
