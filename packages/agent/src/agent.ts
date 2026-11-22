@@ -1524,16 +1524,27 @@ export class Agent {
 	}
 
 	clearSteeringQueue() {
-		this.#steeringQueue = [];
+		if (this.#steeringQueue.length > 0) {
+			this.#steeringQueue = [];
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	clearFollowUpQueue() {
-		this.#followUpQueue = [];
+		if (this.#followUpQueue.length > 0) {
+			this.#followUpQueue = [];
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	clearAllQueues() {
+		const hadSteering = this.#steeringQueue.length > 0;
+		const hadFollowUp = this.#followUpQueue.length > 0;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		if (hadSteering || hadFollowUp) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	hasQueuedMessages(): boolean {
@@ -1622,6 +1633,7 @@ export class Agent {
 		const taken = takes.flat();
 		if (taken.length === 0) return [];
 		this.#steeringQueue = this.#steeringQueue.slice(taken.length);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return taken;
 	}
 
@@ -1633,16 +1645,19 @@ export class Agent {
 			this.#followUpBatches.delete(first);
 			if (batch.every((message, index) => this.#followUpQueue[index] === message)) {
 				this.#followUpQueue = this.#followUpQueue.slice(batch.length);
+				for (const notify of [...this.#queueChangeWaiters]) notify();
 				return [...batch];
 			}
 		}
 		if (this.#followUpMode === "one-at-a-time") {
 			this.#followUpQueue = this.#followUpQueue.slice(1);
+			for (const notify of [...this.#queueChangeWaiters]) notify();
 			return [first];
 		}
 
 		if (this.#followUpForceOneAtATime.has(first)) {
 			this.#followUpQueue = this.#followUpQueue.slice(1);
+			for (const notify of [...this.#queueChangeWaiters]) notify();
 			return [first];
 		}
 
@@ -1650,6 +1665,7 @@ export class Agent {
 		const takeCount = forcedIndex === -1 ? this.#followUpQueue.length : forcedIndex;
 		const followUp = this.#followUpQueue.slice(0, takeCount);
 		this.#followUpQueue = this.#followUpQueue.slice(takeCount);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return followUp;
 	}
 
@@ -1875,8 +1891,13 @@ export class Agent {
 		this.#state.pendingToolCalls = new Set<string>();
 		this.#managedLogicalRunOwner = undefined;
 		this.#state.error = undefined;
+		const hadSteering = this.#steeringQueue.length > 0;
+		const hadFollowUp = this.#followUpQueue.length > 0;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		if (hadSteering || hadFollowUp) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 		// A reset starts a new provider cache lineage (/new, context clear, handoff):
 		// its first request must report `initial`, not a mutation of the old session.
 		this.#promptPrefixTracker = new PromptPrefixTracker();

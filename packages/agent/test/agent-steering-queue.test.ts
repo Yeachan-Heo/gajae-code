@@ -499,4 +499,138 @@ describe("Agent steering admission", () => {
 			await run;
 		}
 	});
+
+	it("queue-change waiter resolves when clearSteeringQueue() removes messages", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		const controller = new AbortController();
+		try {
+			await h.entered;
+			// Enqueue a steer
+			const msg = userMessage("steer");
+			expect(h.agent.steer(msg).admitted).toBe(true);
+
+			// Start waiting AFTER the steer is queued
+			let queueChangeResolved = false;
+			const queueChangePromise = h.agent.waitForQueueChange(controller.signal).then(() => {
+				queueChangeResolved = true;
+			});
+
+			// Wait a bit to ensure nothing happens on its own
+			await scheduler.yield();
+			expect(queueChangeResolved).toBe(false);
+
+			// Clear the steering queue
+			h.agent.clearSteeringQueue();
+
+			// Wait should resolve
+			await queueChangePromise;
+			expect(queueChangeResolved).toBe(true);
+		} finally {
+			controller.abort();
+			h.release();
+			await run;
+		}
+	});
+
+	it("queue-change waiter resolves when clearFollowUpQueue() removes messages", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		const controller = new AbortController();
+		try {
+			await h.entered;
+			// Enqueue a follow-up
+			const msg = userMessage("follow-up");
+			h.agent.followUp(msg);
+
+			// Start waiting AFTER the follow-up is queued
+			let queueChangeResolved = false;
+			const queueChangePromise = h.agent.waitForQueueChange(controller.signal).then(() => {
+				queueChangeResolved = true;
+			});
+
+			// Wait a bit to ensure nothing happens on its own
+			await scheduler.yield();
+			expect(queueChangeResolved).toBe(false);
+
+			// Clear the follow-up queue
+			h.agent.clearFollowUpQueue();
+
+			// Wait should resolve
+			await queueChangePromise;
+			expect(queueChangeResolved).toBe(true);
+		} finally {
+			controller.abort();
+			h.release();
+			await run;
+		}
+	});
+
+	it("queue-change waiter resolves when clearAllQueues() removes messages", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		const controller = new AbortController();
+		try {
+			await h.entered;
+			// Enqueue both a steer and a follow-up
+			const steerMsg = userMessage("steer");
+			const followUpMsg = userMessage("follow-up");
+			expect(h.agent.steer(steerMsg).admitted).toBe(true);
+			h.agent.followUp(followUpMsg);
+
+			// Start waiting AFTER messages are queued
+			let queueChangeResolved = false;
+			const queueChangePromise = h.agent.waitForQueueChange(controller.signal).then(() => {
+				queueChangeResolved = true;
+			});
+
+			// Wait a bit to ensure nothing happens on its own
+			await scheduler.yield();
+			expect(queueChangeResolved).toBe(false);
+
+			// Clear all queues
+			h.agent.clearAllQueues();
+
+			// Wait should resolve
+			await queueChangePromise;
+			expect(queueChangeResolved).toBe(true);
+		} finally {
+			controller.abort();
+			h.release();
+			await run;
+		}
+	});
+
+	it("queue-change waiter does NOT resolve when clearSteeringQueue() finds it already empty", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		const controller = new AbortController();
+		try {
+			await h.entered;
+
+			// Start waiting when queue is already empty
+			let queueChangeResolved = false;
+			const queueChangePromise = h.agent.waitForQueueChange(controller.signal).then(() => {
+				queueChangeResolved = true;
+			});
+
+			// Wait a bit
+			await scheduler.yield();
+
+			// Clear the already-empty queue
+			h.agent.clearSteeringQueue();
+
+			// Wait a bit more - nothing should resolve
+			await scheduler.yield();
+			expect(queueChangeResolved).toBe(false);
+
+			// Abort to clean up the pending promise
+			controller.abort();
+			await queueChangePromise;
+		} finally {
+			controller.abort();
+			h.release();
+			await run;
+		}
+	});
 });
