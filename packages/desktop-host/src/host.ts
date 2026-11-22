@@ -2643,6 +2643,14 @@ export class DesktopHost {
 		if (Date.now() - live.ownerCheckedAt < OWNER_RECHECK_MS || !this.#reloadable(live)) return;
 		live.ownerCheckedAt = Date.now();
 		if (!(await this.#ownedElsewhere(live.metadata))) return;
+		if (this.#live.get(live.metadata.id) === live && !this.#reloadable(live)) {
+			// Work started in this copy while the broker answered (another prompt found the check
+			// recent). Releasing it now would dispose that work, so keep the copy writable and check
+			// again before the next prompt; the store's compare-and-append refusal stays the backstop.
+			this.#elsewhere.delete(live.metadata.id);
+			live.ownerCheckedAt = 0;
+			return;
+		}
 		if (this.#live.get(live.metadata.id) === live) {
 			this.#live.delete(live.metadata.id);
 			this.#retiredLive.add(live);

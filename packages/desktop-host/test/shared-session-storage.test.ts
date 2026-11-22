@@ -99,10 +99,12 @@ async function fixture(model?: Model) {
 	// The broker's live-owner answer: transcript ids a terminal holds open, or a broker that fails.
 	const liveOwners = new Set<string>();
 	let brokerFails = false;
+	let brokerHold: Promise<void> | undefined;
 	const ownerLookups: string[] = [];
 	const liveOwnerClient = {
 		global: async (_operation: string, input: Record<string, unknown>) => {
 			ownerLookups.push(String(input.resolveSessionId));
+			await brokerHold;
 			if (brokerFails) throw new Error("broker connection refused");
 			return {
 				ok: true,
@@ -155,6 +157,15 @@ async function fixture(model?: Model) {
 		ownerLookups,
 		failBroker: (fails: boolean) => {
 			brokerFails = fails;
+		},
+		/** Holds every broker answer until the returned release is called. */
+		holdBroker: () => {
+			const held = Promise.withResolvers<void>();
+			brokerHold = held.promise;
+			return () => {
+				brokerHold = undefined;
+				held.resolve();
+			};
 		},
 	};
 }
@@ -210,6 +221,11 @@ async function controlledFixture(handler?: (signal?: AbortSignal) => Promise<voi
 		return entryId;
 	};
 	return { ...h, project, session, sdk, model, lastUser };
+}
+
+async function until(check: () => boolean, what: string): Promise<void> {
+	for (let i = 0; i < 1_000 && !check(); i++) await Bun.sleep(5);
+	if (!check()) throw new Error(`Timed out waiting for ${what}`);
 }
 
 /** The terminal's own resume path, used here as the other surface of the shared store. */
@@ -1008,6 +1024,52 @@ test("a prompt after a long idle checks again and steps aside for a terminal tha
 	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
 	await live.awaitDisposeCompletion();
 	expect(live.isDisposed).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
+	await h.close();
+});
+
+test("a turn that starts while the owner check is waiting is not released under it", async () => {
+	const held = heldTurn();
+	const h = await controlledFixture(held.handler);
+	cleanups.push(async () => held.release());
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	h.liveOwners.add(await transcriptId(h));
+	const now = Date.now();
+	const later = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60_000);
+	cleanups.push(async () => later.mockRestore());
+	const releaseBroker = h.holdBroker();
+	const lookups = h.ownerLookups.length;
+	// The first prompt after a long idle asks the broker, which has not answered yet.
+	const checking = h.call("prompt", { sessionId, text: "first after idle" });
+	void checking.catch(() => {});
+	await until(() => h.ownerLookups.length > lookups, "the owner lookup");
+	// A second prompt meanwhile finds the check recent and starts a turn.
+	held.arm();
+	const running = h.call("prompt", { sessionId, text: "started meanwhile" });
+	await held.entered;
+	releaseBroker();
+	// The check answers "a terminal has it open", but a turn now runs in this copy: it stays, and
+	// the first prompt joins that turn as a steer instead of the turn being released under it.
+	expect(await checking).toMatchObject({ queued: true });
+	expect(live.isDisposed).toBe(false);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	held.release();
+	await running;
+	await until(
+		() =>
+			h
+				.snapshot()
+				.deliveries.slice(-2)
+				.every(receipt => receipt.disposition === "completed"),
+		"both prompts to complete",
+	);
+	// The next prompt checks again at once and steps aside, before anything runs.
+	const calls = h.model.calls.length;
+	await expect(h.call("prompt", { sessionId, text: "after the turn" })).rejects.toThrow("terminal");
+	expect(h.model.calls).toHaveLength(calls);
+	await live.awaitDisposeCompletion();
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
 	await h.close();
 });
