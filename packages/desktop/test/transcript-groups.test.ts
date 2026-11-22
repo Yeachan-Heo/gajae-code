@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolCall } from "@gajae-code/desktop-host/tool-protocol";
-import { groupTranscript, TranscriptRuns, toolRunKinds, transcriptAnchorIndex } from "../src/transcript-groups";
+import {
+	groupTranscript,
+	type TranscriptItem,
+	TranscriptRuns,
+	toolRunKinds,
+	transcriptAnchorIndex,
+} from "../src/transcript-groups";
 
 const row = (id: string): DesktopMessage => ({ id, role: "assistant", text: `answer ${id}` });
 const call = (
@@ -23,7 +29,7 @@ const reasoning = (id: string): DesktopMessage => ({
 	blocks: [{ type: "thinking", text: "next, check the caller" }],
 });
 const typedShell = (id: string): DesktopMessage => ({ id, role: "tool", toolName: "Direct shell", text: "ls" });
-const shape = (items: ReturnType<typeof groupTranscript>) =>
+const shape = (items: TranscriptItem[]) =>
 	items.map(item => [item.key, item.tools, item.messages.map(message => message.id)]);
 
 describe("transcript entries", () => {

@@ -1,6 +1,6 @@
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import type { DesktopMessage } from "./protocol";
-import { projectTodos } from "./session-state";
+import { projectTodoPhases } from "./session-state";
 import {
 	DESKTOP_TOOL_LIMITS,
 	type DesktopToolCall,
@@ -430,8 +430,10 @@ interface LiveCall {
 const liveCalls = new WeakMap<object, Map<string, LiveCall>>();
 
 /**
- * Receives every event of a live SDK session, before the Host's own handling, so running calls
- * can be tracked between `message_end` and their result. It must not throw.
+ * Receives every event of a live SDK session, so running calls can be tracked between
+ * `message_end` and their result. The Host calls it last, after its own handling has scheduled the
+ * next publish; that publish is deferred (75 ms), so it projects the state recorded here. It must
+ * not throw.
  */
 export function observeToolEvent(session: Session, event: { readonly type: string }): void {
 	try {
@@ -803,11 +805,8 @@ export function projectToolDetail(
 	}
 	const search = family === "tool-search" ? toolSearchDetail(result, redact) : undefined;
 	if (search) detail.toolSearch = search;
-	const phases = family === "todo" ? record(result?.details)?.phases : undefined;
-	if (phases !== undefined) {
-		const todos = projectTodos({ getTodoPhases: () => phases as never }, redact).todos;
-		if (todos) detail.todo = todos;
-	}
+	const todos = family === "todo" ? projectTodoPhases(record(result?.details)?.phases, redact) : undefined;
+	if (todos) detail.todo = todos;
 	// The generic view: everything not shown by a section above, never `_`-prefixed keys.
 	const sectioned = detail.diff !== undefined || detail.toolSearch !== undefined || detail.todo !== undefined;
 	const args = call && !sectioned ? prettyArgs(call.arguments, omit, redact) : undefined;

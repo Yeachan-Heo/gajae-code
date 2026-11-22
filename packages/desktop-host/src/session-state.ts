@@ -47,7 +47,19 @@ export function projectTodos(
 	} catch {
 		return {};
 	}
-	if (!Array.isArray(phases) || phases.length === 0) return {};
+	const todos = projectTodoPhases(phases, redact);
+	return todos ? { todos } : {};
+}
+
+/**
+ * The same projection for phases of any origin, such as a `todo_write` result's `details`: every
+ * field is checked here, so the value needs no type. Undefined when no task can be shown.
+ */
+export function projectTodoPhases(
+	phases: unknown,
+	redact: (value: string) => string = value => value,
+): DesktopTodoPhase[] | undefined {
+	if (!Array.isArray(phases) || phases.length === 0) return undefined;
 	const projected: DesktopTodoPhase[] = [];
 	let remaining = MAX_TASKS;
 	for (const phase of phases.slice(0, MAX_PHASES)) {
@@ -71,7 +83,7 @@ export function projectTodos(
 		}
 		if (items.length > 0) projected.push({ name: text(record.name, redact), tasks: items });
 	}
-	return projected.length > 0 ? { todos: projected } : {};
+	return projected.length > 0 ? projected : undefined;
 }
 
 /**
