@@ -1,8 +1,11 @@
-import type { DesktopToolInfo } from "@gajae-code/desktop-host/tool-protocol";
+import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
+import type { DesktopToolInfo, DesktopToolSearchDetail } from "@gajae-code/desktop-host/tool-protocol";
+import { ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { Button, Modal } from "./components";
 import { t } from "./i18n";
 import { type ToolCatalog, ToolCatalogPanel, type ToolCatalogPanelProps } from "./ToolCatalogDialog";
+import { ToolSearchBody } from "./ToolSearchBody";
 
 /** Design-only tool rows. Labels and descriptions stand in for Host-issued tool metadata, which is not catalog copy. */
 const fixtureTools: DesktopToolInfo[] = [
@@ -227,9 +230,68 @@ const states: Array<{ id: string; title: () => string; props: FixtureProps; narr
 	{ id: "empty", title: () => t("catalog.showcaseEmpty"), props: { catalog: catalogOf([]) } },
 ];
 
+const searchMessage: DesktopMessage = {
+	id: "DESIGN-ONLY-tool-search",
+	role: "tool",
+	toolName: "search_tool_bm25",
+	text: '{"query":"todo list","activated_tools":["todo_write","mcp_linear_create_issue"],"match_count":4,"total_tools":31}',
+	tool: { callId: "DESIGN-ONLY-call", status: "done", family: "tool-search", subject: "todo list", detail: true },
+};
+
+const populatedSearch: DesktopToolSearchDetail = {
+	query: "todo list",
+	activated: ["todo_write", "mcp_linear_create_issue"],
+	matches: [
+		{
+			name: "todo_write",
+			label: "Todo Write",
+			description: "Write a structured todo list to track progress within a session",
+		},
+		{
+			name: "mcp_linear_create_issue",
+			label: "linear/create_issue",
+			description:
+				"Create an issue in a Linear team, with a title, a description, labels, an assignee and a due date.",
+			mcpServer: "linear",
+		},
+		{
+			name: "mcp_notion_search",
+			label: "notion/검색",
+			description: "노션 워크스페이스에서 할 일 목록이 있는 페이지와 데이터베이스를 검색합니다.",
+			mcpServer: "노션",
+		},
+		{
+			name: "checkpoint",
+			label: "Checkpoint",
+			description: "Create a git-based checkpoint to save and restore session state",
+		},
+	],
+	total: 4,
+};
+
+const searchStates: Array<{ id: string; title: () => string; search?: DesktopToolSearchDetail }> = [
+	{ id: "populated", title: () => t("catalog.showcaseSearchPopulated"), search: populatedSearch },
+	{
+		id: "capped",
+		title: () => t("catalog.showcaseSearchCapped"),
+		search: { ...populatedSearch, activated: [], total: 27 },
+	},
+	{
+		id: "empty",
+		title: () => t("catalog.showcaseSearchEmpty"),
+		search: { query: "kubernetes rollout", activated: [], matches: [], total: 0 },
+	},
+	{ id: "fallback", title: () => t("catalog.showcaseSearchFallback") },
+];
+
 /** Showcase index links for the tool catalog and tool search sections. */
 export function ShowcaseToolCatalogNav() {
-	return <a href="#showcase-tool-catalog">{t("catalog.showcaseNavDialog")}</a>;
+	return (
+		<>
+			<a href="#showcase-tool-catalog">{t("catalog.showcaseNavDialog")}</a>
+			<a href="#showcase-tool-search">{t("catalog.showcaseNavSearch")}</a>
+		</>
+	);
 }
 
 /**
@@ -237,6 +299,41 @@ export function ShowcaseToolCatalogNav() {
  * `<section id="showcase-…">` with an `<h2>` and a matching index link.
  */
 export function ShowcaseToolCatalog() {
+	return (
+		<>
+			<ShowcaseToolCatalogDialog />
+			<section id="showcase-tool-search">
+				<h2>{t("catalog.showcaseSearchHeading")}</h2>
+				<p className="fixture-note muted">{t("catalog.showcaseSearchNote")}</p>
+				{searchStates.map(state => (
+					<div className="tool-catalog-showcase" id={`showcase-tool-search-${state.id}`} key={state.id}>
+						<h3>{state.title()}</h3>
+						<article className="message tool">
+							<details className="tool-disclosure" open>
+								<summary>
+									<ChevronRight className="disclosure-chevron" aria-hidden="true" />
+									<span className="tool-name">{searchMessage.toolName}</span>
+								</summary>
+								<ToolSearchBody
+									message={searchMessage}
+									detail={state.search ? { callId: "DESIGN-ONLY-call", toolSearch: state.search } : undefined}
+									output={
+										<div className="tool-output">
+											<pre className="bounded-output">{searchMessage.text}</pre>
+										</div>
+									}
+								/>
+							</details>
+						</article>
+					</div>
+				))}
+			</section>
+		</>
+	);
+}
+
+/** Every Tools dialog state inline, plus the populated panel inside a real native dialog. */
+function ShowcaseToolCatalogDialog() {
 	const [open, setOpen] = useState(false);
 	return (
 		<section id="showcase-tool-catalog">

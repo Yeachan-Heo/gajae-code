@@ -813,6 +813,23 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-catalog-status { flex: 1 1 14rem; min-width: 0; font-size: 0.75rem; color: var(--muted); }
 .tool-catalog-status > p { margin: 0; }
 .tool-catalog-status > .tool-catalog-reason { color: var(--text); }
+/* The tool-search card body: the query, the tools it turned on, then the ranked matches. */
+.tool-search-body { display: flex; flex-direction: column; gap: 0.625rem; max-height: 20rem; overflow: auto; padding: 0.75rem; min-width: 0; }
+.tool-search-body > p { margin: 0; font-size: 0.8125rem; }
+.tool-search-query { color: var(--muted); }
+.tool-search-query code, .tool-search-match code { font-family: var(--mono); color: var(--text); overflow-wrap: anywhere; word-break: break-all; }
+.tool-search-activated { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; font-size: 0.75rem; }
+.tool-search-activated > span { color: var(--muted); }
+.tool-search-activated > ul { display: flex; flex-wrap: wrap; gap: 0.25rem; min-width: 0; margin: 0; padding: 0; list-style: none; }
+.tool-search-chip { display: inline-flex; padding: 0.0625rem 0.5rem; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent); font-family: var(--mono); font-size: 0.6875rem; line-height: 1.5; overflow-wrap: anywhere; word-break: break-all; }
+.tool-search-matches { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); }
+.tool-search-match { display: flex; flex-direction: column; gap: 0.125rem; min-width: 0; padding: 0.5rem 0.75rem; }
+.tool-search-match + .tool-search-match { border-top: 1px solid var(--border-soft); }
+.tool-search-match-title { display: flex; flex-wrap: wrap; align-items: center; gap: 0.125rem 0.5rem; font-size: 0.8125rem; }
+.tool-search-match-title > strong { font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-search-match-title code { font-size: 0.75rem; color: var(--muted); }
+.tool-search-match-description { overflow: hidden; color: var(--muted); font-size: 0.75rem; white-space: nowrap; text-overflow: ellipsis; }
+.tool-search-empty, .tool-search-total { color: var(--muted); }
 /* Showcase only: a dialog-sized frame so each state shows the pinned search, list and footer. */
 .tool-catalog-showcase { margin: 1.5rem 0 0; scroll-margin-top: 1rem; }
 .tool-catalog-frame { display: flex; flex-direction: column; max-height: 30rem; margin-top: 0.5rem; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); box-shadow: var(--shadow-soft); }

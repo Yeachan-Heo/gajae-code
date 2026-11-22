@@ -30,6 +30,11 @@ export const catalog = {
 	"catalog.searchChanged":
 		"A tool search changed this conversation's tools. Reload the list before saving; your changes are kept.",
 	"catalog.reload": "Reload",
+	"catalog.searchQuery": "Searched for",
+	"catalog.searchActivated": "Turned on",
+	"catalog.searchMatches": "Matching tools",
+	"catalog.searchNoMatches": "No matching tools found.",
+	"catalog.searchTotal": "Showing {shown} of {total} matches.",
 	"catalog.showcaseNavDialog": "Tools dialog",
 	"catalog.showcaseHeading": "Tools dialog · search, sections, tags and save states",
 	"catalog.showcaseNote":
@@ -49,4 +54,12 @@ export const catalog = {
 	"catalog.showcaseDisconnected": "Disconnected · Save waits",
 	"catalog.showcaseUnavailable": "Unavailable · another process owns the conversation",
 	"catalog.showcaseEmpty": "Empty registry",
+	"catalog.showcaseNavSearch": "Tool search results",
+	"catalog.showcaseSearchHeading": "Tool search results · expanded tool-search card body",
+	"catalog.showcaseSearchNote":
+		"Design example · The real tool-search body inside a static tool disclosure. Without a loaded tool.detail it keeps the plain output.",
+	"catalog.showcaseSearchPopulated": "Populated · turned-on tools, MCP servers, Korean and long descriptions",
+	"catalog.showcaseSearchCapped": "More matches than shown · nothing turned on",
+	"catalog.showcaseSearchEmpty": "No matches",
+	"catalog.showcaseSearchFallback": "Details not loaded · plain output",
 } as const;

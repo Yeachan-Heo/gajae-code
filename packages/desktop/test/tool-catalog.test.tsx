@@ -544,7 +544,7 @@ suite("Tools dialog", () => {
 		}
 	}, 30000);
 
-	test("the showcase renders every Tools dialog state without widening a 390 px page", async () => {
+	test("the showcase renders every Tools dialog and tool-search state without widening a 390 px page", async () => {
 		const context = await browser.createBrowserContext();
 		try {
 			const page = await context.newPage();
@@ -554,11 +554,21 @@ suite("Tools dialog", () => {
 			await page.goto(`${origin}/?showcase`);
 			await page.waitForSelector("#showcase-tool-catalog-empty");
 			const layout = await page.evaluate(() => ({
-				states: [...document.querySelectorAll("#showcase-tool-catalog .tool-catalog-showcase")].map(node => node.id),
-				nav: document.querySelector('.showcase-index a[href="#showcase-tool-catalog"]')?.textContent,
+				states: [...document.querySelectorAll("#showcase-tool-catalog .tool-catalog-showcase")].map(
+					node => node.id,
+				),
+				searchStates: [...document.querySelectorAll("#showcase-tool-search .tool-catalog-showcase")].map(
+					node => node.id,
+				),
+				nav: [
+					document.querySelector('.showcase-index a[href="#showcase-tool-catalog"]')?.textContent,
+					document.querySelector('.showcase-index a[href="#showcase-tool-search"]')?.textContent,
+				],
 				width: document.documentElement.clientWidth,
 				scroll: document.documentElement.scrollWidth,
-				frames: [...document.querySelectorAll(".tool-catalog-frame")].map(frame => frame.scrollWidth <= frame.clientWidth),
+				frames: [...document.querySelectorAll(".tool-catalog-frame")].map(
+					frame => frame.scrollWidth <= frame.clientWidth,
+				),
 			}));
 			expect(layout.states).toEqual(
 				[
@@ -577,7 +587,10 @@ suite("Tools dialog", () => {
 					"empty",
 				].map(state => `showcase-tool-catalog-${state}`),
 			);
-			expect(layout.nav).toBe("Tools dialog");
+			expect(layout.searchStates).toEqual(
+				["populated", "capped", "empty", "fallback"].map(state => `showcase-tool-search-${state}`),
+			);
+			expect(layout.nav).toEqual(["Tools dialog", "Tool search results"]);
 			expect(layout.scroll).toBeLessThanOrEqual(layout.width);
 			expect(layout.frames.every(Boolean)).toBe(true);
 			expect(errors).toEqual([]);
