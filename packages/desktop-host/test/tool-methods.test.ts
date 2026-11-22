@@ -10,7 +10,7 @@ import { DesktopHost } from "../src/host";
 import type { DesktopFrame, DesktopProject, DesktopRequest, DesktopSession } from "../src/protocol";
 import { parseRequest } from "../src/protocol";
 import { TOOL_DETAIL_GONE } from "../src/tool-projection";
-import type { DesktopToolDetail } from "../src/tool-protocol";
+import { DESKTOP_TOOL_LIMITS, type DesktopToolDetail, type DesktopToolList } from "../src/tool-protocol";
 
 describe("desktop tool methods on a live session", () => {
 	let environment: NodeJS.ProcessEnv;
@@ -133,5 +133,146 @@ describe("desktop tool methods on a live session", () => {
 		expect(JSON.parse(detail.args!)).toEqual({ env: { API_TOKEN: "[redacted]" }, cwd: "packages/app" });
 		expect(JSON.stringify(detail)).not.toContain("credential-1234567890");
 		expect(detail.truncated).toBeUndefined();
+	}, 30_000);
+
+	/**
+	 * `tool.detail` and `tools.list` answers skip the Host's emit-time redaction, so the projection
+	 * is the only guard. Each value puts the Host-learned key ten characters before its section's
+	 * cut: cutting first would leave the key's opening characters, which no later pass can match.
+	 */
+	const KEY = "QXJ9-kv7w-ZP2M-4tN8-Hc6R-credential";
+	const straddle = (fill: string, cut: number, offset = 0) => `${fill.repeat(cut - 10 - offset)}${KEY}`;
+	const expectNoKey = (value: unknown) => {
+		const text = JSON.stringify(value);
+		expect(text).not.toContain(KEY.slice(0, 6));
+		expect(text).not.toContain(KEY.slice(-10));
+	};
+
+	test("every tool.detail section is redacted by the Host's own credentials before its cut", async () => {
+		const h = await fixture();
+		await h.respond("auth.setKey", { provider: "unknown-provider", key: KEY });
+		const limits = DESKTOP_TOOL_LIMITS;
+		const call = (id: string, name: string, args: Record<string, unknown>) => ({
+			role: "assistant",
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id, name, arguments: args }],
+		});
+		const result = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: name,
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: 1,
+			...extra,
+		});
+		// The envelope names both files; the result names neither, so the headers do.
+		const envelope = `*** Begin Patch\n*** Update File: ${straddle("p", limits.subject)}\n*** Update File: b-${KEY}.ts\n*** End Patch`;
+		const args = JSON.stringify({ cwd: "" }, null, 2);
+		h.sdk.agent.replaceMessages([
+			call("toolu_edit", "edit", { input: envelope }),
+			result("toolu_edit", "edit", {
+				details: {
+					perFileResults: [
+						// The first file's diff fills the whole diff bound and crosses it.
+						{ diff: straddle("d", limits.diff), op: "update" },
+						{ diff: "", isError: true, displayErrorText: straddle("e", limits.description) },
+						// A path the result states wins over the envelope's.
+						{ path: straddle("r", limits.subject), diff: "+1|x" },
+					],
+				},
+			}),
+			call("toolu_write", "write", { file_path: `notes/${KEY}.md`, content: `top\n${KEY}\nend\n` }),
+			result("toolu_write", "write"),
+			call("toolu_bash", "bash", {
+				command: straddle("c", limits.args),
+				cwd: straddle("w", limits.args, args.indexOf('""') + 1),
+			}),
+			result("toolu_bash", "bash"),
+			call("toolu_search", "search_tool_bm25", { query: straddle("q", limits.subject) }),
+			result("toolu_search", "search_tool_bm25", {
+				details: {
+					query: straddle("q", limits.subject),
+					activated_tools: [KEY],
+					tools: [
+						{
+							name: `t-${KEY}`,
+							label: straddle("l", 100),
+							description: straddle("s", limits.description),
+							server_name: straddle("m", 100),
+						},
+					],
+				},
+			}),
+		] as never);
+		const detail = (callId: string) => h.call<DesktopToolDetail>("tool.detail", { sessionId: h.session.id, callId });
+
+		const edit = await detail("toolu_edit");
+		expect(edit.diff?.map(file => file.path)).toEqual([
+			`${"p".repeat(limits.subject - 10)}[redacted]`,
+			"b-[redacted].ts",
+			`${"r".repeat(limits.subject - 10)}[redacted]`,
+		]);
+		expect(edit.diff?.[0]?.diff).toBe(`${"d".repeat(limits.diff - 10)}[redacted]`);
+		expect(edit.diff?.[1]?.error).toBe(`${"e".repeat(limits.description - 10)}[redacted]`);
+		expectNoKey(edit);
+
+		const write = await detail("toolu_write");
+		expect(write.diff).toEqual([
+			{ path: "notes/[redacted].md", diff: "+1|top\n+2|[redacted]\n+3|end", added: 3, removed: 0 },
+		]);
+		expectNoKey(write);
+
+		const bash = await detail("toolu_bash");
+		expect(bash.command).toBe(`${"c".repeat(limits.args - 10)}[redacted]`);
+		expect(bash.args?.endsWith("[redacted]")).toBe(true);
+		expect(bash.args).toHaveLength(limits.args);
+		expectNoKey(bash);
+
+		const search = (await detail("toolu_search")).toolSearch;
+		expect(search).toMatchObject({
+			query: `${"q".repeat(limits.subject - 10)}[redacted]`,
+			activated: ["[redacted]"],
+			matches: [
+				{
+					name: "t-[redacted]",
+					label: `${"l".repeat(90)}[redacted]`,
+					description: `${"s".repeat(limits.description - 10)}[redacted]`,
+					mcpServer: `${"m".repeat(90)}[redacted]`,
+				},
+			],
+		});
+		expectNoKey(search);
+	}, 30_000);
+
+	test("every tools.list string is redacted by the Host's own credentials before its cut", async () => {
+		const h = await fixture();
+		await h.respond("auth.setKey", { provider: "unknown-provider", key: KEY });
+		const [name] = h.sdk.getAllToolNames();
+		const lookup = h.sdk.getToolByName.bind(h.sdk);
+		const tool = lookup(name!)!;
+		// A catalog bound ends in an ellipsis, so the visible text stops one character early; each
+		// value runs on past the bound so that the bound applies.
+		const cut = DESKTOP_TOOL_LIMITS.description - 1;
+		const long = (fill: string) => `${straddle(fill, cut)} and more`;
+		spies.push(
+			vi.spyOn(h.sdk, "getToolByName").mockImplementation(other =>
+				other === name
+					? Object.create(tool, {
+							label: { value: long("l") },
+							summary: { value: long("s") },
+							mcpServerName: { value: long("m") },
+						})
+					: lookup(other),
+			),
+		);
+		const list = await h.call<DesktopToolList>("tools.list", { sessionId: h.session.id });
+		const entry = list.tools?.find(item => item.name === name);
+		expect(entry).toMatchObject({
+			label: `${"l".repeat(cut - 10)}[redacted]…`,
+			description: `${"s".repeat(cut - 10)}[redacted]…`,
+			mcpServer: `${"m".repeat(cut - 10)}[redacted]…`,
+		});
+		expectNoKey(list);
 	}, 30_000);
 });
