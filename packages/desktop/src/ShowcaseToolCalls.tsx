@@ -1,7 +1,9 @@
 import type { DesktopMessage } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolCall, DesktopToolDetail } from "@gajae-code/desktop-host/tool-protocol";
+import { Message } from "./components";
 import { t } from "./i18n";
 import { ToolCallCard, ToolDetailContext, type ToolDetailSource } from "./ToolCallCard";
+import { groupTranscript, ToolRun } from "./transcript-groups";
 
 /** A fixture tool row; its call id doubles as the message id. */
 function fixture(
@@ -271,12 +273,84 @@ function detailFixtures(): Array<{ id: string; source: ToolDetailSource | null; 
 	];
 }
 
+/** Transcript slices for the grouping examples. */
+function groupFixtures(): Array<{ id: string; open: boolean; messages: DesktopMessage[] }> {
+	return [
+		{
+			id: "collapsed",
+			open: false,
+			messages: [
+				fixture("g1-read", "read", { family: "read", status: "done", subject: "src/ToolCallCard.tsx" }),
+				fixture("g1-read-2", "read", { family: "read", status: "done", subject: "src/transcript-groups.tsx" }),
+				fixture("g1-search", "search", {
+					family: "search",
+					status: "done",
+					subject: "groupTranscript · src/",
+					stats: { matches: 3, files: 2 },
+				}),
+				fixture(
+					"g1-test",
+					"bash",
+					{
+						family: "shell",
+						status: "failed",
+						subject: "$ bun test test/transcript-groups.test.ts",
+						stats: { exitCode: 1 },
+					},
+					{ text: t("tools.showcaseOutputFailed") },
+				),
+				fixture(
+					"g1-rerun",
+					"bash",
+					{ family: "shell", status: "running", subject: "$ bun test test/transcript-groups.test.ts" },
+					{ id: "call:showcase-g1-rerun", text: t("tools.showcaseOutputLive") },
+				),
+			],
+		},
+		{
+			id: "expanded",
+			open: true,
+			messages: [
+				fixture("g2-read", "read", { family: "read", status: "done", subject: "src/ToolCallCard.tsx" }),
+				{
+					id: "showcase-g2-reasoning",
+					role: "assistant",
+					text: "",
+					blocks: [{ type: "thinking", text: t("tools.showcaseReasoning") }],
+				},
+				fixture("g2-edit", "edit", {
+					family: "edit",
+					status: "done",
+					subject: "src/ToolCallCard.tsx",
+					stats: { added: 3, removed: 1 },
+				}),
+				fixture("g2-write", "write", {
+					family: "write",
+					status: "done",
+					subject: "docs/notes.md",
+					stats: { added: 12 },
+				}),
+			],
+		},
+		{
+			id: "typed-shell",
+			open: false,
+			messages: [
+				fixture("g3-read", "read", { family: "read", status: "done", subject: "package.json" }),
+				{ id: "showcase-g3-typed", role: "tool", toolName: "Direct shell", text: "git status\nOn branch main" },
+				fixture("g3-find", "find", { family: "find", status: "done", subject: "**/*.md", stats: { files: 9 } }),
+			],
+		},
+	];
+}
+
 /** Showcase index links for the tool call card sections. */
 export function ShowcaseToolCallsNav() {
 	return (
 		<>
 			<a href="#showcase-tool-calls">{t("tools.showcaseNavCalls")}</a>
 			<a href="#showcase-tool-details">{t("tools.showcaseNavDetails")}</a>
+			<a href="#showcase-tool-groups">{t("tools.showcaseNavGroups")}</a>
 		</>
 	);
 }
@@ -290,6 +364,7 @@ export function ShowcaseToolCalls() {
 		<>
 			<ShowcaseToolCallRows />
 			<ShowcaseToolDetails />
+			<ShowcaseToolGroups />
 		</>
 	);
 }
@@ -322,6 +397,31 @@ function ShowcaseToolDetails() {
 					<ToolDetailContext.Provider value={source}>
 						<ToolCallCard message={message} defaultOpen />
 					</ToolDetailContext.Provider>
+				</div>
+			))}
+		</section>
+	);
+}
+
+function ShowcaseToolGroups() {
+	return (
+		<section id="showcase-tool-groups">
+			<h2>{t("tools.showcaseGroupsHeading")}</h2>
+			<p className="muted">{t("tools.showcaseGroupsNote")}</p>
+			{groupFixtures().map(({ id, open, messages }) => (
+				<div key={id} id={`showcase-tool-group-${id}`}>
+					{groupTranscript(messages, messages.length).map(item =>
+						item.tools ? (
+							<ToolRun
+								key={item.key}
+								item={item}
+								initialOpen={open}
+								renderMessage={message => <Message message={message} />}
+							/>
+						) : (
+							item.messages.map(message => <Message key={message.id} message={message} />)
+						),
+					)}
 				</div>
 			))}
 		</section>

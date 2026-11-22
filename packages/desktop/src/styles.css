@@ -774,6 +774,27 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-diff-hunk { color: var(--muted); }
 .tool-diff-number { display: inline-block; min-width: 4ch; margin-right: 8px; color: var(--muted); text-align: right; user-select: none; }
 .tool-diff-sign { margin-right: 6px; }
+/* A run of calls is a wrapper; a single card keeps its own message rhythm. A group of two or more
+   is one collapsed summary card whose members, when opened, hang below it on a quiet rule. */
+.message.tool-run { padding: 0; }
+.message.tool-group { padding: 12px 0; }
+.tool-group .role-label { margin-bottom: 4px; }
+.tool-group-summary { display: flex; align-items: flex-start; gap: 8px; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); color: var(--text); text-align: left; font-size: 0.8125rem; }
+.tool-group-summary:hover { background: var(--surface-2); }
+.tool-group-summary svg { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 1.75; }
+.tool-group-summary > .disclosure-chevron { margin-top: 2px; }
+.tool-group-summary .disclosure-chevron[data-open] { transform: rotate(90deg); }
+.tool-group-head { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.tool-group-title { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-group-count { font-weight: 600; }
+.tool-group-kinds { color: var(--muted); }
+.tool-group-failed { display: inline-flex; align-items: center; gap: 4px; color: var(--error); }
+.tool-group-failed svg { width: 14px; height: 14px; }
+.tool-group-latest { min-width: 0; color: var(--muted); }
+.tool-group-latest .tool-call-verb { font-weight: 500; }
+.tool-group .tool-run-items { margin: 4px 0 0 12px; padding-left: 12px; border-left: 1px solid var(--border-soft); }
+.tool-group .tool-run-items > .message { padding: 6px 0; }
+.tool-group .tool-call > .role-label { display: none; }
 
 /* Section B: task list (TodoPanel.tsx, TodoToolBody.tsx, SessionWorkProgress.tsx). */
 .todo-progress { display: block; height: 0.25rem; margin-top: 0.25rem; overflow: hidden; border-radius: var(--radius-pill); background: var(--border-soft); }
