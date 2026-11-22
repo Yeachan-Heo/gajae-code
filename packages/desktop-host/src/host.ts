@@ -21,6 +21,7 @@ import {
 	createSessionImageInput,
 	deleteEmbeddedSession,
 	type EmbeddedAgentSessionResult,
+	type EmbeddedTranscriptTail,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	executeAcpBuiltinSlashCommand,
@@ -31,6 +32,7 @@ import {
 	type InputEventResult,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
+	readEmbeddedTranscriptTail,
 	resolveManagedSessionScope,
 	restoreSessionView,
 	type SdkComposerCompletionResult,
@@ -375,6 +377,11 @@ interface SavedSession {
 	sessionId?: string;
 	/** App presentation only: an exact SDK cursor, never ownership or mutation authority. */
 	view?: SdkSessionView;
+	/**
+	 * The transcript's newest entry this app held when `view` was saved. A different tail on
+	 * reopen means another surface appended. Absent on rows saved before it was recorded.
+	 */
+	viewTail?: string | null;
 	createdAt?: number;
 	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
 	managed?: true;
@@ -695,6 +702,11 @@ export class DesktopHost {
 						sessionId,
 						leafEntryId: view.leafEntryId === null ? null : requiredString(view, "leafEntryId", 128),
 					};
+				}
+				if (item.viewTail !== undefined) {
+					if (!session.view || (item.viewTail !== null && typeof item.viewTail !== "string"))
+						throw new Error("Invalid saved session view");
+					session.viewTail = item.viewTail === null ? null : requiredString(item, "viewTail", 128);
 				}
 				return session;
 			});
@@ -1286,7 +1298,16 @@ export class DesktopHost {
 				});
 			// Restore before publication or metadata reconciliation. A stale/foreign cursor
 			// must leave the saved intent intact, not silently publish the file's latest branch.
-			if (metadata.view) await restoreSessionView(result.session, metadata.view);
+			if (metadata.view) {
+				// A tail other than the one saved with the view means another surface (the terminal)
+				// continued this transcript: stay at its new tail, where the transcript opened, so
+				// those turns are visible and the next prompt continues them. Rows saved before tails
+				// were recorded, and an unreadable tail, keep restoring the exact view.
+				const tail = metadata.viewTail === undefined ? undefined : await this.#transcriptTail(candidate);
+				if (!tail || tail.committed === metadata.viewTail) await restoreSessionView(result.session, metadata.view);
+				else if (result.session.sessionId !== metadata.view.sessionId)
+					throw new Error("Saved session view identity does not match transcript");
+			}
 			// Construction notices were raised as the conversation opened: after its restored history.
 			for (const notice of candidate.notices) notice.anchor = result.session.messages.length;
 			// Materialization remains behind the SDK factory's owned manager.
@@ -1791,7 +1812,9 @@ export class DesktopHost {
 			if (!view) return;
 			await live.sdk.sessionManager.flush();
 			if (!this.#ownsView(live)) return;
-			this.#recordView(live, view);
+			const tail = await this.#transcriptTail(live);
+			if (!this.#ownsView(live)) return;
+			this.#recordView(live, view, tail);
 			await this.#save();
 		});
 		if (failures.length) throw new AggregateError(failures, "Session final view persistence failed");
@@ -1821,13 +1844,29 @@ export class DesktopHost {
 			throw error;
 		}
 	}
-	#recordView(candidate: SessionCandidate, flushed: SdkSessionView | undefined): void {
+	#recordView(
+		candidate: SessionCandidate,
+		flushed: SdkSessionView | undefined,
+		tail: EmbeddedTranscriptTail | undefined,
+	): void {
 		if (!flushed) return;
 		const current = this.#captureView(candidate);
 		// Flush yields to other inputs. Never replace saved intent with a cursor
 		// from an older operation, nor publish a cursor whose entries were not flushed.
-		if (current?.sessionId === flushed.sessionId && current.leafEntryId === flushed.leafEntryId)
-			candidate.metadata.view = current;
+		if (current?.sessionId !== flushed.sessionId || current.leafEntryId !== flushed.leafEntryId) return;
+		candidate.metadata.view = current;
+		// Saved together with the view. Without a readable tail there is no later-writer
+		// evidence, so the row restores exactly like one saved before tails were recorded.
+		if (tail) candidate.metadata.viewTail = tail.held;
+		else delete candidate.metadata.viewTail;
+	}
+	/** The committed transcript's tails; undefined when unreadable, which never blocks persistence. */
+	async #transcriptTail(candidate: SessionCandidate): Promise<EmbeddedTranscriptTail | undefined> {
+		try {
+			return await readEmbeddedTranscriptTail(candidate.sdk);
+		} catch {
+			return undefined;
+		}
 	}
 	async #flushSession(live: SessionCandidate, owner?: LiveSession): Promise<void> {
 		if (owner && !this.#ownsView(owner)) return;
@@ -1877,7 +1916,10 @@ export class DesktopHost {
 		if (owner && !this.#ownsView(owner)) return;
 		assertCurrent();
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
-		this.#recordView(live, view);
+		const tail = await this.#transcriptTail(live);
+		if (owner && !this.#ownsView(owner)) return;
+		assertCurrent();
+		this.#recordView(live, view, tail);
 	}
 	#cancelQuestions(owner?: LiveSession): void {
 		const failures: unknown[] = [];

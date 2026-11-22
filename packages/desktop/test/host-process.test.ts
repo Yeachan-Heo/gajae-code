@@ -395,24 +395,26 @@ for (const isolated of [true, false]) {
 				view: { sessionId: string; leafEntryId: string | null };
 			} = JSON.parse(seedOutput);
 			expect(selectedEntryId).not.toBe("");
-			// Appending to a transcript must not advance the app's saved exact view.
-			// First prove ordinary resume still selects the original branch, even at root.
+			// Another writer appended after the app saved its view, so the transcript's tail moved:
+			// resume lands on those appended turns instead of hiding them behind the older cursor.
 			host = launch();
 			await host.request("session.select", { sessionId: session.id });
-			const exactHistory = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
-			expect(exactHistory.messages.map(message => [message.role, message.text])).toEqual(
-				historyBeforeSeed.messages.map(message => [message.role, message.text]),
-			);
-			expect(exactHistory.messages.some(message => message.entryId === selectedEntryId)).toBe(false);
+			const continuedHistory = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
+			expect(continuedHistory.messages.map(message => [message.role, message.text])).toEqual([
+				...historyBeforeSeed.messages.map(message => [message.role, message.text]),
+				["user", "유지할 앞 메시지"],
+				["user", branchText],
+				["user", "제외할 뒤 메시지"],
+			]);
 			await host.request("shutdown");
 			expect(await host.child.exited).toBe(0);
 			await host.reader;
-			// Explicitly select the synthetic seed cursor in this stopped fixture's
-			// presentation catalog; production restore must never infer the latest leaf.
+			// The reopened tail became the saved cursor; keep selecting it explicitly in this
+			// stopped fixture's presentation catalog for the branch checks below.
 			const selectedCatalog: typeof seedCatalog = await Bun.file(path.join(dataAlias, "catalog.json")).json();
 			const selectedRow = selectedCatalog.sessions.find(item => item.id === session.id);
 			if (!selectedRow) throw new Error("Seeded session missing from catalog");
-			expect(selectedRow.view).toEqual(sourceRow.view);
+			expect(selectedRow.view).toEqual(view);
 			selectedRow.view = view;
 			await Bun.write(path.join(dataAlias, "catalog.json"), JSON.stringify(selectedCatalog));
 			host = launch();

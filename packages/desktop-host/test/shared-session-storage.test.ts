@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { registerCustomApi, unregisterCustomApis } from "@gajae-code/ai";
-import type { Model } from "@gajae-code/ai/core";
+import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -145,6 +145,7 @@ interface SharedCatalog {
 		sessionId: string;
 		createdAt?: number;
 		view?: SdkSessionView;
+		viewTail?: string | null;
 	}>;
 }
 
@@ -185,6 +186,42 @@ async function controlledFixture(handler?: () => Promise<void>) {
 /** The terminal's own resume path, used here as the other surface of the shared store. */
 async function resumeAsTerminal(file: string, cwd: string, agentDir: string) {
 	return SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
+}
+
+/** One complete turn written by the terminal: its prompt and a finished answer. */
+async function continueInTerminal(
+	file: string,
+	cwd: string,
+	agentDir: string,
+	track: (manager: SessionManager) => SessionManager,
+) {
+	const terminal = track(await resumeAsTerminal(file, cwd, agentDir));
+	const prompt = terminal.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: "continued in the terminal" }],
+		timestamp: Date.now(),
+	});
+	const answer: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "answered in the terminal" }],
+		api: "openai-completions",
+		provider: "terminal-fixture",
+		model: "terminal-model",
+		stopReason: "stop",
+		timestamp: Date.now(),
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	};
+	const tail = terminal.appendMessage(answer);
+	await terminal.flush();
+	expect(await terminal.closeStrict()).toMatchObject({ kind: "closed" });
+	return { prompt, tail };
 }
 
 test("exact old, revised and continued views survive fresh host and SDK owners without provider calls", async () => {
@@ -243,7 +280,11 @@ test("exact old, revised and continued views survive fresh host and SDK owners w
 	expect(captureSessionView(h.sdk())).toEqual(latest);
 	expect(h.model.calls).toHaveLength(callsAfterContinuation);
 	const row = (await readCatalog(h.dataDir)).sessions[0]!;
-	expect({ ...row, view: undefined }).toEqual({ ...rowBefore, view: undefined });
+	expect({ ...row, view: undefined, viewTail: undefined }).toEqual({
+		...rowBefore,
+		view: undefined,
+		viewTail: undefined,
+	});
 	expect(row.id).toBe(sessionId);
 	expect(row.sessionId).toBe(oldView.sessionId);
 	expect((await Bun.file(transcript).text()).startsWith(bytes)).toBe(true);
@@ -400,6 +441,84 @@ test("persisted view shape and catalog or actual SDK identity mismatches are rej
 	await expect(h.call("session.select", { sessionId })).rejects.toThrow();
 	expect((await readCatalog(h.dataDir)).sessions[0]).toEqual(forged);
 	expect(h.model.calls).toHaveLength(calls);
+});
+
+test("a saved view does not hide turns the terminal appended after it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const saved = captureSessionView(h.sdk());
+	const transcript = h.sdk().sessionFile!;
+	await h.call("project.close", { projectId: h.project.id });
+	expect((await readCatalog(h.dataDir)).sessions[0]?.view).toEqual(saved);
+	const { tail } = await continueInTerminal(transcript, h.projectDir, h.agentDir, h.track);
+	const calls = h.model.calls.length;
+	await h.restart();
+	await h.call("project.open", { path: h.projectDir });
+	await h.call("session.select", { sessionId });
+	// The reopened conversation lands where the terminal left it, not on the older saved cursor.
+	expect(captureSessionView(h.sdk())).toEqual({ sessionId: saved.sessionId, leafEntryId: tail });
+	const history = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(history.messages.map(message => message.text)).toEqual([
+		"app turn",
+		"controlled answer",
+		"continued in the terminal",
+		"answered in the terminal",
+	]);
+	expect(h.model.calls).toHaveLength(calls);
+	// The next app prompt continues the terminal's turn instead of branching beside it.
+	await h.call("prompt", { sessionId, text: "app continues" });
+	// SDK bookkeeping may sit between them; the terminal's answer is still the prompt's ancestor.
+	expect(
+		h
+			.sdk()
+			.sessionManager.getBranch(h.lastUser())
+			.map(entry => entry.id),
+	).toContain(tail);
+	const continued = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(continued.messages.map(message => message.text)).toEqual([
+		"app turn",
+		"controlled answer",
+		"continued in the terminal",
+		"answered in the terminal",
+		"app continues",
+		"controlled answer",
+	]);
+});
+
+test("a row saved before tails were recorded keeps restoring its exact view", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const saved = captureSessionView(h.sdk());
+	const transcript = h.sdk().sessionFile!;
+	await h.close();
+	const catalog = await readCatalog(h.dataDir);
+	delete catalog.sessions[0]!.viewTail;
+	await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify(catalog));
+	await continueInTerminal(transcript, h.projectDir, h.agentDir, h.track);
+	await h.restart();
+	await h.call("session.select", { sessionId });
+	// Without a recorded tail there is no evidence of who wrote later: restore exactly, as before.
+	expect(captureSessionView(h.sdk())).toEqual(saved);
+	const history = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(JSON.stringify(history.messages)).not.toContain("continued in the terminal");
+});
+
+test("a recorded tail needs a saved view and an entry id", async () => {
+	const h = await controlledFixture();
+	await h.call("prompt", { sessionId: h.session.id, text: "app turn" });
+	await h.close();
+	const catalog = await readCatalog(h.dataDir);
+	const row = catalog.sessions[0]!;
+	expect(typeof row.viewTail).toBe("string");
+	for (const invalid of [
+		{ ...row, viewTail: 17 },
+		{ ...row, view: undefined },
+	]) {
+		await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify({ ...catalog, sessions: [invalid] }));
+		await expect(h.restart()).rejects.toThrow("Invalid saved session view");
+	}
 });
 
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {

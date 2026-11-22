@@ -460,6 +460,44 @@ export async function forkEmbeddedSession(
 	}
 }
 
+/** Where a transcript stands on disk relative to one open session's copy of it. */
+export interface EmbeddedTranscriptTail {
+	/** Newest committed entry: where any surface that opens the transcript now lands. Null when empty. */
+	committed: string | null;
+	/**
+	 * Newest committed entry this session holds. It equals `committed` until another process
+	 * appends; after that it names this session's last known position in the file.
+	 */
+	held: string | null;
+}
+
+/**
+ * Read the committed transcript without touching the session's cursor, entries or writer state.
+ * Undefined when nothing readable is published for this session: absent, unsupported, or a
+ * different transcript identity at its path.
+ */
+export async function readEmbeddedTranscriptTail(
+	session: Pick<CreateAgentSessionResult["session"], "sessionManager">,
+): Promise<EmbeddedTranscriptTail | undefined> {
+	const manager = session.sessionManager;
+	const read = await manager.captureCommittedSnapshot();
+	if (read.kind !== "snapshot" || read.snapshot.sessionId !== manager.getSessionId()) return undefined;
+	const { entryIds } = read.snapshot;
+	let held: string | null = null;
+	for (let index = entryIds.length - 1; index >= 0 && held === null; index--)
+		if (manager.getEntry(entryIds[index]!)) held = entryIds[index]!;
+	return { committed: entryIds.at(-1) ?? null, held };
+}
+
+/**
+ * True once the store refused this session's write because another process changed the
+ * transcript after this session read it. The refusal lasts for the session's lifetime: reopen
+ * the transcript to continue.
+ */
+export function isEmbeddedAppendRefused(session: Pick<CreateAgentSessionResult["session"], "sessionManager">): boolean {
+	return session.sessionManager.getAppendIdentityMismatch() !== undefined;
+}
+
 /** The embedding must first release its writer and remove the durable catalog reference. */
 export async function deleteEmbeddedSession(file: string, options?: { managed: true }): Promise<void> {
 	if (options?.managed && (await Bun.file(file).exists())) await SessionManager.deleteManagedCandidate(file);

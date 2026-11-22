@@ -425,6 +425,16 @@ means the intentionally viewed empty root. Refresh the descriptor after settled
 prompts, revision selection and other transcript mutations, including settled
 teardown; a busy capture must never replace the previous saved intent.
 
+A saved view can go stale when another surface continues the transcript. Save the
+`held` id from `await readEmbeddedTranscriptTail(session)` together with the view.
+On reopen, restore the view only when the transcript's `committed` tail still equals
+that saved id; otherwise stay where the transcript opened, at its newest entry, so the
+other surface's turns are visible and the next prompt continues them. While a session
+is open, `committed !== held` means another process appended after this session read
+the file. `isEmbeddedAppendRefused(session)` reports the store's lasting refusal of a
+stale writer; reopen the transcript to continue. Both read only; neither changes the
+session's cursor, entries or writer state.
+
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
 `releaseResources()` joins actual session disposal before closing the embedding's

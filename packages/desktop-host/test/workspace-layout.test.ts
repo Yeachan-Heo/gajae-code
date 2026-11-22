@@ -668,7 +668,9 @@ describe("desktop workspace layout", () => {
 			const successor = created[1]!.session;
 			expect(successor.sessionManager.getSessionFile()).toBe(sdk.sessionManager.getSessionFile());
 			expect(successor.sessionManager.getSessionId()).toBe(sdk.sessionManager.getSessionId());
-			expect(captureSessionView(successor)).toEqual(initial);
+			// The retiring owner appended after the saved view, so the transcript's tail moved and
+			// the successor opens there instead of hiding that append behind the older view.
+			expect(captureSessionView(successor)).toEqual(final);
 			await restoreSessionView(successor, { sessionId: successor.sessionId, leafEntryId: null });
 			await call("session.star", { sessionId: session.id, starred: true });
 			const selected = captureSessionView(successor);
