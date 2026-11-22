@@ -82,4 +82,34 @@ suite("Session work visuals", () => {
 			await context.close();
 		}
 	}, 60000);
+
+	test("the Identity disclosure shows only the app's chevron, turned when open", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			const summary = "#showcase-session-work .activity-details > summary";
+			await page.waitForSelector(summary);
+			const disclosure = () =>
+				page.$eval(summary, node => {
+					const chevron = node.querySelector(".disclosure-chevron")!;
+					const style = getComputedStyle(node);
+					// Any browser marker would take room before the chevron, which is the summary's first child.
+					return {
+						chevronFirst:
+							chevron.getBoundingClientRect().left <=
+							node.getBoundingClientRect().left + Number.parseFloat(style.paddingLeft) + 0.5,
+						turned: getComputedStyle(chevron).transform !== "none",
+					};
+				});
+			expect(await disclosure()).toEqual({ chevronFirst: true, turned: false });
+			await page.click(summary);
+			await page.waitForSelector("#showcase-session-work .activity-details[open]");
+			expect(await disclosure()).toEqual({ chevronFirst: true, turned: true });
+		} finally {
+			await context.close();
+		}
+	}, 30000);
 });

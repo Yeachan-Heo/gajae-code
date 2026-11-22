@@ -445,6 +445,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .activity-meta, .activity-empty { color: var(--muted); font-size: 0.75rem; }
 .activity-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0; }
 .activity-actions { margin-top: 12px; }
+/* Like the tool disclosure: the app's chevron is the only marker, and it turns when open. */
+.activity-details > summary { display: inline-flex; align-items: center; gap: 4px; list-style: none; }
+.activity-details > summary::-webkit-details-marker { display: none; }
+.activity-details[open] > summary .disclosure-chevron { transform: rotate(90deg); }
 .gate-evidence dl { display: grid; grid-template-columns: minmax(64px, auto) minmax(0, 1fr); gap: 4px 12px; margin: 8px 0; }
 .gate-evidence dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .gate-dialog { width: min(800px, calc(100vw - 32px)); }

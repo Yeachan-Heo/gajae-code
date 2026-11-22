@@ -78,7 +78,7 @@ Operations expose pending/failure, preserve drafts on failure, prevent duplicate
 
 ## Motion and depth
 
-120ms color/opacity transitions and a small disclosure-chevron rotation; reduced-motion disables transitions/animations. Loading icons are static: visible text conveys activity without requiring motion. One soft overlay shadow on dialogs only; no per-token animation. Keep native dialog focus containment, Escape cancellation and trigger restoration unchanged.
+120ms color/opacity transitions and a small disclosure-chevron rotation (every `<details>` disclosure, such as a Session work entry's Identity, hides the browser's own marker, so the chevron is its only marker); reduced-motion disables transitions/animations. Loading icons are static: visible text conveys activity without requiring motion. One soft overlay shadow on dialogs only; no per-token animation. Keep native dialog focus containment, Escape cancellation and trigger restoration unchanged.
 
 ## Responsive
 
