@@ -1570,6 +1570,7 @@ export class Agent {
 	restoreSteering(messages: AgentMessage[]): void {
 		if (messages.length === 0) return;
 		this.#steeringQueue = [...messages, ...this.#steeringQueue];
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 	}
 
 	/** Snapshot the follow-up queue without mutating it. */
@@ -1581,6 +1582,7 @@ export class Agent {
 	restoreFollowUp(messages: AgentMessage[]): void {
 		if (messages.length === 0) return;
 		this.#followUpQueue = [...messages, ...this.#followUpQueue];
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 	}
 
 	/** Snapshot both executable queues as one atomic session-level view. */
