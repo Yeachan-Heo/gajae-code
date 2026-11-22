@@ -2,7 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DesktopAuthProvider, DesktopAuthState, DesktopModel } from "@gajae-code/desktop-host/protocol";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import type { ProviderKeyState } from "../src/ProvidersPanel";
+import { type DesktopThemeId, THEME_IDS, THEME_STORAGE_KEY } from "../src/themes";
 import { browserPath, closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
+import { measureContrast } from "./fixtures/contrast";
 
 const suite = browserPath ? describe : describe.skip;
 
@@ -54,6 +56,8 @@ interface Control {
 	select(provider: string | null): void;
 	/** Dialog fixtures only: mounts or unmounts the native `Modal` around the panel. */
 	open(value: boolean): void;
+	/** Applies a bundled theme the way the app does (`applyTheme`). */
+	theme(id: DesktopThemeId): void;
 	calls(): Call[];
 }
 interface FixtureOptions {
@@ -119,6 +123,7 @@ async function fixture(width = 1000, options: FixtureOptions = {}): Promise<{ co
 					import { Modal } from '/src/components.tsx';
 					import { ProvidersPanel } from '/src/ProvidersPanel.tsx';
 					import { projectProviders, visibleFlow } from '/src/provider-status.ts';
+					import { applyTheme } from '/src/themes.ts';
 					const h = React.createElement;
 					const calls = [];
 					const dialog = ${options.dialog === true};
@@ -127,7 +132,7 @@ async function fixture(width = 1000, options: FixtureOptions = {}): Promise<{ co
 						const [selected, setSelected] = React.useState(null);
 						const [query, setQuery] = React.useState('');
 						const [open, setOpen] = React.useState(${options.closed !== true});
-						window.providersTest = { set: next => setData(previous => ({ ...previous, ...next })), select: setSelected, open: setOpen, calls: () => calls };
+						window.providersTest = { set: next => setData(previous => ({ ...previous, ...next })), select: setSelected, open: setOpen, theme: applyTheme, calls: () => calls };
 						const owned = new Set(data.owned);
 						const shown = visibleFlow(data.flow, owned);
 						const panel = h(ProvidersPanel, {
@@ -561,6 +566,82 @@ suite("Providers panel interactions", () => {
 					}).toEqual({ width, size, problems: [] });
 				}
 			}
+		} finally {
+			await context.close();
+		}
+	}, 60000);
+
+	test("amber flow-card text, the failed status and the key error clear 4.5:1 in every bundled theme", async () => {
+		const { context, page } = await fixture(1000, { dialog: true });
+		try {
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			const failures: string[] = [];
+			const check = async (theme: string, state: string, selectors: string[]) => {
+				for (const sample of await page.evaluate(measureContrast, selectors))
+					if (sample.ratio < 4.5) failures.push(`${theme} · ${state} · "${sample.text}": ${sample.ratio}`);
+			};
+			const warning = { id: "00000000-0000-4000-8000-0000000000a1", message: "Fixture risk notice" };
+			for (const theme of THEME_IDS) {
+				await page.evaluate(id => window.providersTest.theme(id), theme);
+				// A sign-in this dialog started has failed: its row at rest and under the pointer.
+				await select(page, null);
+				await set(page, {
+					flow: flow({ provider: "gamma", status: "error", error: "Denied" }),
+					owned: [FLOW],
+					keyState: null,
+				});
+				const failed = '.provider-row[data-provider-id="gamma"] .provider-status[data-state="failed"]';
+				await page.waitForSelector(failed);
+				await page.mouse.move(1, 1);
+				await check(theme, "failed row", [failed]);
+				await page.hover('.provider-row[data-provider-id="gamma"]');
+				await check(theme, "failed row under the pointer", [failed]);
+				await select(page, "gamma");
+				await page.waitForSelector('.provider-flow[data-view="failed"]');
+				await check(theme, "failed detail", ['.provider-detail-head .provider-status[data-state="failed"]']);
+				// The amber outcome cards: connected without models, and saved without a refreshed list.
+				await set(page, { flow: flow({ provider: "beta", status: "complete" }) });
+				await select(page, "beta");
+				await page.waitForSelector('.provider-flow[data-view="connected"][data-tone="waiting"]');
+				await check(theme, "connected without models", [".provider-flow-status"]);
+				await set(page, { flow: flow({ provider: "beta", status: "waiting", warning }) });
+				await page.waitForSelector('.provider-flow[data-view="warning"][data-tone="waiting"]');
+				await check(theme, "provider warning", [".provider-flow-status", ".provider-warning > h5", ".provider-warning > p"]);
+				await set(page, { flow: null, keyState: { provider: "delta", status: "saved", catalogRefreshed: false } });
+				await select(page, "delta");
+				await page.waitForSelector('.provider-flow[data-view="saved-refresh-failed"][data-tone="waiting"]');
+				await check(theme, "saved without a refreshed list", [".provider-flow-status"]);
+				await set(page, { keyState: { provider: "delta", status: "invalid", reason: "command" } });
+				await page.waitForSelector(".provider-field-error");
+				await check(theme, "key error", [".provider-field-error"]);
+			}
+			expect(failures).toEqual([]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 60000);
+
+	test("the onboarding notice's text clears 4.5:1 on its amber card in every bundled theme", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			const failures: string[] = [];
+			for (const theme of THEME_IDS) {
+				await page.evaluate((key, id) => localStorage.setItem(key, id), THEME_STORAGE_KEY, theme);
+				await page.reload();
+				await page.waitForFunction(id => document.documentElement.dataset.theme === id, {}, theme);
+				await page.waitForSelector("#showcase-provider-onboarding .provider-notice");
+				const samples = await page.evaluate(measureContrast, [
+					"#showcase-provider-onboarding .provider-notice-dock .provider-notice-text > strong",
+					"#showcase-provider-onboarding .provider-notice-dock .provider-notice-text > span",
+					"#showcase-provider-onboarding .composer-area .provider-notice-text > span",
+				]);
+				for (const sample of samples)
+					if (sample.ratio < 4.5) failures.push(`${theme} · "${sample.text}": ${sample.ratio}`);
+			}
+			expect(failures).toEqual([]);
 		} finally {
 			await context.close();
 		}

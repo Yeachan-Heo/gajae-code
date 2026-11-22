@@ -919,6 +919,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .providers-dialog { width: min(640px, calc(100vw - 32px)); }
 /* The dialog's generic section/form rhythm must not stack on the panel's own grid. */
 .providers-panel { display: grid; gap: 0.75rem; min-width: 0; }
+/* Error words mix the error hue toward the body ink, so they clear 4.5:1 on the card, a hovered row
+   and inset surfaces in every bundled palette; dots and icons keep the pure hue. */
+.providers-panel { --provider-error-ink: color-mix(in srgb, var(--status-error) 60%, var(--text)); }
 .providers-panel :is(section, form) { margin: 0; }
 .providers-panel form > .button { margin-top: 0; }
 .providers-panel :is(p, h3, h4, h5, label) { margin: 0; }
@@ -951,7 +954,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-status[data-state="ready"] { color: var(--status-done); }
 .provider-status[data-state="configured"] { color: var(--status-waiting); }
 .provider-status[data-state="connecting"] { color: var(--status-running); }
-.provider-status[data-state="failed"] { color: var(--status-error); }
+.provider-status[data-state="failed"] { color: var(--provider-error-ink); }
+.provider-status[data-state="failed"]::before { background: var(--status-error); }
 .provider-empty { padding: 1.5rem 0.75rem; border: 1px dashed var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); color: var(--muted); text-align: center; }
 .provider-detail { display: grid; gap: 0.875rem; min-width: 0; }
 .provider-back { justify-self: start; padding-left: 0.25rem; color: var(--muted); }
@@ -964,7 +968,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-field-row { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
 .provider-field-row > input { flex: 1 1 12rem; }
 .provider-field-row > .button { flex: none; }
-.provider-field-error { color: var(--status-error); font-size: 0.75rem; }
+.provider-field-error { color: var(--provider-error-ink); font-size: 0.75rem; }
 .provider-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .provider-blocked { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; padding: 0.625rem 0.75rem; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); font-size: 0.8125rem; }
 .provider-link { min-height: 0; padding: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
@@ -980,6 +984,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-flow[data-tone="done"] .provider-flow-heading > svg { color: var(--status-done); }
 .provider-flow[data-tone="waiting"] .provider-flow-heading > svg { color: var(--status-waiting); }
 .provider-flow-status { color: var(--muted); font-size: 0.8125rem; }
+/* Text on an amber-tinted card uses the body ink: muted ink falls under 4.5:1 on the tint in some
+   palettes. The amber stays on the card's edge, its icon and its heading. */
+.provider-flow[data-tone="waiting"] .provider-flow-status { color: var(--text); }
 .provider-code { display: grid; gap: 0.25rem; justify-items: start; }
 .provider-code > span { color: var(--muted); font-size: 0.75rem; }
 .provider-code-value { padding: 0.5rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); font-family: var(--mono); font-size: 1.5rem; font-weight: 600; letter-spacing: 0.12em; overflow-wrap: anywhere; word-break: break-all; user-select: all; }
@@ -994,7 +1001,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .provider-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; max-width: 800px; min-width: 0; margin: 0 auto 8px; padding: 0.75rem 0.875rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
 .provider-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; color: var(--status-waiting); }
 .provider-notice-text { flex: 1 1 16rem; min-width: 0; display: grid; gap: 2px; }
-.provider-notice-text > span { color: var(--muted); font-size: 0.8125rem; }
+.provider-notice-text > span { font-size: 0.8125rem; }
 .provider-notice-action { flex: none; margin-left: auto; }
 /* Below the empty state, which takes the free space, so the notice lands at the column's bottom. */
 .provider-notice-dock { flex: none; padding: 12px 24px 20px; }
