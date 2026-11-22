@@ -442,6 +442,15 @@ A read taken within 10 ms of the file's last change (2 s when the filesystem rep
 whole-millisecond times) is not reused, because a write in the same timestamp tick could
 leave every field equal.
 
+To show a conversation the application does not hold open, for example one it released
+so another surface could continue it, call `await readEmbeddedTranscriptHistory(file, leaf?)`.
+It parses the transcript without opening a session, taking a writer or rewriting the file, and
+returns `{ sessionId, tail, leafId, messages }`. Pass the saved view as
+`{ entryId: view.leafEntryId, whenTail: savedHeldTail }` to show the same position a reopen
+would: the saved entry while `whenTail` is still the newest entry (or when no tail was
+recorded), otherwise the newest entry. It returns `undefined` for an absent, oversized or
+unreadable file. The result is display data only; reopen the transcript to continue it.
+
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
 `releaseResources()` joins actual session disposal before closing the embedding's

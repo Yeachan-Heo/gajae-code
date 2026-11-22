@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { AgentMessage } from "@gajae-code/agent-core";
 import { postmortem } from "@gajae-code/utils";
 import { releaseSettingsScope } from "../capability";
 import { isSessionCredentialPinBlocking } from "../config/model-profile-activation";
@@ -12,7 +13,14 @@ import { initializeLocalRoot } from "../internal-urls";
 import { usePostmortemSignalExitAuthority } from "../lsp/client";
 import { type InitializeExtensionsOptions, initializeExtensions } from "../modes/runtime-init";
 import { AgentRegistry } from "../registry/agent-registry";
-import { type SessionEntry, SessionManager } from "../session/session-manager";
+import {
+	buildSessionContext,
+	migrateSessionEntries,
+	parseSessionEntries,
+	RESUME_TRANSCRIPT_MAX_BYTES,
+	type SessionEntry,
+	SessionManager,
+} from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { createSdkPreferenceControls } from "./preference-controls";
 import type { SdkRevisionInput, SdkRevisionResult } from "./protocol/revision-contracts";
@@ -568,6 +576,61 @@ export async function readEmbeddedTranscriptTail(
 	)
 		transcriptTails.set(manager, { stamp: after, tail: { ...tail } });
 	return tail;
+}
+
+/** The conversation a transcript shows, read without opening a writer. */
+export interface EmbeddedTranscriptHistory {
+	/** Transcript identity from its header. */
+	sessionId: string;
+	/** Newest entry: where any surface that opens the transcript lands. Null when empty. */
+	tail: string | null;
+	/** The entry the messages lead to. */
+	leafId: string | null;
+	/** That branch's conversation, as an opened session would show it. */
+	messages: AgentMessage[];
+}
+
+/**
+ * Read a transcript's conversation for display without opening a session, taking a writer or
+ * migrating the file. `leaf` selects a saved position: it is shown when `whenTail` is still the
+ * newest entry (or was never recorded), otherwise the newest entry is, exactly as reopening the
+ * transcript after another surface appended would land. An unknown target also falls back to the
+ * newest entry. Undefined when the file is absent, larger than a resumable transcript, or not a
+ * readable transcript.
+ */
+export async function readEmbeddedTranscriptHistory(
+	file: string,
+	leaf?: { entryId: string | null; whenTail?: string | null },
+): Promise<EmbeddedTranscriptHistory | undefined> {
+	let entries: ReturnType<typeof parseSessionEntries>;
+	try {
+		const stat = await fs.stat(file);
+		if (!stat.isFile() || stat.size > RESUME_TRANSCRIPT_MAX_BYTES) return undefined;
+		entries = parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(await Bun.file(file).bytes()));
+	} catch {
+		return undefined;
+	}
+	const header = entries[0];
+	if (header?.type !== "session" || typeof header.id !== "string") return undefined;
+	// Migration only shapes this in-memory copy; the file is never rewritten here.
+	migrateSessionEntries(entries);
+	const sessionEntries = entries.filter(
+		(entry): entry is SessionEntry => entry.type !== "session" && typeof entry.id === "string",
+	);
+	const tail = sessionEntries.at(-1)?.id ?? null;
+	const target = leaf?.entryId;
+	const leafId =
+		leaf &&
+		(leaf.whenTail === undefined || leaf.whenTail === tail) &&
+		(target === null || sessionEntries.some(entry => entry.id === target))
+			? (target ?? null)
+			: tail;
+	return {
+		sessionId: header.id,
+		tail,
+		leafId,
+		messages: buildSessionContext(sessionEntries, leafId, undefined, header.id).messages,
+	};
 }
 
 /**
