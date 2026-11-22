@@ -472,6 +472,21 @@ describe("tool call details", () => {
 		);
 	});
 
+	test("a write's content is redacted whole before its lines are numbered, and file_path names it too", () => {
+		// Line prefixes inside the value would hide a secret that spans lines from exact matching.
+		const secret = "line-one-SECRET\nline-two-SECRET";
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]").replaceAll("path-SECRET", "[redacted]");
+		const written = detail(
+			pair("write", { file_path: "notes/path-SECRET.md", content: `head\n${secret}\ntail\n` }),
+			"c1",
+			redact,
+		);
+		expect(written.diff).toEqual([
+			{ path: "notes/[redacted].md", diff: "+1|head\n+2|[redacted]\n+3|tail", added: 3, removed: 0 },
+		]);
+		expect(JSON.stringify(written)).not.toContain("SECRET");
+	});
+
 	test("a tool search shows its bounded matches and a todo write its task list", () => {
 		const tools = Array.from({ length: 30 }, (_, index) => ({
 			name: `tool_${index}`,

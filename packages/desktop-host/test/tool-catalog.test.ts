@@ -198,6 +198,22 @@ describe("tools.list projection", () => {
 		// The name lists stay complete: they are what `tools.set` validates against.
 		expect(result.available).toHaveLength(tools.length);
 	});
+
+	test("redacts a label and a summary before trimming their edges", () => {
+		// Trimming first would strip the edge that makes the source an exact secret match.
+		const secret = " edge-secret-42";
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]");
+		const result = projectToolCatalog(
+			fakeSession([{ name: "edge", label: `${secret} `, summary: `Reads${secret}\n` }], {
+				active: ["edge"],
+				discoverable: [],
+				selected: [],
+			}),
+			redact,
+		);
+		expect(result.tools?.[0]).toMatchObject({ label: "[redacted]", description: "Reads[redacted]" });
+		expect(JSON.stringify(result)).not.toContain("edge-secret");
+	});
 });
 
 describe("tools.list on a real SDK session", () => {

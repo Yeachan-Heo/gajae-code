@@ -53,9 +53,9 @@ function bound(text: string, limit: number): string {
  * are long model prompts, so only that opening line describes the tool to a person.
  */
 function describeTool(tool: CatalogTool, redact: (text: string) => string): string | undefined {
-	const summary = typeof tool.summary === "string" ? tool.summary.trim() : "";
-	// Redaction sees the whole source string before any paragraph, sentence or length cut.
-	const source = summary ? redact(summary) : typeof tool.description === "string" ? redact(tool.description) : "";
+	// Redaction sees the whole source string before any trim, paragraph, sentence or length cut.
+	const summary = typeof tool.summary === "string" && tool.summary.trim() ? redact(tool.summary).trim() : "";
+	const source = summary || (typeof tool.description === "string" ? redact(tool.description) : "");
 	const paragraph = (source.split(/\n\s*\n/u).find(part => part.trim()) ?? "")
 		.replaceAll("`", "")
 		.replace(/\s+/gu, " ")
@@ -93,7 +93,7 @@ export function projectToolCatalog(session: ToolCatalogSession, redact: (text: s
 		const tool = session.getToolByName(name);
 		const searchable = discoverable.get(name);
 		const isActive = active.has(name);
-		const label = typeof tool?.label === "string" && tool.label.trim() ? tool.label.trim() : name;
+		const label = typeof tool?.label === "string" && tool.label.trim() ? redact(tool.label).trim() : redact(name);
 		const description = tool ? describeTool(tool, redact) : undefined;
 		const server =
 			tool && "mcpServerName" in tool && typeof tool.mcpServerName === "string" && tool.mcpServerName
@@ -104,7 +104,7 @@ export function projectToolCatalog(session: ToolCatalogSession, redact: (text: s
 		const discovered = selected.has(name) && !server;
 		return {
 			name: redact(name),
-			label: bound(redact(label), DESKTOP_TOOL_LIMITS.description),
+			label: bound(label, DESKTOP_TOOL_LIMITS.description),
 			...(description ? { description } : {}),
 			active: isActive,
 			origin: origin(tool, searchable !== undefined, selected.has(name)),

@@ -544,7 +544,11 @@ function diffEntries(
 	redact: (text: string) => string,
 ): { diff: DesktopToolDiff[]; truncated: boolean } | undefined {
 	const details = record(result?.details);
-	const sources: Array<{ path: unknown; diff: unknown; op?: unknown; error?: unknown }> =
+	// An edit's diff arrives already numbered by the SDK and is redacted as it stands. A write's
+	// content is redacted whole first: numbering its lines would split a secret that spans them.
+	const content = family === "write" && result?.isError !== true ? call?.arguments.content : undefined;
+	const written = typeof content === "string" && content.length <= MAX_REDACTION_CHARS ? redact(content) : undefined;
+	const sources: Array<{ path: unknown; diff: unknown; redacted?: boolean; op?: unknown; error?: unknown }> =
 		family === "edit"
 			? editDiffs(details).map((item, index) => ({
 					path: item.path ?? details?.path ?? callPath(call, index, redact),
@@ -552,19 +556,17 @@ function diffEntries(
 					op: item.op,
 					error: item.isError === true ? (item.displayErrorText ?? item.errorText) : undefined,
 				}))
-			: family === "write" &&
-					call &&
-					typeof call.arguments.content === "string" &&
-					call.arguments.content.length <= MAX_REDACTION_CHARS &&
-					result?.isError !== true
+			: written !== undefined
 				? [
 						{
-							path: call.arguments.path,
-							diff: call.arguments.content
+							// The same fields the row subject names the file by.
+							path: call?.arguments.path ?? call?.arguments.file_path,
+							diff: written
 								.replace(/\n$/, "")
 								.split("\n")
 								.map((line, index) => `+${index + 1}|${line}`)
 								.join("\n"),
+							redacted: true,
 						},
 					]
 				: [];
@@ -575,7 +577,13 @@ function diffEntries(
 	for (const source of sources.slice(0, 64)) {
 		const path = redactedHead(source.path, DESKTOP_TOOL_LIMITS.subject, redact) ?? "";
 		const full =
-			typeof source.diff === "string" && source.diff.length <= MAX_REDACTION_CHARS ? redact(source.diff) : "";
+			typeof source.diff !== "string"
+				? ""
+				: source.redacted
+					? source.diff
+					: source.diff.length <= MAX_REDACTION_CHARS
+						? redact(source.diff)
+						: "";
 		if (typeof source.diff === "string" && !full && source.diff) truncated = true;
 		const lines = diffLineCounts(full);
 		const text = cut(full, Math.max(0, remaining));
