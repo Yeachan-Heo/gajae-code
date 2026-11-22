@@ -13,6 +13,7 @@ import type {
 	DesktopModel,
 	DesktopProject,
 	DesktopSession,
+	DesktopSnapshot,
 } from "@gajae-code/desktop-host/protocol";
 import {
 	assertFixtureEndpoint,
@@ -27,8 +28,11 @@ import {
 	QA_DEMONSTRATIONS,
 	QA_EDIT_DEMO_FILE,
 	QA_KEY,
+	QA_MODEL_IDS,
 	QA_PROVIDER,
+	QA_UNREGISTERED_KEY_ENV,
 	readFixtureGateControl,
+	type SeedOptions,
 	seedFixture,
 	startModelFixture,
 	validateFixtureEnvironment,
@@ -47,7 +51,7 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	}
 }
 
-async function ownedFixture(options: ModelFixtureOptions = {}) {
+async function ownedFixture(options: ModelFixtureOptions = {}, seed: SeedOptions = {}) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-ui-qa-")));
 	const layout = fixtureLayout(root);
 	const fixture = startModelFixture(layout.artifactPath, options);
@@ -58,7 +62,7 @@ async function ownedFixture(options: ModelFixtureOptions = {}) {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
-	await seedFixture(layout, fixture.baseUrl, fixture.providerToken);
+	await seedFixture(layout, fixture.baseUrl, fixture.providerToken, seed);
 	const environment = fixtureEnvironment(layout, fixture.baseUrl, fixture.providerToken);
 	return { layout, fixture, environment };
 }
@@ -92,8 +96,8 @@ async function stopChild(child: Bun.Subprocess<"pipe", "pipe", "pipe">) {
 	}
 }
 
-async function sdkHost() {
-	const owned = await ownedFixture();
+async function sdkHost(seed: SeedOptions = {}) {
+	const owned = await ownedFixture({}, seed);
 	const child = Bun.spawn(
 		[process.execPath, path.resolve(import.meta.dir, "../../desktop-host/test/fixtures/qa-fixture-host.ts")],
 		{
@@ -141,10 +145,10 @@ async function sdkHost() {
 		if (!response.ok) throw new Error(response.error);
 		return response.result as T;
 	};
-	await call("bootstrap");
+	const bootstrap = await call<DesktopSnapshot>("bootstrap");
 	const project = await call<DesktopProject>("project.open", { path: owned.layout.project });
 	const session = await call<DesktopSession>("session.create", { projectId: project.id });
-	return { ...owned, child, send, call, frames, session, diagnostics: () => stderr };
+	return { ...owned, child, send, call, frames, bootstrap, session, diagnostics: () => stderr };
 }
 
 test("real discovered extension startup question does not block publication or prompt admission", async () => {
@@ -689,6 +693,9 @@ describe("test-only desktop model fixture safety", () => {
 			{ HTTPS_PROXY: "http://example.invalid" },
 			{ GJC_DESKTOP_QA_LIVE: "1" },
 			{ GJC_DESKTOP_QA_FIXTURE_URL: "http://127.0.0.1:1234/v1" },
+			// Wrapper-only controls and the onboarding credential reference never reach the Host.
+			{ GJC_DESKTOP_QA_ONBOARDING: "1" },
+			{ [QA_UNREGISTERED_KEY_ENV]: QA_KEY },
 		])
 			await expect(validateFixtureEnvironment({ ...environment, ...patch })).rejects.toThrow();
 		const cache = environment.XDG_CACHE_HOME!;
@@ -1143,6 +1150,30 @@ test("a refused chain step settles the real Host turn with the reason and leaves
 	expect(settled.status).not.toBe("running");
 	expect(settled.messages.some(message => message.role === "tool" && message.toolName === "read")).toBe(true);
 	expect(settled.messages.some(message => message.text.includes("todo_write is not offered"))).toBe(true);
+}, 60000);
+
+test("the onboarding seed starts with no models until the app stores the fixture key", async () => {
+	const { fixture, call, send, frames, bootstrap, session } = await sdkHost({ credential: "unregistered" });
+	expect(bootstrap.models).toEqual([]);
+	expect(session.model).toBeUndefined();
+	expect(await call<string[]>("auth.keyProviders")).toContain(QA_PROVIDER);
+	const before = frames.length;
+	expect(await call<Record<string, unknown>>("auth.setKey", { provider: QA_PROVIDER, key: QA_KEY })).toEqual({
+		provider: QA_PROVIDER,
+		saved: true,
+		catalogRefreshed: true,
+	});
+	const published = frames.slice(before).findLast(frame => frame.type === "snapshot");
+	if (published?.type !== "snapshot") throw new Error("No snapshot after the key was stored");
+	expect(published.snapshot.models.map(model => model.id)).toEqual(QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`));
+	const created = await call<DesktopSession>("session.create", { projectId: session.projectId });
+	expect(created.model).toBe(`${QA_PROVIDER}/qa-reasoning`);
+	// The stored key is the one the fenced transport and the fixture both demand.
+	const prompt = send("prompt", { sessionId: created.id, text: "first onboarded turn" });
+	await waitFor(() => fixture.snapshot().requests.length === 1, "onboarded completion");
+	expect(fixture.release(1)).toBe(true);
+	expect((await prompt).ok).toBe(true);
+	expect(fixture.snapshot().requests[0]).toMatchObject({ state: "completed", body: { model: "qa-reasoning" } });
 }, 60000);
 
 test("the tool search demonstration activates todo_write between completions of one turn", async () => {

@@ -8,6 +8,9 @@ import {
 	type FixtureSnapshot,
 	QA_DEMONSTRATIONS,
 	QA_EDIT_DEMO_FILE,
+	QA_KEY,
+	QA_MODEL_IDS,
+	QA_PROVIDER,
 } from "../scripts/qa-model-fixture";
 
 interface WrapperConfig {
@@ -21,6 +24,8 @@ interface WrapperConfig {
 		dataDir: string;
 		initialHold: boolean;
 		requestLimit: number;
+		onboarding: boolean;
+		onboardingCredential?: { provider: string; key: string };
 		demonstrations: unknown;
 		editDemoFile: string;
 	};
@@ -180,6 +185,8 @@ test("invalid or misplaced run controls are refused before any state exists", as
 			{ GJC_DESKTOP_QA_MODEL_FIXTURE: "", GJC_DESKTOP_QA_REQUEST_LIMIT: "100" },
 			"require GJC_DESKTOP_QA_MODEL_FIXTURE=1",
 		],
+		[{ GJC_DESKTOP_QA_ONBOARDING: "true" }, "GJC_DESKTOP_QA_ONBOARDING must be 0 or 1"],
+		[{ GJC_DESKTOP_QA_MODEL_FIXTURE: "", GJC_DESKTOP_QA_ONBOARDING: "1" }, "require GJC_DESKTOP_QA_MODEL_FIXTURE=1"],
 	];
 	const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-qa-refusal-")));
 	try {
@@ -223,7 +230,8 @@ test("an interactive run streams its first prompt at once and reports its run co
 		const expires = Date.parse(qa.config.expiresAt) - started;
 		expect(expires).toBeGreaterThan(89 * 60 * 1000);
 		expect(expires).toBeLessThanOrEqual(90 * 60 * 1000 + 30000);
-		expect(qa.config.modelFixture).toMatchObject({ initialHold: false, requestLimit: 200 });
+		expect(qa.config.modelFixture).toMatchObject({ initialHold: false, requestLimit: 200, onboarding: false });
+		expect(qa.config.modelFixture.onboardingCredential).toBeUndefined();
 		await qa.connect();
 		const snapshot = await qa.call<DesktopSnapshot>("bootstrap");
 		const seeded = snapshot.sessions.find(session => session.title === "Short conversation");
@@ -245,6 +253,51 @@ test("an interactive run streams its first prompt at once and reports its run co
 		expect(demo?.status).not.toBe("??");
 		expect(demo?.patch).toContain("-status: draft\n-reviewer: none\n+status: reviewed\n+reviewer: desktop-qa\n");
 		expect(diff.find(file => file.path === "qa-untracked.txt")?.status).toBe("??");
+		await qa.call("shutdown");
+		expect(await qa.child.exited).toBe(0);
+	} finally {
+		await qa.close();
+	}
+}, 60000);
+
+test("onboarding mode starts with no models, admits only the fixture key and keeps sign-in flows out", async () => {
+	const qa = await wrapper({ GJC_DESKTOP_QA_ONBOARDING: "1", GJC_DESKTOP_QA_INITIAL_HOLD: "0" });
+	try {
+		expect(qa.config.modelFixture).toMatchObject({
+			onboarding: true,
+			onboardingCredential: { provider: QA_PROVIDER, key: QA_KEY },
+		});
+		await qa.connect();
+		const snapshot = await qa.call<DesktopSnapshot>("bootstrap");
+		expect(snapshot.models).toEqual([]);
+		const request = (method: string, params: Record<string, unknown>) =>
+			qa.post("/request", { id: crypto.randomUUID(), method, params });
+		// A sign-in would start a real provider flow; answer and cancel only act on a flow it created.
+		for (const [method, params] of [
+			["auth.login", { provider: "openai-codex" }],
+			["auth.answer", { flowId: crypto.randomUUID(), promptId: crypto.randomUUID(), value: "confirm" }],
+			["auth.cancel", { flowId: crypto.randomUUID() }],
+		] as const)
+			expect((await request(method, params)).status).toBe(403);
+		for (const params of [
+			{ provider: "openai", key: QA_KEY },
+			{ provider: QA_PROVIDER, key: "a-real-looking-key" },
+		])
+			expect((await request("auth.setKey", params)).status).toBe(403);
+		expect(await qa.call<string[]>("auth.keyProviders")).toContain(QA_PROVIDER);
+		expect(await qa.call("auth.state")).toBeNull();
+		expect(Array.isArray(await qa.call("auth.providers"))).toBe(true);
+		await qa.call("auth.setKey", { provider: QA_PROVIDER, key: QA_KEY });
+		const published = qa.frames.findLast(frame => frame.type === "snapshot");
+		if (published?.type !== "snapshot") throw new Error("No snapshot after the key was stored");
+		expect(published.snapshot.models.map(model => model.id)).toEqual(QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`));
+		const created = await qa.call<DesktopSession>("session.create", { projectId: snapshot.projects[0]!.id });
+		expect(created.model).toBe(`${QA_PROVIDER}/qa-reasoning`);
+		await qa.call("prompt", { sessionId: created.id, text: "first onboarded turn through the bridge" });
+		// The tool features' reads and saves reach the Host.
+		const tools = await qa.call<{ active: string[] }>("tools.list", { sessionId: created.id });
+		await qa.call("tools.set", { sessionId: created.id, names: tools.active });
+		expect((await request("tool.detail", { sessionId: created.id, callId: "qa-tool-call-1" })).status).toBe(200);
 		await qa.call("shutdown");
 		expect(await qa.child.exited).toBe(0);
 	} finally {

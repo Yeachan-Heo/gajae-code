@@ -10,6 +10,10 @@
 //     once instead of waiting for release(1). hold() still pauses the next completion.
 //   GJC_DESKTOP_QA_REQUEST_LIMIT=1..512 (fixture only; default 64) completions per collection
 //     before the fixture answers 429. A tool turn costs one completion per step plus one.
+//   GJC_DESKTOP_QA_ONBOARDING=1 (fixture only) seeds the fixture provider with a credential
+//     reference that is never set, so the Host starts with no available models. Saving the
+//     fixture key (printed as modelFixture.onboardingCredential) through the app's normal
+//     auth.setKey makes the three fixture models appear; any other provider or key gets 403.
 // Scripted model turns (fixture mode), read from the newest user message; JSON fills the rest of the line:
 //   qa-tool-call:<tool>[:<json object>]               one call
 //   qa-tool-calls:[{"name":…,"arguments":{…}},…]      several calls in one response
@@ -74,9 +78,10 @@ function switchFlag(name: string, fallback: boolean): boolean {
 const lifetimeMinutes = integerFlag("GJC_DESKTOP_QA_LIFETIME_MINUTES", 15, 1, 240);
 const initialHold = switchFlag("GJC_DESKTOP_QA_INITIAL_HOLD", true);
 const requestLimit = integerFlag("GJC_DESKTOP_QA_REQUEST_LIMIT", QA_DEFAULT_REQUEST_LIMIT, 1, QA_MAX_REQUEST_LIMIT);
-if (!fixtureMode && (!initialHold || requestLimit !== QA_DEFAULT_REQUEST_LIMIT))
+const onboarding = switchFlag("GJC_DESKTOP_QA_ONBOARDING", false);
+if (!fixtureMode && (!initialHold || requestLimit !== QA_DEFAULT_REQUEST_LIMIT || onboarding))
 	throw new Error(
-		"GJC_DESKTOP_QA_INITIAL_HOLD and GJC_DESKTOP_QA_REQUEST_LIMIT require GJC_DESKTOP_QA_MODEL_FIXTURE=1",
+		"GJC_DESKTOP_QA_INITIAL_HOLD, GJC_DESKTOP_QA_REQUEST_LIMIT and GJC_DESKTOP_QA_ONBOARDING require GJC_DESKTOP_QA_MODEL_FIXTURE=1",
 	);
 
 const uiOrigin = new URL(process.env.GJC_DESKTOP_QA_UI_ORIGIN ?? "http://127.0.0.1:1420");
@@ -457,7 +462,9 @@ try {
 	if (fixtureMode) {
 		const layout = fixtureLayout(temporary);
 		fixture = startModelFixture(layout.artifactPath, { initialHold, requestLimit });
-		await seedFixture(layout, fixture.baseUrl, fixture.providerToken);
+		await seedFixture(layout, fixture.baseUrl, fixture.providerToken, {
+			credential: onboarding ? "unregistered" : "literal",
+		});
 		// Commit only the edit target, so the edit demonstration shows as a modification in the
 		// diff view while everything else stays untracked.
 		await isolatedGit(["-C", project, "add", "--", QA_EDIT_DEMO_FILE], "Isolated git add failed");
@@ -861,6 +868,9 @@ try {
 								? "the first completion pauses after its initial SSE text until release(requestId) or abort; hold() arms the next one"
 								: "completions stream to the end; hold() pauses the next completion until release(requestId)",
 							requestLimit,
+							onboarding,
+							// A fixture-only constant, not a provider secret: the one key auth.setKey admits.
+							...(onboarding ? { onboardingCredential: { provider: QA_PROVIDER, key: QA_KEY } } : {}),
 							demonstrations: QA_DEMONSTRATIONS,
 							editDemoFile: path.join(project, QA_EDIT_DEMO_FILE),
 						},

@@ -7,6 +7,12 @@ import * as path from "node:path";
 export const QA_PROVIDER = "desktop-qa-fixture";
 export const QA_KEY = "fixture-only-not-a-provider-secret";
 export const QA_MODEL_IDS = ["qa-reasoning", "qa-plain", "qa-discrete"] as const;
+/**
+ * The credential reference of the zero-model onboarding seed. Nothing ever sets it: the Host
+ * child's environment is built from scratch and `validateFixtureEnvironment` refuses extra keys,
+ * so the provider has no key until the app stores `QA_KEY` through `auth.setKey`.
+ */
+export const QA_UNREGISTERED_KEY_ENV = "GJC_DESKTOP_QA_FIXTURE_UNREGISTERED_KEY";
 /** Default per-collection completion cap; a long interactive run can raise it. */
 export const QA_DEFAULT_REQUEST_LIMIT = 64;
 export const QA_MAX_REQUEST_LIMIT = 512;
@@ -176,7 +182,22 @@ export function assertFixtureMode(environment: NodeJS.ProcessEnv): void {
 		throw new Error("Model fixture requires explicit fixture mode and forbids LIVE=1");
 }
 
-export async function seedFixture(layout: FixtureLayout, baseUrl: string, providerToken: string): Promise<void> {
+export interface SeedOptions {
+	/**
+	 * `literal` (the default) writes `QA_KEY` into models.yml, so the three models are available at
+	 * startup. `unregistered` points the provider at `QA_UNREGISTERED_KEY_ENV` instead: the Host
+	 * starts with no available models until `auth.setKey(QA_PROVIDER, QA_KEY)` stores the key in the
+	 * owned credential store, which makes exactly the three fixture models appear.
+	 */
+	credential?: "literal" | "unregistered";
+}
+
+export async function seedFixture(
+	layout: FixtureLayout,
+	baseUrl: string,
+	providerToken: string,
+	options: SeedOptions = {},
+): Promise<void> {
 	assertFixtureEndpoint(baseUrl);
 	for (const directory of [
 		layout.agentDir,
@@ -286,7 +307,7 @@ export default function() {}
 				[QA_PROVIDER]: {
 					api: "openai-completions",
 					baseUrl,
-					apiKey: QA_KEY,
+					...(options.credential === "unregistered" ? { apiKeyEnv: QA_UNREGISTERED_KEY_ENV } : { apiKey: QA_KEY }),
 					headers: { "X-Desktop-QA-Fixture": providerToken },
 					compat: { supportsReasoningEffort: true, thinkingFormat: "openai", supportsStore: false },
 					models,
