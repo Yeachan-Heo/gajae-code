@@ -1,0 +1,234 @@
+import { describe, expect, test } from "bun:test";
+import { fitMessages, HISTORY_LIMIT, projectHistoryPage, projectMessages } from "../src/message-projection";
+import type { DesktopMessage } from "../src/protocol";
+import { DESKTOP_TOOL_LIMITS, type DesktopToolCall } from "../src/tool-protocol";
+
+const live = { sessionGeneration: 1 };
+
+/** One call and its result, projected the way the Host projects a live session. */
+function row(
+	name: string,
+	args: Record<string, unknown>,
+	result: Record<string, unknown> = {},
+	redact: (text: string) => string = text => text,
+): DesktopToolCall | undefined {
+	const messages = projectMessages(
+		[
+			{ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "c1", name, arguments: args }] },
+			{ role: "toolResult", toolCallId: "c1", toolName: name, content: [{ type: "text", text: "ok" }], ...result },
+		],
+		redact,
+		500_000,
+		live,
+	);
+	return messages.find(message => message.role === "tool")?.tool;
+}
+
+describe("tool row summaries", () => {
+	test("each family builds its subject only from its allowlisted fields", () => {
+		const hidden = { content: "body-hidden", env: { TOKEN: "env-hidden" }, timeout: 5, _i: "intent-from-args" };
+		const cases: Array<[string, Record<string, unknown>, Partial<DesktopToolCall>]> = [
+			["read", { path: "src/app.ts:10-20", ...hidden }, { family: "read", subject: "src/app.ts:10-20" }],
+			[
+				"read",
+				{ path: "https://user:pass@example.com/doc?q=1" },
+				{ family: "read", subject: "https://example.com/doc?q=1" },
+			],
+			["write", { path: "notes/plan.md", content: "a\nb\n" }, { family: "write", subject: "notes/plan.md" }],
+			["edit", { path: "src/a.ts", edits: [{ old_text: "old-hidden" }] }, { family: "edit", subject: "src/a.ts" }],
+			[
+				"ast_edit",
+				{ ops: [{ pat: "pat-hidden" }], paths: ["src/", "test/"] },
+				{ family: "edit", subject: "src/ · test/" },
+			],
+			[
+				"search",
+				{ pattern: "TODO\\(", paths: ["src/**/*.ts"], i: true },
+				{ family: "search", subject: "TODO\\( · src/**/*.ts" },
+			],
+			["ast_grep", { pat: "foo($A)", paths: ["lib/"] }, { family: "search", subject: "foo($A) · lib/" }],
+			["find", { paths: ["**/*.test.ts"], limit: 10 }, { family: "find", subject: "**/*.test.ts" }],
+			[
+				"bash",
+				{ command: "\n  npm test -- --watch\nrm -rf hidden-line", ...hidden },
+				{ family: "shell", subject: "$ npm test -- --watch" },
+			],
+			["ssh", { host: "host-hidden", command: "uptime" }, { family: "shell", subject: "$ uptime" }],
+			["python", { action: "run", code: "import os\nprint(os.environ)" }, { family: "shell", subject: "import os" }],
+			["eval", { cells: [{ language: "js", code: "1 + 1\nhidden()" }] }, { family: "shell", subject: "1 + 1" }],
+			["web_search", { query: "bun test spyOn", recency: "week" }, { family: "web", subject: "bun test spyOn" }],
+			[
+				"task",
+				{ agent: "executor", tasks: [{ assignment: "assignment-hidden" }, {}] },
+				{ family: "task", subject: "executor", stats: { tasks: 2 } },
+			],
+			[
+				"todo_write",
+				{ ops: [{ op: "done", task: "Write tests" }, { op: "start" }] },
+				{ family: "todo", subject: "done · Write tests" },
+			],
+			["search_tool_bm25", { query: "todo list", limit: 3 }, { family: "tool-search", subject: "todo list" }],
+			["skill", { name: "ralplan", args: "args-hidden" }, { family: "other", subject: "ralplan" }],
+			["mcp_server_tool", { query: "mcp-hidden" }, { family: "other" }],
+		];
+		for (const [name, args, expected] of cases) {
+			const tool = row(name, args);
+			expect(tool).toMatchObject({ callId: "c1", status: "done", ...expected });
+			if (!expected.subject) expect(tool?.subject).toBeUndefined();
+			expect(JSON.stringify(tool)).not.toMatch(/hidden/);
+		}
+		expect(row("read", { path: "a", _i: "Check the entry point" })?.intent).toBe("Check the entry point");
+	});
+
+	test("subjects and intent are redacted whole and stay on one bounded line", () => {
+		const secret = "secret-value";
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]");
+		const tool = row(
+			"search",
+			{
+				pattern: `key=${secret}\nnext`,
+				paths: [`dir/${secret}`, ...Array.from({ length: 200 }, () => "p".repeat(50))],
+			},
+			{},
+			redact,
+		);
+		expect(tool?.subject?.startsWith("key=[redacted] next · dir/[redacted] · ")).toBe(true);
+		expect(tool?.subject).toHaveLength(DESKTOP_TOOL_LIMITS.subject);
+		const intent = row("read", { path: "a", _i: `${"i".repeat(195)}${secret}` }, {}, redact)?.intent;
+		expect(intent).toBe(`${"i".repeat(195)}[reda`);
+		expect(row("read", { path: "x".repeat(8 * 1024 * 1024 + 1) })?.subject).toBeUndefined();
+	});
+
+	test("status comes from the result", () => {
+		expect(row("read", { path: "missing" }, { isError: true })?.status).toBe("failed");
+		expect(
+			row(
+				"bash",
+				{ command: "sleep 9" },
+				{ isError: true, content: [{ type: "text", text: "Tool execution was aborted." }] },
+			)?.status,
+		).toBe("cancelled");
+		expect(
+			row(
+				"bash",
+				{ command: "x" },
+				{ isError: true, content: [{ type: "text", text: "Skipped due to queued user message." }] },
+			)?.status,
+		).toBe("cancelled");
+		expect(
+			row("bash", { command: "serve" }, { details: { async: { state: "running", jobId: "j", type: "bash" } } })
+				?.status,
+		).toBe("background");
+		expect(row("task", { agent: "a" }, { details: { async: { state: "completed" } } })?.status).toBe("done");
+	});
+
+	test("small facts come from result details", () => {
+		const diff = "@@ -1,2 +1,3 @@\n 1|keep\n-2|old\n+2|new\n+3|added";
+		expect(row("edit", { path: "a" }, { details: { diff } })?.stats).toEqual({ added: 2, removed: 1 });
+		expect(
+			row(
+				"edit",
+				{ path: "a" },
+				{
+					details: {
+						diff: "",
+						perFileResults: [
+							{ path: "a", diff },
+							{ path: "b", diff: "+1|x" },
+						],
+					},
+				},
+			)?.stats,
+		).toEqual({ added: 3, removed: 1, files: 2 });
+		expect(row("write", { path: "a", content: "one\ntwo\n" })?.stats).toEqual({ added: 2 });
+		expect(row("search", { pattern: "x" }, { details: { matchCount: 4, fileCount: 2 } })?.stats).toEqual({
+			matches: 4,
+			files: 2,
+		});
+		expect(row("find", { paths: ["*"] }, { details: { fileCount: 7 } })?.stats).toEqual({ files: 7 });
+		expect(
+			row(
+				"bash",
+				{ command: "false" },
+				{ isError: true, content: [{ type: "text", text: "out\n\nCommand exited with code 3" }] },
+			)?.stats,
+		).toEqual({ exitCode: 3 });
+		expect(row("bash", { command: "true" })?.stats).toBeUndefined();
+		const names = Array.from({ length: 12 }, (_, index) => `tool_${index}`);
+		const redact = (text: string) => text.replaceAll("tool_0", "[redacted]");
+		expect(row("search_tool_bm25", { query: "q" }, { details: { activated_tools: names } }, redact)?.stats).toEqual({
+			activated: ["[redacted]", ...names.slice(1, DESKTOP_TOOL_LIMITS.statsActivated)],
+		});
+	});
+
+	test("only a live Host projection marks rows as expandable", () => {
+		const messages = [
+			{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "a" } }] },
+			{ role: "toolResult", toolCallId: "c1", toolName: "read", content: "ok" },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "c2", name: "read", arguments: { _i: "only intent" } }],
+			},
+			{ role: "toolResult", toolCallId: "c2", toolName: "read", content: "ok" },
+		];
+		expect(projectMessages(messages).map(message => message.tool?.detail)).toEqual([false, false]);
+		expect(projectMessages(messages, undefined, 500_000, live).map(message => message.tool?.detail)).toEqual([
+			true,
+			false,
+		]);
+		expect(projectHistoryPage(messages, 0, 10, undefined, live).page.map(message => message.tool?.detail)).toEqual([
+			true,
+			false,
+		]);
+	});
+
+	test("a reused call id pairs each result with its nearest preceding call", () => {
+		const messages = projectMessages([
+			{ role: "assistant", content: [{ type: "toolCall", id: "dup", name: "read", arguments: { path: "first" } }] },
+			{ role: "toolResult", toolCallId: "dup", toolName: "read", content: "1" },
+			{ role: "assistant", content: [{ type: "toolCall", id: "dup", name: "read", arguments: { path: "second" } }] },
+			{ role: "toolResult", toolCallId: "dup", toolName: "read", content: "2" },
+			{ role: "toolResult", toolCallId: "orphan", toolName: "read", content: "3" },
+			{ role: "toolResult", toolName: "read", content: "no id" },
+		]);
+		expect(messages.map(message => message.tool?.subject)).toEqual(["first", "second", undefined, undefined]);
+		expect(messages[2]?.tool).toEqual({ callId: "orphan", status: "done", family: "read", detail: false });
+		expect(messages[3]?.tool).toBeUndefined();
+	});
+
+	test("tool metadata stays small enough for a full window in the snapshot budget", () => {
+		const window = (query: string, intent: string, activated: string[]) => {
+			const messages: unknown[] = [];
+			for (let index = 0; index < HISTORY_LIMIT; index++) {
+				const id = `toolu_${index}_${"x".repeat(24)}`;
+				messages.push({
+					role: "assistant",
+					content: [{ type: "toolCall", id, name: "search_tool_bm25", arguments: { query, _i: intent } }],
+				});
+				messages.push({
+					role: "toolResult",
+					toolCallId: id,
+					toolName: "search_tool_bm25",
+					content: "ok",
+					details: { activated_tools: activated },
+				});
+			}
+			return projectMessages(messages, undefined, 500_000, live);
+		};
+		// Worst case: every bound reached with three-byte characters.
+		const worst = window(
+			"長".repeat(400),
+			"長".repeat(400),
+			Array.from({ length: 20 }, () => "n".repeat(200)),
+		);
+		expect(worst).toHaveLength(HISTORY_LIMIT);
+		const sizes = worst.map(message => Buffer.byteLength(JSON.stringify(message.tool), "utf8"));
+		expect(Math.max(...sizes)).toBeLessThan(3_000);
+		expect(worst.every((message: DesktopMessage) => message.tool?.subject?.length === 300)).toBe(true);
+		// One conversation's whole snapshot share holds even the worst-case window.
+		expect(fitMessages(worst, 500_000).truncated).toBe(false);
+		// Typical rows fit when three conversations share the snapshot.
+		const typical = window("todo list", "Find the task tool", ["todo_write"]);
+		expect(fitMessages(typical, Math.floor(500_000 / 3)).truncated).toBe(false);
+	});
+});

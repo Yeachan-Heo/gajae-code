@@ -75,6 +75,8 @@ export interface DesktopToolCallStats {
 	exitCode?: number;
 	/** Tool names a tool search activated. */
 	activated?: string[];
+	/** Subagent tasks a task call delegated. */
+	tasks?: number;
 }
 
 /**

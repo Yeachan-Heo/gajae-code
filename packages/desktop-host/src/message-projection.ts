@@ -1,6 +1,13 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { getSessionMessageEntryId } from "@gajae-code/coding-agent/sdk";
 import type { DesktopMessage, DesktopMessageBlock, DesktopMessageRevision } from "./protocol";
+import {
+	MAX_REDACTION_CHARS,
+	projectToolCall,
+	type ToolCallSource,
+	toolCallBlocks,
+	toolResultStatus,
+} from "./tool-projection";
 
 export const HISTORY_LIMIT = 160;
 export const TEXT_LIMIT = 8_000;
@@ -8,8 +15,6 @@ export const HISTORY_PAGE_BYTES = 2_000_000;
 /** Maximum encoded bytes for one inline preview. The enclosing page has a shared budget too. */
 export const IMAGE_PREVIEW_BYTES = 256_000;
 const MAX_BLOCKS = 128;
-// Bound redaction/concatenation allocations without exposing an unredacted prefix or tail.
-const MAX_REDACTION_CHARS = 8 * 1024 * 1024;
 const withheld = "[withheld: display limit]";
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const unavailable = "Image preview is unavailable.";
@@ -95,6 +100,10 @@ export function copyableMessageText(value: unknown): string | undefined {
 	return record(value)?.role === "user" ? userPromptText(value) : assistantAnswerText(value);
 }
 
+/**
+ * Controls the Host answers for a live session it owns. Its presence also marks tool rows as
+ * expandable through `tool.detail`, which managed (SDK-owner) sessions refuse.
+ */
 interface CopyProjection {
 	sessionGeneration: number;
 	streamingMessage?: unknown;
@@ -134,6 +143,24 @@ export function countVisibleMessages(messages: readonly unknown[]): number {
 	return count;
 }
 
+/**
+ * The call each `toolResult` answers, by message index: the nearest preceding `toolCall` with its
+ * id, so a provider that reuses ids still pairs each result with its own arguments.
+ */
+function resolveToolCalls(messages: readonly unknown[]): Map<number, ToolCallSource> {
+	const latest = new Map<string, ToolCallSource>();
+	const resolved = new Map<number, ToolCallSource>();
+	for (let index = 0; index < messages.length; index++) {
+		const message = record(messages[index]);
+		if (message?.role === "assistant") for (const call of toolCallBlocks(message)) latest.set(call.id, call);
+		else if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
+			const call = latest.get(message.toolCallId);
+			if (call) resolved.set(index, call);
+		}
+	}
+	return resolved;
+}
+
 function project(
 	value: unknown,
 	index: number,
@@ -141,6 +168,7 @@ function project(
 	redact: (text: string) => string,
 	images: { remaining: number },
 	copy?: CopyProjection,
+	call?: ToolCallSource,
 ): DesktopMessage | undefined {
 	if (!visible(value)) return undefined;
 	const message = record(value)!;
@@ -241,6 +269,20 @@ function project(
 		if (rich && text) blocks.push({ type: "text", text });
 	}
 	const revision = entryId ? copy?.revision?.(entryId) : undefined;
+	const tool =
+		message.role === "toolResult" && typeof message.toolCallId === "string" && message.toolCallId
+			? projectToolCall(
+					{
+						callId: message.toolCallId,
+						toolName: typeof message.toolName === "string" ? message.toolName : (call?.name ?? ""),
+						call,
+						result: message,
+						status: toolResultStatus(message),
+						detail: copy !== undefined,
+					},
+					redact,
+				)
+			: undefined;
 	return {
 		id: messageId(index, message.timestamp),
 		...(entryId ? { entryId } : {}),
@@ -254,6 +296,7 @@ function project(
 			? { toolName: projectText(message.toolName, 100, redact, true).text }
 			: {}),
 		...(message.isError === true || failed ? { isError: true } : {}),
+		...(tool ? { tool } : {}),
 	};
 }
 
@@ -380,8 +423,9 @@ export function projectMessages(
 ): DesktopMessage[] {
 	const result: DesktopMessage[] = [];
 	const images = { remaining: imageBudget };
+	const calls = resolveToolCalls(messages);
 	for (let i = messages.length - 1; i >= 0 && result.length < HISTORY_LIMIT; i--) {
-		const message = project(messages[i], i, TEXT_LIMIT, redact, images, copy);
+		const message = project(messages[i], i, TEXT_LIMIT, redact, images, copy, calls.get(i));
 		if (message) result.push(message);
 	}
 	return result.reverse();
@@ -399,10 +443,11 @@ export function projectHistoryPage(
 	let budget = HISTORY_PAGE_BYTES - 1;
 	const images = { remaining: HISTORY_PAGE_BYTES };
 	let full = false;
+	const calls = resolveToolCalls(messages);
 	for (let index = 0; index < messages.length; index++) {
 		if (!visible(messages[index])) continue;
 		if (total++ < offset || full || page.length >= limit) continue;
-		let message = project(messages[index], index, 32_000, redact, images, copy)!;
+		let message = project(messages[index], index, 32_000, redact, images, copy, calls.get(index))!;
 		let size = bytes(message);
 		if (size > budget && message.blocks?.some(block => block.type === "image")) {
 			message = {

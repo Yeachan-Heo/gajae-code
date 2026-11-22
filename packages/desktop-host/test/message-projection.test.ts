@@ -21,7 +21,7 @@ describe("desktop message projection", () => {
 				content: [
 					{ type: "thinking", thinking: "reasoning", thinkingSignature: "signature-secret" },
 					{ type: "text", text: "first" },
-					{ type: "toolCall", arguments: { token: "argument-secret" } },
+					{ type: "toolCall", id: "call-1", name: "bash", arguments: { token: "argument-secret" } },
 					image,
 					{ type: "text", text: "second" },
 				],
@@ -35,6 +35,58 @@ describe("desktop message projection", () => {
 			{ type: "text", text: "second" },
 		]);
 		expect(JSON.stringify(message)).not.toContain("secret");
+	});
+
+	test("a tool row shows only its allowlisted argument, redacted in full before the cut", () => {
+		const secret = "sk-abcdefghij1234567890";
+		// The secret straddles the subject bound: a cut before redaction would leak its prefix.
+		const command = `${"echo ".repeat(58)}${secret} done\nsecond line`;
+		const assistant = {
+			role: "assistant",
+			headers: { authorization: "header-secret" },
+			stopReason: "toolUse",
+			content: [
+				{ type: "thinking", thinking: "reasoning", thinkingSignature: "signature-secret" },
+				{
+					type: "toolCall",
+					id: "call-1",
+					name: "bash",
+					arguments: { command, env: { API_TOKEN: "argument-secret" }, cwd: "argument-secret/dir" },
+					intent: "List the files",
+				},
+			],
+		};
+		const result = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "listing" }],
+			isError: false,
+		};
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]");
+		for (const messages of [
+			projectMessages([assistant, result], redact),
+			projectHistoryPage([assistant, result], 0, 10, redact).page,
+		]) {
+			const tool = messages.find(message => message.role === "tool");
+			expect(tool?.tool).toEqual({
+				callId: "call-1",
+				status: "done",
+				family: "shell",
+				subject: `$ ${"echo ".repeat(58)}[redacted] done`.slice(0, 300),
+				intent: "List the files",
+				detail: false,
+			});
+			// The cut lands inside the redaction marker, never inside the secret.
+			expect(tool?.tool?.subject).toHaveLength(300);
+			expect(tool?.tool?.subject?.endsWith(" [redacte")).toBe(true);
+			const serialized = JSON.stringify(messages);
+			expect(serialized).not.toContain("argument-secret");
+			expect(serialized).not.toContain("header-secret");
+			expect(serialized).not.toContain("signature-secret");
+			expect(serialized).not.toContain("sk-abcdefghij");
+			expect(serialized).not.toContain("second line");
+		}
 	});
 
 	test("places each notice before the first projected message at or after its anchor", () => {
