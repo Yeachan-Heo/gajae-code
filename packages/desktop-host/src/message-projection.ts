@@ -403,6 +403,21 @@ export function fitMessages(
 	return { messages: result.reverse(), truncated };
 }
 
+/**
+ * The rows a session frame shows: the newest `HISTORY_LIMIT` transcript rows with their notices,
+ * then the Host's synthesized live rows. Live rows are display-only, so they come on top of that
+ * window instead of taking places in it; when the byte budget still cuts older rows, or the
+ * window itself drops some, `truncated` says so.
+ */
+export function fitDisplay(
+	transcript: readonly DesktopMessage[],
+	live: readonly DesktopMessage[],
+	budget: number,
+): { messages: DesktopMessage[]; truncated: boolean } {
+	const fitted = fitMessages([...transcript.slice(-HISTORY_LIMIT), ...live], budget);
+	return { messages: fitted.messages, truncated: fitted.truncated || transcript.length > HISTORY_LIMIT };
+}
+
 /** A Host notice and the transcript position it was raised at. */
 export interface AnchoredNotice {
 	/**

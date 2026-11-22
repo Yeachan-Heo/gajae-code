@@ -70,7 +70,7 @@ import {
 	anchorNotices,
 	copyableMessageText,
 	countVisibleMessages,
-	fitMessages,
+	fitDisplay,
 	HISTORY_LIMIT,
 	projectHistoryPage,
 	projectMessages,
@@ -982,12 +982,13 @@ export class DesktopHost {
 			},
 		}));
 		// Notices sit where they were raised rather than after every later turn.
-		// Calls still running join the display copy too; they never count as transcript.
-		const display = [
-			...anchorNotices(transcript, notices),
-			...projectLiveToolCalls(live?.sdk, live?.streamingMessage, text => this.#redact(text), this.#secrets),
-		];
-		const fitted = fitMessages(display.slice(-HISTORY_LIMIT), messageBudget);
+		// Calls still running join the display copy too; they never count as transcript
+		// and never take a place in its window.
+		const fitted = fitDisplay(
+			anchorNotices(transcript, notices),
+			projectLiveToolCalls(live?.sdk, live?.streamingMessage, text => this.#redact(text), this.#secrets),
+			messageBudget,
+		);
 		return {
 			id: metadata.id,
 			projectId: metadata.projectId,

@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
 	anchorNotices,
 	copyableMessageText,
+	fitDisplay,
 	fitMessages,
+	HISTORY_LIMIT,
 	HISTORY_PAGE_BYTES,
 	IMAGE_PREVIEW_BYTES,
 	projectHistoryPage,
@@ -506,5 +508,33 @@ describe("desktop message projection", () => {
 				).messages,
 		);
 		expect(Buffer.byteLength(JSON.stringify(sessions))).toBeLessThan(510_000);
+	});
+
+	test("live rows come on top of the transcript window, and a budget they crowd reports the cut", () => {
+		const transcript = Array.from({ length: 150 }, (_, index) => ({
+			id: `${index}:1`,
+			role: "user" as const,
+			text: `row ${index} ${"x".repeat(1_000)}`,
+		}));
+		const live = Array.from({ length: 20 }, (_, index) => ({
+			id: `call:c${index}`,
+			role: "tool" as const,
+			text: "o".repeat(4_000),
+		}));
+		const roomy = fitDisplay(transcript, live, 2_000_000);
+		expect(roomy.messages).toHaveLength(170);
+		expect(roomy.messages[0]?.id).toBe("0:1");
+		expect(roomy.truncated).toBe(false);
+		// The transcript alone fits this budget; with the live rows it cannot, and that is reported.
+		const budget = Buffer.byteLength(JSON.stringify(transcript)) + 1_000;
+		expect(fitMessages(transcript, budget).truncated).toBe(false);
+		const crowded = fitDisplay(transcript, live, budget);
+		expect(crowded.truncated).toBe(true);
+		expect(crowded.messages.slice(-20)).toEqual(live);
+		// More transcript rows than the window are cut by the window and reported too.
+		const long = [...transcript, ...transcript.map(row => ({ ...row, id: `${row.id}b` }))];
+		const windowed = fitDisplay(long, live, 10_000_000);
+		expect(windowed.messages).toHaveLength(HISTORY_LIMIT + 20);
+		expect(windowed.truncated).toBe(true);
 	});
 });

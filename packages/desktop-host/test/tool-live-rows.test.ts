@@ -66,7 +66,7 @@ describe("desktop live tool rows", () => {
 		}
 	});
 
-	async function launch(partial?: string) {
+	async function launch(partial?: string, options: { calls?: number } = {}) {
 		const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-tools-live-"));
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-tools-project-"));
 		await setModelPresetRegistryDisabled({ agentDir: path.join(dataDir, "agent"), disabled: true });
@@ -78,10 +78,18 @@ describe("desktop live tool rows", () => {
 		const read = parkedRead(partial);
 		const mock = createMockModel({
 			responses: [
-				{ content: [{ type: "toolCall", id: CALL_ID, name: "read", arguments: { path: "src/app.ts" } }] },
+				{
+					content: Array.from({ length: options.calls ?? 1 }, (_, index) => ({
+						type: "toolCall" as const,
+						id: index === 0 ? CALL_ID : `${CALL_ID}_${index}`,
+						name: "read",
+						arguments: { path: `src/app${index || ""}.ts` },
+					})),
+				},
 				{ content: ["finished"] },
 			],
 		});
+		let created: AgentSession | undefined;
 		const frames: DesktopFrame[] = [];
 		const waiters: Array<{ test(session: DesktopSession): boolean; resolve(session: DesktopSession): void }> = [];
 		const host = new DesktopHost({
@@ -112,6 +120,7 @@ describe("desktop live tool rows", () => {
 					agentDir: options.agentDir,
 					workflowGatePublication: "local",
 				});
+				created = session;
 				const eventBus = new EventBus();
 				session.registerToolSessionCleanup(() => eventBus.clear());
 				return {
@@ -146,7 +155,7 @@ describe("desktop live tool rows", () => {
 		};
 		const project = await call<DesktopProject>("project.open", { path: projectDir });
 		const session = await call<DesktopSession>("session.create", { projectId: project.id });
-		return { call, published, session, read };
+		return { call, published, session, read, sdk: created! };
 	}
 
 	const rowsFor = (session: DesktopSession): DesktopMessage[] =>
@@ -195,6 +204,29 @@ describe("desktop live tool rows", () => {
 		const live = await running;
 		expect(rowsFor(live)[0]?.text).toBe("token: ");
 		expect(JSON.stringify(live)).not.toContain(key.slice(0, 6));
+		h.read.release();
+		await prompt;
+	}, 30_000);
+
+	test("live rows come on top of the transcript window and never hide its rows unreported", async () => {
+		// 150 earlier rows fit the 160-row window; 20 calls of one turn then run at once.
+		const history = Array.from({ length: 150 }, (_, index) => ({
+			role: "user",
+			content: `earlier ${index}`,
+			timestamp: index + 1,
+		}));
+		const h = await launch(undefined, { calls: 20 });
+		h.sdk.agent.replaceMessages(history as never);
+		const running = h.published(session => rowsFor(session)[0]?.tool?.status === "running");
+		const prompt = h.call("prompt", { sessionId: h.session.id, text: "read them" });
+		await h.read.entered;
+		const live = await running;
+		const rows = live.messages.filter(message => message.id.startsWith("call:"));
+		expect(rows).toHaveLength(20);
+		const transcript = live.messages.filter(message => !message.id.startsWith("call:"));
+		expect(transcript[0]?.text).toBe("earlier 0");
+		expect(transcript.filter(message => message.text.startsWith("earlier"))).toHaveLength(150);
+		expect(live.historyTruncated).toBeUndefined();
 		h.read.release();
 		await prompt;
 	}, 30_000);
