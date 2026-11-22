@@ -1232,9 +1232,17 @@ suite("mounted desktop navigation", () => {
 			await page.waitForSelector(".connection-notice");
 			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Open in a terminal");
 			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Open in terminal");
+			// Still open there: the answer says so instead of looking like nothing happened.
+			await page.evaluate(() => window.navigationFixture.setElsewhere(["old"]));
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(button => button.textContent === "Check again")?.click());
 			await heldRequest(page, "session.connect");
+			await page.waitForFunction(() => document.querySelector(".conversation .notice")?.textContent?.includes("still has this conversation open"));
+			expect(await page.$(".composer textarea")).toBeNull();
+			await page.evaluate(() => window.navigationFixture.setElsewhere([]));
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(button => button.textContent === "Check again")?.click());
+			await heldRequest(page, "session.connect", 2);
 			await page.waitForSelector(".composer textarea");
+			expect(await page.$(".conversation .notice")).toBeNull();
 		} finally { await context.close(); }
 	}, 30000);
 });

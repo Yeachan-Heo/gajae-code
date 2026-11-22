@@ -15,6 +15,8 @@ export const connection = {
 	"connection.elsewhereTitle": "Open in a terminal",
 	"connection.elsewhereBody":
 		"Another gjc process, usually a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.",
+	"connection.stillElsewhere":
+		"Another gjc process still has this conversation open. Close it there, then check again.",
 	"connection.confirmTitle": "Disconnect while it is working?",
 	"connection.confirmRunning": "Disconnecting stops the current turn, as Stop does.",
 	"connection.confirmQueuedOne": "1 queued message is cancelled.",

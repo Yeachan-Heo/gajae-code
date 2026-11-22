@@ -1716,7 +1716,10 @@ export default function App() {
 	/** Connect, or re-check whether another process still has the conversation open. */
 	const connectSession = (sessionId: string) =>
 		void run(sessionId, async () => {
-			await request<DesktopSession>("session.connect", { sessionId });
+			const connected = await request<DesktopSession>("session.connect", { sessionId });
+			// A check that finds the other process still there is an answer; say it, so the click shows.
+			if (selectedRef.current !== sessionId) return;
+			setNotice(connected.connection?.state === "elsewhere" ? t("connection.stillElsewhere") : "");
 		});
 	/** Without `confirm` the Host refuses to stop work and says what Disconnect would stop. */
 	const disconnectSession = (sessionId: string, confirm = false) =>

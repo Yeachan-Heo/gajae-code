@@ -22,6 +22,8 @@ export interface NavigationFixture {
 	flushAnimationFrames(includeCancelled?: boolean): void;
 	/** The flow `auth.state` would report now. */
 	authState(): DesktopAuthState | null;
+	/** Conversations another process holds open: `session.connect` answers them read-only. */
+	setElsewhere(ids: string[]): void;
 }
 
 declare global {
@@ -49,6 +51,7 @@ export function installNavigationFixture(holdBootstrap = false, options: Navigat
 	let bootstrapId: string | undefined;
 	let holdReorder = false;
 	let heldReorder: DesktopRequest | undefined;
+	let elsewhere = new Set<string>();
 	const session = (id: string, title: string, status: DesktopSession["status"]): DesktopSession => ({
 		id,
 		title,
@@ -185,6 +188,9 @@ export function installNavigationFixture(holdBootstrap = false, options: Navigat
 			}
 		},
 		emit,
+		setElsewhere(ids) {
+			elsewhere = new Set(ids);
+		},
 		requests: () => requests,
 		authState: () => authState,
 		snapshot: () => snapshot,
@@ -368,11 +374,9 @@ export function installNavigationFixture(holdBootstrap = false, options: Navigat
 				case "session.connect": {
 					const target = snapshot.sessions.find(item => item.id === request.params.sessionId);
 					if (!target) break;
-					const connected: DesktopSession = {
-						...target,
-						controlGeneration: 2,
-						connection: { state: "connected" },
-					};
+					const connected: DesktopSession = elsewhere.has(target.id)
+						? { ...target, controlGeneration: null, connection: { state: "elsewhere" } }
+						: { ...target, controlGeneration: 2, connection: { state: "connected" } };
 					emit({ type: "session", session: connected });
 					result = connected;
 					break;
