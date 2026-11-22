@@ -7,6 +7,8 @@ import * as path from "node:path";
 export const QA_PROVIDER = "desktop-qa-fixture";
 export const QA_KEY = "fixture-only-not-a-provider-secret";
 export const QA_MODEL_IDS = ["qa-reasoning", "qa-plain", "qa-discrete"] as const;
+const MAX_CALLS_PER_RESPONSE = 16;
+const MAX_CHAIN_STEPS = 16;
 const markerName = "qa-model-fixture.json";
 
 export interface FixtureSessionObservation {
@@ -230,6 +232,9 @@ export default function() {}
 			compaction: { enabled: false },
 			retry: { enabled: false },
 			lsp: { enabled: true },
+			// An unfinished task list would otherwise make the SDK append up to three hidden reminder
+			// turns, each answered with closing text, after every todo demonstration.
+			todo: { reminders: false },
 		}),
 	);
 	// Reuse the SDK's real protocol fixture, copied into this run's owned root.
@@ -463,10 +468,13 @@ export interface FixtureRequestRecord {
 	method: "POST";
 	path: "/v1/chat/completions";
 	body: Record<string, unknown>;
-	state: "held" | "completed" | "aborted";
+	/** `refused`: a qa-tool marker failed validation; answered with HTTP 400, never streamed or held. */
+	state: "held" | "completed" | "aborted" | "refused";
 	held: boolean;
 	released: boolean;
 	chunks: string[];
+	/** The refusal reason, also sent as the OpenAI-style error message. */
+	error?: string;
 }
 export interface FixtureSnapshot {
 	version: 1;
@@ -491,41 +499,113 @@ export interface ModelFixture {
 	close(): Promise<void>;
 }
 
-/**
- * Test-only tool-call trigger: a user message containing `qa-tool-call:<name>` makes the mock
- * model ask for that offered tool, so a desktop turn can execute a real builtin tool.
- */
-function requestedToolCall(body: Record<string, unknown>): { name: string; arguments: string } | null {
-	if (!Array.isArray(body.tools)) return null;
-	const names = body.tools
-		.map(tool => (tool && typeof tool === "object" ? (tool as { function?: { name?: unknown } }).function?.name : ""))
-		.filter((name): name is string => typeof name === "string");
-	if (names.length === 0) return null;
-	const messages = Array.isArray(body.messages) ? body.messages : [];
-	// Only the newest message can request a call: an older marker must not re-fire after its
-	// tool result has already been returned.
-	const newest = messages.at(-1);
-	if (!newest || typeof newest !== "object") return null;
-	const entry = newest as { role?: unknown; content?: unknown };
-	if (entry.role !== "user") return null;
+interface FixtureToolCall {
+	name: string;
+	/** Serialized JSON object, as OpenAI streams it. */
+	arguments: string;
+}
+
+/** A qa-tool marker the fixture will not answer; the completion fails with this reason. */
+class FixtureRefusal extends Error {}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function messageText(message: Record<string, unknown>): string {
 	// Wire content is either a string or an array of typed parts.
-	const content = Array.isArray(entry.content)
-		? entry.content
-				.map(part =>
-					part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
-						? (part as { text: string }).text
-						: "",
-				)
-				.join("\n")
-		: typeof entry.content === "string"
-			? entry.content
-			: "";
-	const match = /qa-tool-call:([a-z0-9_]+)(?::([^\n]+))?/.exec(content);
-	if (!match) return null;
-	const name = match[1]!;
-	if (!names.includes(name)) throw new Error(`Fixture tool ${name} is not offered`);
-	const argumentText = match[2]?.trim() || "{}";
-	return { name, arguments: JSON.stringify(JSON.parse(argumentText)) };
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content.map(part => (isRecord(part) && typeof part.text === "string" ? part.text : "")).join("\n");
+}
+
+function parseMarkerJson(text: string, label: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new FixtureRefusal(`${label} is not valid JSON; it must fill the rest of its line`);
+	}
+}
+
+function parseCalls(value: unknown, label: string): FixtureToolCall[] {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_CALLS_PER_RESPONSE)
+		throw new FixtureRefusal(`${label} must list 1 to ${MAX_CALLS_PER_RESPONSE} calls`);
+	return value.map((entry, index) => {
+		if (
+			!isRecord(entry) ||
+			typeof entry.name !== "string" ||
+			Object.keys(entry).some(key => key !== "name" && key !== "arguments") ||
+			(entry.arguments !== undefined && !isRecord(entry.arguments))
+		)
+			throw new FixtureRefusal(`${label} call ${index + 1} must be {"name": string, "arguments": object}`);
+		return { name: entry.name, arguments: JSON.stringify(entry.arguments ?? {}) };
+	});
+}
+
+function requireOffered(calls: FixtureToolCall[], offered: string[], label: string): FixtureToolCall[] {
+	for (const call of calls)
+		if (!offered.includes(call.name))
+			throw new FixtureRefusal(
+				`${label}: tool ${call.name} is not offered in this request (offered: ${offered.join(", ") || "none"})`,
+			);
+	return calls;
+}
+
+/**
+ * Test-only tool-call triggers, read from the newest user message of the request:
+ * - `qa-tool-call:<name>[:<json object>]` asks for one call while that message is the newest.
+ * - `qa-tool-calls:[{"name":…,"arguments":{…}},…]` asks for several calls in one response while
+ *   that message is the newest.
+ * - `qa-tool-chain:[step,…]` scripts a turn across completions: step k (0-based) answers the
+ *   request that has k assistant responses after the message, so with one call per step it fires
+ *   once k tool results follow. A step is one call object or an array of them. After the last step
+ *   the turn closes with text.
+ * The JSON must fill the rest of the marker's line. Every call is checked against the tools
+ * offered by THIS request, so a chain proves that an earlier step changed the tool list. A marker
+ * that fails a check is refused before anything streams.
+ */
+function plannedToolCalls(body: Record<string, unknown>): FixtureToolCall[] | null {
+	const messages = Array.isArray(body.messages) ? body.messages : [];
+	const userIndex = messages.findLastIndex(message => isRecord(message) && message.role === "user");
+	if (userIndex < 0) return null;
+	const text = messageText(messages[userIndex] as Record<string, unknown>);
+	const markers = [...text.matchAll(/qa-tool-(calls|call|chain):/g)];
+	if (markers.length === 0) return null;
+	if (markers.length > 1) throw new FixtureRefusal("A message may carry only one qa-tool marker");
+	const marker = markers[0]!;
+	const kind = marker[1] as "call" | "calls" | "chain";
+	const rest = text
+		.slice(marker.index + marker[0].length)
+		.split("\n", 1)[0]!
+		.trim();
+	const offered = (Array.isArray(body.tools) ? body.tools : [])
+		.map(tool => (isRecord(tool) && isRecord(tool.function) ? tool.function.name : undefined))
+		.filter((name): name is string => typeof name === "string");
+	const answered = messages.slice(userIndex + 1).filter(message => isRecord(message) && message.role === "assistant");
+	if (kind === "chain") {
+		const steps = parseMarkerJson(rest, "qa-tool-chain");
+		if (!Array.isArray(steps) || steps.length === 0 || steps.length > MAX_CHAIN_STEPS)
+			throw new FixtureRefusal(`qa-tool-chain must list 1 to ${MAX_CHAIN_STEPS} steps`);
+		const parsed = steps.map((step, index) =>
+			parseCalls(Array.isArray(step) ? step : [step], `qa-tool-chain step ${index + 1}`),
+		);
+		const step = answered.length;
+		if (step >= parsed.length) return null;
+		return requireOffered(parsed[step]!, offered, `qa-tool-chain step ${step + 1}`);
+	}
+	// A single response must not re-fire after its tool results have been returned.
+	if (userIndex !== messages.length - 1) return null;
+	if (kind === "calls")
+		return requireOffered(
+			parseCalls(parseMarkerJson(rest, "qa-tool-calls"), "qa-tool-calls"),
+			offered,
+			"qa-tool-calls",
+		);
+	const match = /^([a-z0-9_]+)(?::(.+))?/.exec(rest);
+	if (!match) throw new FixtureRefusal("qa-tool-call must name a tool: qa-tool-call:<name>[:<json object>]");
+	const argumentsValue = parseMarkerJson(match[2]?.trim() || "{}", "qa-tool-call arguments");
+	if (!isRecord(argumentsValue)) throw new FixtureRefusal("qa-tool-call arguments must be a JSON object");
+	return requireOffered([{ name: match[1]!, arguments: JSON.stringify(argumentsValue) }], offered, "qa-tool-call");
 }
 
 function isTitleRequest(body: Record<string, unknown>): boolean {
@@ -641,18 +721,38 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 			const title = isTitleRequest(body);
 			const collection = title ? titleRecords : records;
 			if (collection.length >= 64) return new Response("Fixture request limit", { status: 429 });
+			// Title transactions offer only set_title, so a marker in the prompt they quote is ignored.
+			let toolCalls: FixtureToolCall[] | null = null;
+			let refusal: string | undefined;
+			if (!title) {
+				try {
+					toolCalls = plannedToolCalls(body);
+				} catch (error) {
+					if (!(error instanceof FixtureRefusal)) throw error;
+					refusal = `TEST ONLY fixture refused the qa-tool marker: ${error.message}`;
+				}
+			}
 			const record: FixtureRequestRecord = {
 				id: collection.length + 1,
 				method: "POST",
 				path: "/v1/chat/completions",
 				body,
-				state: "held",
-				held: !title && holdNext,
+				state: refusal ? "refused" : "held",
+				held: !title && !refusal && holdNext,
 				released: false,
 				chunks: [],
+				...(refusal ? { error: refusal } : {}),
 			};
-			if (!title) holdNext = false;
+			// A refusal never streams, so it leaves the pending hold for the next completion.
+			if (!title && !refusal) holdNext = false;
 			collection.push(record);
+			if (refusal) {
+				persist();
+				return Response.json(
+					{ error: { message: refusal, type: "invalid_request_error", code: "qa_fixture_refused" } },
+					{ status: 400, headers: { "Cache-Control": "no-store" } },
+				);
+			}
 			let heartbeat: Timer | undefined;
 			let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
 			const onAbort = () => {
@@ -685,20 +785,25 @@ export function startModelFixture(artifactPath: string): ModelFixture {
 					const finish = () => {
 						if (record.state !== "held") return;
 						if (heartbeat) clearInterval(heartbeat);
-						const toolCall = title ? null : requestedToolCall(body as Record<string, unknown>);
-						if (toolCall) {
-							send(
-								chunk({
-									tool_calls: [
-										{
-											index: 0,
-											id: `qa-tool-call-${record.id}`,
-											type: "function",
-											function: { name: toolCall.name, arguments: toolCall.arguments },
-										},
-									],
-								}),
-							);
+						const calls = toolCalls;
+						if (calls) {
+							// One delta per call, as OpenAI streams parallel calls.
+							for (const [index, call] of calls.entries()) {
+								const id =
+									calls.length === 1 ? `qa-tool-call-${record.id}` : `qa-tool-call-${record.id}-${index + 1}`;
+								send(
+									chunk({
+										tool_calls: [
+											{
+												index,
+												id,
+												type: "function",
+												function: { name: call.name, arguments: call.arguments },
+											},
+										],
+									}),
+								);
+							}
 							send(chunk({}, "tool_calls"));
 						} else if (title) {
 							send(

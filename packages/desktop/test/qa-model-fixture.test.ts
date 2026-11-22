@@ -891,6 +891,255 @@ describe("deterministic loopback SSE", () => {
 	});
 });
 
+interface StreamedToolCall {
+	index: number;
+	id: string;
+	type: string;
+	function: { name: string; arguments: string };
+}
+
+function markerCompletion(
+	fixture: { baseUrl: string; providerToken: string },
+	messages: Array<Record<string, unknown>>,
+	tools: string[],
+) {
+	return fetch(`${fixture.baseUrl}/chat/completions`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${QA_KEY}`,
+			"X-Desktop-QA-Fixture": fixture.providerToken,
+		},
+		body: JSON.stringify({
+			model: "qa-plain",
+			stream: true,
+			messages,
+			tools: tools.map(name => ({ type: "function", function: { name, parameters: { type: "object" } } })),
+		}),
+	});
+}
+
+async function streamed(response: Response) {
+	expect(response.status).toBe(200);
+	const events = (await response.text())
+		.split("\n\n")
+		.filter(event => event.startsWith("data: {"))
+		.map(
+			event =>
+				JSON.parse(event.slice(6)) as {
+					choices: Array<{
+						delta: { content?: string; tool_calls?: StreamedToolCall[] };
+						finish_reason: string | null;
+					}>;
+				},
+		);
+	const choices = events.flatMap(event => event.choices);
+	return {
+		calls: choices.flatMap(choice => choice.delta.tool_calls ?? []),
+		text: choices.map(choice => choice.delta.content ?? "").join(""),
+		finish: choices.map(choice => choice.finish_reason).filter(Boolean),
+	};
+}
+
+async function refusal(response: Response): Promise<string> {
+	expect(response.status).toBe(400);
+	const body = (await response.json()) as { error: { message: string; code: string } };
+	expect(body.error.code).toBe("qa_fixture_refused");
+	return body.error.message;
+}
+
+const user = (content: string) => ({ role: "user", content: [{ type: "text", text: content }] });
+const answered = (...names: string[]) => [
+	{
+		role: "assistant",
+		content: "earlier step",
+		tool_calls: names.map((name, index) => ({
+			id: `earlier-${index}`,
+			type: "function",
+			function: { name, arguments: "{}" },
+		})),
+	},
+	...names.map((_, index) => ({ role: "tool", tool_call_id: `earlier-${index}`, content: "earlier result" })),
+];
+
+describe("scripted tool-call markers", () => {
+	test("qa-tool-calls streams several calls in one response and only while its message is newest", async () => {
+		const { fixture } = await ownedFixture();
+		const marker = `qa-tool-calls:${JSON.stringify([
+			{ name: "read", arguments: { path: "probe.move" } },
+			{ name: "find", arguments: { paths: ["*.move"] } },
+			{ name: "search", arguments: { pattern: "OWNED" } },
+		])}`;
+		const tools = ["read", "find", "search", "bash"];
+		const first = await markerCompletion(fixture, [user(marker)], tools);
+		expect(fixture.release(1)).toBe(true);
+		const response = await streamed(first);
+		expect(response.calls).toEqual([
+			{
+				index: 0,
+				id: "qa-tool-call-1-1",
+				type: "function",
+				function: { name: "read", arguments: '{"path":"probe.move"}' },
+			},
+			{
+				index: 1,
+				id: "qa-tool-call-1-2",
+				type: "function",
+				function: { name: "find", arguments: '{"paths":["*.move"]}' },
+			},
+			{
+				index: 2,
+				id: "qa-tool-call-1-3",
+				type: "function",
+				function: { name: "search", arguments: '{"pattern":"OWNED"}' },
+			},
+		]);
+		expect(response.finish).toEqual(["tool_calls"]);
+		// Once the three results follow, the same marker closes the turn instead of re-firing.
+		const closing = await streamed(
+			await markerCompletion(fixture, [user(marker), ...answered("read", "find", "search")], tools),
+		);
+		expect(closing.calls).toEqual([]);
+		expect(closing.text).toContain("Fixture turn 2 complete.");
+		expect(closing.finish).toEqual(["stop"]);
+	});
+
+	test("qa-tool-chain answers step k after k responses and checks each step against that request's tools", async () => {
+		const { fixture } = await ownedFixture();
+		const marker = `qa-tool-chain:${JSON.stringify([
+			{ name: "search_tool_bm25", arguments: { query: "todo", limit: 1 } },
+			{ name: "todo_write", arguments: { ops: [{ op: "init", list: [{ phase: "One", items: ["a"] }] }] } },
+			[
+				{ name: "read", arguments: { path: "a.txt" } },
+				{ name: "read", arguments: { path: "b.txt" } },
+			],
+		])}`;
+		const first = await markerCompletion(fixture, [user(marker)], ["read", "search_tool_bm25"]);
+		expect(fixture.release(1)).toBe(true);
+		expect((await streamed(first)).calls.map(call => call.function)).toEqual([
+			{ name: "search_tool_bm25", arguments: '{"query":"todo","limit":1}' },
+		]);
+		// Step 2 is refused while the request does not offer todo_write, and answered once it does.
+		const unoffered = await refusal(
+			await markerCompletion(fixture, [user(marker), ...answered("search_tool_bm25")], ["read", "search_tool_bm25"]),
+		);
+		expect(unoffered).toContain("qa-tool-chain step 2: tool todo_write is not offered in this request");
+		expect(fixture.snapshot().requests[1]).toMatchObject({ id: 2, state: "refused", held: false, chunks: [] });
+		const activated = await streamed(
+			await markerCompletion(
+				fixture,
+				[user(marker), ...answered("search_tool_bm25")],
+				["read", "search_tool_bm25", "todo_write"],
+			),
+		);
+		expect(activated.calls.map(call => call.function.name)).toEqual(["todo_write"]);
+		// A step may hold several calls; the chain counts responses, not results.
+		const grouped = await streamed(
+			await markerCompletion(
+				fixture,
+				[user(marker), ...answered("search_tool_bm25"), ...answered("todo_write")],
+				["read", "todo_write"],
+			),
+		);
+		expect(grouped.calls.map(call => [call.id, call.function.arguments])).toEqual([
+			["qa-tool-call-4-1", '{"path":"a.txt"}'],
+			["qa-tool-call-4-2", '{"path":"b.txt"}'],
+		]);
+		const closing = await streamed(
+			await markerCompletion(
+				fixture,
+				[user(marker), ...answered("search_tool_bm25"), ...answered("todo_write"), ...answered("read", "read")],
+				["read"],
+			),
+		);
+		expect(closing.calls).toEqual([]);
+		expect(closing.finish).toEqual(["stop"]);
+		// A newer user message ends the chain.
+		const later = await streamed(
+			await markerCompletion(
+				fixture,
+				[user(marker), ...answered("search_tool_bm25"), user("plain")],
+				["todo_write"],
+			),
+		);
+		expect(later.calls).toEqual([]);
+	});
+
+	test("malformed, ambiguous or unoffered markers are refused before streaming and keep the pending hold", async () => {
+		const { layout, fixture } = await ownedFixture();
+		const cases: Array<[string, string]> = [
+			['qa-tool-calls:[{"name":"read"', "qa-tool-calls is not valid JSON"],
+			['qa-tool-chain:[{"name":"read"}] trailing words', "qa-tool-chain is not valid JSON"],
+			["qa-tool-calls:[]", "qa-tool-calls must list 1 to 16 calls"],
+			['qa-tool-calls:[{"name":"read","args":{}}]', "qa-tool-calls call 1 must be"],
+			['qa-tool-chain:[{"name":"read","arguments":[1]}]', "qa-tool-chain step 1 call 1 must be"],
+			["qa-tool-call:read:[1]", "qa-tool-call arguments must be a JSON object"],
+			["qa-tool-call:edit", "qa-tool-call: tool edit is not offered in this request (offered: read)"],
+			['qa-tool-call:read qa-tool-chain:[{"name":"read"}]', "only one qa-tool marker"],
+		];
+		for (const [marker, reason] of cases)
+			expect(await refusal(await markerCompletion(fixture, [user(marker)], ["read"]))).toContain(reason);
+		const snapshot = fixture.snapshot();
+		expect(snapshot.holdNext).toBe(true);
+		expect(snapshot.requests.map(record => [record.state, record.held, record.chunks.length])).toEqual(
+			cases.map(() => ["refused", false, 0]),
+		);
+		expect(snapshot.requests.every(record => record.error?.startsWith("TEST ONLY fixture refused"))).toBe(true);
+		// The first completion that actually streams still takes the initial hold.
+		const valid = await markerCompletion(fixture, [user("qa-tool-call:read")], ["read"]);
+		expect(fixture.snapshot().requests.at(-1)).toMatchObject({ state: "held", held: true });
+		expect(fixture.release(cases.length + 1)).toBe(true);
+		expect((await streamed(valid)).calls.map(call => call.function)).toEqual([{ name: "read", arguments: "{}" }]);
+		await fixture.flush();
+		expect(((await Bun.file(layout.artifactPath).json()) as FixtureSnapshot).requests[0]?.state).toBe("refused");
+	});
+});
+
+test("a refused chain step settles the real Host turn with the reason and leaves nothing held", async () => {
+	const { fixture, call, send, session } = await sdkHost();
+	// todo_write stays hidden behind tool search, so step 2 is never offered.
+	const marker = `qa-tool-chain:${JSON.stringify([
+		{ name: "read", arguments: { path: "probe.move" } },
+		{ name: "todo_write", arguments: { ops: [{ op: "init", list: [{ phase: "One", items: ["a"] }] }] } },
+	])}`;
+	const prompt = send("prompt", { sessionId: session.id, text: marker });
+	await waitFor(() => fixture.snapshot().requests.length === 1, "chain step 1");
+	expect(fixture.release(1)).toBe(true);
+	await prompt;
+	const requests = fixture.snapshot().requests;
+	expect(requests.map(record => record.state)).toEqual(["completed", "refused"]);
+	expect(requests[1]!.error).toContain("qa-tool-chain step 2: tool todo_write is not offered");
+	const settled = await call<DesktopSession>("session.select", { sessionId: session.id });
+	expect(settled.status).not.toBe("running");
+	expect(settled.messages.some(message => message.role === "tool" && message.toolName === "read")).toBe(true);
+	expect(settled.messages.some(message => message.text.includes("todo_write is not offered"))).toBe(true);
+}, 60000);
+
+test("one tool search step changes the offered tools within the same turn", async () => {
+	const { fixture, call, send, session } = await sdkHost();
+	const marker = `qa-tool-chain:${JSON.stringify([
+		{ name: "search_tool_bm25", arguments: { query: "todo", limit: 1 } },
+		{ name: "todo_write", arguments: { ops: [{ op: "init", list: [{ phase: "Plan", items: ["Write it down"] }] }] } },
+	])}`;
+	const prompt = send("prompt", { sessionId: session.id, text: marker });
+	await waitFor(() => fixture.snapshot().requests.length === 1, "search step");
+	expect(fixture.release(1)).toBe(true);
+	expect((await prompt).ok).toBe(true);
+	const offered = fixture
+		.snapshot()
+		.requests.map(record =>
+			(record.body.tools as Array<{ function: { name: string } }>).map(tool => tool.function.name),
+		);
+	expect(offered).toHaveLength(3);
+	expect(offered[0]).toContain("search_tool_bm25");
+	expect(offered[0]).not.toContain("todo_write");
+	expect(offered[1]).toContain("todo_write");
+	const settled = await call<DesktopSession>("session.select", { sessionId: session.id });
+	const search = settled.messages.find(message => message.role === "tool" && message.toolName === "search_tool_bm25");
+	expect(JSON.parse(search?.text ?? "{}")).toMatchObject({ activated_tools: ["todo_write"] });
+	expect(settled.todos).toEqual([{ name: "Plan", tasks: [{ content: "Write it down", status: "in_progress" }] }]);
+}, 60000);
+
 test("QA driver fixture controls retain Origin/token/method and SSE-first admission fences", async () => {
 	const child = Bun.spawn([process.execPath, path.resolve(import.meta.dir, "../scripts/host-ui-qa.ts")], {
 		cwd: os.tmpdir(),
