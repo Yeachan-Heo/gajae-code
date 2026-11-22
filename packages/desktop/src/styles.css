@@ -724,3 +724,16 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 @media (prefers-reduced-motion: reduce) {
 	*, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
+
+/* Feature sections. Each package appends only inside its own section, so parallel changes never
+   touch the same lines. They follow the shared @media blocks above, so a section carries its own
+   responsive rules. */
+
+/* Section A: tool call cards (ToolCallCard.tsx, transcript-groups.tsx). */
+
+/* Section B: task list (TodoPanel.tsx, TodoToolBody.tsx, SessionWorkProgress.tsx). */
+
+/* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
+
+/* Section P: providers dialog and onboarding notice (ProvidersDialog.tsx, ProvidersPanel.tsx,
+   ProviderOnboardingNotice.tsx). */

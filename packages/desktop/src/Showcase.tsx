@@ -31,10 +31,14 @@ import { ForkPanel, type ForkPanelProps } from "./ForkPanel";
 import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole, type PickerSelectionScope } from "./ModelPicker";
+import { ProvidersShowcase, ProvidersShowcaseNav } from "./ProvidersShowcase";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
 import { SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
+import { ShowcaseTodo, ShowcaseTodoNav } from "./ShowcaseTodo";
+import { ShowcaseToolCalls, ShowcaseToolCallsNav } from "./ShowcaseToolCalls";
+import { ShowcaseToolCatalog, ShowcaseToolCatalogNav } from "./ShowcaseToolCatalog";
 import { DESKTOP_THEMES } from "./themes";
 import { UpdatesPanel } from "./UpdatesPanel";
 import "./styles.css";
@@ -1405,6 +1409,10 @@ export default function Showcase() {
 					<a href="#showcase-composers">{t("showcase.navComposers")}</a>
 					<a href="#showcase-settings">{t("showcase.navSettings")}</a>
 					<a href="#showcase-settings-tabs">{t("showcase.navSettingsTabs")}</a>
+					<ShowcaseToolCallsNav />
+					<ShowcaseTodoNav />
+					<ShowcaseToolCatalogNav />
+					<ProvidersShowcaseNav />
 				</nav>
 			</header>
 			<section id="showcase-sessions">
@@ -1835,6 +1843,10 @@ export default function Showcase() {
 					/>
 				</div>
 			</section>
+			<ShowcaseToolCalls />
+			<ShowcaseTodo />
+			<ShowcaseToolCatalog />
+			<ProvidersShowcase />
 			<p className="showcase-result" role="status">
 				{answer || t("showcase.answerIdle")}
 			</p>

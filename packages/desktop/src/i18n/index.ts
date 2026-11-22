@@ -9,12 +9,16 @@
  */
 
 import { useSyncExternalStore } from "react";
+import { catalog } from "./en/catalog";
 import { models } from "./en/models";
 import { panels } from "./en/panels";
+import { providers } from "./en/providers";
 import { settings } from "./en/settings";
 import { shell } from "./en/shell";
 import { showcase } from "./en/showcase";
 import { support } from "./en/support";
+import { todo } from "./en/todo";
+import { tools } from "./en/tools";
 
 export type Locale = "en" | "ko" | "zh" | "ja";
 
@@ -29,6 +33,10 @@ const english = {
 	...panels,
 	...settings,
 	...showcase,
+	...tools,
+	...todo,
+	...catalog,
+	...providers,
 };
 
 export type MessageKey = keyof typeof english;
