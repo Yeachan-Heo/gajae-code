@@ -10,6 +10,7 @@
 
 import { useSyncExternalStore } from "react";
 import { catalog } from "./en/catalog";
+import { connection } from "./en/connection";
 import { models } from "./en/models";
 import { panels } from "./en/panels";
 import { providers } from "./en/providers";
@@ -39,6 +40,7 @@ const english = {
 	...catalog,
 	...providers,
 	...recovery,
+	...connection,
 };
 
 export type MessageKey = keyof typeof english;

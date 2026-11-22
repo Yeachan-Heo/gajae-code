@@ -1173,4 +1173,68 @@ suite("mounted desktop navigation", () => {
 			expect(await page.$(".connection-state")).toBeNull();
 		} finally { await context.close(); }
 	}, 30000);
+	test("Disconnect releases the conversation: Connect replaces the composer and the draft comes back", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.click('.session-select[title="Oldest conversation · Idle"]');
+			await page.waitForSelector(".composer textarea:not([disabled])");
+			await page.type(".composer textarea", "kept while disconnected");
+			await conversationAction(page, "Disconnect from app");
+			await page.waitForSelector(".connection-notice");
+			expect(await page.$(".composer textarea")).toBeNull();
+			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Disconnected from the app");
+			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Disconnected");
+			expect(await page.$eval('.session-select[aria-current="page"]', node => node.getAttribute("aria-label"))).toBe(
+				"Oldest conversation · Idle · disconnected from the app",
+			);
+			// A read-only conversation offers only what works without the app's writer.
+			expect(await page.$eval('button[aria-label="Review changes"]', node => (node as HTMLButtonElement).disabled)).toBe(true);
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector('dialog[open] [aria-label="Conversation actions"]');
+			expect(await page.$$eval('[aria-label="Conversation actions"] button', nodes => nodes.map(node => node.textContent?.trim()))).toEqual(["Connect", "Delete conversation"]);
+			await page.keyboard.press("Escape");
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(button => button.textContent === "Connect")?.click());
+			const connect = await heldRequest(page, "session.connect");
+			expect(connect.params).toEqual({ sessionId: "old" });
+			await page.waitForSelector(".composer textarea");
+			expect(await page.$eval(".composer textarea", node => (node as HTMLTextAreaElement).value)).toBe("kept while disconnected");
+			expect(await page.$(".toolbar .connection-badge")).toBeNull();
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("Disconnect during a turn asks first and stops it only when confirmed", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.click('.session-select[title="Middle conversation · Working"]');
+			await page.waitForSelector(".composer textarea");
+			await conversationAction(page, "Disconnect from app");
+			await page.waitForSelector(".disconnect-confirmation");
+			expect(await page.$eval("dialog[open]", node => node.textContent)).toContain("Disconnect while it is working?");
+			expect(await page.$eval(".disconnect-confirmation", node => node.textContent)).toContain("stops the current turn");
+			expect((await page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "session.disconnect"))).map(request => request.params)).toEqual([{ sessionId: "middle" }]);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".disconnect-confirmation button")].find(button => button.textContent === "Stop and disconnect")?.click());
+			const confirmed = await heldRequest(page, "session.disconnect", 2);
+			expect(confirmed.params).toEqual({ sessionId: "middle", confirm: true });
+			await page.waitForSelector(".connection-notice");
+			await page.waitForSelector(".disconnect-confirmation", { hidden: true });
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("a conversation another process has open is read-only and can be checked again", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.click('.session-select[title="Oldest conversation · Idle"]');
+			await page.waitForSelector(".composer textarea");
+			await page.evaluate(() => {
+				const session = window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!;
+				window.navigationFixture.emit({ type: "session", session: { ...session, controlGeneration: null, connection: { state: "elsewhere" } } });
+			});
+			await page.waitForSelector(".connection-notice");
+			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Open in a terminal");
+			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Open in terminal");
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(button => button.textContent === "Check again")?.click());
+			await heldRequest(page, "session.connect");
+			await page.waitForSelector(".composer textarea");
+		} finally { await context.close(); }
+	}, 30000);
 });

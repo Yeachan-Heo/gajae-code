@@ -30,6 +30,7 @@ import { t } from "./i18n";
 import { Markdown } from "./Markdown";
 import { MessageBlocks } from "./MessageBlocks";
 import { Select } from "./Select";
+import { connectionMarkLabel, SessionConnectionMark } from "./SessionConnectionMark";
 import { ToolCallCard } from "./ToolCallCard";
 
 export * from "./TodoPanel";
@@ -76,12 +77,14 @@ export function SessionRow({
 	onMenu?: (x: number, y: number) => void;
 }) {
 	const StatusIcon = statusIcons[session.status];
+	const connection = connectionMarkLabel(session);
+	const name = `${session.title} · ${statuses[session.status]()}${connection ? ` · ${connection}` : ""}`;
 	return (
 		<div className={`session-row ${selected ? "selected" : ""}`}>
 			<button
 				className="session-select"
-				aria-label={`${session.title} · ${statuses[session.status]()}`}
-				title={`${session.title} · ${statuses[session.status]()}`}
+				aria-label={name}
+				title={name}
 				aria-current={selected ? "page" : undefined}
 				aria-haspopup={onMenu ? "menu" : undefined}
 				onClick={onSelect}
@@ -99,6 +102,7 @@ export function SessionRow({
 					<span className="sr-only">{statuses[session.status]()}</span>
 				</span>
 				<span className="session-title">{session.title}</span>
+				<SessionConnectionMark session={session} />
 			</button>
 		</div>
 	);

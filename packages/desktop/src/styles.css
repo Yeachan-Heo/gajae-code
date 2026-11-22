@@ -1086,10 +1086,27 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
    repeated for this frame. */
 .providers-showcase-narrow-notice { max-width: 302px; }
 .providers-showcase-narrow-notice .provider-notice-action { flex: 1 1 100%; width: 100%; }
-/* Section S: session connection and recovery labels (RecoveryConversation.tsx). */
+/* Section S: session connection and recovery labels (RecoveryConversation.tsx, SessionConnection.tsx). */
 /* A recovery card names its conversation; Open or Copy sits on the same line when it fits. */
 .recovery-conversation { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; margin: 0.25rem 0 0.5rem; }
 .recovery-conversation-name { margin: 0; min-width: 0; color: var(--text); font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
 .recovery-conversation-hint { flex-basis: 100%; margin: 0; word-break: keep-all; overflow-wrap: anywhere; }
-/* Showcase only: the narrow state's column. */
+/* The composer's place while the app does not write the conversation: a neutral card in the
+   composer's 800px column, not an error. The draft is kept and returns with the composer. */
+.connection-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; max-width: 800px; min-width: 0; margin: 0 auto; padding: 0.75rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); }
+.connection-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; color: var(--muted); }
+.connection-notice-text { flex: 1 1 16rem; min-width: 0; display: grid; gap: 2px; word-break: keep-all; overflow-wrap: anywhere; }
+.connection-notice-text > span { color: var(--muted); font-size: 0.8125rem; }
+/* Header chip beside the title and the sidebar mark beside a row's name: muted, never a status hue. */
+.toolbar-title h1:has(+ .connection-badge) { display: inline; }
+.connection-badge { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; padding: 2px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); font-size: 0.6875rem; font-weight: 500; line-height: 1.4; vertical-align: 0.15em; white-space: nowrap; }
+.connection-badge svg, .connection-mark svg { width: 0.75rem; height: 0.75rem; }
+.connection-mark { flex: none; display: inline-flex; color: var(--muted); }
+.desktop-sidebar[data-compact] .connection-mark { display: none; }
+.disconnect-confirmation p { word-break: keep-all; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+	.connection-notice-action { flex: 1 1 100%; width: 100%; }
+}
+/* Showcase only: the narrow state's column and a sidebar-width strip of rows. */
 .showcase-session-narrow { max-width: 20rem; }
+.showcase-session-rows { max-width: 264px; padding: 8px; border-radius: var(--radius-md); background: var(--sidebar); }

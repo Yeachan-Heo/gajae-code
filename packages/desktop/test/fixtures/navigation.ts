@@ -61,6 +61,8 @@ export function installNavigationFixture(holdBootstrap = false, options: Navigat
 		controlGeneration: 1,
 		model: "fixture/astra",
 		thinking: { level: "medium", scope: "session", available: true, options: [{ value: "medium", label: "Medium" }] },
+		// The app writes these conversations itself, as it does every conversation it created.
+		connection: { state: "connected" },
 	});
 	let snapshot: DesktopSnapshot = {
 		protocolVersion: 1,
@@ -343,6 +345,36 @@ export function installNavigationFixture(holdBootstrap = false, options: Navigat
 				case "session.select": {
 					const selected = snapshot.sessions.find(item => item.id === request.params.sessionId);
 					if (selected) emit({ type: "session", session: selected });
+					break;
+				}
+				// Like the Host: work in progress needs confirmation; the answer follows the session frame.
+				case "session.disconnect": {
+					const target = snapshot.sessions.find(item => item.id === request.params.sessionId);
+					if (!target) break;
+					if (target.status === "running" && request.params.confirm !== true) {
+						result = { disconnected: false, confirm: { running: true, queued: target.queued?.length ?? 0 } };
+						break;
+					}
+					const released: DesktopSession = {
+						...target,
+						status: "idle",
+						controlGeneration: null,
+						connection: { state: "disconnected" },
+					};
+					emit({ type: "session", session: released });
+					result = { disconnected: true, session: released };
+					break;
+				}
+				case "session.connect": {
+					const target = snapshot.sessions.find(item => item.id === request.params.sessionId);
+					if (!target) break;
+					const connected: DesktopSession = {
+						...target,
+						controlGeneration: 2,
+						connection: { state: "connected" },
+					};
+					emit({ type: "session", session: connected });
+					result = connected;
 					break;
 				}
 			}

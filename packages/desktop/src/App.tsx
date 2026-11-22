@@ -26,6 +26,7 @@ import type {
 	DesktopCompletionResult,
 	DesktopDeliveryReceipt,
 	DesktopDiff,
+	DesktopDisconnectResult,
 	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
@@ -51,12 +52,14 @@ import {
 	Network,
 	PanelLeftClose,
 	PanelLeftOpen,
+	Plug,
 	Plus,
 	RotateCcw,
 	Settings2,
 	Target,
 	Trash2,
 	TriangleAlert,
+	Unplug,
 	Wrench,
 } from "lucide-react";
 import {
@@ -122,6 +125,8 @@ import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { RecoveryConversation } from "./RecoveryConversation";
 import { Select } from "./Select";
+import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
+import { connectionState, SessionConnectionBadge } from "./SessionConnectionMark";
 import { SessionHudPanel } from "./SessionHudPanel";
 import { hasSessionWorkContent, SessionWorkPanel } from "./SessionWorkPanel";
 import { SessionWorkProgress, sessionWorkLabel } from "./SessionWorkProgress";
@@ -159,6 +164,7 @@ type Dialog =
 	| "mcp"
 	| "session-info"
 	| "btw"
+	| "disconnect"
 	| null;
 interface GateView {
 	sessionId: string;
@@ -693,6 +699,10 @@ export default function App() {
 	/** Sidebar rename target; independent of the selected conversation's dialogs. */
 	const [renaming, setRenaming] = useState<{ sessionId: string; title: string } | null>(null);
 	const [result, setResult] = useState("");
+	/** What a confirmed Disconnect would stop, for the conversation it was asked about. */
+	const [disconnectAsk, setDisconnectAsk] = useState<{ sessionId: string; running: boolean; queued: number } | null>(
+		null,
+	);
 	const transcriptPositions = useRef(new Map<string, TranscriptPosition>());
 	const transcriptView = useRef<TranscriptView | null>(null);
 	const [, setTranscriptRevision] = useState(0);
@@ -706,6 +716,8 @@ export default function App() {
 	} | null>(null);
 	const conversation = useRef<HTMLDivElement>(null);
 	const session = snapshot?.sessions.find(item => item.id === selected);
+	/** The app writes the selected conversation itself; otherwise it is shown read-only. */
+	const writable = connectionState(session) === "connected";
 	const rememberedTranscript = transcriptPositions.current.get(selected);
 	const transcriptRuns = useTranscriptRuns(selected, session?.controlGeneration ?? null);
 	const anchorIndex =
@@ -1701,6 +1713,26 @@ export default function App() {
 			onRevision: target => showPromptRevision(owner.id, target),
 		};
 	};
+	/** Connect, or re-check whether another process still has the conversation open. */
+	const connectSession = (sessionId: string) =>
+		void run(sessionId, async () => {
+			await request<DesktopSession>("session.connect", { sessionId });
+		});
+	/** Without `confirm` the Host refuses to stop work and says what Disconnect would stop. */
+	const disconnectSession = (sessionId: string, confirm = false) =>
+		void run(sessionId, async () => {
+			const result = await request<DesktopDisconnectResult>("session.disconnect", {
+				sessionId,
+				...(confirm ? { confirm: true } : {}),
+			});
+			if (!result.disconnected) {
+				setDisconnectAsk({ sessionId, ...result.confirm });
+				setDialog("disconnect");
+				return;
+			}
+			setDisconnectAsk(null);
+			if (selectedRef.current === sessionId) closeDialog();
+		});
 	const openFork = () => {
 		const sessionId = selected;
 		const generation = setDialog("fork");
@@ -2775,6 +2807,7 @@ export default function App() {
 					<div className="toolbar-title">
 						{project && <small>{project.name}</small>}
 						<h1>{session?.title || t("shell.startInProject")}</h1>
+						{session && <SessionConnectionBadge session={session} />}
 					</div>
 					{session && (
 						<>
@@ -2786,7 +2819,7 @@ export default function App() {
 								aria-label={t("shell.reviewChanges")}
 								title={t("shell.reviewChanges")}
 								aria-pressed={review}
-								disabled={!connected}
+								disabled={!connected || !writable}
 								onClick={() => {
 									setCardSelection(previous => ({ ...previous, [selected]: review ? null : "review" }));
 								}}
@@ -2824,7 +2857,7 @@ export default function App() {
 									)}
 							</Button>
 							<Button
-								disabled={!connected}
+								disabled={!connected || !writable}
 								aria-label={t("shell.sessionStatus")}
 								title={t("shell.sessionStatus")}
 								onClick={openSessionInfo}
@@ -2975,89 +3008,103 @@ export default function App() {
 								{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
 
 								<div className="composer-area">
-									{providerOnboarding && <ProviderOnboardingNotice onConnect={() => setProvidersOpen(true)} />}
-									<Composer
-										overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
-										controls={modelControls(session)}
-										attachment={
-											<AttachmentPicker
-												sessionId={session.id}
-												attachments={attachmentDrafts[session.id] ?? []}
-												supportsImageInput={session.imageInput?.supported === true}
-												imagesBlocked={session.imageInput?.blocked}
+									{!writable && session.connection && session.connection.state !== "connected" ? (
+										<SessionConnectionNotice
+											state={session.connection.state}
+											pending={!connected || !!pending[session.id]}
+											onConnect={() => connectSession(session.id)}
+										/>
+									) : (
+										<>
+											{providerOnboarding && (
+												<ProviderOnboardingNotice onConnect={() => setProvidersOpen(true)} />
+											)}
+											<Composer
+												overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
+												controls={modelControls(session)}
+												attachment={
+													<AttachmentPicker
+														sessionId={session.id}
+														attachments={attachmentDrafts[session.id] ?? []}
+														supportsImageInput={session.imageInput?.supported === true}
+														imagesBlocked={session.imageInput?.blocked}
+														disabled={!connected || busyDrafts[session.id]}
+														onChange={changeAttachments}
+													/>
+												}
+												attachments={
+													<AttachmentList
+														sessionId={session.id}
+														attachments={attachmentDrafts[session.id] ?? []}
+														supportsImageInput={session.imageInput?.supported === true}
+														imagesBlocked={session.imageInput?.blocked}
+														disabled={!connected || busyDrafts[session.id]}
+														onChange={changeAttachments}
+													/>
+												}
+												hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
+												allowQueue={!session.operatorRunning}
+												sendDisabled={
+													session.operatorRunning ||
+													unsentBlocked[session.id] ||
+													attachmentDrafts[session.id]?.some(
+														draft =>
+															draft.status !== "ready" ||
+															(draft.attachment.kind === "image" &&
+																(session.imageInput?.supported !== true ||
+																	session.imageInput?.blocked === true)),
+													)
+												}
+												onPaste={event => {
+													// A paste that carries text stays a text paste; a copied file from Finder
+													// carries none and becomes an attachment.
+													if (event.clipboardData.types.includes("text/plain")) return;
+													const files = desktopTransferFiles(event.clipboardData);
+													if (!files.length || !connected || draftLocks.current.has(session.id)) return;
+													event.preventDefault();
+													addAttachmentFiles(files);
+												}}
+												value={drafts[selected] || ""}
+												onChange={value => changeText(selected, () => value)}
+												onSend={send}
+												onStop={() =>
+													void call(
+														"abort",
+														{ sessionId: session.id, sessionGeneration: session.controlGeneration },
+														`abort:${session.id}`,
+													)
+												}
+												busy={session.status === "running" || session.status === "waiting"}
+												autocomplete={
+													connected && session.controlGeneration !== null
+														? {
+																owner: `${session.id}:${session.controlGeneration}`,
+																complete: (text, cursor) =>
+																	request<DesktopCompletionResult>("composer.complete", {
+																		sessionId: session.id,
+																		sessionGeneration: session.controlGeneration,
+																		text,
+																		cursor,
+																	}).then(result => ({
+																		...result,
+																		items: result.items.map(item =>
+																			item.text.trim() === "/clear"
+																				? {
+																						...item,
+																						description: t(
+																							"shell.clearNewConversationDescription",
+																						),
+																					}
+																				: item,
+																		),
+																	})),
+															}
+														: undefined
+												}
 												disabled={!connected || busyDrafts[session.id]}
-												onChange={changeAttachments}
 											/>
-										}
-										attachments={
-											<AttachmentList
-												sessionId={session.id}
-												attachments={attachmentDrafts[session.id] ?? []}
-												supportsImageInput={session.imageInput?.supported === true}
-												imagesBlocked={session.imageInput?.blocked}
-												disabled={!connected || busyDrafts[session.id]}
-												onChange={changeAttachments}
-											/>
-										}
-										hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
-										allowQueue={!session.operatorRunning}
-										sendDisabled={
-											session.operatorRunning ||
-											unsentBlocked[session.id] ||
-											attachmentDrafts[session.id]?.some(
-												draft =>
-													draft.status !== "ready" ||
-													(draft.attachment.kind === "image" &&
-														(session.imageInput?.supported !== true ||
-															session.imageInput?.blocked === true)),
-											)
-										}
-										onPaste={event => {
-											// A paste that carries text stays a text paste; a copied file from Finder
-											// carries none and becomes an attachment.
-											if (event.clipboardData.types.includes("text/plain")) return;
-											const files = desktopTransferFiles(event.clipboardData);
-											if (!files.length || !connected || draftLocks.current.has(session.id)) return;
-											event.preventDefault();
-											addAttachmentFiles(files);
-										}}
-										value={drafts[selected] || ""}
-										onChange={value => changeText(selected, () => value)}
-										onSend={send}
-										onStop={() =>
-											void call(
-												"abort",
-												{ sessionId: session.id, sessionGeneration: session.controlGeneration },
-												`abort:${session.id}`,
-											)
-										}
-										busy={session.status === "running" || session.status === "waiting"}
-										autocomplete={
-											connected && session.controlGeneration !== null
-												? {
-														owner: `${session.id}:${session.controlGeneration}`,
-														complete: (text, cursor) =>
-															request<DesktopCompletionResult>("composer.complete", {
-																sessionId: session.id,
-																sessionGeneration: session.controlGeneration,
-																text,
-																cursor,
-															}).then(result => ({
-																...result,
-																items: result.items.map(item =>
-																	item.text.trim() === "/clear"
-																		? {
-																				...item,
-																				description: t("shell.clearNewConversationDescription"),
-																			}
-																		: item,
-																),
-															})),
-													}
-												: undefined
-										}
-										disabled={!connected || busyDrafts[session.id]}
-									/>
+										</>
+									)}
 								</div>
 							</>
 						) : connection && !fatal ? (
@@ -3175,6 +3222,7 @@ export default function App() {
 							mcp: t("shell.dialogMcp"),
 							"session-info": t("shell.sessionStatus"),
 							"session-actions": t("shell.conversationActions"),
+							disconnect: t("connection.confirmTitle"),
 						}[dialog]
 					}
 					onClose={closeDialog}
@@ -3185,63 +3233,86 @@ export default function App() {
 					{notice && <p role="status">{notice}</p>}
 					{dialog === "session-actions" && (
 						<nav className="command-list" aria-label={t("shell.conversationActions")}>
-							<Button onClick={() => setDialog("operator")}>
-								<Command aria-hidden="true" />
-								{t("shell.dialogOperator")}
-							</Button>
-							<Button disabled={!connected || session?.controlGeneration === null} onClick={() => openBtw()}>
-								<Command aria-hidden="true" />
-								{t("shell.sideChatCommand")}
-							</Button>
-							<Button onClick={openMcp}>
-								<Network aria-hidden="true" />
-								{t("shell.dialogMcp")}
-							</Button>
-							<Button onClick={openFork}>
-								<GitFork aria-hidden="true" />
-								{t("shell.dialogFork")}
-							</Button>
-							<Button
-								disabled={sessionActionDisabled}
-								onClick={() => {
-									closeDialog();
-									void call("session.retry", { sessionId: selected });
-								}}
-							>
-								<RotateCcw aria-hidden="true" />
-								{t("shell.retryResponse")}
-							</Button>
-							<Button
-								disabled={sessionActionDisabled}
-								onClick={() => {
-									const sessionId = selected;
-									const generation = dialogGeneration.current;
-									void run(sessionId, async () => {
-										const value = await request<{ path: string }>("session.export", { sessionId });
-										if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
-										setResult(t("shell.exportedConversation", { path: value.path }));
-										setDialog("result");
-									});
-								}}
-							>
-								<FileOutput aria-hidden="true" />
-								{t("shell.exportConversation")}
-							</Button>
-							<Button disabled={!connected || !session} onClick={() => setDialog("tools")}>
-								<Wrench aria-hidden="true" />
-								{t("shell.manageActiveTools")}
-							</Button>
-							<Button
-								disabled={sessionActionDisabled}
-								onClick={() => {
-									setEditText("");
-									setResult("");
-									setDialog("goal");
-								}}
-							>
-								<Target aria-hidden="true" />
-								{t("shell.manageGoal")}
-							</Button>
+							{session?.connection && (
+								<Button
+									disabled={!connected || !!pending[selected]}
+									onClick={() => {
+										if (writable) disconnectSession(selected);
+										else {
+											closeDialog();
+											connectSession(selected);
+										}
+									}}
+								>
+									{writable ? <Unplug aria-hidden="true" /> : <Plug aria-hidden="true" />}
+									{writable ? t("connection.disconnect") : t("connection.connect")}
+								</Button>
+							)}
+							{writable && (
+								<>
+									<Button onClick={() => setDialog("operator")}>
+										<Command aria-hidden="true" />
+										{t("shell.dialogOperator")}
+									</Button>
+									<Button
+										disabled={!connected || session?.controlGeneration === null}
+										onClick={() => openBtw()}
+									>
+										<Command aria-hidden="true" />
+										{t("shell.sideChatCommand")}
+									</Button>
+									<Button onClick={openMcp}>
+										<Network aria-hidden="true" />
+										{t("shell.dialogMcp")}
+									</Button>
+									<Button onClick={openFork}>
+										<GitFork aria-hidden="true" />
+										{t("shell.dialogFork")}
+									</Button>
+									<Button
+										disabled={sessionActionDisabled}
+										onClick={() => {
+											closeDialog();
+											void call("session.retry", { sessionId: selected });
+										}}
+									>
+										<RotateCcw aria-hidden="true" />
+										{t("shell.retryResponse")}
+									</Button>
+									<Button
+										disabled={sessionActionDisabled}
+										onClick={() => {
+											const sessionId = selected;
+											const generation = dialogGeneration.current;
+											void run(sessionId, async () => {
+												const value = await request<{ path: string }>("session.export", { sessionId });
+												if (dialogGeneration.current !== generation || selectedRef.current !== sessionId)
+													return;
+												setResult(t("shell.exportedConversation", { path: value.path }));
+												setDialog("result");
+											});
+										}}
+									>
+										<FileOutput aria-hidden="true" />
+										{t("shell.exportConversation")}
+									</Button>
+									<Button disabled={!connected || !session} onClick={() => setDialog("tools")}>
+										<Wrench aria-hidden="true" />
+										{t("shell.manageActiveTools")}
+									</Button>
+									<Button
+										disabled={sessionActionDisabled}
+										onClick={() => {
+											setEditText("");
+											setResult("");
+											setDialog("goal");
+										}}
+									>
+										<Target aria-hidden="true" />
+										{t("shell.manageGoal")}
+									</Button>
+								</>
+							)}
 							<Button className="danger" onClick={() => setDialog("delete")}>
 								<Trash2 aria-hidden="true" />
 								{t("shell.dialogDelete")}
@@ -3591,6 +3662,15 @@ export default function App() {
 						) : (
 							<p>{t("shell.loadingFullHistory")}</p>
 						))}
+					{dialog === "disconnect" && disconnectAsk?.sessionId === dialogOwner && (
+						<DisconnectConfirmation
+							running={disconnectAsk.running}
+							queued={disconnectAsk.queued}
+							pending={!connected || !!pending[dialogOwner]}
+							onCancel={closeDialog}
+							onConfirm={() => disconnectSession(dialogOwner, true)}
+						/>
+					)}
 					{dialog === "delete" && (
 						<>
 							<div className="delete-confirmation">
