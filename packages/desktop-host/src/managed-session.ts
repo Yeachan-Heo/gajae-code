@@ -46,6 +46,10 @@ export interface ManagedSessionOptions {
 	/** Desktop-issued epoch; the SDK's numeric generation may be reused by a successor. */
 	nextControlGeneration: () => number;
 	onChange: () => void;
+	/** A turn of this conversation already ended earlier in this app run. */
+	turnEnded?: boolean;
+	/** This attachment saw a turn end: the owner went from running to idle, or a Desktop prompt settled. */
+	onTurnEnded?: () => void;
 	/** Only a correlated successful Desktop-dispatched prompt/follow-up, never an admission or steer. */
 	onTaskCompleted?: (turnId: string, capturedDesktopEpoch: number) => void;
 	delivery: (
@@ -70,6 +74,7 @@ export class ManagedSession {
 	#models: Q10Model[] = [];
 	#title: string;
 	#idle = true;
+	#turnEnded: boolean;
 	#waiting = false;
 	#error?: string;
 	#closed = false;
@@ -82,6 +87,7 @@ export class ManagedSession {
 	constructor(options: ManagedSessionOptions) {
 		this.#options = options;
 		this.#title = options.title;
+		this.#turnEnded = options.turnEnded === true;
 		const onFrame = (_attachment: sdkRouter.SessionAttachment, frame: sdkRouter.SessionRouterFrame) => {
 			if (!["query_response", "control_response", "hello", "pong", "protocol_error"].includes(frame.name ?? ""))
 				this.#scheduleRefresh();
@@ -348,6 +354,7 @@ export class ManagedSession {
 				this.#models = models as Q10Model[];
 				this.#title =
 					typeof metadata?.name === "string" && metadata.name ? metadata.name.slice(0, 200) : this.#title;
+				if (!this.#idle && checkpoint.idle) this.#markTurnEnded();
 				this.#idle = checkpoint.idle;
 				this.#waiting = gates.some(gate => record(gate)?.tag === "pending");
 				this.#error = undefined;
@@ -465,6 +472,7 @@ export class ManagedSession {
 					...(typeof result?.commandId === "string" ? { sdkSubmissionId: result.commandId } : {}),
 				});
 				selector.deliveryTerminal = disposition === "completed" || disposition === "failed";
+				if (selector.deliveryTerminal && selector.kind === "prompt") this.#markTurnEnded();
 			}
 			// Delivery may be terminal before the SDK enriches its receipt/outcome.
 			// Keep only ephemeral notification intent, without rewriting the journal.
@@ -548,6 +556,12 @@ export class ManagedSession {
 			});
 			throw error;
 		}
+	}
+
+	#markTurnEnded(): void {
+		if (this.#turnEnded) return;
+		this.#turnEnded = true;
+		this.#options.onTurnEnded?.();
 	}
 
 	async query(name: string, input: Record<string, unknown> = {}): Promise<unknown> {
@@ -664,7 +678,7 @@ export class ManagedSession {
 					? "error"
 					: !this.#idle
 						? "running"
-						: projected.messages.length
+						: this.#turnEnded
 							? "done"
 							: "idle",
 			messages: projected.messages,

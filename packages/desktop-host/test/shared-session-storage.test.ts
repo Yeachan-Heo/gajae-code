@@ -522,6 +522,30 @@ test("a recorded tail needs a saved view and an entry id", async () => {
 	}
 });
 
+test("Done means a turn ended in this app run; opening, selecting or renaming never changes status", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	const status = () => h.snapshot().sessions.find(session => session.id === sessionId)?.status;
+	expect(status()).toBe("idle");
+	await h.call("prompt", { sessionId, text: "a turn in this run" });
+	expect(status()).toBe("done");
+	// Closing the workspace unloads the conversation; what happened in this run still holds.
+	await h.call("project.close", { projectId: h.project.id });
+	await h.call("project.open", { path: h.projectDir });
+	expect(status()).toBe("done");
+	await h.call("session.select", { sessionId });
+	expect(status()).toBe("done");
+	await h.restart();
+	expect(status()).toBe("idle");
+	// A conversation with history is still idle when it is merely loaded.
+	await h.call("session.select", { sessionId });
+	expect(status()).toBe("idle");
+	await h.call("session.rename", { sessionId, title: "Renamed after restart" });
+	expect(status()).toBe("idle");
+	await h.call("session.select", { sessionId });
+	expect(status()).toBe("idle");
+});
+
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });

@@ -550,6 +550,8 @@ export class DesktopHost {
 	 * left uncataloged (a branch fork's ancestor, retained cleanup, a failed removal). In-run only.
 	 */
 	#heldTranscripts = new Set<string>();
+	/** Catalog rows whose turn ended while this Host ran. Loading or opening a row never adds it. */
+	#endedTurns = new Set<string>();
 	#opening = new Map<string, Promise<LiveSession>>();
 	/**
 	 * One queue per workspace path. Open and close both mutate the same catalog entry, and the
@@ -977,8 +979,8 @@ export class DesktopHost {
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
 		const gates = live?.activityUpdate?.activity.sessionState?.gates;
 		const awaitingGate = gates?.available && gates.pending.length > 0;
-		// The real transcript. Status, and anything else that describes the conversation itself,
-		// reads this list; notices and other Host-synthesized rows join only the display copy below.
+		// The real transcript. Notices and other Host-synthesized rows join only the display copy
+		// below. Status never reads either list: it must not depend on whether a row is loaded.
 		const transcript = live
 			? projectMessages(
 					live.streamingMessage ? [...live.sdk.messages, live.streamingMessage] : live.sdk.messages,
@@ -1035,7 +1037,7 @@ export class DesktopHost {
 						? "running"
 						: live?.error
 							? "error"
-							: transcript.length > 0
+							: this.#endedTurns.has(metadata.id)
 								? "done"
 								: "idle",
 			...(live?.sdk.model ? { model: `${live.sdk.model.provider}/${live.sdk.model.id}` } : {}),
@@ -1411,6 +1413,7 @@ export class DesktopHost {
 		this.#attachOperatorController(live);
 		this.#attachBtwController(live);
 		live.unsubscribe = live.sdk.subscribe(event => {
+			if (event.type === "agent_end") this.#endedTurns.add(live.metadata.id);
 			if (event.type === "message_update") live.streamingMessage = event.message;
 			if (event.type === "message_end" || event.type === "agent_end") live.streamingMessage = undefined;
 			if (event.type === "agent_end")
@@ -3650,6 +3653,8 @@ export class DesktopHost {
 			},
 			redact: text => this.#redact(text),
 			delivery: (id, changes) => this.#delivery(id, changes),
+			turnEnded: this.#endedTurns.has(metadata.id),
+			onTurnEnded: () => this.#endedTurns.add(metadata.id),
 			onTaskCompleted: (turnId, desktopEpoch) => {
 				if (
 					!this.#closed &&

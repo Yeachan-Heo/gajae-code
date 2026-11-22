@@ -455,7 +455,8 @@ test("managed answer copy fails closed for old-owner unknown, error, partial, th
 	];
 	h.entries.push(...rows);
 	await h.adapter.refresh();
-	expect(h.adapter.dto().status).toBe("done");
+	// History alone is not a turn this app saw end.
+	expect(h.adapter.dto().status).toBe("idle");
 	const answers = (messages: DesktopMessage[]) => messages.filter(message => message.role !== "user");
 	expect(answers(h.adapter.dto().messages).every(message => message.copy === undefined)).toBe(true);
 	expect(answers(h.adapter.history(0, 50).messages).every(message => message.copy === undefined)).toBe(true);
@@ -667,7 +668,7 @@ test("resumes through SDK identity authority and reads an owned endpoint without
 	expect(h.lifecycleCalls.map(call => call.operation)).toEqual(["session.list", "session.resume"]);
 	expect(h.lifecycleCalls[1]?.input).toMatchObject({ sessionId: h.id, sessionPath: h.file });
 	expect(h.lifecycleCalls[1]?.key).toBeTruthy();
-	expect(h.adapter.dto()).toMatchObject({ id: h.id, title: "Original terminal title", status: "done" });
+	expect(h.adapter.dto()).toMatchObject({ id: h.id, title: "Original terminal title", status: "idle" });
 	expect(h.adapter.history(0, 20).messages[0]?.text).toBe("Existing terminal transcript");
 	expect(await Bun.file(h.file).text()).toBe(h.transcript);
 	expect(JSON.stringify(h.adapter.dto())).not.toContain(h.file);
@@ -1232,6 +1233,18 @@ for (const missing of ["content", "outcome", "both"] as const) {
 	});
 }
 
+test("reports done only after it sees an owner's turn end, never from history", async () => {
+	const h = await fixture({ idle: false });
+	expect(h.adapter.dto().status).toBe("running");
+	h.complete();
+	await h.adapter.refresh();
+	expect(h.adapter.dto().status).toBe("done");
+	const quiet = await fixture();
+	quiet.entries.push({ id: "earlier-answer", role: "assistant", body: "earlier answer", stopReason: "stop" });
+	await quiet.adapter.refresh();
+	expect(quiet.adapter.dto().status).toBe("idle");
+});
+
 test("deduplicates repeated confirmations of one public managed SDK turn", async () => {
 	const h = await fixture({ idle: false });
 	const epoch = h.adapter.controlGeneration;
@@ -1337,7 +1350,7 @@ test("does not infer completion from history, idle snapshots, events, or steer t
 	h.entries.push({ id: "historical-success", role: "assistant", body: "historical answer", stopReason: "stop" });
 	await h.emit();
 	await h.adapter.refresh();
-	expect(h.adapter.dto().status).toBe("done");
+	expect(h.adapter.dto().status).toBe("idle");
 	expect(h.completions).toEqual([]);
 	await h.adapter.close();
 	const reopened = h.createAdapter();

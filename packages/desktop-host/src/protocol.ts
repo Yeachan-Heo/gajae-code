@@ -207,9 +207,10 @@ export interface DesktopSession {
 	projectId: string;
 	title: string;
 	/**
-	 * `done` means at least one visible transcript message exists and the session is otherwise
-	 * settled (not busy, waiting on an answer/gate, or failed); a never-used session stays `idle`.
-	 * Host notices in `messages` are not transcript messages and never make a session `done`.
+	 * `done` means a turn of this conversation ended while the app was running and the session is
+	 * otherwise settled (not busy, waiting on an answer/gate, or failed). Everything else is `idle`,
+	 * including a conversation with history from an earlier run: loading, opening, selecting or
+	 * renaming a conversation never changes its status, and notices never count as a turn.
 	 */
 	status: "idle" | "done" | "running" | "waiting" | "error";
 	queued?: DesktopQueuedInput[];
