@@ -729,7 +729,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* The summary is one call line plus an optional muted intent line. The subject keeps one line and
    ellipsizes (the full text is its hover title); facts and status wrap below it when narrow. */
 .tool-call .tool-disclosure > summary { flex-wrap: nowrap; align-items: flex-start; }
-.tool-call .tool-disclosure > summary > .disclosure-chevron { margin-top: 2px; }
+/* Icons are sized in rem so they grow with the text size (16 px and 14 px at the default size). A
+   chevron centers on its summary's first text line, which is one line-height (1lh) tall. */
+.tool-call .tool-disclosure > summary svg, .tool-group-summary svg { width: 1rem; height: 1rem; }
+.tool-call .tool-disclosure > summary > .disclosure-chevron, .tool-group-summary > .disclosure-chevron { margin-top: max(0px, calc((1lh - 1rem) / 2)); }
 .tool-call-head { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
 .tool-call-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
 .tool-call-icon { color: var(--muted); }
@@ -741,7 +744,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-fact-added { color: var(--status-done); }
 .tool-fact-removed { color: var(--status-error); }
 .tool-call-status { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.tool-call-status svg { width: 14px; height: 14px; }
+.tool-call .tool-disclosure > summary .tool-call-status svg, .tool-group-summary .tool-call-status svg { width: 0.875rem; height: 0.875rem; }
 .tool-call-running { color: var(--status-running); }
 .tool-call-waiting { color: var(--status-waiting); }
 /* Cancelled is a neutral outcome, like Idle: muted, never the error treatment. */
@@ -780,15 +783,14 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-group .role-label { margin-bottom: 4px; }
 .tool-group-summary { display: flex; align-items: flex-start; gap: 8px; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); color: var(--text); text-align: left; font-size: 0.8125rem; }
 .tool-group-summary:hover { background: var(--surface-2); }
-.tool-group-summary svg { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 1.75; }
-.tool-group-summary > .disclosure-chevron { margin-top: 2px; }
+.tool-group-summary svg { flex-shrink: 0; stroke-width: 1.75; }
 .tool-group-summary .disclosure-chevron[data-open] { transform: rotate(90deg); }
 .tool-group-head { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
 .tool-group-title { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; word-break: keep-all; overflow-wrap: anywhere; }
 .tool-group-count { font-weight: 600; }
 .tool-group-kinds { color: var(--muted); }
 .tool-group-failed { display: inline-flex; align-items: center; gap: 4px; color: var(--tool-error-text); }
-.tool-group-failed svg { width: 14px; height: 14px; }
+.tool-group-summary .tool-group-failed svg { width: 0.875rem; height: 0.875rem; }
 .tool-group-latest { min-width: 0; color: var(--muted); }
 .tool-group-latest .tool-call-verb { font-weight: 500; }
 .tool-group .tool-run-items { margin: 4px 0 0 12px; padding-left: 12px; border-left: 1px solid var(--border-soft); }

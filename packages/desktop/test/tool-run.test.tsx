@@ -144,6 +144,38 @@ suite("tool cards and runs in a mounted transcript", () => {
 		} finally { await closeComponentFixture(context, page); }
 	}, 30000);
 
+	test("card and group icons grow with the text size, and chevrons sit on their first text line", async () => {
+		const { context, page } = await fixture([call("1:2", "a", "failed"), call("call:b", "b", "running")]);
+		try {
+			await page.click(".tool-group-summary");
+			const measure = (size: number) => page.evaluate(size => {
+				document.documentElement.style.setProperty("--text-size", `${size}px`);
+				const box = (selector: string) => document.querySelector(selector)!.getBoundingClientRect();
+				const center = (rect: DOMRect) => rect.top + rect.height / 2;
+				const card = '[data-tool-status="failed"]';
+				return {
+					sizes: [
+						`${card} summary > .disclosure-chevron`,
+						`${card} .tool-call-icon`,
+						`${card} .tool-call-status svg`,
+						".tool-group-summary > .disclosure-chevron",
+						".tool-group-failed svg",
+					].map(selector => box(selector).width),
+					// Distance between each chevron's center and its first text line's center.
+					offsets: [
+						center(box(`${card} summary > .disclosure-chevron`)) - center(box(`${card} .tool-call-verb`)),
+						center(box(".tool-group-summary > .disclosure-chevron")) - center(box(".tool-group-count")),
+					],
+				};
+			}, size);
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			const normal = await measure(14);
+			const large = await measure(20);
+			for (const [index, width] of large.sizes.entries()) expect(width / normal.sizes[index]!).toBeGreaterThan(1.35);
+			for (const offset of [...normal.offsets, ...large.offsets]) expect(Math.abs(offset)).toBeLessThanOrEqual(1);
+		} finally { await closeComponentFixture(context, page); }
+	}, 30000);
+
 	test("a group stays collapsed through failures and new calls, shows the newest call, and opens only on request", async () => {
 		const { context, page } = await fixture([call("1:2", "a", "done"), call("call:b", "b", "running")]);
 		try {
