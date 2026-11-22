@@ -1,5 +1,13 @@
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
-import type { DesktopFrame, DesktopRequest, DesktopSession, DesktopSnapshot } from "@gajae-code/desktop-host/protocol";
+import type {
+	DesktopAuthProvider,
+	DesktopAuthState,
+	DesktopFrame,
+	DesktopModel,
+	DesktopRequest,
+	DesktopSession,
+	DesktopSnapshot,
+} from "@gajae-code/desktop-host/protocol";
 
 export interface NavigationFixture {
 	connect(): void;
@@ -12,6 +20,8 @@ export interface NavigationFixture {
 	holdAnimationFrames(hold: boolean): void;
 	pendingAnimationFrames(): number;
 	flushAnimationFrames(includeCancelled?: boolean): void;
+	/** The flow `auth.state` would report now. */
+	authState(): DesktopAuthState | null;
 }
 
 declare global {
@@ -20,8 +30,18 @@ declare global {
 	}
 }
 
-/** Page-owned transport for mounted navigation tests and visual QA; never a product fallback. */
-export function installNavigationFixture(holdBootstrap = false): void {
+export interface NavigationFixtureOptions {
+	/** Start with no available model: the zero-model onboarding state. A saved key brings them back. */
+	zeroModels?: boolean;
+	/** The `auth.providers` reply. Without it the fixture answers an empty list, as before. */
+	providers?: DesktopAuthProvider[];
+}
+
+/**
+ * Page-owned transport for mounted navigation tests and visual QA; never a product fallback.
+ * It is serialized into the page, so it must stay self-contained.
+ */
+export function installNavigationFixture(holdBootstrap = false, options: NavigationFixtureOptions = {}): void {
 	const callbacks = new Map<number, (event: unknown) => void>();
 	const listeners = new Map<number, number>();
 	const requests: DesktopRequest[] = [];
@@ -76,6 +96,12 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		capabilities: [],
 		deliveries: [],
 	};
+	/** The models a saved key brings back; `zeroModels` starts the snapshot without them. */
+	const fixtureModels: DesktopModel[] = snapshot.models;
+	if (options.zeroModels) snapshot = { ...snapshot, models: [] };
+	let providers = structuredClone(options.providers ?? []);
+	/** The Host's single authorization flow as `auth.state` reports it; `auth` frames update it. */
+	let authState: DesktopAuthState | null = null;
 	const available = { available: true, reason: null };
 	const preferences: DesktopPreferences = {
 		profiles: [
@@ -110,6 +136,7 @@ export function installNavigationFixture(holdBootstrap = false): void {
 	};
 	const emit = (frame: DesktopFrame) => {
 		if (frame.type === "snapshot") snapshot = frame.snapshot;
+		if (frame.type === "auth") authState = frame.auth;
 		if (frame.type === "session")
 			snapshot = {
 				...snapshot,
@@ -157,6 +184,7 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		},
 		emit,
 		requests: () => requests,
+		authState: () => authState,
 		snapshot: () => snapshot,
 		seedTranscripts(messageCount, sessionCount) {
 			const sessions =
@@ -251,8 +279,53 @@ export function installNavigationFixture(holdBootstrap = false): void {
 				case "preferences.get":
 					result = preferences;
 					break;
-				case "settings.get":
 				case "auth.providers":
+					result = providers;
+					break;
+				case "auth.state":
+					result = authState;
+					break;
+				case "auth.login":
+				case "auth.answer":
+				case "auth.cancel": {
+					// Like the Host: publish the new flow state first, then answer with it.
+					const provider =
+						request.method === "auth.login" ? String(request.params.provider) : (authState?.provider ?? "");
+					const next: DesktopAuthState = {
+						id: request.method === "auth.login" ? crypto.randomUUID() : String(request.params.flowId),
+						provider,
+						status: request.method === "auth.cancel" ? "cancelled" : "authorizing",
+					};
+					emit({ type: "auth", auth: next });
+					result = next;
+					break;
+				}
+				case "auth.setKey": {
+					// Like the Host: the snapshot with the provider's models goes out before the response.
+					const provider = String(request.params.provider);
+					const keyed = fixtureModels.filter(model => model.provider === provider);
+					const added = keyed.length
+						? keyed
+						: [{ ...fixtureModels[1]!, id: `${provider}/keyed`, name: "Keyed model", provider }];
+					emit({
+						type: "snapshot",
+						snapshot: {
+							...snapshot,
+							models: [
+								...snapshot.models,
+								...added.filter(model => !snapshot.models.some(item => item.id === model.id)),
+							],
+						},
+					});
+					providers = providers.map(item =>
+						item.id === provider
+							? { ...item, configured: true, stored: true, credentialKinds: ["api_key"] }
+							: item,
+					);
+					result = { provider, saved: true, catalogRefreshed: true };
+					break;
+				}
+				case "settings.get":
 				case "auth.keyProviders":
 				case "command.list":
 					result = [];

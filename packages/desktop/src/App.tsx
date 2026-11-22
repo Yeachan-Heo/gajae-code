@@ -117,6 +117,7 @@ import { McpPanel } from "./McpPanel";
 import { ModelPicker } from "./ModelPicker";
 import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
+import { ProvidersDialog } from "./ProvidersDialog";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
 import { SessionHudPanel } from "./SessionHudPanel";
@@ -719,6 +720,8 @@ export default function App() {
 	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal && recoveryReady;
+	/** The Providers dialog is its own native modal, so it stacks above Settings when opened there. */
+	const [providersOpen, setProvidersOpen] = useState(false);
 	const copyMounted = useRef(false);
 	useLayoutEffect(() => {
 		copyMounted.current = true;
@@ -2013,7 +2016,7 @@ export default function App() {
 					models={catalog?.models ?? []}
 					roles={catalog?.roles}
 					profiles={catalog?.profiles}
-					onConfigureProviders={() => openSettingsTab("account")}
+					onConfigureProviders={() => setProvidersOpen(true)}
 					selectedId={deferred?.modelId ?? owner.model}
 					disabled={!connected || changing}
 					onRefresh={() => {
@@ -2105,7 +2108,7 @@ export default function App() {
 					</small>
 				)}
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
-					<Button disabled={!connected} onClick={() => openSettingsTab("account")}>
+					<Button disabled={!connected} onClick={() => setProvidersOpen(true)}>
 						{t("shell.addProvider")}
 					</Button>
 				)}
@@ -3076,6 +3079,13 @@ export default function App() {
 					session={session}
 					connected={connected}
 					onClose={closeDialog}
+				/>
+			)}
+			{providersOpen && (
+				<ProvidersDialog
+					connected={connected}
+					models={snapshot?.models ?? []}
+					onClose={() => setProvidersOpen(false)}
 				/>
 			)}
 			{dialog && dialog !== "btw" && dialog !== "tools" && dialogOwner === selected && (
