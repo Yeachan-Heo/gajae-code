@@ -29,8 +29,9 @@ export const shell = {
 	"shell.foldUnsupported": "The current foreground tool does not support moving to the background.",
 	"shell.foldAlreadyBackgrounded": "The current tool is already in the background.",
 	"shell.foldMoved": "Moved the current foreground tool to the background. This does not mean it has finished.",
-	"shell.providerRequired": "Register or connect a provider, then choose a model.",
-	"shell.addProvider": "Add or connect a provider",
+	"shell.chooseModel": "Choose a model to start.",
+	"shell.noConversationModels": "No models are available for this conversation.",
+	"shell.manageProviders": "Manage providers",
 	"shell.sideChatCommand": "Side chat (/btw)",
 	"shell.clearNewConversationDescription": "Start a new conversation in this project; keep the current history.",
 	"shell.clearNewConversationOnly":

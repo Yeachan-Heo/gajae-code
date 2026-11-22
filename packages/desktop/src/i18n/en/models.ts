@@ -35,7 +35,7 @@ export const models = {
 	"models.modelCount": "Models: {count}",
 	"models.favoritesError": "Starred models could not be saved or loaded. You can still choose a model.",
 	"models.loadingModels": "Loading models…",
-	"models.noModels": "No models available. Add a provider or connect an account in settings.",
+	"models.noModels": "No models available yet. Connect a provider to add models.",
 	"models.noModelMatches": "No matching models. Try another name or provider.",
 	"models.modelResults": "Model search results",
 	"models.selectedModel": "Selected",

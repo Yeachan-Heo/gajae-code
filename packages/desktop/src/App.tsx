@@ -117,6 +117,7 @@ import { McpPanel } from "./McpPanel";
 import { ModelPicker } from "./ModelPicker";
 import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
+import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboardingNotice";
 import { ProvidersDialog } from "./ProvidersDialog";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
@@ -722,6 +723,13 @@ export default function App() {
 	const connected = snapshot !== null && !fatal && recoveryReady;
 	/** The Providers dialog is its own native modal, so it stacks above Settings when opened there. */
 	const [providersOpen, setProvidersOpen] = useState(false);
+	/** Connected with no available model (and none in the open conversation's catalog): guide to providers. */
+	const providerOnboarding = useProviderOnboarding({
+		connected,
+		models: snapshot?.models,
+		session,
+		catalog: modelCatalog,
+	});
 	const copyMounted = useRef(false);
 	useLayoutEffect(() => {
 		copyMounted.current = true;
@@ -2102,14 +2110,15 @@ export default function App() {
 						);
 					}}
 				/>
-				{!loadingModels && !changing && !currentModelAvailable && (
+				{/* The onboarding notice above the composer already says what to do. */}
+				{!providerOnboarding && !loadingModels && !changing && !currentModelAvailable && (
 					<small className="model-control-status" role="status">
-						{t("shell.providerRequired")}
+						{catalog?.models.length ? t("shell.chooseModel") : t("shell.noConversationModels")}
 					</small>
 				)}
-				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
+				{!providerOnboarding && !loadingModels && !catalog?.error && catalog?.models.length === 0 && (
 					<Button disabled={!connected} onClick={() => setProvidersOpen(true)}>
-						{t("shell.addProvider")}
+						{t("shell.manageProviders")}
 					</Button>
 				)}
 				{catalog?.error && (
@@ -2913,6 +2922,7 @@ export default function App() {
 								{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
 
 								<div className="composer-area">
+									{providerOnboarding && <ProviderOnboardingNotice onConnect={() => setProvidersOpen(true)} />}
 									<Composer
 										overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
 										controls={modelControls(session)}
@@ -3003,15 +3013,25 @@ export default function App() {
 								<p>{connection}</p>
 							</div>
 						) : (
-							<div className="empty">
-								<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
-								<h2>
-									{snapshot?.projects.length ? t("shell.selectConversation") : t("shell.openProjectToStart")}
-								</h2>
-								<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-									{t("shell.chooseProjectFolder")}
-								</Button>
-							</div>
+							<>
+								<div className="empty">
+									<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+									<h2>
+										{snapshot?.projects.length
+											? t("shell.selectConversation")
+											: t("shell.openProjectToStart")}
+									</h2>
+									<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
+										{t("shell.chooseProjectFolder")}
+									</Button>
+								</div>
+								{/* The empty state keeps its single action; the dock sits at the column's bottom. */}
+								{providerOnboarding && (
+									<div className="provider-notice-dock">
+										<ProviderOnboardingNotice onConnect={() => setProvidersOpen(true)} />
+									</div>
+								)}
+							</>
 						)}
 					</div>
 					{activeCard !== null && (
