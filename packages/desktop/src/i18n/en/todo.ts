@@ -15,6 +15,8 @@ export const todo = {
 	"todo.progressChip": "{done}/{total}",
 	"todo.sessionWorkLabel": "Session work, {done} of {total} tasks done",
 	"todo.stale": "Task list may be out of date. Its last update failed.",
+	"todo.showcaseNavSessionWork": "Session work card",
+	"todo.showcaseSessionWorkHeading": "Real components · Session work card",
 	"todo.showcaseNavPanel": "Task list panel",
 	"todo.showcaseNavCard": "Task list in Session work",
 	"todo.showcaseNavChip": "Task progress chip",

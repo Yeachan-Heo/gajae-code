@@ -1388,6 +1388,7 @@ export default function Showcase() {
 					<a href="#showcase-session-info">{t("showcase.navSessionInfo")}</a>
 					<a href="#showcase-btw">{t("showcase.navBtw")}</a>
 					<a href="#showcase-fork">{t("showcase.navFork")}</a>
+					<a href="#showcase-session-work">{t("todo.showcaseNavSessionWork")}</a>
 					<a href="#showcase-session-state">{t("showcase.navSessionState")}</a>
 					<a href="#showcase-composers">{t("showcase.navComposers")}</a>
 					<a href="#showcase-settings">{t("showcase.navSettings")}</a>
@@ -1642,6 +1643,7 @@ export default function Showcase() {
 				<FixtureForkPanel />
 			</section>
 			<section id="showcase-session-work">
+				<h2>{t("todo.showcaseSessionWorkHeading")}</h2>
 				<FixtureSessionWorkPanel session={session} />
 			</section>
 			<section id="showcase-session-state">

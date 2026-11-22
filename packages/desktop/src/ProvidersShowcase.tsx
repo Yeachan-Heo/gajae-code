@@ -261,7 +261,7 @@ function FixturePanel({ state, onLocal, onDone }: { state: FixtureState; onLocal
 function FixtureProvidersPanel() {
 	const states = fixtureStates();
 	const [state, setState] = useState<FixtureState>(states[3]!);
-	const [notice, setNotice] = useState(t("providers.showcaseNoticeInitial"));
+	const [notice, setNotice] = useState(() => t("providers.showcaseNoticeSelected", { label: t(states[3]!.label) }));
 	const [dialog, setDialog] = useState(false);
 	const local = () => setNotice(t("providers.showcaseNoticeLocal"));
 	return (
@@ -325,7 +325,7 @@ function FixtureProvidersPanel() {
 }
 
 function FixtureOnboarding() {
-	const [notice, setNotice] = useState(t("providers.showcaseNoticeInitial"));
+	const [notice, setNotice] = useState(t("providers.showcaseOnboardingInitial"));
 	const connect = () => setNotice(t("providers.showcaseNoticeLocal"));
 	return (
 		<>

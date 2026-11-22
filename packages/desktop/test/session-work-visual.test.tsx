@@ -83,6 +83,35 @@ suite("Session work visuals", () => {
 		}
 	}, 60000);
 
+	test("the Session work showcase has a heading, an index link and a visibly selected state", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-session-work .session-work-panel");
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			await page.mouse.move(1, 1);
+			expect(await page.$eval("#showcase-session-work > h2", node => node.textContent)).toBeTruthy();
+			expect(await page.$('.showcase-index a[href="#showcase-session-work"]')).not.toBeNull();
+			const look = (pressed: boolean) =>
+				page.$eval(`#showcase-session-work .actions[role=group] button[aria-pressed="${pressed}"]`, node => {
+					const style = getComputedStyle(node);
+					return { background: style.backgroundColor, border: style.borderTopColor };
+				});
+			const selected = await look(true);
+			const other = await look(false);
+			expect(selected.background).not.toBe(other.background);
+			expect(selected.border).not.toBe(other.border);
+			const [contrast] = await page.evaluate(measureContrast, [
+				'#showcase-session-work .actions[role=group] button[aria-pressed="true"]',
+			]);
+			expect(contrast!.ratio).toBeGreaterThanOrEqual(4.5);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("the Identity disclosure shows only the app's chevron, turned when open", async () => {
 		const context = await browser.createBrowserContext();
 		try {

@@ -132,7 +132,6 @@ export const providers = {
 	"providers.showcaseStateKeyError": "Key error",
 	"providers.showcaseStateKeyCommand": "Key starting with !",
 	"providers.showcaseStateKeySaved": "Key saved",
-	"providers.showcaseNoticeInitial": "Pick a state above. Every action stays local.",
 	"providers.showcaseNoticeSelected": "Showing: {label}",
 	"providers.showcaseNoticeLocal": "Design example only: nothing was sent.",
 	"providers.showcaseOpenDialog": "Open in a native dialog",
@@ -161,4 +160,5 @@ export const providers = {
 	"providers.showcaseOnboardingDock": "Docked below the empty state",
 	"providers.showcaseOnboardingComposer": "Above the composer",
 	"providers.showcaseOnboardingNarrow": "In a 390px window",
+	"providers.showcaseOnboardingInitial": "Connect a provider stays local here: selecting it only updates this line.",
 } as const;

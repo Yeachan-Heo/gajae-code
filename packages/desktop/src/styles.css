@@ -846,6 +846,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .showcase-todo-card { margin: 0; }
 .showcase-todo-toolbar { border: 1px solid var(--border-soft); border-radius: var(--radius-md); margin-bottom: 0.5rem; }
 .showcase-todo-label { display: block; font-size: 0.8125rem; }
+/* Showcase only: the selected Session work fixture state reads as pressed, in the body ink. */
+#showcase-session-work .actions > .button[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--text); }
 
 /* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
 /* The Tools dialog pins its search row, the tool-search notice and the Save footer; only the list
@@ -1029,7 +1031,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .providers-summary { display: grid; gap: 0.625rem; justify-items: start; }
 .providers-summary-empty { display: flex; align-items: center; gap: 0.375rem; color: var(--status-waiting); }
 .providers-summary-empty > svg { flex: none; width: 1rem; height: 1rem; }
+/* Showcase only: group labels line up with their buttons, and the selected fixture state reads as
+   pressed, in the body ink. */
+#showcase-providers > .actions { align-items: center; }
+#showcase-providers > .actions > .button[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--text); }
 .providers-showcase-frame { max-width: 640px; min-width: 0; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); }
+.providers-showcase-frame + .providers-showcase-frame { margin-top: 0.75rem; }
 /* The Providers dialog in a 390px window: its width there (the UA's dialog max-width, 100% - 6px - 2em,
    under the dialog's own 100vw - 32px), its 16px narrow padding and the content's 4px. */
 .providers-showcase-frame[data-narrow] { max-width: min(358px, calc(384px - 2em)); padding: 20px; }

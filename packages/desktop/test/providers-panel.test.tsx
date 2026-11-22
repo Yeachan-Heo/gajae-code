@@ -597,6 +597,58 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
+	test("the showcase marks the selected state and its status lines describe what is shown", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-providers .provider-row");
+			await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+			await page.mouse.move(1, 1);
+			const look = (pressed: boolean) =>
+				page.$eval(`#showcase-providers > .actions[role=group] button[aria-pressed="${pressed}"]`, node => {
+					const style = getComputedStyle(node);
+					return { text: node.textContent, background: style.backgroundColor, border: style.borderTopColor };
+				});
+			const selected = await look(true);
+			const other = await look(false);
+			expect(selected.text).toBe("Populated");
+			expect(selected.background).not.toBe(other.background);
+			expect(selected.border).not.toBe(other.border);
+			const [contrast] = await page.evaluate(measureContrast, ['#showcase-providers button[aria-pressed="true"]']);
+			expect(contrast!.ratio).toBeGreaterThanOrEqual(4.5);
+			expect(await page.$eval("#showcase-providers .showcase-result", node => node.textContent)).toBe(
+				"Showing: Populated",
+			);
+			// Each group label lines up with its buttons, and the two account-summary frames do not touch.
+			const layout = await page.evaluate(() => {
+				const center = (node: Element) => {
+					const range = document.createRange();
+					range.selectNodeContents(node);
+					const rect = range.getBoundingClientRect();
+					return rect.top + rect.height / 2;
+				};
+				const groups = [...document.querySelectorAll("#showcase-providers > .actions[role=group]")];
+				const frames = [...document.querySelectorAll("#showcase-providers > .providers-showcase-frame")].slice(-2);
+				return {
+					labelOffsets: groups.map(group =>
+						Math.round(Math.abs(center(group.querySelector("strong")!) - center(group.querySelector("button")!))),
+					),
+					summaryGap: Math.round(frames[1]!.getBoundingClientRect().top - frames[0]!.getBoundingClientRect().bottom),
+				};
+			});
+			expect(layout.labelOffsets.every(offset => offset <= 1)).toBe(true);
+			expect(layout.summaryGap).toBeGreaterThanOrEqual(8);
+			// The onboarding section has no states to pick from.
+			expect(await page.$eval("#showcase-provider-onboarding .showcase-result", node => node.textContent)).not.toContain(
+				"Pick a state",
+			);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("the showcase renders every providers fixture state and the onboarding notice placements", async () => {
 		const context = await browser.createBrowserContext();
 		try {
