@@ -9,7 +9,8 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
 import type { DesktopFrame, DesktopProject, DesktopRequest, DesktopSession } from "../src/protocol";
 import { parseRequest } from "../src/protocol";
-import { TOOL_DETAIL_UNAVAILABLE } from "../src/tool-projection";
+import { TOOL_DETAIL_GONE } from "../src/tool-projection";
+import type { DesktopToolDetail } from "../src/tool-protocol";
 
 describe("desktop tool methods on a live session", () => {
 	let environment: NodeJS.ProcessEnv;
@@ -82,14 +83,55 @@ describe("desktop tool methods on a live session", () => {
 		expect(result.active.length).toBeGreaterThan(0);
 	}, 30_000);
 
-	test("tool.detail is admitted for a live session and fails closed without data", async () => {
+	test("tool.detail refuses an unknown call without echoing it and requires a call id", async () => {
 		const h = await fixture();
 		const response = await h.respond("tool.detail", { sessionId: h.session.id, callId: "toolu_unknown" });
-		expect(response).toMatchObject({ ok: false, error: TOOL_DETAIL_UNAVAILABLE });
+		expect(response).toMatchObject({ ok: false, error: TOOL_DETAIL_GONE });
 		expect("result" in response).toBe(false);
+		expect(JSON.stringify(response)).not.toContain("toolu_unknown");
 		expect(await h.respond("tool.detail", { sessionId: h.session.id })).toMatchObject({
 			ok: false,
 			error: "Invalid callId",
 		});
+	}, 30_000);
+
+	test("tool.detail returns the full call, redacted by the Host's own credentials before its bounds", async () => {
+		const h = await fixture();
+		// A credential the Host learns about; JSON would escape its quote and backslash.
+		const secret = 'sk-"quoted\\credential-1234567890';
+		await h.respond("auth.setKey", { provider: "unknown-provider", key: secret });
+		h.sdk.agent.replaceMessages([
+			{
+				role: "assistant",
+				stopReason: "toolUse",
+				content: [
+					{
+						type: "toolCall",
+						id: "toolu_bash",
+						name: "bash",
+						arguments: {
+							command: `curl -H "Authorization: ${secret}" https://example.invalid\necho done`,
+							env: { API_TOKEN: secret },
+							cwd: "packages/app",
+							_i: "Call the service",
+						},
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "toolu_bash",
+				toolName: "bash",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: 1,
+			},
+		] as never);
+		const detail = await h.call<DesktopToolDetail>("tool.detail", { sessionId: h.session.id, callId: "toolu_bash" });
+		expect(detail.callId).toBe("toolu_bash");
+		expect(detail.command).toBe('curl -H "Authorization: [redacted]" https://example.invalid\necho done');
+		expect(JSON.parse(detail.args!)).toEqual({ env: { API_TOKEN: "[redacted]" }, cwd: "packages/app" });
+		expect(JSON.stringify(detail)).not.toContain("credential-1234567890");
+		expect(detail.truncated).toBeUndefined();
 	}, 30_000);
 });

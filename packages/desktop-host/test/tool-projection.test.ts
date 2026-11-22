@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import { fitMessages, HISTORY_LIMIT, projectHistoryPage, projectMessages } from "../src/message-projection";
 import type { DesktopMessage } from "../src/protocol";
-import { LIVE_TAIL_LIMIT, observeToolEvent, projectLiveToolCalls } from "../src/tool-projection";
+import {
+	LIVE_TAIL_LIMIT,
+	observeToolEvent,
+	projectLiveToolCalls,
+	projectToolDetail,
+	TOOL_DETAIL_GONE,
+} from "../src/tool-projection";
 import { DESKTOP_TOOL_LIMITS, type DesktopToolCall } from "../src/tool-protocol";
 
 type Session = CreateAgentSessionResult["session"];
@@ -337,5 +343,147 @@ describe("live tool rows", () => {
 		expect(row?.tool?.subject).toBe("$ curl -H [redacted] host");
 		expect(JSON.stringify(row)).not.toContain("env-secret");
 		expect(JSON.stringify(row)).not.toContain("token-123");
+	});
+});
+
+describe("tool call details", () => {
+	const detail = (messages: unknown[], callId = "c1", redact = (text: string) => text, streaming?: unknown) =>
+		projectToolDetail({ messages } as unknown as Session, streaming, callId, redact);
+	const pair = (name: string, args: Record<string, unknown>, result: Record<string, unknown> = {}) => [
+		assistantCalls(["c1", name, args]),
+		{ role: "toolResult", toolCallId: "c1", toolName: name, content: "ok", ...result },
+	];
+
+	test("arguments are pretty JSON without underscore keys, redacted leaf by leaf, then bounded", () => {
+		const secret = 'tok"en\\value';
+		const redact = (text: string) => text.replaceAll(secret, "[redacted]");
+		const result = detail(
+			pair("web_search", {
+				query: `find ${secret}`,
+				nested: { [secret]: [secret, 3] },
+				_i: "intent",
+				__partialJson: "{",
+			}),
+			"c1",
+			redact,
+		);
+		expect(result).toEqual({
+			callId: "c1",
+			args: JSON.stringify({ query: "find [redacted]", nested: { "[redacted]": ["[redacted]", 3] } }, null, 2),
+		});
+		const long = detail(pair("web_search", { query: "q".repeat(DESKTOP_TOOL_LIMITS.args * 2) }));
+		expect(long.args).toHaveLength(DESKTOP_TOOL_LIMITS.args);
+		expect(long.truncated).toBe(true);
+	});
+
+	test("a shell call shows its whole command and the remaining arguments", () => {
+		expect(detail(pair("bash", { command: "cd app\nnpm test", timeout: 30 }))).toEqual({
+			callId: "c1",
+			command: "cd app\nnpm test",
+			args: JSON.stringify({ timeout: 30 }, null, 2),
+		});
+		expect(detail(pair("eval", { cells: [{ code: "a = 1" }, { code: "a + 1" }] })).command).toBe("a = 1\n\na + 1");
+		expect(detail(pair("python", { code: "print(1)" }))).toEqual({ callId: "c1", command: "print(1)" });
+	});
+
+	test("edits and writes show per-file diffs, bounded together", () => {
+		const diff = "@@ -1 +1 @@\n-1|old\n+1|new";
+		expect(
+			detail(
+				pair(
+					"edit",
+					{ path: "a.ts", edits: [] },
+					{
+						details: {
+							diff: "",
+							perFileResults: [
+								{ path: "a.ts", diff, op: "update" },
+								{
+									path: "b.ts",
+									diff: "",
+									isError: true,
+									errorText: "raw",
+									displayErrorText: "No match in b.ts",
+								},
+							],
+						},
+					},
+				),
+			).diff,
+		).toEqual([
+			{ path: "a.ts", diff, added: 1, removed: 1, op: "update" },
+			{ path: "b.ts", diff: "", added: 0, removed: 0, error: "No match in b.ts" },
+		]);
+		expect(detail(pair("write", { path: "n.md", content: "one\ntwo\n" })).diff).toEqual([
+			{ path: "n.md", diff: "+1|one\n+2|two", added: 2, removed: 0 },
+		]);
+		const big = "+1|".padEnd(40_000, "x");
+		const bounded = detail(
+			pair(
+				"edit",
+				{ path: "a" },
+				{
+					details: {
+						perFileResults: [
+							{ path: "a", diff: big },
+							{ path: "b", diff: big },
+						],
+					},
+				},
+			),
+		);
+		expect(bounded.diff?.map(item => item.diff.length)).toEqual([40_000, DESKTOP_TOOL_LIMITS.diff - 40_000]);
+		expect(bounded.diff?.map(item => item.added)).toEqual([1, 1]);
+		expect(bounded.truncated).toBe(true);
+		// Without a diff, a failed edit falls back to its arguments.
+		expect(detail(pair("edit", { path: "a.ts" }, { isError: true })).args).toBe(
+			JSON.stringify({ path: "a.ts" }, null, 2),
+		);
+	});
+
+	test("a tool search shows its bounded matches and a todo write its task list", () => {
+		const tools = Array.from({ length: 30 }, (_, index) => ({
+			name: `tool_${index}`,
+			label: `Tool ${index}`,
+			description: `${"d".repeat(300)}`,
+			server_name: index === 0 ? "docs" : undefined,
+			schema_keys: ["secret_schema"],
+			score: 1,
+		}));
+		const search = detail(
+			pair(
+				"search_tool_bm25",
+				{ query: "todo" },
+				{ details: { query: "todo", activated_tools: ["todo_write"], tools } },
+			),
+		).toolSearch;
+		expect(search?.matches).toHaveLength(DESKTOP_TOOL_LIMITS.searchMatches);
+		expect(search?.matches[0]).toEqual({
+			name: "tool_0",
+			label: "Tool 0",
+			description: "d".repeat(DESKTOP_TOOL_LIMITS.description),
+			mcpServer: "docs",
+		});
+		expect(search).toMatchObject({ query: "todo", activated: ["todo_write"], total: 30 });
+		expect(JSON.stringify(search)).not.toContain("secret_schema");
+		const phases = [{ name: "Build", tasks: [{ content: "Write tests", status: "in_progress" }] }];
+		expect(detail(pair("todo_write", { ops: [{ op: "start" }] }, { details: { phases } })).todo).toEqual([
+			{ name: "Build", tasks: [{ content: "Write tests", status: "in_progress" }] },
+		]);
+	});
+
+	test("lookup covers the streaming call, a redacted id and results without a call", () => {
+		const streaming = assistantCalls(["live", "read", { path: "still-streaming" }]);
+		expect(detail([], "live", undefined, streaming).args).toBe(JSON.stringify({ path: "still-streaming" }, null, 2));
+		const redact = (text: string) => text.replaceAll("secret", "[redacted]");
+		const messages = pair("read", { path: "a" });
+		(messages[0] as { content: Array<{ id: string }> }).content[0]!.id = "id-secret";
+		(messages[1] as { toolCallId: string }).toolCallId = "id-secret";
+		expect(detail(messages, "id-[redacted]", redact)).toMatchObject({ callId: "id-[redacted]" });
+		const orphan = [
+			{ role: "toolResult", toolCallId: "o", toolName: "edit", content: "ok", details: { diff: "+1|x" } },
+		];
+		expect(detail(orphan, "o").diff).toEqual([{ path: "", diff: "+1|x", added: 1, removed: 0 }]);
+		expect(() => detail(messages, "missing")).toThrow(TOOL_DETAIL_GONE);
 	});
 });

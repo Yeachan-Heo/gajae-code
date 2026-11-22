@@ -1,18 +1,19 @@
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import type { DesktopMessage } from "./protocol";
+import { projectTodos } from "./session-state";
 import {
 	DESKTOP_TOOL_LIMITS,
 	type DesktopToolCall,
 	type DesktopToolCallStats,
 	type DesktopToolCallStatus,
 	type DesktopToolDetail,
+	type DesktopToolDiff,
 	type DesktopToolFamily,
+	type DesktopToolSearchDetail,
+	type DesktopToolSearchMatch,
 } from "./tool-protocol";
 
 type Session = CreateAgentSessionResult["session"];
-
-/** The `tool.detail` refusal while call details are not projected; it never stands in for data. */
-export const TOOL_DETAIL_UNAVAILABLE = "Tool call details are not available yet.";
 
 /**
  * Strings longer than this are withheld instead of redacted, so redaction never allocates without
@@ -417,16 +418,243 @@ function liveTail(
 	return { text: safe.slice(-LIVE_TAIL_LIMIT), truncated: safe.length > LIVE_TAIL_LIMIT };
 }
 
+/** The `tool.detail` answer for a call id the session no longer holds. It never echoes the id. */
+export const TOOL_DETAIL_GONE = "This tool call is no longer available.";
+/** Nesting and node bounds for pretty-printed arguments; the string bound applies after them. */
+const ARGS_DEPTH = 24;
+const ARGS_NODES = 20_000;
+const withheld = "[withheld: display limit]";
+
+/** Cut to `limit` without leaving half of a surrogate pair at the end. */
+function cut(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	const head = text.slice(0, limit);
+	return /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
+}
+
 /**
- * Answers `tool.detail` for a live session. `tool.detail` is a projected control method, so the
- * Host does not redact this result when it emits it: every string must pass through `redact`
- * before any cut. Until call details are projected this fails closed.
+ * A copy of an argument value with every string key and leaf redacted whole. Redacting before
+ * `JSON.stringify` matters: escaping (quotes, backslashes, control characters) would otherwise
+ * hide a secret from exact matching.
+ */
+function redactValue(
+	value: unknown,
+	redact: (text: string) => string,
+	budget: { nodes: number; cut: boolean },
+	depth = 0,
+): unknown {
+	if (budget.nodes-- <= 0 || depth > ARGS_DEPTH) {
+		budget.cut = true;
+		return withheld;
+	}
+	if (typeof value === "string") {
+		if (value.length > MAX_REDACTION_CHARS) {
+			budget.cut = true;
+			return withheld;
+		}
+		const safe = redact(value);
+		return safe.length > MAX_REDACTION_CHARS ? withheld : safe;
+	}
+	if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+	if (Array.isArray(value)) return value.map(item => redactValue(item, redact, budget, depth + 1));
+	const object = record(value);
+	if (!object) return undefined;
+	const out: Record<string, unknown> = {};
+	for (const [key, item] of Object.entries(object)) {
+		const safeKey = typeof key === "string" && key.length <= MAX_REDACTION_CHARS ? redact(key) : withheld;
+		out[safeKey] = redactValue(item, redact, budget, depth + 1);
+	}
+	return out;
+}
+
+/** Pretty JSON of the arguments without `_`-prefixed (provider and harness) keys. */
+function prettyArgs(
+	args: Record<string, unknown>,
+	omit: readonly string[],
+	redact: (text: string) => string,
+): { text: string; truncated: boolean } | undefined {
+	const shown = Object.fromEntries(
+		Object.entries(args).filter(([key]) => !key.startsWith("_") && !omit.includes(key)),
+	);
+	if (Object.keys(shown).length === 0) return undefined;
+	const budget = { nodes: ARGS_NODES, cut: false };
+	const text = JSON.stringify(redactValue(shown, redact, budget), null, 2);
+	return {
+		text: cut(text, DESKTOP_TOOL_LIMITS.args),
+		truncated: budget.cut || text.length > DESKTOP_TOOL_LIMITS.args,
+	};
+}
+
+/** The full command or script of a shell-family call. */
+function commandText(name: string, args: Record<string, unknown>): { field: string; text: unknown } | undefined {
+	if (name === "bash" || name === "ssh") return { field: "command", text: args.command };
+	if (name === "python") return { field: "code", text: args.code };
+	if (name === "eval" && Array.isArray(args.cells)) {
+		const code = args.cells.map(cell => record(cell)?.code).filter(code => typeof code === "string");
+		return { field: "cells", text: code.join("\n\n") };
+	}
+	return undefined;
+}
+
+function diffEntries(
+	call: ToolCallSource | undefined,
+	family: DesktopToolFamily,
+	result: Record<string, unknown> | undefined,
+	redact: (text: string) => string,
+): { diff: DesktopToolDiff[]; truncated: boolean } | undefined {
+	const details = record(result?.details);
+	const sources: Array<{ path: unknown; diff: unknown; op?: unknown; error?: unknown }> =
+		family === "edit"
+			? editDiffs(details).map(item => ({
+					path: item.path ?? details?.path ?? call?.arguments.path,
+					diff: item.diff,
+					op: item.op,
+					error: item.isError === true ? (item.displayErrorText ?? item.errorText) : undefined,
+				}))
+			: family === "write" && call && typeof call.arguments.content === "string" && result?.isError !== true
+				? [
+						{
+							path: call.arguments.path,
+							diff: call.arguments.content
+								.replace(/\n$/, "")
+								.split("\n")
+								.map((line, index) => `+${index + 1}|${line}`)
+								.join("\n"),
+						},
+					]
+				: [];
+	if (sources.length === 0) return undefined;
+	let remaining = DESKTOP_TOOL_LIMITS.diff;
+	let truncated = false;
+	const diff: DesktopToolDiff[] = [];
+	for (const source of sources.slice(0, 64)) {
+		const path = redactedHead(source.path, DESKTOP_TOOL_LIMITS.subject, redact) ?? "";
+		const full =
+			typeof source.diff === "string" && source.diff.length <= MAX_REDACTION_CHARS ? redact(source.diff) : "";
+		if (typeof source.diff === "string" && !full && source.diff) truncated = true;
+		const lines = diffLineCounts(full);
+		const text = cut(full, Math.max(0, remaining));
+		if (text.length < full.length) truncated = true;
+		remaining -= text.length;
+		const error = redactedHead(source.error, DESKTOP_TOOL_LIMITS.description, redact);
+		diff.push({
+			path,
+			diff: text,
+			...lines,
+			...(source.op === "create" || source.op === "update" || source.op === "delete" ? { op: source.op } : {}),
+			...(error ? { error } : {}),
+		});
+	}
+	return { diff, truncated: truncated || sources.length > 64 };
+}
+
+function toolSearchDetail(
+	result: Record<string, unknown> | undefined,
+	redact: (text: string) => string,
+): DesktopToolSearchDetail | undefined {
+	const details = record(result?.details);
+	if (!details || !Array.isArray(details.tools)) return undefined;
+	const names = (value: unknown) =>
+		(Array.isArray(value) ? value : [])
+			.slice(0, DESKTOP_TOOL_LIMITS.searchMatches)
+			.map(name => redactedHead(name, ACTIVATED_NAME_LIMIT, redact))
+			.filter(name => name !== undefined);
+	const matches: DesktopToolSearchMatch[] = [];
+	for (const item of details.tools.slice(0, DESKTOP_TOOL_LIMITS.searchMatches)) {
+		const match = record(item);
+		const name = redactedHead(match?.name, ACTIVATED_NAME_LIMIT, redact);
+		if (!match || !name) continue;
+		const description = redactedHead(match.description, MAX_REDACTION_CHARS, redact)?.replace(/\s+/g, " ").trim();
+		const server = redactedHead(match.server_name, ACTIVATED_NAME_LIMIT, redact);
+		matches.push({
+			name,
+			label: redactedHead(match.label, ACTIVATED_NAME_LIMIT, redact) ?? name,
+			...(description ? { description: cut(description, DESKTOP_TOOL_LIMITS.description) } : {}),
+			...(server ? { mcpServer: server } : {}),
+		});
+	}
+	return {
+		query: redactedHead(details.query, DESKTOP_TOOL_LIMITS.subject, redact) ?? "",
+		activated: names(details.activated_tools),
+		matches,
+		total: details.tools.length,
+	};
+}
+
+/**
+ * The call with `callId` and the result that answers it: the newest such call, checked in the
+ * streaming message first. Row ids are redacted, so a stored id matches by its redacted form too.
+ */
+function findCall(
+	session: Pick<Session, "messages">,
+	streamingMessage: unknown,
+	callId: string,
+	redact: (text: string) => string,
+): { call?: ToolCallSource; result?: Record<string, unknown> } | undefined {
+	const matches = (id: unknown) =>
+		typeof id === "string" && (id === callId || redactedHead(id, 512, redact) === callId);
+	const streaming = toolCallBlocks(streamingMessage).find(call => matches(call.id));
+	if (streaming) return { call: streaming };
+	const messages = session.messages;
+	let result: Record<string, unknown> | undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = record(messages[index]);
+		if (!result && message?.role === "toolResult" && matches(message.toolCallId)) result = message;
+		else if (message?.role === "assistant") {
+			const call = toolCallBlocks(message).find(item => matches(item.id));
+			if (call) return { call, ...(result ? { result } : {}) };
+		}
+	}
+	return result ? { result } : undefined;
+}
+
+/**
+ * Answers `tool.detail` for a live session: the full command, pretty-printed arguments, per-file
+ * diffs, tool-search matches or the resulting task list, whichever apply to the call.
+ * `tool.detail` is a projected control method, so the Host does not redact this result when it
+ * emits it: every string here is redacted whole before any `DESKTOP_TOOL_LIMITS` cut.
  */
 export function projectToolDetail(
-	_session: Session,
-	_streamingMessage: unknown,
-	_callId: string,
-	_redact: (text: string) => string,
+	session: Pick<Session, "messages">,
+	streamingMessage: unknown,
+	callId: string,
+	redact: (text: string) => string,
 ): DesktopToolDetail {
-	throw new Error(TOOL_DETAIL_UNAVAILABLE);
+	const found = findCall(session, streamingMessage, callId, redact);
+	if (!found) throw new Error(TOOL_DETAIL_GONE);
+	const { call, result } = found;
+	const name = call?.name ?? (typeof result?.toolName === "string" ? result.toolName : "");
+	const family = toolFamily(name);
+	const detail: DesktopToolDetail = { callId };
+	let truncated = false;
+	let omit: string[] = [];
+	const command = call && family === "shell" ? commandText(name, call.arguments) : undefined;
+	if (command) {
+		omit = [command.field];
+		const text = redactedHead(command.text, MAX_REDACTION_CHARS, redact);
+		if (text) {
+			detail.command = cut(text, DESKTOP_TOOL_LIMITS.args);
+			if (text.length > DESKTOP_TOOL_LIMITS.args) truncated = true;
+		}
+	}
+	const diffs = diffEntries(call, family, result, redact);
+	if (diffs) {
+		detail.diff = diffs.diff;
+		truncated ||= diffs.truncated;
+	}
+	const search = family === "tool-search" ? toolSearchDetail(result, redact) : undefined;
+	if (search) detail.toolSearch = search;
+	const phases = family === "todo" ? record(result?.details)?.phases : undefined;
+	if (phases !== undefined) {
+		const todos = projectTodos({ getTodoPhases: () => phases as never }, redact).todos;
+		if (todos) detail.todo = todos;
+	}
+	// The generic view: everything not shown by a section above, never `_`-prefixed keys.
+	const sectioned = detail.diff !== undefined || detail.toolSearch !== undefined || detail.todo !== undefined;
+	const args = call && !sectioned ? prettyArgs(call.arguments, omit, redact) : undefined;
+	if (args) {
+		detail.args = args.text;
+		truncated ||= args.truncated;
+	}
+	return truncated ? { ...detail, truncated: true } : detail;
 }
