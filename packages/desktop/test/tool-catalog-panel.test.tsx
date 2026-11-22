@@ -280,6 +280,13 @@ describe("Tools dialog panel", () => {
 		expect(empty).toContain("No tools match “없는도구”.");
 		expect(empty).not.toContain("data-tool-name");
 		expect(render({ catalog: { tools: [], active: [] } })).toContain("No tools are available.");
+		// An empty registry offers nothing to search and no tool-search hint.
+		const searchField = (html: string) => /<input[^>]*placeholder="Search by name or description"[^>]*>/.exec(html)?.[0];
+		const none = render({ catalog: { tools: [], active: [], discovery: { enabled: true } } });
+		expect(searchField(none)).toContain("disabled");
+		expect(none).not.toContain("tool search finds them");
+		expect(none).toContain("0 active · 0 available");
+		expect(searchField(render())).not.toContain("disabled");
 	});
 
 	test("a tool search over unsaved edits holds Save until the list is reloaded", () => {

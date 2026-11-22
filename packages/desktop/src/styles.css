@@ -830,19 +830,21 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .showcase-todo-label { display: block; font-size: 0.8125rem; }
 
 /* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
-/* The Tools dialog pins its search row and Save footer; only the list scrolls. When 200% text
-   or a short window cannot fit the pinned parts, the whole panel scrolls instead. */
+/* The Tools dialog pins its search row, the tool-search notice and the Save footer; only the list
+   scrolls, and it gives up its height first, down to nothing. Only when the pinned parts alone
+   cannot fit (text beyond the Settings range in a short window) does the whole panel scroll. */
 .modal-content:has(> .tool-catalog) { display: flex; flex-direction: column; overflow: hidden; }
 .tool-catalog { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; gap: 0.75rem; overflow: auto; overscroll-behavior: contain; }
 .tool-catalog-head { flex: none; }
 .tool-catalog-head > .model-search { height: 2.25rem; margin: 0; }
+.tool-catalog-head > .model-search > svg { width: 1rem; height: 1rem; }
 .tool-catalog-summary { margin: 0.5rem 0 0; font-size: 0.75rem; }
 .tool-catalog-loading { margin: 0; color: var(--muted); }
 .tool-catalog-failure { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; flex: none; }
 .tool-catalog-failure > .error-banner { align-self: stretch; margin: 0; }
 .tool-catalog-changed { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; flex: none; padding: 0.5rem 0.75rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 9%, transparent); }
 .tool-catalog-changed > p { flex: 1 1 14rem; margin: 0; font-size: 0.8125rem; }
-.tool-catalog-list { flex: 1 1 auto; min-height: min(12rem, 40dvh); overflow: auto; overscroll-behavior: contain; padding: 0.125rem; }
+.tool-catalog-list { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 0.125rem; }
 .modal .tool-catalog-section { margin: 0 0 1rem; }
 .modal .tool-catalog-section:last-child { margin-bottom: 0; }
 .tool-catalog-section > h3 { display: flex; align-items: baseline; gap: 0.375rem; margin: 0 0 0.5rem; font-size: 0.75rem; color: var(--muted); }
@@ -851,7 +853,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* A row is one bordered box like a model option; the whole box toggles its checkbox. */
 .tool-catalog-option { display: flex; align-items: flex-start; gap: 0.625rem; margin: 0; padding: 0.5rem 0.625rem; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); cursor: pointer; transition: border-color var(--dur) var(--ease), background-color var(--dur) var(--ease); }
 .tool-catalog-option:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); background: var(--surface); }
-.tool-catalog-option input[type="checkbox"] { flex: none; width: auto; min-height: 0; margin: 0.1875rem 0 0; padding: 0; border: 0; background: none; box-shadow: none; accent-color: var(--accent); }
+.tool-catalog-option input[type="checkbox"] { flex: none; width: 0.9375rem; height: 0.9375rem; min-height: 0; margin: 0.1875rem 0 0; padding: 0; border: 0; background: none; box-shadow: none; accent-color: var(--accent); }
 .tool-catalog-option:has(input:disabled) { cursor: default; }
 /* A checked state that differs from the saved one: a dashed accent edge until Save lands. */
 .tool-catalog-row[data-edited] > .tool-catalog-option { border-style: dashed; border-color: color-mix(in srgb, var(--accent) 70%, var(--border-soft)); }
@@ -891,6 +893,13 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-catalog-frame-narrow { max-width: 20rem; }
 @media (max-width: 480px) {
 	.tool-catalog-footer > .button { width: 100%; }
+}
+/* A short window leaves the list more room by tightening the pinned parts' spacing. */
+@media (max-height: 640px) {
+	.tool-catalog { gap: 0.5rem; }
+	.tool-catalog-summary { margin-top: 0.25rem; }
+	.tool-catalog-changed { padding: 0.375rem 0.625rem; }
+	.tool-catalog-footer { padding-top: 0.5rem; }
 }
 
 /* Section P: providers dialog and onboarding notice (ProvidersDialog.tsx, ProvidersPanel.tsx,

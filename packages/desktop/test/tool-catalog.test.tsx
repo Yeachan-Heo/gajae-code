@@ -528,6 +528,82 @@ suite("Tools dialog", () => {
 		}
 	}, 30000);
 
+	test("only the list scrolls: search, the tool-search notice and Save stay in view in small windows and at 20 px text", async () => {
+		const { context, page } = await fixture();
+		try {
+			const many = Array.from({ length: 30 }, (_, index) => ({
+				name: `tool_${String(index).padStart(2, "0")}`,
+				label: `Tool ${index}`,
+				description: "A tool with a one-line description for the list.",
+				active: index < 10,
+				origin: "discoverable" as const,
+				discovered: false,
+			}));
+			await updateSession(page, {
+				messages: [{ id: "earlier-search", role: "tool", toolName: "search_tool_bm25", text: "{}" }],
+			});
+			await openTools(page);
+			await answer(page, await waitHeld(page, "tools.list", 1), {
+				available: many.map(tool => tool.name),
+				active: many.filter(tool => tool.active).map(tool => tool.name),
+				tools: many,
+				discovery: { enabled: true },
+			});
+			await page.waitForSelector("dialog[open] input[data-tool-name]");
+			// An unsaved edit, then a new tool-search result: the notice that holds Save appears.
+			await toggle(page, "tool_12");
+			await updateSession(page, {
+				messages: [
+					{ id: "earlier-search", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+					{ id: "search-result-1", role: "tool", toolName: "search_tool_bm25", text: "{}" },
+				],
+			});
+			await page.waitForSelector("dialog[open] .tool-catalog-changed");
+			const layouts: Record<string, unknown> = {};
+			for (const [width, height, text] of [
+				[720, 520, 20],
+				[720, 520, 14],
+				[390, 844, 20],
+				[390, 844, 14],
+			] as const) {
+				await page.setViewport({ width, height });
+				await page.evaluate(size => document.documentElement.style.setProperty("--text-size", `${size}px`), text);
+				await Bun.sleep(50);
+				layouts[`${width}x${height}@${text}`] = await page.evaluate(() => {
+					const dialog = document.querySelector("dialog[open]")!;
+					const inside = (node: Element | null | undefined) => {
+						const box = node?.getBoundingClientRect();
+						const frame = dialog.getBoundingClientRect();
+						return !!box && box.top >= frame.top - 0.5 && box.bottom <= Math.min(frame.bottom, window.innerHeight) + 0.5;
+					};
+					const panel = dialog.querySelector(".tool-catalog")!;
+					const list = dialog.querySelector(".tool-catalog-list")!;
+					const save = [...dialog.querySelectorAll("button")].find(button => button.textContent?.trim() === "Save tools");
+					return {
+						panelScrolls: panel.scrollHeight > panel.clientHeight + 1,
+						listScrolls: list.scrollHeight > list.clientHeight + 1,
+						listShowsARow: list.clientHeight >= 48,
+						pinned: [
+							inside(dialog.querySelector(".tool-catalog-head input")),
+							inside(dialog.querySelector(".tool-catalog-changed button")),
+							inside(dialog.querySelector(".tool-catalog-status")),
+							inside(save),
+						],
+					};
+				});
+			}
+			const pinned = { panelScrolls: false, listScrolls: true, listShowsARow: true, pinned: [true, true, true, true] };
+			expect(layouts).toEqual({
+				"720x520@20": pinned,
+				"720x520@14": pinned,
+				"390x844@20": pinned,
+				"390x844@14": pinned,
+			});
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("opens while a turn runs, so tool search can be watched, and holds Save until the turn ends", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -656,6 +732,10 @@ suite("Tools dialog", () => {
 					.filter(node => node.scrollWidth > node.clientWidth)
 					.map(node => node.id || node.className),
 				sections: document.querySelectorAll("#showcase-tool-catalog, #showcase-tool-search").length,
+				// Only a state's list scrolls; the panel around it keeps search, notices and Save in view.
+				scrollingPanels: [...document.querySelectorAll("#showcase-tool-catalog .tool-catalog")]
+					.filter(node => node.scrollHeight > node.clientHeight + 1)
+					.map(node => node.closest(".tool-catalog-showcase")?.id),
 			}));
 			expect(layout.states).toEqual(
 				[
@@ -680,6 +760,7 @@ suite("Tools dialog", () => {
 			expect(layout.nav).toEqual(["Tools dialog", "Tool search results"]);
 			expect(layout.sections).toBe(2);
 			expect(layout.overflow).toEqual([]);
+			expect(layout.scrollingPanels).toEqual([]);
 			expect(errors).toEqual([]);
 		} finally {
 			await context.close();

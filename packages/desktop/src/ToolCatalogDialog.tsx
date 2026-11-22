@@ -277,6 +277,8 @@ export function ToolCatalogPanel({
 							<input
 								ref={searchRef}
 								value={query}
+								// An empty registry has nothing to search.
+								disabled={tools.length === 0}
 								placeholder={t("catalog.searchPlaceholder")}
 								onChange={event => onQueryChange(event.target.value)}
 								onKeyDown={event => {
@@ -290,7 +292,7 @@ export function ToolCatalogPanel({
 						</label>
 						<p className="tool-catalog-summary muted">
 							{t("catalog.counts", { active: activeCount, available: tools.length - activeCount })}
-							{catalog.discovery && (
+							{catalog.discovery && tools.length > 0 && (
 								<>
 									{" · "}
 									{catalog.discovery.enabled ? t("catalog.discoveryOn") : t("catalog.discoveryOff")}
