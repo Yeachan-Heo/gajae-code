@@ -5,7 +5,7 @@ import path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { type Theme, theme } from "../modes/theme/theme";
 import { formatGroupedFiles } from "../tools/grouped-file-output";
-import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { formatPathRelativeToCwd, readTextFromDisk, resolveToCwd, specialFileKind } from "../tools/path-utils";
 import type {
 	CodeAction,
 	Command,
@@ -20,6 +20,7 @@ import type {
 } from "./types";
 
 export { detectLanguageId } from "../utils/lang-from-path";
+export { readTextFromDisk, specialFileKind } from "../tools/path-utils";
 
 // =============================================================================
 // URI Handling (Cross-Platform)
