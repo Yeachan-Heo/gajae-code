@@ -583,6 +583,7 @@ import {
 	ttsrPromptFields,
 	wrapUntrustedContent,
 } from "./messages";
+import { isHiddenUserCompanion, isUserAuthoredQueuedMessage } from "./queued-messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import type { SessionRecapAppendResult, SessionRecapInput } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
@@ -20655,6 +20656,42 @@ export class AgentSession {
 		// accepted SDK submission boundedly (#4668 review P1).
 		this.#fireQueuedRemovalHooks([...steeringQueued, ...followUpQueued, ...deferredQueued]);
 		return { steering, followUp };
+	}
+
+	/** The messages queued right now, as an opaque mark for {@link dropUserInputQueuedSince}. */
+	queuedMessageMark(): ReadonlySet<AgentMessage> {
+		return new Set([...this.agent.snapshotSteering(), ...this.agent.snapshotFollowUp()]);
+	}
+
+	/**
+	 * Remove the user input queued after `mark` (from {@link queuedMessageMark}) and, when given,
+	 * still present in `until` (a later mark), together with the hidden companions right before
+	 * it. Everything else stays queued: messages already queued at `mark`, messages queued after
+	 * `until`, and agent or extension work that is not user input (with an agent-attributed
+	 * prompt's companions). A caller takes back a batch whose delivery failed by marking before
+	 * delivery and after it; user input another source queued between the two marks cannot be
+	 * told apart from the batch: it is removed with the batch and is not restored.
+	 */
+	dropUserInputQueuedSince(mark: ReadonlySet<AgentMessage>, until?: ReadonlySet<AgentMessage>): void {
+		const callers = (message: AgentMessage): boolean =>
+			!mark.has(message) && (until === undefined || until.has(message));
+		const keepFrom = (queue: readonly AgentMessage[]): AgentMessage[] => {
+			const kept: AgentMessage[] = [];
+			let companions: AgentMessage[] = [];
+			for (const message of queue) {
+				if (callers(message) && isHiddenUserCompanion(message)) {
+					companions.push(message);
+					continue;
+				}
+				// Companions go with the message they precede.
+				if (!callers(message) || !isUserAuthoredQueuedMessage(message)) kept.push(...companions, message);
+				companions = [];
+			}
+			return kept;
+		};
+		const steering = keepFrom(this.agent.snapshotSteering());
+		const followUp = keepFrom(this.agent.snapshotFollowUp());
+		this.agent.restoreQueues({ steering, followUp });
 	}
 
 	/** Number of pending messages (includes steering, follow-up, and next-turn messages) */
