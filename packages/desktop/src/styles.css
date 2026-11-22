@@ -720,6 +720,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
    responsive rules. */
 
 /* Section A: tool call cards (ToolCallCard.tsx, transcript-groups.tsx). */
+/* Text on cards and tinted lines is mixed toward the foreground, so it keeps 4.5:1 in every theme
+   by construction: error text keeps the --status-error hue, quiet text keeps the muted tone. */
+.tool-call, .tool-run, .tool-call-details {
+	--tool-error-text: color-mix(in srgb, var(--status-error) 72%, var(--text));
+	--tool-quiet-text: color-mix(in srgb, var(--muted) 55%, var(--text));
+}
 /* The summary is one call line plus an optional muted intent line. The subject keeps one line and
    ellipsizes (the full text is its hover title); facts and status wrap below it when narrow. */
 .tool-call .tool-disclosure > summary { flex-wrap: nowrap; align-items: flex-start; }
@@ -740,7 +746,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-call-waiting { color: var(--status-waiting); }
 /* Cancelled is a neutral outcome, like Idle: muted, never the error treatment. */
 .tool-call-status.tool-call-cancelled { color: var(--muted); }
-.tool-call-status.tool-failure { color: var(--error); }
+.tool-call-status.tool-failure { color: var(--tool-error-text); }
 .tool-call-intent { color: var(--muted); font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
 /* A failed card keeps its error border and status; its summary text stays readable. */
 .tool-call.message-error { color: var(--text); }
@@ -748,7 +754,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-call-details { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px 0; min-width: 0; }
 .tool-call-details > .truncation-notice { margin: 0; }
 .tool-detail-note { margin: 0; color: var(--muted); font-size: 0.8125rem; }
-.tool-detail-error { margin: 0; }
+.tool-detail-error { margin: 0; color: var(--tool-error-text); }
+.tool-call > .truncation-notice, .tool-call-details > .truncation-notice { color: var(--tool-quiet-text); }
 .tool-detail-section, .tool-diff-file { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .tool-detail-heading { color: var(--muted); font-size: 0.75rem; font-weight: 600; }
 .tool-output-heading { display: block; padding: 10px 12px 4px; }
@@ -757,14 +764,14 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-diff-header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 0.75rem; }
 .tool-diff-path { min-width: 0; font-family: var(--mono); word-break: normal; overflow-wrap: anywhere; }
 .tool-diff-op { padding: 0 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); }
-.tool-diff-error { margin: 0; color: var(--error); font-size: 0.8125rem; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-diff-error { margin: 0; color: var(--tool-error-text); font-size: 0.8125rem; word-break: keep-all; overflow-wrap: anywhere; }
 /* A grid keeps every line as wide as the widest, so highlights span the scrolled width too. */
 .tool-diff { display: grid; margin: 0; max-height: 320px; overflow: auto; padding: 6px 0; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); background: var(--surface-2); font-family: var(--mono); font-size: 0.8125rem; line-height: 1.5; }
 .tool-diff-line { min-height: 1.5em; padding: 0 12px; white-space: pre; }
 .tool-diff-add { background: color-mix(in srgb, var(--status-done) 14%, transparent); }
 .tool-diff-remove { background: color-mix(in srgb, var(--status-error) 14%, transparent); }
 .tool-diff-hunk { color: var(--muted); }
-.tool-diff-number { display: inline-block; min-width: 4ch; margin-right: 8px; color: var(--muted); text-align: right; user-select: none; }
+.tool-diff-number { display: inline-block; min-width: 4ch; margin-right: 8px; color: var(--tool-quiet-text); text-align: right; user-select: none; }
 .tool-diff-sign { margin-right: 6px; }
 /* A run of calls is a wrapper; a single card keeps its own message rhythm. A group of two or more
    is one collapsed summary card whose members, when opened, hang below it on a quiet rule. */
@@ -780,7 +787,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-group-title { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; word-break: keep-all; overflow-wrap: anywhere; }
 .tool-group-count { font-weight: 600; }
 .tool-group-kinds { color: var(--muted); }
-.tool-group-failed { display: inline-flex; align-items: center; gap: 4px; color: var(--error); }
+.tool-group-failed { display: inline-flex; align-items: center; gap: 4px; color: var(--tool-error-text); }
 .tool-group-failed svg { width: 14px; height: 14px; }
 .tool-group-latest { min-width: 0; color: var(--muted); }
 .tool-group-latest .tool-call-verb { font-weight: 500; }
