@@ -552,7 +552,11 @@ function diffEntries(
 					op: item.op,
 					error: item.isError === true ? (item.displayErrorText ?? item.errorText) : undefined,
 				}))
-			: family === "write" && call && typeof call.arguments.content === "string" && result?.isError !== true
+			: family === "write" &&
+					call &&
+					typeof call.arguments.content === "string" &&
+					call.arguments.content.length <= MAX_REDACTION_CHARS &&
+					result?.isError !== true
 				? [
 						{
 							path: call.arguments.path,
