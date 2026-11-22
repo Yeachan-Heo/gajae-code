@@ -181,12 +181,12 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.replaceAuthCredentialsRemote(provider, credentials);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					// P1: Journal broker revocations BEFORE writing local fallback and marking provider local.
-					// This ensures if the process crashes after revocation is journaled but before the credential
-					// is written, the revocation will be retried at startup, avoiding orphaned unserved credentials.
-					await this.#disableUnservedEntries(error.unservedEntries, provider);
+					// P2-1: Persist local credentials BEFORE attempting broker disable to ensure
+					// crash safety. If we disable first and crash before persisting, the credential is lost.
+					// By persisting first, we ensure a usable copy survives process crashes.
 					this.#keepLocal(provider);
 					this.#local.replaceAuthCredentialsForProvider(provider, credentials);
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return this.listAuthCredentials(provider);
 				}
 				throw error;
@@ -202,12 +202,12 @@ export class HybridAuthCredentialStore implements AuthCredentialStore {
 				return await this.#broker.upsertAuthCredentialRemote(provider, credential);
 			} catch (error) {
 				if (error instanceof AuthBrokerUnservedProviderError) {
-					// P1: Journal broker revocations BEFORE writing local fallback and marking provider local.
-					// This ensures if the process crashes after revocation is journaled but before the credential
-					// is written, the revocation will be retried at startup, avoiding orphaned unserved credentials.
-					await this.#disableUnservedEntries(error.unservedEntries, provider);
+					// P2-1: Persist local credentials BEFORE attempting broker disable to ensure
+					// crash safety. If we disable first and crash before persisting, the credential is lost.
+					// By persisting first, we ensure a usable copy survives process crashes.
 					this.#keepLocal(provider);
 					this.#local.upsertAuthCredentialForProvider(provider, credential);
+					await this.#disableUnservedEntries(error.unservedEntries, provider);
 					return this.listAuthCredentials(provider);
 				}
 				throw error;
