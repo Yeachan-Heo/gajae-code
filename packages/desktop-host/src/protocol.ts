@@ -337,6 +337,12 @@ export interface DesktopAuthState {
 	status: "authorizing" | "waiting" | "complete" | "cancelled" | "error";
 	url?: string;
 	instructions?: string;
+	/**
+	 * A provider risk notice the user must accept before the flow continues. Present only while
+	 * the flow is `waiting` on that acknowledgement, never alongside `prompt`. Confirm with
+	 * `auth.answer {promptId: warning.id, value: "confirm"}`; decline with `auth.cancel`.
+	 */
+	warning?: { id: string; message: string };
 	prompt?: { id: string; message: string; placeholder?: string; allowEmpty?: boolean };
 	error?: string;
 }

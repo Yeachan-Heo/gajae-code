@@ -741,6 +741,13 @@ export class DesktopHost {
 			status: state.status === "stored" ? (state.catalogRefreshed === false ? "error" : "complete") : state.status,
 			...(state.url ? { url: state.url } : {}),
 			...(state.verificationCode ? { instructions: `Verification code: ${state.verificationCode}` } : {}),
+			// A warning is a pending answer with no prompt: dropping it leaves the flow waiting on
+			// a confirmation the user was never shown. The SDK holds one pending answer at a time
+			// and clears a confirmed warning a step after it resumes, so it is only answerable
+			// while the flow waits without a prompt.
+			...(state.warning && state.status === "waiting" && !state.prompt
+				? { warning: { id: state.warning.id, message: this.#redact(state.warning.message) } }
+				: {}),
 			...(state.prompt ? { prompt: { ...state.prompt, message: this.#redact(state.prompt.message) } } : {}),
 			...(state.error ? { error: this.#redact(state.error) } : {}),
 			...(state.status === "stored" && state.catalogRefreshed === false

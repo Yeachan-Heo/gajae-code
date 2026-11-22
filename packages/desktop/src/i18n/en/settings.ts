@@ -79,6 +79,8 @@ export const settings = {
 	"settings.oauthOpen": "Open the authorization page in a browser",
 	"settings.oauthInsecureUrl": "Cannot open: this is not a safe HTTPS authorization URL.",
 	"settings.oauthSubmit": "Submit answer",
+	"settings.oauthWarningHeading": "Confirm before continuing",
+	"settings.oauthWarningContinue": "Continue",
 	"settings.oauthCancel": "Cancel account connection",
 	"settings.gateQuestion": "Question",
 	"settings.gateApproval": "Approval request",

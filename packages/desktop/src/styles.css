@@ -391,6 +391,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .oauth-flow { border: 1px solid var(--border-soft); border-radius: var(--radius-md); padding: 16px; min-width: 0; background: var(--card); }
 .oauth-url { font-family: var(--mono); font-size: 0.75rem; overflow-wrap: anywhere; word-break: break-all; }
 .oauth-settings .bounded-output { white-space: pre-wrap; }
+.oauth-warning { margin: 12px 0 0; padding: 12px; min-width: 0; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
+.oauth-warning legend { padding: 0 6px; font-size: 0.8125rem; font-weight: 600; color: var(--status-waiting); }
+.oauth-warning p { margin: 0 0 12px; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
 .setting-field { padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
 .setting-field small { display: block; margin: 4px 0 8px; }
 .setting-field label { font-family: var(--mono); overflow-wrap: anywhere; font-size: 0.8125rem; }

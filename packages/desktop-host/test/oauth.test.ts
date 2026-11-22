@@ -3,6 +3,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as geminiCli from "@gajae-code/ai/utils/oauth/google-gemini-cli";
+import type { OAuthController, OAuthCredentials } from "@gajae-code/ai/utils/oauth/types";
 import * as sdk from "@gajae-code/coding-agent/sdk";
 import { getAgentDir, hookFetch, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
@@ -349,6 +351,78 @@ describe("desktop authorization through the public SDK", () => {
 		expect((await h.state()).id).toBe(flow.id);
 		expect(authorizationCalls.filter(call => call.operation === "auth.start")).toHaveLength(1);
 		await h.call("auth.cancel", { flowId: flow.id });
+	});
+
+	// The shape of the real consent URL: its parameters are what the SDK checks answers against.
+	const geminiConsentUrl = `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({
+		client_id: "fixture-client.apps.googleusercontent.com",
+		response_type: "code",
+		redirect_uri: "http://localhost:8085/oauth2callback",
+		scope: "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email",
+		state: "0".repeat(64),
+		access_type: "offline",
+		prompt: "consent",
+	}).toString()}`;
+
+	function holdGeminiLogin() {
+		let logins = 0;
+		const login = vi.spyOn(geminiCli, "loginGeminiCli").mockImplementation(async (controller: OAuthController) => {
+			logins += 1;
+			controller.onAuth?.({ url: geminiConsentUrl });
+			const stopped = Promise.withResolvers<OAuthCredentials>();
+			controller.signal?.addEventListener("abort", () => stopped.reject(new Error("aborted")), { once: true });
+			return stopped.promise;
+		});
+		restores.push(() => login.mockRestore());
+		return () => logins;
+	}
+
+	test("shows a provider risk warning before sign-in and declines it without starting the provider login", async () => {
+		const logins = holdGeminiLogin();
+		const h = await launch();
+		const flow = await h.call<DesktopAuthState>("auth.login", { provider: "google-gemini-cli" });
+		const waiting = await observe(h.state, state => state.status === "waiting");
+		expect(waiting.warning?.message).toContain("Google");
+		expect(waiting.prompt).toBeUndefined();
+		expect(waiting.url).toBeUndefined();
+		const warningId = waiting.warning?.id;
+		if (!warningId) throw new Error("Expected a warning confirmation identity");
+		expect(h.frames).toContainEqual({ type: "auth", auth: waiting });
+		await expect(
+			h.call("auth.answer", { flowId: flow.id, promptId: crypto.randomUUID(), value: "confirm" }),
+		).rejects.toThrow();
+		expect((await h.state()).warning?.id).toBe(warningId);
+		const cancelled = await h.call<DesktopAuthState>("auth.cancel", { flowId: flow.id });
+		expect(cancelled).toEqual({ id: flow.id, provider: "google-gemini-cli", status: "cancelled" });
+		expect(logins()).toBe(0);
+		expect(h.owner.session.modelRegistry.authStorage.get("google-gemini-cli")).toBeUndefined();
+	});
+
+	test("continues to the provider sign-in page once the risk warning is confirmed", async () => {
+		const logins = holdGeminiLogin();
+		const h = await launch();
+		const flow = await h.call<DesktopAuthState>("auth.login", { provider: "google-gemini-cli" });
+		const waiting = await observe(h.state, state => state.status === "waiting");
+		const warningId = waiting.warning?.id;
+		if (!warningId) throw new Error("Expected a warning confirmation identity");
+		expect(logins()).toBe(0);
+		const answered = await h.call<DesktopAuthState>("auth.answer", {
+			flowId: flow.id,
+			promptId: warningId,
+			value: "confirm",
+		});
+		// The SDK clears a confirmed warning one step after resuming; it must not be offered again.
+		expect(answered.warning).toBeUndefined();
+		const authorizing = await observe(h.state, state => state.url !== undefined || state.status === "error");
+		expect(authorizing).toEqual({
+			id: flow.id,
+			provider: "google-gemini-cli",
+			status: "authorizing",
+			url: new URL(geminiConsentUrl).href,
+		});
+		expect(logins()).toBe(1);
+		await expect(h.call("auth.answer", { flowId: flow.id, promptId: warningId, value: "confirm" })).rejects.toThrow();
+		expect((await h.call<DesktopAuthState>("auth.cancel", { flowId: flow.id })).status).toBe("cancelled");
 	});
 
 	test("cancels a native prompt without accepting stale answers or duplicate cancellation", async () => {

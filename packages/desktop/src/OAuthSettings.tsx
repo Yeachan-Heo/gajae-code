@@ -127,6 +127,8 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 	const active = auth?.status === "authorizing" || auth?.status === "waiting";
 	const url = authorizationUrl(auth?.url);
 	const prompt = active ? auth?.prompt : undefined;
+	// The Host sends a warning only while the flow waits on it.
+	const warning = active ? auth?.warning : undefined;
 	return (
 		<section className="oauth-settings" aria-labelledby="oauth-title">
 			<h3 id="oauth-title">{t("settings.oauthHeading")}</h3>
@@ -196,6 +198,20 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 								</>
 							)}
 							{auth.url && !url && <ErrorBanner>{t("settings.oauthInsecureUrl")}</ErrorBanner>}
+							{warning && (
+								<fieldset className="oauth-warning">
+									<legend>{t("settings.oauthWarningHeading")}</legend>
+									<p>{warning.message}</p>
+									<Button
+										disabled={!connected || !ready || busy}
+										onClick={() =>
+											void act("auth.answer", { flowId: auth.id, promptId: warning.id, value: "confirm" })
+										}
+									>
+										{t("settings.oauthWarningContinue")}
+									</Button>
+								</fieldset>
+							)}
 							{prompt && (
 								<form
 									onSubmit={event => {
