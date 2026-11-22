@@ -3060,15 +3060,21 @@ export class DesktopHost {
 						: await live.sdk.submitUserMessage(text, { ...options, trackSubmission: true });
 				} catch (error) {
 					unsubscribeTerminal();
+					// A Stop cancelled this steer's pending admission. As for a prompt Stop caught before
+					// its run, nothing of it reached the conversation, so its text goes back.
+					const stoppedBeforeQueue = !journalFailed && live.stopRequests !== stops && !claimant.turns.length;
 					await this.#delivery(
 						request.id,
 						journalFailed
 							? { disposition: "unknown", error: "Delivery journal unavailable" }
-							: {
-									disposition: accepted ? "unknown" : "refused",
-									error: accepted ? "Submission outcome unknown" : "Submission refused",
-								},
+							: stoppedBeforeQueue
+								? { disposition: "refused", error: "Prompt stopped before it started" }
+								: {
+										disposition: accepted ? "unknown" : "refused",
+										error: accepted ? "Submission outcome unknown" : "Submission refused",
+									},
 					);
+					if (stoppedBeforeQueue) return null;
 					throw error;
 				}
 				const queuedPersisted = this.#delivery(request.id, {

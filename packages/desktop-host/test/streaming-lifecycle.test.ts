@@ -914,6 +914,64 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task"]);
 	});
 
+	test("Stop while the SDK is still admitting a steer cancels it and returns its text", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-before-admitted-steer");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			// The SDK accepted the steer's preflight and waits for this write before queueing it.
+			if (id === "steer-in-preflight" && changes.disposition === "accepted") {
+				held.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const steer = call(
+			"prompt",
+			{ sessionId: session.id, text: "typed before Stop", deliverAs: "steer" },
+			"steer-in-preflight",
+		);
+		await held.promise;
+		// The abort cancels the pending preflight, so the SDK refuses the steer once the write lands.
+		const stopping = call("abort", { sessionId: session.id });
+		await stopReached.promise;
+		release.resolve();
+		expect(await stopping).toBeNull();
+		expect(await steer).toBeNull();
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.sessions[0]?.error).toBeUndefined();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-in-preflight",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
 	test("invalid prompt reports a definitive refusal before admission", async () => {
 		const { call, session, frames, snapshot } = await launch();
 		await expect(call("prompt", { sessionId: session.id, text: "" }, "invalid-id")).rejects.toThrow();
