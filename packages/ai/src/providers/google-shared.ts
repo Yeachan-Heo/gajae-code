@@ -29,7 +29,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
-import { GeminiHeaderRunDetector, isGeminiModel } from "../utils/thinking-loop";
+import { GeminiHeaderRunawayError, GeminiHeaderRunDetector, isGeminiModel } from "../utils/thinking-loop";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
@@ -645,8 +645,9 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 							);
 							// Defer error until after tool calls in this frame are processed.
 							// Error will be caught by caller and classified by error code in retry policy.
-							geminiHeaderRunawayError = new Error(
+							geminiHeaderRunawayError = new GeminiHeaderRunawayError(
 								`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupted to prevent budget exhaustion.`,
+								geminiHeaderRunDetector.count,
 							);
 						}
 					} else {
@@ -671,8 +672,6 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 				if (part.functionCall) {
 					// Reset Gemini header runaway detector when transitioning to tool calls.
 					geminiHeaderRunDetector?.reset();
-					// Throw deferred Gemini runaway error after tool call is processed.
-					if (geminiHeaderRunawayError) throw geminiHeaderRunawayError;
 					if (currentBlock) {
 						flushCurrent();
 						currentBlock = null;
@@ -693,6 +692,8 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 
 					output.content.push(toolCall);
 					pushToolCallEvents(toolCall, blockIndex(), output, stream);
+					// Throw deferred Gemini runaway error after tool call is processed.
+					if (geminiHeaderRunawayError) throw geminiHeaderRunawayError;
 				}
 			}
 		}
@@ -1063,6 +1064,10 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			// Detect Gemini header runaway error and set error code for terminal classification.
+			if (error instanceof GeminiHeaderRunawayError) {
+				output.errorCode = error.errorCode;
+			}
 			output.errorStatus = extractHttpStatusFromError(error);
 			output.transportFailure = transportFailureFacts(error) ?? output.transportFailure;
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);

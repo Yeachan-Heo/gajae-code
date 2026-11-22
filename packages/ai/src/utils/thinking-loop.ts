@@ -63,6 +63,21 @@ export function isReasoningSummaryHeader(line: string): boolean {
  * thought, so the run IS the number of summaries); leaving the reasoning channel
  * does, via {@link reset} on a new thinking block / prose / tool call.
  */
+/**
+ * Error thrown when Gemini header runaway detector fires.
+ * Carries the error code for classification in the retry policy.
+ */
+export class GeminiHeaderRunawayError extends Error {
+	readonly errorCode = GEMINI_HEADER_RUNAWAY_ERROR_CODE;
+	readonly count: number;
+
+	constructor(message: string, count: number) {
+		super(message);
+		this.name = "GeminiHeaderRunawayError";
+		this.count = count;
+	}
+}
+
 export class GeminiHeaderRunDetector {
 	/** Thinking text not yet split into completed lines. */
 	#pending = "";
