@@ -1384,6 +1384,7 @@ export function prepareCompaction(
 ): CompactionPreparation | undefined {
 	let shouldReExpandTrailingCompaction = false;
 	let trailingCompactionIndex = -1;
+	let trailingCompactionToPreserve: CompactionEntry | undefined;
 
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		const lastEntry = pathEntries[pathEntries.length - 1] as CompactionEntry;
@@ -1399,6 +1400,8 @@ export function prepareCompaction(
 		// Otherwise, continue with re-expansion (the compaction becomes live again)
 		shouldReExpandTrailingCompaction = true;
 		trailingCompactionIndex = pathEntries.length - 1;
+		// Preserve the trailing compaction's summary to maintain fidelity during re-expansion
+		trailingCompactionToPreserve = lastEntry;
 	}
 
 	let prevCompactionIndex = -1;
@@ -1512,7 +1515,11 @@ export function prepareCompaction(
 	// Get previous summary and preserved data for iterative updates
 	let previousSummary: string | undefined;
 	let previousPreserveData: Record<string, unknown> | undefined;
-	if (prevCompactionIndex >= 0) {
+	// When re-expanding a trailing compaction, preserve its summary to maintain fidelity
+	if (trailingCompactionToPreserve) {
+		previousSummary = trailingCompactionToPreserve.summary;
+		previousPreserveData = trailingCompactionToPreserve.preserveData;
+	} else if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
 		previousSummary = prevCompaction.summary;
 		previousPreserveData = prevCompaction.preserveData;

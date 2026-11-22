@@ -246,4 +246,45 @@ describe("re-expand trailing remote compaction", () => {
 		});
 		expect(prep2).toBeUndefined();
 	});
+
+	test("preserves trailing compaction summary during re-expansion for incompatible model", () => {
+		const claude = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!claude) throw new Error("Expected Claude model to exist");
+
+		// Build entries with a message history (using default 30 turns and 50000 tokens)
+		const messages = buildEntries();
+		const trailingCompactionSummary =
+			"Important context from previous summarization: User discussed project architecture and implementation details.";
+
+		// Create a trailing OpenAI remote compaction with meaningful summary
+		const trailing: SessionEntry[] = [
+			...messages,
+			{
+				type: "compaction",
+				id: "comp1",
+				parentId: messages[messages.length - 1].id ?? null,
+				timestamp,
+				summary: trailingCompactionSummary,
+				firstKeptEntryId: "u0",
+				tokensBefore: 10000,
+				preserveData: withOpenAiRemoteCompactionPreserveData(undefined, {
+					provider: "openai",
+					replacementHistory: [],
+					compactionItem: {
+						type: "compaction",
+						encrypted_content: "encrypted_data",
+					},
+				}),
+			} as CompactionEntry,
+		];
+
+		// Claude cannot replay the OpenAI compaction, so it should trigger re-expansion
+		const prep = prepareCompaction(trailing, DEFAULT_COMPACTION_SETTINGS, {
+			activeModel: claude,
+			contextWindow: 100000,
+		});
+		expect(prep).toBeDefined();
+		// The critical fix: the trailing compaction's summary must be preserved as previousSummary
+		expect(prep?.previousSummary).toBe(trailingCompactionSummary);
+	});
 });
