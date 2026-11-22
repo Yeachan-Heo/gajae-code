@@ -52,7 +52,16 @@ type Call = [string, ...(string | null)[]];
 interface Control {
 	set(data: Partial<FixtureData>): void;
 	select(provider: string | null): void;
+	/** Dialog fixtures only: mounts or unmounts the native `Modal` around the panel. */
+	open(value: boolean): void;
 	calls(): Call[];
+}
+interface FixtureOptions {
+	height?: number;
+	/** Render the panel inside the real `Modal` with the Providers dialog's class, as the app does. */
+	dialog?: boolean;
+	/** With `dialog`, start with the dialog unmounted so a test can stage data before it opens. */
+	closed?: boolean;
 }
 declare global {
 	interface Window {
@@ -96,10 +105,10 @@ const flow = (overrides: Partial<DesktopAuthState>): DesktopAuthState => ({
 	...overrides,
 });
 
-async function fixture(width = 1000): Promise<{ context: BrowserContext; page: Page }> {
+async function fixture(width = 1000, options: FixtureOptions = {}): Promise<{ context: BrowserContext; page: Page }> {
 	const { context, page } = await componentFixture(browser, origin);
 	try {
-		await page.setViewport({ width, height: 900 });
+		await page.setViewport({ width, height: options.height ?? 900 });
 		await componentReady(page, async () => {
 			await page.addScriptTag({
 				type: "module",
@@ -107,18 +116,21 @@ async function fixture(width = 1000): Promise<{ context: BrowserContext; page: P
 					import '/src/styles.css';
 					import React from '/node_modules/.vite/deps/react.js';
 					import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
+					import { Modal } from '/src/components.tsx';
 					import { ProvidersPanel } from '/src/ProvidersPanel.tsx';
 					import { projectProviders, visibleFlow } from '/src/provider-status.ts';
 					const h = React.createElement;
 					const calls = [];
+					const dialog = ${options.dialog === true};
 					function Fixture() {
 						const [data, setData] = React.useState({ providers: [], models: [], flow: null, owned: [], loaded: true, disconnected: false, busy: false, keyState: null });
 						const [selected, setSelected] = React.useState(null);
 						const [query, setQuery] = React.useState('');
-						window.providersTest = { set: next => setData(previous => ({ ...previous, ...next })), select: setSelected, calls: () => calls };
+						const [open, setOpen] = React.useState(${options.closed !== true});
+						window.providersTest = { set: next => setData(previous => ({ ...previous, ...next })), select: setSelected, open: setOpen, calls: () => calls };
 						const owned = new Set(data.owned);
 						const shown = visibleFlow(data.flow, owned);
-						return h('div', { className: 'modal-content', style: { maxWidth: '640px' } }, h(ProvidersPanel, {
+						const panel = h(ProvidersPanel, {
 							groups: projectProviders(data.providers, data.models, shown, owned),
 							totalModels: data.models.length,
 							loaded: data.loaded,
@@ -137,7 +149,11 @@ async function fixture(width = 1000): Promise<{ context: BrowserContext; page: P
 							onSaveKey: (id, draft) => calls.push(['saveKey', id, draft]),
 							onOpenUrl: url => calls.push(['open', url]),
 							onDone: () => calls.push(['done']),
-						}));
+						});
+						if (!dialog) return h('div', { className: 'modal-content', style: { maxWidth: '640px' } }, panel);
+						return open
+							? h(Modal, { title: 'Providers', className: 'providers-dialog', onClose: () => { calls.push(['close']); setOpen(false); } }, panel)
+							: h('button', { id: 'opener', onClick: () => setOpen(true) }, 'Open');
 					}
 					const root = document.createElement('div');
 					root.id = 'providers-fixture';
@@ -146,12 +162,13 @@ async function fixture(width = 1000): Promise<{ context: BrowserContext; page: P
 				`,
 			});
 			await page.waitForFunction(
-				() => !!document.querySelector("#providers-fixture .providers-panel") && !!window.providersTest,
+				() =>
+					!!document.querySelector("#providers-fixture :is(.providers-panel, #opener)") && !!window.providersTest,
 			);
 		});
 		await page.addStyleTag({ url: `${origin}/src/styles.css` });
 		await set(page, { providers, models });
-		await page.waitForSelector(".provider-row");
+		if (options.closed !== true) await page.waitForSelector(".provider-row");
 		return { context, page };
 	} catch (error) {
 		await context.close();
@@ -191,6 +208,44 @@ async function click(page: Page, text: string): Promise<void> {
 		if (!button) throw new Error(`Missing button: ${label}`);
 		button.click();
 	}, text);
+}
+/** The reader's text size, as Settings applies it (`applyFontSize`). */
+async function textSize(page: Page, px: number): Promise<void> {
+	await page.evaluate(value => document.documentElement.style.setProperty("--text-size", `${value}px`), px);
+}
+/**
+ * Every provider row under `scope` whose name or id shares pixels with its status or a method
+ * tag, or whose status or tags break onto a second line. Names are measured as their text's line
+ * boxes, so a status spilling over the name is caught even though the two flex boxes never meet.
+ */
+async function rowCollisions(page: Page, scope: string): Promise<string[]> {
+	return page.$$eval(`${scope} .provider-row`, rows => {
+		const problems: string[] = [];
+		const lines = (node: Element) => {
+			const range = document.createRange();
+			range.selectNodeContents(node);
+			return [...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0);
+		};
+		const meet = (a: DOMRect, b: DOMRect) =>
+			a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5;
+		for (const row of rows) {
+			const label = row.getAttribute("data-provider-id") ?? "?";
+			const text = [...row.querySelectorAll(".provider-row-main > strong, .provider-row-main > .provider-id")].flatMap(
+				lines,
+			);
+			const status = row.querySelector(".provider-status");
+			const tags = [...row.querySelectorAll(".provider-methods .model-role-tag")];
+			for (const item of [status, ...tags]) {
+				if (!item) continue;
+				const box = item.getBoundingClientRect();
+				if (text.some(line => meet(line, box))) problems.push(`${label}: "${item.textContent}" overlaps the name`);
+				if (new Set(lines(item).map(line => Math.round(line.top))).size > 1)
+					problems.push(`${label}: "${item.textContent}" wraps`);
+			}
+			if (row.scrollWidth > row.clientWidth) problems.push(`${label}: row overflows`);
+		}
+		return problems;
+	});
 }
 async function waitText(page: Page, text: string): Promise<void> {
 	await page.waitForFunction(
@@ -451,6 +506,61 @@ suite("Providers panel interactions", () => {
 				),
 			).toEqual(["provider-notice-dock", "composer-area", ""]);
 			expect(errors).toEqual([]);
+		} finally {
+			await context.close();
+		}
+	}, 60000);
+
+	test("a long name never meets its status or method tags in the dialog, at any width or text size", async () => {
+		// Longer than any real provider name, one carrying the longest status, one a single unbroken word.
+		const longRows = [
+			provider(
+				"extra-long-name",
+				"Extraordinarily long provider display name written to outgrow every real provider name, so the row has to wrap it beside its status 이름이 아주 긴 공급자",
+				{ configured: true, stored: true },
+			),
+			provider("unbroken-name", "Providernamewithoutanyspaceswhatsoeverthatkeepsgoingpasttheedgeofthedialog"),
+		];
+		for (const [width, height] of [
+			[1400, 900],
+			[720, 520],
+			[481, 800],
+			[390, 844],
+		] as const) {
+			const { context, page } = await fixture(width, { height, dialog: true });
+			try {
+				await set(page, { providers: [...providers, ...longRows], models });
+				await page.waitForSelector('.provider-row[data-provider-id="unbroken-name"]');
+				expect(
+					await page.$eval('.provider-row[data-provider-id="extra-long-name"] .provider-status', node => node.textContent),
+				).toBe("Connected · no models");
+				for (const size of [14, 20]) {
+					await textSize(page, size);
+					expect({ width, size, problems: await rowCollisions(page, "dialog") }).toEqual({ width, size, problems: [] });
+				}
+			} finally {
+				await closeComponentFixture(context, page);
+			}
+		}
+	}, 60000);
+
+	test("the showcase's long-name row stays clear of its status in both frames", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			for (const width of [1200, 390]) {
+				await page.setViewport({ width, height: 900 });
+				await page.goto(`${origin}/?showcase`);
+				await page.waitForSelector("#showcase-providers .providers-panel .provider-row");
+				for (const size of [14, 20]) {
+					await textSize(page, size);
+					expect({
+						width,
+						size,
+						problems: await rowCollisions(page, "#showcase-providers .providers-showcase-frame"),
+					}).toEqual({ width, size, problems: [] });
+				}
+			}
 		} finally {
 			await context.close();
 		}
