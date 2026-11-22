@@ -491,7 +491,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-dialog { width: min(640px, calc(100vw - 32px)); }
 .model-search { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding-left: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
 .model-search > svg { width: 16px; height: 16px; flex-shrink: 0; color: var(--muted); }
-.model-search input { border: 0; background: transparent; padding-left: 0; }
+/* A placeholder (or an unfocused query) too long for a narrow field ends with an ellipsis, not a cut word. */
+.model-search input { border: 0; background: transparent; padding-left: 0; text-overflow: ellipsis; }
 .model-search input:focus-visible { border-color: transparent; box-shadow: none; outline: none; }
 .model-result-list { display: flex; flex-direction: column; gap: 6px; max-height: 44dvh; overflow: auto; margin: 0 0 12px; padding: 4px; list-style: none; }
 .model-result-list li { min-width: 0; }

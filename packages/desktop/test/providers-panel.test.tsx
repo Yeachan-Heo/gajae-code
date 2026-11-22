@@ -603,6 +603,48 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
+	test("a search placeholder too long for its field ends with an ellipsis: Providers, Tools and the model picker", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 390, height: 844 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-tool-catalog-populated .model-search input");
+			await textSize(page, 20);
+			await page.click("#showcase-models .model-trigger");
+			await page.waitForSelector("dialog[open] .model-search input");
+			const fields = await page.evaluate(() => {
+				const canvas = document.createElement("canvas").getContext("2d")!;
+				return Object.fromEntries(
+					(
+						[
+							["providers", "#showcase-providers .providers-showcase-frame[data-narrow] .model-search input"],
+							["tools", "#showcase-tool-catalog-populated .model-search input"],
+							["models", "dialog[open] .model-search input"],
+						] as const
+					).map(([name, selector]) => {
+						const input = document.querySelector<HTMLInputElement>(selector)!;
+						const style = getComputedStyle(input);
+						canvas.font = style.font;
+						const room = input.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+						return [
+							name,
+							{ overflows: canvas.measureText(input.placeholder).width > room, textOverflow: style.textOverflow },
+						];
+					}),
+				);
+			});
+			// At 390 px with 20 px text each placeholder overflows its field, and each field ends it with an ellipsis.
+			expect(fields).toEqual({
+				providers: { overflows: true, textOverflow: "ellipsis" },
+				tools: { overflows: true, textOverflow: "ellipsis" },
+				models: { overflows: true, textOverflow: "ellipsis" },
+			});
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("the showcase marks the selected state and its status lines describe what is shown", async () => {
 		const context = await browser.createBrowserContext();
 		try {
