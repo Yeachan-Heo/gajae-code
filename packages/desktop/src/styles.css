@@ -822,7 +822,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* The toolbar chip is the always-visible sign of the list; the button keeps its icon-first shape. */
 .toolbar .session-work-toggle:has(.session-work-progress) { gap: 0.375rem; }
 .session-work-progress { padding: 0 0.375rem; border-radius: var(--radius-pill); background: var(--surface-2); color: var(--muted); font-size: 0.6875rem; line-height: 1.5; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.session-work-toggle[aria-pressed="true"] .session-work-progress { background: transparent; color: inherit; }
+/* The pressed button is accent-tinted, where accent and green text both fall under 4.5:1 in some
+   palettes; the count takes the body ink there, finished or not. */
+.session-work-toggle[aria-pressed="true"] .session-work-progress { background: transparent; color: var(--text); }
 .session-work-progress.complete { color: var(--status-done); }
 .todo-stale { display: flex; align-items: flex-start; gap: 0.5rem; margin: 0 0 0.5rem; color: var(--status-waiting); font-size: 0.75rem; }
 .todo-stale > svg { flex: none; width: 0.875rem; height: 0.875rem; margin-top: 0.1875rem; }
