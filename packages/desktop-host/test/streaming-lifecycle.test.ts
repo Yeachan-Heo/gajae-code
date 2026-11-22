@@ -1174,6 +1174,35 @@ describe("desktop streaming lifecycle", () => {
 		});
 	});
 
+	test("Stop before a builtin command's forwarded prompt starts keeps it from running", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		// `/notify on` is a real builtin that hands its own text on as a prompt.
+		const record = holdDeliveryBegin("forwarding-command");
+		const command = call<DesktopCommandResult>(
+			"prompt",
+			{ sessionId: session.id, text: "/notify on" },
+			"forwarding-command",
+		);
+		await record.held;
+		expect(await call("abort", { sessionId: session.id })).toBeNull();
+		record.release();
+		expect(await Promise.race([command.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe(
+			"settled",
+		);
+		expect(await command).toMatchObject({ consumed: true, prompt: "/notify on" });
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(0);
+		expect(sdk.isStreaming).toBe(false);
+		expect(userTurns(sdk)).toEqual([]);
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "forwarding-command",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+	});
+
 	test("Stop in one conversation leaves another conversation's run and inputs alone", async () => {
 		const first = await launch();
 		const running = first.call("prompt", { sessionId: first.session.id, text: "task a" }, "run-a");

@@ -2133,10 +2133,10 @@ export class DesktopHost {
 		text: string,
 		images: ImageContent[],
 		settleView: () => void,
+		arrival: number,
 		alreadyBegun = false,
 		allowGateMutation = false,
 		editEntryId?: string,
-		arrival = this.#arrivals,
 	): Promise<void> {
 		let completeTask = this.#localTaskCompletion(live);
 		// Only a Stop that arrived after this prompt's request interrupts it.
@@ -2684,7 +2684,7 @@ export class DesktopHost {
 				},
 			];
 		if (method === "command.run")
-			return this.#command(this.#metadata(params), requiredString(params, "text"), request.id);
+			return this.#command(this.#metadata(params), requiredString(params, "text"), request.id, arrival);
 		if (method === "history.get") {
 			const live = await this.#open(this.#metadata(params));
 			const offset = params.offset === undefined ? 0 : params.offset;
@@ -3001,7 +3001,7 @@ export class DesktopHost {
 					throw new Error("Slash commands cannot be submitted with attachments.");
 				if (live.busy || live.sdk.isStreaming)
 					throw new Error("Run the command after the current operation finishes.");
-				const result = await this.#command(metadata, text, request.id, true);
+				const result = await this.#command(metadata, text, request.id, arrival, true);
 				if (result.refused) await this.#delivery(request.id, { disposition: "refused", error: result.output });
 				else if (result.consumed && result.prompt === undefined && commandName !== "btw")
 					await this.#delivery(request.id, { disposition: "completed" });
@@ -3223,10 +3223,10 @@ export class DesktopHost {
 						text,
 						images,
 						settleView,
+						arrival,
 						true,
 						false,
 						editEntryId,
-						arrival,
 					);
 					return null;
 				},
@@ -3946,6 +3946,7 @@ export class DesktopHost {
 		metadata: SavedSession,
 		text: string,
 		requestId: string,
+		arrival: number,
 		alreadyBegun = false,
 	): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
@@ -3976,7 +3977,7 @@ export class DesktopHost {
 		// Commands mutate the same session as prompts, so they take the same lock.
 		return this.#exclusive(
 			live,
-			settleView => this.#runCommand(live, text, requestId, settleView, alreadyBegun),
+			settleView => this.#runCommand(live, text, requestId, settleView, arrival, alreadyBegun),
 			true,
 		);
 	}
@@ -3985,6 +3986,7 @@ export class DesktopHost {
 		text: string,
 		requestId: string,
 		settleView: () => void,
+		arrival: number,
 		alreadyBegun = false,
 	): Promise<DesktopCommandResult> {
 		const chunks: string[] = [];
@@ -4047,7 +4049,8 @@ export class DesktopHost {
 				// A builtin that returns a prompt starts a real turn, so its failure is the
 				// conversation's failure even though command.run itself is administrative.
 				try {
-					await this.#promptDelivery(live, requestId, forwarded, [], settleView, alreadyBegun, true);
+					// Judged against the command's own arrival: a Stop while the command ran stops this.
+					await this.#promptDelivery(live, requestId, forwarded, [], settleView, arrival, alreadyBegun, true);
 				} catch (error) {
 					if (
 						!live.errorOwner &&
