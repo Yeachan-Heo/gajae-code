@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
 import { getOAuthProviders, type ImageContent, type Model } from "@gajae-code/ai/core";
 import {
@@ -25,6 +26,7 @@ import {
 	executeAcpBuiltinSlashCommand,
 	forkEmbeddedSession,
 	getEmbeddedAvailableModels,
+	getSessionMessageEntryId,
 	getSettingsCatalog,
 	type InputEventResult,
 	listEmbeddedProjectSessions,
@@ -123,6 +125,15 @@ const SETTING_CATALOG = getSettingsCatalog(Settings.isolated());
 
 const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
 	JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
+/**
+ * Transcript evidence that a user turn durably joined the conversation: the SDK bound this exact
+ * message to a session entry. Preflight acceptance is not this proof, because it commits before
+ * the message is appended.
+ */
+const persistedUserTurn = (sdk: AgentSession, message: AgentMessage | undefined): boolean => {
+	const entryId = message === undefined ? undefined : getSessionMessageEntryId(message);
+	return entryId !== undefined && sdk.sessionManager.getEntry(entryId) !== undefined;
+};
 /** Owned control DTOs are already redacted; completion draft replacements must remain exact. */
 const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"composer.complete",
@@ -422,6 +433,8 @@ interface LiveSession extends SessionCandidate {
 	/** Explicitly queued steering/follow-up submissions, in admission order. */
 	queued: Map<string, TrackedQueuedInput>;
 	revisions?: PromptRevisions;
+	/** User Stop requests so far. Only a run stopped after its input counted one ends `cancelled`. */
+	stopRequests: number;
 }
 interface PendingQuestion {
 	ownerToken: symbol;
@@ -1262,6 +1275,7 @@ export class DesktopHost {
 			busy: false,
 			queued: new Map(),
 			scopeOwners: new Map(),
+			stopRequests: 0,
 		};
 		this.#live.set(live.metadata.id, live);
 		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
@@ -2061,6 +2075,8 @@ export class DesktopHost {
 		editEntryId?: string,
 	): Promise<void> {
 		let completeTask = this.#localTaskCompletion(live);
+		// Only a Stop counted after this point interrupts this prompt.
+		const stops = live.stopRequests;
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
 		const settleTerminalView = async () => {
@@ -2082,7 +2098,16 @@ export class DesktopHost {
 		images = input.images;
 		const run: { started?: AttemptRunHandle } = {};
 		const terminals = new Map<string, { reason: string | undefined; assistant: string | undefined }>();
+		// This prompt's own user message is the first one its first accepted run appends.
+		let promptScope: string | undefined;
+		let promptMessage: AgentMessage | undefined;
+		let userTurnObserved = false;
 		const unsubscribe = live.sdk.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "user") {
+				userTurnObserved = true;
+				if (promptMessage === undefined && event.scope && scopeKey(event.scope) === promptScope)
+					promptMessage = event.message;
+			}
 			if (event.type !== "agent_end" || !event.scope) return;
 			const assistant = event.messages.filter(message => message.role === "assistant").at(-1);
 			terminals.set(scopeKey(event.scope), { reason: event.stopReason, assistant: assistant?.stopReason });
@@ -2094,6 +2119,7 @@ export class DesktopHost {
 		} = {
 			onRunAccepted: handle => {
 				run.started = handle;
+				promptScope ??= scopeKey(handle.scope);
 				// Revision admission advances lifecycle generation before starting its turn.
 				if (editEntryId !== undefined) completeTask = this.#localTaskCompletion(live);
 				live.scopeOwners.set(scopeKey(handle.scope), { id, order: 0 });
@@ -2120,6 +2146,19 @@ export class DesktopHost {
 			await live.sdk.waitForIdle();
 		} catch (error) {
 			await settleTerminalView();
+			if (!journalFailed && live.stopRequests !== stops) {
+				// The user stopped this prompt. Once its text is in the transcript that is a
+				// cancellation. If no run ever took it, it definitively did not run: `refused`
+				// is what returns the text to the composer, which `cancelled` would not.
+				if (persistedUserTurn(live.sdk, promptMessage)) {
+					await this.#delivery(id, { disposition: "cancelled" });
+					return;
+				}
+				if (!run.started && !userTurnObserved) {
+					await this.#delivery(id, { disposition: "refused", error: "Prompt stopped before it started" });
+					return;
+				}
+			}
 			await this.#delivery(
 				id,
 				journalFailed
@@ -2140,6 +2179,12 @@ export class DesktopHost {
 		settleView();
 		const owned = run.started ? terminals.get(scopeKey(run.started.scope)) : undefined;
 		if (owned?.assistant === "error" || owned?.assistant === "aborted" || owned?.reason === "cancelled") {
+			// A user Stop whose prompt text is already in the transcript is a cancellation, not
+			// an uncertain outcome. A Host abort (workspace close, session switch) stays unknown.
+			if (owned.assistant !== "error" && live.stopRequests !== stops && persistedUserTurn(live.sdk, promptMessage)) {
+				await this.#delivery(id, { disposition: "cancelled" });
+				return;
+			}
 			await this.#delivery(id, {
 				disposition: owned.assistant === "error" ? "failed" : "unknown",
 				error: owned.assistant === "error" ? "Prompt failed" : "Prompt outcome unknown",
@@ -2632,11 +2677,14 @@ export class DesktopHost {
 				this.#publish(live);
 				return null;
 			}
+			// Count the Stop before releasing anything it interrupts, so their outcomes observe it.
+			live.stopRequests++;
 			this.#cancelQuestions(live);
 			for (const tracked of live.queued.values()) {
 				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			}
-			await live.sdk.abort();
+			// The TUI's Esc cause: this is the user's interrupt, not a Host teardown.
+			await live.sdk.abort({ cause: "user_interrupt" });
 			this.#publish(live);
 			return null;
 		}
@@ -2845,6 +2893,7 @@ export class DesktopHost {
 				live.queuedAdmissionOrder = (live.queuedAdmissionOrder ?? 0) + 1;
 				const admissionOrder = live.queuedAdmissionOrder;
 				const errorEpoch = live.errorEpoch;
+				const stops = live.stopRequests;
 				let accepted = this.#deliveries
 					.list()
 					.some(receipt => receipt.id === request.id && receipt.disposition === "accepted");
@@ -2863,7 +2912,11 @@ export class DesktopHost {
 					},
 				};
 				const terminalEvents = new Map<string, { reason: string | undefined; assistant: string | undefined }>();
+				// User turns appended after this admission. The terminal's attempt scope can name a
+				// different attempt of the same logical run, so the exact text identifies this input.
+				const userTurns: AgentMessage[] = [];
 				const unsubscribeTerminal = live.sdk.subscribe(event => {
+					if (event.type === "message_end" && event.message.role === "user") userTurns.push(event.message);
 					if (event.type !== "agent_end" || !event.scope) return;
 					const assistant = event.messages.filter(message => message.role === "assistant").at(-1);
 					terminalEvents.set(scopeKey(event.scope), {
@@ -2957,6 +3010,14 @@ export class DesktopHost {
 								outcome.disposition === "completed"
 									? terminalEvents.get(scopeKey(outcome.attemptScope))
 									: undefined;
+							// Consumption settles before the input's own message is appended, so a
+							// Stop cancels this input only once that exact text is in the transcript.
+							const stoppedInTranscript =
+								outcome.disposition === "completed" &&
+								live.stopRequests !== stops &&
+								userTurns.some(
+									message => copyableMessageText(message) === text && persistedUserTurn(live.sdk, message),
+								);
 							const disposition =
 								outcome.disposition === "removed"
 									? outcome.reason === "cancelled"
@@ -2970,7 +3031,10 @@ export class DesktopHost {
 												terminal.assistant &&
 												terminal.assistant !== "aborted"
 											? "completed"
-											: "unknown";
+											: (terminal?.assistant === "aborted" || terminal?.reason === "cancelled") &&
+													stoppedInTranscript
+												? "cancelled"
+												: "unknown";
 							await this.#delivery(request.id, {
 								disposition,
 								...(disposition === "failed" ? { error: "Prompt failed" } : {}),

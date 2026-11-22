@@ -573,11 +573,19 @@ for (const result of ["error", "abort", "no-scope", "length"] as const) {
 				frame =>
 					frame.type === "delivery" &&
 					frame.receipt.id === "queued-case" &&
-					["failed", "unknown", "completed"].includes(frame.receipt.disposition),
+					["failed", "unknown", "completed", "cancelled"].includes(frame.receipt.disposition),
 			),
 		);
 		const receipt = (await h.snapshot()).deliveries.find(item => item.id === "queued-case");
-		expect(receipt?.disposition).toBe(result === "error" ? "failed" : result === "length" ? "completed" : "unknown");
+		expect(receipt?.disposition).toBe(
+			result === "error"
+				? "failed"
+				: result === "length"
+					? "completed"
+					: result === "abort"
+						? "cancelled"
+						: "unknown",
+		);
 		const queuedTerminal = h.terminals.filter(event => event.type === "agent_end").at(-1);
 		if (queuedTerminal?.type !== "agent_end" || !queuedTerminal.scope)
 			throw new Error("Missing real queued terminal");
@@ -629,9 +637,14 @@ for (const reason of ["error", "abort"] as const) {
 		const h = await launch();
 		const running = h.call("prompt", { sessionId: h.session.id, text: reason });
 		await h.started();
-		if (reason === "error") h.finish("error");
-		else await h.call("abort", { sessionId: h.session.id });
-		await expect(running).rejects.toThrow(reason === "error" ? "Prompt failed" : "Prompt outcome unknown");
+		if (reason === "error") {
+			h.finish("error");
+			await expect(running).rejects.toThrow("Prompt failed");
+		} else {
+			await h.call("abort", { sessionId: h.session.id });
+			// A user Stop settles the request as a cancellation; it is still not a success.
+			expect(await running).toBeNull();
+		}
 		expect(h.completions()).toEqual([]);
 	});
 }

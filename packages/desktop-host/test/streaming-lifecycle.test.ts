@@ -18,6 +18,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { createSdkRunCapability } from "../../coding-agent/src/sdk/host/sdk-run-capability";
+import { DeliveryJournal } from "../src/delivery-journal";
 import { DesktopHost } from "../src/host";
 import {
 	type DesktopCommandResult,
@@ -332,7 +333,7 @@ describe("desktop streaming lifecycle", () => {
 
 	test("a run reports running, accepts a steer, and abort clears it", async () => {
 		const { call, snapshot, session, sdk, control, frames } = await launch();
-		const running = call("prompt", { sessionId: session.id, text: "long task" });
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-run");
 		await Promise.race([
 			control.started,
 			running.then(() => {
@@ -384,18 +385,87 @@ describe("desktop streaming lifecycle", () => {
 		expect(sdk.getQueuedMessages().followUp).toEqual(["second turn"]);
 		expect((await snapshot()).sessions[0]?.queued ?? []).toHaveLength(1);
 		await call("abort", { sessionId: session.id });
-		await expect(running).rejects.toThrow("Prompt outcome unknown");
+		// A user Stop is a cancellation, not an uncertain outcome: the prompt request settles
+		// normally and its already-persisted text stays in the conversation.
+		expect(await running).toBeNull();
 		expect(control.aborts).toBe(1);
 		expect(sdk.isStreaming).toBe(false);
 		expect(sdk.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 		expect(control.prompts).toHaveLength(1);
-		const aborted = (await snapshot()).sessions[0];
+		const state = await snapshot();
+		const aborted = state.sessions[0];
 		expect(aborted?.status).not.toBe("running");
+		expect(aborted?.status).not.toBe("error");
+		expect(aborted?.error).toBeUndefined();
+		expect(aborted?.errorOwner).toBeUndefined();
 		expect(aborted?.queued ?? []).toHaveLength(0);
-		expect((await snapshot()).deliveries).toContainEqual(
+		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "stopped-run", disposition: "cancelled" }));
+		expect(state.deliveries).toContainEqual(
 			expect.objectContaining({ id: "followup-delivery", disposition: "cancelled" }),
 		);
+		const history = await call<DesktopHistory>("history.get", { sessionId: session.id });
+		expect(history.messages.map(message => message.text)).toContain("long task");
 		expect(frames.some(frame => frame.type === "session" && frame.session.status === "running")).toBe(true);
+	});
+
+	test("a Stop after acceptance but before the transcript append restores the draft", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			if (id === "stopped-before-append" && changes.disposition === "accepted") {
+				held.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const running = call("prompt", { sessionId: session.id, text: "keep this draft" }, "stopped-before-append");
+		// SDK preflight accepted the prompt; its user message is appended only after this write.
+		await held.promise;
+		// The SDK abort joins the in-flight acceptance, so the write is released once Stop reached it.
+		const stopping = call("abort", { sessionId: session.id });
+		await stopReached.promise;
+		release.resolve();
+		await stopping;
+		expect(await running).toBeNull();
+		const state = await snapshot();
+		// The app restores a refused prompt into the composer before finalizing it. A cancelled
+		// receipt is finalized without restoring, which would lose text the transcript never got.
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-before-append", disposition: "refused" }),
+		);
+		expect(control.prompts).toHaveLength(0);
+		expect(sdk.messages.some(message => message.role === "user")).toBe(false);
+		expect(state.sessions[0]?.error).toBeUndefined();
+		expect(state.sessions[0]?.errorOwner).toBeUndefined();
+	});
+
+	test("closing the workspace during a run leaves the prompt outcome unknown", async () => {
+		const { call, snapshot, session, project, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "interrupted by close" }, "closed-run");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		// A Host-initiated abort is not the user's Stop: the app cannot claim a cancellation.
+		await call("project.close", { projectId: project.id });
+		await expect(running).rejects.toThrow("Prompt outcome unknown");
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({ id: "closed-run", disposition: "unknown" }),
+		);
 	});
 
 	test("invalid prompt reports a definitive refusal before admission", async () => {
@@ -514,9 +584,9 @@ describe("desktop streaming lifecycle", () => {
 			expect(control.prompts.length).toBe(2);
 			if (result === "abort") await call("abort", { sessionId: session.id });
 			else control.finishTurn("second completed", result === "error");
-			if (result === "success") await running;
-			else await expect(running).rejects.toThrow(result === "error" ? "Prompt failed" : "Prompt outcome unknown");
-			const expected = result === "success" ? "completed" : result === "error" ? "failed" : "unknown";
+			if (result === "error") await expect(running).rejects.toThrow("Prompt failed");
+			else await running;
+			const expected = result === "success" ? "completed" : result === "error" ? "failed" : "cancelled";
 			let state = await snapshot();
 			for (
 				let i = 0;
