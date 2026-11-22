@@ -399,7 +399,14 @@ interface Catalog {
 }
 /** The store refused a write because another process (the terminal) changed the transcript first. */
 const STALE_TRANSCRIPT =
-	"This conversation was changed in another window, such as the terminal, after the app opened it. The app reloaded it with the latest messages. Try again.";
+	"This conversation was changed in another window, such as the terminal, after the app opened it.";
+/** What became of the stale copy once the refused operation ended; the message names only that. */
+type StaleReplacement = "reloaded" | "deferred" | "failed";
+const STALE_OUTCOME: Record<StaleReplacement, string> = {
+	reloaded: `${STALE_TRANSCRIPT} The app reloaded it with the latest messages. Try again.`,
+	deferred: `${STALE_TRANSCRIPT} The app will reload it with the latest messages once the work still running in it finishes. Then try again.`,
+	failed: `${STALE_TRANSCRIPT} The app could not reload it. Select the conversation again to retry.`,
+};
 /** Released identities kept; the oldest are dropped first. */
 const RELEASED_LIMIT = 1_000;
 interface TrackedQueuedInput {
@@ -2450,12 +2457,15 @@ export class DesktopHost {
 			? { ready: ready.promise, settle: () => ready.resolve() }
 			: undefined;
 		live.exclusiveViewHandoff = viewHandoff;
+		// Set when the store refused this operation's write. Its wording waits for the replacement below.
+		let staleError: Error | undefined;
 		try {
 			if (retireGates) await live.gatePresenter?.withdrawAll();
 			return await operation(() => viewHandoff?.settle());
 		} catch (caught) {
 			// Any write this operation made may meet the store's refusal; say it plainly, once.
-			const error = isEmbeddedAppendRefused(live.sdk) ? new Error(STALE_TRANSCRIPT) : caught;
+			if (isEmbeddedAppendRefused(live.sdk)) staleError = new Error(STALE_TRANSCRIPT);
+			const error = staleError ?? caught;
 			if (
 				recordFailure &&
 				!live.errorOwner &&
@@ -2483,17 +2493,48 @@ export class DesktopHost {
 				if (this.#live.get(live.metadata.id) === live) this.#publish(live);
 				// The refusal lasts for this copy's lifetime. Replace it now, so the user sees the
 				// other surface's turns instead of a conversation that fails every write.
-				if (isEmbeddedAppendRefused(live.sdk)) await this.#replaceStale(live);
+				if (isEmbeddedAppendRefused(live.sdk)) {
+					const replacement = await this.#replaceStale(live);
+					// The request's error tells only what actually happened to the conversation.
+					if (staleError) {
+						staleError.message = STALE_OUTCOME[replacement];
+						if (live.errorOwner && live.error === STALE_TRANSCRIPT) live.error = staleError.message;
+					}
+				}
 			}
 		}
 	}
 	/** Replaces a live copy the store refused, once no work remains on it. */
-	async #replaceStale(live: LiveSession): Promise<void> {
-		if (this.#closed || !this.#catalog.sessions.includes(live.metadata) || !this.#reloadable(live)) return;
+	async #replaceStale(live: LiveSession): Promise<StaleReplacement> {
+		const id = live.metadata.id;
+		if (this.#closed || !this.#catalog.sessions.includes(live.metadata)) return "deferred";
+		// A concurrent request already retired this copy; its reopen decides the outcome.
+		if (this.#live.get(id) !== live) {
+			const opening = this.#opening.get(id);
+			if (!opening) return this.#live.has(id) ? "reloaded" : "failed";
+			return opening.then(
+				() => "reloaded" as const,
+				() => "failed" as const,
+			);
+		}
+		// Queued input can never be written by a refused copy. Hand back what no run has taken yet:
+		// `refused` returns its text to the composer, and the copy no longer waits on it.
+		for (const tracked of [...live.queued.values()]) {
+			if (!tracked.submission.cancel()) continue;
+			live.queued.delete(tracked.dto.id);
+			await this.#delivery(tracked.deliveryId, { disposition: "refused", error: STALE_TRANSCRIPT });
+		}
+		// Input a run already took, a gate or extension startup still needs this copy. The next
+		// select or prompt after that work settles reloads it (see #refreshIfMoved).
+		if (!this.#reloadable(live)) return "deferred";
 		try {
 			this.#publish(await this.#reload(live));
+			return "reloaded";
 		} catch (error) {
 			console.error(`Desktop could not reopen a conversation changed elsewhere: ${String(error)}`);
+			// The row is no longer live; publish it so the app stops offering the retired copy.
+			this.#publishSnapshot();
+			return "failed";
 		}
 	}
 	/** Nothing a reload could interrupt or lose: no run, queued input, question, gate or startup. */

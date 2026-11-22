@@ -676,6 +676,81 @@ test("a running turn is never reloaded under it; the stale copy is replaced once
 	await h.close();
 });
 
+test("a refused write whose reload cannot reopen says so, and selecting again retries", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	await continueInTerminal(stale.sessionFile!, h.projectDir, h.agentDir, h.track);
+	const read = sdk.readEmbeddedTranscriptTail;
+	const unmoved = vi.spyOn(sdk, "readEmbeddedTranscriptTail").mockImplementation(async session => {
+		const tail = await read(session);
+		return tail && { committed: tail.held, held: tail.held };
+	});
+	const reopen = vi.spyOn(sdk, "createEmbeddedAgentSession").mockRejectedValueOnce(new Error("reopen refused"));
+	let message = "";
+	try {
+		await h.call("prompt", { sessionId, text: "stale write" }).catch((error: Error) => {
+			message = error.message;
+		});
+	} finally {
+		unmoved.mockRestore();
+		reopen.mockRestore();
+	}
+	expect(message).toContain("changed in another window");
+	expect(message).toContain("could not reload it");
+	expect(message).not.toContain("reloaded it");
+	// The receipt never claims a reload either; it only says why the text came back.
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	expect(h.snapshot().deliveries.at(-1)?.error).not.toContain("reload");
+	await h.call("session.select", { sessionId });
+	expect(h.sdk()).not.toBe(stale);
+	expect(h.snapshot().sessions[0]?.messages.map(message => message.text)).toEqual([...sideBySide]);
+	await h.close();
+});
+
+test("a refused write hands back queued input it can never send, then reloads", async () => {
+	let hold = false;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const h = await controlledFixture(async () => {
+		if (!hold) return;
+		hold = false;
+		entered.resolve();
+		await release.promise;
+	});
+	cleanups.push(async () => release.resolve());
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	hold = true;
+	const running = h.call("prompt", { sessionId, text: "held turn" });
+	void running.catch(() => {});
+	await entered.promise;
+	const live = h.sdk();
+	await continueInTerminal(live.sessionFile!, h.projectDir, h.agentDir, h.track);
+	await h.call("prompt", { sessionId, text: "queued behind", deliverAs: "followUp" });
+	const queued = h.snapshot().deliveries.at(-1)!;
+	expect(queued.disposition).toBe("queued");
+	release.resolve();
+	let message = "";
+	await running.catch((error: Error) => {
+		message = error.message;
+	});
+	expect(message).toContain("changed in another window");
+	expect(message).toContain("reloaded it");
+	// The refused copy could never write the queued message; `refused` returns it to the composer.
+	expect(h.snapshot().deliveries.find(receipt => receipt.id === queued.id)?.disposition).toBe("refused");
+	expect(h.sdk()).not.toBe(live);
+	expect(h.snapshot().sessions[0]?.queued).toBeUndefined();
+	expect(
+		h
+			.snapshot()
+			.sessions[0]?.messages.map(message => message.text)
+			.slice(-2),
+	).toEqual(["continued in the terminal", "answered in the terminal"]);
+	await h.close();
+});
+
 test("a new conversation is stored where the terminal reads it, not in a private directory", async () => {
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
