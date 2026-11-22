@@ -1714,8 +1714,10 @@ export default function App() {
 		};
 	};
 	/** Connect, or re-check whether another process still has the conversation open. */
+	// Its own scope, like Stop's: a prompt in flight holds the conversation's scope for the whole turn.
+	const connectionScope = (sessionId: string) => `connection:${sessionId}`;
 	const connectSession = (sessionId: string) =>
-		void run(sessionId, async () => {
+		void run(connectionScope(sessionId), async () => {
 			const connected = await request<DesktopSession>("session.connect", { sessionId });
 			// A check that finds the other process still there is an answer; say it, so the click shows.
 			if (selectedRef.current !== sessionId) return;
@@ -1723,7 +1725,7 @@ export default function App() {
 		});
 	/** Without `confirm` the Host refuses to stop work and says what Disconnect would stop. */
 	const disconnectSession = (sessionId: string, confirm = false) =>
-		void run(sessionId, async () => {
+		void run(connectionScope(sessionId), async () => {
 			const result = await request<DesktopDisconnectResult>("session.disconnect", {
 				sessionId,
 				...(confirm ? { confirm: true } : {}),
@@ -2967,6 +2969,7 @@ export default function App() {
 										`abort:${selected}`,
 										`queue:${selected}`,
 										`enqueue:${selected}`,
+										connectionScope(selected),
 									].map(scope =>
 										scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 									)}
@@ -3014,7 +3017,7 @@ export default function App() {
 									{!writable && session.connection && session.connection.state !== "connected" ? (
 										<SessionConnectionNotice
 											state={session.connection.state}
-											pending={!connected || !!pending[session.id]}
+											pending={!connected || !!pending[connectionScope(session.id)]}
 											onConnect={() => connectSession(session.id)}
 										/>
 									) : (
@@ -3230,7 +3233,7 @@ export default function App() {
 					}
 					onClose={closeDialog}
 				>
-					{[settingsScope, "goal", selected].map(scope =>
+					{[settingsScope, "goal", selected, connectionScope(selected)].map(scope =>
 						scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 					)}
 					{notice && <p role="status">{notice}</p>}
@@ -3238,7 +3241,7 @@ export default function App() {
 						<nav className="command-list" aria-label={t("shell.conversationActions")}>
 							{session?.connection && (
 								<Button
-									disabled={!connected || !!pending[selected]}
+									disabled={!connected || !!pending[connectionScope(selected)]}
 									onClick={() => {
 										if (writable) disconnectSession(selected);
 										else {
@@ -3669,7 +3672,7 @@ export default function App() {
 						<DisconnectConfirmation
 							running={disconnectAsk.running}
 							queued={disconnectAsk.queued}
-							pending={!connected || !!pending[dialogOwner]}
+							pending={!connected || !!pending[connectionScope(dialogOwner)]}
 							onCancel={closeDialog}
 							onConfirm={() => disconnectSession(dialogOwner, true)}
 						/>

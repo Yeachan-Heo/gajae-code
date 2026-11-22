@@ -171,7 +171,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			}
 			return tx;
 		};
-		const session = (id: string, title: string): DesktopSession => ({ id, title, projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] });
+		const session = (id: string, title: string): DesktopSession => ({ id, title, projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [], connection: { state: "connected" } });
 		const stored = (): FixtureState => JSON.parse(sessionStorage.getItem("fixture") || '{"receipts":[],"requests":[]}') as FixtureState;
 		const save = (value: FixtureState) => sessionStorage.setItem("fixture", JSON.stringify(value));
 		const emit = (frame: DesktopFrame) => {
@@ -245,6 +245,16 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					}),
 				};
 				if (request.method === "models.list") result = models;
+				// Like the Host: without confirmation, a conversation with a prompt in flight is left alone.
+				if (request.method === "session.disconnect") {
+					const sessionId = String(request.params.sessionId);
+					if (request.params.confirm !== true) result = { disconnected: false, confirm: { running: true, queued: 0 } };
+					else {
+						const released: DesktopSession = { ...session(sessionId, sessionId === "a" ? "Session A" : "Session B"), controlGeneration: null, connection: { state: "disconnected" } };
+						emit({ type: "session", session: released });
+						result = { disconnected: true, session: released };
+					}
+				}
 				if (request.method === "diff.get") result = diffs;
 				if (request.method === "session.create") {
 					const created = session("created", "New conversation");
@@ -3681,6 +3691,21 @@ suite("mounted composer delivery recovery", () => {
 				return entries.length === 0;
 			});
 			expect(await page.evaluate(() => document.body.textContent?.includes("the outcome is unknown"))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("Disconnect stays available while a sent prompt is still in flight", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); await send(page, "held while disconnecting");
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector('dialog[open] [aria-label="Conversation actions"]');
+			expect(await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.trim() === "Disconnect from app")?.disabled)).toBe(false);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.trim() === "Disconnect from app")?.click());
+			await page.waitForSelector(".disconnect-confirmation");
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".disconnect-confirmation button")].find(button => button.textContent === "Stop and disconnect")?.click());
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "session.disconnect" && r.params.confirm === true));
+			await page.waitForSelector(".connection-notice");
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
