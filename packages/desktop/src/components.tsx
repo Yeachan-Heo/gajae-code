@@ -810,7 +810,9 @@ export function Modal({
 		const rect = dialog.getBoundingClientRect();
 		return x < rect.left || x > rect.right || y < rect.top || y > rect.bottom;
 	};
-	useEffect(() => {
+	// A layout effect, so the dialog is open before any descendant's own effects run: content that
+	// moves focus on mount (a pending sign-in answer) keeps it instead of losing it to `showModal()`.
+	useLayoutEffect(() => {
 		const previous = document.activeElement;
 		const dialog = ref.current;
 		dialog?.showModal();

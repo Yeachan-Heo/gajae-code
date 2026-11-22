@@ -193,6 +193,39 @@ suite("Providers dialog in the mounted app", () => {
 		}
 	}, 30000);
 
+	test("an answer the sign-in waits on takes focus, whether it was pending at opening or arrives while open", async () => {
+		const { context, page } = await fixture();
+		const activeType = () => page.evaluate(() => (document.activeElement as HTMLInputElement | null)?.type);
+		try {
+			await emitAuth(page, {
+				id: FLOW,
+				provider: GEMINI,
+				status: "waiting",
+				prompt: { id: "00000000-0000-4000-8000-0000000000c3", message: "Paste the fixture code" },
+			});
+			await openFromModelPicker(page);
+			await page.waitForSelector("dialog.providers-dialog .provider-prompt input");
+			expect(await activeType()).toBe("password");
+			await emitAuth(page, { id: FLOW, provider: GEMINI, status: "cancelled" });
+			await waitDialogText(page, "Sign-in cancelled");
+			// A sign-in started in the open dialog whose provider then asks for an answer.
+			await clickInDialog(page, "Try again");
+			await waitDialogText(page, "Signing in to Google Cloud Code Assist (Gemini CLI)");
+			const running = await page.evaluate(() => window.navigationFixture.authState());
+			if (!running) throw new Error("Expected the running sign-in");
+			await emitAuth(page, {
+				...running,
+				status: "waiting",
+				prompt: { id: "00000000-0000-4000-8000-0000000000c4", message: "Paste the second fixture code" },
+			});
+			await waitDialogText(page, "Paste the second fixture code");
+			expect(await activeType()).toBe("password");
+			expect(await page.evaluate(() => document.activeElement?.closest("dialog.providers-dialog") !== null)).toBe(true);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("a flow that finished before opening is history; closing never cancels a running sign-in and reopening resumes it", async () => {
 		const { context, page } = await fixture();
 		try {

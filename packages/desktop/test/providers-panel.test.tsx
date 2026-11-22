@@ -395,6 +395,48 @@ suite("Providers panel interactions", () => {
 		}
 	}, 30000);
 
+	test("a dialog that opens on a pending answer or warning focuses it, not the dialog's Close button", async () => {
+		const { context, page } = await fixture(1000, { dialog: true, closed: true });
+		try {
+			const prompt = { id: "00000000-0000-4000-8000-0000000000b1", message: "Enter the code" };
+			await set(page, { flow: flow({ status: "waiting", prompt }) });
+			await select(page, "beta");
+			await page.click("#opener");
+			await page.waitForSelector("dialog[open] .provider-prompt input");
+			expect(await focused(page)).toBe("input:password");
+			await page.keyboard.press("Escape");
+			await page.waitForSelector("#opener");
+			const warning = { id: "00000000-0000-4000-8000-0000000000a1", message: "Fixture risk notice" };
+			await set(page, { flow: flow({ status: "waiting", warning }) });
+			await page.click("#opener");
+			await page.waitForSelector("dialog[open] .provider-warning");
+			expect(await focused(page)).toBe("h5:Notice from Beta");
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a prompt that arrives while the dialog is open takes focus from the list and from an earlier prompt", async () => {
+		const { context, page } = await fixture(1000, { dialog: true });
+		try {
+			await page.focus(".model-search input");
+			await set(page, {
+				flow: flow({ status: "waiting", prompt: { id: "00000000-0000-4000-8000-0000000000b1", message: "First" } }),
+			});
+			await select(page, "beta");
+			await page.waitForSelector("dialog[open] .provider-prompt input");
+			expect(await focused(page)).toBe("input:password");
+			await page.focus(".provider-back");
+			await set(page, {
+				flow: flow({ status: "waiting", prompt: { id: "00000000-0000-4000-8000-0000000000b2", message: "Second" } }),
+			});
+			await waitText(page, "Second");
+			expect(await focused(page)).toBe("input:password");
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("opens only an HTTPS sign-in page and shows a device code as its own block", async () => {
 		const { context, page } = await fixture();
 		try {
