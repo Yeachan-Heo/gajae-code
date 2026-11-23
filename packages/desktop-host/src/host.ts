@@ -4631,7 +4631,6 @@ export class DesktopHost {
 		return next;
 	}
 
-	/** Read-only SDK inventory: no recovery, transcript copies, or eager live sessions. */
 	/**
 	 * A listed transcript's path relative to the shared store's root, or undefined when it lies
 	 * outside it (a project-local `.gjc` transcript) or cannot be resolved. Only a transcript
@@ -4644,6 +4643,7 @@ export class DesktopHost {
 		return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : undefined;
 	}
 	/**
+	 * Read-only SDK inventory: no recovery, transcript copies, or eager live sessions.
 	 * A conversation another surface (the terminal) created is an ordinary shared-store row, the
 	 * same kind the app creates: listing it grants nothing, and opening it takes the same path,
 	 * owner check included. `placed` are rows an earlier build saved without a transcript path
