@@ -977,5 +977,33 @@ describe("unified diff scrubber", () => {
 			expect(scrubbed).toContain("shared-data");
 			expect(scrubbed).toContain("final-line");
 		});
+
+		it("[REGRESSION] credential opened on new side of hunk 1 and continued in hunk 2", () => {
+			// Issue: When a credential opens on the NEW side of hunk 1 (but not on old side),
+			// and continues into hunk 2, the continuation should be redacted.
+			// This tests that NEW-side bracket state is carried forward across hunks.
+			const diff = [
+				...HEADER,
+				"@@ -1,2 +1,2 @@ ",
+				"-simple_key: value", // old side: no bracket
+				"+secret_config: [", // new side: opens bracket
+				" context",
+				"@@ -40,2 +40,2 @@ ",
+				'-  "old-side-plain"',
+				'+  "hunk-two-new-canary"]', // new side: credential continuation and close
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// The continuation on the new side should be redacted
+			expect(scrubbed).not.toContain("hunk-two-new-canary");
+
+			// Context line should be preserved
+			expect(scrubbed).toContain(" context");
+
+			// Line count preserved
+			expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+		});
 	});
 });

@@ -741,6 +741,7 @@ function redactAccumulatedContentWithState(
 	let oldBracketDepth = inputState.bracketDepth;
 	const oldBracketStack: string[] = [...inputState.bracketStack];
 	let newBracketDepth = inputState.bracketDepth;
+	const newBracketStack: string[] = [...inputState.bracketStack];
 
 	// Helper to check if a line looks like it's part of a data structure (JSON/YAML key-value pairs)
 	// vs. plain text comment or label. Lines with quotes or colons are likely structure data.
@@ -827,11 +828,7 @@ function redactAccumulatedContentWithState(
 
 				// Also update bracket depth for new-side projection (tracked separately, not carried forward)
 				for (const char of originalContent) {
-					if (char === "[" || char === "{") {
-						newBracketDepth += 1;
-					} else if ((char === "]" || char === "}") && newBracketDepth > 0) {
-						newBracketDepth -= 1;
-					}
+					newBracketDepth = updateBracketStack(newBracketStack, char, newBracketDepth);
 				}
 			}
 		}
@@ -865,21 +862,17 @@ function redactAccumulatedContentWithState(
 
 				// Update bracket depth for next line (new side only, not carried forward)
 				for (const char of originalContent) {
-					if (char === "[" || char === "{") {
-						newBracketDepth += 1;
-					} else if ((char === "]" || char === "}") && newBracketDepth > 0) {
-						newBracketDepth -= 1;
-					}
+					newBracketDepth = updateBracketStack(newBracketStack, char, newBracketDepth);
 				}
 			}
 		}
 	}
 
-	// Update output state based on final old-side bracket depth and stack
-	// (the old side's state carries forward to the next hunk)
-	outputState.bracketStack = oldBracketStack;
-	outputState.bracketDepth = oldBracketDepth;
-	if (oldBracketDepth > 0) {
+	// Update output state based on final new-side bracket depth and stack
+	// (the new side's state carries forward to the next hunk since new side = final file state)
+	outputState.bracketStack = newBracketStack;
+	outputState.bracketDepth = newBracketDepth;
+	if (newBracketDepth > 0) {
 		outputState.inCredentialValue = true;
 	} else {
 		outputState.inCredentialValue = false;
