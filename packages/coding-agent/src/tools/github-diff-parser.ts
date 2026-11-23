@@ -622,19 +622,6 @@ function redactAccumulatedContentWithState(
 	// Since projections can be asymmetric (old side opens container, new side doesn't),
 	// we track the old-side state which carries forward to the next hunk.
 	const outputState: HunkState = { ...inputState };
-	let oldBracketDepth = inputState.bracketDepth; // Track bracket depth as we process old-side lines
-	const oldBracketStack: string[] = [...inputState.bracketStack]; // Track bracket stack independently for old side
-	let newBracketDepth = inputState.bracketDepth; // Also track new-side separately for asymmetric containers
-
-	// Helper to check if a line looks like it's part of a data structure (JSON/YAML key-value pairs)
-	// vs. plain text comment or label. Lines with quotes or colons are likely structure data.
-	const looksLikeStructureData = (content: string): boolean => {
-		// Check if line starts with a quote (JSON string) or looks like a JSON key
-		if (/^\s*["']/.test(content)) return true;
-		// Check if line contains a colon followed by whitespace or bracket (YAML/JSON key-value)
-		if (/:(?:\s|$|\{|\[)/.test(content)) return true;
-		return false;
-	};
 
 	// Helper to update bracket stack based on a character
 	const updateBracketStack = (stack: string[], char: string, depth: number): number => {
@@ -651,6 +638,120 @@ function redactAccumulatedContentWithState(
 		return depth;
 	};
 
+	// Pre-calculate bracket depths for both projections independently
+	// OLD PROJECTION: based on context + deleted lines only
+	// NEW PROJECTION: based on context + added lines only
+	// This ensures deleted lines don't contaminate new projection state calculations
+	const depthAtStartOfLine: Array<{ oldDepth: number; newDepth: number }> = [];
+
+	// Build state for OLD projection (context + deleted lines)
+	const oldProjectionStateAtLine: number[] = [];
+	let oldProjDepth = inputState.bracketDepth;
+	const oldProjStack: string[] = [...inputState.bracketStack];
+
+	for (let i = 0; i < lineInfos.length; i += 1) {
+		const originalInfo = lineInfos[i];
+		const prefix = originalInfo.prefix;
+
+		oldProjectionStateAtLine.push(oldProjDepth);
+
+		if (prefix === " " || prefix === "-") {
+			if (prefix === " ") {
+				const oldIdx = oldProjectionIndices.indexOf(i);
+				if (oldIdx >= 0) {
+					const originalContent = oldProjectionLines[oldIdx];
+					for (const char of originalContent) {
+						oldProjDepth = updateBracketStack(oldProjStack, char, oldProjDepth);
+					}
+				}
+			} else if (prefix === "-") {
+				const oldIdx = oldProjectionIndices.indexOf(i);
+				if (oldIdx >= 0) {
+					const originalContent = oldProjectionLines[oldIdx];
+					for (const char of originalContent) {
+						oldProjDepth = updateBracketStack(oldProjStack, char, oldProjDepth);
+					}
+				}
+			}
+		}
+	}
+
+	// Build state for NEW projection (context + added lines)
+	const newProjectionStateAtLine: number[] = [];
+	let newProjDepth = inputState.bracketDepth;
+	const newProjStack: string[] = [...inputState.bracketStack];
+
+	for (let i = 0; i < lineInfos.length; i += 1) {
+		const originalInfo = lineInfos[i];
+		const prefix = originalInfo.prefix;
+
+		newProjectionStateAtLine.push(newProjDepth);
+
+		if (prefix === " " || prefix === "+") {
+			if (prefix === " ") {
+				const newIdx = newProjectionIndices.indexOf(i);
+				if (newIdx >= 0) {
+					const originalContent = newProjectionLines[newIdx];
+					for (const char of originalContent) {
+						if (char === "[" || char === "{") {
+							newProjStack.push(char);
+							newProjDepth += 1;
+						} else if ((char === "]" || char === "}") && newProjStack.length > 0) {
+							if (
+								(char === "]" && newProjStack[newProjStack.length - 1] === "[") ||
+								(char === "}" && newProjStack[newProjStack.length - 1] === "{")
+							) {
+								newProjStack.pop();
+								newProjDepth = Math.max(0, newProjDepth - 1);
+							}
+						}
+					}
+				}
+			} else if (prefix === "+") {
+				const newIdx = newProjectionIndices.indexOf(i);
+				if (newIdx >= 0) {
+					const originalContent = newProjectionLines[newIdx];
+					for (const char of originalContent) {
+						if (char === "[" || char === "{") {
+							newProjStack.push(char);
+							newProjDepth += 1;
+						} else if ((char === "]" || char === "}") && newProjStack.length > 0) {
+							if (
+								(char === "]" && newProjStack[newProjStack.length - 1] === "[") ||
+								(char === "}" && newProjStack[newProjStack.length - 1] === "{")
+							) {
+								newProjStack.pop();
+								newProjDepth = Math.max(0, newProjDepth - 1);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Now create depthAtStartOfLine combining both projections
+	for (let i = 0; i < lineInfos.length; i += 1) {
+		depthAtStartOfLine.push({
+			oldDepth: oldProjectionStateAtLine[i],
+			newDepth: newProjectionStateAtLine[i],
+		});
+	}
+
+	let oldBracketDepth = inputState.bracketDepth;
+	const oldBracketStack: string[] = [...inputState.bracketStack];
+	let newBracketDepth = inputState.bracketDepth;
+
+	// Helper to check if a line looks like it's part of a data structure (JSON/YAML key-value pairs)
+	// vs. plain text comment or label. Lines with quotes or colons are likely structure data.
+	const looksLikeStructureData = (content: string): boolean => {
+		// Check if line starts with a quote (JSON string) or looks like a JSON key
+		if (/^\s*["']/.test(content)) return true;
+		// Check if line contains a colon followed by whitespace or bracket (YAML/JSON key-value)
+		if (/:(?:\s|$|\{|\[)/.test(content)) return true;
+		return false;
+	};
+
 	// Also redact lines that are inside incomplete containers
 	// (containers opened in previous hunks or opened in this hunk but not closed)
 	// We track bracket depth and stack separately for each projection since they can be asymmetric
@@ -659,6 +760,9 @@ function redactAccumulatedContentWithState(
 		const info = result[i]; // The corresponding redacted line info
 		const originalInfo = lineInfos[i];
 		const prefix = originalInfo.prefix;
+
+		// Use the bracket depth at the START of this line (pre-calculated)
+		const startDepths = depthAtStartOfLine[i] || { oldDepth: 0, newDepth: 0 };
 
 		// Handle deleted lines only (old-side projection)
 		// Context lines are shared and have already been processed by redactCrashSecretsPreservingLines.
@@ -673,9 +777,14 @@ function redactAccumulatedContentWithState(
 				// Don't redact purely structural lines - they're important for preserving format
 				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 
-				// If we're inside a container at the start of this line, redact it
+				// If we're inside a container at the START of this line, redact it
 				// But skip purely structural lines
-				if (oldBracketDepth > 0 && info.content !== "" && !isOnlyStructure && !info.content.includes("«redacted")) {
+				if (
+					startDepths.oldDepth > 0 &&
+					info.content !== "" &&
+					!isOnlyStructure &&
+					!info.content.includes("«redacted")
+				) {
 					info.content = "«redacted»";
 				}
 
@@ -696,10 +805,10 @@ function redactAccumulatedContentWithState(
 				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 				const isStructureData = looksLikeStructureData(info.content);
 
-				// Redact if inside container AND (looks like structure data OR doesn't look like plain text)
+				// Redact if inside container at START of line AND (looks like structure data OR doesn't look like plain text)
 				// BUT preserve lines that are only whitespace and structure, or plain text words
 				if (
-					oldBracketDepth > 0 &&
+					startDepths.oldDepth > 0 &&
 					info.content !== "" &&
 					!isOnlyStructure &&
 					isStructureData &&
@@ -742,11 +851,11 @@ function redactAccumulatedContentWithState(
 				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 
 				// Redact if:
-				// 1. We're inside a container on the new side, OR
-				// 2. We're in an asymmetric container (old side deeper than new side)
+				// 1. We're inside a container on the new side AT START OF LINE, OR
+				// 2. We're in an asymmetric container (old side deeper than new side AT START OF LINE)
 				// But skip purely structural lines
 				if (
-					(newBracketDepth > 0 || oldBracketDepth > newBracketDepth) &&
+					(startDepths.newDepth > 0 || startDepths.oldDepth > startDepths.newDepth) &&
 					info.content !== "" &&
 					!isOnlyStructure &&
 					!info.content.includes("«redacted")
