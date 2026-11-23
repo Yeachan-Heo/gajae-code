@@ -1,0 +1,3 @@
+### Fixed
+
+- Keep a live native-build temporary file, and keep the existing index when a rename fails for a reason other than a Windows file-in-use error. A missing or regular `index.js` or `index.d.ts` is written in place without a temporary file or rename: an existing file keeps its inode, mode, owner, and ACL, and a missing one is created with mode 0644 (subject to umask). Temp and rename are used only for a symlink or another non-regular destination. An existing index is truncated only after the opened file is confirmed to be the one that was checked. A symlinked `index.js` or declaration is not read, so a linked private file is never copied into a new index.
