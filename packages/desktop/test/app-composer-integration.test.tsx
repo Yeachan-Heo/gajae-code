@@ -2989,6 +2989,22 @@ suite("mounted composer delivery recovery", () => {
 			messages: [],
 			connection: { state },
 		});
+		// `send` returns the latest prompt request, which can still be the previous one while the new
+		// one is being journaled. Wait for the request that carries this text.
+		const sendText = async (text: string) => {
+			await send(page, text);
+			await page.waitForFunction(
+				text => window.fixture.requests().some(request => request.method === "prompt" && request.params.text === text),
+				{ timeout: 15_000 },
+				text,
+			);
+			const request = await page.evaluate(
+				text => window.fixture.requests().find(request => request.method === "prompt" && request.params.text === text),
+				text,
+			);
+			if (!request) throw new Error(`No prompt request carries "${text}"`);
+			return request;
+		};
 		const banners = () =>
 			page.$$eval(".conversation-column .error-banner", nodes => nodes.map(node => node.textContent ?? ""));
 		try {
@@ -3004,7 +3020,7 @@ suite("mounted composer delivery recovery", () => {
 				},
 			];
 			for (const { state, error } of cases) {
-				const request = await send(page, `refused while ${state}`);
+				const request = await sendText(`refused while ${state}`);
 				// The Host steps aside (or finds it released) and answers the prompt as a typed refusal.
 				await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation(state));
 				await page.evaluate(
@@ -3024,9 +3040,10 @@ suite("mounted composer delivery recovery", () => {
 				expect({ state, banners: await banners() }).toEqual({ state, banners: [] });
 				// "Check again" (or Connect) takes the conversation back: the draft is back, still no banner.
 				await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation("connected"));
+				// The draft comes back through delivery recovery, which can be slow on a loaded machine.
 				await page.waitForFunction(
 					text => (document.querySelector(".composer textarea") as HTMLTextAreaElement | null)?.value === text,
-					{},
+					{ timeout: 15_000 },
 					`refused while ${state}`,
 				);
 				expect({ state, banners: await banners() }).toEqual({ state, banners: [] });
@@ -3039,7 +3056,7 @@ suite("mounted composer delivery recovery", () => {
 			}
 			// "Being disconnected" is not a connection state the notice shows, so it is a banner, until the
 			// conversation's connection changes.
-			const request = await send(page, "refused while disconnecting");
+			const request = await sendText("refused while disconnecting");
 			const disconnecting = "This conversation is being disconnected from the app, so nothing new can start in it. Connect it again to continue here.";
 			await page.evaluate(
 				({ id, error }) =>
@@ -3064,7 +3081,7 @@ suite("mounted composer delivery recovery", () => {
 		} finally {
 			await closeFixture(context, page);
 		}
-	}, 30000);
+	}, 60000);
 
 	test("a conversation the app cannot open replaces the composer with Remove, whose dialog keeps the transcript", async () => {
 		const { context, page } = await fixture();
