@@ -238,6 +238,38 @@ describe("desktop canonical model availability", () => {
 		expect(sdk.model).toBeUndefined();
 	});
 
+	test("preferences read after a catalog refresh in flight lands", async () => {
+		const { call, first, sessions } = await launch();
+		const sdk = sessions[0]!;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let refreshed = false;
+		vi.spyOn(sdk.modelRegistry, "refresh").mockImplementation(async function (
+			this: ModelRegistry,
+			_strategy,
+			sessionId,
+		) {
+			if (this === sdk.modelRegistry) {
+				entered.resolve();
+				await release.promise;
+				refreshed = true;
+				return;
+			}
+			await originalRefresh.call(this, "offline", sessionId);
+		});
+		const listing = call("models.list", { sessionId: first.id, refresh: true });
+		await entered.promise;
+		let readAt: boolean | undefined;
+		const reading = call("preferences.get", { sessionId: first.id }).then(() => {
+			readAt = refreshed;
+		});
+		await Bun.sleep(50);
+		expect(readAt).toBeUndefined();
+		release.resolve();
+		await Promise.all([listing, reading]);
+		expect(readAt).toBe(true);
+	});
+
 	test("a delayed catalog refresh cannot publish models for a deleted session", async () => {
 		const { call, first, sessions } = await launch();
 		const sdk = sessions[0]!;

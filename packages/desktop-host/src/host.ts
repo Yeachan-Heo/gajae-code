@@ -4012,7 +4012,12 @@ export class DesktopHost {
 				throw new Error("Invalid MCP parameters");
 			return this.#exclusive(live, () => live.mcp.operate(params.ref, params.action));
 		}
-		if (method === "preferences.get") return live.preferences.read();
+		if (method === "preferences.get") {
+			// Availability depends on the catalog, so read it after a refresh in flight lands, as
+			// `models.list` does.
+			await this.#catalogRefreshTail;
+			return live.preferences.read();
+		}
 		if (method === "preferences.apply") {
 			let outcome: SdkPreferenceOutcome | undefined;
 			let preferenceError: DesktopPreferenceError | undefined;
