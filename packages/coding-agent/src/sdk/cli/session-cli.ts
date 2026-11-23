@@ -2548,6 +2548,8 @@ export async function runSdkSessionCli(
 			const input = await inputFromArgs(args);
 			if (input.sessionId !== undefined && input.sessionId !== sessionId)
 				throw new SdkSessionCliError("invalid_input", "Close sessionId does not match the selected session.", 2);
+			if (args.ifIdle && Object.hasOwn(input, "ifIdle") && input.ifIdle !== true)
+				throw new SdkSessionCliError("invalid_input", "--if-idle conflicts with the JSON input ifIdle value.", 2);
 			const secretError = validateAdapterSecretFields("session.close", input);
 			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 			const lifecycle = deps.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);

@@ -5168,6 +5168,8 @@ export class AgentSession {
 			this.#handoffTransitionActive ||
 			this.#cancelAndSubmitInProgress ||
 			this.#sessionWorkLease.isHeld() ||
+			// A detached recap still holds an open provider request until its handle clears.
+			this.#recapController !== undefined ||
 			(manager?.getRunningJobs(ownerFilter).length ?? 0) > 0
 		) {
 			throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });

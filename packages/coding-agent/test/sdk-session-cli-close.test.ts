@@ -166,6 +166,23 @@ test("close --if-idle is public grammar and forwards the fence with a distinct s
 		});
 });
 
+test("close --if-idle rejects a json input that disables the fence before any broker contact", async () => {
+	for (const jsonInput of ['{"ifIdle":false}', '{"ifIdle":"yes"}', '{"ifIdle":null}']) {
+		const { outputs, exitCode } = await run({ action: "close", sessionId: "sess-1", ifIdle: true, jsonInput });
+		expect(exitCode).toBe(2);
+		expect(outputs[0]).toMatchObject({
+			ok: false,
+			error: { code: "usage", category: "usage", outcomeCertainty: "not-applied", retryability: "no" },
+		});
+	}
+	expect(captured.requests).toEqual([]);
+	expect(captured.listCalls).toBe(0);
+
+	await run({ action: "close", sessionId: "sess-1", ifIdle: true, jsonInput: '{"ifIdle":true}' });
+	expect(captured.requests).toHaveLength(1);
+	expect(captured.requests[0]).toMatchObject({ target: { ifIdle: true } });
+});
+
 for (const [code, certainty, retryability] of [
 	["busy", "retryable", "yes"],
 	["not_found", "terminal", "no"],
@@ -183,6 +200,42 @@ for (const [code, certainty, retryability] of [
 		expect(JSON.stringify(outputs)).not.toContain("Private broker details");
 	});
 }
+
+test("a busy close recommends inspect, wait and same-key retry; a stale close recommends inspect before any new key", async () => {
+	executeResult = {
+		ok: false,
+		operation: "session.close",
+		certainty: "retryable",
+		error: { code: "busy", message: "Session is not idle." },
+	};
+	const busy = (await run({ action: "close", sessionId: "sess-1", ifIdle: true })).outputs[0] as {
+		error: { nextSteps: { description: string; argv?: string[] }[] };
+	};
+	expect(busy.error.nextSteps).toHaveLength(1);
+	const busyStep = busy.error.nextSteps[0]!;
+	expect(busyStep.argv).toEqual(["sdk", "session", "inspect", "sess-1"]);
+	expect(busyStep.description).toContain("rerun the same close command");
+	expect(busyStep.description).toContain("Do not switch to a forced close");
+	expect(busyStep.description).not.toContain("turn.steer");
+
+	executeResult = {
+		ok: false,
+		operation: "session.close",
+		certainty: "terminal",
+		error: { code: "endpoint_stale", message: "Endpoint changed." },
+	};
+	const stale = (await run({ action: "close", sessionId: "sess-1", ifIdle: true })).outputs[0] as {
+		error: { code: string; outcomeCertainty: string; nextSteps: { description: string; argv?: string[] }[] };
+	};
+	expect(stale.error).toMatchObject({ code: "endpoint_stale", outcomeCertainty: "unknown" });
+	// The stale step comes first; the shared unknown-outcome warning follows it.
+	expect(stale.error.nextSteps).toHaveLength(2);
+	expect(stale.error.nextSteps[1]!.description).toContain("do not blindly retry");
+	const staleStep = stale.error.nextSteps[0]!;
+	expect(staleStep.argv).toEqual(["sdk", "session", "inspect", "sess-1"]);
+	expect(staleStep.description).toContain("terminal for its idempotency key");
+	expect(staleStep.description).not.toContain("rerun the same close command");
+});
 
 test("a generic not_found code cannot erase prior acceptance proof or invent no-effect proof", async () => {
 	for (const [proof, certainty] of [

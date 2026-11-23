@@ -338,6 +338,78 @@ test("an unsupported idle executor refuses without falling back to signals", asy
 	}
 }, 30_000);
 
+function terminatingSignals(kill: { mock: { calls: unknown[][] } }): unknown[][] {
+	return kill.mock.calls.filter(([, signal]) => signal === "SIGTERM" || signal === "SIGKILL");
+}
+
+test("an indexed host without a lifecycle request id refuses idle close without signalling", async () => {
+	const host = await fixture();
+	const listSessions = host.broker.index.listSessions.bind(host.broker.index);
+	const listSpy = spyOn(host.broker.index, "listSessions").mockImplementation(() => {
+		const listed = listSessions();
+		return {
+			...listed,
+			sessions: listed.sessions.map(row =>
+				row.sessionId === host.sessionId ? { ...row, lifecycleRequestId: undefined } : row,
+			),
+		};
+	});
+	const kill = spyOn(process, "kill");
+	try {
+		await host.idle();
+		expect(await host.close()).toMatchObject({ ok: false, error: { code: "close_refused" } });
+		expect(terminatingSignals(kill)).toEqual([]);
+		expect(await host.client.query("context.get")).toMatchObject({ ok: true });
+	} finally {
+		kill.mockRestore();
+		listSpy.mockRestore();
+		await host.cleanup();
+	}
+}, 30_000);
+
+test("a missing endpoint refuses idle close without signalling the still-running host", async () => {
+	const host = await fixture();
+	const handleRequest = host.broker.handleRequest.bind(host.broker);
+	const requestSpy = spyOn(host.broker, "handleRequest").mockImplementation(async (operation, input, key) =>
+		operation === "session.get_endpoint"
+			? { ok: false, error: { code: "resource_gone", message: "endpoint record is gone" } }
+			: await handleRequest(operation, input, key),
+	);
+	const kill = spyOn(process, "kill");
+	try {
+		await host.idle();
+		expect(await host.close()).toMatchObject({ ok: false, error: { code: "close_refused" } });
+		expect(terminatingSignals(kill)).toEqual([]);
+		expect(await host.client.query("context.get")).toMatchObject({ ok: true });
+	} finally {
+		kill.mockRestore();
+		requestSpy.mockRestore();
+		await host.cleanup();
+	}
+}, 30_000);
+
+test("endpoint_stale stays terminal for its key while a new key can close the idle host", async () => {
+	const host = await fixture();
+	const handleRequest = host.broker.handleRequest.bind(host.broker);
+	const requestSpy = spyOn(host.broker, "handleRequest").mockImplementation(async (operation, input, key) =>
+		operation === "session.get_endpoint"
+			? { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } }
+			: await handleRequest(operation, input, key),
+	);
+	try {
+		await host.idle();
+		expect(await host.close(true, "stale")).toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		requestSpy.mockRestore();
+		// Unlike busy, the stale refusal is not compacted: the same key replays it against a closable host.
+		expect(await host.close(true, "stale")).toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		expect(await host.client.query("context.get")).toMatchObject({ ok: true });
+		expect(await host.close(true, "fresh")).toMatchObject({ ok: true, result: { sessionId: host.sessionId } });
+	} finally {
+		requestSpy.mockRestore();
+		await host.cleanup();
+	}
+}, 30_000);
+
 test("notification runtime tears down an accepted close whose response write is rejected", async () => {
 	const host = await fixture();
 	try {

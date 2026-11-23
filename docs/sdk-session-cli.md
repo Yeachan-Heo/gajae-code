@@ -312,8 +312,10 @@ request identity and is closed by a new lifecycle operation. Pass
 
 `--if-idle` passes `ifIdle: true` to the existing broker operation. The runtime
 atomically checks streaming and pending turns, prompt queues, running owned
-async jobs, foreground bash, and side questions (including credential lookup),
-then fences prompt admission until shutdown. Prompt continuations, completion
+async jobs, foreground bash, side questions (including credential lookup), and
+an in-flight session recap request, then fences prompt admission until shutdown.
+`--if-idle` combined with a JSON input whose `ifIdle` is anything other than
+`true` is rejected as a usage error before the broker is contacted. Prompt continuations, completion
 delivery, `/btw`, and IRC/background side turns cannot start after that fence. A busy host
 returns `busy` without closing or signalling it and remains usable. Retry the
 same key after it becomes idle: `busy` retains the request binding but is not a
@@ -324,6 +326,22 @@ Once close is accepted, runtime teardown proceeds even if the close response is
 dropped or rejected. The caller can still receive a refused/uncertain outcome
 when that acknowledgement is lost. Managed spawn cleanup accepts an already-gone
 substrate only with the exact pinned host-exit proof; identity mismatch stays refused.
+
+An idle-fenced close settles a spawned child's spawn authority only after the
+generic close has proven that the host exited. It skips the early
+spawn-authority path that an ordinary close takes, so a spawned child that is
+no longer indexed by the broker gets the generic lifecycle `not_found` and its
+spawn authority stays active: `--if-idle` cannot retire it, and repeating it
+with the same key only replays that refusal. `gjc sdk session close` itself
+refuses an unindexed session with `not_found` before contacting the broker. To
+recover, first confirm that the child should stop (it no longer appears in
+`gjc sdk session list`, so use the master's own record of the spawn), then
+send an ordinary close (no `ifIdle`) with a new key, for example
+`gjc sdk session raw global --op session.close --idempotency-key <new-key>
+--json-input '{"sessionId":"<childId>"}'`. That path routes through the spawn
+authority and closes only an exactly re-proven substrate, but it performs no
+idle check. Children orphaned by master loss are also reaped automatically (see
+the spawn section below).
 
 `busy` and an unindexed session's `not_found` are public refusal codes with
 `outcomeCertainty: "not-applied"`. `busy` is retryable, while `not_found` is not.

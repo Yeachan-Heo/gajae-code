@@ -1059,6 +1059,37 @@ describe("AgentSession turn-end recap", () => {
 		});
 	});
 
+	describe("idle close", () => {
+		it("refuses busy while a recap request is open and leaves the session usable", async () => {
+			const harness = createHarness();
+			const gate = await startPendingRecap(harness);
+
+			let refusal: unknown;
+			try {
+				harness.session.prepareCloseIfIdle();
+			} catch (error) {
+				refusal = error;
+			}
+			expect((refusal as { code?: unknown } | undefined)?.code).toBe("busy");
+
+			// The refusal set no fence: the held recap still commits once it resolves.
+			gate.release();
+			await waitUntil(() => harness.manager.getSessionRecap() !== undefined, "recap commit");
+			expect(recapEntries(harness.manager)).toHaveLength(1);
+		});
+
+		it("accepts the idle close once the recap request has settled", async () => {
+			const harness = createHarness();
+			await runTurn(harness, "first request");
+			await waitUntil(() => harness.manager.getSessionRecap() !== undefined, "recap commit");
+			await settle();
+
+			harness.session.prepareCloseIfIdle();
+			await expect(harness.session.prompt("after close")).rejects.toThrow();
+			expect(harness.mainRequests).toHaveLength(1);
+		});
+	});
+
 	describe("resume", () => {
 		it("reads the persisted recap after reopening without generating anything", async () => {
 			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-session-recap-"));
