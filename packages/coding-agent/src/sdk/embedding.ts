@@ -15,6 +15,7 @@ import { type InitializeExtensionsOptions, initializeExtensions } from "../modes
 import { AgentRegistry } from "../registry/agent-registry";
 import {
 	buildSessionContext,
+	type FileEntry,
 	migrateSessionEntries,
 	parseSessionEntries,
 	RESUME_TRANSCRIPT_MAX_BYTES,
@@ -22,7 +23,7 @@ import {
 	SessionManager,
 } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
-import { readBrokerDiscovery } from "./broker/discovery";
+import { type BrokerDiscovery, readBrokerDiscovery } from "./broker/discovery";
 import { SdkClient } from "./client/client";
 import { type SessionLifecycleClient, SessionLifecycleService } from "./lifecycle/service";
 import { createSdkPreferenceControls } from "./preference-controls";
@@ -605,7 +606,7 @@ export async function readEmbeddedTranscriptHistory(
 	file: string,
 	leaf?: { entryId: string | null; whenTail?: string | null },
 ): Promise<EmbeddedTranscriptHistory | undefined> {
-	let entries: ReturnType<typeof parseSessionEntries>;
+	let entries: FileEntry[];
 	try {
 		const stat = await fs.stat(file);
 		if (!stat.isFile() || stat.size > RESUME_TRANSCRIPT_MAX_BYTES) return undefined;
@@ -676,7 +677,7 @@ export async function findEmbeddedLiveOwner(input: {
 	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
 	let client = input.client;
 	if (!client) {
-		let discovery: Awaited<ReturnType<typeof readBrokerDiscovery>>;
+		let discovery: BrokerDiscovery | null;
 		try {
 			discovery = await readBrokerDiscovery(input.agentDir);
 		} catch {
