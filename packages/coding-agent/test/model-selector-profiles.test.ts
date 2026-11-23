@@ -396,6 +396,47 @@ describe("model selector profiles", () => {
 		expect(getApiKeyForProvider).toHaveBeenCalledWith("provider-a", "profile-session");
 	});
 
+	test("preset navigation reads the credential-scoped catalog independently of the number of role overrides", async () => {
+		setThemeInstance(testTheme);
+		const base = [defaultModel, alternateModel, aliasModel, providerBDefault];
+		const scopedReadsPerKey = async (agentModelOverrides: Record<string, string>): Promise<number[]> => {
+			const registry = createRegistry() as unknown as TestModelRegistry & {
+				getAll: (credentialSessionId?: string) => Model[];
+				onCatalogChanged: (listener: () => void) => () => void;
+			};
+			registry.onCatalogChanged = () => () => {};
+			const getAll = vi.fn((credentialSessionId?: string) => (credentialSessionId === undefined ? base : [...base]));
+			registry.getAll = getAll;
+			// Role overrides make every preset-row build resolve selectors against the catalog.
+			const settings = Settings.isolated({
+				modelRoles: { default: "provider-a/default" },
+				"task.agentModelOverrides": agentModelOverrides,
+			});
+			const selector = createSelector(() => {}, { registry, settings, sessionId: "nav-session" });
+			await Bun.sleep(10);
+			setThemeInstance(testTheme);
+			const reads: number[] = [];
+			for (const key of ["\x1b[B", "\x1b[B", "\x1b[A", "\x1b[B"]) {
+				getAll.mockClear();
+				selector.handleInput(key);
+				selector.render(220);
+				reads.push(getAll.mock.calls.filter(([sessionId]) => sessionId === "nav-session").length);
+			}
+			return reads;
+		};
+
+		const oneRole = await scopedReadsPerKey({ executor: "provider-a/alternate" });
+		const fourRoles = await scopedReadsPerKey({
+			executor: "provider-a/alternate",
+			architect: "provider-a/alternate",
+			planner: "provider-b/default",
+			critic: "provider-a/default",
+		});
+
+		expect(oneRole.every(count => count > 0)).toBe(true);
+		expect(fourRoles).toEqual(oneRole);
+	});
+
 	for (const proxyMode of ["fallback", "always"] as const) {
 		for (const [provider, apiKey, available] of [
 			["opencodex", kNoAuth, true],
