@@ -3441,9 +3441,6 @@ class CodexWebSocketConnection {
 			}, CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS);
 		}
 
-		// Capture the socket in each handler to prevent stale close events from clearing
-		// a replacement socket after reconnect
-		const capturedSocket = socket;
 		socket.onopen = event => {
 			if (!settled) {
 				settled = true;
@@ -3453,7 +3450,6 @@ class CodexWebSocketConnection {
 			}
 		};
 		socket.onerror = event => {
-			if (this.#socket !== capturedSocket) return;
 			const eventRecord = event as unknown as Record<string, unknown>;
 			const detail =
 				(typeof eventRecord.message === "string" && eventRecord.message) ||
@@ -3469,9 +3465,7 @@ class CodexWebSocketConnection {
 			this.#push(error);
 		};
 		socket.onclose = event => {
-			if (this.#socket === capturedSocket) {
-				this.#socket = null;
-			}
+			this.#socket = null;
 			if (!settled) {
 				settled = true;
 				clearPending();
@@ -3482,7 +3476,6 @@ class CodexWebSocketConnection {
 			this.#push(null);
 		};
 		socket.onmessage = event => {
-			if (this.#socket !== capturedSocket) return;
 			try {
 				if (!this.#activeRequest) return;
 				const text = typeof event.data === "string" ? event.data : Buffer.from(event.data).toString("utf-8");
