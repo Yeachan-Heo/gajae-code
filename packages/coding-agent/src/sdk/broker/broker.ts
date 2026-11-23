@@ -731,9 +731,8 @@ const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_LATE_REGISTRATION_RECHECK_MS = 20_000;
 /**
  * How often the recheck asks whether its outcome is already decided. The early
- * end only needs to beat the 20 s bound, and the incarnation probe is
- * synchronous (a PowerShell fallback on Windows), so it runs coarser than the
- * index poll.
+ * end only needs to beat the 20 s bound, and the OS observation is a
+ * synchronous native call, so it runs coarser than the index poll.
  */
 const SPAWN_LATE_RECHECK_PROBE_MS = 250;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
