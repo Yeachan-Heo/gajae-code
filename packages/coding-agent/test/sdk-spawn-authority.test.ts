@@ -14,6 +14,7 @@ import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import {
 	setLifecycleCommandResolverForTest,
+	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
 	writeSessionLifecycleStartupCommit,
@@ -1388,8 +1389,14 @@ describe("Broker spawn flow driver", () => {
 		}
 	}
 
-	for (const readiness of [true, false] as const) {
-		it(`${readiness ? "admits" : "refuses"} a timely host when the index lock is held until 3.7 s past the deadline (real reader, readiness and startup commit ${readiness ? "published" : "absent"})`, async () => {
+	// 8.7 s is the largest reported overrun (incident 6dc4dc3b): the global index
+	// lock was released only then, after an 8 s recheck window had already closed.
+	for (const { overrunMs, readiness } of [
+		{ overrunMs: 3_700, readiness: true },
+		{ overrunMs: 3_700, readiness: false },
+		{ overrunMs: 8_700, readiness: true },
+	] as const) {
+		it(`${readiness ? "admits" : "refuses"} a timely host when the index lock is held until ${overrunMs / 1_000} s past the deadline (real reader, readiness and startup commit ${readiness ? "published" : "absent"})`, async () => {
 			const agentDir = await temp();
 			const incarnation = processIncarnation(process.pid);
 			if (!incarnation) throw new Error("test process incarnation is unavailable");
@@ -1442,11 +1449,11 @@ describe("Broker spawn flow driver", () => {
 								await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
 							}
 							// Another process holds the machine-global index lock from before
-							// the broker can read the row until 3.7 s past the deadline.
+							// the broker can read the row until the overrun past the deadline.
 							const acquired = Promise.withResolvers<void>();
 							holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
 								acquired.resolve();
-								await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 3_700);
+								await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + overrunMs);
 							});
 							await acquired.promise;
 						}
@@ -1470,12 +1477,12 @@ describe("Broker spawn flow driver", () => {
 				const response = await broker.handleRequest(
 					"session.spawn",
 					{ ...spawnInput(), cwd: agentDir },
-					`lock-incident-${readiness}`,
+					`lock-incident-${overrunMs}-${readiness}`,
 				);
 				await holder;
 				const claim = await latestClaim(agentDir);
 				if (readiness) {
-					expect(Date.now()).toBeGreaterThan(deadlineAt + 3_700);
+					expect(Date.now()).toBeGreaterThan(deadlineAt + overrunMs);
 					expect(calls).toBe(2);
 					expect(response).toMatchObject({ ok: true });
 					expect(dispatches).toBe(1);
@@ -1495,6 +1502,158 @@ describe("Broker spawn flow driver", () => {
 				expect(claim?.seed).toBeUndefined();
 			} finally {
 				await holder;
+				await broker.stop();
+			}
+		}, 40_000);
+	}
+
+	// The recheck may last 20 s, but only a live, ready host behind a held lock
+	// should wait for it. Each case decides the refusal mid-recheck while the lock
+	// is still held (or, for a mismatch, on the first recheck read); the broker
+	// must answer within a few polls, not at lock release or the recheck bound.
+	for (const outcome of ["dead-owner", "failure-receipt", "mismatch"] as const) {
+		it(`ends the post-deadline recheck early on a ${outcome}`, async () => {
+			const agentDir = await temp();
+			const incarnation = processIncarnation(process.pid);
+			if (!incarnation) throw new Error("test process incarnation is unavailable");
+			const lockHeldPastDeadlineMs = outcome === "mismatch" ? 1_000 : 10_000;
+			const decidedPastDeadlineMs = 1_000;
+			let closes = 0;
+			let dispatches = 0;
+			let calls = 0;
+			let deadlineAt = 0;
+			let ownerDead = false;
+			let holder: Promise<void> | undefined;
+			let decision: Promise<void> | undefined;
+			let brokerRef: Broker | undefined;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "early-exit-provider",
+							pid: process.pid,
+							processIncarnation: incarnation,
+						},
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async (input: SpawnRegistrationRequest) => {
+						calls += 1;
+						if (!brokerRef) throw new Error("broker not set");
+						if (calls === 1) {
+							deadlineAt = input.deadlineAt;
+							await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+							const host = await new SessionIndex(agentDir).open();
+							const registration = {
+								type: "host_registered" as const,
+								sessionId: input.childId,
+								locator: await resolveSessionLocator(input.cwd, input.stateRoot),
+								endpointGeneration: 1,
+								pid: process.pid,
+								processIncarnation: incarnation,
+								hostIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
+							};
+							await host.append(registration);
+							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+							await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+							// The host's row no longer matches once it unregisters.
+							if (outcome === "mismatch") await host.append({ ...registration, type: "host_unregistered" });
+							const acquired = Promise.withResolvers<void>();
+							holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+								acquired.resolve();
+								await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + lockHeldPastDeadlineMs);
+							});
+							await acquired.promise;
+							const { stateRoot, childId, effectMarker } = input;
+							if (outcome !== "mismatch")
+								decision = (async () => {
+									await Bun.sleep(Math.max(0, deadlineAt - Date.now()) + decidedPastDeadlineMs);
+									if (outcome === "dead-owner") {
+										ownerDead = true;
+										return;
+									}
+									await writeSessionLifecycleFailure(
+										stateRoot,
+										childId,
+										effectMarker,
+										{ phase: "startup", reason: "failed", message: "host failed after readiness" },
+										{
+											endpointGeneration: 1,
+											fenced: true,
+											runtimeRemoved: true,
+											hostStopped: true,
+											brokerRegistrationReleased: true,
+										},
+										undefined,
+										incarnation,
+										process.pid,
+									);
+								})();
+						}
+						return await awaitSpawnHostRegistration(brokerRef.index, input);
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return {
+							kind: "accepted" as const,
+							commandId: "cmd-early-exit",
+							turnId: "turn-early-exit",
+							acceptedAt: Date.now(),
+						};
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			brokerRef = broker;
+			// The owner process "dies" through the broker's incarnation seam; the
+			// index's own liveness probe still sees this live test process.
+			setProcessIncarnationForTest(broker, pid =>
+				ownerDead && pid === process.pid ? undefined : processIncarnation(pid),
+			);
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`early-exit-${outcome}`,
+				);
+				const answeredAt = Date.now();
+				await decision;
+				await holder;
+				const claim = await latestClaim(agentDir);
+				expect(calls).toBe(2);
+				// Decided at +1 s; the lock (+10 s) and the recheck bound (+21 s) are far later.
+				expect(answeredAt).toBeGreaterThan(deadlineAt + decidedPastDeadlineMs);
+				expect(answeredAt).toBeLessThan(deadlineAt + decidedPastDeadlineMs + 3_000);
+				expect(response).toMatchObject({
+					ok: false,
+					error: {
+						code: "spawn_failed",
+						details: {
+							code: outcome === "failure-receipt" ? "child_registration_failed" : "child_registration_timeout",
+						},
+					},
+				});
+				if (outcome === "mismatch") expect(claim?.failure?.message).toContain("did not match the launched host");
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await decision;
+				await holder;
+				setProcessIncarnationForTest(broker, undefined);
 				await broker.stop();
 			}
 		}, 40_000);

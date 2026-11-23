@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc sdk spawn` no longer refuses a timely child host when another process holds the global session index lock until about 8.7 s past the admission deadline. The post-deadline registration recheck now lasts up to 20 s instead of 8 s, and still admits a late host only on its startup commit record. The recheck ends as soon as the outcome is decided: when the host's registration row no longer matches, when the host writes a failure receipt, or when the host process is gone, including while the recheck is waiting for the index lock. Only a live, ready host behind a held lock waits out the bound.
