@@ -1389,6 +1389,9 @@ export class DesktopHost {
 			this.#dropLeftover(metadata);
 			return answer;
 		}
+		// No broker runs, so nothing could be asked: that is not an attempt. The owner check came from
+		// the session index, and the next check with a broker running asks.
+		if (closed.kind === "unknown" && closed.reason === "broker_absent") return answer;
 		// Busy, or no answer: try again at a later check, a bounded number of times. While the owner
 		// is busy, the row says an earlier app session's process is working, not a terminal.
 		if (closed.kind === "not_closed") this.#leftoverBusy.add(metadata.id);

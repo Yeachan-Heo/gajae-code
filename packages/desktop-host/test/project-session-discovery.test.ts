@@ -931,6 +931,25 @@ test("an idle close with no answer is retried within the same cap, without namin
 	await h.noteSaved(undefined);
 });
 
+test("with no broker to ask, a leftover close is not counted as an attempt", async () => {
+	const { h, terminal } = await leftoverRow("No broker to close it");
+	// The owner check saw the owner (from the session index); the close had no broker to ask.
+	const closing = vi
+		.spyOn(sdk, "closeEmbeddedIdleOwner")
+		.mockResolvedValue({ kind: "unknown", reason: "broker_absent" });
+	for (let check = 0; check < 4; check++) {
+		const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+		expect(selected.connection).toEqual({ state: "elsewhere" });
+	}
+	expect(closing).toHaveBeenCalledTimes(4);
+	await h.noteSaved(0);
+	// Once a broker answers, the note is used as before.
+	closing.mockRestore();
+	const free = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(free.connection).toEqual({ state: "connected" });
+	expect(h.closeRequests).toEqual([terminal.id]);
+});
+
 test("a note saved before attempts were counted loads and is used", async () => {
 	const { h, terminal } = await leftoverRow("Noted by the first version of the note");
 	await h.restart();
