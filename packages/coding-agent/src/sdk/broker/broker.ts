@@ -925,8 +925,8 @@ export async function awaitSpawnHostRegistration(
  * deadline and writes a startup failure receipt when it rolls back, but the
  * marker becomes visible slightly before the host's last cutoff check and can
  * still be revoked. So readiness counts only when it is present on two reads at
- * least one poll apart, the later one at least two polls past the semantic
- * deadline, with the owner still the same live process and no failure receipt
+ * least one poll apart, the later one no earlier than the termination start
+ * (`waitDeadlineAt`), with the owner still the same live process and no failure receipt
  * on either read.
  * A failure receipt always wins.
  *
@@ -943,7 +943,9 @@ async function awaitLateSpawnHostVerdict(
 	semanticDeadlineAt: number,
 	waitDeadlineAt: number,
 ): Promise<{ kind: "ready" } | { kind: "failed"; failure: LifecycleFailureArtifact } | { kind: "unconfirmed" }> {
-	const confirmAt = semanticDeadlineAt + 2 * SPAWN_HOST_REGISTRATION_POLL_MS;
+	// The confirming read lands no earlier than `waitDeadlineAt` (termination
+	// start), giving a host that lost its cutoff race time to revoke readiness.
+	const confirmAt = Math.max(semanticDeadlineAt + 2 * SPAWN_HOST_REGISTRATION_POLL_MS, waitDeadlineAt);
 	let readySince: number | undefined;
 	for (;;) {
 		const observedAt = Date.now();
@@ -3180,6 +3182,10 @@ export class Broker {
 							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
 					);
 				}
+				if (firstMiss !== undefined)
+					logger.info(
+						`sdk broker: spawn child ${prep.childId} admitted by the post-deadline recheck (first observation: ${firstMiss})`,
+					);
 				pinnedRegistration = registration.registration;
 				const now = Date.now();
 				const proof = launched.proof;

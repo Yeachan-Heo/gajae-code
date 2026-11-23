@@ -1189,7 +1189,9 @@ describe("Broker spawn flow driver", () => {
 						if (host === "failed-late")
 							// The host's failure receipt lands only after the late path started polling.
 							setTimeout(() => void writeFailure(), Math.max(0, input.deadlineAt - Date.now()) + 200);
-						await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 50);
+						// The stalled case returns past termination start, so only an
+						// unconditional confirming read can still admit it.
+						await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + (host === "ready-stalled" ? 1_500 : 50));
 						return {
 							ok: true as const,
 							registration: {
