@@ -4636,9 +4636,11 @@ export class DesktopHost {
 	#publishShown(): DesktopSnapshot {
 		const snapshot = this.snapshot();
 		this.#emit({ type: "snapshot", snapshot });
+		// Every conversation that can be on screen: the app's own writers, read-only views, and
+		// conversations another surface owns that the app is attached to.
 		const shown = [
 			...[...this.#live.values()].map(live => live.metadata),
-			...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id)),
+			...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id) || this.#managed.has(session.id)),
 		];
 		for (const metadata of shown) {
 			const row = snapshot.sessions.find(session => session.id === metadata.id);

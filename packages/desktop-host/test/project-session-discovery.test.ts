@@ -531,6 +531,52 @@ test("an inventory that comes back empty cannot remove a terminal conversation f
 	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
 });
 
+test("a window-focus refresh never shrinks an open terminal-owned conversation", async () => {
+	const h = await fixture();
+	const terminal = await h.persist("Owned by the terminal", h.projectDir, true);
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	// The SDK owner's attachment, reduced to what this test needs: a long transcript the snapshot's
+	// per-row history budget cuts short.
+	const messages = Array.from({ length: 30 }, (_, index) => ({
+		id: `m${index}`,
+		role: "user" as const,
+		text: `turn ${index}`,
+	}));
+	vi.spyOn(ManagedSession.prototype, "open").mockResolvedValue(undefined);
+	vi.spyOn(ManagedSession.prototype, "refresh").mockResolvedValue(undefined);
+	const attached = Object.getOwnPropertyDescriptor(ManagedSession.prototype, "isAttached");
+	if (!attached) throw new Error("ManagedSession no longer reports its attachment");
+	Object.defineProperty(ManagedSession.prototype, "isAttached", { configurable: true, get: () => true });
+	cleanups.push(async () => {
+		Object.defineProperty(ManagedSession.prototype, "isAttached", attached);
+	});
+	vi.spyOn(ManagedSession.prototype, "dto").mockImplementation(
+		(budget = 2_000_000): DesktopSession => ({
+			id: terminal.id,
+			projectId: project.id,
+			title: "Owned by the terminal",
+			starred: false,
+			status: "idle",
+			imageInput: null,
+			operatorRunning: false,
+			controlGeneration: 1,
+			messages: budget < 1_000_000 ? messages.slice(-5) : messages,
+		}),
+	);
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(selected.messages).toHaveLength(30);
+	const from = h.frames.length;
+	await h.call("bootstrap");
+	await h.refreshed();
+	// Apply the frames in order, as the app does: the snapshot replaces rows, session frames follow.
+	let shown: DesktopSession | undefined;
+	for (const frame of h.frames.slice(from)) {
+		if (frame.type === "snapshot") shown = frame.snapshot.sessions.find(session => session.id === terminal.id);
+		if (frame.type === "session" && frame.session.id === terminal.id) shown = frame.session;
+	}
+	expect(shown?.messages).toHaveLength(30);
+});
+
 test("uses SDK ownership admission rather than a local transcript writer when selecting a discovered session", async () => {
 	const h = await fixture();
 	const terminal = await h.persist("Still owned by terminal", h.projectDir, true);
