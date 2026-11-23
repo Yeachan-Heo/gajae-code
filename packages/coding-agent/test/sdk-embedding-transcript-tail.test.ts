@@ -171,6 +171,7 @@ test("a read during which another process appended is not reused, even when file
 	});
 	cleanups.push(async () => reads.mockRestore());
 	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	if (foreign === undefined) throw new Error("The other process did not append during the read");
 	// The file changed while it was read, so the next check reads it again and sees the append.
 	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: foreign, held: own });
 });
