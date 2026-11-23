@@ -688,6 +688,34 @@ describe("SDK composer and HUD observation", () => {
 		expect(observation.info({}).modelProfile).toBe("safe [REDACTED] suffix");
 	});
 
+	it("masks HUD credentials split by characters that display as spaces", async () => {
+		const secret = "sk-abcdefghijklmnop";
+		await auth.set("spaced-split", { type: "api_key", key: secret });
+		for (const control of ["\t", "\n", "\r\n", "\u2028", "\u2029"]) {
+			const rawProfile = `safe sk-abcdefg${control}hijklmnop suffix`;
+			session.setActiveModelProfile(rawProfile);
+			const info = observation.info({});
+			expect(info.modelProfile).toBe("safe [REDACTED] suffix");
+			expect(JSON.stringify(info)).not.toContain("hijklmnop");
+			expect(session.getActiveModelProfile()).toBe(rawProfile);
+		}
+		session.setActiveModelProfile("safe\tpublic\nprofile");
+		expect(observation.info({}).modelProfile).toBe("safe public profile");
+	});
+
+	it("withholds HUD credentials hidden from ANSI parsing by other controls", async () => {
+		const secret = "sk-abcdefghijklmnop";
+		await auth.set("escape-split", { type: "api_key", key: secret });
+		for (const rawProfile of ["x \x1b[sk-abcdefg\x00hijklmnop y", "x \x1b[sk-abcdefg\thijklmnop y"]) {
+			session.setActiveModelProfile(rawProfile);
+			const info = observation.info({});
+			expect(info.modelProfile).toBe("[REDACTED]");
+			expect(JSON.stringify(info)).not.toContain("hijklmnop");
+		}
+		session.setActiveModelProfile("x \x1b[31mpublic\x00 profile\x1b[0m y");
+		expect(observation.info({}).modelProfile).toBe("x public profile y");
+	});
+
 	it("keeps unavailable context and usage honest and bounds sanitized HUD display text", async () => {
 		await session.sessionManager.setSessionName(`Name\x1b[31m\n\u2028\t${"𐐀".repeat(300)}`, "user");
 		const context = spyOn(session, "getContextUsage").mockReturnValue({
