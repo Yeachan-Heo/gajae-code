@@ -871,9 +871,9 @@ built, is compared with the canonical (symlink-resolved) path the Broker
 recorded when the child registered; the recorded spelling is never
 re-resolved later, so a symlinked state root that is retargeted afterwards
 does not carry the owner to another directory. A spawn authority recorded
-without that canonical root (a pre-pin spawn, or one recorded by an older
-Broker, including a child still running across the upgrade) attributes the
-child to no row. When
+without that canonical root (a pre-pin spawn, one whose state root could not be
+resolved at registration, or one recorded by an older Broker, including a child
+still running across the upgrade) attributes the child to no row. When
 the command runs inside a master session's Bash tool, `spawnedBy.self` is
 `true` for that master's own children and `false` for another master's; the Bash
 tool in a non-master session never passes an inherited owner id through, so
