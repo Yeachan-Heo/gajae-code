@@ -2862,18 +2862,22 @@ export class DesktopHost {
 			// conversation refused until restart.
 			const stopBudget = AbortSignal.timeout(DISCONNECT_STOP_MS);
 			const stopped = live;
-			const within = async (work: Promise<unknown> | undefined) => {
+			// Only running out of the budget means "still stopping". The stop itself is this
+			// Disconnect's own work, so its failure is the answer; the other waits join work another
+			// request owns and reports, so their failures are not this Disconnect's.
+			const within = async (work: Promise<unknown> | undefined, own = false) => {
 				if (!work) return;
+				const joined = own ? work : work.catch(() => {});
+				// Past the budget nobody awaits it any more; a late failure must not go unhandled.
+				joined.catch(() => {});
 				try {
-					await bounded(
-						work.catch(() => {}),
-						stopBudget,
-					);
-				} catch {
-					throw new Error(STILL_STOPPING);
+					await bounded(joined, stopBudget);
+				} catch (error) {
+					if (stopBudget.aborted) throw new Error(STILL_STOPPING);
+					throw error;
 				}
 			};
-			if (stopping) await within(this.#stop(stopped, arrival));
+			if (stopping) await within(this.#stop(stopped, arrival), true);
 			// A stopped shell command settles on its own schedule; wait for it within the same budget.
 			await within(
 				(async () => {

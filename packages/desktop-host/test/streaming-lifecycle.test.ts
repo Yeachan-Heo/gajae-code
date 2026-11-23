@@ -1363,6 +1363,53 @@ describe("desktop streaming lifecycle", () => {
 		).toBe(true);
 	}, 20_000);
 
+	test("a Disconnect whose stop fails says why, at once, and releases nothing", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-journal-fails");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "queued behind", deliverAs: "followUp" }, "queued-journal-fails");
+		// The receipt that hands the queued text back cannot be written once.
+		const update = DeliveryJournal.prototype.update;
+		let failures = 0;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			if (id === "queued-journal-fails" && changes.disposition === "removed" && failures++ === 0)
+				throw new Error("delivery journal disk is full");
+			return update.call(this, id, changes);
+		});
+		const started = performance.now();
+		const failed = await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true }).then(
+			() => "disconnected",
+			(error: Error) => error.message,
+		);
+		// The real cause, not a timeout's "still stopping" five seconds later.
+		expect(failed).toContain("delivery journal disk is full");
+		expect(failed).not.toContain("still stopping");
+		expect(performance.now() - started).toBeLessThan(2_000);
+		// Nothing was released, and the fence is gone: requests are answered normally again.
+		expect(sdk.isDisposed).toBe(false);
+		expect((await snapshot()).sessions[0]?.connection).toEqual({ state: "connected" });
+		expect((await call<DesktopSession>("session.select", { sessionId })).connection).toEqual({
+			state: "connected",
+		});
+		// Trying again stops the run and releases the writer.
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		expect(await running).toBeNull();
+		expect((await settledReceipts(snapshot, ["run-journal-fails"]))["run-journal-fails"]).toBe("cancelled");
+	}, 20_000);
+
 	test("a confirmed Disconnect waits for the shell command it stopped", async () => {
 		const h = await launch();
 		const { call, session, sdk } = h;
