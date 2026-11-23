@@ -822,12 +822,14 @@ id that more than one state root with an unterminated registration claims
 (`gjc sdk session list` and `inspect` rows mark it `ambiguous: true`) and a
 host in another state root that reuses the id after the child stopped. Search
 and snapshot rows carry no ambiguity marker, so a missing `spawnedBy` there
-does not say why. The state root is compared by the canonical
-(symlink-resolved) path the Broker recorded when the child registered, never
-by re-resolving the registered spelling later, so a symlinked state root that
-is retargeted afterwards does not carry the owner to another directory. A
-spawn authority recorded without that canonical root (a pre-pin spawn, or one
-recorded by an older Broker) attributes the child to no row. When
+does not say why. The listed row's state root, resolved when the list is
+built, is compared with the canonical (symlink-resolved) path the Broker
+recorded when the child registered; the recorded spelling is never
+re-resolved later, so a symlinked state root that is retargeted afterwards
+does not carry the owner to another directory. A spawn authority recorded
+without that canonical root (a pre-pin spawn, or one recorded by an older
+Broker, including a child still running across the upgrade) attributes the
+child to no row. When
 the command runs inside a master session's Bash tool, `spawnedBy.self` is
 `true` for that master's own children and `false` for another master's; the Bash
 tool in a non-master session never passes an inherited owner id through, so

@@ -560,6 +560,7 @@ describe("master peer ownership", () => {
 				return spawned.rendered.sessionId;
 			};
 			const retargeted = await spawn(repos.retarget, "retarget");
+			const sameSpelling = await spawn(repos.retarget, "same-spelling");
 			const stable = await spawn(repos.stable, "stable");
 			const plain = await spawn(repos.plain, "plain");
 			const registration = (sessionId: string, at: SessionLocatorV2, pid: number) =>
@@ -572,34 +573,46 @@ describe("master peer ownership", () => {
 					processIncarnation: `inc-${pid}`,
 					hostIncarnation: `inc-${pid}`,
 				});
-			// The retargeted child registered through the symlink spelling, then stopped.
-			const retargetedPid = registeredPids.get(retargeted)!;
+			const stopped = (sessionId: string): SessionIndexEvent[] => {
+				const pid = registeredPids.get(sessionId)!;
+				return [
+					registration(sessionId, locators.retarget, pid),
+					indexEvent({
+						type: "host_unregistered",
+						sessionId,
+						locator: locators.retarget,
+						endpointGeneration: 1,
+						pid,
+						processIncarnation: `inc-${pid}`,
+						hostIncarnation: `inc-${pid}`,
+					}),
+				];
+			};
+			// Both retarget-workspace children registered through the symlink spelling, then stopped.
 			await appendIndex(agentDir, [
-				registration(retargeted, locators.retarget, retargetedPid),
-				indexEvent({
-					type: "host_unregistered",
-					sessionId: retargeted,
-					locator: locators.retarget,
-					endpointGeneration: 1,
-					pid: retargetedPid,
-					processIncarnation: `inc-${retargetedPid}`,
-					hostIncarnation: `inc-${retargetedPid}`,
-				}),
+				...stopped(retargeted),
+				...stopped(sameSpelling),
 				registration(stable, locators.stable, registeredPids.get(stable)!),
 				registration(plain, locators.plain, registeredPids.get(plain)!),
 			]);
-			// The symlink now names another directory, where an unrelated host reuses
-			// the stopped child's session id.
+			// The symlink now names another directory, where unrelated hosts reuse the
+			// stopped children's session ids: one spelled by the new target, one spelled
+			// exactly like the recorded registration (the symlink path).
 			await fs.rm(retargetLink);
 			await fs.symlink(targetB, retargetLink);
 			const foreignLocator = await resolveSessionLocator(repos.retarget, targetB);
-			await appendIndex(agentDir, [registration(retargeted, foreignLocator, process.pid)]);
+			await appendIndex(agentDir, [
+				registration(retargeted, foreignLocator, process.pid),
+				registration(sameSpelling, locators.retarget, process.pid),
+			]);
 
 			const listed = (await broker.handleRequest("session.list", {}, undefined)) as {
 				ok: true;
 				result: { sessions: Array<Record<string, unknown>> };
 			};
 			const byId = new Map(listed.result.sessions.map(session => [session.sessionId, session]));
+			expect(byId.get(sameSpelling)).toMatchObject({ ambiguous: false, locator: { stateRoot: retargetLink } });
+			expect(byId.get(sameSpelling)).not.toHaveProperty("spawnedBy");
 			expect(byId.get(retargeted)).toMatchObject({ ambiguous: false, locator: { stateRoot: targetB } });
 			expect(byId.get(retargeted)).not.toHaveProperty("spawnedBy");
 			expect(toSessionRowV1(byId.get(retargeted)!)).not.toHaveProperty("spawnedBy");

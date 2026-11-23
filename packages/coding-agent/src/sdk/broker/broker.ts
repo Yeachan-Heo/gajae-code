@@ -769,17 +769,17 @@ function spawnOwnerForRow(
 }
 
 /**
- * Canonical path of an existing state root, or undefined when it does not
- * exist. Uses the same resolver as `spawnOwnerForRow` so both sides of the
- * comparison spell a canonical path identically.
+ * Canonical path of an existing state root, or undefined when it cannot be
+ * resolved. Same resolution as `resolveEquivalentPath` (used by
+ * `spawnOwnerForRow`) minus its lexical fallback, so an unresolvable root is
+ * never recorded as if it were canonical.
  */
 async function canonicalStateRoot(stateRoot: string): Promise<string | undefined> {
 	try {
-		if (!(await fs.stat(stateRoot)).isDirectory()) return undefined;
+		return await fs.realpath(path.resolve(stateRoot));
 	} catch {
 		return undefined;
 	}
-	return resolveEquivalentPath(stateRoot);
 }
 
 /** Exact admission predicate for the child host row published after launch. */
