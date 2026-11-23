@@ -3651,7 +3651,14 @@ export class DesktopHost {
 		try {
 			const opened = await this.#open(metadata);
 			if (OWNER_CHECKED_METHODS.has(method)) await this.#recheckOwner(opened, method);
-			live = method === "session.select" || method === "prompt" ? await this.#refreshIfMoved(opened) : opened;
+			// The check may have waited for the broker while another request replaced the copy: go on
+			// with the conversation's current copy (joining a replacement still opening), never a retired one.
+			live =
+				method === "session.select" || method === "prompt"
+					? await this.#refreshIfMoved(opened)
+					: OWNER_CHECKED_METHODS.has(method)
+						? await this.#current(opened)
+						: opened;
 		} catch (error) {
 			// The owner check found another process holding it: answer as a read-only conversation.
 			if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
@@ -4891,7 +4898,8 @@ export class DesktopHost {
 		this.#cancelQuestions(live);
 		live.queued.clear();
 		await this.#disposeLive(live);
-		this.#live.delete(metadata.id);
+		// Only this copy: a successor another request opened meanwhile is never dropped undisposed.
+		if (this.#live.get(metadata.id) === live) this.#live.delete(metadata.id);
 		const index = this.#catalog.sessions.indexOf(metadata);
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
 		const restoreReleased = this.#release(metadata);
@@ -4979,9 +4987,13 @@ export class DesktopHost {
 		arrival: number,
 		alreadyBegun = false,
 	): Promise<DesktopCommandResult> {
-		const live = await this.#open(metadata);
-		// A slash command typed in the composer was checked as its prompt request; `command.run` checks here.
-		if (!alreadyBegun) await this.#recheckOwner(live, "command.run");
+		let live = await this.#open(metadata);
+		// A slash command typed in the composer was checked as its prompt request; `command.run` checks
+		// here, then goes on with the current copy in case the check waited while it was replaced.
+		if (!alreadyBegun) {
+			await this.#recheckOwner(live, "command.run");
+			live = await this.#current(live);
+		}
 		if (!this.#writable(metadata)) throw this.#notWritable(metadata);
 		await this.#awaitStartup(live);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";

@@ -1446,6 +1446,38 @@ test("an owner check that answers after its copy was replaced applies to the cop
 	await h.close();
 });
 
+for (const method of ["session.rename", "session.delete"] as const)
+	test(`a ${method.slice(8)} whose owner check waits while a select replaces the copy uses the new copy`, async () => {
+		const h = await controlledFixture();
+		const sessionId = h.session.id;
+		await h.call("prompt", { sessionId, text: "app turn" });
+		const stale = h.sdk();
+		const file = stale.sessionFile!;
+		const releaseBroker = h.holdBroker();
+		const lookups = h.ownerLookups.length;
+		const waiting = respond(h, method, { sessionId, ...(method === "session.rename" ? { title: "Renamed" } : {}) });
+		await until(() => h.ownerLookups.length > lookups, "the owner lookup");
+		// Meanwhile the terminal appends, and a select replaces the stale copy with a fresh one.
+		await continueInTerminal(file, h.projectDir, h.agentDir, h.track);
+		await h.call("session.select", { sessionId });
+		const fresh = h.sdk();
+		expect(fresh).not.toBe(stale);
+		releaseBroker();
+		// The request goes on with the copy that is now the conversation's, not the one it opened.
+		expect(await waiting).toMatchObject({ ok: true });
+		if (method === "session.rename") {
+			expect(fresh.sessionManager.getSessionName()).toBe("Renamed");
+			expect(h.snapshot().sessions[0]?.title).toBe("Renamed");
+			expect(fresh.isDisposed).toBe(false);
+		} else {
+			expect(h.snapshot().sessions).toEqual([]);
+			expect(await Bun.file(file).exists()).toBe(false);
+			await fresh.awaitDisposeCompletion();
+			expect(fresh.isDisposed).toBe(true);
+		}
+		await h.close();
+	});
+
 test("a turn that starts while the owner check is waiting is not released under it", async () => {
 	const held = heldTurn();
 	const h = await controlledFixture(held.handler);
