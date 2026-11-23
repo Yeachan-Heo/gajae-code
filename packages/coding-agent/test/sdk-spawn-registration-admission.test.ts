@@ -150,6 +150,24 @@ describe("awaitSpawnHostRegistration", () => {
 		expect(result).toEqual({ ok: false, reason: "mismatch" });
 	});
 
+	it("reports inconclusive when an absent read is followed by polls blocked past the deadline", async () => {
+		const f = await fixture("child-absent-then-locked");
+		const deadlineAt = Date.now() + 1_200;
+		const waiting = awaitSpawnHostRegistration(f.observer, f.request(deadlineAt));
+		await Bun.sleep(300);
+		const acquired = Promise.withResolvers<void>();
+		const holder = withFileLock(path.join(f.agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+			acquired.resolve();
+			await Bun.sleep(Math.max(0, deadlineAt - Date.now()) + 300);
+		});
+		await acquired.promise;
+		const result = await waiting;
+		await holder;
+		// Early reads saw no row, but nothing was readable near the deadline, so
+		// absence is unproven.
+		expect(result).toEqual({ ok: false, reason: "inconclusive" });
+	});
+
 	it("reports absent when no row for the child was ever published", async () => {
 		const f = await fixture("child-absent");
 		await f.host.append({ ...f.registration(), sessionId: "unrelated-session" });
@@ -191,6 +209,44 @@ describe("awaitSpawnHostRegistration", () => {
 		await fs.mkdir(foreign, { recursive: true });
 		await f.host.append(f.registration({ locator: { ...f.locator, stateRoot: foreign } }));
 		const result = await awaitSpawnHostRegistration(f.observer, f.request(Date.now() + 300));
+		expect(result).toEqual({ ok: false, reason: "mismatch" });
+	});
+
+	for (const control of [
+		{ name: "lifecycle_terminal row", overrides: { type: "lifecycle_terminal" } },
+		{ name: "terminal-uncertain row", overrides: { terminalUncertain: true } },
+	] as const) {
+		it(`refuses a ${control.name} for the child`, async () => {
+			const f = await fixture(`child-${control.name.replaceAll(" ", "-")}`);
+			await f.host.append(f.registration(control.overrides));
+			const result = await awaitSpawnHostRegistration(f.observer, f.request(Date.now() + 300));
+			expect(result).toEqual({ ok: false, reason: "mismatch" });
+		});
+	}
+
+	it("refuses an ambiguous child claimed from two state roots", async () => {
+		const f = await fixture("child-two-roots");
+		const other = path.join(f.agentDir, "other", ".gjc", "state");
+		await fs.mkdir(other, { recursive: true });
+		await f.host.append(f.registration());
+		await f.host.append(f.registration({ locator: { ...f.locator, stateRoot: other } }));
+		const result = await awaitSpawnHostRegistration(f.observer, f.request(Date.now() + 300));
+		expect(result).toEqual({ ok: false, reason: "mismatch" });
+	});
+
+	it("refuses a dead host whose recorded incarnation still matches the owner", async () => {
+		const f = await fixture("child-dead-host");
+		const child = Bun.spawn(["sleep", "0.2"]);
+		const incarnation = processIncarnation(child.pid);
+		if (!incarnation) throw new Error("child process incarnation is unavailable");
+		await child.exited;
+		await f.host.append(
+			f.registration({ pid: child.pid, processIncarnation: incarnation, hostIncarnation: incarnation }),
+		);
+		const result = await awaitSpawnHostRegistration(f.observer, {
+			...f.request(Date.now() + 300),
+			owner: { pid: child.pid, incarnation },
+		});
 		expect(result).toEqual({ ok: false, reason: "mismatch" });
 	});
 

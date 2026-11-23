@@ -4596,10 +4596,10 @@ export async function readSessionLifecycleFailure(
 }
 
 /**
- * Whether the host committed its own readiness: both the owner marker and the
- * readiness marker name exactly `expected`. The host publishes readiness only
- * before its semantic cutoff, so this is the host-side verdict a broker needs
- * when it observed the registration only after that cutoff.
+ * Whether the owner marker and the readiness marker both name exactly
+ * `expected`. The host publishes readiness only before its semantic cutoff, but
+ * may revoke it if it loses that race, so a single read is evidence, not a
+ * commit: callers that need a verdict confirm it on a later read.
  */
 export async function hasSessionLifecycleReadiness(root: string, id: string, expected: EffectMarker): Promise<boolean> {
 	const [effect, ready] = await Promise.all([
@@ -4690,16 +4690,7 @@ async function hasOwnedReadinessEvidence(
 		"alive"
 	)
 		return false;
-	const [effect, ready] = await Promise.all([
-		readEffectMarker(lifecycleMarkerPath(root, id)),
-		readEffectMarker(lifecycleReadyPath(root, id)),
-	]);
-	return (
-		effect !== undefined &&
-		ready !== undefined &&
-		sameEffectMarker(effect, expected) &&
-		sameEffectMarker(ready, expected)
-	);
+	return await hasSessionLifecycleReadiness(root, id, expected);
 }
 
 /**
