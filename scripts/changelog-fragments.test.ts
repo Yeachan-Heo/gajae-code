@@ -243,4 +243,27 @@ describe("CLI entrypoints", () => {
 		expect(dropped.stderr).toContain(`${stray}::is deleted by this pull request`);
 		expect(dropped.stderr).not.toContain(`${fragment}::`);
 	});
+
+	test("history guard admits fragments a release consumed before its tagged version bump", async () => {
+		const early = "packages/coding-agent/changelog.d/early.md";
+		const late = "packages/coding-agent/changelog.d/late.md";
+		const root = await tempDir();
+		await init(root);
+		await put(root, early, "### Fixed\n\n- Early.\n");
+		await put(root, late, "### Fixed\n\n- Late.\n");
+		await commit(root, "notes");
+		const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+		// Release prep folds one fragment, then the tagged bump folds the other.
+		await git(root, ["checkout", "-q", "-b", "main"]);
+		await fs.rm(path.join(root, early));
+		await commit(root, "chore(release): normalize pending changelog sections");
+		await fs.rm(path.join(root, late));
+		await commit(root, "chore: bump version to 1.0.1");
+		expect((await git(root, ["tag", "v1.0.1"])).exitCode).toBe(0);
+
+		const backmerged = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(backmerged.stderr).toBe("");
+		expect(backmerged.exitCode).toBe(0);
+	});
 });

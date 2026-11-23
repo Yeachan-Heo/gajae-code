@@ -1,3 +1,0 @@
-### Fixed
-
-- Fixed session wedge after threshold auto-compaction when user prompts again. The `checkCompaction` method was using stale assistant message usage from before a compaction completed, causing re-entry into `runAutoCompaction("threshold")` with no-op compaction. The `errorIsFromBeforeCompaction` guard—which prevents compaction triggers from messages already compacted—is now also applied to the threshold branch (previously it was only applied to the overflow branch). This ensures that after a threshold compaction completes and a user prompts, the stale message does not trigger another unnecessary compaction attempt.

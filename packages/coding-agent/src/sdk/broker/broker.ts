@@ -161,6 +161,7 @@ import {
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
 	type SpawnLifecycleOwner,
+	type SpawnOwnerRecord,
 	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -762,6 +763,26 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(pinned.cwd) &&
 		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(pinned.stateRoot)
 	);
+}
+
+/**
+ * The spawning master to show on a listed row, or undefined. Spawn authority is
+ * keyed by session id, so the row must also come from a state root the child's
+ * host registered in: an ambiguous row cannot say which root it describes, and
+ * a row from another root (the same id opened or resumed elsewhere) is not the
+ * spawned host. Either carries no spawning master rather than a wrong one.
+ */
+function spawnOwnerForRow(
+	session: IndexedSession,
+	owners: ReadonlyMap<string, SpawnOwnerRecord> | undefined,
+): string | undefined {
+	if (!isSessionAuthorityEligible(session)) return undefined;
+	const owner = owners?.get(session.sessionId);
+	if (owner === undefined) return undefined;
+	if (owner.stateRoots.has(session.locator.stateRoot)) return owner.ownerSessionId;
+	const rowRoot = resolveEquivalentPath(session.locator.stateRoot);
+	for (const root of owner.stateRoots) if (resolveEquivalentPath(root) === rowRoot) return owner.ownerSessionId;
+	return undefined;
 }
 
 /** Exact admission predicate for the child host row published after launch. */
@@ -5535,7 +5556,7 @@ export class Broker {
 				...publicSession
 			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			const spawnOwner = spawnOwners?.get(session.sessionId);
+			const spawnOwner = spawnOwnerForRow(session, spawnOwners);
 			return {
 				...publicSession,
 				...(incarnation === undefined ? {} : { endpointIncarnation: incarnation }),
