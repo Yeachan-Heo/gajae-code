@@ -1407,7 +1407,12 @@ describe("desktop streaming lifecycle", () => {
 			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
 		).toBe(true);
 		expect(await running).toBeNull();
-		expect((await settledReceipts(snapshot, ["run-journal-fails"]))["run-journal-fails"]).toBe("cancelled");
+		// The queued text never ran, so it still goes back to the composer although the receipt
+		// that hands it back failed once.
+		expect(await settledReceipts(snapshot, ["run-journal-fails", "queued-journal-fails"])).toEqual({
+			"run-journal-fails": "cancelled",
+			"queued-journal-fails": "removed",
+		});
 	}, 20_000);
 
 	test("a confirmed Disconnect waits for the shell command it stopped", async () => {

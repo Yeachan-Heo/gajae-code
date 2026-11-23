@@ -617,6 +617,11 @@ export class DesktopHost {
 	 * input that arrived before such a Stop can end `cancelled` or be handed back as not run.
 	 */
 	#runStops = new Map<string, number>();
+	/**
+	 * Queued inputs a Stop cancelled to hand their text back. If that receipt cannot be written, the
+	 * SDK's own report of the cancellation still records them as handed back, never as cancelled.
+	 */
+	#handedBack = new Set<string>();
 	/** The background workspace refresh a bootstrap started, and whether another pass was asked for. */
 	#workspaceRefresh?: Promise<void>;
 	#workspaceRefreshAgain = false;
@@ -2762,7 +2767,9 @@ export class DesktopHost {
 		// returns its text to the composer, where `cancelled` would drop it. This write lands
 		// before the SDK's own cancellation report, which the final receipt then ignores.
 		for (const tracked of live.queued.values()) {
+			this.#handedBack.add(tracked.deliveryId);
 			if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "removed" });
+			else this.#handedBack.delete(tracked.deliveryId);
 		}
 		// Stop means stop: the default cause ends the run without starting another. A user steer it
 		// did not take is dropped and reported removed; an agent follow-up stays queued for the next
@@ -3955,7 +3962,9 @@ export class DesktopHost {
 								await this.#delivery(request.id, {
 									disposition:
 										outcome.reason === "cancelled"
-											? "cancelled"
+											? this.#handedBack.has(request.id)
+												? "removed"
+												: "cancelled"
 											: outcome.reason === "refused"
 												? "refused"
 												: "removed",
@@ -3987,10 +3996,13 @@ export class DesktopHost {
 						const ownTurn = outcome.disposition === "completed" ? this.#claimUserTurn(live, claimant) : undefined;
 						const stoppedRun = stopped();
 						const inTranscript = ownTurn !== undefined && persistedUserTurn(live.sdk, ownTurn);
+						const handedBack = this.#handedBack.delete(request.id);
 						const disposition =
 							outcome.disposition === "removed"
 								? outcome.reason === "cancelled"
-									? "cancelled"
+									? handedBack
+										? "removed"
+										: "cancelled"
 									: outcome.reason === "refused"
 										? "refused"
 										: "removed"
