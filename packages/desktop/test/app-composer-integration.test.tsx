@@ -2940,6 +2940,34 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("the sidebar menu offers no Rename for a conversation the app does not write", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			const menuItems = async () => {
+				await page.evaluate(() => {
+					const row = [...document.querySelectorAll(".desktop-sidebar .session-item")].find(
+						node => node.querySelector(".session-title")?.textContent === "Session B",
+					);
+					row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
+				});
+				await page.waitForSelector('.context-menu [role="menuitem"]');
+				const items = await page.$$eval('.context-menu [role="menuitem"]', nodes => nodes.map(node => node.textContent?.trim()));
+				await page.keyboard.press("Escape");
+				await page.waitForFunction(() => !document.querySelector(".context-menu"));
+				return items;
+			};
+			for (const state of ["disconnected", "elsewhere"] as const) {
+				await page.evaluate(state => window.fixture.emit({ type: "session", session: { id: "b", title: "Session B", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: null, messages: [], connection: { state } } }), state);
+				await page.waitForSelector(`.desktop-sidebar .connection-mark[data-state="${state}"]`);
+				// The Host refuses a rename here, so the menu does not offer one, like the actions menu.
+				expect({ state, items: await menuItems() }).toEqual({ state, items: ["Open conversation"] });
+			}
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
 	test("the sidebar menu renames another conversation without selecting it", async () => {
 		const { context, page } = await fixture();
 		try {

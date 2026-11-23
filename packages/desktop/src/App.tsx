@@ -2724,16 +2724,19 @@ export default function App() {
 							>
 								{t("shell.openConversation")}
 							</Button>
-							<Button
-								role="menuitem"
-								disabled={!connected}
-								onClick={() => {
-									setMenu(null);
-									setRenaming({ sessionId: menuSession.id, title: menuSession.title });
-								}}
-							>
-								{t("shell.rename")}
-							</Button>
+							{/* The Host refuses to rename a conversation the app does not write; offer it only when it can. */}
+							{connectionState(menuSession) === "connected" && (
+								<Button
+									role="menuitem"
+									disabled={!connected}
+									onClick={() => {
+										setMenu(null);
+										setRenaming({ sessionId: menuSession.id, title: menuSession.title });
+									}}
+								>
+									{t("shell.rename")}
+								</Button>
+							)}
 						</>
 					)
 				)}
