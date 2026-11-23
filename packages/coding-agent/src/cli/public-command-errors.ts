@@ -401,8 +401,9 @@ export function classifyPublicCommandFailure(
 		} else if (isSessionClose && kind === "busy" && outcomeCertainty === "not-applied") {
 			// Idle close is retirement: steering would add work. busy stays retryable under the same key.
 			nextSteps.push(step(CLOSE_BUSY_STEP, inspectArgv));
-		} else if (isSessionClose && kind === "endpoint_stale") {
-			// Unlike busy, a stale-endpoint close is terminal for its key and does not prove no effect.
+		} else if (isSessionClose && kind === "endpoint_stale" && outcomeCertainty !== "not-applied") {
+			// Unlike busy, a broker stale-endpoint close is terminal for its key and does not prove no effect.
+			// A pre-send refusal (no live endpoint authority) sent no close and falls through to inspect.
 			nextSteps.push(step(CLOSE_STALE_STEP, inspectArgv));
 		} else if (kind === "busy" && canonical[0] === "sdk" && outcomeCertainty === "not-applied") {
 			// A refused-before-execution request has no operation record to reconcile:

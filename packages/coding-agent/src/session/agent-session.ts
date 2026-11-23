@@ -9932,9 +9932,9 @@ export class AgentSession {
 	#cancelPendingSessionRecap(): void {
 		this.#recapEpoch++;
 		this.#terminalRecapContext = undefined;
-		const controller = this.#recapController;
-		this.#recapController = undefined;
-		controller?.abort();
+		// Keep the handle until the detached chain settles (its finally clears it): an aborted
+		// recap can still be finishing an append, and idle close must count it as busy.
+		this.#recapController?.abort();
 	}
 
 	/** Cancel a pending recap and forget the request of the turn in progress. */

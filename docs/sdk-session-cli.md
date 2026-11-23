@@ -315,9 +315,10 @@ atomically checks streaming and pending turns, prompt queues, running owned
 async jobs, foreground bash, side questions (including credential lookup), and
 an in-flight session recap request, then fences prompt admission until shutdown.
 `--if-idle` combined with a JSON input whose `ifIdle` is anything other than
-`true` is rejected as a usage error before the broker is contacted. Prompt continuations, completion
-delivery, `/btw`, and IRC/background side turns cannot start after that fence. A busy host
-returns `busy` without closing or signalling it and remains usable. Retry the
+`true` is rejected as a usage error before the broker is contacted. Prompt
+continuations, completion delivery, `/btw`, and IRC/background side turns
+cannot start after that fence. A busy host returns `busy` without closing or
+signalling it and remains usable. Retry the
 same key after it becomes idle: `busy` retains the request binding but is not a
 terminal ledger result. The default derived key includes the idle-only mode so
 it cannot collide with an ordinary forced close. An unsupported or unreachable
@@ -333,7 +334,8 @@ spawn-authority path that an ordinary close takes, so a spawned child that is
 no longer indexed by the broker gets the generic lifecycle `not_found` and its
 spawn authority stays active: `--if-idle` cannot retire it, and repeating it
 with the same key only replays that refusal. `gjc sdk session close` itself
-refuses an unindexed session with `not_found` before contacting the broker. To
+looks the session up through the broker and refuses an unindexed session with
+`not_found` before sending any close request. To
 recover, first confirm that the child should stop (it no longer appears in
 `gjc sdk session list`, so use the master's own record of the spawn), then
 send an ordinary close (no `ifIdle`) with a new key, for example
@@ -351,7 +353,10 @@ Generic lifecycle `not_found` failures retain `outcomeCertainty: "unknown"`.
 authority and using a new key. It can arise during generation revalidation
 after close dispatch or shutdown escalation, so the code alone does not prove
 that nothing happened. Unlike `busy`, resetting it would discard effect
-uncertainty. Without `--if-idle`, forced-close behavior is unchanged.
+uncertainty. The exception is a session whose indexed row has no live endpoint
+authority: `gjc sdk session close` reports `endpoint_stale` with
+`outcomeCertainty: "not-applied"` because it refused before sending any close.
+Without `--if-idle`, forced-close behavior is unchanged.
 
 ### retire
 

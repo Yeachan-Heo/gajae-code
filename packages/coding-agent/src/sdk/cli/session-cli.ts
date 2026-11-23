@@ -2353,7 +2353,8 @@ async function resolveCloseAuthority(
 		typeof row.endpointIncarnation !== "string" ||
 		!/^[a-f0-9]{64}$/u.test(row.endpointIncarnation)
 	)
-		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} has no live endpoint authority.`, 1);
+		// Refused while resolving authority: no close request was sent and no key was bound.
+		throw sdkPublicFailure("session_unavailable", { sessionId }, "pre-send");
 	return { endpointGeneration: row.endpointGeneration, endpointIncarnation: row.endpointIncarnation };
 }
 

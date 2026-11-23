@@ -1076,6 +1076,37 @@ describe("AgentSession turn-end recap", () => {
 			gate.release();
 			await waitUntil(() => harness.manager.getSessionRecap() !== undefined, "recap commit");
 			expect(recapEntries(harness.manager)).toHaveLength(1);
+			// Once the same recap settles, the session is idle again.
+			await settle();
+			harness.session.prepareCloseIfIdle();
+		});
+
+		it("stays busy while a cancelled recap is still finishing its append", async () => {
+			const harness = createHarness();
+			const appendGate = Promise.withResolvers<void>();
+			const appendEntered = Promise.withResolvers<void>();
+			const append = harness.session.appendSessionRecapForSession.bind(harness.session);
+			vi.spyOn(harness.session, "appendSessionRecapForSession").mockImplementation(async input => {
+				appendEntered.resolve();
+				await appendGate.promise;
+				return await append(input);
+			});
+			await runTurn(harness, "first request");
+			await appendEntered.promise;
+
+			// The cancel arrives after the commit checks passed: the append is still outstanding.
+			harness.settings.set("ui.language", "ko");
+			let refusal: unknown;
+			try {
+				harness.session.prepareCloseIfIdle();
+			} catch (error) {
+				refusal = error;
+			}
+			expect((refusal as { code?: unknown } | undefined)?.code).toBe("busy");
+
+			appendGate.resolve();
+			await settle();
+			harness.session.prepareCloseIfIdle();
 		});
 
 		it("accepts the idle close once the recap request has settled", async () => {

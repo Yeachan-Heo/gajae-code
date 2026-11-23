@@ -25,6 +25,7 @@ const lifecycle: SdkSessionCliDependencies["lifecycleService"] = {
 						endpointIncarnation: "a".repeat(64),
 						live: true,
 					},
+					{ sessionId: "sess-no-authority", live: false },
 				],
 				warnings: [],
 			},
@@ -235,6 +236,19 @@ test("a busy close recommends inspect, wait and same-key retry; a stale close re
 	expect(staleStep.argv).toEqual(["sdk", "session", "inspect", "sess-1"]);
 	expect(staleStep.description).toContain("terminal for its idempotency key");
 	expect(staleStep.description).not.toContain("rerun the same close command");
+});
+
+test("a row without endpoint authority refuses before any close is sent and omits the terminal-key step", async () => {
+	const { outputs, exitCode } = await run({ action: "close", sessionId: "sess-no-authority", ifIdle: true });
+	expect(exitCode).toBe(1);
+	const envelope = outputs[0] as {
+		error: { code: string; outcomeCertainty: string; nextSteps: { description: string; argv?: string[] }[] };
+	};
+	expect(envelope.error).toMatchObject({ code: "endpoint_stale", outcomeCertainty: "not-applied" });
+	for (const next of envelope.error.nextSteps)
+		expect(next.description).not.toContain("terminal for its idempotency key");
+	expect(captured.listCalls).toBe(1);
+	expect(captured.requests).toEqual([]);
 });
 
 test("a generic not_found code cannot erase prior acceptance proof or invent no-effect proof", async () => {
