@@ -950,6 +950,24 @@ test("with no broker to ask, a leftover close is not counted as an attempt", asy
 	expect(h.closeRequests).toEqual([terminal.id]);
 });
 
+test("a failed owner-note save is logged, not reported when the app shuts down", async () => {
+	const { h, terminal } = await leftoverRow("Note save fails");
+	h.broker.closeAnswer = "busy";
+	const write = Bun.write;
+	const failing = vi.spyOn(Bun, "write").mockImplementation((async (...args: Parameters<typeof Bun.write>) => {
+		if (String(args[0]).includes(`${path.sep}catalog.`)) throw new Error("disk full");
+		return write(...args);
+	}) as typeof Bun.write);
+	const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+	await h.call("session.select", { sessionId: terminal.id });
+	for (let attempt = 0; attempt < 200 && !logged.mock.calls.length; attempt++) await Bun.sleep(5);
+	failing.mockRestore();
+	expect(logged.mock.calls.map(call => String(call[0])).some(line => line.includes("owner note"))).toBe(true);
+	// Shutting down does not report the lost note as a failure.
+	await h.restart();
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
+});
+
 test("a note saved before attempts were counted loads and is used", async () => {
 	const { h, terminal } = await leftoverRow("Noted by the first version of the note");
 	await h.restart();

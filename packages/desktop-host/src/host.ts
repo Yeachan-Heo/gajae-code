@@ -1183,7 +1183,11 @@ export class DesktopHost {
 			throw new Error(`Managed session storage is unavailable for this workspace: ${result.message}`);
 		return result.scope.directoryPath;
 	}
-	#save(): Promise<void> {
+	/**
+	 * Writes the catalog. A failure is kept for `close()` to report, unless the write only records
+	 * an advisory note (`advisory`), whose loss a later write repairs.
+	 */
+	#save(options: { advisory?: boolean } = {}): Promise<void> {
 		const content = JSON.stringify(
 			this.#connectPending.size === 0
 				? this.#catalog
@@ -1206,7 +1210,7 @@ export class DesktopHost {
 		// Keep the queue drain separate from failure history: a later successful
 		// rollback or teardown write cannot erase an earlier persistence failure.
 		this.#saving = save.catch(error => {
-			this.#saveFailures.push(error);
+			if (!options.advisory) this.#saveFailures.push(error);
 		});
 		return save;
 	}
@@ -1410,7 +1414,9 @@ export class DesktopHost {
 	}
 	/** Saves a leftover-owner note change; a failed save is retried by the next catalog write. */
 	#saveNote(): void {
-		this.#save().catch(error => {
+		// The note is advisory: its loss only means one more close attempt, so a failed write is
+		// logged here and never reported as a shutdown failure.
+		this.#save({ advisory: true }).catch(error => {
 			console.error(`Desktop could not save a conversation's owner note: ${this.#diagnostic(error)}`);
 		});
 	}
