@@ -49,6 +49,18 @@ export interface FunctionCallPart {
 	name?: string;
 	args?: Record<string, unknown>;
 	id?: string;
+	partialArgs?: PartialArg[];
+	willContinue?: boolean;
+}
+
+/** JSONPath-addressed primitive fragment. An omitted value can terminate an open string. */
+export interface PartialArg {
+	jsonPath: string;
+	numberValue?: number;
+	stringValue?: string;
+	boolValue?: boolean;
+	nullValue?: null | "NULL_VALUE" | 0;
+	willContinue?: boolean;
 }
 
 /** Tool execution result fed back to the model. */
@@ -103,6 +115,7 @@ export interface ToolConfig {
 	functionCallingConfig?: {
 		mode: FunctionCallingConfigMode;
 		allowedFunctionNames?: string[];
+		streamFunctionCallArguments?: boolean;
 	};
 }
 
