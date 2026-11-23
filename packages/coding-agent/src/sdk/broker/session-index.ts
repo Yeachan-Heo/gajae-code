@@ -1904,12 +1904,16 @@ export class SessionIndex {
 		const budget = new AbortController();
 		const abandoned = Promise.withResolvers<never>();
 		let reading = false;
-		const timer = setTimeout(() => {
-			budget.abort(expired());
-			// A read already under the lock is awaited to completion; only a caller
-			// still waiting in the queue or on the lock is released here.
-			if (!reading) abandoned.reject(budget.signal.reason);
-		}, deadlineAt - Date.now());
+		// The delay is clamped: setTimeout overflows above 2^31-1 ms and fires at once.
+		const timer = setTimeout(
+			() => {
+				budget.abort(expired());
+				// A read already under the lock is awaited to completion; only a caller
+				// still waiting in the queue or on the lock is released here.
+				if (!reading) abandoned.reject(budget.signal.reason);
+			},
+			Math.min(deadlineAt - Date.now(), 2 ** 31 - 1),
+		);
 		timer.unref?.();
 		const queued = SessionIndex.#enqueue(indexPath, async () => {
 			budget.signal.throwIfAborted();

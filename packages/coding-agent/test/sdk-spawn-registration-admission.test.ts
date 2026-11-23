@@ -133,6 +133,23 @@ describe("awaitSpawnHostRegistration", () => {
 		expect(recovered).toMatchObject({ ok: true, registration: { sessionId: "child-lock-held" } });
 	});
 
+	it("keeps an earlier mismatch when the final polls cannot read the index", async () => {
+		const f = await fixture("child-mismatch-then-locked");
+		await f.host.append(f.registration({ lifecycleRequestId: "marker-other" }));
+		const deadlineAt = Date.now() + 1_200;
+		const waiting = awaitSpawnHostRegistration(f.observer, f.request(deadlineAt));
+		await Bun.sleep(300);
+		const acquired = Promise.withResolvers<void>();
+		const holder = withFileLock(path.join(f.agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+			acquired.resolve();
+			await Bun.sleep(Math.max(0, deadlineAt - Date.now()) + 300);
+		});
+		await acquired.promise;
+		const result = await waiting;
+		await holder;
+		expect(result).toEqual({ ok: false, reason: "mismatch" });
+	});
+
 	it("reports absent when no row for the child was ever published", async () => {
 		const f = await fixture("child-absent");
 		await f.host.append({ ...f.registration(), sessionId: "unrelated-session" });

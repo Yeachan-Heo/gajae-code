@@ -6,7 +6,11 @@ import * as path from "node:path";
 import { Broker, type SpawnRegistrationRequest, spawnRegistrationMatches } from "../src/sdk/broker/broker";
 import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import {
+	setLifecycleCommandResolverForTest,
+	writeSessionLifecycleFailure,
+	writeSessionLifecycleReady,
+} from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { type IndexedSession, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
@@ -1076,71 +1080,122 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
-	it("admits a valid registration that the registration layer observed after the deadline", async () => {
-		// The registration layer bounds its own reads by the deadline and may return
-		// a read that began in time after the clock passed it. The flow driver must
-		// not discard that host by re-checking the clock (the macOS
-		// child_registration_timeout report: host registered at +1.9 s of 8 s).
-		const agentDir = await temp();
-		let closes = 0;
-		let dispatches = 0;
-		let deadlineAt = 0;
-		const broker = new Broker({
-			agentDir,
-			masterCapabilityVerifier: verifier,
-			spawnSubstrateProvider: {
-				launch: async () => ({
-					ok: true as const,
-					proof: {
-						substrateKind: "headless" as const,
-						providerIdentity: "late-observer-provider",
-						pid: 996,
-						processIncarnation: "inc-996",
-					},
-				}),
-				verify: async () => "verified" as const,
-				resolveLifecycleOwner: resolveFakeLifecycleOwner,
-				close: async () => {
-					closes += 1;
-					return { ok: true };
-				},
-			},
-			spawnPromptLayer: {
-				awaitRegistration: async (input: SpawnRegistrationRequest) => {
-					deadlineAt = input.deadlineAt;
-					await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 50);
-					return {
+	for (const host of ["ready", "failed", "silent"] as const) {
+		it(`settles a registration observed after the deadline on the host's own verdict: ${host}`, async () => {
+			// The registration layer may return a read that began in time after the
+			// clock passed the deadline (the macOS child_registration_timeout report:
+			// host registered at +1.9 s of 8 s). The flow driver must not discard that
+			// host on the clock alone, but past the deadline the host may already be
+			// rolling back, so admission needs its committed readiness.
+			const agentDir = await temp();
+			const incarnation = processIncarnation(process.pid);
+			if (!incarnation) throw new Error("test process incarnation is unavailable");
+			let closes = 0;
+			let dispatches = 0;
+			let deadlineAt = 0;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
 						ok: true as const,
-						registration: {
-							sessionId: input.childId,
-							lifecycleRequestId: input.effectMarker,
-							endpointGeneration: 1,
-							pid: 996,
-							processIncarnation: "inc-996",
-							cwd: input.cwd,
-							stateRoot: input.stateRoot,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "late-observer-provider",
+							pid: process.pid,
+							processIncarnation: incarnation,
 						},
-					};
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
 				},
-				dispatch: async () => {
-					dispatches += 1;
-					return { kind: "accepted" as const, commandId: "cmd-late", turnId: "turn-late", acceptedAt: Date.now() };
+				spawnPromptLayer: {
+					awaitRegistration: async (input: SpawnRegistrationRequest) => {
+						deadlineAt = input.deadlineAt;
+						if (host === "ready")
+							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+						if (host === "failed")
+							await writeSessionLifecycleFailure(
+								input.stateRoot,
+								input.childId,
+								input.effectMarker,
+								{ phase: "startup", reason: "pending", message: "readiness cutoff" },
+								{
+									endpointGeneration: null,
+									fenced: true,
+									runtimeRemoved: true,
+									hostStopped: true,
+									brokerRegistrationReleased: true,
+								},
+								undefined,
+								incarnation,
+								process.pid,
+							);
+						await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 50);
+						return {
+							ok: true as const,
+							registration: {
+								sessionId: input.childId,
+								lifecycleRequestId: input.effectMarker,
+								endpointGeneration: 1,
+								pid: process.pid,
+								processIncarnation: incarnation,
+								cwd: input.cwd,
+								stateRoot: input.stateRoot,
+							},
+						};
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return {
+							kind: "accepted" as const,
+							commandId: "cmd-late",
+							turnId: "turn-late",
+							acceptedAt: Date.now(),
+						};
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
 				},
-				reconcile: async () => ({ status: "unknown" as const }),
-			},
-		});
-		await broker.start();
-		try {
-			const response = await broker.handleRequest("session.spawn", spawnInput(), "late-observer-key");
-			expect(Date.now()).toBeGreaterThan(deadlineAt);
-			expect(response).toMatchObject({ ok: true });
-			expect(dispatches).toBe(1);
-			expect(closes).toBe(0);
-			expect((await latestClaim(agentDir))?.state).toBe("accepted");
-		} finally {
-			await broker.stop();
-		}
-	}, 20_000);
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`late-observer-${host}`,
+				);
+				expect(Date.now()).toBeGreaterThan(deadlineAt);
+				const claim = await latestClaim(agentDir);
+				if (host === "ready") {
+					expect(response).toMatchObject({ ok: true });
+					expect(dispatches).toBe(1);
+					expect(closes).toBe(0);
+					expect(claim?.state).toBe("accepted");
+					return;
+				}
+				expect(response).toMatchObject({
+					ok: false,
+					error: {
+						code: "spawn_failed",
+						details: {
+							code: host === "failed" ? "child_registration_failed" : "child_registration_timeout",
+						},
+					},
+				});
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.seed).toBeUndefined();
+				if (host === "silent") expect(claim?.failure?.message).toContain("did not confirm readiness");
+			} finally {
+				await broker.stop();
+			}
+		}, 20_000);
+	}
 
 	for (const scenario of [
 		{ reason: "absent", message: "no registration row was observed" },

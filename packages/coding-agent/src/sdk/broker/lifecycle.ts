@@ -1718,6 +1718,8 @@ export type SpawnChildHostLaunch = {
 	env: Readonly<Record<string, string>>;
 	effectMarker: string;
 	semanticReadyDeadlineAt: number;
+	/** Host rollback has started by then; bounds a broker waiting for the host's own startup verdict. */
+	terminationStartDeadlineAt: number;
 };
 
 export function prepareSpawnChildHostLaunch(
@@ -1770,6 +1772,7 @@ export function prepareSpawnChildHostLaunch(
 		},
 		effectMarker,
 		semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
+		terminationStartDeadlineAt: deadlines.terminationStartDeadlineAt,
 	};
 }
 
@@ -4586,6 +4589,25 @@ export async function readSessionLifecycleFailure(
 ): Promise<LifecycleFailureArtifact | undefined> {
 	return (await readLifecycleFailureArtifact(lifecycleFailurePath(root, id, expected.effectMarker), expected))
 		?.artifact;
+}
+
+/**
+ * Whether the host committed its own readiness: both the owner marker and the
+ * readiness marker name exactly `expected`. The host publishes readiness only
+ * before its semantic cutoff, so this is the host-side verdict a broker needs
+ * when it observed the registration only after that cutoff.
+ */
+export async function hasSessionLifecycleReadiness(root: string, id: string, expected: EffectMarker): Promise<boolean> {
+	const [effect, ready] = await Promise.all([
+		readEffectMarker(lifecycleMarkerPath(root, id)),
+		readEffectMarker(lifecycleReadyPath(root, id)),
+	]);
+	return (
+		effect !== undefined &&
+		ready !== undefined &&
+		sameEffectMarker(effect, expected) &&
+		sameEffectMarker(ready, expected)
+	);
 }
 
 /**
