@@ -557,7 +557,8 @@ not settle earlier effects.
   and never creates one. Malformed state or an unreadable/malformed existing
   attestation fails without writing. The ledger must also fit the bounds the
   broker applies when it opens it (64 MiB, 10,000 rows, 8 MiB per row by
-  default), because the broker loads no attestation from a ledger past them. An
+  default), because the broker refuses to open a ledger past them, so an
+  attestation computed from it would never load. An
   existing attestation must fit the same 64 MiB bound and list only lowercase
   64-character hex identities; any other entry is refused rather than
   republished, and a union that would exceed the bound is not written. A failure before rename leaves the previous
@@ -586,12 +587,16 @@ not settle earlier effects.
   already-attested identities are excluded. Unproven rows stay fenced. The file
   takes effect at the next broker start for the same agent directory; the
   restart notice names that directory, shell-quoted. Restart through the
-  external supervisor for `gjc sdk broker run --agent-dir <dir>`. An on-demand
-  broker loads it when the next `gjc sdk` command run with `--agent-dir <dir>`
-  starts it; if one is still running, wait for it to exit once idle or stop it
-  first. From a source checkout, `bun run restart:sdk-broker -- --agent-dir <dir>`
-  restarts it (the script is not part of installed builds). The attestation
-  command never restarts the broker.
+  external supervisor for `gjc sdk broker run --agent-dir <dir>`. Restart a
+  running on-demand broker with
+  `gjc doctor --fix --repair service.restart-owned` on its broker target, run
+  with `GJC_CODING_AGENT_DIR` set to that directory (see [doctor](doctor.md));
+  if none is running, the next `gjc sdk session`, `search` or `spawn` command
+  run with `--agent-dir <dir>` (not attach-only) starts one. From a source
+  checkout, `bun run restart:sdk-broker -- --agent-dir <dir>` also restarts it
+  (the script is not part of installed builds). The attestation command never
+  restarts the broker, and refuses an agent directory that no broker can run
+  for (relative, control characters, or a leading `-`).
   The broker itself never writes or derives this file. It honors a listed
   identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target

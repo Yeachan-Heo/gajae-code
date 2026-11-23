@@ -57,13 +57,6 @@ function identity(token: string, operation = "session.spawn", version = 3): stri
 /** A well-formed prior attestation entry that is not in the test ledger. */
 const preserved = identity("preserved-not-in-ledger");
 
-async function sparseFile(file: string, size: number): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const handle = await fs.open(file, "w");
-	await handle.truncate(size);
-	await handle.close();
-}
-
 function row(id: string, fields: Partial<LifecycleLedgerEntry> = {}): LifecycleLedgerEntry {
 	return { version: 1, identity: id, requestHash: "request", state: "accepted", ts: 1, ...fields };
 }
@@ -736,14 +729,25 @@ describe("SDK spawn-anchor attestation", () => {
 		await expect(new LifecycleLedger(f.agentDir).open()).rejects.toThrow("maximum row count");
 	}, 30_000);
 
-	it("refuses a ledger past the broker byte bound before reading it", async () => {
+	it("refuses a ledger of valid rows past the broker byte bound", async () => {
 		const f = await fixture();
-		await sparseFile(f.ledgerPath, DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes + 1);
-		await Bun.write(f.evidencePath, "byte-bound-canary");
+		const { maxBytes, maxLineBytes, maxRows } = DEFAULT_LIFECYCLE_LEDGER_LIMITS;
+		// Every row is valid JSON padded with trailing whitespace, within the row and line bounds;
+		// only the total byte bound can reject this source.
+		const rowCount = Math.ceil(maxBytes / (maxLineBytes - 1024)) + 1;
+		expect(rowCount).toBeLessThan(maxRows);
+		const lines = Array.from({ length: rowCount }, (_, index) =>
+			JSON.stringify(row(identity(`byte-bound-${index}`))).padEnd(maxLineBytes - 1024, " "),
+		);
+		await Bun.write(f.ledgerPath, `${lines.join("\n")}\n`);
+		expect((await fs.stat(f.ledgerPath)).size).toBeGreaterThan(maxBytes);
+		await Bun.write(f.evidencePath, "byte-bound-0");
 		const result = await cliCommand(f, ["--evidence", f.evidencePath, "--write", "--json"]);
 		expectFailureEnvelope(result, "spawn_anchor_ledger_invalid");
 		expect(await Bun.file(f.attestationPath).exists()).toBe(false);
-	}, 30_000);
+		// The real broker refuses the same source, so a written attestation would never load.
+		await expect(new LifecycleLedger(f.agentDir).open()).rejects.toThrow("maximum file byte length");
+	}, 60_000);
 
 	it.each([
 		["a non-digest string", "not-an-identity"],
@@ -761,16 +765,22 @@ describe("SDK spawn-anchor attestation", () => {
 		expect(await Bun.file(f.attestationPath).text()).toBe(original);
 	});
 
-	it("refuses an existing attestation past the broker byte bound", async () => {
+	it("refuses a well-formed existing attestation past the broker byte bound", async () => {
 		const f = await fixture();
 		await writeRows(f, [row(identity("oversized-attestation-token"))]);
 		await Bun.write(f.evidencePath, "oversized-attestation-token");
-		await sparseFile(f.attestationPath, DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes + 1);
+		// Valid JSON apart from its size: trailing whitespace parses, so only the byte bound refuses it.
+		const original = JSON.stringify({ version: 1, identities: [preserved] }).padEnd(
+			DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes + 1,
+			" ",
+		);
+		expect(JSON.parse(original)).toEqual({ version: 1, identities: [preserved] });
+		await Bun.write(f.attestationPath, original);
 		await expect(
 			runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath], write: true }),
 		).rejects.toMatchObject({ input: { proof: "pre-effect", diagnostics: ["spawn_anchor_attestation_invalid"] } });
 		expect((await fs.stat(f.attestationPath)).size).toBe(DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes + 1);
-	});
+	}, 30_000);
 
 	it("does not publish a union the broker would ignore as oversized", async () => {
 		const f = await fixture();
@@ -809,8 +819,13 @@ describe("SDK spawn-anchor attestation", () => {
 			]) {
 				expect(notice).toContain(`next broker start for agent directory ${quoted}.`);
 				expect(notice).toContain(`your supervisor for gjc sdk broker run --agent-dir ${quoted}.`);
-				expect(notice).toContain(`the next gjc sdk command run with --agent-dir ${quoted} starts it`);
-				expect(notice).toContain(`bun run restart:sdk-broker -- --agent-dir ${quoted} restarts it.`);
+				expect(notice).toContain(
+					`gjc doctor --fix --repair service.restart-owned on its broker target, run with GJC_CODING_AGENT_DIR set to ${quoted};`,
+				);
+				expect(notice).toContain(
+					`the next gjc sdk session, search or spawn command run with --agent-dir ${quoted} starts one.`,
+				);
+				expect(notice).toContain(`bun run restart:sdk-broker -- --agent-dir ${quoted} also restarts it.`);
 				expect(notice).not.toMatch(/[a-f0-9]{64}/i);
 			}
 			// The quoted form round-trips through a POSIX shell to the exact directory.
@@ -820,12 +835,27 @@ describe("SDK spawn-anchor attestation", () => {
 		30_000,
 	);
 
-	it("quotes the agent directory for PowerShell on Windows and never shell-quotes control characters", () => {
+	it("quotes the agent directory for PowerShell on Windows", () => {
 		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o'neil\\gjc agent", "win32")).toContain(
 			"--agent-dir 'C:\\Users\\o''neil\\gjc agent'",
 		);
-		const notice = spawnAnchorAttestationRestartNotice("/tmp/agent\nnext", "linux");
-		expect(notice).toContain('--agent-dir "/tmp/agent\\nnext"');
-		expect(notice).not.toContain("\n");
 	});
+
+	// Windows paths cannot contain a newline.
+	it.skipIf(process.platform === "win32")(
+		"refuses an agent directory no broker can run for before reading any state",
+		async () => {
+			const f = await fixture();
+			await writeRows(f, [row(identity("unsafe-dir-canary"))]);
+			await Bun.write(f.evidencePath, "unsafe-dir-canary");
+			const unsafe = `${f.agentDir}\nnext`;
+			await fs.cp(f.agentDir, unsafe, { recursive: true });
+			await expect(
+				runSpawnAnchorAttestation({ agentDir: unsafe, evidence: [f.evidencePath], write: true }),
+			).rejects.toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+			expect(
+				await Bun.file(path.join(unsafe, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json")).exists(),
+			).toBe(false);
+		},
+	);
 });

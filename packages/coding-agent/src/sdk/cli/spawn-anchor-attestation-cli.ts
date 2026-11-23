@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, logger } from "@gajae-code/utils";
+import { isSafeSdkInternalAgentDir } from "../../cli/public-command-entry";
 import { PublicCommandFailure } from "../../cli/public-command-errors";
 import { posixQuote, windowsPowerShellQuote } from "../../slash-commands/helpers/aside";
 import {
@@ -29,23 +30,18 @@ const MAX_STATE_LINE_BYTES = 8 * 1024 * 1024;
 const TOKEN_SEPARATOR_BYTES = new Set(Buffer.from(" \t\n\r\v\f\"'`\\,;|=()[]{}<>"));
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
 
-/** Shell-quoted agent directory for restart guidance; a control character makes it display-only. */
-function quoteAgentDir(agentDir: string, platform: NodeJS.Platform): string {
-	if (CONTROL_CHARACTER.test(agentDir)) return JSON.stringify(agentDir);
-	return platform === "win32" ? windowsPowerShellQuote(agentDir) : posixQuote(agentDir);
-}
-
 /**
  * Restart guidance for the agent directory that received the attestation. Every route names that
- * directory, because a broker started for another agent directory never loads this file.
+ * directory, shell-quoted, because a broker started for another agent directory never loads this
+ * file. `agentDir` must satisfy `isSafeSdkInternalAgentDir`, as every attested directory does.
  */
 export function spawnAnchorAttestationRestartNotice(agentDir: string, platform = process.platform): string {
-	const dir = quoteAgentDir(agentDir, platform);
+	const dir = platform === "win32" ? windowsPowerShellQuote(agentDir) : posixQuote(agentDir);
 	return [
 		`Takes effect at the next broker start for agent directory ${dir}.`,
 		`Restart through your supervisor for gjc sdk broker run --agent-dir ${dir}.`,
-		`An on-demand broker loads it when the next gjc sdk command run with --agent-dir ${dir} starts it; if one is still running, wait for it to exit once idle or stop it first.`,
-		`From a source checkout, bun run restart:sdk-broker -- --agent-dir ${dir} restarts it.`,
+		`Restart a running on-demand broker with gjc doctor --fix --repair service.restart-owned on its broker target, run with GJC_CODING_AGENT_DIR set to ${dir}; if none is running, the next gjc sdk session, search or spawn command run with --agent-dir ${dir} starts one.`,
+		`From a source checkout, bun run restart:sdk-broker -- --agent-dir ${dir} also restarts it.`,
 	].join(" ");
 }
 
@@ -381,6 +377,8 @@ export async function runSpawnAnchorAttestation(
 	options: SpawnAnchorAttestationOptions,
 ): Promise<SpawnAnchorAttestationResult> {
 	const agentDir = path.resolve(options.agentDir ?? getAgentDir());
+	// No broker can run for a directory outside the broker's own rule, so an attestation there is inert.
+	if (!isSafeSdkInternalAgentDir(agentDir)) throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 	let key: Buffer;
 	try {
 		// Never call getBrokerIdentityKey here: its missing-key path creates new authority.

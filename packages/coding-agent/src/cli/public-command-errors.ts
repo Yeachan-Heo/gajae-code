@@ -103,11 +103,11 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	spawn_anchor_attestation_invalid:
 		"The existing spawn-anchor attestation is malformed or unreadable. Preserve it and investigate before writing.",
 	spawn_anchor_ledger_invalid:
-		"The lifecycle ledger is malformed, unsupported, or unreadable. No attestation was written.",
+		"The lifecycle ledger is malformed, unsupported, unreadable, or past the bounds the broker applies when it opens it. No attestation was written.",
 	spawn_anchor_journal_invalid:
 		"The spawn-authority journal failed authenticated replay validation or could not be read. No attestation was written.",
 	spawn_anchor_write_failed:
-		"Spawn-anchor attestation publication failed before rename. The previous attestation was not replaced.",
+		"Spawn-anchor attestation publication failed before rename, or the union would exceed the byte bound the broker loads. The previous attestation was not replaced.",
 	spawn_anchor_publication_uncertain:
 		"The attestation was renamed, but its durability could not be confirmed. Inspect the existing attestation before any retry; it may take effect at the next broker start.",
 	spawn_anchor_output_failed:
