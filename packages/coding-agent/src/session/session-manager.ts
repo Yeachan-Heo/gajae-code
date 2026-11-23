@@ -7986,6 +7986,8 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#readOnlyResume = false;
+	/** Set only by {@link SessionManager.openReadOnlySnapshot}; every mutation entry point refuses. */
+	#readOnlySnapshot = false;
 	#strictResumeMutationPending = false;
 	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
@@ -18283,6 +18285,8 @@ export class SessionManager {
 	}
 
 	setSessionMemoryMode(mode: SessionMemoryMode): void {
+		// Any mode but "off" builds sidecars beside the source transcript.
+		if (this.#readOnlySnapshot && mode !== "off") throw new Error("read_only_snapshot");
 		const retainedColdRuntime = this.#coldSidecarActive();
 		this.#sessionMemoryMode = mode;
 		if (mode === "off") {
@@ -19374,6 +19378,7 @@ export class SessionManager {
 	 *   Auto-generated titles are silently ignored when the user has already set a name.
 	 */
 	#assertRecoveryHydrationWritable(): void {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		if (this.#strictClosePending) throw new Error("Session manager is closing.");
 	}
@@ -25377,14 +25382,17 @@ export class SessionManager {
 	}
 
 	/**
-	 * Load an existing transcript as a detached in-memory snapshot for read-only
-	 * consumers such as standalone HTML export. Unlike {@link open}, this never
-	 * writes: no replay-metadata patch records (sanitation applies in memory
+	 * Load an existing transcript as a detached snapshot for read-only consumers
+	 * such as standalone HTML export. Unlike {@link open}, this never writes to the
+	 * transcript, its artifact directory, the managed session store, or the terminal
+	 * breadcrumb: no replay-metadata patch records (sanitation applies in memory
 	 * only), no version-migration rewrite, no session-memory sidecars or legacy
-	 * sidecar cleanup, no terminal breadcrumb, and no managed-store adoption.
-	 * Session memory stays `"off"`, so transcripts above the eager inspection cap
-	 * fail with {@link SessionTranscriptOversizedError}. Callers must not mutate
-	 * the returned manager; they only read from it and then `close()` it.
+	 * sidecar cleanup, and no managed-store adoption. Shared content-addressed blobs
+	 * and the process resident cache under the agent dir may still be written, as
+	 * on every load. Session memory stays `"off"`, so transcripts above the eager
+	 * inspection cap fail with {@link SessionTranscriptOversizedError}. The returned
+	 * manager refuses every mutation ({@link isReadOnlySnapshot}); callers only read
+	 * from it and then `close()` it.
 	 */
 	static async openReadOnlySnapshot(
 		filePath: string,
@@ -25413,7 +25421,13 @@ export class SessionManager {
 		await manager.#hydrateExistingSession(filePath, inspected.entries, false, inspected.identity.sha256);
 		manager.#sanitizeLoadedOpenAIResponsesReplayMetadata();
 		manager.buildSessionContext();
+		manager.#readOnlySnapshot = true;
 		return manager;
+	}
+
+	/** True for a manager from {@link SessionManager.openReadOnlySnapshot}, which refuses every mutation. */
+	isReadOnlySnapshot(): boolean {
+		return this.#readOnlySnapshot;
 	}
 
 	/**

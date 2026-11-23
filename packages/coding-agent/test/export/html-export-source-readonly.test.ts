@@ -353,3 +353,52 @@ describe("standalone HTML export of legacy and vanished sources", () => {
 		expect(fs.existsSync(sessionFile)).toBe(false);
 	});
 });
+
+describe("read-only session snapshot", () => {
+	it("refuses every mutation and leaves the source untouched", async () => {
+		const content = staleReplayTranscript();
+		const { sourceDir, sessionFile } = seedSource(content);
+		const before = snapshotTree(sourceDir);
+		const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+		try {
+			expect(snapshot.isReadOnlySnapshot()).toBe(true);
+			const mutations: Record<string, () => unknown> = {
+				appendMessage: () => snapshot.appendMessage({ role: "user", content: "probe", timestamp: 2 }),
+				appendCustomEntry: () => snapshot.appendCustomEntry("probe", { value: 1 }),
+				appendModelChange: () => snapshot.appendModelChange("openai/test"),
+				appendThinkingLevelChange: () => snapshot.appendThinkingLevelChange("high"),
+				appendLabelChange: () => snapshot.appendLabelChange("user", "label"),
+				appendCompaction: () => snapshot.appendCompaction("summary", "short", "user", 1),
+				setSessionName: () => snapshot.setSessionName("Renamed", "user"),
+				setSessionStarred: () => snapshot.setSessionStarred(true),
+				branch: () => snapshot.branch("user"),
+				resetLeaf: () => snapshot.resetLeaf(),
+				rewriteEntries: () => snapshot.rewriteEntries(),
+				ensureOnDisk: () => snapshot.ensureOnDisk(),
+				newSession: () => snapshot.newSession(),
+				sanitizeLoadedOpenAIResponsesReplayMetadata: () => snapshot.sanitizeLoadedOpenAIResponsesReplayMetadata(),
+				setSessionMemoryModeEnabled: () => snapshot.setSessionMemoryMode("enabled"),
+			};
+			const refusals: Record<string, string | undefined> = {};
+			for (const [name, mutate] of Object.entries(mutations)) refusals[name] = await rejectionMessage(mutate);
+			expect(refusals).toEqual(Object.fromEntries(Object.keys(mutations).map(name => [name, "read_only_snapshot"])));
+		} finally {
+			await snapshot.close();
+		}
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
+		expect(snapshotTree(sourceDir)).toEqual(before);
+	});
+
+	it("leaves normally opened sessions writable", async () => {
+		const { sessionFile } = seedSource(staleReplayTranscript());
+		const manager = await SessionManager.open(sessionFile, undefined, undefined, "copy-retain", "off");
+		try {
+			expect(manager.isReadOnlySnapshot()).toBe(false);
+			manager.appendMessage({ role: "user", content: "normal append", timestamp: 2 });
+			await manager.flush();
+		} finally {
+			await manager.close();
+		}
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("normal append");
+	});
+});
