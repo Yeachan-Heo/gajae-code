@@ -254,13 +254,15 @@ export interface DesktopSessionConnection {
 }
 
 /**
- * `session.disconnect` answer. Without `confirm`, a conversation with a running turn or queued
- * input is left untouched and the answer says what Disconnect would stop. With `confirm: true`
- * that work is stopped exactly as Stop does before the writer is released.
+ * `session.disconnect` answer. Without `confirm`, a conversation with a running turn, queued
+ * input or background work is left untouched and the answer says what Disconnect would stop.
+ * With `confirm: true` the turn and queue are stopped exactly as Stop does, and the background
+ * work ends with the session, before the writer is released. `background` (present only when
+ * above zero) counts running jobs, live tasks and schedules.
  */
 export type DesktopDisconnectResult =
 	| { disconnected: true; session: DesktopSession }
-	| { disconnected: false; confirm: { running: boolean; queued: number } };
+	| { disconnected: false; confirm: { running: boolean; queued: number; background?: number } };
 
 export type DesktopForkResult =
 	| { cancelled: true }

@@ -34,6 +34,7 @@ import {
 	type InputEventResult,
 	isEmbeddedAncestor,
 	isEmbeddedAppendRefused,
+	type JobObservationSnapshot,
 	type lifecycle,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
@@ -432,6 +433,9 @@ const STILL_STOPPING = "The conversation is still stopping. Try Disconnect again
 /** A live process other than the app (usually a terminal) holds the transcript open. */
 const ELSEWHERE =
 	"A terminal (another gjc process) is using this conversation, so the app shows it read-only. Finish there, then check again.";
+/** A terminal has the conversation open, but the app still holds it because its background work runs. */
+const ELSEWHERE_BACKGROUND =
+	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs, so nothing new starts here; Disconnect stops that work and leaves the conversation to the terminal.";
 /** A released conversation is not deleted while the running broker cannot say whether a terminal has it. */
 const OWNER_UNCHECKED_DELETE =
 	"The app could not check whether a terminal has this conversation open, so it was not deleted. Try again in a moment.";
@@ -2705,8 +2709,8 @@ export class DesktopHost {
 	 * keeping its final view, and the request is refused before anything runs (an input's text
 	 * returns to the composer). A slow or failing broker never holds this up past its timeout.
 	 */
-	async #recheckOwner(live: LiveSession): Promise<void> {
-		if (!this.#reloadable(live)) return;
+	async #recheckOwner(live: LiveSession, method: DesktopRequest["method"]): Promise<void> {
+		if (!this.#idle(live)) return;
 		if ((await this.#ownerAnswer(live.metadata)).kind !== "live") return;
 		// Another request replaced or released this copy while the broker answered. The answer was
 		// about a copy that is no longer the conversation's: leave the row as it is, and let the
@@ -2715,7 +2719,13 @@ export class DesktopHost {
 		// Work started in this copy meanwhile (another request found no owner and started a turn).
 		// Releasing it now would dispose that work, so keep the copy writable; the next write checks
 		// again, and the store's compare-and-append refusal stays the backstop.
-		if (!this.#reloadable(live)) return;
+		if (!this.#idle(live)) return;
+		// Stepping aside would dispose the session and end its background work. Keep the copy, and
+		// start nothing new in it while the terminal has it; selecting it still shows it.
+		if (this.#backgroundWork(live) > 0) {
+			if (method === "session.select") return;
+			throw new Error(ELSEWHERE_BACKGROUND);
+		}
 		this.#elsewhere.add(live.metadata.id);
 		this.#live.delete(live.metadata.id);
 		this.#retiredLive.add(live);
@@ -2764,8 +2774,8 @@ export class DesktopHost {
 	#recordRunStop(sessionId: string, arrival: number): void {
 		this.#runStops.set(sessionId, Math.max(this.#runStops.get(sessionId) ?? 0, arrival));
 	}
-	/** Work Disconnect would stop: a turn, queued input, a command, an approval or a question still waiting. */
-	#disconnectWouldStop(live: LiveSession): { running: boolean; queued: number } | undefined {
+	/** Work Disconnect would stop: a turn, queued input, a command, an approval, a question still waiting, or background work. */
+	#disconnectWouldStop(live: LiveSession): { running: boolean; queued: number; background?: number } | undefined {
 		// Read the gates now, not from the last published activity: an approval can be waiting with
 		// nothing else running, and releasing the writer would leave it unanswerable here.
 		const gates = live.activity.getSnapshot().sessionState?.gates;
@@ -2775,7 +2785,32 @@ export class DesktopHost {
 			live.operator?.isBusy() === true ||
 			(gates?.available === true && gates.pending.length > 0) ||
 			[...this.#questions.values()].some(pending => pending.ownerToken === live.viewOwnerToken);
-		return running || live.queued.size > 0 ? { running, queued: live.queued.size } : undefined;
+		// Releasing the writer disposes the session, which ends its background work too.
+		const background = this.#backgroundWork(live);
+		if (!running && live.queued.size === 0 && background === 0) return undefined;
+		return { running, queued: live.queued.size, ...(background > 0 ? { background } : {}) };
+	}
+	/**
+	 * Background work disposing this session would end: jobs still running, tasks running, queued
+	 * or paused, and schedules (they live only in the session). Read from the SDK's job view, which,
+	 * unlike the published activity snapshot, is complete, current and consumes no acknowledgement.
+	 * A session without that view, or one whose view is retired mid-transition, shows no work.
+	 */
+	#backgroundWork(live: LiveSession): number {
+		let snapshot: JobObservationSnapshot | undefined;
+		try {
+			snapshot = live.factory.jobObservation?.getSnapshot();
+		} catch {
+			return 0;
+		}
+		if (!snapshot) return 0;
+		const tasks = snapshot.tasks.filter(
+			task => task.status === "running" || task.status === "queued" || task.status === "paused",
+		);
+		// A running task is also listed as the job that runs it; count it once.
+		const taskJobs = new Set(tasks.flatMap(task => (task.currentJobId ? [task.currentJobId] : [])));
+		const jobs = snapshot.jobs.filter(job => job.status === "running" && !taskJobs.has(job.id));
+		return jobs.length + tasks.length + snapshot.crons.length;
 	}
 	/**
 	 * Release the app's writer for one conversation without deleting it, so another surface (the
@@ -3040,8 +3075,12 @@ export class DesktopHost {
 			return "failed";
 		}
 	}
-	/** Nothing a reload could interrupt or lose: no run, queued input, question, gate or startup. */
+	/** Nothing a reload could interrupt or lose: no run, queued input, question, gate, startup or background work. */
 	#reloadable(live: LiveSession): boolean {
+		return this.#idle(live) && this.#backgroundWork(live) === 0;
+	}
+	/** No run, queued input, question, gate or startup: nothing a new request would join. Background work may still run. */
+	#idle(live: LiveSession): boolean {
 		const gates = live.activityUpdate?.activity.sessionState?.gates;
 		return (
 			this.#live.get(live.metadata.id) === live &&
@@ -3568,7 +3607,7 @@ export class DesktopHost {
 		let live: LiveSession;
 		try {
 			const opened = await this.#open(metadata);
-			if (OWNER_CHECKED_METHODS.has(method)) await this.#recheckOwner(opened);
+			if (OWNER_CHECKED_METHODS.has(method)) await this.#recheckOwner(opened, method);
 			live = method === "session.select" || method === "prompt" ? await this.#refreshIfMoved(opened) : opened;
 		} catch (error) {
 			// The owner check found another process holding it: answer as a read-only conversation.
@@ -4894,7 +4933,7 @@ export class DesktopHost {
 	): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
 		// A slash command typed in the composer was checked as its prompt request; `command.run` checks here.
-		if (!alreadyBegun) await this.#recheckOwner(live);
+		if (!alreadyBegun) await this.#recheckOwner(live, "command.run");
 		if (!this.#writable(metadata)) throw this.#notWritable(metadata);
 		await this.#awaitStartup(live);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";

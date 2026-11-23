@@ -6,8 +6,10 @@ import * as path from "node:path";
 import { registerCustomApi, unregisterCustomApis } from "@gajae-code/ai";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
 import * as sdk from "@gajae-code/coding-agent/sdk";
 import {
 	type CreateAgentSessionOptions,
@@ -1257,6 +1259,95 @@ test("a prompt sent just before a Disconnect of an idle conversation never runs 
 	await expect(prompt).rejects.toThrow("disconnected");
 	expect(h.model.calls).toHaveLength(calls);
 	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
+	await h.close();
+});
+
+/** A background job run by the conversation's own SDK session, until the test or a stop ends it. */
+function backgroundJob(h: { created: CreateAgentSessionResult[] }) {
+	const result = h.created.at(-1);
+	const manager = AsyncJobManager.instance();
+	if (!result || !manager) throw new Error("The SDK session owns no background job manager");
+	const finished = Promise.withResolvers<string>();
+	let stopped = false;
+	const id = manager.register(
+		"bash",
+		"background build",
+		({ signal }) => {
+			signal.addEventListener(
+				"abort",
+				() => {
+					stopped = true;
+					finished.resolve("stopped");
+				},
+				{ once: true },
+			);
+			return finished.promise;
+		},
+		{ ownerId: MAIN_AGENT_ID },
+	);
+	// The conversation's own job view lists it, so it runs in this conversation's manager.
+	if (!result.jobObservation?.getSnapshot().jobs.some(job => job.id === id && job.status === "running"))
+		throw new Error("The background job does not belong to the conversation");
+	return {
+		get stopped() {
+			return stopped;
+		},
+		running: () => manager.getJob(id)?.status === "running",
+		cancel: () => manager.cancel(id),
+	};
+}
+
+test("selecting a conversation whose background job runs keeps it, even once a terminal has it open", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const job = backgroundJob(h);
+	h.liveOwners.add(await transcriptId(h));
+	// Stepping aside would dispose the session and end its job, so selecting keeps the app's copy.
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.connection).toEqual({ state: "connected" });
+	expect(live.isDisposed).toBe(false);
+	expect(job.running()).toBe(true);
+	// Nothing new starts in it while the terminal has it: the prompt is refused before it runs.
+	const calls = h.model.calls.length;
+	await expect(h.call("prompt", { sessionId, text: "while the job runs" })).rejects.toThrow("terminal");
+	expect(h.model.calls).toHaveLength(calls);
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	await expect(h.call("session.rename", { sessionId, title: "renamed meanwhile" })).rejects.toThrow("terminal");
+	expect(live.isDisposed).toBe(false);
+	expect(job.running()).toBe(true);
+	expect(job.stopped).toBe(false);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	// Once the job has ended, the next select steps aside as for any idle conversation.
+	job.cancel();
+	await until(() => !job.running(), "the job to end");
+	await until(() => !h.sdk().isStreaming, "the conversation to settle");
+	const after = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(after.connection).toEqual({ state: "elsewhere" });
+	await live.awaitDisposeCompletion();
+	await h.close();
+});
+
+test("Disconnect asks before stopping background work, and a confirmed Disconnect stops it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const job = backgroundJob(h);
+	const asked = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
+	expect(asked).toEqual({ disconnected: false, confirm: { running: false, queued: 0, background: 1 } });
+	expect(live.isDisposed).toBe(false);
+	expect(job.running()).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	const confirmed = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+	expect(confirmed.disconnected).toBe(true);
+	// The job was stopped, not left running in a released conversation.
+	expect(job.stopped).toBe(true);
+	expect(job.running()).toBe(false);
 	await live.awaitDisposeCompletion();
 	expect(live.isDisposed).toBe(true);
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
