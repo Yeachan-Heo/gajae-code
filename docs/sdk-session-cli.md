@@ -609,14 +609,16 @@ not settle earlier effects.
   spawn mirror, not a create, close or delete request. Current claim mirrors and
   already-attested identities are excluded. Unproven rows stay fenced. The file
   takes effect at the next broker start for the same agent directory; the
-  restart notice names that directory, shell-quoted. Restart through the
+  restart notice names that directory, shell-quoted (on Windows the notice
+  quotes for PowerShell and says so; cmd.exe needs its own quoting). Restart through the
   external supervisor for `gjc sdk broker run --agent-dir <dir>`. To restart a
   running on-demand broker, set `GJC_CODING_AGENT_DIR` to that directory for
   both `gjc doctor --check service`, which reports its broker target id, and
   `gjc doctor --fix --repair service.restart-owned --target <id> --allow-risk service-interruption --yes`
   (see [doctor](doctor.md));
   if none is running, the next `gjc sdk session`, `search` or `spawn` command
-  run with `--agent-dir <dir>` (not attach-only) starts one. From a source
+  run with `--agent-dir <dir>` starts one, unless `GJC_SDK_BROKER_AUTOSTART=0`
+  or `--attach-only` makes that command attach-only. From a source
   checkout, `bun run restart:sdk-broker -- --agent-dir <dir>` also restarts it
   (the script is not part of installed builds). The attestation command never
   restarts the broker. It resolves `--agent-dir` against the current

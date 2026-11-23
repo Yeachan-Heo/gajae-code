@@ -823,8 +823,9 @@ describe("SDK spawn-anchor attestation", () => {
 					`set GJC_CODING_AGENT_DIR to ${quoted} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes;`,
 				);
 				expect(notice).toContain(
-					`the next gjc sdk session, search or spawn command run with --agent-dir ${quoted} starts one.`,
+					`the next gjc sdk session, search or spawn command run with --agent-dir ${quoted} starts one, unless broker autostart is off (GJC_SDK_BROKER_AUTOSTART=0) or the command runs with --attach-only.`,
 				);
+				expect(notice).not.toContain("PowerShell");
 				expect(notice).toContain(`bun run restart:sdk-broker -- --agent-dir ${quoted} also restarts it.`);
 				expect(notice).not.toMatch(/[a-f0-9]{64}/i);
 			}
@@ -836,9 +837,10 @@ describe("SDK spawn-anchor attestation", () => {
 	);
 
 	it("quotes the agent directory for PowerShell on Windows", () => {
-		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o'neil\\gjc agent", "win32")).toContain(
-			"--agent-dir 'C:\\Users\\o''neil\\gjc agent'",
-		);
+		const notice = spawnAnchorAttestationRestartNotice("C:\\Users\\o'neil\\gjc agent", "win32");
+		expect(notice).toContain("--agent-dir 'C:\\Users\\o''neil\\gjc agent'");
+		// cmd.exe passes single quotes through literally, so the notice must say which shell it targets.
+		expect(notice).toContain("The commands below are quoted for PowerShell, not cmd.exe.");
 		// PowerShell treats U+2018 through U+201B as single quotes too.
 		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o\u2019neil\u201b", "win32")).toContain(
 			"--agent-dir 'C:\\Users\\o\u2019\u2019neil\u201b\u201b'",

@@ -32,15 +32,18 @@ const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
 
 /**
  * Restart guidance for the agent directory that received the attestation. Every route names that
- * directory, shell-quoted, because a broker started for another agent directory never loads this
- * file. `agentDir` must satisfy `isSafeSdkInternalAgentDir`, as every attested directory does.
+ * directory, shell-quoted (PowerShell quoting on Windows, which cmd.exe does not accept), because a
+ * broker started for another agent directory never loads this file. `agentDir` must satisfy
+ * `isSafeSdkInternalAgentDir`, as every attested directory does.
  */
 export function spawnAnchorAttestationRestartNotice(agentDir: string, platform = process.platform): string {
-	const dir = platform === "win32" ? windowsPowerShellQuote(agentDir) : posixQuote(agentDir);
+	const windows = platform === "win32";
+	const dir = windows ? windowsPowerShellQuote(agentDir) : posixQuote(agentDir);
 	return [
 		`Takes effect at the next broker start for agent directory ${dir}.`,
+		...(windows ? ["The commands below are quoted for PowerShell, not cmd.exe."] : []),
 		`Restart through your supervisor for gjc sdk broker run --agent-dir ${dir}.`,
-		`To restart a running on-demand broker, set GJC_CODING_AGENT_DIR to ${dir} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes; if none is running, the next gjc sdk session, search or spawn command run with --agent-dir ${dir} starts one.`,
+		`To restart a running on-demand broker, set GJC_CODING_AGENT_DIR to ${dir} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes; if none is running, the next gjc sdk session, search or spawn command run with --agent-dir ${dir} starts one, unless broker autostart is off (GJC_SDK_BROKER_AUTOSTART=0) or the command runs with --attach-only.`,
 		`From a source checkout, bun run restart:sdk-broker -- --agent-dir ${dir} also restarts it.`,
 	].join(" ");
 }
