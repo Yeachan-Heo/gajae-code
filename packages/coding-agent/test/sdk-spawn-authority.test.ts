@@ -1230,12 +1230,12 @@ describe("Broker spawn flow driver", () => {
 		}, 20_000);
 	}
 
-	// Incident magnitude: in the macOS reports the broker came back about 4 s and
-	// 8.7 s past the semantic deadline although the host had registered at +1.9 s
-	// and +2.9 s of the 8 s budget.
+	// Incident magnitude: in the latest macOS report the host registered at +5.9 s
+	// of the 8 s budget (2.1 s left) and the broker rejected it about 3.7 s past
+	// the deadline; earlier reports came back 4 s and 8.7 s late.
 	for (const path_ of ["late-read", "recheck"] as const) {
 		for (const readiness of [true, false] as const) {
-			it(`${readiness ? "admits" : "refuses"} a host observed 4 s past the deadline (${path_}, readiness ${readiness ? "published" : "absent"})`, async () => {
+			it(`${readiness ? "admits" : "refuses"} a host registered 2.1 s before and observed 3.7 s past the deadline (${path_}, readiness ${readiness ? "published" : "absent"})`, async () => {
 				const agentDir = await temp();
 				const incarnation = processIncarnation(process.pid);
 				if (!incarnation) throw new Error("test process incarnation is unavailable");
@@ -1274,7 +1274,9 @@ describe("Broker spawn flow driver", () => {
 								return await awaitSpawnHostRegistration(brokerRef.index, input);
 							}
 							deadlineAt = input.deadlineAt;
-							// The host registers and publishes readiness well inside the budget.
+							// The host registers 2.1 s before the deadline, then publishes readiness.
+							await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+							expect(Date.now()).toBeLessThan(input.deadlineAt - 1_500);
 							const host = await new SessionIndex(agentDir).open();
 							await host.append({
 								type: "host_registered",
@@ -1288,8 +1290,8 @@ describe("Broker spawn flow driver", () => {
 							});
 							if (readiness)
 								await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
-							// The observer only comes back 4 s past the deadline.
-							await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 4_000);
+							// The observer only comes back 3.7 s past the deadline.
+							await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 3_700);
 							if (path_ === "recheck") return { ok: false as const, reason: "inconclusive" as const };
 							return {
 								ok: true as const,
@@ -1324,7 +1326,7 @@ describe("Broker spawn flow driver", () => {
 						{ ...spawnInput(), cwd: agentDir },
 						`incident-${path_}-${readiness}`,
 					);
-					expect(Date.now()).toBeGreaterThan(deadlineAt + 4_000);
+					expect(Date.now()).toBeGreaterThan(deadlineAt + 3_700);
 					const claim = await latestClaim(agentDir);
 					// Without published readiness there is no post-deadline recheck.
 					expect(calls).toBe(path_ === "recheck" && readiness ? 2 : 1);
