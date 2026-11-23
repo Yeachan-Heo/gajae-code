@@ -151,7 +151,7 @@ function canonicalCleanupSessionId(value: unknown): value is string {
 	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 }
 
-const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+export const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Readonly<Required<LifecycleLedgerLimits>> = {
 	// Terminal evidence intentionally has no time-based expiry: forgetting a
 	// completed close would allow a delayed duplicate to reach a later host
 	// generation. The row/byte bounds below are storage limits; compaction keeps

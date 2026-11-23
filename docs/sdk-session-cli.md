@@ -555,7 +555,12 @@ not settle earlier effects.
   reads the ledger and optional spawn-authority journal without opening or
   changing either store. It requires the existing original broker identity key
   and never creates one. Malformed state or an unreadable/malformed existing
-  attestation fails without writing. A failure before rename leaves the previous
+  attestation fails without writing. The ledger must also fit the bounds the
+  broker applies when it opens it (64 MiB, 10,000 rows, 8 MiB per row by
+  default), because the broker loads no attestation from a ledger past them. An
+  existing attestation must fit the same 64 MiB bound and list only lowercase
+  64-character hex identities; any other entry is refused rather than
+  republished, and a union that would exceed the bound is not written. A failure before rename leaves the previous
   attestation unchanged; failure of directory synchronization after rename reports
   an unknown publication outcome rather than claiming that nothing was written.
   Evidence scanning recursively reads regular
@@ -579,9 +584,14 @@ not settle earlier effects.
   and `4|session.spawn|<caller-key>|`. Those operation-specific inputs prove a
   spawn mirror, not a create, close or delete request. Current claim mirrors and
   already-attested identities are excluded. Unproven rows stay fenced. The file
-  takes effect at the next broker start: restart through the external supervisor
-  for `gjc sdk broker run`, or use `bun run restart:sdk-broker` for an on-demand
-  broker. The attestation command never restarts the broker.
+  takes effect at the next broker start for the same agent directory; the
+  restart notice names that directory, shell-quoted. Restart through the
+  external supervisor for `gjc sdk broker run --agent-dir <dir>`. An on-demand
+  broker loads it when the next `gjc sdk` command run with `--agent-dir <dir>`
+  starts it; if one is still running, wait for it to exit once idle or stop it
+  first. From a source checkout, `bun run restart:sdk-broker -- --agent-dir <dir>`
+  restarts it (the script is not part of installed builds). The attestation
+  command never restarts the broker.
   The broker itself never writes or derives this file. It honors a listed
   identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target

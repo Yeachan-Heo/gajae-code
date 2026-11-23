@@ -3,9 +3,20 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, logger } from "@gajae-code/utils";
 import { PublicCommandFailure } from "../../cli/public-command-errors";
-import { brokerIdentityPath, deriveSpawnAnchorIdentities, MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH } from "../broker/identity";
+import { posixQuote, windowsPowerShellQuote } from "../../slash-commands/helpers/aside";
+import {
+	brokerIdentityPath,
+	deriveSpawnAnchorIdentities,
+	isSpawnAnchorIdentity,
+	MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH,
+} from "../broker/identity";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "../broker/lifecycle-codec";
-import { hasValidTerminalDigests, isLifecycleLedgerEntry, type LifecycleLedgerEntry } from "../broker/lifecycle-ledger";
+import {
+	DEFAULT_LIFECYCLE_LEDGER_LIMITS,
+	hasValidTerminalDigests,
+	isLifecycleLedgerEntry,
+	type LifecycleLedgerEntry,
+} from "../broker/lifecycle-ledger";
 import {
 	createSpawnAuthorityJournalState,
 	replaySpawnAuthorityJournalRow,
@@ -17,8 +28,26 @@ const MAX_EVIDENCE_BYTES = 256 * 1024 * 1024;
 const MAX_STATE_LINE_BYTES = 8 * 1024 * 1024;
 const TOKEN_SEPARATOR_BYTES = new Set(Buffer.from(" \t\n\r\v\f\"'`\\,;|=()[]{}<>"));
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
-export const SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE =
-	"Takes effect at the next broker start. Restart through your supervisor for gjc sdk broker run, or use bun run restart:sdk-broker for an on-demand broker.";
+
+/** Shell-quoted agent directory for restart guidance; a control character makes it display-only. */
+function quoteAgentDir(agentDir: string, platform: NodeJS.Platform): string {
+	if (CONTROL_CHARACTER.test(agentDir)) return JSON.stringify(agentDir);
+	return platform === "win32" ? windowsPowerShellQuote(agentDir) : posixQuote(agentDir);
+}
+
+/**
+ * Restart guidance for the agent directory that received the attestation. Every route names that
+ * directory, because a broker started for another agent directory never loads this file.
+ */
+export function spawnAnchorAttestationRestartNotice(agentDir: string, platform = process.platform): string {
+	const dir = quoteAgentDir(agentDir, platform);
+	return [
+		`Takes effect at the next broker start for agent directory ${dir}.`,
+		`Restart through your supervisor for gjc sdk broker run --agent-dir ${dir}.`,
+		`An on-demand broker loads it when the next gjc sdk command run with --agent-dir ${dir} starts it; if one is still running, wait for it to exit once idle or stop it first.`,
+		`From a source checkout, bun run restart:sdk-broker -- --agent-dir ${dir} restarts it.`,
+	].join(" ");
+}
 
 export interface SpawnAnchorAttestationOptions {
 	agentDir?: string;
@@ -43,36 +72,69 @@ function record(value: unknown): Record<string, unknown> | undefined {
 		: undefined;
 }
 
+interface StateSourceBounds {
+	maxBytes: number;
+	maxLineBytes: number;
+	maxRows: number;
+}
+
+/**
+ * The bounds `LifecycleLedger` enforces when the broker opens the ledger. A source past them never
+ * loads attestations, so an attestation computed from it would be inert.
+ */
+const LIFECYCLE_LEDGER_SOURCE_BOUNDS: StateSourceBounds = {
+	maxBytes: DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
+	maxLineBytes: DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
+	maxRows: DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxRows,
+};
+
 /** Streaming, read-only parsing. Never opens the mutating ledger/store implementations. */
-async function* jsonLines(file: string, optional = false, json5 = false): AsyncGenerator<unknown> {
+async function* jsonLines(
+	file: string,
+	options: { optional?: boolean; json5?: boolean; bounds?: StateSourceBounds } = {},
+): AsyncGenerator<unknown> {
+	const bounds = options.bounds;
+	const maxLineBytes = bounds?.maxLineBytes ?? MAX_STATE_LINE_BYTES;
 	try {
 		const stat = await fs.lstat(file);
 		if (!stat.isFile()) throw new Error("State source must be a regular file.");
+		if (bounds && stat.size > bounds.maxBytes) throw new Error("State source exceeds the byte limit.");
 	} catch (error) {
-		if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+		if (options.optional && (error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
 	}
+	let rows = 0;
+	let bytesRead = 0;
+	const parse = (line: Uint8Array): unknown => {
+		if (bounds && ++rows > bounds.maxRows) throw new Error("State source exceeds the row limit.");
+		return options.json5 ? Bun.JSON5.parse(decodeLifecycleUtf8(line)) : parseLifecycleJson(line);
+	};
 	let pending = Buffer.alloc(0);
 	for await (const chunk of Bun.file(file).stream()) {
+		bytesRead += chunk.length;
+		// The size check above can race a growing file; the broker bounds the bytes it actually reads.
+		if (bounds && bytesRead > bounds.maxBytes) throw new Error("State source exceeds the byte limit.");
 		const bytes = Buffer.concat([pending, chunk]);
 		let start = 0;
 		for (let offset = 0; offset < bytes.length; offset++) {
 			if (bytes[offset] !== 0x0a) continue;
 			const line = bytes.subarray(start, offset);
 			start = offset + 1;
-			if (line.length > MAX_STATE_LINE_BYTES) throw new Error("State row exceeds the read limit.");
-			if (line.length > 0) yield json5 ? Bun.JSON5.parse(decodeLifecycleUtf8(line)) : parseLifecycleJson(line);
+			if (line.length > maxLineBytes) throw new Error("State row exceeds the read limit.");
+			if (line.length > 0) yield parse(line);
 		}
 		pending = Buffer.from(bytes.subarray(start));
-		if (pending.length > MAX_STATE_LINE_BYTES) throw new Error("State row exceeds the read limit.");
+		if (pending.length > maxLineBytes) throw new Error("State row exceeds the read limit.");
 	}
-	if (pending.length > 0) yield json5 ? Bun.JSON5.parse(decodeLifecycleUtf8(pending)) : parseLifecycleJson(pending);
+	if (pending.length > 0) yield parse(pending);
 }
 
 async function existingAttestation(file: string): Promise<Set<string>> {
 	try {
 		const stat = await fs.lstat(file);
-		if (!stat.isFile() || stat.size > MAX_EVIDENCE_BYTES) throw new Error("Invalid attestation source.");
+		// The broker ignores an attestation past the ledger byte bound.
+		if (!stat.isFile() || stat.size > DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes)
+			throw new Error("Invalid attestation source.");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
 		throw new PublicCommandFailure({
@@ -85,8 +147,8 @@ async function existingAttestation(file: string): Promise<Set<string>> {
 		const value = record(parseLifecycleJson(await Bun.file(file).bytes()));
 		if (value?.version !== 1 || !Array.isArray(value.identities)) throw new Error("Invalid attestation.");
 		const identities = value.identities;
-		if (!identities.every((identity): identity is string => typeof identity === "string"))
-			throw new Error("Invalid identities.");
+		// Refuse junk instead of republishing it: every real entry is a spawn identity digest.
+		if (!identities.every(isSpawnAnchorIdentity)) throw new Error("Invalid identities.");
 		return new Set(identities);
 	} catch {
 		throw new PublicCommandFailure({
@@ -100,7 +162,7 @@ async function existingAttestation(file: string): Promise<Set<string>> {
 async function candidateIdentities(ledgerPath: string): Promise<Set<string>> {
 	const histories = new Map<string, { row: LifecycleLedgerEntry; count: number; valid: boolean }>();
 	try {
-		for await (const value of jsonLines(ledgerPath)) {
+		for await (const value of jsonLines(ledgerPath, { bounds: LIFECYCLE_LEDGER_SOURCE_BOUNDS })) {
 			assertSupportedStateVersion(ledgerPath, value);
 			// A malformed shape makes prior pending rows corruption-uncertain on broker open.
 			// Refuse the entire source rather than attest identities that open would quarantine.
@@ -139,7 +201,8 @@ async function candidateIdentities(ledgerPath: string): Promise<Set<string>> {
 async function excludeCurrentClaims(candidates: Set<string>, file: string, key: Uint8Array): Promise<void> {
 	try {
 		const state = createSpawnAuthorityJournalState();
-		for await (const value of jsonLines(file, true, true)) replaySpawnAuthorityJournalRow(state, value, key);
+		for await (const value of jsonLines(file, { optional: true, json5: true }))
+			replaySpawnAuthorityJournalRow(state, value, key);
 		validateSpawnAuthorityJournalAliases(state);
 		for (const identity of state.latest.keys()) candidates.delete(identity);
 	} catch {
@@ -271,16 +334,17 @@ async function scanEvidence(
 
 async function writeAttestation(file: string, identities: ReadonlySet<string>): Promise<void> {
 	const temporary = path.join(path.dirname(file), `.spawn-anchor-attestation-${randomUUID()}.tmp`);
+	const text = `${JSON.stringify({ version: 1, identities: [...identities].sort() })}\n`;
 	let created = false;
 	let renamed = false;
 	try {
+		// The broker ignores an attestation past the ledger byte bound; never publish an inert file.
+		if (Buffer.byteLength(text) > DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes)
+			throw new Error("Attestation exceeds the byte limit.");
 		const handle = await fs.open(temporary, "wx", 0o600);
 		created = true;
 		try {
-			await Bun.write(
-				Bun.file(handle.fd),
-				`${JSON.stringify({ version: 1, identities: [...identities].sort() })}\n`,
-			);
+			await Bun.write(Bun.file(handle.fd), text);
 			await handle.sync();
 		} finally {
 			await handle.close();
@@ -357,12 +421,17 @@ export async function runSpawnAnchorAttestation(
 	};
 }
 
+/** The agent directory whose `sdk/` holds the attestation (see {@link runSpawnAnchorAttestation}). */
+export function attestationAgentDir(result: SpawnAnchorAttestationResult): string {
+	return path.dirname(path.dirname(result.attestationPath));
+}
+
 export function renderSpawnAnchorAttestation(result: SpawnAnchorAttestationResult, json = false): string {
 	if (json) return `${JSON.stringify(result)}\n`;
 	return `${[
 		`Candidates: ${result.candidates}; proven: ${result.proven}; unproven: ${result.unproven}; already attested: ${result.alreadyAttested}`,
 		`Files scanned: ${result.filesScanned}; files skipped: ${result.filesSkipped}`,
 		`Written: ${result.written}; attestation path: ${JSON.stringify(result.attestationPath)}`,
-		...(result.written ? [SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE] : []),
+		...(result.written ? [spawnAnchorAttestationRestartNotice(attestationAgentDir(result))] : []),
 	].join("\n")}\n`;
 }
