@@ -415,7 +415,7 @@ type StaleReplacement = "reloaded" | "deferred" | "failed" | "elsewhere";
 const STALE_OUTCOME: Record<StaleReplacement, string> = {
 	elsewhere: `${STALE_TRANSCRIPT} Another gjc process, such as a terminal, has it open, so the app now shows it read-only.`,
 	reloaded: `${STALE_TRANSCRIPT} The app reloaded it with the latest messages. Try again.`,
-	deferred: `${STALE_TRANSCRIPT} The app will reload it with the latest messages once the work still running in it finishes. Then try again.`,
+	deferred: `${STALE_TRANSCRIPT} The app will reload it with the latest messages once the work still running in it finishes. Then try again. To reload sooner, stop or cancel that work (background work is in the Session work panel), or Disconnect and then Connect.`,
 	failed: `${STALE_TRANSCRIPT} The app could not reload it. Select the conversation again to retry.`,
 };
 /** Every writing request on a released conversation answers with this, before any work starts. */
@@ -446,7 +446,7 @@ class SteppedAside extends Error {
 }
 /** A terminal has the conversation open, but the app still holds it because its background work runs. */
 const ELSEWHERE_BACKGROUND =
-	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs and does not start what you send; when that work finishes, the app may still add its result and a reply. Disconnect stops that work and leaves the conversation to the terminal.";
+	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs and does not start what you send; when that work finishes, the app may still add its result and a reply. To leave it to the terminal now, stop or cancel that work in the Session work panel, or Disconnect.";
 /** A released conversation is not deleted while the running broker cannot say whether a terminal has it. */
 const OWNER_UNCHECKED_DELETE =
 	"The app could not check whether a terminal has this conversation open, so it was not deleted. Try again in a moment.";

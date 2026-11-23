@@ -1454,7 +1454,14 @@ test("selecting a conversation whose background job runs keeps it, even once a t
 	expect(job.running()).toBe(true);
 	// Nothing new starts in it while the terminal has it: the prompt is refused before it runs.
 	const calls = h.model.calls.length;
-	await expect(h.call("prompt", { sessionId, text: "while the job runs" })).rejects.toThrow("terminal");
+	// The refusal names the ways out: stopping that work, or Disconnect.
+	const refusal = await h.call("prompt", { sessionId, text: "while the job runs" }).then(
+		() => "",
+		(error: Error) => error.message,
+	);
+	expect(refusal).toContain("terminal");
+	expect(refusal).toContain("Session work panel");
+	expect(refusal).toContain("Disconnect");
 	expect(h.model.calls).toHaveLength(calls);
 	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
 	await expect(h.call("session.rename", { sessionId, title: "renamed meanwhile" })).rejects.toThrow("terminal");
@@ -1469,6 +1476,28 @@ test("selecting a conversation whose background job runs keeps it, even once a t
 	const after = await h.call<DesktopSession>("session.select", { sessionId });
 	expect(after.connection).toEqual({ state: "elsewhere" });
 	await live.awaitDisposeCompletion();
+	await h.close();
+});
+
+test("a stale copy kept for its background work says how to reload it sooner", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const job = backgroundJob(h);
+	// The terminal continues the conversation and closes while the app's background work runs.
+	await continueInTerminal(live.sessionFile!, h.projectDir, h.agentDir, h.track);
+	const refusal = await h.call("prompt", { sessionId, text: "after the terminal" }).then(
+		() => "",
+		(error: Error) => error.message,
+	);
+	// The copy is kept, so the work goes on, and the message names the ways to reload sooner.
+	expect(refusal).toContain("once the work still running in it finishes");
+	expect(refusal).toContain("Session work panel");
+	expect(refusal).toContain("Disconnect");
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	expect(job.running()).toBe(true);
+	expect(live.isDisposed).toBe(false);
 	await h.close();
 });
 
