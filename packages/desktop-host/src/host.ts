@@ -2848,12 +2848,13 @@ export class DesktopHost {
 			// Join the stopped request until its receipt and view are written; disposing earlier would
 			// turn a cancelled prompt into an unknown one.
 			for (let attempt = 0; attempt < 3 && stopped.exclusiveDone; attempt++) await within(stopped.exclusiveDone);
+			// The final view and idle belong to the stop budget too, ahead of the separate settle wait.
+			await within(stopped.viewPersistence);
+			if (stopped.sdk.isStreaming) await within(stopped.sdk.waitForIdle());
 			// Inputs still being admitted (a delivery record, an input hook, the SDK's admission) are
 			// refused or handed back against the recorded stop; let them finish against this session.
 			const budget = AbortSignal.timeout(DISCONNECT_SETTLE_MS);
 			await bounded(Promise.allSettled([...(this.#inputs.get(metadata.id) ?? [])]), budget).catch(() => {});
-			await within(stopped.viewPersistence);
-			if (stopped.sdk.isStreaming) await within(stopped.sdk.waitForIdle());
 			// The Stop's sweep, and the queued branch's own check after it, handed back what no run took.
 			// Let the inputs the run took settle from this session's transcript before it is disposed.
 			await bounded(Promise.allSettled([...stopped.settling]), budget).catch(() => {});
