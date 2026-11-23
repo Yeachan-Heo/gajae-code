@@ -815,11 +815,21 @@ the session, from Broker spawn authority, which keeps the owner after the child
 closes. `masterSessionId` is the master's lineage owner id, which can differ
 from its current row id after a session switch. `spawnedBy` is omitted when
 the Broker has no spawn authority for the session (for example a spawn that
-never reached host registration), or when recorded authorities disagree. When
+never reached host registration), when recorded authorities disagree, or when
+the listed row does not come from the state root the spawned child's host
+registered in. Spawn authority is keyed by session id, so this covers a session
+id that more than one state root with an unterminated registration claims
+(`gjc sdk session list` and `inspect` rows mark it `ambiguous: true`) and a
+host in another state root that reuses the id after the child stopped. Search
+and snapshot rows carry no ambiguity marker, so a missing `spawnedBy` there
+does not say why. When
 the command runs inside a master session's Bash tool, `spawnedBy.self` is
 `true` for that master's own children and `false` for another master's; the Bash
 tool in a non-master session never passes an inherited owner id through, so
-`self` is absent there. The same fields appear on `gjc sdk session list` and
+`self` is absent there. `spawnedBy.self` is an advisory, viewer-relative display
+hint and grants no permission: neither the Broker nor the session router
+compares the caller with the spawning master before `send`, `steer`,
+`interrupt`, or `close`. The same fields appear on `gjc sdk session list` and
 `gjc sdk session inspect` rows. The `gjc sdk search` table shows them in the
 `OWNER` column: `self`, `other`, or `spawned` (no viewer) for spawned children,
 `master` for master sessions (`master/self`, `master/other`, or
