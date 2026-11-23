@@ -3645,9 +3645,9 @@ export class DesktopHost {
 		}
 		if (method === "session.connect") return this.#connect(metadata);
 		if (!this.#writable(metadata)) {
-			// The app may still be stepping aside for a terminal (or finding one as it opens): join
-			// that, and answer as it does.
-			const pending = this.#opening.get(metadata.id);
+			// A select may take the conversation back, so it first joins a step-aside still in progress
+			// (or an open finding the terminal) and answers as that does. Anything else is refused now.
+			const pending = method === "session.select" ? this.#opening.get(metadata.id) : undefined;
 			if (pending) await pending.catch(() => {});
 			// The terminal that had it open may have closed since: selecting checks again.
 			if (method === "session.select" && !metadata.disconnected && !pending) this.#elsewhere.delete(metadata.id);

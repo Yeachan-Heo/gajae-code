@@ -1290,7 +1290,11 @@ test("a request that arrives while a Disconnect waits for the conversation to op
 	const disconnecting = h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
 	const calls = h.model.calls.length;
 	const prompted = respond(h, "prompt", { sessionId, text: "sent after Disconnect" });
-	await Bun.sleep(50);
+	// The fence is up from the moment Disconnect arrived: the prompt is answered while the open is
+	// still held, without waiting for it (and so without depending on who resumes first after it).
+	expect(await Promise.race([prompted.then(() => "answered"), Bun.sleep(1_000).then(() => "waiting")])).toBe(
+		"answered",
+	);
 	opening.release();
 	await selecting;
 	expect((await disconnecting).disconnected).toBe(true);
