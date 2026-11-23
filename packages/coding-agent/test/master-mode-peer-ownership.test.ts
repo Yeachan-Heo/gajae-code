@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,7 +13,7 @@ import {
 	sessionIndexChecksum,
 } from "../src/sdk/broker/session-index";
 import { type SdkSearchRowV1, sdkSearchRowV1 } from "../src/sdk/broker/session-scope";
-import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
+import { SpawnAuthorityStore, type SpawnOwnerRecord } from "../src/sdk/broker/spawn-authority";
 import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
 import { runSdkSpawn } from "../src/sdk/cli/master-cli";
 import { toSessionRowV1 } from "../src/sdk/cli/rows";
@@ -138,6 +138,11 @@ function ownership(rows: readonly SdkSearchRowV1[]): Record<string, unknown> {
 }
 
 describe("master peer ownership", () => {
+	// Each test writes a fresh agent-dir index, whose sequence must start at 1.
+	beforeEach(() => {
+		indexSeq = 0;
+	});
+
 	it("shows each of two masters in one scope only its own children as self", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-peer-owner-"));
 		const agentDir = path.join(root, "agent");
@@ -308,6 +313,145 @@ describe("master peer ownership", () => {
 		}
 	});
 
+	it("omits the spawning master on ambiguous rows and on rows from another state root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-peer-owner-ambiguous-"));
+		const agentDir = path.join(root, "agent");
+		const repo = path.join(root, "repo");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(repo, { recursive: true });
+		const git = Bun.spawn(["git", "init", "-q", repo]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const locator = await resolveSessionLocator(repo, path.join(repo, ".gjc", "state"));
+		const otherLocator = await resolveSessionLocator(repo, path.join(repo, ".gjc", "other-state"));
+		if (locator.worktreeRoot === null) throw new Error("test Git worktree was not resolved");
+
+		const registeredPids = new Map<string, number>();
+		const broker = new Broker({
+			agentDir,
+			spawnSubstrateProvider: substrateFake(),
+			spawnPromptLayer: promptLayerFake(registeredPids),
+			masterCapabilityVerifier: {
+				verifyMasterCapability: async (owner, supplied, suppliedEpoch) => ({
+					allowed: masters.some(m => m.id === owner && m.grant === supplied && m.epoch === suppliedEpoch),
+				}),
+			},
+		});
+		await broker.start();
+		try {
+			await appendIndex(agentDir, [
+				...masterRegistration(masters[0], locator),
+				...masterRegistration(masters[1], locator),
+			]);
+			const children: string[] = [];
+			for (const index of [0, 1, 2, 3]) {
+				const spawned = await runSdkSpawn(
+					{ cwd: repo, prompt: `task ${index}`, agentDir, idempotencyKey: `ambiguous-${index}` },
+					{
+						env: { GJC_MASTER_CAPABILITY: masters[0].grant, GJC_MASTER_OWNER_SESSION_ID: masters[0].id },
+						dispatch: async (_dir: string, payload: Record<string, unknown>, key: string) =>
+							await broker.handleRequest("session.spawn", payload, key),
+					},
+				);
+				expect(spawned.rendered.code).toBe("spawn_accepted");
+				if (!spawned.rendered.sessionId) throw new Error("spawn returned no child id");
+				children.push(spawned.rendered.sessionId);
+			}
+			const [unique, duplicated, reused, fenced] = children as [string, string, string, string];
+			const registration = (sessionId: string, at: SessionLocatorV2, pid: number) =>
+				indexEvent({
+					type: "host_registered",
+					sessionId,
+					locator: at,
+					endpointGeneration: 1,
+					pid,
+					processIncarnation: `inc-${pid}`,
+					hostIncarnation: `inc-${pid}`,
+				});
+			// Every spawned child registers in its own state root. An unrelated host
+			// in a second state root then claims one live child's session id
+			// (ambiguous), and another reuses the id of a child that already stopped
+			// (a sole live root, so not ambiguous, but not the spawned host either).
+			const reusedPid = registeredPids.get(reused)!;
+			await appendIndex(agentDir, [
+				registration(unique, locator, registeredPids.get(unique)!),
+				registration(duplicated, locator, registeredPids.get(duplicated)!),
+				registration(duplicated, otherLocator, 7000),
+				registration(reused, locator, reusedPid),
+				indexEvent({
+					type: "host_unregistered",
+					sessionId: reused,
+					locator,
+					endpointGeneration: 1,
+					pid: reusedPid,
+					processIncarnation: `inc-${reusedPid}`,
+					hostIncarnation: `inc-${reusedPid}`,
+				}),
+				registration(reused, otherLocator, process.pid),
+				// The foreign claim lands first, so the public row of this ambiguous id
+				// is the child's own registration: only the ambiguity gate hides it.
+				registration(fenced, otherLocator, 7001),
+				registration(fenced, locator, registeredPids.get(fenced)!),
+			]);
+
+			// The raw Broker page marks only the duplicated id ambiguous and omits its owner.
+			const listed = (await broker.handleRequest("session.list", {}, undefined)) as {
+				ok: true;
+				result: { sessions: Array<Record<string, unknown>> };
+			};
+			const byId = new Map(listed.result.sessions.map(session => [session.sessionId, session]));
+			expect(byId.get(duplicated)).toMatchObject({ ambiguous: true });
+			expect(byId.get(duplicated)).not.toHaveProperty("spawnedBy");
+			expect(byId.get(unique)).toMatchObject({ ambiguous: false, spawnedBy: { masterSessionId: "master-a" } });
+			expect(byId.get(reused)).toMatchObject({ ambiguous: false, locator: { stateRoot: otherLocator.stateRoot } });
+			expect(byId.get(reused)).not.toHaveProperty("spawnedBy");
+			expect(byId.get(fenced)).toMatchObject({ ambiguous: true, locator: { stateRoot: locator.stateRoot } });
+			expect(byId.get(fenced)).not.toHaveProperty("spawnedBy");
+			const listRow = toSessionRowV1(byId.get(duplicated)!);
+			expect(listRow.ambiguous).toBe(true);
+			expect(listRow).not.toHaveProperty("spawnedBy");
+
+			// The spawning master's snapshot never claims the ambiguous row as its own.
+			const service = new SessionLifecycleService(new BrokerClient(broker));
+			const snapshot = await collectMasterPeerSnapshot({
+				lifecycle: service,
+				actor: { id: "master-a", namespace: "sdk:master-snapshot" },
+				ownerSessionId: "master-a",
+				scope: "repo",
+				requestAnchor: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot },
+			});
+			expect(snapshot.status).toBe("populated");
+			expect(ownership(snapshot.rows)).toEqual({
+				"master-b": { role: "master" },
+				[unique]: { spawnedBy: { masterSessionId: "master-a", self: true } },
+				[duplicated]: {},
+				[reused]: {},
+				[fenced]: {},
+			});
+
+			// `gjc sdk search` as the spawning master shows the same suppression.
+			const prior = process.env.GJC_MASTER_OWNER_SESSION_ID;
+			process.env.GJC_MASTER_OWNER_SESSION_ID = "master-a";
+			try {
+				const searched = await runSdkSearch(
+					{ agentDir, repo },
+					() => service,
+					async (_agentDir, value) => value,
+				);
+				const rows = ownership(searched.result.rows);
+				expect(rows[duplicated]).toEqual({});
+				expect(rows[reused]).toEqual({});
+				expect(rows[fenced]).toEqual({});
+				expect(rows[unique]).toEqual({ spawnedBy: { masterSessionId: "master-a", self: true } });
+			} finally {
+				if (prior === undefined) delete process.env.GJC_MASTER_OWNER_SESSION_ID;
+				else process.env.GJC_MASTER_OWNER_SESSION_ID = prior;
+			}
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("validates ownership fields on search rows strictly", () => {
 		const base = { id: "s", locator: { cwd: "/r", worktreeRoot: "/r", stateRoot: "/st" }, live: true };
 		expect(sdkSearchRowV1({ ...base, role: "master", spawnedBy: { masterSessionId: "m", self: false } })).toEqual({
@@ -348,7 +492,13 @@ describe("master peer ownership", () => {
 		try {
 			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
 			await store.open();
-			const record = async (identity: string, childId: string, ownerSessionId: string, pid: number) => {
+			const record = async (
+				identity: string,
+				childId: string,
+				ownerSessionId: string,
+				pid: number,
+				endpointStateRoot: string | null = "/state-a",
+			) => {
 				const owner = await store.claimOrJoin(identity, `${"c".repeat(63)}${pid % 10}`);
 				if (owner.kind !== "owner") throw new Error("expected owner");
 				await store.persistTransition(identity, {
@@ -374,6 +524,7 @@ describe("master peer ownership", () => {
 						providerIdentity: "p",
 						pid,
 						processIncarnation: `inc-${pid}`,
+						...(endpointStateRoot === null ? {} : { endpointStateRoot }),
 						closeState: "active",
 						createdAt: at,
 						updatedAt: at,
@@ -386,10 +537,13 @@ describe("master peer ownership", () => {
 			await record("agree-2", "child-agree", "master-b", 903);
 			await record("split-1", "child-split", "master-a", 904);
 			await record("split-2", "child-split", "master-b", 905);
+			// A pre-pin authority names the owner but records no state root.
+			await record("pre-pin", "child-pre-pin", "master-a", 906, null);
 
-			const expected = new Map([
-				["child-one", "master-a"],
-				["child-agree", "master-b"],
+			const expected = new Map<string, SpawnOwnerRecord>([
+				["child-one", { ownerSessionId: "master-a", stateRoots: new Set(["/state-a"]) }],
+				["child-agree", { ownerSessionId: "master-b", stateRoots: new Set(["/state-a"]) }],
+				["child-pre-pin", { ownerSessionId: "master-a", stateRoots: new Set() }],
 			]);
 			expect(new Map(store.spawnOwnersByChild())).toEqual(expected);
 			// Ownership is durable: a reopened store derives the same attribution.
