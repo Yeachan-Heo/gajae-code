@@ -840,7 +840,7 @@ describe("SDK spawn-anchor attestation", () => {
 		const notice = spawnAnchorAttestationRestartNotice("C:\\Users\\o'neil\\gjc agent", "win32");
 		expect(notice).toContain("--agent-dir 'C:\\Users\\o''neil\\gjc agent'");
 		// cmd.exe passes single quotes through literally, so the notice must say which shell it targets.
-		expect(notice).toContain("The commands below are quoted for PowerShell, not cmd.exe.");
+		expect(notice).toContain("The commands that follow are quoted for PowerShell, not cmd.exe.");
 		// PowerShell treats U+2018 through U+201B as single quotes too.
 		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o\u2019neil\u201b", "win32")).toContain(
 			"--agent-dir 'C:\\Users\\o\u2019\u2019neil\u201b\u201b'",

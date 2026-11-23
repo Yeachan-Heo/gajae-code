@@ -41,7 +41,7 @@ export function spawnAnchorAttestationRestartNotice(agentDir: string, platform =
 	const dir = windows ? windowsPowerShellQuote(agentDir) : posixQuote(agentDir);
 	return [
 		`Takes effect at the next broker start for agent directory ${dir}.`,
-		...(windows ? ["The commands below are quoted for PowerShell, not cmd.exe."] : []),
+		...(windows ? ["The commands that follow are quoted for PowerShell, not cmd.exe."] : []),
 		`Restart through your supervisor for gjc sdk broker run --agent-dir ${dir}.`,
 		`To restart a running on-demand broker, set GJC_CODING_AGENT_DIR to ${dir} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes; if none is running, the next gjc sdk session, search or spawn command run with --agent-dir ${dir} starts one, unless broker autostart is off (GJC_SDK_BROKER_AUTOSTART=0) or the command runs with --attach-only.`,
 		`From a source checkout, bun run restart:sdk-broker -- --agent-dir ${dir} also restarts it.`,

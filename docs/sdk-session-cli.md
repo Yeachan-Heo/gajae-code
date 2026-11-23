@@ -610,8 +610,9 @@ not settle earlier effects.
   already-attested identities are excluded. Unproven rows stay fenced. The file
   takes effect at the next broker start for the same agent directory; the
   restart notice names that directory, shell-quoted (on Windows the notice
-  quotes for PowerShell and says so; cmd.exe needs its own quoting). Restart through the
-  external supervisor for `gjc sdk broker run --agent-dir <dir>`. To restart a
+  quotes for PowerShell and says so; cmd.exe needs its own quoting). Restart
+  through the external supervisor for `gjc sdk broker run --agent-dir <dir>`.
+  To restart a
   running on-demand broker, set `GJC_CODING_AGENT_DIR` to that directory for
   both `gjc doctor --check service`, which reports its broker target id, and
   `gjc doctor --fix --repair service.restart-owned --target <id> --allow-risk service-interruption --yes`
