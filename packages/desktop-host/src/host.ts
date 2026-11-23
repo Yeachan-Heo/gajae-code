@@ -2858,10 +2858,12 @@ export class DesktopHost {
 		return { running, queued: live.queued.size, ...(background > 0 ? { background } : {}) };
 	}
 	/**
-	 * Background work disposing this session would end: jobs still running, tasks running, queued
-	 * or paused, and schedules (they live only in the session). Read from the SDK's job view, which,
-	 * unlike the published activity snapshot, is complete, current and consumes no acknowledgement.
-	 * A session without that view, or one whose view is retired mid-transition, shows no work.
+	 * Background work disposing this session would end: jobs still running, and tasks running,
+	 * queued or paused. Read from the SDK's job view, which, unlike the published activity snapshot,
+	 * is complete, current and consumes no acknowledgement. A session without that view, or one
+	 * whose view is retired mid-transition, shows no work. Schedules are not counted: the SDK keys
+	 * them by agent id, which every conversation the app opens shares, so the view lists every
+	 * conversation's schedules and cannot say which are this one's.
 	 */
 	#backgroundWork(live: LiveSession): number {
 		let snapshot: JobObservationSnapshot | undefined;
@@ -2877,7 +2879,7 @@ export class DesktopHost {
 		// A running task is also listed as the job that runs it; count it once.
 		const taskJobs = new Set(tasks.flatMap(task => (task.currentJobId ? [task.currentJobId] : [])));
 		const jobs = snapshot.jobs.filter(job => job.status === "running" && !taskJobs.has(job.id));
-		return jobs.length + tasks.length + snapshot.crons.length;
+		return jobs.length + tasks.length;
 	}
 	/**
 	 * Release the app's writer for one conversation without deleting it, so another surface (the

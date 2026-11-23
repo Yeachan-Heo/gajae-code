@@ -258,7 +258,7 @@ export interface DesktopSessionConnection {
  * input or background work is left untouched and the answer says what Disconnect would stop.
  * With `confirm: true` the turn and queue are stopped exactly as Stop does, and the background
  * work ends with the session, before the writer is released. `background` (present only when
- * above zero) counts running jobs, live tasks and schedules.
+ * above zero) counts running jobs and live tasks.
  */
 export type DesktopDisconnectResult =
 	| { disconnected: true; session: DesktopSession }

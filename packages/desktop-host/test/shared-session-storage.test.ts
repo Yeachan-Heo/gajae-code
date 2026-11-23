@@ -21,6 +21,8 @@ import {
 	type SdkSessionView,
 } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { CronTool, clearOwnerSchedules } from "@gajae-code/coding-agent/tools/cron";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
 import {
@@ -1490,6 +1492,35 @@ test("stopping background work never waits on the broker or steps aside, while a
 	expect(job.stopped).toBe(true);
 	expect(live.isDisposed).toBe(false);
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	await h.close();
+});
+
+test("a schedule another conversation made is not counted as this conversation's background work", async () => {
+	const h = await controlledFixture();
+	const scheduling = h.sdk();
+	const other = await h.call<DesktopSession>("session.create", { projectId: h.project.id });
+	cleanups.push(async () => clearOwnerSchedules(scheduling.getAgentId()));
+	// The first conversation schedules a prompt, as its cron tool would.
+	const tools: ToolSession = {
+		cwd: scheduling.sessionManager.getCwd(),
+		hasUI: false,
+		settings: scheduling.settings,
+		getSessionFile: () => scheduling.sessionFile ?? null,
+		getSessionSpawns: () => null,
+		getSessionId: () => scheduling.sessionManager.getSessionId(),
+		getAgentId: () => scheduling.getAgentId() ?? null,
+		getAsyncJobManager: () => AsyncJobManager.instance(),
+		sendCustomMessage: scheduling.sendCustomMessage.bind(scheduling),
+	};
+	await new CronTool(tools).execute("scheduled-elsewhere", {
+		op: "create",
+		cron_expression: "0 * * * *",
+		recurring: true,
+		prompt: "scheduled in the first conversation",
+	});
+	// The other, idle conversation has nothing running: Disconnect releases it without asking.
+	const released = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId: other.id });
+	expect(released.disconnected).toBe(true);
 	await h.close();
 });
 
