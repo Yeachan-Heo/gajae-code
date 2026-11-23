@@ -3103,7 +3103,38 @@ suite("mounted composer delivery recovery", () => {
 			const deletes = await page.evaluate(() =>
 				window.fixture.requests().filter(request => request.method === "session.delete").map(request => request.params),
 			);
-			expect(deletes).toEqual([{ sessionId: "a" }]);
+			// Sent as removal, so the Host never turns it into a Delete.
+			expect(deletes).toEqual([{ sessionId: "a", removeOnly: true }]);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("a Remove dialog closes when its conversation becomes openable, instead of turning into Delete", async () => {
+		const { context, page } = await fixture();
+		const conversation = (connection: object) => ({
+			id: "a",
+			title: "Session A",
+			projectId: "p",
+			status: "idle",
+			starred: false,
+			imageInput: null,
+			operatorRunning: false,
+			controlGeneration: null,
+			messages: [],
+			connection,
+		});
+		try {
+			await select(page);
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation({ state: "unavailable" }));
+			await page.waitForSelector('.composer-area .connection-notice[data-state="unavailable"]');
+			await page.click(".connection-notice-action");
+			await page.waitForSelector("dialog[open] .delete-dialog");
+			// The store places the row while the dialog is open.
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation({ state: "connected" }));
+			await page.waitForFunction(() => !document.querySelector("dialog[open] .delete-dialog"));
+			const deletes = await page.evaluate(() => window.fixture.requests().filter(request => request.method === "session.delete"));
+			expect(deletes).toEqual([]);
 		} finally {
 			await closeFixture(context, page);
 		}

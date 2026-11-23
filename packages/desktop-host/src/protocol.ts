@@ -255,10 +255,12 @@ export interface DesktopSession {
 /**
  * A request refused because the app does not write the conversation right now: it is released
  * (`disconnected`), being released (`disconnecting`), or another gjc process has it (`elsewhere`).
- * `unavailable`: a row an earlier build saved that the shared store cannot place. The session's
- * `connection` state already says all but `disconnecting`.
+ * `unavailable`: a row an earlier build saved that the shared store cannot place. `placed`: a
+ * remove-only `session.delete` for a row the store has placed since, which opens now; nothing was
+ * removed. The session's `connection` state already says `elsewhere`, `disconnected` and
+ * `unavailable`.
  */
-export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnecting" | "unavailable";
+export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnecting" | "unavailable" | "placed";
 
 export interface DesktopSessionConnection {
 	/**

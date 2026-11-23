@@ -728,6 +728,11 @@ export default function App() {
 	const writable = connectionState(session) === "connected";
 	/** The app cannot open this row at all: Delete only forgets it, and leaves its transcript alone. */
 	const removeOnly = connectionState(session) === "unavailable";
+	/**
+	 * Whether the open Delete dialog is the remove-only one, fixed when it opened. A row placed in the
+	 * store while it is open closes it rather than turning Remove into Delete under the pointer.
+	 */
+	const [deleteRemovesOnly, setDeleteRemovesOnly] = useState(false);
 	const sessionConnection = session ? connectionState(session) : undefined;
 	// A refusal about who writes this conversation goes stale when its connection changes: after
 	// Disconnect finishes, Connect, or "Check again" taking it back.
@@ -871,6 +876,11 @@ export default function App() {
 	const closeDialog = useCallback(() => {
 		setDialog(null);
 	}, [setDialog]);
+	// The row changed under an open Delete dialog (placed in the store, or no longer openable): close
+	// it, so its wording and action never change in place.
+	useEffect(() => {
+		if (dialog === "delete" && deleteRemovesOnly !== removeOnly) closeDialog();
+	}, [dialog, deleteRemovesOnly, removeOnly, closeDialog]);
 	const filteredSettings = (settings ?? []).filter(setting =>
 		`${setting.path} ${setting.description ?? ""}`.toLowerCase().includes(settingFilter.toLowerCase()),
 	);
@@ -3068,7 +3078,10 @@ export default function App() {
 											state={session.connection.state}
 											holder={session.connection.holder}
 											reason={session.connection.reason}
-											onRemove={() => setDialog("delete")}
+											onRemove={() => {
+												setDeleteRemovesOnly(true);
+												setDialog("delete");
+											}}
 											pending={!connected || !!pending[connectionScope(session.id)]}
 											onConnect={() => connectSession(session.id)}
 										/>
@@ -3272,7 +3285,7 @@ export default function App() {
 						{
 							settings: t("shell.settings"),
 							fork: t("shell.dialogFork"),
-							delete: t(removeOnly ? "shell.dialogRemove" : "shell.dialogDelete"),
+							delete: t(deleteRemovesOnly ? "shell.dialogRemove" : "shell.dialogDelete"),
 							goal: t("shell.dialogGoal"),
 							result: t("shell.dialogResult"),
 							"activity-detail": t("shell.dialogActivityDetail"),
@@ -3373,7 +3386,13 @@ export default function App() {
 									</Button>
 								</>
 							)}
-							<Button className="danger" onClick={() => setDialog("delete")}>
+							<Button
+								className="danger"
+								onClick={() => {
+									setDeleteRemovesOnly(removeOnly);
+									setDialog("delete");
+								}}
+							>
 								<Trash2 aria-hidden="true" />
 								{t("shell.dialogDelete")}
 							</Button>
@@ -3735,7 +3754,7 @@ export default function App() {
 					{dialog === "delete" && (
 						<DeleteConversationConfirmation
 							title={session?.title ?? ""}
-							removeOnly={removeOnly}
+							removeOnly={deleteRemovesOnly}
 							// Deleting drops the conversation's recovery records too; name every text that goes with them.
 							texts={recoveriesDroppedWithConversation(recoveries, selected).lost.map(item => item.text)}
 							disabled={!connected || !!pending[selected]}
@@ -3743,7 +3762,10 @@ export default function App() {
 								const sessionId = selected;
 								const generation = dialogGeneration.current;
 								void run(sessionId, async () => {
-									await request("session.delete", { sessionId });
+									await request("session.delete", {
+										sessionId,
+										...(deleteRemovesOnly ? { removeOnly: true } : {}),
+									});
 									dropRecoveries(sessionId);
 									if (dialogGeneration.current === generation && selectedRef.current === sessionId)
 										closeDialog();

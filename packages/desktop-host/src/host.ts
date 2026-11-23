@@ -482,6 +482,9 @@ const UNPLACED_OUTSIDE =
 	"The app cannot open this conversation here: its transcript is kept in the project's .gjc folder, outside the conversation store the app uses. Continue it in the terminal, or remove it from this list.";
 /** The store's listing failed, so the app cannot tell whether such a row's transcript still exists. */
 const UNPLACED_UNCHECKED = "The app could not look up this conversation's transcript just now. Try again in a moment.";
+/** A remove-only request for a row the shared store has placed meanwhile: it opens now. */
+const PLACED_NOT_REMOVED =
+	"This conversation can be opened now, so it was not removed. Select it to continue, or delete it from the conversation's actions.";
 /** How long an idle owner left by an earlier build gets to close before the app answers anyway. */
 const LEFTOVER_CLOSE_TIMEOUT_MS = 3_000;
 /** Idle-close attempts per row without a definite answer before the app stops asking. */
@@ -3499,6 +3502,17 @@ export class DesktopHost {
 		if (method === "composer.complete") return this.#complete(params);
 		if (method === "message.copyText") return this.#copyText(request);
 		if (typeof params.sessionId === "string") {
+			// "Remove from list" promises to leave the transcript alone, so it is sent as its own intent
+			// and never becomes a Delete: a row placed in the store since the user chose it is refused.
+			// From this check to the row leaving the catalog nothing awaits, so placement cannot land
+			// in between.
+			if (method === "session.delete" && params.removeOnly !== undefined) {
+				if (params.removeOnly !== true) throw new Error("Invalid removeOnly");
+				const target = this.#metadata(params);
+				if (!target.managed) throw new ConnectionRefusal("placed", PLACED_NOT_REMOVED);
+				this.#unplaced.delete(target.id);
+				return this.#forgetMissingSession(target, false);
+			}
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) {
 				// A row an earlier build saved without a transcript path. Once the store's listing

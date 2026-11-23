@@ -764,6 +764,33 @@ test("an earlier build's reference to a transcript in the project's .gjc folder 
 	expect(h.created).toHaveLength(0);
 });
 
+test("Remove from list never deletes a transcript, even for a row the store placed after the user chose it", async () => {
+	const h = await fixture();
+	const terminal = await h.persist("Placed while the dialog was open");
+	await h.call("project.open", { path: h.projectDir });
+	await h.restartOnEarlierCatalog([terminal.id]);
+	// The user chose Remove from list while the row could not open; a refresh placed it meanwhile.
+	await h.call("bootstrap");
+	await h.refreshed();
+	expect(h.snapshot().sessions.map(session => session.connection)).toEqual([{ state: "connected" }]);
+	const id = crypto.randomUUID();
+	await expect(h.call("session.delete", { sessionId: terminal.id, removeOnly: true }, id)).rejects.toThrow(
+		"can be opened now, so it was not removed",
+	);
+	expect(h.frames.find(frame => frame.type === "response" && frame.id === id)).toMatchObject({
+		connectionRefusal: "placed",
+	});
+	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
+	// While it is still unplaced, the same request only forgets the entry.
+	await h.restartOnEarlierCatalog([terminal.id]);
+	await h.call("session.delete", { sessionId: terminal.id, removeOnly: true });
+	expect(h.snapshot().sessions).toEqual([]);
+	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+	await expect(h.call("session.delete", { sessionId: terminal.id, removeOnly: "yes" })).rejects.toThrow();
+	expect(h.created).toHaveLength(0);
+});
+
 test("selecting an earlier build's terminal reference places it at once, before any refresh", async () => {
 	const h = await fixture();
 	const terminal = await h.persist("Selected right after start");
