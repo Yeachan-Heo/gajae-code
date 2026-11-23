@@ -47,6 +47,30 @@ test("reports the committed tail and the tail this session holds once another pr
 	expect(isEmbeddedAppendRefused({ sessionManager: app })).toBe(true);
 });
 
+test("a terminal that resumed before the embedding's last write is refused too, so the transcript never branches", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close().catch(() => {}));
+	const first = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	// A terminal resumes the transcript, then the embedding writes before the terminal does.
+	const terminal = await SessionManager.open(app.getSessionFile()!, destination);
+	cleanups.push(() => terminal.close().catch(() => {}));
+	const second = app.appendMessage(user("second app turn"));
+	await app.flush();
+	expect(() => terminal.appendMessage(user("stale terminal write"))).toThrow("managed_append_identity_mismatch");
+	const entries = (await Bun.file(app.getSessionFile()!).text())
+		.trimEnd()
+		.split("\n")
+		.map(line => JSON.parse(line) as { type: string; id?: string; parentId?: string | null })
+		.filter(entry => entry.type === "message");
+	expect(entries.map(entry => [entry.id, entry.parentId])).toEqual([
+		[first, null],
+		[second, first],
+	]);
+});
+
 test("has no tail to report before the transcript is published", async () => {
 	const { cwd, destination } = await store();
 	const app = SessionManager.create(cwd, destination);

@@ -475,9 +475,10 @@ cannot be cut short, so on a slow system the answer can come that much later. Th
 check, or any process while no broker runs, is not seen, so keep relying on the store's
 compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop. A turn the session
 starts by itself, for example when background work it owns completes, is preceded by no
-embedding request, so no check can run before it writes. The refusal protects only the
-embedding's own appends: a terminal that appends from a position older than the embedding's
-last write starts a separate branch of the transcript instead of being refused.
+embedding request, so no check can run before it writes. The store applies the same refusal
+to every writer of a managed transcript: a terminal that appends from a position older than
+the embedding's last write is refused too (`managed_append_identity_mismatch`), so neither
+side's append branches or overwrites the other's; the refused writer reopens to continue.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
