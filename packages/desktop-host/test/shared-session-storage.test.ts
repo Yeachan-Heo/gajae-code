@@ -67,6 +67,7 @@ async function fixture(model?: Model) {
 	const created: CreateAgentSessionResult[] = [];
 	const managers: SessionManager[] = [];
 	let openHold: { entered: () => void; release: Promise<void> } | undefined;
+	let writeHold: { entered: () => void; release: Promise<void> } | undefined;
 	const createSession = async (options: CreateAgentSessionOptions) => {
 		const hold = openHold;
 		openHold = undefined;
@@ -101,6 +102,19 @@ async function fixture(model?: Model) {
 			result.session.settings.set("async.enabled", false);
 		}
 		created.push(result);
+		const write = writeHold;
+		writeHold = undefined;
+		if (write) {
+			// The first write puts the transcript on disk before the catalog row is tied to it.
+			const manager = result.session.sessionManager;
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			manager.ensureOnDisk = async () => {
+				manager.ensureOnDisk = ensureOnDisk;
+				await ensureOnDisk();
+				write.entered();
+				await write.release;
+			};
+		}
 		return result;
 	};
 	// The broker's live-owner answer: transcript ids a terminal holds open, or a broker that fails.
@@ -173,6 +187,13 @@ async function fixture(model?: Model) {
 		failBroker: (fails: boolean) => {
 			brokerFails = fails;
 		},
+		/** Holds the next created session right after its transcript first reaches the disk. */
+		holdNextWrite: () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			writeHold = { entered: () => entered.resolve(), release: release.promise };
+			return { entered: entered.promise, release: () => release.resolve() };
+		},
 		/** Holds the next SDK session the Host opens until `release` is called. */
 		holdOpen: () => {
 			const entered = Promise.withResolvers<void>();
@@ -205,6 +226,7 @@ interface SharedCatalog {
 		viewTail?: string | null;
 		disconnected?: true;
 	}>;
+	released?: string[];
 }
 
 async function readCatalog(dataDir: string): Promise<SharedCatalog> {
@@ -1492,6 +1514,128 @@ test("a workspace refresh never shrinks the open conversation's transcript", asy
 	}
 	expect(shown?.messages.length).toBeGreaterThan(20);
 	expect(shown?.messages).toEqual(selected.messages);
+});
+
+test("a fork made before released identities were recorded still hides its private ancestor", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "first turn" });
+	await h.call("prompt", { sessionId, text: "second turn" });
+	const fork = await h.call<{ session: DesktopSession }>("session.fork", { sessionId, entryId: h.lastUser() });
+	const rows = h.snapshot().sessions.map(session => session.id);
+	await h.close();
+	// An older build kept no released list: only the fork's lineage marks the copy it was cut from.
+	const catalog = await readCatalog(h.dataDir);
+	delete catalog.released;
+	await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify(catalog));
+	await h.restart();
+	await h.call("bootstrap");
+	await h.refreshed();
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual(rows);
+	expect(rows).toEqual([sessionId, fork.session.id]);
+});
+
+test("a refresh during a new conversation's creation does not list its transcript a second time", async () => {
+	const h = await controlledFixture();
+	const write = h.holdNextWrite();
+	const creating = h.call<DesktopSession>("session.create", { projectId: h.project.id });
+	// The new transcript is on disk, and its catalog row does not name it yet.
+	await write.entered;
+	await h.call("bootstrap");
+	await h.refreshed();
+	write.release();
+	const created = await creating;
+	expect(
+		h
+			.snapshot()
+			.sessions.map(session => session.id)
+			.sort(),
+	).toEqual([h.session.id, created.id].sort());
+});
+
+test("a released conversation never shows a credential the app knows, in its view or its history", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	const secret = "sk-desktop-released-0123456789abcdef";
+	// The Host learns the key; the provider is unknown, so the save itself is refused.
+	await respond(h, "auth.setKey", { provider: "unknown-provider", key: secret });
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const file = h.sdk().sessionFile!;
+	await h.call("session.disconnect", { sessionId });
+	// The terminal writes the key into the conversation: a prompt, a tool call's arguments, its output.
+	const terminal = h.track(await resumeAsTerminal(file, h.projectDir, h.agentDir));
+	const usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	// Long enough that the view (8,000 characters) or a history page (32,000) keeps only its end, and
+	// the cut falls inside the key: masking must see the whole text before the cut, or the key's end
+	// would survive it.
+	const straddling = (keep: number) => `${"a".repeat(100)}${secret}${"b".repeat(keep - 10)}`;
+	terminal.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: straddling(8_000) }],
+		timestamp: Date.now(),
+	});
+	terminal.appendMessage({
+		role: "assistant",
+		content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: `curl -H 'Bearer ${secret}'` } }],
+		api: "openai-completions",
+		provider: "terminal-fixture",
+		model: "terminal-model",
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+		usage,
+	});
+	terminal.appendMessage({
+		role: "toolResult",
+		toolCallId: "call-1",
+		toolName: "bash",
+		content: [{ type: "text", text: straddling(32_000) }],
+		isError: false,
+		timestamp: Date.now(),
+	});
+	await terminal.flush();
+	expect(await terminal.closeStrict()).toMatchObject({ kind: "closed" });
+	const from = h.frames.length;
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	const history = await h.call<DesktopHistory>("history.get", { sessionId, offset: 0, limit: 50 });
+	// The rows are there, with the key masked where it appeared.
+	expect(JSON.stringify(selected.messages)).toContain("[redacted]");
+	expect(JSON.stringify(history.messages)).toContain("[redacted]");
+	const tail = secret.slice(-10);
+	for (const shown of [JSON.stringify(selected), JSON.stringify(history), JSON.stringify(h.frames.slice(from))]) {
+		expect(shown).not.toContain(secret);
+		expect(shown).not.toContain(tail);
+	}
+});
+
+test("a released conversation never shows another conversation's transcript found at its path", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const file = h.sdk().sessionFile!;
+	await h.call("session.disconnect", { sessionId });
+	const other = h.track(
+		SessionManager.create(h.projectDir, SessionManager.managedDestination(h.projectDir, h.agentDir)),
+	);
+	other.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: "someone else's turn" }],
+		timestamp: Date.now(),
+	});
+	await other.ensureOnDisk();
+	await other.flush();
+	// Another conversation's transcript now sits at the recorded path.
+	await Bun.write(file, await Bun.file(other.getSessionFile()!).text());
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	const history = await h.call<DesktopHistory>("history.get", { sessionId, offset: 0, limit: 50 });
+	expect(JSON.stringify(selected.messages)).not.toContain("someone else's turn");
+	expect(JSON.stringify(history.messages)).not.toContain("someone else's turn");
 });
 
 test("refreshing the workspace does not list a branch fork's private ancestor as a conversation", async () => {

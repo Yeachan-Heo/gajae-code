@@ -1483,6 +1483,73 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task", "steer it"]);
 	});
 
+	test("an input whose hook outlasts Disconnect's wait is still handed back once it ends", async () => {
+		const holdKey = "__gjcDesktopLongHookHold";
+		const enteredKey = "__gjcDesktopLongHookEntered";
+		const hold = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const globals = globalThis as Record<string, unknown>;
+		globals[holdKey] = hold.promise;
+		globals[enteredKey] = () => entered.resolve();
+		cleanups.push(async () => {
+			hold.resolve();
+			delete globals[holdKey];
+			delete globals[enteredKey];
+		});
+		const h = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => {
+				if (event.text.startsWith("slow")) {
+					globalThis.${enteredKey}();
+					await globalThis.${holdKey};
+				}
+				return { text: event.text };
+			});
+		}`,
+		);
+		const { call, snapshot, session, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-long-hook");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const steer = respond(h, "prompt", { sessionId, text: "slow steer", deliverAs: "steer" }, "steer-in-long-hook");
+		await entered.promise;
+		// Disconnect waits for it only so long, then releases the writer with the hook still running.
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		hold.resolve();
+		await steer;
+		expect(await settledReceipts(snapshot, ["steer-in-long-hook"])).toEqual({ "steer-in-long-hook": "refused" });
+		expect(control.prompts).toHaveLength(1);
+	}, 20_000);
+
+	test("Disconnect waits for a rename still writing before it releases the writer", async () => {
+		const { call, session, sdk } = await launch();
+		const sessionId = session.id;
+		const setName = sdk.setSessionName.bind(sdk);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "setSessionName").mockImplementation(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return setName(...args);
+		});
+		const renaming = call("session.rename", { sessionId, title: "Renamed before release" });
+		await entered.promise;
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await Bun.sleep(100);
+		release.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		await renaming;
+		expect(sdk.sessionName).toBe("Renamed before release");
+	});
+
 	test("Disconnect answers only once a steer the run sent has its receipt written", async () => {
 		const h = await launch();
 		const { call, snapshot, session, control } = h;
