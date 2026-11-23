@@ -9,7 +9,7 @@ import {
 	type NativeDirectoryTreeSnapshot,
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
-import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { logger, resolveEquivalentPath, resolveExistingEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import { FileLockAcquireError, withFileLock } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
@@ -766,20 +766,6 @@ function spawnOwnerForRow(
 	const owner = owners?.get(session.sessionId);
 	if (owner === undefined || owner.stateRoots.size === 0) return undefined;
 	return owner.stateRoots.has(resolveEquivalentPath(session.locator.stateRoot)) ? owner.ownerSessionId : undefined;
-}
-
-/**
- * Canonical path of an existing state root, or undefined when it cannot be
- * resolved. Same resolution as `resolveEquivalentPath` (used by
- * `spawnOwnerForRow`) minus its lexical fallback, so an unresolvable root is
- * never recorded as if it were canonical.
- */
-async function canonicalStateRoot(stateRoot: string): Promise<string | undefined> {
-	try {
-		return await fs.realpath(path.resolve(stateRoot));
-	} catch {
-		return undefined;
-	}
 }
 
 /** Exact admission predicate for the child host row published after launch. */
@@ -2952,7 +2938,9 @@ export class Broker {
 				pinnedRegistration = registration.registration;
 				// Taken now, while the registration is fresh, so attribution never depends
 				// on where a symlinked spelling points later.
-				const stateRootIdentity = await canonicalStateRoot(registration.registration.stateRoot);
+				// Same primitive as `spawnOwnerForRow`'s `resolveEquivalentPath`, minus its
+				// lexical fallback, so an unresolvable root is never recorded as canonical.
+				const stateRootIdentity = resolveExistingEquivalentPath(registration.registration.stateRoot);
 				const now = Date.now();
 				const proof = launched.proof;
 				const authorityRecord: SpawnAuthorityV1 = {
