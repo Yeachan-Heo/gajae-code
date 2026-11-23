@@ -12,7 +12,9 @@ export const recovery = {
 	"recovery.openConversation": "Open conversation",
 	"recovery.copyText": "Copy text",
 	"recovery.copied": "Text copied.",
-	"recovery.copyFailed": "The text could not be copied.",
+	"recovery.copyFailed": "The text could not be copied. Select it above and copy it yourself.",
+	"recovery.textLabel": "Unsent text",
+	"recovery.showText": "Show the unsent text",
 	"recovery.showcaseNav": "Recovery cards",
 	"recovery.showcaseHeading": "Delivery recovery cards · which conversation they belong to",
 	"recovery.showcaseNote":

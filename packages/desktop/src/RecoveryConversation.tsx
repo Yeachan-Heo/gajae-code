@@ -1,4 +1,5 @@
 import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
+import { Check, ChevronRight, CircleAlert } from "lucide-react";
 import { useState } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
@@ -26,11 +27,38 @@ export interface RecoveryConversationProps {
 	onOpen: () => void;
 }
 
+/** Past this length or line count the orphan's text starts collapsed behind a disclosure. */
+const LONG_TEXT_CHARACTERS = 280;
+const LONG_TEXT_LINES = 4;
+
+/**
+ * An orphan's unsent text, readable and selectable on the card: it may be the last copy, so it
+ * must survive a clipboard that refuses the write. Long text starts collapsed.
+ */
+function RecoveryText({ text, open, onToggle }: { text: string; open: boolean; onToggle(open: boolean): void }) {
+	const body = (
+		// Focusable so the keyboard can scroll a long text in WebKit too.
+		<pre className="recovery-text" tabIndex={0} aria-label={t("recovery.textLabel")}>
+			{text}
+		</pre>
+	);
+	if (text.length <= LONG_TEXT_CHARACTERS && text.split("\n").length <= LONG_TEXT_LINES) return body;
+	return (
+		<details className="recovery-text-disclosure" open={open} onToggle={event => onToggle(event.currentTarget.open)}>
+			<summary>
+				<ChevronRight className="disclosure-chevron" aria-hidden="true" />
+				{t("recovery.showText")}
+			</summary>
+			{body}
+		</details>
+	);
+}
+
 /**
  * Names the conversation a delivery-recovery card belongs to. A listed conversation can be
- * opened from the card; an orphan (not in the list: deleted, or its workspace closed) offers
- * its text instead, because restoring a draft into it would write into a conversation the
- * user cannot see.
+ * opened from the card; an orphan (not in the list: deleted, or its workspace closed) shows its
+ * text and offers it on the clipboard instead, because restoring a draft into it would write
+ * into a conversation the user cannot see. A failed copy opens the text so it can be selected.
  */
 export function RecoveryConversation({
 	orphan,
@@ -41,6 +69,7 @@ export function RecoveryConversation({
 	onOpen,
 }: RecoveryConversationProps) {
 	const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
+	const [textOpen, setTextOpen] = useState(false);
 	const name = title ?? rememberedTitle;
 	return (
 		<div className="recovery-conversation">
@@ -52,6 +81,7 @@ export function RecoveryConversation({
 					: name !== undefined && t("recovery.conversation", { title: name })}
 			</p>
 			{orphan && <p className="recovery-conversation-hint">{t("recovery.orphanHint")}</p>}
+			{orphan && <RecoveryText text={text} open={textOpen} onToggle={setTextOpen} />}
 			{!orphan && !current && <Button onClick={onOpen}>{t("recovery.openConversation")}</Button>}
 			{orphan && (
 				<Button
@@ -63,7 +93,10 @@ export function RecoveryConversation({
 							]);
 						write().then(
 							() => setCopy("copied"),
-							() => setCopy("failed"),
+							() => {
+								setCopy("failed");
+								setTextOpen(true);
+							},
 						);
 					}}
 				>
@@ -71,11 +104,17 @@ export function RecoveryConversation({
 				</Button>
 			)}
 			{copy === "copied" && (
-				<span className="sr-only" role="status">
+				<p className="recovery-copy-status" role="status">
+					<Check aria-hidden="true" />
 					{t("recovery.copied")}
-				</span>
+				</p>
 			)}
-			{copy === "failed" && <span role="alert">{t("recovery.copyFailed")}</span>}
+			{copy === "failed" && (
+				<p className="recovery-copy-error" role="alert">
+					<CircleAlert aria-hidden="true" />
+					{t("recovery.copyFailed")}
+				</p>
+			)}
 		</div>
 	);
 }
@@ -105,9 +144,12 @@ export interface RecoveryCardProps extends RecoveryConversationProps {
  */
 export function RecoveryCard({ notice, error, retry, restore, discard, ...conversation }: RecoveryCardProps) {
 	return (
-		<div className="notice recovery-card" role="status">
-			<p>{notice}</p>
-			{error && <p>{error}</p>}
+		<div className="notice recovery-card">
+			{/* Only what happened is announced; the conversation, its text and copy feedback are not. */}
+			<div className="recovery-card-message" role="status">
+				<p>{notice}</p>
+				{error && <p>{error}</p>}
+			</div>
 			<RecoveryConversation {...conversation} />
 			{retry && (
 				<Button disabled={retry.disabled} onClick={retry.onClick}>

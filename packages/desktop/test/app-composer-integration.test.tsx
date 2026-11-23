@@ -1789,13 +1789,13 @@ suite("mounted composer delivery recovery", () => {
 			await select(page);
 			const prompt = await send(page, "recover this payload");
 			await receipt(page, prompt, "failed");
-			await page.waitForFunction(() => [...document.querySelectorAll('[role="status"] button')].some(button => button.textContent?.includes("Restore draft")));
+			await page.waitForFunction(() => [...document.querySelectorAll('.recovery-card button')].some(button => button.textContent?.includes("Restore draft")));
 			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "running", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [], queued: Array.from({ length: 30 }, (_, index) => ({ id: `queue-${index}`, text: `queued ${index} ${"long".repeat(100)}`, deliverAs: "followUp" as const, cancelable: true })) } }));
 			await page.waitForSelector(".queued-input:nth-child(31)");
 			const layout = await page.evaluate(() => {
 				const queue = document.querySelector<HTMLElement>(".queued-inputs")!;
 				const pane = document.querySelector<HTMLElement>(".main-pane")!;
-				const recovery = [...document.querySelectorAll<HTMLButtonElement>('[role="status"] button')].find(button => button.textContent?.includes("Restore draft"))!;
+				const recovery = [...document.querySelectorAll<HTMLButtonElement>('.recovery-card button')].find(button => button.textContent?.includes("Restore draft"))!;
 				const composer = document.querySelector<HTMLTextAreaElement>(".composer textarea")!;
 				const reachable = (element: HTMLElement) => {
 					element.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -2030,7 +2030,7 @@ suite("mounted composer delivery recovery", () => {
 			await page.evaluate(() => window.fixture.failPostHandoffDraftSave(2));
 			await page.click('.composer button[type="submit"]');
 			await page.waitForFunction(() => document.body.textContent?.includes("Retry recovery"));
-			const panels = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')]
+			const panels = await page.evaluate(() => [...document.querySelectorAll('.recovery-card')]
 				.filter(el => el.textContent?.includes("Delivery recovery:"))
 				.map(el => ({ text: el.textContent ?? "", repairs: [...el.querySelectorAll("button")].filter(button => button.textContent?.includes("Retry recovery")).length })));
 			expect(panels).toHaveLength(1);
@@ -2083,7 +2083,7 @@ suite("mounted composer delivery recovery", () => {
 				await page.evaluate(({ id, disposition }) => window.fixture.response(id, false, "same error", disposition), { id: request.id, disposition });
 				await page.waitForFunction(copy => [...document.querySelectorAll('[role="status"]')].some(el => el.textContent?.includes(copy)), {}, disposition === "failed" ? "delivery failed" : "the outcome is unknown");
 				expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("");
-				const panel = await page.evaluate(() => [...document.querySelectorAll('[role="status"]')].find(el => el.textContent?.includes("Delivery recovery:"))?.textContent ?? "");
+				const panel = await page.evaluate(() => [...document.querySelectorAll('.recovery-card')].find(el => el.textContent?.includes("Delivery recovery:"))?.textContent ?? "");
 				expect(panel).toContain(disposition === "failed" ? "Some work may already have run." : "It may already have run.");
 				expect(panel).toContain("Restore draft");
 				expect(panel).toContain(disposition === "failed" ? "Discard recovery record" : "Restoring the draft will not resend it automatically");
