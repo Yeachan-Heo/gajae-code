@@ -123,7 +123,7 @@ import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboa
 import { ProvidersDialog } from "./ProvidersDialog";
 import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
-import { RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
+import { DeleteRecoveryWarning, RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
 import { Select } from "./Select";
 import { DisconnectConfirmation, disconnectConfirmTitle, SessionConnectionNotice } from "./SessionConnection";
 import { connectionState, SessionConnectionBadge } from "./SessionConnectionMark";
@@ -3695,6 +3695,20 @@ export default function App() {
 									<strong>{t("shell.deleteConversationIrreversible")}</strong>
 								</p>
 							</div>
+							{/* Deleting drops the conversation's recovery records too; name the unrestored ones. */}
+							<DeleteRecoveryWarning
+								texts={recoveries
+									.filter(
+										item =>
+											item.sessionId === selected &&
+											!item.restored &&
+											!item.finalizing &&
+											(item.disposition === "unknown" ||
+												item.disposition === "failed" ||
+												unsentRepairs.current.get(item.id) === item.sessionId),
+									)
+									.map(item => item.text)}
+							/>
 							<Button
 								className="danger"
 								disabled={!connected || pending[selected]}

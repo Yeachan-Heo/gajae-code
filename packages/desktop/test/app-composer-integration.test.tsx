@@ -2915,6 +2915,9 @@ suite("mounted composer delivery recovery", () => {
 				return { question: question.textContent, warning: warning.textContent, separate: question.getBoundingClientRect().bottom < warning.getBoundingClientRect().top, emphasized: getComputedStyle(question).color !== getComputedStyle(warning).color };
 			});
 			expect(warning).toEqual({ question: 'Delete the conversation “Session A”?', warning: 'This cannot be undone.', separate: true, emphasized: true });
+			// Without unrestored recovery records the confirmation says nothing about them.
+			expect(await page.$(".delete-recoveries")).toBeNull();
+			expect(await page.$eval("dialog[open]", node => node.textContent)).not.toContain("unsent");
 			expect(await page.evaluate(() => window.fixture.requests().some(request => request.method === 'session.delete'))).toBe(false);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
@@ -3764,6 +3767,15 @@ suite("mounted composer delivery recovery", () => {
 			await page.click('button[aria-label="Conversation actions menu"]');
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".command-list button")].find(button => button.textContent?.includes("Delete"))?.click());
 			await page.waitForSelector(".delete-confirmation");
+			// The confirmation names what deleting discards with it and offers the text first.
+			await page.waitForSelector(".delete-recoveries");
+			expect(await page.$eval(".delete-recoveries", node => node.textContent)).toContain("1 unsent message");
+			expect(await page.$eval(".delete-recoveries .recovery-text", node => node.textContent)).toBe("deleted with its conversation");
+			await installResponseClipboard(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".delete-recoveries button")].find(button => button.textContent === "Copy text")?.click());
+			await page.waitForFunction(() => window.responseClipboard.commits.length === 1);
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["deleted with its conversation"]);
+			await page.waitForSelector(".delete-recoveries .recovery-copy-status");
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".modal button.danger")].find(button => button.textContent?.includes("Delete"))?.click());
 			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "session.delete"));
 			await page.waitForFunction(async () => {

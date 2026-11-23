@@ -11,6 +11,11 @@ export const recovery = {
 	"recovery.discardOrphan": "Discard record",
 	"recovery.restoreFirst":
 		"Restore the draft first. The outcome is unknown, so this record keeps the text until it is back in the message box.",
+	"recovery.deleteDiscardsOne":
+		"Deleting also discards 1 unsent message whose draft was never restored. Copy its text first if you still need it.",
+	"recovery.deleteDiscards":
+		"Deleting also discards {count} unsent messages whose drafts were never restored. Copy their text first if you still need it.",
+	"recovery.copyAllText": "Copy all text",
 	"recovery.openConversation": "Open conversation",
 	"recovery.copyText": "Copy text",
 	"recovery.copied": "Text copied.",

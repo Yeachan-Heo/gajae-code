@@ -54,6 +54,47 @@ function RecoveryText({ text, open, onToggle }: { text: string; open: boolean; o
 	);
 }
 
+type CopyState = "idle" | "copied" | "failed";
+
+/**
+ * Copies unsent text on the user's click and remembers how it went. `copy` must run inside the
+ * click handler, so WebKit keeps the user gesture for the clipboard write.
+ */
+function useCopyText(text: string, onFailure: () => void): [CopyState, () => void] {
+	const [state, setState] = useState<CopyState>("idle");
+	const copy = () => {
+		const write = async () =>
+			navigator.clipboard.write([new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }) })]);
+		write().then(
+			() => setState("copied"),
+			() => {
+				setState("failed");
+				onFailure();
+			},
+		);
+	};
+	return [state, copy];
+}
+
+/** Visible copy feedback: a green check when copied, an error-ink alert when the write is refused. */
+function CopyFeedback({ state }: { state: CopyState }) {
+	if (state === "copied")
+		return (
+			<p className="recovery-copy-status" role="status">
+				<Check aria-hidden="true" />
+				{t("recovery.copied")}
+			</p>
+		);
+	if (state === "failed")
+		return (
+			<p className="recovery-copy-error" role="alert">
+				<CircleAlert aria-hidden="true" />
+				{t("recovery.copyFailed")}
+			</p>
+		);
+	return null;
+}
+
 /**
  * Names the conversation a delivery-recovery card belongs to. An orphan (not in the list:
  * deleted, or its workspace closed) also shows its text, because restoring a draft into it would
@@ -122,10 +163,10 @@ export function RecoveryCard({
 	onOpen,
 	...conversation
 }: RecoveryCardProps) {
-	const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
 	const [textOpen, setTextOpen] = useState(false);
 	const reasonId = useId();
 	const { orphan, text } = conversation;
+	const [copy, copyText] = useCopyText(text, () => setTextOpen(true));
 	const reason = discard.disabled ? discard.reason : undefined;
 	return (
 		<section className="recovery-card">
@@ -147,26 +188,7 @@ export function RecoveryCard({
 						{restore.label}
 					</Button>
 				)}
-				{orphan && (
-					<Button
-						onClick={() => {
-							// Registered inside the click so WebKit keeps the user gesture for the write.
-							const write = async () =>
-								navigator.clipboard.write([
-									new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }) }),
-								]);
-							write().then(
-								() => setCopy("copied"),
-								() => {
-									setCopy("failed");
-									setTextOpen(true);
-								},
-							);
-						}}
-					>
-						{t("recovery.copyText")}
-					</Button>
-				)}
+				{orphan && <Button onClick={copyText}>{t("recovery.copyText")}</Button>}
 				<Button
 					disabled={discard.disabled}
 					aria-describedby={reason ? reasonId : undefined}
@@ -180,18 +202,30 @@ export function RecoveryCard({
 					{reason}
 				</p>
 			)}
-			{copy === "copied" && (
-				<p className="recovery-copy-status" role="status">
-					<Check aria-hidden="true" />
-					{t("recovery.copied")}
-				</p>
-			)}
-			{copy === "failed" && (
-				<p className="recovery-copy-error" role="alert">
-					<CircleAlert aria-hidden="true" />
-					{t("recovery.copyFailed")}
-				</p>
-			)}
+			<CopyFeedback state={copy} />
 		</section>
+	);
+}
+
+/**
+ * Inside the Delete conversation confirmation: deleting also discards the conversation's
+ * unrestored recovery records, so it says how many unsent messages go with it and offers their
+ * text first, as an orphan card does. Renders nothing when there are none.
+ */
+export function DeleteRecoveryWarning({ texts }: { texts: readonly string[] }) {
+	const [textOpen, setTextOpen] = useState(false);
+	const joined = texts.join("\n\n");
+	const [copy, copyText] = useCopyText(joined, () => setTextOpen(true));
+	if (texts.length === 0) return null;
+	const one = texts.length === 1;
+	return (
+		<div className="delete-recoveries">
+			<p>{one ? t("recovery.deleteDiscardsOne") : t("recovery.deleteDiscards", { count: texts.length })}</p>
+			<RecoveryText text={joined} open={textOpen} onToggle={setTextOpen} />
+			<div className="recovery-card-actions">
+				<Button onClick={copyText}>{one ? t("recovery.copyText") : t("recovery.copyAllText")}</Button>
+			</div>
+			<CopyFeedback state={copy} />
+		</div>
 	);
 }

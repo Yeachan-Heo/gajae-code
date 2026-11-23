@@ -1106,6 +1106,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .recovery-card-actions > .button:hover:not(:disabled) { background: var(--surface); }
 .recovery-card-actions > .button:disabled { border-style: dashed; background: transparent; color: var(--muted); }
 .recovery-card-reason { font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
+/* In the Delete conversation confirmation: the unrestored texts that go with it, and a copy first. */
+.delete-recoveries { display: grid; gap: 0.5rem; margin: 0 0 1rem; }
+.delete-recoveries > p { margin: 0; word-break: keep-all; overflow-wrap: anywhere; }
 /* An orphan's unsent text, in the bounded-output vocabulary: inset, scrollable, its whitespace kept
    and selectable, because it may be the last copy. Long text starts behind a disclosure. */
 .recovery-text, .recovery-text-disclosure { flex-basis: 100%; min-width: 0; }
