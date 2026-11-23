@@ -1338,6 +1338,13 @@ export class CommandController {
 			this.ctx.showError("Usage: /move <path>");
 			return;
 		}
+		// Refuse before the cwd transition and flush, not from inside them.
+		try {
+			this.ctx.sessionManager.assertLegacyMutationAllowed("move session");
+		} catch (err) {
+			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
 
 		const cwd = this.ctx.sessionManager.getCwd();
 		const resolvedPath = resolveToCwd(unquoted, cwd);

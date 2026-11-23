@@ -5,11 +5,14 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
+import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -226,5 +229,49 @@ describe("#7856 Move Session in a shared root TUI session", () => {
 		}
 
 		expect(threwExpected).toBe(true);
+	});
+
+	it("refuses the move_session tool before it changes the process cwd or rebinds services", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-move-session-tool-"));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		// move_session only narrows the scope, so the target is a descendant.
+		const target = path.join(cwd, "narrower");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(target, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const settings = Settings.isolated();
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		managers.push(sessionManager);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager,
+			settings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMcpAutoload: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: ["move_session"],
+		});
+		sessions.push(session);
+		expect((await sessionManager.appendMessageSharingSession(user("shared message"))).kind).toBe("committed");
+		const processCwd = process.cwd();
+		const transition = vi.spyOn(sessionManager, "runExclusiveCwdMoveTransition");
+		const tool = session.getToolByName("move_session");
+		if (!tool) throw new Error("move_session tool is unavailable");
+		await expect(tool.execute("move-session-refused", { path: target } as never)).rejects.toThrow(
+			"Shared session mutation requires transaction admission: move session",
+		);
+		expect(transition).not.toHaveBeenCalled();
+		expect(process.cwd()).toBe(processCwd);
+		expect(sessionManager.getCwd()).toBe(cwd);
 	});
 });

@@ -618,6 +618,7 @@ import {
 	SessionManager,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
+	GraphSuccessorUnavailableError,
 	SharedSessionMutationUnsupportedError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
@@ -22826,6 +22827,13 @@ export class AgentSession {
 				this.#resetActiveSdkRunOwnership();
 			};
 
+			// Refuse before the hook and the agent disconnect below. A bounded cold fork
+			// copies through SessionManager.forkFrom, not prepareFork.
+			const forkRefusal = this.sessionManager.getSessionMemoryStats().coldRetirementActive
+				? undefined
+				: this.sessionManager.graphSuccessorRefusal({ wholeSession: true });
+			if (forkRefusal) throw new GraphSuccessorUnavailableError("prepare fork", forkRefusal);
+
 			// Emit session_before_switch event with reason "fork" (can be cancelled)
 			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 				const result = (await this.#extensionRunner.emit({
@@ -35993,6 +36001,11 @@ export class AgentSession {
 			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 				throw new Error("Invalid entry ID for branching");
 			}
+			// Refuse before the hook, the agent disconnect and the /btw settle below.
+			const branchRefusal = selectedEntry.parentId
+				? this.sessionManager.graphSuccessorRefusal({ leafId: selectedEntry.parentId })
+				: undefined;
+			if (branchRefusal) throw new GraphSuccessorUnavailableError("prepare branched session", branchRefusal);
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();

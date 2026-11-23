@@ -359,95 +359,76 @@ async function only(sessions: string): Promise<string> {
 	return file!;
 }
 
-/**
- * Known failing until the /fork fix lands: the test passes under it.failing only when the
- * run stops on exactly the reported refusal, so a harness break or timeout is not
- * mistaken for the reproduction. Flip to a plain it() with the fix.
- */
-function reproducesRefusal(refusal: RegExp, run: () => Promise<void>): () => Promise<void> {
-	return async () => {
-		try {
-			await run();
-		} catch (error) {
-			if (refusal.test(error instanceof Error ? error.message : String(error))) throw error;
-		}
-	};
-}
-
 describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI", () => {
-	it.failing(
-		"forks from the newest and the first prompt after shared-append messages",
-		reproducesRefusal(/requires transaction admission: prepare branched session/, async () => {
-			const { root, cwd, agent, sessions, cli, model } = await fixture();
-			try {
-				const tui = startTui({ cli, cwd, root, agent });
-				await ready(tui);
-				tui.pty.write("fork-p1\r");
-				const source = await only(sessions);
-				await replied(source, "fork-p1");
-				tui.pty.write("fork-p2\r");
-				await replied(source, "fork-p2");
-				const sourceId = (await readTranscript(source)).header.id;
+	it("forks from the newest and the first prompt after shared-append messages", async () => {
+		const { root, cwd, agent, sessions, cli, model } = await fixture();
+		try {
+			const tui = startTui({ cli, cwd, root, agent });
+			await ready(tui);
+			tui.pty.write("fork-p1\r");
+			const source = await only(sessions);
+			await replied(source, "fork-p1");
+			tui.pty.write("fork-p2\r");
+			await replied(source, "fork-p2");
+			const sourceId = (await readTranscript(source)).header.id;
 
-				// Fork 1: the newest prompt. Model selection survives the fork.
-				await sendCommand(tui, "/model fake/fake-model-b", /fake-model-b/);
-				// The fork never writes the source's workflow state directory.
-				const sourceWorkflow = sessionRoot(cwd, sourceId);
-				const sourceWorkflowBefore = await settledSnapshot(sourceWorkflow);
-				const first = await forkFrom(tui, sessions, source, 0, "fork-p2");
-				expect(first.header.parentSession).toBe(sourceId);
-				expect(messagesWith(first.entries, "fork-p1")).toHaveLength(1);
-				expect(messagesWith(first.entries, "fork-p1-reply")).toHaveLength(1);
-				expect(first.entries.some(entry => entry.type === "model_change")).toBe(true);
-				// Submitting the restored prompt lands it in the fork, on the selected model.
-				await submitRestored(tui, first.file, "fork-p2");
-				await replied(first.file, "fork-p2");
-				expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-p2" });
-				expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
-				const fork1Controls = await runControls(tui, first.file, model, "fork1");
+			// Fork 1: the newest prompt. Model selection survives the fork.
+			await sendCommand(tui, "/model fake/fake-model-b", /fake-model-b/);
+			// The fork never writes the source's workflow state directory.
+			const sourceWorkflow = sessionRoot(cwd, sourceId);
+			const sourceWorkflowBefore = await settledSnapshot(sourceWorkflow);
+			const first = await forkFrom(tui, sessions, source, 0, "fork-p2");
+			expect(first.header.parentSession).toBe(sourceId);
+			expect(messagesWith(first.entries, "fork-p1")).toHaveLength(1);
+			expect(messagesWith(first.entries, "fork-p1-reply")).toHaveLength(1);
+			expect(first.entries.some(entry => entry.type === "model_change")).toBe(true);
+			// Submitting the restored prompt lands it in the fork, on the selected model.
+			await submitRestored(tui, first.file, "fork-p2");
+			await replied(first.file, "fork-p2");
+			expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-p2" });
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
+			const fork1Controls = await runControls(tui, first.file, model, "fork1");
 
-				// Fork 2: the first prompt, from the fork the TUI is now on.
-				const second = await forkFrom(tui, sessions, first.file, 2, "fork-p1");
-				expect(messagesWith(second.entries, "fork-p1")).toHaveLength(0);
-				expect(messagesWith(second.entries, "fork-p2")).toHaveLength(0);
-				await submitRestored(tui, second.file, "fork-p1");
-				await replied(second.file, "fork-p1");
-				expect(Buffer.from(await Bun.file(first.file).arrayBuffer())).toEqual(second.sourceBytes);
-				expect(await runControls(tui, second.file, model, "fork2")).toEqual(fork1Controls);
-				expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
-				expect(await treeSnapshot(sourceWorkflow)).toEqual(sourceWorkflowBefore);
+			// Fork 2: the first prompt, from the fork the TUI is now on.
+			const second = await forkFrom(tui, sessions, first.file, 2, "fork-p1");
+			expect(messagesWith(second.entries, "fork-p1")).toHaveLength(0);
+			expect(messagesWith(second.entries, "fork-p2")).toHaveLength(0);
+			await submitRestored(tui, second.file, "fork-p1");
+			await replied(second.file, "fork-p1");
+			expect(Buffer.from(await Bun.file(first.file).arrayBuffer())).toEqual(second.sourceBytes);
+			expect(await runControls(tui, second.file, model, "fork2")).toEqual(fork1Controls);
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
+			expect(await treeSnapshot(sourceWorkflow)).toEqual(sourceWorkflowBefore);
 
-				// The source stays fully usable after being forked, and forks again once resumed.
-				tui.pty.kill();
-				await tui.done.catch(() => undefined);
-				const resumed = startTui({ cli, cwd, root, agent, extra: ["--resume", sourceId] });
-				await ready(resumed);
-				expect(await runControls(resumed, source, model, "source")).toEqual(fork1Controls);
-				expect(await transcriptById(sessions, sourceId)).toBe(source);
-				// A real /compact, then a fork whose branch path carries the compaction.
-				resumed.pty.write("/compact\r");
-				await waitFor(
-					async () => (await readTranscript(source)).entries.some(entry => entry.type === "compaction"),
-					60_000,
-					"compaction entry",
-				);
-				resumed.pty.write("fork-after-compact\r");
-				await replied(source, "fork-after-compact");
-				const resumedWorkflow = await settledSnapshot(sourceWorkflow);
-				const third = await forkFrom(resumed, sessions, source, 0, "fork-after-compact");
-				expect(third.entries.some(entry => entry.type === "compaction")).toBe(true);
-				expect(messagesWith(third.entries, "fork-source-after")).toHaveLength(1);
-				await submitRestored(resumed, third.file, "fork-after-compact");
-				await replied(third.file, "fork-after-compact");
-				expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-after-compact" });
-				expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(third.sourceBytes);
-				expect(await treeSnapshot(sourceWorkflow)).toEqual(resumedWorkflow);
-			} finally {
-				await model.server.stop(true);
-			}
-		}),
-		240_000,
-	);
+			// The source stays fully usable after being forked, and forks again once resumed.
+			tui.pty.kill();
+			await tui.done.catch(() => undefined);
+			const resumed = startTui({ cli, cwd, root, agent, extra: ["--resume", sourceId] });
+			await ready(resumed);
+			expect(await runControls(resumed, source, model, "source")).toEqual(fork1Controls);
+			expect(await transcriptById(sessions, sourceId)).toBe(source);
+			// A real /compact, then a fork whose branch path carries the compaction.
+			resumed.pty.write("/compact\r");
+			await waitFor(
+				async () => (await readTranscript(source)).entries.some(entry => entry.type === "compaction"),
+				60_000,
+				"compaction entry",
+			);
+			resumed.pty.write("fork-after-compact\r");
+			await replied(source, "fork-after-compact");
+			const resumedWorkflow = await settledSnapshot(sourceWorkflow);
+			const third = await forkFrom(resumed, sessions, source, 0, "fork-after-compact");
+			expect(third.entries.some(entry => entry.type === "compaction")).toBe(true);
+			expect(messagesWith(third.entries, "fork-source-after")).toHaveLength(1);
+			await submitRestored(resumed, third.file, "fork-after-compact");
+			await replied(third.file, "fork-after-compact");
+			expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-after-compact" });
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(third.sourceBytes);
+			expect(await treeSnapshot(sourceWorkflow)).toEqual(resumedWorkflow);
+		} finally {
+			await model.server.stop(true);
+		}
+	}, 240_000);
 
 	it("never writes the shared transcript when /fork runs beside a peer TUI", async () => {
 		const { root, cwd, agent, sessions, cli, model } = await fixture();
@@ -474,7 +455,9 @@ describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI
 				await waitFor(() => /Fork failed|›\s*fork-[ab]\d/.test(since(tui, mark)), 30_000, "fork refusal or picker");
 				if (!/Fork failed/.test(since(tui, mark))) tui.pty.write("\r");
 				await waitFor(() => /Fork failed/.test(since(tui, mark)), 30_000, "fork refusal");
-				expect(since(tui, mark)).toMatch(/requires transaction admission: prepare branched session/);
+				expect(since(tui, mark)).toMatch(
+					/Cannot fork this session: another gjc process has written to this session/,
+				);
 				expect(await transcriptFiles(sessions)).toEqual([shared]);
 				expect(Buffer.from(await Bun.file(shared).arrayBuffer())).toEqual(bytes);
 			}
