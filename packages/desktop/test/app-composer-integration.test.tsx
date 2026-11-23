@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
+import { measureContrast } from "./fixtures/contrast";
 import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
@@ -3621,11 +3622,11 @@ suite("mounted composer delivery recovery", () => {
 			expect(await page.$eval(".recovery-conversation", el => el.textContent)).toContain("Session A");
 			// The conversation is still listed: its draft can be restored there, so nothing offers a copy.
 			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent === "Copy text"))).toBe(false);
-			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".recovery-conversation button")].find(button => button.textContent === "Open conversation")?.click());
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".recovery-card button")].find(button => button.textContent === "Open conversation")?.click());
 			await page.waitForFunction(() => document.querySelector(".desktop-sidebar .session-select[aria-current='page'] .session-title")?.textContent === "Session A");
 			// Under its own open conversation the card still names it but offers no way to open it again.
 			expect(await page.$eval(".recovery-conversation", el => el.textContent)).toContain("Session A");
-			expect(await page.evaluate(() => [...document.querySelectorAll(".recovery-conversation button")].some(button => button.textContent === "Open conversation"))).toBe(false);
+			expect(await page.evaluate(() => [...document.querySelectorAll(".recovery-card button")].some(button => button.textContent === "Open conversation"))).toBe(false);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
@@ -3656,13 +3657,100 @@ suite("mounted composer delivery recovery", () => {
 			// No draft can be restored into a conversation that is not listed.
 			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent?.includes("Restore draft")))).toBe(false);
 			await installResponseClipboard(page);
-			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".recovery-conversation button")].find(button => button.textContent === "Copy text")?.click());
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".recovery-card button")].find(button => button.textContent === "Copy text")?.click());
 			await page.waitForFunction(() => window.responseClipboard.commits.length === 1);
 			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["orphaned prompt text"]);
 			expect(await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("Discard"))?.disabled)).toBe(false);
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("Discard"))?.click());
 			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "delivery.ack" && r.params.deliveryId === "orphan-delivery"));
 			await page.waitForFunction(() => !document.querySelector(".recovery-conversation"));
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("stacked recovery cards are separate cards in the reading column, each with one row of distinct actions", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					open.onsuccess = () => resolve(open.result);
+					open.onerror = () => reject(open.error);
+				});
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction("deliveries", "readwrite");
+					const store = tx.objectStore("deliveries");
+					store.put({ id: "stack-1", sessionId: "a", title: "Session A", text: "first unsent", attachments: [], disposition: "unknown", sequence: 1 });
+					store.put({ id: "stack-2", sessionId: "b", title: "Session B", text: "second unsent", attachments: [], disposition: "failed", sequence: 2 });
+					store.put({ id: "stack-3", sessionId: "gone", title: "Old chat", text: "third unsent", attachments: [], disposition: "unknown", sequence: 3 });
+					tx.oncomplete = () => resolve();
+					tx.onerror = () => reject(tx.error);
+				});
+				db.close();
+			});
+			await page.reload();
+			await page.waitForFunction(() => document.querySelectorAll(".conversation-column > .recovery-card").length === 3);
+			// A 656 px column (the reviewed width), the minimum 720 px window (456 px beside the open sidebar),
+			// and a 390 px window, where the open sidebar leaves the column 126 px.
+			for (const [width, columnWidth] of [[920, 656], [720, 456], [390, 126]] as const) {
+				await page.setViewport({ width, height: 900 });
+				const layout = await page.evaluate(() => {
+					const column = document.querySelector(".conversation-column")!.getBoundingClientRect();
+					const cards = [...document.querySelectorAll<HTMLElement>(".conversation-column > .recovery-card")];
+					const boxes = cards.map(card => card.getBoundingClientRect());
+					const background = getComputedStyle(document.querySelector(".conversation-column")!).backgroundColor;
+					return {
+						column: Math.round(column.width),
+						cards: cards.map((card, index) => {
+							const box = boxes[index]!;
+							const style = getComputedStyle(card);
+							const buttons = [...card.querySelectorAll<HTMLButtonElement>("button")];
+							return {
+								edged: Number.parseFloat(style.borderTopWidth) >= 1 && style.backgroundColor !== background,
+								gutter: box.left - column.left >= 15.5 && column.right - box.right >= 15.5,
+								bounded: box.width <= 800.5,
+								// Every action of a card sits in its one actions row, inside the card.
+								oneRow: buttons.every(button => button.parentElement?.classList.contains("recovery-card-actions")),
+								inside: buttons.every(button => {
+									const rect = button.getBoundingClientRect();
+									return rect.left >= box.left && rect.right <= box.right && rect.top >= box.top && rect.bottom <= box.bottom;
+								}),
+							};
+						}),
+						gaps: boxes.slice(1).map((box, index) => Math.round(box.top - boxes[index]!.bottom)),
+					};
+				});
+				expect(layout.cards).toEqual(Array.from({ length: 3 }, () => ({ edged: true, gutter: true, bounded: true, oneRow: true, inside: true })));
+				expect(layout.gaps.every(gap => gap >= 8)).toBe(true);
+				expect(layout.column).toBe(columnWidth);
+			}
+			// Enabled actions read as buttons in the body ink; a disabled Discard looks different and says why.
+			const actions = await page.evaluate(() => {
+				const card = document.querySelector<HTMLElement>(".conversation-column > .recovery-card")!;
+				const buttons = [...card.querySelectorAll<HTMLButtonElement>(".recovery-card-actions button")];
+				const discard = buttons.find(button => button.textContent === "Discard restored record")!;
+				const restore = buttons.find(button => button.textContent === "Restore draft")!;
+				const reason = document.getElementById(discard.getAttribute("aria-describedby") ?? "");
+				for (const [index, button] of buttons.entries()) button.dataset.stackAction = String(index);
+				return {
+					labels: buttons.map(button => button.textContent),
+					discardDisabled: discard.disabled,
+					restoreDisabled: restore.disabled,
+					fillsDiffer: getComputedStyle(discard).backgroundColor !== getComputedStyle(restore).backgroundColor,
+					reason: reason?.textContent ?? null,
+					reasonShown: !!reason && reason.checkVisibility(),
+				};
+			});
+			expect(actions).toEqual({
+				labels: ["Open conversation", "Restore draft", "Discard restored record"],
+				discardDisabled: true,
+				restoreDisabled: false,
+				fillsDiffer: true,
+				reason: "Restore the draft first. The outcome is unknown, so this record keeps the text until it is back in the message box.",
+				reasonShown: true,
+			});
+			await page.mouse.move(1, 1);
+			for (const sample of await page.evaluate(measureContrast, ['[data-stack-action="0"]', '[data-stack-action="1"]']))
+				expect(sample.ratio).toBeGreaterThanOrEqual(4.5);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 

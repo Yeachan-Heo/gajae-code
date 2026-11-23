@@ -1,6 +1,6 @@
 import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
 import { Check, ChevronRight, CircleAlert } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
 
@@ -55,21 +55,21 @@ function RecoveryText({ text, open, onToggle }: { text: string; open: boolean; o
 }
 
 /**
- * Names the conversation a delivery-recovery card belongs to. A listed conversation can be
- * opened from the card; an orphan (not in the list: deleted, or its workspace closed) shows its
- * text and offers it on the clipboard instead, because restoring a draft into it would write
- * into a conversation the user cannot see. A failed copy opens the text so it can be selected.
+ * Names the conversation a delivery-recovery card belongs to. An orphan (not in the list:
+ * deleted, or its workspace closed) also shows its text, because restoring a draft into it would
+ * write into a conversation the user cannot see, so the text may be the last copy.
  */
-export function RecoveryConversation({
+function RecoveryConversation({
 	orphan,
 	title,
 	rememberedTitle,
-	current,
 	text,
-	onOpen,
-}: RecoveryConversationProps) {
-	const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
-	const [textOpen, setTextOpen] = useState(false);
+	textOpen,
+	onTextToggle,
+}: Pick<RecoveryConversationProps, "orphan" | "title" | "rememberedTitle" | "text"> & {
+	textOpen: boolean;
+	onTextToggle(open: boolean): void;
+}) {
 	const name = title ?? rememberedTitle;
 	return (
 		<div className="recovery-conversation">
@@ -81,40 +81,7 @@ export function RecoveryConversation({
 					: name !== undefined && t("recovery.conversation", { title: name })}
 			</p>
 			{orphan && <p className="recovery-conversation-hint">{t("recovery.orphanHint")}</p>}
-			{orphan && <RecoveryText text={text} open={textOpen} onToggle={setTextOpen} />}
-			{!orphan && !current && <Button onClick={onOpen}>{t("recovery.openConversation")}</Button>}
-			{orphan && (
-				<Button
-					onClick={() => {
-						// Registered inside the click so WebKit keeps the user gesture for the write.
-						const write = async () =>
-							navigator.clipboard.write([
-								new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }) }),
-							]);
-						write().then(
-							() => setCopy("copied"),
-							() => {
-								setCopy("failed");
-								setTextOpen(true);
-							},
-						);
-					}}
-				>
-					{t("recovery.copyText")}
-				</Button>
-			)}
-			{copy === "copied" && (
-				<p className="recovery-copy-status" role="status">
-					<Check aria-hidden="true" />
-					{t("recovery.copied")}
-				</p>
-			)}
-			{copy === "failed" && (
-				<p className="recovery-copy-error" role="alert">
-					<CircleAlert aria-hidden="true" />
-					{t("recovery.copyFailed")}
-				</p>
-			)}
+			{orphan && <RecoveryText text={text} open={textOpen} onToggle={onTextToggle} />}
 		</div>
 	);
 }
@@ -124,6 +91,8 @@ export interface RecoveryAction {
 	label: string;
 	disabled?: boolean;
 	onClick?: () => void;
+	/** Shown under the actions while the action is disabled, and linked to it as its description. */
+	reason?: string;
 }
 
 export interface RecoveryCardProps extends RecoveryConversationProps {
@@ -138,32 +107,91 @@ export interface RecoveryCardProps extends RecoveryConversationProps {
 }
 
 /**
- * A delivery-recovery card: what happened, which conversation it belongs to, and its actions.
- * Presentational only, so the App and the showcase render the same card; the App decides what
- * each action does and when it is available.
+ * A delivery-recovery card: what happened, which conversation it belongs to, and one row of
+ * actions (retry, open, restore or copy, then discard last). Presentational only, so the App and
+ * the showcase render the same card; the App decides what each action does and when it is
+ * available. A failed copy opens an orphan's text so it can be selected by hand.
  */
-export function RecoveryCard({ notice, error, retry, restore, discard, ...conversation }: RecoveryCardProps) {
+export function RecoveryCard({
+	notice,
+	error,
+	retry,
+	restore,
+	discard,
+	current,
+	onOpen,
+	...conversation
+}: RecoveryCardProps) {
+	const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
+	const [textOpen, setTextOpen] = useState(false);
+	const reasonId = useId();
+	const { orphan, text } = conversation;
+	const reason = discard.disabled ? discard.reason : undefined;
 	return (
-		<div className="notice recovery-card">
+		<section className="recovery-card">
 			{/* Only what happened is announced; the conversation, its text and copy feedback are not. */}
 			<div className="recovery-card-message" role="status">
 				<p>{notice}</p>
 				{error && <p>{error}</p>}
 			</div>
-			<RecoveryConversation {...conversation} />
-			{retry && (
-				<Button disabled={retry.disabled} onClick={retry.onClick}>
-					{retry.label}
+			<RecoveryConversation {...conversation} textOpen={textOpen} onTextToggle={setTextOpen} />
+			<div className="recovery-card-actions">
+				{retry && (
+					<Button disabled={retry.disabled} onClick={retry.onClick}>
+						{retry.label}
+					</Button>
+				)}
+				{!orphan && !current && <Button onClick={onOpen}>{t("recovery.openConversation")}</Button>}
+				{restore && (
+					<Button disabled={restore.disabled} onClick={restore.onClick}>
+						{restore.label}
+					</Button>
+				)}
+				{orphan && (
+					<Button
+						onClick={() => {
+							// Registered inside the click so WebKit keeps the user gesture for the write.
+							const write = async () =>
+								navigator.clipboard.write([
+									new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }) }),
+								]);
+							write().then(
+								() => setCopy("copied"),
+								() => {
+									setCopy("failed");
+									setTextOpen(true);
+								},
+							);
+						}}
+					>
+						{t("recovery.copyText")}
+					</Button>
+				)}
+				<Button
+					disabled={discard.disabled}
+					aria-describedby={reason ? reasonId : undefined}
+					onClick={discard.onClick}
+				>
+					{discard.label}
 				</Button>
+			</div>
+			{reason && (
+				<p className="recovery-card-reason" id={reasonId}>
+					{reason}
+				</p>
 			)}
-			{restore && (
-				<Button disabled={restore.disabled} onClick={restore.onClick}>
-					{restore.label}
-				</Button>
+			{copy === "copied" && (
+				<p className="recovery-copy-status" role="status">
+					<Check aria-hidden="true" />
+					{t("recovery.copied")}
+				</p>
 			)}
-			<Button disabled={discard.disabled} onClick={discard.onClick}>
-				{discard.label}
-			</Button>
-		</div>
+			{copy === "failed" && (
+				<p className="recovery-copy-error" role="alert">
+					<CircleAlert aria-hidden="true" />
+					{t("recovery.copyFailed")}
+				</p>
+			)}
+		</section>
 	);
 }

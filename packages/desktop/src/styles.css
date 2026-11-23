@@ -1089,10 +1089,22 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .providers-showcase-narrow-notice { max-width: 302px; }
 .providers-showcase-narrow-notice .provider-notice-action { flex: 1 1 100%; width: 100%; }
 /* Section S: session connection and recovery labels (RecoveryConversation.tsx, SessionConnection.tsx). */
-/* A recovery card names its conversation; Open or Copy sits on the same line when it fits. */
-.recovery-conversation { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; margin: 0.25rem 0 0.5rem; }
-.recovery-conversation-name { margin: 0; min-width: 0; color: var(--text); font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
-.recovery-conversation-hint { flex-basis: 100%; margin: 0; word-break: keep-all; overflow-wrap: anywhere; }
+/* One bounded card per delivery, in the conversation's 800px reading column with the column's 16px
+   gutter (as the error banner beside it), so stacked cards and their actions stay apart: what
+   happened, which conversation, an orphan's text, then one row of actions. */
+.recovery-card { flex: none; display: grid; gap: 0.5rem; width: min(800px, calc(100% - 32px)); min-width: 0; margin: 8px auto; padding: 0.75rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); color: var(--muted); font-size: 0.8125rem; }
+.recovery-card p { margin: 0; }
+.recovery-card-message { display: grid; gap: 0.25rem; word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-conversation { display: grid; gap: 0.25rem; min-width: 0; }
+.recovery-conversation-name { min-width: 0; color: var(--text); font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-conversation-hint { word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-card-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+/* Scoped to the card, among muted prose: an enabled action is filled and in the body ink, a disabled
+   one unfilled with a dashed edge, so the two differ by more than color in every palette. */
+.recovery-card-actions > .button { border-color: var(--border-soft); background: var(--surface-2); color: var(--text); }
+.recovery-card-actions > .button:hover:not(:disabled) { background: var(--surface); }
+.recovery-card-actions > .button:disabled { border-style: dashed; background: transparent; color: var(--muted); }
+.recovery-card-reason { font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
 /* An orphan's unsent text, in the bounded-output vocabulary: inset, scrollable, its whitespace kept
    and selectable, because it may be the last copy. Long text starts behind a disclosure. */
 .recovery-text, .recovery-text-disclosure { flex-basis: 100%; min-width: 0; }
@@ -1128,4 +1140,5 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 }
 /* Showcase only: the narrow state's column and a sidebar-width strip of rows. */
 .showcase-session-narrow { max-width: 20rem; }
+.showcase-recovery-column { overflow: visible; padding: 8px 0; border: 1px dashed var(--border-soft); border-radius: var(--radius-lg); }
 .showcase-session-rows { max-width: 264px; padding: 8px; border-radius: var(--radius-md); background: var(--sidebar); }

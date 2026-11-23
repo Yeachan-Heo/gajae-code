@@ -16,7 +16,7 @@ function State({ caption, narrow, children }: { caption: MessageKey; narrow?: bo
 	);
 }
 
-// A fixture record with an unknown outcome; nothing here is read from or written to the store.
+// Fixture records; nothing here is read from or written to the store.
 const record: DeliveryRecovery = {
 	id: "showcase-recovery",
 	sessionId: "showcase",
@@ -24,35 +24,45 @@ const record: DeliveryRecovery = {
 	attachments: [],
 	disposition: "unknown",
 };
+const longText = Array.from(
+	{ length: 8 },
+	(_, index) => `Step ${index + 1}: rerun the failing test with verbose output and keep the log.`,
+).join("\n");
 
-/** The App's recovery card around a fixture record; its buttons do nothing here. */
+/** The App's recovery card around a fixture record, with the App's rules; its buttons do nothing here. */
 function FixtureCard({
 	orphan = false,
 	restored = false,
+	disposition = "unknown",
 	title,
 	rememberedTitle,
 	current = false,
+	text = record.text,
 }: {
 	orphan?: boolean;
 	restored?: boolean;
+	disposition?: DeliveryRecovery["disposition"];
 	title?: string;
 	rememberedTitle?: string;
 	current?: boolean;
+	text?: string;
 }) {
 	const none = () => {};
+	const unknown = disposition === "unknown";
 	return (
 		<RecoveryCard
-			notice={recoveryNotice(record, false, orphan) ?? ""}
+			notice={recoveryNotice({ ...record, disposition }, false, orphan) ?? ""}
 			orphan={orphan}
 			title={title}
 			rememberedTitle={rememberedTitle}
 			current={current}
-			text={record.text}
+			text={text}
 			onOpen={none}
 			restore={orphan ? undefined : { label: t("shell.restoreDraft"), disabled: restored, onClick: none }}
 			discard={{
-				label: recoveryDiscardLabel(orphan, record.disposition),
-				disabled: !orphan && !restored,
+				label: recoveryDiscardLabel(orphan, disposition),
+				disabled: !orphan && unknown && !restored,
+				reason: !orphan && unknown && !restored ? t("recovery.restoreFirst") : undefined,
 				onClick: none,
 			}}
 		/>
@@ -184,6 +194,15 @@ function ShowcaseRecovery() {
 				<State caption="recovery.showcaseLong" narrow>
 					<FixtureCard title="터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 화면에서도 자연스럽게 줄바꿈되는지 확인합니다" />
 				</State>
+				<State caption="recovery.showcaseOrphanLong">
+					<FixtureCard orphan rememberedTitle="Release checklist" text={longText} />
+				</State>
+			</div>
+			<h3>{t("recovery.showcaseStacked")}</h3>
+			<div className="conversation-column showcase-recovery-column">
+				<FixtureCard title="Fix the flaky test" />
+				<FixtureCard title="Release checklist" disposition="failed" />
+				<FixtureCard orphan rememberedTitle="Old planning notes" />
 			</div>
 		</section>
 	);

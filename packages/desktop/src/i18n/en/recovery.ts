@@ -9,6 +9,8 @@ export const recovery = {
 		"Delivery recovery: the outcome is unknown. It may already have run; the app will not send it again.",
 	"recovery.orphanFailed": "Delivery recovery: delivery failed. Some work may already have run.",
 	"recovery.discardOrphan": "Discard record",
+	"recovery.restoreFirst":
+		"Restore the draft first. The outcome is unknown, so this record keeps the text until it is back in the message box.",
 	"recovery.openConversation": "Open conversation",
 	"recovery.copyText": "Copy text",
 	"recovery.copied": "Text copied.",
@@ -24,4 +26,6 @@ export const recovery = {
 	"recovery.showcaseOrphan": "Orphan · remembered title",
 	"recovery.showcaseOrphanUnnamed": "Orphan · record saved before titles were kept",
 	"recovery.showcaseLong": "Long and Korean title · narrow width",
+	"recovery.showcaseOrphanLong": "Orphan · long text behind a disclosure",
+	"recovery.showcaseStacked": "Three cards stacked in the conversation column",
 } as const;

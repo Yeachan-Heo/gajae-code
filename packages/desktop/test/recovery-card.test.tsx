@@ -186,3 +186,38 @@ suite("Recovery card", () => {
 		}
 	}, 30000);
 });
+
+suite("Recovery card showcase", () => {
+	test("three stacked cards keep their gutter, edges and actions inside them at 390 px and with 20 px text", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 390, height: 844 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector(".showcase-recovery-column .recovery-card");
+			for (const size of [14, 20]) {
+				await page.evaluate(px => document.documentElement.style.setProperty("--text-size", `${px}px`), size);
+				const cards = await page.$$eval(".showcase-recovery-column > .recovery-card", nodes => {
+					const column = nodes[0]!.parentElement!.getBoundingClientRect();
+					return nodes.map(card => {
+						const box = card.getBoundingClientRect();
+						return {
+							gutter: box.left - column.left >= 15.5 && column.right - box.right >= 15.5,
+							inside: [...card.querySelectorAll("button")].every(button => {
+								const rect = button.getBoundingClientRect();
+								return rect.left >= box.left && rect.right <= box.right && rect.bottom <= box.bottom;
+							}),
+							overflow: card.scrollWidth > card.clientWidth,
+						};
+					});
+				});
+				expect({ size, cards }).toEqual({
+					size,
+					cards: Array.from({ length: 3 }, () => ({ gutter: true, inside: true, overflow: false })),
+				});
+			}
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+});

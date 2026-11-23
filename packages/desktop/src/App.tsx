@@ -2613,6 +2613,17 @@ export default function App() {
 				}
 				discard={{
 					label: recoveryDiscardLabel(orphan, item.disposition),
+					// Why Discard waits, only while Restore itself is available to unblock it.
+					reason:
+						!orphan &&
+						item.disposition === "unknown" &&
+						!item.restored &&
+						!item.finalizing &&
+						!unsentBlocked[item.sessionId] &&
+						!unsentRepairs.current.has(item.id) &&
+						restorationFailure?.sessionId !== item.sessionId
+							? t("recovery.restoreFirst")
+							: undefined,
 					disabled:
 						item.finalizing ||
 						(!orphan &&
