@@ -732,6 +732,15 @@ export class DesktopHost {
 	#error(error: unknown): string {
 		return this.#redact(error instanceof Error ? error.message : "Operation failed").slice(0, 1000);
 	}
+	/**
+	 * A stderr diagnostic: the Host's safe error description (message only, known secrets redacted,
+	 * bounded), with the home directory shortened to `~` so logs do not carry the user's account path.
+	 */
+	#diagnostic(error: unknown): string {
+		const home = os.homedir();
+		const safe = this.#error(error);
+		return home ? safe.replaceAll(home, "~") : safe;
+	}
 	initialize(): Promise<void> {
 		this.#init ??= this.#initialize();
 		return this.#init;
@@ -1450,7 +1459,7 @@ export class DesktopHost {
 		try {
 			await this.#deliveries.forget(metadata.id);
 		} catch (error) {
-			console.error(`Desktop could not forget a removed conversation's deliveries: ${String(error)}`);
+			console.error(`Desktop could not forget a removed conversation's deliveries: ${this.#diagnostic(error)}`);
 		}
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
@@ -2710,7 +2719,9 @@ export class DesktopHost {
 			this.#cancelQuestions(live);
 			await this.#disposeLive(live);
 		} catch (error) {
-			console.error(`Desktop could not fully release a conversation another process opened: ${String(error)}`);
+			console.error(
+				`Desktop could not fully release a conversation another process opened: ${this.#diagnostic(error)}`,
+			);
 		}
 		await this.#loadReadOnly(live.metadata);
 		this.#emit({ type: "session", session: this.#dto(live.metadata) });
@@ -3021,7 +3032,7 @@ export class DesktopHost {
 		} catch (error) {
 			// The process that wrote it still has it open; the row is now shown read-only.
 			if (this.#elsewhere.has(id)) return "elsewhere";
-			console.error(`Desktop could not reopen a conversation changed elsewhere: ${String(error)}`);
+			console.error(`Desktop could not reopen a conversation changed elsewhere: ${this.#diagnostic(error)}`);
 			// The app keeps showing the last copy beside the error; selecting again opens a fresh one.
 			return "failed";
 		}
@@ -3073,7 +3084,7 @@ export class DesktopHost {
 				this.#cancelQuestions(live);
 				await this.#disposeLive(live);
 			} catch (error) {
-				console.error(`Desktop could not fully release a stale conversation copy: ${String(error)}`);
+				console.error(`Desktop could not fully release a stale conversation copy: ${this.#diagnostic(error)}`);
 			}
 			try {
 				return await this.#load(metadata);
@@ -4670,7 +4681,9 @@ export class DesktopHost {
 						.filter(project => !project.closed)
 						.map(project =>
 							this.#withProject(project.path, () => this.#refreshProject(project)).catch(error => {
-								console.error(`Desktop could not refresh a workspace's conversations: ${String(error)}`);
+								console.error(
+									`Desktop could not refresh a workspace's conversations: ${this.#diagnostic(error)}`,
+								);
 								return false;
 							}),
 						),
@@ -4680,7 +4693,7 @@ export class DesktopHost {
 			} while (this.#workspaceRefreshAgain && !this.#closed);
 		})()
 			.catch(error => {
-				console.error(`Desktop could not publish refreshed conversations: ${String(error)}`);
+				console.error(`Desktop could not publish refreshed conversations: ${this.#diagnostic(error)}`);
 			})
 			.finally(() => {
 				if (this.#workspaceRefresh === refresh) this.#workspaceRefresh = undefined;

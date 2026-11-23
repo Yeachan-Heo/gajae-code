@@ -234,6 +234,21 @@ test("bootstrap answers at once; a conversation found by the slower workspace li
 	]);
 });
 
+test("a diagnostic about a failed refresh names no home directory", async () => {
+	const h = await fixture();
+	await h.call("project.open", { path: h.projectDir });
+	vi.spyOn(sdk, "listEmbeddedProjectSessions").mockRejectedValueOnce(
+		new Error(`could not list ${path.join(os.homedir(), "work", "project")}`),
+	);
+	const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+	await h.call("bootstrap");
+	await h.refreshed();
+	const lines = logged.mock.calls.map(call => call.map(String).join(" "));
+	expect(lines.some(line => line.includes("could not refresh a workspace"))).toBe(true);
+	expect(lines.some(line => line.includes(os.homedir()))).toBe(false);
+	expect(lines.some(line => line.includes(path.join("~", "work", "project")))).toBe(true);
+});
+
 test("bootstrap still answers when one workspace cannot be listed", async () => {
 	const h = await fixture();
 	const first = await h.persist("Listed before");
