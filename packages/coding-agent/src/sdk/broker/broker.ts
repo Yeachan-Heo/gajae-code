@@ -527,7 +527,11 @@ export type SpawnQ26Reconciliation = {
 	acceptedAt?: number;
 };
 
-/** Exact registration a spawn waits for, bounded by the original readiness deadline. */
+/**
+ * Exact registration a spawn waits for, bounded by `deadlineAt`: the original
+ * semantic readiness deadline, or a later one for the single post-deadline
+ * recheck after the host published readiness.
+ */
 export interface SpawnRegistrationRequest {
 	childId: string;
 	cwd: string;
@@ -540,14 +544,15 @@ export interface SpawnRegistrationRequest {
 
 /**
  * Why a spawn admission saw no matching registration:
- * - `absent`: the last completed index read held no endpoint row for the child;
+ * - `absent`: a completed index read near the deadline held no endpoint row for
+ *   the child, and no later attempt failed or was abandoned;
  * - `mismatch`: an endpoint row for the child exists but fails the exact
  *   identity, authority, or liveness predicate;
- * - `inconclusive`: the last observation attempt could not read the index before
- *   the deadline (queue or lock wait, or a read error) and none completed, so
- *   absence is unproven;
+ * - `inconclusive`: absence is unproven: no read completed near the deadline,
+ *   or a later attempt could not read the index in time (queue or lock wait, or
+ *   a read error);
  * - `unconfirmed`: (flow driver only) a matching registration was observed after
- *   the deadline, but the host committed neither readiness nor a startup failure.
+ *   the deadline, but readiness was not confirmed and no startup failure appeared.
  */
 export type SpawnRegistrationMiss = "absent" | "mismatch" | "inconclusive" | "unconfirmed";
 
@@ -557,6 +562,10 @@ export type SpawnRegistrationResult =
 
 /** Q26-only host control seam. It never receives or returns durable request material. */
 export interface SpawnPromptLayer {
+	/**
+	 * May be called a second time, once, with a later deadline after a
+	 * non-mismatch miss when the host published readiness; must be idempotent.
+	 */
 	awaitRegistration(input: SpawnRegistrationRequest): Promise<SpawnRegistrationResult>;
 	dispatch(input: {
 		sessionId: string;
@@ -684,8 +693,13 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 }
 
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
-/** Bound for the single post-deadline registration observation after the host published readiness. */
-const SPAWN_LATE_REGISTRATION_RECHECK_MS = 1_000;
+/**
+ * Bound for the single post-deadline registration observation after the host
+ * published readiness: the observer gets the same 8 s semantic window the host
+ * had, so index contention that outlasts the deadline by up to that much still
+ * admits a host that registered in time. The master CLI waits 120 s for spawn.
+ */
+const SPAWN_LATE_REGISTRATION_RECHECK_MS = 8_000;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
 /** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
@@ -912,12 +926,15 @@ export async function awaitSpawnHostRegistration(
  * marker becomes visible slightly before the host's last cutoff check and can
  * still be revoked. So readiness counts only when it is present on two reads at
  * least one poll apart, the later one at least two polls past the semantic
- * deadline, with the owner still the same live process and no failure receipt.
+ * deadline, with the owner still the same live process and no failure receipt
+ * on either read.
  * A failure receipt always wins.
  *
  * `waitDeadlineAt` bounds waiting for a verdict that has not appeared. It does
- * not bound confirming readiness that is already present: a host that published
- * readiness in time is admitted even when the broker observes it seconds late.
+ * not bound confirming readiness that is already present: one confirming read
+ * is always taken, so a host that published readiness in time is admitted even
+ * when the broker observes it seconds late. A flapping marker resets the
+ * confirmation and is then bounded by `waitDeadlineAt`.
  */
 async function awaitLateSpawnHostVerdict(
 	stateRoot: string,
@@ -937,19 +954,17 @@ async function awaitLateSpawnHostVerdict(
 		// cutoff writes the failure, and that must win over a stale ready read.
 		const failure = await readSessionLifecycleFailure(stateRoot, childId, marker);
 		if (failure) return { kind: "failed", failure };
-		if (!ready) readySince = undefined;
-		else if (readySince === undefined) readySince = observedAt;
-		else if (observedAt - readySince >= SPAWN_HOST_REGISTRATION_POLL_MS && observedAt >= confirmAt)
-			return { kind: "ready" };
-		const bound =
-			readySince === undefined
-				? waitDeadlineAt
-				: Math.max(
-						waitDeadlineAt,
-						readySince + 3 * SPAWN_HOST_REGISTRATION_POLL_MS,
-						confirmAt + SPAWN_HOST_REGISTRATION_POLL_MS,
-					);
-		const remaining = bound - Date.now();
+		if (ready && readySince !== undefined) return { kind: "ready" };
+		if (ready) {
+			// Confirmation is count-based: the second read is always taken, at
+			// least one poll later and past the confirmation point, so a broker
+			// event-loop stall cannot turn present readiness into unconfirmed.
+			readySince = observedAt;
+			await Bun.sleep(Math.max(0, Math.max(readySince + SPAWN_HOST_REGISTRATION_POLL_MS, confirmAt) - Date.now()));
+			continue;
+		}
+		readySince = undefined;
+		const remaining = waitDeadlineAt - Date.now();
 		if (remaining <= 0) return { kind: "unconfirmed" };
 		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, remaining));
 	}
@@ -958,7 +973,7 @@ async function awaitLateSpawnHostVerdict(
 function spawnRegistrationMissMessage(reason: SpawnRegistrationMiss | undefined): string {
 	switch (reason) {
 		case "absent":
-			return "session.spawn child host did not register before the bounded admission deadline (no registration row was observed)";
+			return "session.spawn child host did not register before the bounded admission deadline (no registration row was observed near the deadline)";
 		case "mismatch":
 			return "session.spawn child host registration did not match the launched host identity, authority, or liveness";
 		case "unconfirmed":
@@ -3066,15 +3081,20 @@ export class Broker {
 				// too slow, not the host: allow one bounded post-deadline observation.
 				// Admission below still needs the exact predicate on that fresh read and
 				// the late readiness verdict.
+				let firstMiss: SpawnRegistrationMiss | undefined;
 				if (
 					!registration.ok &&
 					registration.reason !== "mismatch" &&
-					(await hasSessionLifecycleReadiness(prep.stateRoot, prep.childId, marker))
-				)
+					processIncarnation(pid) === incarnation &&
+					(await hasSessionLifecycleReadiness(prep.stateRoot, prep.childId, marker)) &&
+					(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) === undefined
+				) {
+					firstMiss = registration.reason ?? "inconclusive";
 					registration = await this.#spawnPromptLayer.awaitRegistration({
 						...registrationRequest,
 						deadlineAt: Date.now() + SPAWN_LATE_REGISTRATION_RECHECK_MS,
 					});
+				}
 				const registrationMatches =
 					registration.ok &&
 					registration.registration.sessionId === prep.childId &&
@@ -3111,9 +3131,13 @@ export class Broker {
 						: registrationMatches
 							? "unconfirmed"
 							: "mismatch";
+					const recheckNote =
+						firstMiss === undefined
+							? ""
+							: ` (first observation: ${firstMiss}; the host published readiness, and a post-deadline recheck was taken)`;
 					if (startupFailure === undefined)
 						logger.warn(
-							`sdk broker: spawn child ${prep.childId} registration not admitted (${miss ?? "unknown"})`,
+							`sdk broker: spawn child ${prep.childId} registration not admitted (${miss ?? "unknown"})${recheckNote}`,
 						);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
 					if (release === "closed" || release === "gone") {
@@ -3122,7 +3146,7 @@ export class Broker {
 							code: startupFailure === undefined ? "child_registration_timeout" : "child_registration_failed",
 							message:
 								startupFailure === undefined
-									? spawnRegistrationMissMessage(miss)
+									? spawnRegistrationMissMessage(miss) + recheckNote
 									: `session.spawn child host failed during ${startupFailure.phase}/${startupFailure.reason}`,
 						};
 						current = (
