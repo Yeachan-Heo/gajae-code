@@ -1065,14 +1065,29 @@ export class LifecycleLedger {
 	 * other listed identity, and every identity of an unreadable file, stays fenced.
 	 * The file is optional and only ever lifts fences, so failing to read it leaves
 	 * the attested set empty instead of failing the ledger open.
+	 *
+	 * The read goes through one no-follow, nonblocking descriptor that must be a
+	 * regular file, and stops at the ledger byte bound: a symlink, FIFO, device or
+	 * oversized file is ignored instead of stalling or exhausting broker startup.
 	 */
 	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
 		let text: string;
 		try {
-			text = await fs.readFile(this.#spawnAnchorAttestationFile, "utf8");
+			const read = await this.#readSpawnAnchorAttestation();
+			if (read === undefined) return;
+			if (read === "oversized") {
+				this.#warnings.push("Oversized spawn-anchor attestation ignored");
+				logger.warn(
+					"sdk broker: spawn-anchor attestation exceeds the ledger byte bound; pre-marker mirrors stay fenced",
+					{
+						maxBytes: this.#limits.maxBytes,
+					},
+				);
+				return;
+			}
+			text = read;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "ENOENT") return;
 			this.#warnings.push("Unreadable spawn-anchor attestation ignored");
 			logger.warn("sdk broker: spawn-anchor attestation is unreadable; pre-marker mirrors stay fenced", {
 				code: code ?? "unknown",
@@ -1116,6 +1131,45 @@ export class LifecycleLedger {
 		}
 		if (rejected > 0) this.#warnings.push("Spawn-anchor attestation entries that are not spawn-mirror rows ignored");
 		this.#attestedSpawnAnchors = attested;
+	}
+	/**
+	 * Returns the attestation text, `undefined` when the file is absent, or
+	 * `"oversized"` past the ledger byte bound. Throws for anything that is not a
+	 * regular file reached without following a final-component symlink.
+	 */
+	async #readSpawnAnchorAttestation(): Promise<string | "oversized" | undefined> {
+		const flags =
+			fsSync.constants.O_RDONLY |
+			(process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0));
+		let handle: fs.FileHandle;
+		try {
+			handle = await fs.open(this.#spawnAnchorAttestationFile, flags);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		try {
+			const stat = await handle.stat();
+			if (!stat.isFile())
+				throw Object.assign(new Error("spawn-anchor attestation is not a regular file"), { code: "EINVAL" });
+			const maxBytes = this.#limits.maxBytes;
+			if (stat.size > maxBytes) return "oversized";
+			// The size is re-checked while reading, so a file that grows after fstat
+			// still stops one byte past the bound.
+			const chunks: Buffer[] = [];
+			let length = 0;
+			while (length <= maxBytes) {
+				const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - length));
+				const { bytesRead } = await handle.read(chunk, 0, chunk.length, length);
+				if (bytesRead === 0) break;
+				chunks.push(chunk.subarray(0, bytesRead));
+				length += bytesRead;
+			}
+			if (length > maxBytes) return "oversized";
+			return Buffer.concat(chunks, length).toString("utf8");
+		} finally {
+			await handle.close().catch(() => undefined);
+		}
 	}
 	async begin(
 		identity: string,
