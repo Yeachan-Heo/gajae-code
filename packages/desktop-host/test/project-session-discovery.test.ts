@@ -121,6 +121,9 @@ async function fixture() {
 		projectDir,
 		agentDir,
 		snapshot: () => host.snapshot(),
+		frames,
+		/** Waits for the workspace refresh a bootstrap started in the background. */
+		refreshed: () => host.workspacesRefreshed(),
 		restart: async () => {
 			await host.close();
 			await Promise.all(created.map(result => result.session.awaitDisposeCompletion()));
@@ -182,8 +185,10 @@ test("bootstrap discovers a conversation the terminal created after the project 
 	const first = await h.persist("Before the project was opened");
 	await h.call<DesktopProject>("project.open", { path: h.projectDir });
 	const second = await h.persist("Created in the terminal later");
-	const snapshot = await h.call<DesktopSnapshot>("bootstrap");
-	expect(snapshot.sessions.map(session => [session.id, session.title])).toEqual([
+	await h.call<DesktopSnapshot>("bootstrap");
+	// The refresh runs after bootstrap answers; its snapshot frame carries the new row.
+	await h.refreshed();
+	expect(h.snapshot().sessions.map(session => [session.id, session.title])).toEqual([
 		[first.id, "Before the project was opened"],
 		[second.id, "Created in the terminal later"],
 	]);
@@ -193,10 +198,40 @@ test("bootstrap discovers a conversation the terminal created after the project 
 	const catalog = path.join(h.dataDir, "catalog.json");
 	const before = await fs.stat(catalog);
 	await h.call("bootstrap");
+	await h.refreshed();
 	const after = await fs.stat(catalog);
 	expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
 	await h.restart();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([first.id, second.id]);
+});
+
+test("bootstrap answers at once; a conversation found by the slower workspace listing follows in a snapshot", async () => {
+	const h = await fixture();
+	const first = await h.persist("Before the project was opened");
+	await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	const second = await h.persist("Created in the terminal later");
+	const listed = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const list = sdk.listEmbeddedProjectSessions;
+	vi.spyOn(sdk, "listEmbeddedProjectSessions").mockImplementation(async options => {
+		listed.resolve();
+		await release.promise;
+		return list(options);
+	});
+	const from = h.frames.length;
+	const answered = h.call<DesktopSnapshot>("bootstrap");
+	// The listing is still running, and bootstrap has already answered with what the app knows.
+	await listed.promise;
+	const snapshot = await Promise.race([answered, Bun.sleep(1_000).then(() => undefined)]);
+	expect(snapshot?.sessions.map(session => session.id)).toEqual([first.id]);
+	release.resolve();
+	await h.refreshed();
+	// The new row arrives as a snapshot frame, which the app applies like any other.
+	const later = h.frames.slice(from).findLast(frame => frame.type === "snapshot");
+	expect(later?.type === "snapshot" && later.snapshot.sessions.map(session => session.id)).toEqual([
+		first.id,
+		second.id,
+	]);
 });
 
 test("bootstrap still answers when one workspace cannot be listed", async () => {
@@ -208,8 +243,10 @@ test("bootstrap still answers when one workspace cannot be listed", async () => 
 		.spyOn(sdk, "listEmbeddedProjectSessions")
 		.mockRejectedValueOnce(new Error("Fixture inventory unavailable"));
 	const snapshot = await h.call<DesktopSnapshot>("bootstrap");
+	await h.refreshed();
 	expect(listing).toHaveBeenCalledTimes(1);
 	expect(snapshot.sessions.map(session => session.id)).toEqual([first.id]);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([first.id]);
 });
 
 test("keeps discovered references across close, reopen and host restart", async () => {
@@ -473,6 +510,7 @@ test("a discovered conversation whose transcript the terminal deleted can be rem
 	await h.call("session.delete", { sessionId: terminal.id });
 	expect(h.snapshot().sessions).toEqual([]);
 	await h.call("bootstrap");
+	await h.refreshed();
 	expect(h.snapshot().sessions).toEqual([]);
 	await h.restart();
 	expect(h.snapshot().sessions).toEqual([]);
@@ -488,6 +526,7 @@ test("an inventory that comes back empty cannot remove a terminal conversation f
 	expect(h.snapshot().sessions).toEqual([]);
 	// Its identity was not released, so the next refresh lists the existing transcript again.
 	await h.call("bootstrap");
+	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
 	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
 });

@@ -145,6 +145,8 @@ async function fixture(model?: Model) {
 		projectDir,
 		snapshot: () => host.snapshot(),
 		frames,
+		/** Waits for the workspace refresh a bootstrap started in the background. */
+		refreshed: () => host.workspacesRefreshed(),
 		restart: async () => {
 			await host.close();
 			await Promise.all(created.map(result => result.session.awaitDisposeCompletion()));
@@ -1383,6 +1385,7 @@ test("a workspace refresh never shrinks the open conversation's transcript", asy
 	const selected = await h.call<DesktopSession>("session.select", { sessionId });
 	const from = h.frames.length;
 	await h.call("bootstrap");
+	await h.refreshed();
 	// Apply the frames in order, as the app does: the snapshot replaces rows, session frames follow.
 	let shown: DesktopSession | undefined;
 	for (const frame of h.frames.slice(from)) {
@@ -1403,13 +1406,16 @@ test("refreshing the workspace does not list a branch fork's private ancestor as
 	expect(rows).toEqual([sessionId, fork.session.id]);
 	// The SDK keeps the full copy the branch was cut from; only the branch is the user's conversation.
 	await h.call("bootstrap");
+	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual(rows);
 	await h.restart();
 	await h.call("bootstrap");
+	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual(rows);
 	// Nor does the copy surface once the branch itself is deleted.
 	await h.call("session.delete", { sessionId: fork.session.id });
 	await h.call("bootstrap");
+	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([sessionId]);
 });
 

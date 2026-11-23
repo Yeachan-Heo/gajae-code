@@ -603,6 +603,9 @@ export class DesktopHost {
 	 * input that arrived before such a Stop can end `cancelled` or be handed back as not run.
 	 */
 	#runStops = new Map<string, number>();
+	/** The background workspace refresh a bootstrap started, and whether another pass was asked for. */
+	#workspaceRefresh?: Promise<void>;
+	#workspaceRefreshAgain = false;
 	/**
 	 * Conversations whose Disconnect has committed to releasing them. From that instant every new
 	 * request sees the conversation as not writable, and Connect or delete waits for the release.
@@ -3134,34 +3137,10 @@ export class DesktopHost {
 		const { method, params } = request;
 		const attachmentInput = method === "prompt" ? prepareDesktopAttachmentInput(request) : undefined;
 		if (method === "bootstrap") {
-			// Pick up conversations another surface (the terminal) created since the workspace was
-			// opened. Each workspace refreshes under its own open/close fence; one that cannot be
-			// listed keeps its current rows and never blocks the snapshot.
-			await Promise.all(
-				this.#catalog.projects
-					.filter(project => !project.closed)
-					.map(project =>
-						this.#withProject(project.path, () => this.#refreshProject(project)).catch(error => {
-							console.error(`Desktop could not refresh a workspace's conversations: ${String(error)}`);
-						}),
-					),
-			);
-			const snapshot = this.snapshot();
-			this.#emit({ type: "snapshot", snapshot });
-			// The snapshot splits one history budget across every row, and the app replaces its
-			// rows with it. Follow with the full projection of any open conversation it cut short,
-			// so a refresh on window focus never shrinks the transcript being read.
-			const shown = [
-				...[...this.#live.values()].map(live => live.metadata),
-				...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id)),
-			];
-			for (const metadata of shown) {
-				const row = snapshot.sessions.find(session => session.id === metadata.id);
-				if (!row) continue;
-				const full = this.#dto(metadata);
-				if (JSON.stringify(full.messages) !== JSON.stringify(row.messages))
-					this.#emit({ type: "session", session: full });
-			}
+			// Answer with what the app knows now; conversations another surface (the terminal) created
+			// since are picked up in the background and arrive as a later snapshot frame.
+			const snapshot = this.#publishShown();
+			this.#refreshWorkspaces();
 			return snapshot;
 		}
 		if (method === "delivery.ack") {
@@ -4592,20 +4571,83 @@ export class DesktopHost {
 	 * Adds conversations another surface created in an open workspace. The caller holds the
 	 * workspace fence and publishes; nothing is saved when the discovery changed nothing.
 	 */
-	async #refreshProject(project: DesktopProject): Promise<void> {
+	/** Resolves once the background workspace refresh a bootstrap started (if any) has finished. */
+	workspacesRefreshed(): Promise<void> {
+		return this.#workspaceRefresh ?? Promise.resolve();
+	}
+	/**
+	 * Emit the snapshot, then the full projection of every conversation being read that the
+	 * snapshot's split history budget cut short, so a refresh never shrinks the open transcript.
+	 */
+	#publishShown(): DesktopSnapshot {
+		const snapshot = this.snapshot();
+		this.#emit({ type: "snapshot", snapshot });
+		const shown = [
+			...[...this.#live.values()].map(live => live.metadata),
+			...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id)),
+		];
+		for (const metadata of shown) {
+			const row = snapshot.sessions.find(session => session.id === metadata.id);
+			if (!row) continue;
+			const full = this.#dto(metadata);
+			if (JSON.stringify(full.messages) !== JSON.stringify(row.messages))
+				this.#emit({ type: "session", session: full });
+		}
+		return snapshot;
+	}
+	/**
+	 * Re-list every open workspace in the background, each under its own open/close fence. One that
+	 * cannot be listed keeps its rows. Requests during a refresh fold into one more pass, and a
+	 * snapshot is emitted only when a pass changed the catalog.
+	 */
+	#refreshWorkspaces(): void {
+		if (this.#closed) return;
+		if (this.#workspaceRefresh) {
+			this.#workspaceRefreshAgain = true;
+			return;
+		}
+		const refresh = (async () => {
+			do {
+				this.#workspaceRefreshAgain = false;
+				const changed = await Promise.all(
+					this.#catalog.projects
+						.filter(project => !project.closed)
+						.map(project =>
+							this.#withProject(project.path, () => this.#refreshProject(project)).catch(error => {
+								console.error(`Desktop could not refresh a workspace's conversations: ${String(error)}`);
+								return false;
+							}),
+						),
+				);
+				if (this.#closed) return;
+				if (changed.some(Boolean)) this.#publishShown();
+			} while (this.#workspaceRefreshAgain && !this.#closed);
+		})()
+			.catch(error => {
+				console.error(`Desktop could not publish refreshed conversations: ${String(error)}`);
+			})
+			.finally(() => {
+				if (this.#workspaceRefresh === refresh) this.#workspaceRefresh = undefined;
+			});
+		this.#workspaceRefresh = refresh;
+	}
+	/** Whether the refresh changed the catalog. Never saves once the Host is closing. */
+	async #refreshProject(project: DesktopProject): Promise<boolean> {
 		// Queued behind a close or reopen of the same path: refresh only what is still open.
-		if (project.closed || !this.#catalog.projects.includes(project)) return;
+		if (this.#closed || project.closed || !this.#catalog.projects.includes(project)) return false;
 		const discovery = await this.#discoverProjectSessions(project);
+		if (this.#closed) return false;
 		const undo = this.#mergeDiscovered(project, discovery);
-		// Creation-time corrections alone are saved with the next catalog write; a new row needs
-		// its own, and only then can bootstrap wait on the catalog queue.
-		if (!undo || !discovery.discovered.length) return;
+		if (!undo) return false;
+		// Creation-time corrections alone are saved with the next catalog write; a new row needs its own.
+		if (!discovery.discovered.length) return true;
 		try {
 			await this.#save();
 		} catch (error) {
 			undo();
 			throw error;
 		}
+		return true;
 	}
 
 	/** Applies one discovery to the catalog and returns its undo, or undefined when nothing changed. */
@@ -4939,6 +4981,8 @@ export class DesktopHost {
 		// Attach a handler immediately while unrelated session cleanup drains.
 		void authorizationClose?.catch(() => {});
 		await attempt(() => this.#cancelQuestions());
+		// A background workspace refresh saves the catalog; let it finish before teardown.
+		await this.#workspaceRefresh?.catch(() => {});
 		await Promise.allSettled([...this.#opening.values(), ...this.#managedOpening.values()]);
 		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
 		this.#managed.clear();
