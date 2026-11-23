@@ -185,10 +185,17 @@ suite("Session connection", () => {
 			);
 			await page.waitForSelector(".connection-notice");
 			const layouts: Record<string, unknown> = {};
-			for (const size of [14, 20]) {
+			// A tall window shows the explanation; a short one (720x520) keeps the notice to its title line.
+			for (const [height, size] of [
+				[900, 14],
+				[900, 20],
+				[520, 14],
+				[520, 20],
+			] as const) {
+				await page.setViewport({ width: 720, height });
 				await page.evaluate(px => document.documentElement.style.setProperty("--text-size", `${px}px`), size);
 				for (const width of [432, 632]) {
-					layouts[`${width}@${size}`] = await page.$$eval(`[data-width="${width}"] .connection-notice`, notices =>
+					layouts[`${width}@${size}x${height}`] = await page.$$eval(`[data-width="${width}"] .connection-notice`, notices =>
 						notices.map(notice => {
 							const icon = notice.querySelector(".connection-notice-icon")!.getBoundingClientRect();
 							const title = notice.querySelector(".connection-notice-text > strong")!;
@@ -205,6 +212,7 @@ suite("Session connection", () => {
 								// A wrapped button never sits under the icon.
 								buttonClearOfIcon: !wrapped || button.left >= text.left - 0.5,
 								wrapped,
+								buttonWidth: Math.round(button.width),
 							};
 						}),
 					);

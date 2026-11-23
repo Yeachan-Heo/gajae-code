@@ -1144,9 +1144,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .connection-notice-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; word-break: keep-all; overflow-wrap: anywhere; }
 .connection-notice-text > span { color: var(--muted); font-size: 0.8125rem; }
 .connection-notice-action { flex: none; margin-left: auto; }
-/* Both labels reserve the button's width, so the pending label never reflows the text beside it. */
+/* Every label of either state reserves the button's width (one generated line each), so a pending
+   label never reflows the text beside it and both states' buttons, and layouts, match. */
 .connection-notice-label { display: inline-flex; flex-direction: column; align-items: center; }
-.connection-notice-label::after { content: attr(data-reserve); height: 0; overflow: hidden; visibility: hidden; }
+.connection-notice-label::after { content: attr(data-reserve); height: 0; overflow: hidden; visibility: hidden; white-space: pre; }
 /* Pending keeps the primary colors (a legible label is the only sign of progress), adds an inset edge
    and a progress cursor, and does not react to the pointer. */
 .button.primary.connection-notice-action[aria-disabled="true"] { cursor: progress; background: var(--accent); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--on-accent) 30%, transparent); }

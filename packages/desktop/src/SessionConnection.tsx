@@ -22,6 +22,17 @@ export function SessionConnectionNotice({
 	const disconnected = state === "disconnected";
 	const idle = t(disconnected ? "connection.connect" : "connection.retry");
 	const busy = t(disconnected ? "connection.connecting" : "connection.checking");
+	const label = pending ? busy : idle;
+	// Every label either state can show reserves the button's width, so the two states' buttons, and
+	// so their layouts, match at any width and in any language.
+	const reserve = [
+		t("connection.connect"),
+		t("connection.connecting"),
+		t("connection.retry"),
+		t("connection.checking"),
+	]
+		.filter(text => text !== label)
+		.join("\n");
 	const bodyId = useId();
 	const [expanded, setExpanded] = useState(false);
 	const details = expanded ? t("connection.hideDetails") : t("connection.showDetails");
@@ -55,9 +66,9 @@ export function SessionConnectionNotice({
 					if (!pending) onConnect();
 				}}
 			>
-				{/* The other label reserves its width (as generated content, outside the accessible name). */}
-				<span className="connection-notice-label" data-reserve={pending ? idle : busy}>
-					{pending ? busy : idle}
+				{/* The other labels reserve their width (as generated content, outside the accessible name). */}
+				<span className="connection-notice-label" data-reserve={reserve}>
+					{label}
 				</span>
 			</Button>
 		</div>
