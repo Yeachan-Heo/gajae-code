@@ -550,9 +550,11 @@ export interface SpawnRegistrationRequest {
 	/**
 	 * Set only for the post-deadline recheck. The host already registered and
 	 * published readiness, so the outcome can be decided before `deadlineAt`: the
-	 * wait ends when a completed read shows the host's recorded row no longer
-	 * matches, or as soon as `decided()` resolves true (a readable failure receipt,
+	 * wait ends as soon as `decided()` resolves true (a readable failure receipt,
 	 * or an owner that provably exited), including while waiting for the index lock.
+	 * A completed read showing the host's recorded row no longer matches stops the
+	 * index reads, and the refusal then waits for `decided()` or the bound, because
+	 * a rolling-back host unregisters before its failure receipt is readable.
 	 * Polled every {@link SPAWN_LATE_RECHECK_PROBE_MS}.
 	 */
 	recheck?: { decided: () => Promise<boolean> };
@@ -718,10 +720,13 @@ const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
  * to hold a spawn. 20 s stays well inside the budgets around it: a refused
  * spawn still answers around 28 s after the claim plus release, far below the
  * master CLI's 120 s spawn timeout, and the host applies no cutoff once its
- * startup committed. The recheck ends early on a decisive mismatch row, a
- * readable failure receipt, or an owner that provably exited; an owner whose
- * incarnation cannot be read, or a row that fails only the read-time liveness
- * check, keeps it open until it is decided or the bound passes.
+ * startup committed. The recheck ends early on a readable failure receipt or an
+ * owner that provably exited (OS-confirmed absence or a changed incarnation). A
+ * decisive mismatch row stops the index reads but still waits for one of those
+ * or the bound, since a rolling-back host unregisters before its receipt is
+ * readable. An owner the OS cannot query or whose incarnation cannot be read,
+ * or a row that fails only the read-time liveness check, keeps it open until it
+ * is decided or the bound passes.
  */
 const SPAWN_LATE_REGISTRATION_RECHECK_MS = 20_000;
 /**

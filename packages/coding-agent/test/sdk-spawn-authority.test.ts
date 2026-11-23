@@ -1510,12 +1510,13 @@ describe("Broker spawn flow driver", () => {
 	}
 
 	// The recheck may last 20 s, but only a live, ready host behind a held lock
-	// should wait for it. Each case decides the refusal mid-recheck while the lock
-	// is still held; the broker must answer within a few polls, not at lock
-	// release or the recheck bound. `unregistered-then-receipt` is a host rolling
-	// back in its real order (unregister, then the failure receipt): the first
-	// recheck read sees the unregistered row before the receipt exists, and the
-	// refusal must still report the receipt, not a timeout.
+	// should wait for it. `dead-owner` and `failure-receipt` decide the refusal
+	// mid-recheck while the lock is still held; the broker must answer within a
+	// few polls, not at lock release or the recheck bound.
+	// `unregistered-then-receipt` is a host rolling back in its real order
+	// (unregister, then the failure receipt): the lock is released at +1 s, the
+	// first recheck read sees the unregistered row before the receipt exists
+	// (+1.8 s), and the refusal must wait for and report the receipt, not a timeout.
 	for (const outcome of ["dead-owner", "failure-receipt", "unregistered-then-receipt"] as const) {
 		it(`ends the post-deadline recheck early on a ${outcome}`, async () => {
 			const agentDir = await temp();
@@ -1646,9 +1647,9 @@ describe("Broker spawn flow driver", () => {
 				await holder;
 				const claim = await latestClaim(agentDir);
 				expect(calls).toBe(2);
-				// Decided at +1 s (+1.8 s for the receipt after the unregistered row); the
-				// lock (+10 s, or +1 s when unregistered) and the recheck bound (+21 s) are later.
-				// For an unregistered row, the row alone must not settle the refusal before the receipt.
+				// Decided at +1 s, before the lock release (+10 s) and the recheck bound
+				// (+21 s). For an unregistered row the decision is the receipt at +1.8 s,
+				// after the lock release (+1 s): the row alone must not settle the refusal.
 				expect(answeredAt).toBeGreaterThan(deadlineAt + decidedPastDeadlineMs);
 				expect(answeredAt).toBeLessThan(deadlineAt + decidedPastDeadlineMs + 3_000);
 				expect(response).toMatchObject({
