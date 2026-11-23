@@ -2757,34 +2757,32 @@ export class DesktopHost {
 	 */
 	async #disconnect(metadata: SavedSession, confirm: boolean, arrival: number): Promise<DesktopDisconnectResult> {
 		if (metadata.managed) throw new Error("Disconnect this conversation in the terminal that owns it.");
-		const opening = this.#opening.get(metadata.id);
-		if (opening) await opening.catch(() => {});
 		// One release at a time: a Disconnect already releasing this conversation finishes first.
 		for (let pending = this.#disconnecting.get(metadata.id); pending; pending = this.#disconnecting.get(metadata.id))
 			await pending.catch(() => {});
-		// No await from here to the commit below.
-		const live = this.#live.get(metadata.id);
-		const stopping = live && !metadata.disconnected ? this.#disconnectWouldStop(live) : undefined;
-		if (stopping && !confirm) return { disconnected: false, confirm: stopping };
-		if (live && stopping && live.operator?.isBusy() && !live.operatorCurrentId)
-			throw new Error("Waiting for the previous command to settle. Stop cannot be proven for this conversation.");
-		// Committed. Like a Stop, this ends anything an earlier input would start: every input that
-		// arrived before it is refused or handed back. Every request that arrives after it sees the
-		// conversation as not writable, so nothing new is admitted into the session being released,
-		// and Connect or delete waits for the release.
-		this.#recordRunStop(metadata.id, arrival);
+		// Fence before this Disconnect's first await, so a request that arrives while it waits for an
+		// open in flight is refused like one that arrives after it commits. Every request that arrives
+		// from here sees the conversation as not writable; Connect or delete waits for the fence. A
+		// Disconnect that only asks for confirmation lifts it again.
 		const release = Promise.withResolvers<void>();
 		release.promise.catch(() => {});
 		this.#disconnecting.set(metadata.id, release.promise);
 		try {
-			const result = await this.#releaseWriter(metadata, live, stopping !== undefined, arrival);
-			release.resolve();
-			return result;
-		} catch (error) {
-			release.reject(error);
-			throw error;
+			const opening = this.#opening.get(metadata.id);
+			if (opening) await opening.catch(() => {});
+			// No await from here to the commit below.
+			const live = this.#live.get(metadata.id);
+			const stopping = live && !metadata.disconnected ? this.#disconnectWouldStop(live) : undefined;
+			if (stopping && !confirm) return { disconnected: false, confirm: stopping };
+			if (live && stopping && live.operator?.isBusy() && !live.operatorCurrentId)
+				throw new Error("Waiting for the previous command to settle. Stop cannot be proven for this conversation.");
+			// Committed. Like a Stop, this ends anything an earlier input would start: every input that
+			// arrived before it is refused or handed back.
+			this.#recordRunStop(metadata.id, arrival);
+			return await this.#releaseWriter(metadata, live, stopping !== undefined, arrival);
 		} finally {
 			if (this.#disconnecting.get(metadata.id) === release.promise) this.#disconnecting.delete(metadata.id);
+			release.resolve();
 		}
 	}
 	/** The committed part of Disconnect: stop, settle every receipt, then release the writer. */
@@ -3509,6 +3507,8 @@ export class DesktopHost {
 			if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
 			throw error;
 		}
+		// A Disconnect that began while this request waited for the conversation to open fences it.
+		if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
 			live.gateMutation = true;
@@ -4817,6 +4817,7 @@ export class DesktopHost {
 		const live = await this.#open(metadata);
 		// A slash command typed in the composer was checked as its prompt request; `command.run` checks here.
 		if (!alreadyBegun) await this.#recheckOwner(live);
+		if (!this.#writable(metadata)) throw this.#notWritable(metadata);
 		await this.#awaitStartup(live);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 		if (/^\s*\/btw(?:\s|$)/i.test(text)) {

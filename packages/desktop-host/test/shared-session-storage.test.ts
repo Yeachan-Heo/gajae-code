@@ -66,7 +66,14 @@ async function fixture(model?: Model) {
 	const frames: DesktopFrame[] = [];
 	const created: CreateAgentSessionResult[] = [];
 	const managers: SessionManager[] = [];
+	let openHold: { entered: () => void; release: Promise<void> } | undefined;
 	const createSession = async (options: CreateAgentSessionOptions) => {
+		const hold = openHold;
+		openHold = undefined;
+		if (hold) {
+			hold.entered();
+			await hold.release;
+		}
 		const result = await createAgentSession({
 			...options,
 			extensions: [],
@@ -129,8 +136,11 @@ async function fixture(model?: Model) {
 		for (const manager of managers) await manager.close();
 		await fs.rm(directory, { recursive: true, force: true });
 	});
-	const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<T> => {
-		const id = crypto.randomUUID();
+	const call = async <T>(
+		method: DesktopRequest["method"],
+		params: Record<string, unknown> = {},
+		id: string = crypto.randomUUID(),
+	): Promise<T> => {
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));
 		const frame = frames.findLast(item => item.type === "response" && item.id === id);
 		if (frame?.type !== "response") throw new Error(`Missing response for ${method}`);
@@ -162,6 +172,13 @@ async function fixture(model?: Model) {
 		ownerLookups,
 		failBroker: (fails: boolean) => {
 			brokerFails = fails;
+		},
+		/** Holds the next SDK session the Host opens until `release` is called. */
+		holdOpen: () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			openHold = { entered: () => entered.resolve(), release: release.promise };
+			return { entered: entered.promise, release: () => release.resolve() };
 		},
 		/** Holds the next broker answer until the returned release is called; it reads the owners then. */
 		holdBroker: () => {
@@ -1114,6 +1131,42 @@ for (const broker of ["failing", "silent"] as const)
 		await h.close();
 	});
 
+/** A request's own response frame, whether it succeeded or not. */
+async function respond(
+	h: {
+		frames: DesktopFrame[];
+		call: (method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<unknown>;
+	},
+	method: DesktopRequest["method"],
+	params: Record<string, unknown>,
+) {
+	const id = crypto.randomUUID();
+	await h.call(method, params, id).catch(() => {});
+	return h.frames.findLast(frame => frame.type === "response" && frame.id === id);
+}
+
+test("a request that arrives while a Disconnect waits for the conversation to open is refused", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	await h.restart();
+	const opening = h.holdOpen();
+	const selecting = h.call<DesktopSession>("session.select", { sessionId });
+	await opening.entered;
+	// Disconnect arrives while the conversation is still opening, then a prompt arrives after it.
+	const disconnecting = h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
+	const calls = h.model.calls.length;
+	const prompted = respond(h, "prompt", { sessionId, text: "sent after Disconnect" });
+	await Bun.sleep(50);
+	opening.release();
+	await selecting;
+	expect((await disconnecting).disconnected).toBe(true);
+	expect(await prompted).toMatchObject({ ok: false, deliveryDisposition: "refused" });
+	expect(h.model.calls).toHaveLength(calls);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
+	await h.close();
+});
+
 test("a prompt sent just before a Disconnect of an idle conversation never runs in it", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
@@ -1130,13 +1183,10 @@ test("a prompt sent just before a Disconnect of an idle conversation never runs 
 	const disconnecting = h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
 	releaseBroker();
 	expect((await disconnecting).disconnected).toBe(true);
-	expect(await prompt).toBeNull();
+	// Once its check answers it finds the conversation fenced, and is refused before anything runs.
+	await expect(prompt).rejects.toThrow("disconnected");
 	expect(h.model.calls).toHaveLength(calls);
-	expect(h.snapshot().deliveries.at(-1)).toMatchObject({
-		sessionId,
-		disposition: "refused",
-		error: "Prompt stopped before it started",
-	});
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
 	await live.awaitDisposeCompletion();
 	expect(live.isDisposed).toBe(true);
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
