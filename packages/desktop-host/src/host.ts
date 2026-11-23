@@ -429,8 +429,32 @@ const ELSEWHERE =
 /** The app must not remove a transcript another process may be writing. */
 const ELSEWHERE_DELETE =
 	"Another gjc process, such as a terminal, has this conversation open. Close it there before deleting it here.";
-/** A live writer older than this checks again for another owner before it takes a prompt. */
-const OWNER_RECHECK_MS = 5 * 60_000;
+/**
+ * How long the app waits for the broker's owner answer before going ahead as if none came. With
+ * no broker running the check is one failed file read; a running broker answers in a few ms.
+ */
+const OWNER_CHECK_TIMEOUT_MS = 500;
+/**
+ * Requests that write the conversation, or show an idle writer, check for another owner first
+ * (`#recheckOwner`). `command.run` checks in `#command`. Stop, queue cancel and reads never check.
+ */
+const OWNER_CHECKED_METHODS = new Set<DesktopRequest["method"]>([
+	"session.select",
+	"prompt",
+	"session.retry",
+	"session.compact",
+	"session.rename",
+	"session.revision",
+	"session.delete",
+	"model.set",
+	"thinking.set",
+	"operator.execute",
+	"goal.operate",
+	"preferences.apply",
+	"tools.set",
+	"mcp.operate",
+	"activity.operate",
+]);
 /** Activity for a conversation the app does not hold open; the Session work card shows the reason. */
 const READ_ONLY_ACTIVITY = "Background work is shown only while the app is connected to this conversation.";
 /** Released identities kept; the oldest are dropped first. */
@@ -516,8 +540,6 @@ interface LiveSession extends SessionCandidate {
 	claimedUserTurns: WeakSet<AgentMessage>;
 	/** The exclusive request in flight; settles after its receipt and final view are written. */
 	exclusiveDone?: Promise<void>;
-	/** When this writer last confirmed no other process holds its transcript open. */
-	ownerCheckedAt: number;
 }
 /** A conversation the app shows without holding it open: its transcript's history only. */
 interface ReadOnlyView {
@@ -1166,6 +1188,7 @@ export class DesktopHost {
 		const owner = await findEmbeddedLiveOwner({
 			agentDir: this.agentDir,
 			sessionId: metadata.sessionId,
+			timeoutMs: OWNER_CHECK_TIMEOUT_MS,
 			...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
 		});
 		if (owner.kind === "live") this.#elsewhere.add(metadata.id);
@@ -1534,7 +1557,6 @@ export class DesktopHost {
 			queued: new Map(),
 			scopeOwners: new Map(),
 			claimedUserTurns: new WeakSet(),
-			ownerCheckedAt: Date.now(),
 		};
 		this.#live.set(live.metadata.id, live);
 		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
@@ -2635,20 +2657,19 @@ export class DesktopHost {
 		}
 	}
 	/**
-	 * A writer opened a while ago checks again before taking a prompt: a terminal may have opened
-	 * the same conversation since. If one has, the app steps aside, keeping its final view, and
-	 * the prompt is refused before anything runs, so its text returns to the composer.
+	 * Before the app writes an idle conversation, or shows one it holds open, it checks again
+	 * whether a terminal has opened the same transcript meanwhile. If one has, the app steps aside,
+	 * keeping its final view, and the request is refused before anything runs (an input's text
+	 * returns to the composer). A slow or failing broker never holds this up past its timeout.
 	 */
 	async #recheckOwner(live: LiveSession): Promise<void> {
-		if (Date.now() - live.ownerCheckedAt < OWNER_RECHECK_MS || !this.#reloadable(live)) return;
-		live.ownerCheckedAt = Date.now();
+		if (!this.#reloadable(live)) return;
 		if (!(await this.#ownedElsewhere(live.metadata))) return;
 		if (this.#live.get(live.metadata.id) === live && !this.#reloadable(live)) {
-			// Work started in this copy while the broker answered (another prompt found the check
-			// recent). Releasing it now would dispose that work, so keep the copy writable and check
-			// again before the next prompt; the store's compare-and-append refusal stays the backstop.
+			// Work started in this copy while the broker answered (another request found no owner and
+			// started a turn). Releasing it now would dispose that work, so keep the copy writable;
+			// the next write checks again, and the store's compare-and-append refusal stays the backstop.
 			this.#elsewhere.delete(live.metadata.id);
-			live.ownerCheckedAt = 0;
 			return;
 		}
 		if (this.#live.get(live.metadata.id) === live) {
@@ -3484,7 +3505,7 @@ export class DesktopHost {
 		let live: LiveSession;
 		try {
 			const opened = await this.#open(metadata);
-			if (method === "prompt") await this.#recheckOwner(opened);
+			if (OWNER_CHECKED_METHODS.has(method)) await this.#recheckOwner(opened);
 			live = method === "session.select" || method === "prompt" ? await this.#refreshIfMoved(opened) : opened;
 		} catch (error) {
 			// The owner check found another process holding it: answer as a read-only conversation.
@@ -4734,6 +4755,8 @@ export class DesktopHost {
 		alreadyBegun = false,
 	): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
+		// A slash command typed in the composer was checked as its prompt request; `command.run` checks here.
+		if (!alreadyBegun) await this.#recheckOwner(live);
 		await this.#awaitStartup(live);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 		if (/^\s*\/btw(?:\s|$)/i.test(text)) {

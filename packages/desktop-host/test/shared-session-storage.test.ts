@@ -104,7 +104,10 @@ async function fixture(model?: Model) {
 	const liveOwnerClient = {
 		global: async (_operation: string, input: Record<string, unknown>) => {
 			ownerLookups.push(String(input.resolveSessionId));
-			await brokerHold;
+			// A hold applies to the next lookup only; later lookups answer at once.
+			const hold = brokerHold;
+			brokerHold = undefined;
+			await hold;
 			if (brokerFails) throw new Error("broker connection refused");
 			return {
 				ok: true,
@@ -158,14 +161,11 @@ async function fixture(model?: Model) {
 		failBroker: (fails: boolean) => {
 			brokerFails = fails;
 		},
-		/** Holds every broker answer until the returned release is called. */
+		/** Holds the next broker answer until the returned release is called; it reads the owners then. */
 		holdBroker: () => {
 			const held = Promise.withResolvers<void>();
 			brokerHold = held.promise;
-			return () => {
-				brokerHold = undefined;
-				held.resolve();
-			};
+			return () => held.resolve();
 		},
 	};
 }
@@ -1001,41 +1001,64 @@ test("an unreachable broker never blocks opening; the app opens writable as befo
 	await h.close();
 });
 
-test("a prompt after a long idle checks again and steps aside for a terminal that opened the conversation", async () => {
+test("a terminal that opens the conversation between two prompts makes the next prompt step aside", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
 	await h.call("prompt", { sessionId, text: "app turn" });
 	const live = h.sdk();
-	const owner = await transcriptId(h);
-	h.liveOwners.add(owner);
-	// A prompt soon after the last check sends no broker lookup.
-	const lookups = h.ownerLookups.length;
-	await h.call("prompt", { sessionId, text: "still recent" });
-	expect(h.ownerLookups).toHaveLength(lookups);
-	const now = Date.now();
-	const later = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60_000);
+	// Moments later a terminal resumes the same transcript; the app has not written since.
+	h.liveOwners.add(await transcriptId(h));
 	const calls = h.model.calls.length;
-	try {
-		await expect(h.call("prompt", { sessionId, text: "after a long idle" })).rejects.toThrow("terminal");
-	} finally {
-		later.mockRestore();
-	}
+	await expect(h.call("prompt", { sessionId, text: "right after" })).rejects.toThrow("terminal");
 	expect(h.model.calls).toHaveLength(calls);
+	// Refused before anything ran, so the app hands the text back to the composer.
 	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
 	await live.awaitDisposeCompletion();
 	expect(live.isDisposed).toBe(true);
-	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
+	const shown = h.snapshot().sessions[0];
+	expect(shown?.connection).toEqual({ state: "elsewhere" });
+	expect(shown?.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
 	await h.close();
 });
+
+test("selecting an idle conversation a terminal has since opened shows it read-only", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	h.liveOwners.add(await transcriptId(h));
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.connection).toEqual({ state: "elsewhere" });
+	expect(selected.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	await h.close();
+});
+
+for (const broker of ["failing", "silent"] as const)
+	test(`a ${broker} broker never holds up or refuses a prompt; it runs as before`, async () => {
+		const h = await controlledFixture();
+		const sessionId = h.session.id;
+		await h.call("prompt", { sessionId, text: "app turn" });
+		const lookups = h.ownerLookups.length;
+		if (broker === "failing") h.failBroker(true);
+		// A silent broker never answers this lookup.
+		else h.holdBroker();
+		const started = performance.now();
+		await h.call("prompt", { sessionId, text: "despite the broker" });
+		// The app asked before writing, and went ahead when no answer came.
+		expect(h.ownerLookups.length).toBeGreaterThan(lookups);
+		expect(performance.now() - started).toBeLessThan(1_500);
+		expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "completed" });
+		expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+		await h.close();
+	});
 
 test("a prompt sent just before a Disconnect of an idle conversation never runs in it", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
 	await h.call("prompt", { sessionId, text: "app turn" });
 	const live = h.sdk();
-	const now = Date.now();
-	const later = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60_000);
-	cleanups.push(async () => later.mockRestore());
 	// The prompt has been admitted to the conversation but waits for the owner check.
 	const releaseBroker = h.holdBroker();
 	const lookups = h.ownerLookups.length;
@@ -1067,20 +1090,18 @@ test("a turn that starts while the owner check is waiting is not released under 
 	const sessionId = h.session.id;
 	await h.call("prompt", { sessionId, text: "app turn" });
 	const live = h.sdk();
-	h.liveOwners.add(await transcriptId(h));
-	const now = Date.now();
-	const later = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60_000);
-	cleanups.push(async () => later.mockRestore());
 	const releaseBroker = h.holdBroker();
 	const lookups = h.ownerLookups.length;
-	// The first prompt after a long idle asks the broker, which has not answered yet.
+	// The first prompt asks the broker, which has not answered yet.
 	const checking = h.call("prompt", { sessionId, text: "first after idle" });
 	void checking.catch(() => {});
 	await until(() => h.ownerLookups.length > lookups, "the owner lookup");
-	// A second prompt meanwhile finds the check recent and starts a turn.
+	// A second prompt's own check finds no owner yet, and it starts a turn.
 	held.arm();
 	const running = h.call("prompt", { sessionId, text: "started meanwhile" });
 	await held.entered;
+	// Only then does a terminal open the conversation, and the first check answers "live".
+	h.liveOwners.add(await transcriptId(h));
 	releaseBroker();
 	// The check answers "a terminal has it open", but a turn now runs in this copy: it stays, and
 	// the first prompt joins that turn as a steer instead of the turn being released under it.
