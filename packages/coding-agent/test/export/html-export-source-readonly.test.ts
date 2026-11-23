@@ -4,8 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getSessionsDir } from "@gajae-code/utils";
+import { RESUME_TRANSCRIPT_MAX_BYTES, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { getSessionsDir, getTerminalSessionsDir } from "@gajae-code/utils";
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
@@ -251,4 +251,105 @@ describe("standalone HTML export leaves its source untouched", () => {
 			expect(fs.readFileSync(outputPath, "utf8")).toBe(await referenceHtml(content));
 		});
 	}
+});
+
+describe("standalone HTML export side effects outside the source", () => {
+	it("refuses a transcript above the eager-load limit without writing anything", async () => {
+		const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized")]));
+		// Sparse: the size check runs on stat before any read.
+		fs.truncateSync(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES + 1);
+		const before = snapshotTree(sourceDir);
+		const outputPath = path.join(makeTempDir("output"), "export.html");
+
+		await expect(exportFromFile(sessionFile, { outputPath })).rejects.toThrow(
+			`Session transcript is too large to export (${RESUME_TRANSCRIPT_MAX_BYTES + 1} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes)`,
+		);
+
+		expect(snapshotTree(sourceDir)).toEqual(before);
+		expect(fs.existsSync(outputPath)).toBe(false);
+	});
+
+	it("does not repoint this terminal's --continue breadcrumb at the exported session", async () => {
+		const previous = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE };
+		process.env.TMUX = "export-readonly-test";
+		process.env.TMUX_PANE = "%export-readonly";
+		try {
+			const { sessionFile } = seedSource(staleReplayTranscript());
+			const breadcrumbsBefore = snapshotTreeIfPresent(getTerminalSessionsDir());
+			const outputPath = path.join(makeTempDir("output"), "export.html");
+
+			await exportFromFile(sessionFile, { outputPath });
+			// The breadcrumb write is fire-and-forget; give one that was issued time to land.
+			await Bun.sleep(100);
+
+			expect(snapshotTreeIfPresent(getTerminalSessionsDir())).toEqual(breadcrumbsBefore);
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+});
+
+async function rejectionMessage(action: () => unknown): Promise<string | undefined> {
+	try {
+		await action();
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	return undefined;
+}
+
+/** A v1 transcript (no entry ids) with an index-based compaction, migrated on load. */
+function legacyV1CompactedTranscript(): string {
+	const records: Record<string, unknown>[] = [
+		{ type: "session", id: "readonly-v1", timestamp: TIMESTAMP, cwd: "/cwd" },
+	];
+	for (let index = 0; index < 2_000; index++) {
+		records.push({
+			type: "message",
+			timestamp: TIMESTAMP,
+			message: { role: "user", content: `v1-${index}-${"x".repeat(512)}`, timestamp: index },
+		});
+	}
+	records.push({
+		type: "message",
+		timestamp: TIMESTAMP,
+		message: { role: "user", content: "v1 kept", timestamp: 2_001 },
+	});
+	records.push({
+		type: "compaction",
+		timestamp: TIMESTAMP,
+		summary: "summary",
+		firstKeptEntryIndex: 2_001,
+		tokensBefore: 2_000,
+	});
+	return jsonl(records);
+}
+
+describe("standalone HTML export of legacy and vanished sources", () => {
+	it("exports a v1 transcript with a compaction without touching it", async () => {
+		const content = legacyV1CompactedTranscript();
+		const { sourceDir, sessionFile } = seedSource(content);
+		const before = snapshotTree(sourceDir);
+		const outputPath = path.join(makeTempDir("output"), "export.html");
+
+		await exportFromFile(sessionFile, { outputPath });
+
+		expect(snapshotTree(sourceDir)).toEqual(before);
+		const encoded = fs
+			.readFileSync(outputPath, "utf8")
+			.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/);
+		const data = JSON.parse(Buffer.from(encoded?.[1] ?? "", "base64").toString("utf8")) as { entries: unknown[] };
+		expect(data.entries).toHaveLength(2_002);
+		expect(JSON.stringify(data.entries)).toContain("v1 kept");
+	});
+
+	it("reports a missing source as ENOENT instead of creating a session", async () => {
+		const sessionFile = path.join(makeTempDir("vanished"), "session.jsonl");
+		const error = await rejectionMessage(() => SessionManager.openReadOnlySnapshot(sessionFile));
+		expect(error).toStartWith("ENOENT");
+		expect(fs.existsSync(sessionFile)).toBe(false);
+	});
 });
