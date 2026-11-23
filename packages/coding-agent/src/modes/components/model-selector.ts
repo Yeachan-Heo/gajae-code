@@ -901,10 +901,18 @@ export class ModelSelectorComponent extends Container {
 		return this.#modelRegistry.hasConfiguredProviderAuth(providerId) ? "configured" : "none";
 	}
 
-	#sortModels(models: ModelItem[], roles: RoleAssignments = this.#roles): void {
+	#buildSortContext(): {
+		mruIndex: ReadonlyMap<string, number>;
+		providerAuthStateById: Map<string, ProviderAuthState>;
+	} {
 		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
 		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
 		const providerAuthStateById = new Map<string, ProviderAuthState>();
+		return { mruIndex, providerAuthStateById };
+	}
+
+	#sortModels(models: ModelItem[], roles: RoleAssignments = this.#roles): void {
+		const { mruIndex, providerAuthStateById } = this.#buildSortContext();
 		for (const item of models) {
 			if (!providerAuthStateById.has(item.provider)) {
 				providerAuthStateById.set(item.provider, this.#resolveProviderAuthState(item.provider));
@@ -914,9 +922,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#sortCanonicalModels(models: CanonicalModelItem[], roles: RoleAssignments = this.#roles): void {
-		const mruOrder = this.#settings.getStorage()?.getModelUsageOrder() ?? [];
-		const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
-		const providerAuthStateById = new Map<string, ProviderAuthState>();
+		const { mruIndex, providerAuthStateById } = this.#buildSortContext();
 		for (const item of models) {
 			if (!providerAuthStateById.has(item.model.provider)) {
 				providerAuthStateById.set(item.model.provider, this.#resolveProviderAuthState(item.model.provider));
