@@ -194,6 +194,45 @@ suite("Session connection", () => {
 		}
 	}, 30000);
 
+	test("a conversation held by an earlier app session's background process is not called a terminal's", async () => {
+		const { context, page } = await fixture();
+		try {
+			await mount(
+				page,
+				`import { SessionConnectionNotice } from '/src/SessionConnection.tsx';
+				import { SessionConnectionBadge, SessionConnectionMark } from '/src/SessionConnectionMark.tsx';`,
+				`const held = holder => ({ connection: holder ? { state: 'elsewhere', holder } : { state: 'elsewhere' } });
+				ReactDOM.createRoot(root).render([undefined, 'earlier-app'].map(holder =>
+					h('section', { key: String(holder), 'data-holder': String(holder) },
+						h(SessionConnectionNotice, { state: 'elsewhere', holder, pending: false, onConnect: () => {} }),
+						h(SessionConnectionBadge, { session: held(holder) }),
+						h(SessionConnectionMark, { session: held(holder) }))));`,
+			);
+			await page.waitForSelector('[data-holder="earlier-app"] .connection-notice');
+			const read = (holder: string) =>
+				page.$eval(`[data-holder="${holder}"]`, node => ({
+					notice: node.querySelector(".connection-notice strong")?.textContent,
+					body: node.querySelector(".connection-notice-text span")?.textContent ?? "",
+					badge: node.querySelector(".connection-badge")?.textContent,
+					mark: node.querySelector(".connection-mark")?.getAttribute("title"),
+					action: node.querySelector(".connection-notice-label")?.textContent,
+				}));
+			const terminal = await read("undefined");
+			expect(terminal).toMatchObject({ notice: "In use in a terminal", badge: "In use in a terminal" });
+			const leftover = await read("earlier-app");
+			expect(leftover).toMatchObject({
+				notice: "In use by an earlier app session",
+				badge: "In use by an earlier app session",
+				mark: "in use by an earlier app session",
+				action: "Check again",
+			});
+			expect(leftover.body).toContain("earlier version of the app");
+			expect(leftover.body).not.toContain("terminal");
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("both connection notices lay out alike at the app's composer widths: icon beside and level with the title", async () => {
 		const { context, page } = await fixture();
 		try {

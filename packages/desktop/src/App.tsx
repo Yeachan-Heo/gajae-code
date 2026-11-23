@@ -1750,7 +1750,13 @@ export default function App() {
 			const connected = await request<DesktopSession>("session.connect", { sessionId });
 			// A check that finds the other process still there is an answer; say it, so the click shows.
 			if (selectedRef.current !== sessionId) return;
-			setNotice(connected.connection?.state === "elsewhere" ? t("connection.stillElsewhere") : "");
+			setNotice(
+				connected.connection?.state !== "elsewhere"
+					? ""
+					: connected.connection.holder === "earlier-app"
+						? t("connection.stillLeftover")
+						: t("connection.stillElsewhere"),
+			);
 		});
 	/** Without `confirm` the Host refuses to stop work and says what Disconnect would stop. */
 	const disconnectSession = (sessionId: string, confirm = false) =>
@@ -3058,6 +3064,7 @@ export default function App() {
 									{!writable && session.connection && session.connection.state !== "connected" ? (
 										<SessionConnectionNotice
 											state={session.connection.state}
+											holder={session.connection.holder}
 											pending={!connected || !!pending[connectionScope(session.id)]}
 											onConnect={() => connectSession(session.id)}
 										/>

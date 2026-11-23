@@ -776,11 +776,12 @@ export async function findEmbeddedLiveOwner(input: {
 }
 
 /**
- * What became of an idle-only close request. `not_closed` carries the error code the broker or
- * the connection answered with: `busy` (the owner has work in progress), `close_refused` (the
- * process was not started by the broker, for example a terminal), `not_found` (nothing is
- * registered for the session), `timeout`, and so on. `unknown` means no answer was had at all:
- * no broker is running (`broker_absent`), or the request outlived `timeoutMs` (`broker_unavailable`).
+ * What became of an idle-only close request. `not_closed` carries the code of the broker's answer:
+ * `busy` (the owner has work in progress), `close_refused` (the process was not started by the
+ * broker or refused the idle fence), `invalid_input` (a terminal with no SDK endpoint), `not_found`
+ * (nothing is registered for the session), and so on. `unknown` means no answer was had: no broker
+ * is running (`broker_absent`), or the request failed in transport or outlived `timeoutMs`
+ * (`broker_unavailable`), so the close may or may not still happen.
  */
 export type EmbeddedIdleOwnerClose =
 	| { kind: "closed" }
@@ -823,7 +824,11 @@ export async function closeEmbeddedIdleOwner(input: {
 			target: { sessionId: input.sessionId, ifIdle: true },
 			timeoutMs: remaining(),
 		});
-		return closed.ok ? { kind: "closed" } : { kind: "not_closed", code: closed.error.code };
+		if (closed.ok) return { kind: "closed" };
+		// A refusal the broker decided on is an answer; a transport failure says nothing either way.
+		if (closed.certainty === "terminal" || closed.error.code === "busy")
+			return { kind: "not_closed", code: closed.error.code };
+		return unavailable;
 	})().catch(() => unavailable);
 	return Promise.race([request, Bun.sleep(timeoutMs).then(() => unavailable)]);
 }

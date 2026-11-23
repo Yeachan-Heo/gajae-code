@@ -261,6 +261,11 @@ export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnec
 
 export interface DesktopSessionConnection {
 	state: "connected" | "disconnected" | "elsewhere";
+	/**
+	 * Only with `elsewhere`: the process holding it is one an earlier version of the app started
+	 * (a background owner still busy with its work), not a terminal.
+	 */
+	holder?: "earlier-app";
 }
 
 /**

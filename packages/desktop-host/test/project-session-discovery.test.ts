@@ -72,13 +72,16 @@ async function fixture() {
 	// of one is answered. The app must never ask for any other kind of close.
 	const liveOwners = new Set<string>();
 	const closeRequests: string[] = [];
-	const broker = { closeAnswer: "closed" as "closed" | "busy" | "close_refused" };
+	const broker = {
+		closeAnswer: "closed" as "closed" | "busy" | "close_refused" | "invalid_input" | "not_found" | "unreachable",
+	};
 	const liveOwnerClient = {
 		global: async (operation: string, input: Record<string, unknown>) => {
 			if (operation === "session.close") {
 				const sessionId = String(input.sessionId);
 				closeRequests.push(sessionId);
 				if (input.ifIdle !== true) throw new Error("The app asked for a close that is not idle-only");
+				if (broker.closeAnswer === "unreachable") throw new Error("broker connection reset");
 				if (broker.closeAnswer !== "closed")
 					return { ok: false, error: { code: broker.closeAnswer, message: "The owner was not closed." } };
 				liveOwners.delete(sessionId);
@@ -170,6 +173,24 @@ async function fixture() {
 		/** The saved catalog's rows, as written. */
 		savedRows: async (): Promise<Array<Record<string, unknown>>> =>
 			((await Bun.file(catalogFile).json()) as { sessions: Array<Record<string, unknown>> }).sessions,
+		/** Waits until the saved catalog's first row carries this leftover-owner note (or none). */
+		noteSaved: async (expected: number | undefined) => {
+			for (let attempt = 0; attempt < 200; attempt++) {
+				const rows = ((await Bun.file(catalogFile).json()) as { sessions: Array<Record<string, unknown>> })
+					.sessions;
+				if (rows[0]?.leftoverOwner === expected) return;
+				await Bun.sleep(10);
+			}
+			throw new Error(`The saved owner note never became ${String(expected)}`);
+		},
+		/** Restarts the Host on exactly this catalog. */
+		restartWithCatalog: async (catalog: unknown) => {
+			await host.close();
+			await Promise.all(created.map(result => result.session.awaitDisposeCompletion()));
+			await Bun.write(catalogFile, JSON.stringify(catalog));
+			host = createHost();
+			await host.initialize();
+		},
 		/**
 		 * Restarts the Host on a catalog whose terminal conversations are saved the way an earlier
 		 * build saved them: a bare reference with `managed: true` and no transcript path.
@@ -668,7 +689,7 @@ test("a catalog saved by an earlier build keeps loading, and its terminal refere
 	]);
 	const rows = await h.savedRows();
 	expect(rows.map(row => [row.id, row.sessionId, row.scope, row.managed, row.leftoverOwner])).toEqual([
-		[listed.id, listed.id, "managed", undefined, true],
+		[listed.id, listed.id, "managed", undefined, 0],
 		[gone.id, undefined, undefined, true, undefined],
 	]);
 	expect(path.isAbsolute(String(rows[0]?.file))).toBe(false);
@@ -741,7 +762,7 @@ test("an idle owner an earlier build left behind is closed, so its conversation 
 	await h.restartOnEarlierCatalog([terminal.id]);
 	await h.call("bootstrap");
 	await h.refreshed();
-	expect((await h.savedRows())[0]?.leftoverOwner).toBe(true);
+	expect((await h.savedRows())[0]?.leftoverOwner).toBe(0);
 	// That build's broker-started owner is still running, so the broker reports the transcript held.
 	h.liveOwners.add(terminal.id);
 	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
@@ -749,7 +770,7 @@ test("an idle owner an earlier build left behind is closed, so its conversation 
 	expect(selected.connection).toEqual({ state: "connected" });
 	expect(h.created).toHaveLength(1);
 	// Nobody holds it now: the note is gone, and no later check asks for a close again.
-	expect((await h.savedRows())[0]?.leftoverOwner).toBeUndefined();
+	await h.noteSaved(undefined);
 	await h.call("session.disconnect", { sessionId: terminal.id });
 	h.liveOwners.add(terminal.id);
 	const held = await h.call<DesktopSession>("session.connect", { sessionId: terminal.id });
@@ -757,29 +778,88 @@ test("an idle owner an earlier build left behind is closed, so its conversation 
 	expect(h.closeRequests).toEqual([terminal.id]);
 });
 
-test("an owner that is busy, or that the broker did not start, is left alone and asked again later", async () => {
-	for (const answer of ["busy", "close_refused"] as const) {
-		const h = await fixture();
-		const terminal = await h.persist(`Owner answers ${answer}`);
-		await h.call("project.open", { path: h.projectDir });
-		await h.restartOnEarlierCatalog([terminal.id]);
-		await h.call("bootstrap");
-		await h.refreshed();
-		h.liveOwners.add(terminal.id);
+/** An earlier build's reference, placed, with its leftover owner reported live by the broker. */
+async function leftoverRow(title: string) {
+	const h = await fixture();
+	const terminal = await h.persist(title);
+	await h.call("project.open", { path: h.projectDir });
+	await h.restartOnEarlierCatalog([terminal.id]);
+	await h.call("bootstrap");
+	await h.refreshed();
+	h.liveOwners.add(terminal.id);
+	return { h, terminal };
+}
+
+test("a definite refusal of the idle close drops the note: whatever holds it is not a leftover owner", async () => {
+	for (const answer of ["close_refused", "invalid_input", "not_found"] as const) {
+		const { h, terminal } = await leftoverRow(`Owner answers ${answer}`);
 		h.broker.closeAnswer = answer;
 		const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
-		expect(selected.connection).toEqual({ state: "elsewhere" });
-		expect(h.created).toHaveLength(0);
+		// A terminal (say) has it: read-only as a terminal's, and never asked to close again.
+		expect({ answer, connection: selected.connection }).toEqual({ answer, connection: { state: "elsewhere" } });
 		expect(h.closeRequests).toEqual([terminal.id]);
-		// Still noted across a restart, so the next check tries again.
+		await h.noteSaved(undefined);
 		await h.restart();
-		expect((await h.savedRows())[0]?.leftoverOwner).toBe(true);
-		h.broker.closeAnswer = "closed";
-		const again = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
-		expect(again.connection).toEqual({ state: "connected" });
-		expect(h.closeRequests).toEqual([terminal.id, terminal.id]);
-		expect(h.created).toHaveLength(1);
+		await h.call("session.select", { sessionId: terminal.id });
+		expect(h.closeRequests).toEqual([terminal.id]);
+		expect(h.created).toHaveLength(0);
 	}
+});
+
+test("a busy leftover owner is asked again at later checks, at most three times, and named as the app's own", async () => {
+	const { h, terminal } = await leftoverRow("Leftover owner still working");
+	h.broker.closeAnswer = "busy";
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	// Not "in use in a terminal": the process is one an earlier app session left behind.
+	expect(selected.connection).toEqual({ state: "elsewhere", holder: "earlier-app" });
+	const refused = await h.call("prompt", { sessionId: terminal.id, text: "while it works" }).then(
+		() => "",
+		(error: Error) => error.message,
+	);
+	expect(refused).toContain("earlier version of the app");
+	expect(refused).not.toContain("terminal");
+	await h.noteSaved(1);
+	await h.call("session.select", { sessionId: terminal.id });
+	await h.noteSaved(2);
+	// The attempt count survives a restart, so the cap holds across app sessions.
+	await h.restart();
+	await h.call("session.select", { sessionId: terminal.id });
+	expect(h.closeRequests).toEqual([terminal.id, terminal.id, terminal.id]);
+	await h.noteSaved(undefined);
+	// No fourth attempt, ever.
+	await h.call("session.select", { sessionId: terminal.id });
+	await h.restart();
+	await h.call("session.select", { sessionId: terminal.id });
+	expect(h.closeRequests).toHaveLength(3);
+	// Once it finishes and lets go, the conversation opens like any other.
+	h.liveOwners.delete(terminal.id);
+	const free = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(free.connection).toEqual({ state: "connected" });
+});
+
+test("an idle close with no answer is retried within the same cap, without naming the holder", async () => {
+	const { h, terminal } = await leftoverRow("Broker not answering the close");
+	h.broker.closeAnswer = "unreachable";
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(selected.connection).toEqual({ state: "elsewhere" });
+	await h.noteSaved(1);
+	h.broker.closeAnswer = "closed";
+	const again = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(again.connection).toEqual({ state: "connected" });
+	expect(h.closeRequests).toEqual([terminal.id, terminal.id]);
+	await h.noteSaved(undefined);
+});
+
+test("a note saved before attempts were counted loads and is used", async () => {
+	const { h, terminal } = await leftoverRow("Noted by the first version of the note");
+	await h.restart();
+	const catalogFile = path.join(h.dataDir, "catalog.json");
+	const catalog = (await Bun.file(catalogFile).json()) as { sessions: Array<Record<string, unknown>> };
+	catalog.sessions[0]!.leftoverOwner = true;
+	await h.restartWithCatalog(catalog);
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(h.closeRequests).toEqual([terminal.id]);
+	expect(selected.connection).toEqual({ state: "connected" });
 });
 
 test("an earlier build's reference nobody holds needs no close, and the note is dropped", async () => {

@@ -11,6 +11,11 @@ export const connection = {
 	"connection.badgeElsewhere": "In use in a terminal",
 	"connection.markDisconnected": "not connected to the app",
 	"connection.markElsewhere": "in use in a terminal",
+	"connection.badgeLeftover": "In use by an earlier app session",
+	"connection.markLeftover": "in use by an earlier app session",
+	"connection.leftoverTitle": "In use by an earlier app session",
+	"connection.leftoverBody":
+		"A background process that an earlier version of the app started is still working on this conversation, so it is read-only here. Check again when it has finished.",
 	"connection.disconnectedTitle": "Not connected to the app",
 	"connection.disconnectedBody":
 		"A terminal can continue this conversation now, from its latest message, even if the app was showing an earlier version. Its history stays here, read-only. Connect to continue here; your draft is kept.",
@@ -18,6 +23,8 @@ export const connection = {
 	"connection.elsewhereBody":
 		"The app found this conversation open in another gjc process, usually a terminal, so it shows it read-only here. Finish there, then check again.",
 	"connection.stillElsewhere": "Another gjc process still has this conversation open. Finish there, then check again.",
+	"connection.stillLeftover":
+		"The earlier app session's background process is still working on this conversation. Check again when it has finished.",
 	"connection.confirmTitle": "Disconnect while it is working?",
 	"connection.confirmTitleQueued": "Disconnect with queued messages?",
 	"connection.confirmRunning": "Disconnecting stops the current turn, as Stop does.",
@@ -38,6 +45,7 @@ export const connection = {
 	"connection.showcaseConnecting": "Connect pending",
 	"connection.showcaseElsewhere": "In use in a terminal · check again",
 	"connection.showcaseChecking": "Check pending",
+	"connection.showcaseLeftover": "In use by an earlier app session · busy background process",
 	"connection.showcaseBadges": "Header badges",
 	"connection.showcaseRows": "Sidebar rows",
 	"connection.showcaseConfirm": "Disconnect confirmation · running turn and queued messages",

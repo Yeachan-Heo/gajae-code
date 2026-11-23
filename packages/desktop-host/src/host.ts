@@ -398,10 +398,12 @@ interface SavedSession {
 	 */
 	managed?: true;
 	/**
-	 * An earlier build reached this conversation through an owner process the SDK broker started,
-	 * which may still be running idle. Kept until an owner check answers that nobody has it open.
+	 * An earlier build may have reached this conversation through an owner process the SDK broker
+	 * started, which may still be running idle. The value counts idle-close attempts that got no
+	 * definite answer (`busy` or no answer); the note is dropped on any definite answer, when nobody
+	 * holds the transcript, or after `LEFTOVER_CLOSE_ATTEMPTS` attempts.
 	 */
-	leftoverOwner?: true;
+	leftoverOwner?: number;
 	/** The user released the app's writer (Disconnect); it stays read-only until Connect. */
 	disconnected?: true;
 }
@@ -462,11 +464,14 @@ class ConnectionRefusal extends Error {
 	}
 }
 class SteppedAside extends ConnectionRefusal {
-	constructor() {
-		super("elsewhere", ELSEWHERE);
+	constructor(message = ELSEWHERE) {
+		super("elsewhere", message);
 		this.name = "SteppedAside";
 	}
 }
+/** An owner an earlier build left behind, not a terminal, still has the conversation and is busy. */
+const ELSEWHERE_LEFTOVER =
+	"A background process that an earlier version of the app started is still working on this conversation, so the app shows it read-only. Check again when it has finished.";
 /** A row saved by an earlier build whose transcript the shared store does not list (any more). */
 const UNPLACED =
 	"The app cannot open this conversation: its transcript is not in the shared conversation store. It may have been deleted or moved in the terminal. You can remove it from this list.";
@@ -474,6 +479,8 @@ const UNPLACED =
 const UNPLACED_UNCHECKED = "The app could not look up this conversation's transcript just now. Try again in a moment.";
 /** How long an idle owner left by an earlier build gets to close before the app answers anyway. */
 const LEFTOVER_CLOSE_TIMEOUT_MS = 3_000;
+/** Idle-close attempts per row without a definite answer before the app stops asking. */
+const LEFTOVER_CLOSE_ATTEMPTS = 3;
 /** A terminal has the conversation open, but the app still holds it because its background work runs. */
 const ELSEWHERE_BACKGROUND =
 	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs and does not start what you send; when that work finishes, the app may still add its result and a reply. To leave it to the terminal now, stop or cancel that work in the Session work panel, or Disconnect.";
@@ -719,6 +726,11 @@ export class DesktopHost {
 	/** Rows another live process holds open, from the last owner check; never persisted. */
 	#elsewhere = new Set<string>();
 	/**
+	 * Rows held by an owner an earlier build left behind that answered an idle close as busy: they
+	 * read as held by that process, not by a terminal. Cleared once an owner check answers otherwise.
+	 */
+	#leftoverBusy = new Set<string>();
+	/**
 	 * Disconnected rows the user asked to Connect while a terminal still had them. They read as
 	 * connected in this run, so the next select takes them, but stay released on disk until the
 	 * app actually holds the writer again.
@@ -911,9 +923,18 @@ export class DesktopHost {
 					session.disconnected = true;
 				}
 				if (item.leftoverOwner !== undefined) {
-					if (item.leftoverOwner !== true || !session.file || !session.sessionId)
+					// `true` is the note as first written, before attempts were counted.
+					const attempts = item.leftoverOwner === true ? 0 : item.leftoverOwner;
+					if (
+						typeof attempts !== "number" ||
+						!Number.isInteger(attempts) ||
+						attempts < 0 ||
+						attempts >= LEFTOVER_CLOSE_ATTEMPTS ||
+						!session.file ||
+						!session.sessionId
+					)
 						throw new Error("Invalid session owner note");
-					session.leftoverOwner = true;
+					session.leftoverOwner = attempts;
 				}
 				return session;
 			});
@@ -1272,11 +1293,21 @@ export class DesktopHost {
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
 			// A row not placed in the shared store yet has no transcript to connect to.
-			...(metadata.managed ? {} : { connection: { state: this.#connection(metadata) } }),
+			...(metadata.managed ? {} : { connection: this.#connectionDto(metadata) }),
 		};
 	}
 	#connection(metadata: SavedSession): DesktopSessionConnection["state"] {
 		return metadata.disconnected ? "disconnected" : this.#elsewhere.has(metadata.id) ? "elsewhere" : "connected";
+	}
+	#connectionDto(metadata: SavedSession): DesktopSessionConnection {
+		const state = this.#connection(metadata);
+		return state === "elsewhere" && this.#leftoverBusy.has(metadata.id)
+			? { state, holder: "earlier-app" }
+			: { state };
+	}
+	/** Who has the conversation, in the refusal's words. */
+	#elsewhereText(metadata: SavedSession): string {
+		return this.#leftoverBusy.has(metadata.id) ? ELSEWHERE_LEFTOVER : ELSEWHERE;
 	}
 	/** The app may open its own writer for this conversation. */
 	#writable(metadata: SavedSession): boolean {
@@ -1285,7 +1316,7 @@ export class DesktopHost {
 	#notWritable(metadata: SavedSession): ConnectionRefusal {
 		if (metadata.disconnected) return new ConnectionRefusal("disconnected", DISCONNECTED);
 		if (this.#disconnecting.has(metadata.id)) return new ConnectionRefusal("disconnecting", DISCONNECTING);
-		return new ConnectionRefusal("elsewhere", ELSEWHERE);
+		return new ConnectionRefusal("elsewhere", this.#elsewhereText(metadata));
 	}
 	/**
 	 * Ask the broker whether another live process holds this transcript open, and remember the
@@ -1310,24 +1341,55 @@ export class DesktopHost {
 				...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
 			});
 		const answer = await ask();
-		if (!metadata.leftoverOwner) return answer;
-		// Nobody has it open: the note has done its job. It leaves the catalog with the next save.
-		if (answer.kind === "none") delete metadata.leftoverOwner;
+		if (answer.kind !== "live") this.#leftoverBusy.delete(metadata.id);
+		const attempts = metadata.leftoverOwner;
+		if (attempts === undefined) return answer;
+		// Nobody has it open: the note has done its job.
+		if (answer.kind === "none") this.#dropLeftover(metadata);
 		if (answer.kind !== "live") return answer;
-		// An earlier build opened this conversation through an owner the broker started, and that
-		// owner may be what still holds it. Ask the broker to close it if it is idle: the broker
-		// refuses a busy owner and never touches a process it did not start, such as a terminal.
-		// The note stays until a check answers `none`, so a refused attempt is made again later.
+		// An earlier build may have opened this conversation through an owner the broker started, and
+		// that owner may be what still holds it. Ask the broker to close it if it is idle. The broker
+		// refuses a busy owner and never sends an idle-fenced close as a signal to a process that has
+		// not accepted it, so a terminal keeps running.
 		const closed = await closeEmbeddedIdleOwner({
 			agentDir: this.agentDir,
 			sessionId,
 			timeoutMs: LEFTOVER_CLOSE_TIMEOUT_MS,
 			...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
 		});
-		if (closed.kind !== "closed") return answer;
-		const after = await ask();
-		if (after.kind === "none") delete metadata.leftoverOwner;
-		return after;
+		if (closed.kind === "closed") {
+			this.#dropLeftover(metadata);
+			const after = await ask();
+			if (after.kind !== "live") this.#leftoverBusy.delete(metadata.id);
+			return after;
+		}
+		// Any other definite answer means the holder is not an idle owner the broker started (a
+		// terminal, say) or nothing is registered: there is nothing left to clean up, so the note goes.
+		if (closed.kind === "not_closed" && closed.code !== "busy") {
+			this.#dropLeftover(metadata);
+			return answer;
+		}
+		// Busy, or no answer: try again at a later check, a bounded number of times. While the owner
+		// is busy, the row says an earlier app session's process is working, not a terminal.
+		if (closed.kind === "not_closed") this.#leftoverBusy.add(metadata.id);
+		if (attempts + 1 >= LEFTOVER_CLOSE_ATTEMPTS) this.#dropLeftover(metadata);
+		else {
+			metadata.leftoverOwner = attempts + 1;
+			this.#saveNote();
+		}
+		return answer;
+	}
+	/** Forgets a row's leftover-owner note, durably. */
+	#dropLeftover(metadata: SavedSession): void {
+		if (metadata.leftoverOwner === undefined) return;
+		delete metadata.leftoverOwner;
+		this.#saveNote();
+	}
+	/** Saves a leftover-owner note change; a failed save is retried by the next catalog write. */
+	#saveNote(): void {
+		this.#save().catch(error => {
+			console.error(`Desktop could not save a conversation's owner note: ${this.#diagnostic(error)}`);
+		});
 	}
 	snapshot(): DesktopSnapshot {
 		return {
@@ -1427,7 +1489,7 @@ export class DesktopHost {
 		if (!manager && (await this.#ownedElsewhere(metadata))) {
 			await this.#loadReadOnly(metadata);
 			this.#emit({ type: "session", session: this.#dto(metadata) });
-			throw new SteppedAside();
+			throw new SteppedAside(this.#elsewhereText(metadata));
 		}
 		// A conversation this load creates has no catalog transcript yet; if it never
 		// publishes, its transcript must not survive as a conversation the user never got.
@@ -2876,7 +2938,7 @@ export class DesktopHost {
 				if (!this.#closed && this.#catalog.sessions.includes(metadata))
 					this.#emit({ type: "session", session: this.#dto(metadata) });
 			}
-			throw new SteppedAside();
+			throw new SteppedAside(this.#elsewhereText(metadata));
 		})();
 		this.#opening.set(metadata.id, steppingAside);
 		const release = () => {
@@ -4646,7 +4708,7 @@ export class DesktopHost {
 		session.scope = "managed";
 		session.sessionId = session.id;
 		// That build opened such rows through an owner the broker started; it may still be running.
-		session.leftoverOwner = true;
+		session.leftoverOwner = 0;
 		return () => {
 			session.managed = true;
 			delete session.file;

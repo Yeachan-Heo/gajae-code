@@ -4,6 +4,6 @@
 - Transcripts kept under a project's own `.gjc` folder, such as a workflow's subagent sessions, are no longer listed as conversations in the app. Resume them from the terminal.
 
 ### Fixed
-- Opening a terminal-started conversation no longer starts a background SDK broker and a session process that kept running after the app closed. A process an earlier build left behind is closed the next time its conversation is checked, only while it is idle, and a terminal is never closed.
+- Opening a terminal-started conversation no longer starts a background SDK broker and a session process that kept running after the app closed. A process an earlier build may have left behind is closed when its conversation is checked, only while it is idle, at most three tries per conversation; a terminal is never closed. While such a process is still busy, the app says so instead of calling it a terminal.
 - Conversations an earlier build listed from the terminal keep loading. One whose transcript no longer exists says so in plain words and can be removed.
 - A terminal conversation in a workspace under `/tmp` or `/var/folders` on macOS, or one started from a symlinked folder, now opens, copies and deletes in the app instead of failing with "Session project does not match catalog".

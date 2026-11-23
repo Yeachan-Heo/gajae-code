@@ -11,10 +11,13 @@ import { connectionIcons, type ReadOnlyConnection } from "./SessionConnectionMar
  */
 export function SessionConnectionNotice({
 	state,
+	holder,
 	pending,
 	onConnect,
 }: {
 	state: ReadOnlyConnection;
+	/** With `elsewhere`: an earlier app session's background process holds it, not a terminal. */
+	holder?: "earlier-app";
 	pending: boolean;
 	onConnect: () => void;
 }) {
@@ -36,14 +39,31 @@ export function SessionConnectionNotice({
 	const bodyId = useId();
 	const [expanded, setExpanded] = useState(false);
 	const details = expanded ? t("connection.hideDetails") : t("connection.showDetails");
+	const leftover = !disconnected && holder === "earlier-app";
 	return (
 		<div className="connection-notice" role="status" data-state={state} data-expanded={expanded || undefined}>
 			{/* Icon and text wrap as one unit, so the icon never lands on a line of its own. */}
 			<div className="connection-notice-main">
 				<Icon className="connection-notice-icon" aria-hidden="true" />
 				<div className="connection-notice-text">
-					<strong>{t(disconnected ? "connection.disconnectedTitle" : "connection.elsewhereTitle")}</strong>
-					<span id={bodyId}>{t(disconnected ? "connection.disconnectedBody" : "connection.elsewhereBody")}</span>
+					<strong>
+						{t(
+							disconnected
+								? "connection.disconnectedTitle"
+								: leftover
+									? "connection.leftoverTitle"
+									: "connection.elsewhereTitle",
+						)}
+					</strong>
+					<span id={bodyId}>
+						{t(
+							disconnected
+								? "connection.disconnectedBody"
+								: leftover
+									? "connection.leftoverBody"
+									: "connection.elsewhereBody",
+						)}
+					</span>
 				</div>
 				{/* Shown only in short windows, where the explanation is folded away to keep the action in view. */}
 				<Button

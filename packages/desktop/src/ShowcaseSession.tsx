@@ -155,6 +155,11 @@ function ShowcaseConnection() {
 						<SessionConnectionNotice state="elsewhere" pending={false} onConnect={none} />
 					</ComposerArea>
 				</State>
+				<State caption="connection.showcaseLeftover">
+					<ComposerArea>
+						<SessionConnectionNotice state="elsewhere" holder="earlier-app" pending={false} onConnect={none} />
+					</ComposerArea>
+				</State>
 				<State caption="connection.showcaseChecking">
 					<ComposerArea>
 						<SessionConnectionNotice state="elsewhere" pending onConnect={none} />

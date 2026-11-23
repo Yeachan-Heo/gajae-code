@@ -236,14 +236,18 @@ test("an idle-only close is one idle-fenced request, and reports the broker's ow
 	expect(seen.every(request => typeof request.key === "string" && request.key.length > 0)).toBe(true);
 });
 
-test("an idle-only close that fails or gets no answer in time is reported as not closed or unknown", async () => {
+test("an idle-only close that fails in transport or gets no answer in time is reported as unknown", async () => {
 	const dir = await agentDir();
 	const failing: SessionLifecycleClient = {
 		global: async () => {
 			throw new Error("connection refused");
 		},
 	};
-	expect((await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, client: failing })).kind).toBe("not_closed");
+	// A transport failure is no answer about the owner.
+	expect(await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, client: failing })).toEqual({
+		kind: "unknown",
+		reason: "broker_unavailable",
+	});
 	const silent: SessionLifecycleClient = { global: () => Promise.withResolvers<unknown>().promise };
 	const started = Date.now();
 	expect(await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, client: silent, timeoutMs: 50 })).toEqual({

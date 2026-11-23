@@ -4,7 +4,11 @@ import { t } from "./i18n";
 
 export type ReadOnlyConnection = Exclude<DesktopSessionConnection["state"], "connected">;
 
-/** The conversation's connection state; rows without one (another surface's) count as connected. */
+/**
+ * The conversation's connection state. Only a row an earlier build saved without a transcript path,
+ * not yet placed in the shared store, has none; it counts as connected here, and the Host answers
+ * its requests with why it cannot be opened.
+ */
 export function connectionState(session: Pick<DesktopSession, "connection"> | undefined) {
 	return session?.connection?.state ?? "connected";
 }
@@ -16,10 +20,17 @@ export function SessionConnectionBadge({ session }: { session: Pick<DesktopSessi
 	const state = connectionState(session);
 	if (state === "connected") return null;
 	const Icon = connectionIcons[state];
+	const leftover = state === "elsewhere" && session.connection?.holder === "earlier-app";
 	return (
 		<span className="connection-badge" data-state={state}>
 			<Icon aria-hidden="true" />
-			{t(state === "disconnected" ? "connection.badgeDisconnected" : "connection.badgeElsewhere")}
+			{t(
+				state === "disconnected"
+					? "connection.badgeDisconnected"
+					: leftover
+						? "connection.badgeLeftover"
+						: "connection.badgeElsewhere",
+			)}
 		</span>
 	);
 }
@@ -28,7 +39,8 @@ export function SessionConnectionBadge({ session }: { session: Pick<DesktopSessi
 export function connectionMarkLabel(session: Pick<DesktopSession, "connection">): string {
 	const state = connectionState(session);
 	if (state === "connected") return "";
-	return t(state === "disconnected" ? "connection.markDisconnected" : "connection.markElsewhere");
+	if (state === "disconnected") return t("connection.markDisconnected");
+	return t(session.connection?.holder === "earlier-app" ? "connection.markLeftover" : "connection.markElsewhere");
 }
 
 /** The sidebar row's small, non-alarming mark beside the title. */
